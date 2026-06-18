@@ -1,8 +1,10 @@
 //! fjall KV store for position-keyed VEP cache entries.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::result::Result as StdResult;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -26,6 +28,12 @@ const MAX_DECOMPRESSED_ENTRY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// All variants at the same `(chrom, start)` are merged into one entry.
 pub const FORMAT_V0: u8 = 0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangePrefetchLimitExceeded {
+    Entries,
+    Bytes,
+}
+
 /// Wrapper around fjall `Database` for VEP cache storage.
 ///
 /// Layout:
@@ -42,12 +50,21 @@ pub struct VepKvStore {
     zstd_dict: Option<Arc<Vec<u8>>>,
 }
 
+type SharedStoreKey = (PathBuf, u64);
+
+static SHARED_OPEN_STORES: LazyLock<Mutex<HashMap<SharedStoreKey, Weak<VepKvStore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
 }
 
 fn fjall_err(e: fjall::Error) -> DataFusionError {
     DataFusionError::External(Box::new(e))
+}
+
+fn canonical_store_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn is_destination_too_small_msg(msg: &str) -> bool {
@@ -129,9 +146,41 @@ impl VepKvStore {
         Self::open_with_cache_size(path, 1024 * 1024 * 1024)
     }
 
+    /// Open or reuse an existing process-local KV store handle with default settings.
+    ///
+    /// Fjall keeps an exclusive lock per database path. In embedded Python/Jupyter
+    /// workflows a previous annotation stream can remain alive briefly between
+    /// runs, so a second independent `open()` may hit `FjallError::Locked`.
+    /// Reusing the live handle for the same canonical path avoids opening a
+    /// second database while still allowing the store to close when all users
+    /// drop their `Arc`.
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        Self::open_shared_with_cache_size(path, 1024 * 1024 * 1024)
+    }
+
+    /// Open or reuse an existing process-local KV store handle.
+    pub fn open_shared_with_cache_size(
+        path: impl AsRef<Path>,
+        cache_size_bytes: u64,
+    ) -> Result<Arc<Self>> {
+        let root_path = canonical_store_path(path.as_ref());
+        let key = (root_path.clone(), cache_size_bytes);
+        let mut stores = SHARED_OPEN_STORES.lock().map_err(|e| {
+            DataFusionError::Execution(format!("shared fjall store registry lock poisoned: {e}"))
+        })?;
+        stores.retain(|_, weak| weak.strong_count() > 0);
+        if let Some(store) = stores.get(&key).and_then(Weak::upgrade) {
+            return Ok(store);
+        }
+
+        let store = Arc::new(Self::open_with_cache_size(&root_path, cache_size_bytes)?);
+        stores.insert(key, Arc::downgrade(&store));
+        Ok(store)
+    }
+
     /// Open an existing KV store with a custom fjall block cache size (bytes).
     pub fn open_with_cache_size(path: impl AsRef<Path>, cache_size_bytes: u64) -> Result<Self> {
-        let root_path = path.as_ref().to_path_buf();
+        let root_path = canonical_store_path(path.as_ref());
         let db = Database::builder(&root_path)
             .worker_threads(1)
             .cache_size(cache_size_bytes)
@@ -284,7 +333,20 @@ impl VepKvStore {
         start: i64,
     ) -> Result<Option<fjall::UserValue>> {
         let mut key_buf = Vec::with_capacity(10);
-        super::key_encoding::encode_position_key_buf(chrom_code, start, &mut key_buf);
+        self.get_position_entry_with_key_buf(chrom_code, start, &mut key_buf)
+    }
+
+    /// Read a position entry by chrom code + start using a caller-owned key buffer.
+    ///
+    /// This is the annotation hot-path variant. Reusing the 10-byte key buffer avoids
+    /// one small heap allocation per Fjall point probe.
+    pub fn get_position_entry_with_key_buf(
+        &self,
+        chrom_code: u16,
+        start: i64,
+        key_buf: &mut Vec<u8>,
+    ) -> Result<Option<fjall::UserValue>> {
+        super::key_encoding::encode_position_key_buf(chrom_code, start, key_buf);
         match self.data.get(&key_buf) {
             Ok(v) => Ok(v),
             Err(e) => Err(fjall_err(e)),
@@ -389,26 +451,138 @@ impl VepKvStore {
         decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
-        let raw = self.get_position_entry(chrom_code, start)?;
+        let mut key_buf = Vec::with_capacity(10);
+        self.get_position_entry_fast_with_key_buf(
+            chrom_code,
+            start,
+            decompressor,
+            buf,
+            &mut key_buf,
+        )
+    }
+
+    /// Fetch and decompress a position entry using caller-owned buffers for both the
+    /// encoded key and decompressed value.
+    pub fn get_position_entry_fast_with_key_buf(
+        &self,
+        chrom_code: u16,
+        start: i64,
+        decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
+        buf: &mut Vec<u8>,
+        key_buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let raw = self.get_position_entry_with_key_buf(chrom_code, start, key_buf)?;
         match raw {
             None => Ok(false),
-            Some(compressed) => match decompressor {
-                Some(dec) => {
-                    decompress_into_buffer_with_retry(
-                        dec,
-                        &compressed,
-                        buf,
-                        "zstd decompression failed",
-                    )?;
-                    Ok(true)
-                }
-                None => {
-                    buf.clear();
-                    buf.extend_from_slice(&compressed);
-                    Ok(true)
-                }
-            },
+            Some(compressed) => {
+                self.decode_position_entry_value(&compressed, decompressor, buf)?;
+                Ok(true)
+            }
         }
+    }
+
+    /// Decode a raw position-entry value into a reusable buffer.
+    ///
+    /// Values are zstd-compressed when the store has a dictionary, otherwise
+    /// they are already serialized position entries.
+    pub fn decode_position_entry_value(
+        &self,
+        raw: &[u8],
+        decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        match decompressor {
+            Some(dec) => {
+                decompress_into_buffer_with_retry(dec, raw, buf, "zstd decompression failed")
+            }
+            None => {
+                buf.clear();
+                buf.extend_from_slice(raw);
+                Ok(())
+            }
+        }
+    }
+
+    /// Read position entries for one chromosome/start range.
+    pub fn range_position_entries(
+        &self,
+        chrom_code: u16,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<(i64, fjall::UserValue)>> {
+        self.range_position_entries_limited(chrom_code, start, end, usize::MAX, usize::MAX)?
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "unbounded range_position_entries unexpectedly exceeded limits".to_string(),
+                )
+            })
+    }
+
+    /// Read position entries for one chromosome/start range, returning `None`
+    /// if the caller-provided entry or byte budget would be exceeded.
+    pub fn range_position_entries_limited(
+        &self,
+        chrom_code: u16,
+        start: i64,
+        end: i64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<(i64, fjall::UserValue)>>> {
+        match self.range_position_entries_limited_with_reason(
+            chrom_code,
+            start,
+            end,
+            max_entries,
+            max_bytes,
+        )? {
+            Ok(entries) => Ok(Some(entries)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Read position entries for one chromosome/start range, returning the
+    /// exact budget that would be exceeded.
+    pub(crate) fn range_position_entries_limited_with_reason(
+        &self,
+        chrom_code: u16,
+        start: i64,
+        end: i64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<StdResult<Vec<(i64, fjall::UserValue)>, RangePrefetchLimitExceeded>> {
+        let range_start = start.min(end);
+        let range_end = start.max(end);
+        let mut start_key = Vec::with_capacity(10);
+        let mut end_key = Vec::with_capacity(10);
+        super::key_encoding::encode_position_key_buf(chrom_code, range_start, &mut start_key);
+        super::key_encoding::encode_position_key_buf(chrom_code, range_end, &mut end_key);
+
+        let mut entries = Vec::new();
+        let mut total_bytes = 0usize;
+        for guard in self.data.range(start_key..=end_key) {
+            let (key, value) = guard.into_inner().map_err(fjall_err)?;
+            let key = key.as_ref();
+            if key.len() < 10 {
+                continue;
+            }
+            let entry_chrom = u16::from_be_bytes([key[0], key[1]]);
+            if entry_chrom != chrom_code {
+                continue;
+            }
+            let position = i64::from_be_bytes(key[2..10].try_into().map_err(|_| {
+                DataFusionError::Execution("invalid fjall position key length".to_string())
+            })?);
+            total_bytes = total_bytes.saturating_add(value.as_ref().len());
+            if entries.len() >= max_entries {
+                return Ok(Err(RangePrefetchLimitExceeded::Entries));
+            }
+            if total_bytes > max_bytes {
+                return Ok(Err(RangePrefetchLimitExceeded::Bytes));
+            }
+            entries.push((position, value));
+        }
+
+        Ok(Ok(entries))
     }
 
     /// Batch-insert pre-serialized position entries into the data keyspace.
@@ -540,6 +714,21 @@ mod tests {
     }
 
     #[test]
+    fn test_open_shared_reuses_live_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+
+        let store = VepKvStore::create(dir.path(), schema).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let first = VepKvStore::open_shared(dir.path()).unwrap();
+        let second = VepKvStore::open_shared(dir.path()).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn test_kv_store_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
@@ -581,6 +770,81 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&*loaded, value);
+    }
+
+    #[test]
+    fn test_kv_store_reusable_key_buffer_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+
+        let store = VepKvStore::create(dir.path(), schema).unwrap();
+        let value = b"test_position_data";
+        store.put_position_entry("1", 100, value).unwrap();
+        store.persist().unwrap();
+
+        let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
+        let mut key_buf = Vec::with_capacity(10);
+        let initial_capacity = key_buf.capacity();
+
+        let loaded = store
+            .get_position_entry_with_key_buf(chrom_code, 100, &mut key_buf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*loaded, value);
+        assert_eq!(key_buf.len(), 10);
+        assert_eq!(key_buf.capacity(), initial_capacity);
+
+        let missing = store
+            .get_position_entry_with_key_buf(chrom_code, 999, &mut key_buf)
+            .unwrap();
+        assert!(missing.is_none());
+        assert_eq!(key_buf.len(), 10);
+        assert_eq!(key_buf.capacity(), initial_capacity);
+    }
+
+    #[test]
+    fn test_kv_store_range_position_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+
+        let store = VepKvStore::create(dir.path(), schema.clone()).unwrap();
+        store.put_position_entry("1", 100, b"pos100").unwrap();
+        store.put_position_entry("1", 150, b"pos150").unwrap();
+        store.put_position_entry("1", 200, b"pos200").unwrap();
+        store.put_position_entry("2", 150, b"chr2").unwrap();
+        store.persist().unwrap();
+
+        let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
+        let entries = store.range_position_entries(chrom_code, 120, 200).unwrap();
+        let positions: Vec<_> = entries.iter().map(|(position, _)| *position).collect();
+        let values: Vec<_> = entries
+            .iter()
+            .map(|(_, value)| value.as_ref().to_vec())
+            .collect();
+
+        assert_eq!(positions, vec![150, 200]);
+        assert_eq!(values, vec![b"pos150".to_vec(), b"pos200".to_vec()]);
+
+        let limited = store
+            .range_position_entries_limited(chrom_code, 100, 200, 1, usize::MAX)
+            .unwrap();
+        assert!(limited.is_none());
+
+        let entry_limited = store
+            .range_position_entries_limited_with_reason(chrom_code, 100, 200, 1, usize::MAX)
+            .unwrap();
+        assert!(matches!(
+            entry_limited,
+            Err(RangePrefetchLimitExceeded::Entries)
+        ));
+
+        let byte_limited = store
+            .range_position_entries_limited_with_reason(chrom_code, 100, 200, usize::MAX, 4)
+            .unwrap();
+        assert!(matches!(
+            byte_limited,
+            Err(RangePrefetchLimitExceeded::Bytes)
+        ));
     }
 
     #[test]

@@ -41,6 +41,12 @@ impl CacheSourceType {
         Self::from_parquet_file(&parquet)
     }
 
+    #[cfg(feature = "lance-cache")]
+    pub(crate) fn from_partitioned_lance_cache_source(cache_source: &str) -> Result<Self> {
+        let dataset = first_variation_lance_dataset(cache_source)?;
+        Self::from_lance_dataset(&dataset)
+    }
+
     pub(crate) fn from_parquet_file(parquet: &Path) -> Result<Self> {
         let file = File::open(parquet).map_err(|err| {
             DataFusionError::Execution(format!(
@@ -54,8 +60,14 @@ impl CacheSourceType {
                     "annotate_vep(): failed to read Arrow schema metadata from cache parquet '{}': {err}",
                     parquet.display()
                 ))
-            })?;
+        })?;
         Self::from_schema(metadata.schema().as_ref())
+    }
+
+    #[cfg(feature = "lance-cache")]
+    pub(crate) fn from_lance_dataset(dataset_path: &Path) -> Result<Self> {
+        let schema = read_lance_dataset_schema_sync(dataset_path)?;
+        Self::from_schema(&schema)
     }
 }
 
@@ -114,6 +126,45 @@ fn first_variation_parquet(cache_source: &str) -> Result<PathBuf> {
             cache_source
         ))
     })
+}
+
+#[cfg(feature = "lance-cache")]
+fn first_variation_lance_dataset(cache_source: &str) -> Result<PathBuf> {
+    let variation_dir = Path::new(cache_source).join("variation.lance");
+    let manifest =
+        crate::lance_cache::manifest::ChromManifest::read_from_entity_dir(&variation_dir)?;
+    let first = manifest.entries.first().ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "annotate_vep(): Lance cache source '{}' variation.lance manifest contains no chromosomes",
+            cache_source
+        ))
+    })?;
+    Ok(variation_dir.join(&first.dataset))
+}
+
+#[cfg(feature = "lance-cache")]
+fn read_lance_dataset_schema_sync(dataset_path: &Path) -> Result<Schema> {
+    let path = dataset_path.to_path_buf();
+    let open = async move {
+        lance::Dataset::open(path.to_string_lossy().as_ref())
+            .await
+            .map_err(|err| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): failed to open Lance cache dataset '{}': {err}",
+                    path.display()
+                ))
+            })
+            .map(|dataset| dataset.schema().into())
+    };
+
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(open)),
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|err| DataFusionError::External(Box::new(err)))?;
+            rt.block_on(open)
+        }
+    }
 }
 
 #[cfg(test)]

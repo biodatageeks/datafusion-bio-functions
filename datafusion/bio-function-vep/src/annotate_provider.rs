@@ -17,11 +17,16 @@ use std::io::{BufRead, Seek};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskCtx, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Returns true when VEP_PROFILE env var is set (any value).
 fn profiling_enabled() -> bool {
     std::env::var("VEP_PROFILE").is_ok()
+}
+
+/// Returns true when detailed annotation-engine profiling is enabled.
+fn engine_profiling_enabled() -> bool {
+    std::env::var("VEP_ENGINE_PROFILE").is_ok()
 }
 
 macro_rules! profile_start {
@@ -54,12 +59,103 @@ macro_rules! profile_end {
     };
 }
 
+macro_rules! engine_profile_time {
+    ($enabled:expr, $profile:expr, $field:ident, $block:block) => {{
+        if $enabled {
+            let __engine_profile_started = Instant::now();
+            let __engine_profile_result = { $block };
+            $profile.$field += __engine_profile_started.elapsed();
+            __engine_profile_result
+        } else {
+            $block
+        }
+    }};
+}
+
+#[derive(Debug, Default)]
+struct EngineAnnotationProfile {
+    rows: usize,
+    null_chrom_rows: usize,
+    null_alt_rows: usize,
+    star_allele_rows: usize,
+    cached_fast_rows: usize,
+    engine_rows: usize,
+    assignments: usize,
+    picked_assignments: usize,
+    csq_entries: usize,
+    typed_rows: usize,
+    skip_csq: bool,
+    skip_typed_cols: bool,
+    everything: bool,
+    row_setup: Duration,
+    colocated_fields: Duration,
+    batch3_suffix: Duration,
+    cached_fast_path: Duration,
+    variant_construct: Duration,
+    hgvs_shift: Duration,
+    evaluate_prepared: Duration,
+    collapse_pick_sort: Duration,
+    csq_format: Duration,
+    sift_polyphen: Duration,
+    domains: Duration,
+    mirna: Duration,
+    append_scalars: Duration,
+    typed_columns: Duration,
+    finish_builders: Duration,
+}
+
+impl EngineAnnotationProfile {
+    fn new(rows: usize, skip_csq: bool, skip_typed_cols: bool, everything: bool) -> Self {
+        Self {
+            rows,
+            skip_csq,
+            skip_typed_cols,
+            everything,
+            ..Self::default()
+        }
+    }
+
+    fn summary_line(&self) -> String {
+        format!(
+            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s",
+            self.rows,
+            self.null_chrom_rows,
+            self.null_alt_rows,
+            self.star_allele_rows,
+            self.cached_fast_rows,
+            self.engine_rows,
+            self.assignments,
+            self.picked_assignments,
+            self.csq_entries,
+            self.typed_rows,
+            self.skip_csq,
+            self.skip_typed_cols,
+            self.everything,
+            self.row_setup.as_secs_f64(),
+            self.colocated_fields.as_secs_f64(),
+            self.batch3_suffix.as_secs_f64(),
+            self.cached_fast_path.as_secs_f64(),
+            self.variant_construct.as_secs_f64(),
+            self.hgvs_shift.as_secs_f64(),
+            self.evaluate_prepared.as_secs_f64(),
+            self.collapse_pick_sort.as_secs_f64(),
+            self.csq_format.as_secs_f64(),
+            self.sift_polyphen.as_secs_f64(),
+            self.domains.as_secs_f64(),
+            self.mirna.as_secs_f64(),
+            self.append_scalars.as_secs_f64(),
+            self.typed_columns.as_secs_f64(),
+            self.finish_builders.as_secs_f64(),
+        )
+    }
+}
+
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    Array, AsArray, BooleanArray, Float32Array, Float32Builder, Float64Array, Int8Array,
-    Int8Builder, Int16Array, Int32Array, Int64Array, Int64Builder, LargeStringArray, ListArray,
-    ListBuilder, RecordBatch, StringArray, StringBuilder, StringViewArray, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array, new_null_array,
+    Array, AsArray, BinaryArray, BooleanArray, Float32Array, Float32Builder, Float64Array,
+    Int8Array, Int8Builder, Int16Array, Int32Array, Int64Array, Int64Builder, LargeBinaryArray,
+    LargeStringArray, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder,
+    StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
@@ -73,10 +169,11 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext, col, lit};
-use futures::{Future, Stream};
+use futures::{Future, Stream, StreamExt};
 use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
-use serde_json::Value;
+use std::borrow::Cow;
+use std::fmt::Write;
 
 use crate::allele::{
     MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
@@ -88,18 +185,25 @@ use crate::config;
 use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
+#[cfg(feature = "lance-cache")]
+use crate::partitioned_cache::PartitionedLanceCache;
 use crate::partitioned_cache::PartitionedParquetCache;
+use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    CachedPredictions, CompactPrediction, ExonFeature, FeatureType, MirnaFeature, MotifFeature,
-    PreparedContext, ProteinDomainFeature, RefSeqEdit, RegulatoryFeature, SiftPolyphenCache,
-    StructuralFeature, SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment,
-    TranscriptConsequence, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
-    VariantInput, infer_refseq_deletion_edits_from_sequences, refseq_edit_offset_delta,
+    CachedPredictions, CompactPrediction, ExonFeature, FeatureType, GeometryCache, MirnaFeature,
+    MotifFeature, PreparedContext, ProteinDomainFeature, RefSeqEdit, RegulatoryFeature,
+    SiftPolyphenCache, StructuralFeature, SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment,
+    TranscriptConsequence, TranscriptConsequenceEngine, TranscriptEngineProfile, TranscriptFeature,
+    TranslationFeature, VariantInput, infer_refseq_deletion_edits_from_sequences,
+    refseq_edit_offset_delta,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
 };
+
+#[cfg(feature = "kv-cache")]
+type SiftPredictionStoreRef = Arc<dyn crate::kv_cache::SiftPredictionStore>;
 
 /// Column categories for typed non-meta annotation columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -808,6 +912,23 @@ pub fn cache_lookup_column_names() -> Vec<&'static str> {
         "dbsnp_ids",
     ]
 }
+
+/// `CacheOnly`-category cache columns that are emitted **only** in the structured
+/// Arrow/Polars output and never contribute to the CSQ string. When a scan's
+/// projection does not select these output columns (e.g. a CSQ-only / VCF run),
+/// they are dropped from the cache `take` projection so they are not decoded.
+///
+/// Note: `clin_sig_allele` is deliberately excluded — although it is also a
+/// `CacheOnly` structured column, it feeds the CSQ `CLIN_SIG` per-allele split,
+/// so it must always be read.
+const CACHE_ONLY_CSQ_SKIPPABLE_COLUMNS: &[&str] = &[
+    "clinical_impact",
+    "minor_allele",
+    "minor_allele_freq",
+    "clinvar_ids",
+    "cosmic_ids",
+    "dbsnp_ids",
+];
 
 /// AF column definition: how to read, emit, and name each frequency population.
 struct AfColumn {
@@ -1518,14 +1639,9 @@ impl CsqPlaceholderField {
             Self::Impact => entry.impact,
             Self::ExistingVariation => entry.existing_variation,
             Self::VariantClass => entry.variant_class,
-            Self::AfValue(idx) => entry
-                .frequency_fields
-                .af_values
-                .get(idx)
-                .map(String::as_str)
-                .unwrap_or(""),
-            Self::MaxAf => entry.frequency_fields.max_af.as_str(),
-            Self::MaxAfPops => entry.frequency_fields.max_af_pops.as_str(),
+            Self::AfValue(idx) => entry.frequency_fields.af_value(idx),
+            Self::MaxAf => entry.frequency_fields.max_af(),
+            Self::MaxAfPops => entry.frequency_fields.max_af_pops(),
             Self::ClinSig => entry.variant_fields.clin_sig.as_str(),
             Self::Somatic => entry.variant_fields.somatic.as_str(),
             Self::Pheno => entry.variant_fields.pheno.as_str(),
@@ -1574,26 +1690,8 @@ struct CsqPlaceholderEntry<'a> {
     impact: &'a str,
     existing_variation: &'a str,
     variant_class: &'a str,
-    frequency_fields: &'a ColocatedFrequencyFields,
+    frequency_fields: ColocatedFrequencyFieldRef<'a>,
     variant_fields: &'a ColocatedVariantFields,
-}
-
-#[derive(Debug, Default)]
-struct TranscriptRawMetadata {
-    display_xref_id: Option<String>,
-    source: Option<String>,
-    source_cache: Option<String>,
-    gene_hgnc_id_native: Option<String>,
-    refseq_match: Option<String>,
-    refseq_edits: Vec<RefSeqEdit>,
-    cdna_mapper_segments: Vec<TranscriptCdnaMapperSegment>,
-    spliced_seq: Option<String>,
-    five_prime_utr_seq: Option<String>,
-    three_prime_utr_seq: Option<String>,
-    translateable_seq: Option<String>,
-    flags_str: Option<String>,
-    is_gencode_basic: bool,
-    is_gencode_primary: bool,
 }
 
 /// A single co-located variant entry with allele and clinical metadata.
@@ -1614,7 +1712,11 @@ struct ColocatedEntry {
 #[derive(Debug, Default, Clone)]
 struct ColocatedData {
     entries: Vec<ColocatedEntry>,
+    /// Active compare-space allele fallback for VEP
+    /// `add_colocated_variant_info()`.
     compare_output_allele: Option<String>,
+    /// Genomic-shift original allele fallback for VEP
+    /// `add_colocated_frequency_data()`.
     unshifted_output_allele: Option<String>,
 }
 
@@ -1632,6 +1734,86 @@ struct ColocatedFrequencyFields {
     af_values: Vec<String>,
     max_af: String,
     max_af_pops: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ColocatedFrequencyFieldRef<'a> {
+    Empty,
+    Resolved(&'a ColocatedFrequencyFields),
+}
+
+impl<'a> ColocatedFrequencyFieldRef<'a> {
+    fn af_value(self, idx: usize) -> &'a str {
+        match self {
+            Self::Empty => "",
+            Self::Resolved(fields) => fields.af_values.get(idx).map(String::as_str).unwrap_or(""),
+        }
+    }
+
+    fn max_af(self) -> &'a str {
+        match self {
+            Self::Empty => "",
+            Self::Resolved(fields) => fields.max_af.as_str(),
+        }
+    }
+
+    fn max_af_pops(self) -> &'a str {
+        match self {
+            Self::Empty => "",
+            Self::Resolved(fields) => fields.max_af_pops.as_str(),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Resolved(fields) => {
+                fields.af_values.iter().all(String::is_empty)
+                    && fields.max_af.is_empty()
+                    && fields.max_af_pops.is_empty()
+            }
+        }
+    }
+}
+
+impl ColocatedVariantFields {
+    fn is_empty(&self) -> bool {
+        self.existing_variation.is_empty()
+            && self.clin_sig.is_empty()
+            && self.somatic.is_empty()
+            && self.pheno.is_empty()
+            && self.pubmed.is_empty()
+    }
+}
+
+const EMPTY_BATCH3_SUFFIX: &str = "||||||||||||||||||||||||||||||||";
+
+fn batch3_suffix_for_csq<'a>(
+    frequency_fields: ColocatedFrequencyFieldRef<'a>,
+    variant_fields: &ColocatedVariantFields,
+) -> Cow<'static, str> {
+    if frequency_fields.is_empty() && variant_fields.is_empty() {
+        return Cow::Borrowed(EMPTY_BATCH3_SUFFIX);
+    }
+
+    let mut suffix = String::with_capacity(128);
+    for idx in 0..AF_COLUMNS.len() {
+        if idx > 0 {
+            suffix.push('|');
+        }
+        suffix.push_str(frequency_fields.af_value(idx));
+    }
+    let _ = write!(
+        suffix,
+        "|{}|{}|{}|{}|{}|{}",
+        frequency_fields.max_af(),
+        frequency_fields.max_af_pops(),
+        variant_fields.clin_sig,
+        variant_fields.somatic,
+        variant_fields.pheno,
+        variant_fields.pubmed,
+    );
+    Cow::Owned(suffix)
 }
 
 fn variant_prefix_rank(variation_name: &str) -> u8 {
@@ -1700,11 +1882,11 @@ impl ColocatedData {
     /// - Ensembl VEP `add_colocated_variant_info()`
     ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035>
     ///
-    /// Rust stores the active compare-space allele and any retained original
-    /// compare-space allele separately on the colocated sink. For the live CSQ
-    /// path, `Existing_variation` must prefer the active compare-space allele
-    /// and only fall back to the retained original allele when the output
-    /// allele already equals the active representation.
+    /// Rust stores the parser/input allele fallback and any retained
+    /// genomic-shift original allele separately on the colocated sink. For
+    /// the live CSQ path, `Existing_variation` must mirror VEP
+    /// `add_colocated_variant_info()` by checking the current CSQ allele plus
+    /// `VariationFeature->{shifted_allele_string}`.
     fn variant_match_output_allele<'a>(&'a self, output_allele: &str) -> Option<&'a str> {
         self.compare_output_allele
             .as_deref()
@@ -1722,17 +1904,14 @@ impl ColocatedData {
     ///
     /// Frequency output matches the current CSQ allele first, then
     /// `alt_orig_allele_string` when VEP retained original shift metadata.
-    /// Because Rust stores both active and retained compare-space alleles on
-    /// the sink, the live path must prefer the retained original allele here.
+    /// Unlike `Existing_variation`, this must not use the parser/input allele
+    /// fallback. VEP only supplies `alt_orig_allele_string` to this path when
+    /// a real genomic-shift `shift_hash` exists; otherwise repeat-indel IDs
+    /// remain visible but their allele-specific frequencies stay blank.
     fn frequency_match_output_allele<'a>(&'a self, output_allele: &str) -> Option<&'a str> {
         self.unshifted_output_allele
             .as_deref()
             .filter(|allele| *allele != output_allele)
-            .or_else(|| {
-                self.compare_output_allele
-                    .as_deref()
-                    .filter(|allele| *allele != output_allele)
-            })
     }
 
     /// Traceability:
@@ -2062,6 +2241,42 @@ fn build_colocated_map_from_sink(
         );
     }
     map
+}
+
+fn drain_colocated_sink(sink: &ColocatedSink) -> Result<HashMap<ColocatedKey, ColocatedData>> {
+    let raw = {
+        let mut guard = sink.lock().map_err(|e| {
+            DataFusionError::Execution(format!("colocated sink mutex poisoned: {e}"))
+        })?;
+        std::mem::take(&mut *guard)
+    };
+
+    if raw.is_empty() {
+        Ok(HashMap::new())
+    } else {
+        Ok(build_colocated_map_from_sink(&raw))
+    }
+}
+
+fn merge_colocated_delta(
+    target: &mut Arc<HashMap<ColocatedKey, ColocatedData>>,
+    mut delta: HashMap<ColocatedKey, ColocatedData>,
+) {
+    let target = Arc::make_mut(target);
+    for (key, mut value) in delta.drain() {
+        target
+            .entry(key)
+            .and_modify(|existing| {
+                if existing.compare_output_allele.is_none() {
+                    existing.compare_output_allele = value.compare_output_allele.clone();
+                }
+                if existing.unshifted_output_allele.is_none() {
+                    existing.unshifted_output_allele = value.unshifted_output_allele.clone();
+                }
+                existing.entries.append(&mut value.entries);
+            })
+            .or_insert(value);
+    }
 }
 
 /// Traceability:
@@ -2716,6 +2931,28 @@ fn mirna_structure_field(
     terms.join("&")
 }
 
+/// Build the position-sliced SIFT lookup key `(transcript_uid << 32) | position`
+/// for a consequence, applying the exact same gating as [`lookup_sift_polyphen`]
+/// (single amino-acid substitution, parseable non-negative protein position,
+/// `transcript_uid` present). Returns `None` when no SIFT key applies, so the
+/// per-row warm-up and the per-consequence lookup derive identical keys.
+fn sift_position_key(
+    transcript_uid: Option<u32>,
+    protein_position: Option<&str>,
+    amino_acids: Option<&str>,
+) -> Option<u64> {
+    let uid = transcript_uid?;
+    let parts: Vec<&str> = amino_acids?.split('/').collect();
+    if parts.len() != 2 || parts[0].len() != 1 || parts[1].len() != 1 {
+        return None;
+    }
+    let pos = protein_position?.parse::<i32>().ok()?;
+    if pos < 0 {
+        return None;
+    }
+    Some(((uid as u64) << 32) | (pos as u64))
+}
+
 /// Look up SIFT and PolyPhen predictions from the per-transcript LRU cache.
 ///
 /// Traceability:
@@ -2733,10 +2970,11 @@ fn mirna_structure_field(
 /// HashMap for O(1) lookup. See biodatageeks/datafusion-bio-functions#38.
 fn lookup_sift_polyphen(
     transcript_id: Option<&str>,
+    transcript_uid: Option<u32>,
     protein_position: Option<&str>,
     amino_acids: Option<&str>,
     cache: &mut SiftPolyphenCache,
-    #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
+    #[cfg(feature = "kv-cache")] sift_store: &Option<SiftPredictionStoreRef>,
     #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
 ) -> (String, String) {
     let empty = || (String::new(), String::new());
@@ -2758,17 +2996,52 @@ fn lookup_sift_polyphen(
     let Ok(pos) = pos_str.parse::<i32>() else {
         return empty();
     };
+    if pos < 0 {
+        return empty();
+    }
+
+    // Position-sliced store: resolve by packed key `(uid << 32) | position`,
+    // reading only this amino-acid position's payload. `transcript_id` is not
+    // used on this path; without a `transcript_uid` we cannot build the key, so
+    // skip SIFT rather than guess.
+    #[cfg(feature = "kv-cache")]
+    if let Some(store) = sift_store {
+        if store.is_position_sliced() {
+            let Some(uid) = transcript_uid else {
+                return empty();
+            };
+            let key = ((uid as u64) << 32) | (pos as u64);
+            let Ok(found) = store.get_position_predictions(&[key]) else {
+                return empty();
+            };
+            let Some(preds) = found.get(&key) else {
+                return empty();
+            };
+            let sift = preds
+                .lookup_sift(pos, alt_aa)
+                .map(|(pred, score)| format_prediction(pred, score))
+                .unwrap_or_default();
+            let polyphen = preds
+                .lookup_polyphen(pos, alt_aa)
+                .map(|(pred, score)| format_prediction(pred, score))
+                .unwrap_or_default();
+            return (sift, polyphen);
+        }
+    }
 
     let Some(tx_id) = transcript_id else {
         return empty();
     };
 
-    // Lazy load from fjall sift keyspace on cache miss.
+    // Lazy load from the configured transcript-id prediction store on cache miss.
     if cache.get(tx_id).is_none() {
         #[cfg(feature = "kv-cache")]
-        if let Some(kv) = sift_kv {
-            if let Ok(Some(preds)) = kv.get(tx_id) {
-                cache.insert(tx_id.to_string(), preds, i64::MAX);
+        if let Some(store) = sift_store {
+            let ids = [tx_id.to_string()];
+            if let Ok(mut found) = store.get_many(&ids) {
+                if let Some(preds) = found.remove(tx_id) {
+                    cache.insert(tx_id.to_string(), preds, i64::MAX);
+                }
             }
         }
     }
@@ -2789,6 +3062,447 @@ fn lookup_sift_polyphen(
     (sift, polyphen)
 }
 
+#[cfg(feature = "kv-cache")]
+fn open_sift_prediction_store(parent: &std::path::Path) -> Result<Option<SiftPredictionStoreRef>> {
+    if let Some(path) = std::env::var_os("VEP_SIFT_LOOKUP_PARQUET_DIR") {
+        let path = std::path::PathBuf::from(path);
+        return crate::kv_cache::SiftParquetStore::open_dir(&path)?
+            .map(|store| Arc::new(store) as SiftPredictionStoreRef)
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "VEP_SIFT_LOOKUP_PARQUET_DIR is set to '{}' but no lookup parquet files were found",
+                    path.display()
+                ))
+            })
+            .map(Some);
+    }
+
+    for path in [
+        parent.join("translation_sift_lookup"),
+        parent.join("translation_sift.lookup"),
+        parent.join("translation_sift"),
+    ] {
+        match crate::kv_cache::SiftParquetStore::open_dir(&path) {
+            Ok(Some(store)) => return Ok(Some(Arc::new(store) as SiftPredictionStoreRef)),
+            Ok(None) => {}
+            Err(error)
+                if path.file_name().and_then(|name| name.to_str()) == Some("translation_sift") =>
+            {
+                log::debug!(
+                    "translation_sift is not a compact SIFT lookup parquet directory: {error}"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let sift_path = parent.join("translation_sift.fjall");
+    crate::kv_cache::SiftKvStore::open_path(&sift_path)
+        .map(|store| store.map(|store| Arc::new(store) as SiftPredictionStoreRef))
+}
+
+#[cfg(feature = "kv-cache")]
+fn indexed_variation_parquet_path(
+    cache: &PartitionedParquetCache,
+    chrom: &str,
+) -> Option<std::path::PathBuf> {
+    for suffix in ["_warm", "_cold"] {
+        let path = cache
+            .base_dir()
+            .join("variation")
+            .join(format!("{chrom}{suffix}.parquet"));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "kv-cache")]
+fn read_variation_parquet_schema(path: &std::path::Path) -> Result<Schema> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "failed to open variation parquet schema sample '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "failed to read variation parquet schema sample '{}': {error}",
+            path.display()
+        ))
+    })?;
+    Ok(builder.schema().as_ref().clone())
+}
+
+#[cfg(feature = "lance-cache")]
+async fn read_lance_dataset_schema(path: &std::path::Path) -> Result<Schema> {
+    let dataset = lance::Dataset::open(path.to_string_lossy().as_ref())
+        .await
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to open Lance schema sample '{}': {error}",
+                path.display()
+            ))
+        })?;
+    Ok(dataset.schema().into())
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[derive(Clone)]
+struct InMemorySiftPredictionStore {
+    predictions: Arc<HashMap<String, CachedPredictions>>,
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+impl crate::kv_cache::SiftPredictionStore for InMemorySiftPredictionStore {
+    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+        if transcript_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut out = HashMap::with_capacity(transcript_ids.len());
+        for transcript_id in transcript_ids {
+            if out.contains_key(transcript_id) {
+                continue;
+            }
+            if let Some(predictions) = self.predictions.get(transcript_id) {
+                out.insert(transcript_id.clone(), predictions.clone());
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[derive(Clone)]
+struct LanceBinarySiftPredictionStore {
+    lookup: Arc<crate::lance_cache::context_runtime::TranscriptIdLanceLookup>,
+    predictions: Arc<Mutex<HashMap<String, Option<CachedPredictions>>>>,
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+impl crate::kv_cache::SiftPredictionStore for LanceBinarySiftPredictionStore {
+    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+        if transcript_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut out = HashMap::with_capacity(transcript_ids.len());
+        let mut uncached = Vec::new();
+        let mut seen_uncached = HashSet::new();
+        {
+            let cache = self.predictions.lock().map_err(|error| {
+                DataFusionError::Execution(format!("Lance SIFT prediction cache poisoned: {error}"))
+            })?;
+            for transcript_id in transcript_ids {
+                if out.contains_key(transcript_id) {
+                    continue;
+                }
+                if let Some(cached) = cache.get(transcript_id) {
+                    if let Some(predictions) = cached {
+                        out.insert(transcript_id.clone(), predictions.clone());
+                    }
+                    continue;
+                }
+                if seen_uncached.insert(transcript_id.clone()) {
+                    uncached.push(transcript_id.clone());
+                }
+            }
+        }
+        if uncached.is_empty() {
+            return Ok(out);
+        }
+
+        let batch = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.lookup.take_transcript_ids(&uncached))
+        })?;
+        let fetched = sift_predictions_from_binary_batch(&batch)?;
+        let mut cache = self.predictions.lock().map_err(|error| {
+            DataFusionError::Execution(format!("Lance SIFT prediction cache poisoned: {error}"))
+        })?;
+        for transcript_id in uncached {
+            if let Some(predictions) = fetched.get(&transcript_id) {
+                cache.insert(transcript_id.clone(), Some(predictions.clone()));
+                out.insert(transcript_id, predictions.clone());
+            } else {
+                cache.insert(transcript_id, None);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Position-sliced SIFT store: resolves predictions by the packed key
+/// `(transcript_uid << 32) | protein_position` via [`KeyU64LanceLookup`], so a
+/// missense lookup reads only the needed amino-acid position's payload instead
+/// of the transcript's whole substitution matrix. Memoizes resolved keys
+/// (including misses) to avoid repeated `take_rows`.
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[derive(Clone)]
+struct PositionSlicedLanceSiftStore {
+    lookup: Arc<crate::lance_cache::context_runtime::KeyU64LanceLookup>,
+    cache: Arc<Mutex<HashMap<u64, Option<CachedPredictions>>>>,
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+impl crate::kv_cache::SiftPredictionStore for PositionSlicedLanceSiftStore {
+    fn get_many(&self, _transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+        // Position-sliced stores are keyed by `(uid, position)`; the engine
+        // resolves them via `get_position_predictions`, never by transcript id.
+        Ok(HashMap::new())
+    }
+
+    fn is_position_sliced(&self) -> bool {
+        true
+    }
+
+    fn get_position_predictions(&self, keys: &[u64]) -> Result<HashMap<u64, CachedPredictions>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut out = HashMap::with_capacity(keys.len());
+        let mut uncached = Vec::new();
+        let mut seen_uncached = HashSet::new();
+        {
+            let cache = self.cache.lock().map_err(|error| {
+                DataFusionError::Execution(format!("Lance SIFT position cache poisoned: {error}"))
+            })?;
+            for &key in keys {
+                if out.contains_key(&key) {
+                    continue;
+                }
+                if let Some(cached) = cache.get(&key) {
+                    if let Some(predictions) = cached {
+                        out.insert(key, predictions.clone());
+                    }
+                    continue;
+                }
+                if seen_uncached.insert(key) {
+                    uncached.push(key);
+                }
+            }
+        }
+        if uncached.is_empty() {
+            return Ok(out);
+        }
+
+        let (batch, _present) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.lookup.take_keys(&uncached))
+        })?;
+        let fetched = position_predictions_from_batch(&batch)?;
+        let mut cache = self.cache.lock().map_err(|error| {
+            DataFusionError::Execution(format!("Lance SIFT position cache poisoned: {error}"))
+        })?;
+        for key in uncached {
+            if let Some(predictions) = fetched.get(&key) {
+                cache.insert(key, Some(predictions.clone()));
+                out.insert(key, predictions.clone());
+            } else {
+                cache.insert(key, None);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Decode a position-sliced SIFT take batch (`key: UInt64`, `sift: Binary`,
+/// `poly: Binary`) into per-key [`CachedPredictions`]. The protein position is
+/// recovered from the low 32 bits of `key`.
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+fn position_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<u64, CachedPredictions>> {
+    let schema = batch.schema();
+    let key_idx = schema.index_of("key")?;
+    let sift_idx = schema.index_of("sift").ok();
+    let poly_idx = schema.index_of("poly").ok();
+    let key_col = batch
+        .column(key_idx)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            DataFusionError::Execution("Lance SIFT position key column must be UInt64".into())
+        })?;
+
+    let mut predictions = HashMap::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        if key_col.is_null(row) {
+            continue;
+        }
+        let key = key_col.value(row);
+        let position = (key & 0xFFFF_FFFF) as i32;
+        let sift = match sift_idx {
+            Some(idx) => binary_at(batch.column(idx).as_ref(), row)?.unwrap_or(&[]),
+            None => &[],
+        };
+        let poly = match poly_idx {
+            Some(idx) => binary_at(batch.column(idx).as_ref(), row)?.unwrap_or(&[]),
+            None => &[],
+        };
+        let cached =
+            crate::kv_cache::sift_store::deserialize_position_predictions(position, sift, poly)?;
+        predictions.insert(key, cached);
+    }
+    Ok(predictions)
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+async fn load_lance_sift_prediction_store_for_chrom(
+    cache: &PartitionedLanceCache,
+    chrom: &str,
+) -> Result<Option<SiftPredictionStoreRef>> {
+    let Some(path) = cache.context_path("translation_sift", chrom) else {
+        return Ok(None);
+    };
+    let schema = read_lance_dataset_schema(&path).await?;
+    if schema.index_of("key").is_ok()
+        && (schema.index_of("sift").is_ok() || schema.index_of("poly").is_ok())
+    {
+        let lookup = crate::lance_cache::context_runtime::KeyU64LanceLookup::open(
+            &path,
+            vec!["key".to_string(), "sift".to_string(), "poly".to_string()],
+        )
+        .await?;
+        if lookup.keys_len() == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(Arc::new(PositionSlicedLanceSiftStore {
+            lookup: Arc::new(lookup),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }) as SiftPredictionStoreRef));
+    }
+    if schema.index_of("predictions").is_ok() {
+        let lookup = crate::lance_cache::context_runtime::TranscriptIdLanceLookup::open(
+            &path,
+            vec!["transcript_id".to_string(), "predictions".to_string()],
+        )
+        .await?;
+        if lookup.row_ids_len() == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(Arc::new(LanceBinarySiftPredictionStore {
+            lookup: Arc::new(lookup),
+            predictions: Arc::new(Mutex::new(HashMap::new())),
+        }) as SiftPredictionStoreRef));
+    }
+
+    let profile_enabled = std::env::var_os("VEP_LANCE_PROFILE").is_some();
+    let scan_started = profile_enabled.then(std::time::Instant::now);
+    let batches = crate::lance_cache::context_runtime::scan_projected_existing_columns(
+        &path,
+        &[
+            "transcript_id",
+            "stable_id",
+            "sift_predictions",
+            "polyphen_predictions",
+        ],
+    )
+    .await?;
+    let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    let predictions = sift_predictions_from_batches(&batches)?;
+    if let Some(started) = scan_started {
+        eprintln!(
+            "[vep-lance-profile] sift_scan_load path={} batches={} rows={} transcripts={} seconds={:.3}",
+            path.display(),
+            batches.len(),
+            rows,
+            predictions.len(),
+            started.elapsed().as_secs_f64(),
+        );
+    }
+    if predictions.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(InMemorySiftPredictionStore {
+        predictions: Arc::new(predictions),
+    }) as SiftPredictionStoreRef))
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+fn sift_predictions_from_binary_batch(
+    batch: &RecordBatch,
+) -> Result<HashMap<String, CachedPredictions>> {
+    let schema = batch.schema();
+    let tx_idx = schema
+        .index_of("transcript_id")
+        .or_else(|_| schema.index_of("stable_id"))?;
+    let predictions_idx = schema.index_of("predictions")?;
+    let mut predictions = HashMap::with_capacity(batch.num_rows());
+
+    for row in 0..batch.num_rows() {
+        let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+            continue;
+        };
+        let Some(bytes) = binary_at(batch.column(predictions_idx).as_ref(), row)? else {
+            continue;
+        };
+        let cached = crate::kv_cache::sift_store::deserialize_predictions(bytes)?;
+        predictions.insert(transcript_id, cached);
+    }
+    Ok(predictions)
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+fn binary_at(array: &dyn Array, row: usize) -> Result<Option<&[u8]>> {
+    if row >= array.len() || array.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
+        return Ok(Some(array.value(row)));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Ok(Some(array.value(row)));
+    }
+    Err(DataFusionError::Execution(format!(
+        "Lance SIFT predictions expected binary array, got {:?}",
+        array.data_type()
+    )))
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+fn sift_predictions_from_batches(
+    batches: &[RecordBatch],
+) -> Result<HashMap<String, CachedPredictions>> {
+    let mut predictions = HashMap::new();
+    for batch in batches {
+        predictions.extend(sift_predictions_from_batch(batch)?);
+    }
+    Ok(predictions)
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+fn sift_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<String, CachedPredictions>> {
+    let schema = batch.schema();
+    let tx_idx = schema
+        .index_of("transcript_id")
+        .or_else(|_| schema.index_of("stable_id"))
+        .ok();
+    let sift_idx = schema.index_of("sift_predictions").ok();
+    let polyphen_idx = schema.index_of("polyphen_predictions").ok();
+    let Some(tx_idx) = tx_idx else {
+        return Ok(HashMap::new());
+    };
+
+    let mut predictions = HashMap::new();
+    for row in 0..batch.num_rows() {
+        let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+            continue;
+        };
+        let mut cached = CachedPredictions::default();
+        if let Some(idx) = sift_idx {
+            cached.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
+        }
+        if let Some(idx) = polyphen_idx {
+            cached.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
+        }
+        cached.sort();
+        if !cached.sift.is_empty() || !cached.polyphen.is_empty() {
+            predictions.insert(transcript_id, cached);
+        }
+    }
+    Ok(predictions)
+}
+
+#[cfg(feature = "kv-cache")]
 /// Format a SIFT/PolyPhen prediction as `prediction(score)` with spaces→underscores.
 ///
 /// VEP uses `--sift b` / `--polyphen b` format (both prediction and score).
@@ -2878,6 +3592,9 @@ pub struct AnnotateProvider {
     include_pick_output: bool,
     annotation_column_defs: Vec<AnnotationColumnDef>,
     schema: SchemaRef,
+    /// Set by the `vcf_sink` sharded-output entry to drive per-worker VCF shard
+    /// writing on the `threads>1` path. `None` for the normal scan/SQL path.
+    vcf_shard_ctx: Option<Arc<crate::vcf_sink::VcfShardContext>>,
 }
 
 impl AnnotateProvider {
@@ -2937,7 +3654,18 @@ impl AnnotateProvider {
             include_pick_output,
             annotation_column_defs,
             schema: Arc::new(Schema::new(fields)),
+            vcf_shard_ctx: None,
         })
+    }
+
+    /// Set the VCF shard context, enabling the sharded-output `threads>1` path
+    /// when this provider's plan is executed. Used by `vcf_sink`'s direct-plan
+    /// entry; the normal UDTF/SQL path leaves this `None`.
+    // TODO(sharded-vcf): called from vcf_sink in Task 4.
+    #[allow(dead_code)]
+    pub(crate) fn with_vcf_shard_ctx(mut self, ctx: Arc<crate::vcf_sink::VcfShardContext>) -> Self {
+        self.vcf_shard_ctx = Some(ctx);
+        self
     }
 
     fn escaped_sql_literal(value: &str) -> String {
@@ -3169,8 +3897,9 @@ impl AnnotateProvider {
                 "gene_hgnc_id_native",
                 "gene_hgnc_id",
                 "source",
+                "source_cache",
+                "display_xref_id",
                 "version",
-                "raw_object_json",
                 "cds_start_nf",
                 "cds_end_nf",
                 "mature_mirna_regions",
@@ -3178,8 +3907,14 @@ impl AnnotateProvider {
                 "bam_edit_status",
                 "has_non_polya_rna_edit",
                 "spliced_seq",
+                "five_prime_utr_seq",
+                "three_prime_utr_seq",
                 "translateable_seq",
                 "flags_str",
+                "refseq_match",
+                "refseq_edits",
+                "is_gencode_basic",
+                "is_gencode_primary",
                 "cdna_mapper_segments",
                 "is_canonical",
                 "tsl",
@@ -3246,13 +3981,13 @@ impl AnnotateProvider {
             let gene_hgnc_id_native_idx = schema.index_of("gene_hgnc_id_native").ok();
             let gene_hgnc_id_idx = schema.index_of("gene_hgnc_id").ok();
             let source_idx = schema.index_of("source").ok();
+            let source_cache_idx = schema.index_of("source_cache").ok();
+            let display_xref_id_idx = schema.index_of("display_xref_id").ok();
             let version_idx = schema.index_of("version").ok();
-            let raw_object_json_idx = schema.index_of("raw_object_json").ok();
             let cds_start_nf_idx = schema.index_of("cds_start_nf").ok();
             let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
             let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
             let cdna_seq_idx = schema.index_of("cdna_seq").ok();
-            // Promoted columns (previously extracted from raw_object_json).
             let bam_edit_status_idx = schema.index_of("bam_edit_status").ok();
             let has_non_polya_rna_edit_idx = schema.index_of("has_non_polya_rna_edit").ok();
             let spliced_seq_idx = schema.index_of("spliced_seq").ok();
@@ -3260,6 +3995,10 @@ impl AnnotateProvider {
             let five_prime_utr_seq_idx = schema.index_of("five_prime_utr_seq").ok();
             let three_prime_utr_seq_idx = schema.index_of("three_prime_utr_seq").ok();
             let flags_str_idx = schema.index_of("flags_str").ok();
+            let refseq_match_idx = schema.index_of("refseq_match").ok();
+            let refseq_edits_idx = schema.index_of("refseq_edits").ok();
+            let is_gencode_basic_idx = schema.index_of("is_gencode_basic").ok();
+            let is_gencode_primary_idx = schema.index_of("is_gencode_primary").ok();
             let cdna_mapper_segments_idx = schema.index_of("cdna_mapper_segments").ok();
             // Batch 1 columns.
             let is_canonical_idx = schema.index_of("is_canonical").ok();
@@ -3275,6 +4014,7 @@ impl AnnotateProvider {
             let uniprot_isoform_idx = schema.index_of("uniprot_isoform").ok();
             let appris_idx = schema.index_of("appris").ok();
             let ncrna_structure_idx = schema.index_of("ncrna_structure").ok();
+            let transcript_uid_idx = schema.index_of("transcript_uid").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -3334,73 +4074,65 @@ impl AnnotateProvider {
                         cdna_mapper_segments_from_list_column(batch.column(idx).as_ref(), row)
                     })
                     .unwrap_or_default();
-                let raw_metadata = raw_object_json_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .map(|raw| parse_transcript_raw_metadata(&raw))
+                let display_xref_id =
+                    display_xref_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let refseq_match =
+                    refseq_match_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let mut refseq_edits = refseq_edits_idx
+                    .map(|idx| refseq_edits_from_list_column(batch.column(idx).as_ref(), row))
                     .unwrap_or_default();
-                let TranscriptRawMetadata {
-                    display_xref_id,
-                    source: raw_source,
-                    source_cache: raw_source_cache,
-                    gene_hgnc_id_native: raw_gene_hgnc_id_native,
-                    refseq_match,
-                    refseq_edits,
-                    cdna_mapper_segments: raw_cdna_mapper_segments,
-                    spliced_seq: raw_spliced_seq,
-                    five_prime_utr_seq,
-                    three_prime_utr_seq,
-                    translateable_seq: raw_translateable_seq,
-                    flags_str: raw_flags_str,
-                    is_gencode_basic,
-                    is_gencode_primary,
-                } = raw_metadata;
-                let cdna_mapper_segments = if cdna_mapper_segments.is_empty() {
-                    raw_cdna_mapper_segments
-                } else {
-                    cdna_mapper_segments
-                };
+                refseq_edits.sort_by(|left, right| {
+                    left.start
+                        .cmp(&right.start)
+                        .then(left.end.cmp(&right.end))
+                        .then(left.replacement_len.cmp(&right.replacement_len))
+                });
+                let is_gencode_basic = is_gencode_basic_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let is_gencode_primary = is_gencode_primary_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
                 // Ensembl release/115 computes alternate CDS from the live
                 // transcript object's `_translateable_seq()` / 3'UTR rather
                 // than reconstructing from genomic exons when that state is
                 // already cached on the transcript object.
                 // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2470-L2481
                 let translateable_seq = translateable_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(raw_translateable_seq);
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let five_prime_utr_seq = five_prime_utr_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(five_prime_utr_seq);
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let three_prime_utr_seq = three_prime_utr_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(three_prime_utr_seq);
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 if let Some(seq) = translateable_seq.as_ref() {
                     translateable_seq_by_tx.insert(transcript_id.clone(), seq.clone());
                 }
                 let flags_str = flags_str_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(raw_flags_str)
                     .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf));
 
-                let raw_object_json =
-                    raw_object_json_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let gene_stable_id = gene_stable_id_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or_else(|| gene_stable_id_from_raw_object_json(raw_object_json.as_deref()));
+                let gene_stable_id =
+                    gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_symbol =
                     gene_symbol_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_symbol_source = gene_symbol_source_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_hgnc_id_native = gene_hgnc_id_native_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(raw_gene_hgnc_id_native);
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let promoted_gene_hgnc_id =
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_hgnc_id = gene_hgnc_id_native.clone().or(promoted_gene_hgnc_id);
-                let source_cache = raw_source_cache.or_else(|| {
-                    source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                });
-                let source =
-                    raw_source.or_else(|| source_cache.as_deref().and_then(normalize_source_label));
+                let source_col = source_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .filter(|source| !source.is_empty() && source != "-");
+                let source_cache = source_cache_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .filter(|source| !source.is_empty() && source != "-")
+                    .or_else(|| source_col.clone());
+                let source = source_cache
+                    .as_deref()
+                    .and_then(normalize_source_label)
+                    .or_else(|| source_col.as_deref().and_then(normalize_source_label));
                 let bam_edit_status =
                     bam_edit_status_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
@@ -3410,7 +4142,6 @@ impl AnnotateProvider {
                     cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let spliced_seq = spliced_seq_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(raw_spliced_seq)
                     .or_else(|| {
                         synthesize_spliced_seq(
                             five_prime_utr_seq.as_deref(),
@@ -3452,9 +4183,12 @@ impl AnnotateProvider {
                 let appris = appris_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let ncrna_structure =
                     ncrna_structure_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let transcript_uid =
+                    transcript_uid_idx.and_then(|idx| uint32_at(batch.column(idx).as_ref(), row));
 
                 out.push(TranscriptFeature {
                     transcript_id,
+                    transcript_uid,
                     chrom,
                     start,
                     end,
@@ -3502,6 +4236,7 @@ impl AnnotateProvider {
                     uniprot_isoform,
                     appris,
                     ncrna_structure,
+                    cdna_coords_cache: GeometryCache::default(),
                 });
             }
         }
@@ -4014,6 +4749,495 @@ impl AnnotateProvider {
         Ok(out)
     }
 
+    fn parse_lance_transcript_batches(
+        table: &str,
+        batches: &[RecordBatch],
+    ) -> Result<(Vec<TranscriptFeature>, HashMap<String, String>)> {
+        let mut out = Vec::new();
+        let mut translateable_seq_by_tx = HashMap::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "annotate_vep(): transcript table '{table}' is missing required column transcript_id (or stable_id)"
+                    ))
+                })?;
+            let chrom_idx = schema.index_of("chrom").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column chrom"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column end"
+                ))
+            })?;
+            let strand_idx = schema.index_of("strand").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column strand"
+                ))
+            })?;
+            let biotype_idx = schema.index_of("biotype").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column biotype"
+                ))
+            })?;
+            let cds_start_idx = schema.index_of("cds_start").ok();
+            let cds_end_idx = schema.index_of("cds_end").ok();
+            let cdna_coding_start_idx = schema.index_of("cdna_coding_start").ok();
+            let cdna_coding_end_idx = schema.index_of("cdna_coding_end").ok();
+            let gene_stable_id_idx = schema.index_of("gene_stable_id").ok();
+            let gene_symbol_idx = schema.index_of("gene_symbol").ok();
+            let gene_symbol_source_idx = schema.index_of("gene_symbol_source").ok();
+            let gene_hgnc_id_native_idx = schema.index_of("gene_hgnc_id_native").ok();
+            let gene_hgnc_id_idx = schema.index_of("gene_hgnc_id").ok();
+            let source_idx = schema.index_of("source").ok();
+            let source_cache_idx = schema.index_of("source_cache").ok();
+            let display_xref_id_idx = schema.index_of("display_xref_id").ok();
+            let version_idx = schema.index_of("version").ok();
+            let cds_start_nf_idx = schema.index_of("cds_start_nf").ok();
+            let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
+            let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
+            let cdna_seq_idx = schema.index_of("cdna_seq").ok();
+            let bam_edit_status_idx = schema.index_of("bam_edit_status").ok();
+            let has_non_polya_rna_edit_idx = schema.index_of("has_non_polya_rna_edit").ok();
+            let spliced_seq_idx = schema.index_of("spliced_seq").ok();
+            let translateable_seq_idx = schema.index_of("translateable_seq").ok();
+            let five_prime_utr_seq_idx = schema.index_of("five_prime_utr_seq").ok();
+            let three_prime_utr_seq_idx = schema.index_of("three_prime_utr_seq").ok();
+            let flags_str_idx = schema.index_of("flags_str").ok();
+            let refseq_match_idx = schema.index_of("refseq_match").ok();
+            let refseq_edits_idx = schema.index_of("refseq_edits").ok();
+            let is_gencode_basic_idx = schema.index_of("is_gencode_basic").ok();
+            let is_gencode_primary_idx = schema.index_of("is_gencode_primary").ok();
+            let cdna_mapper_segments_idx = schema.index_of("cdna_mapper_segments").ok();
+            let is_canonical_idx = schema.index_of("is_canonical").ok();
+            let tsl_idx = schema.index_of("tsl").ok();
+            let mane_select_idx = schema.index_of("mane_select").ok();
+            let mane_plus_clinical_idx = schema.index_of("mane_plus_clinical").ok();
+            let translation_stable_id_idx = schema.index_of("translation_stable_id").ok();
+            let gene_phenotype_idx = schema.index_of("gene_phenotype").ok();
+            let ccds_idx = schema.index_of("ccds").ok();
+            let swissprot_idx = schema.index_of("swissprot").ok();
+            let trembl_idx = schema.index_of("trembl").ok();
+            let uniparc_idx = schema.index_of("uniparc").ok();
+            let uniprot_isoform_idx = schema.index_of("uniprot_isoform").ok();
+            let appris_idx = schema.index_of("appris").ok();
+            let ncrna_structure_idx = schema.index_of("ncrna_structure").ok();
+            let transcript_uid_idx = schema.index_of("transcript_uid").ok();
+
+            for row in 0..batch.num_rows() {
+                let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(strand_raw) = int64_at(batch.column(strand_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(biotype) = string_at(batch.column(biotype_idx).as_ref(), row) else {
+                    continue;
+                };
+
+                let cds_start = cds_start_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .filter(|v| *v > 0);
+                let cds_end = cds_end_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .filter(|v| *v > 0);
+                let cdna_coding_start = cdna_coding_start_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .filter(|v| *v > 0)
+                    .and_then(|v| usize::try_from(v).ok());
+                let cdna_coding_end = cdna_coding_end_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .filter(|v| *v > 0)
+                    .and_then(|v| usize::try_from(v).ok());
+                let mature_mirna_regions = if biotype == "miRNA" {
+                    mirna_regions_idx
+                        .and_then(|idx| read_mirna_regions(batch, idx, row))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let cds_start_nf = cds_start_nf_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let cds_end_nf = cds_end_nf_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let cdna_mapper_segments = cdna_mapper_segments_idx
+                    .map(|idx| {
+                        cdna_mapper_segments_from_list_column(batch.column(idx).as_ref(), row)
+                    })
+                    .unwrap_or_default();
+                let translateable_seq = translateable_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                if let Some(seq) = translateable_seq.as_ref() {
+                    translateable_seq_by_tx.insert(transcript_id.clone(), seq.clone());
+                }
+                let five_prime_utr_seq = five_prime_utr_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let three_prime_utr_seq = three_prime_utr_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let cdna_seq =
+                    cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let spliced_seq = spliced_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or_else(|| {
+                        synthesize_spliced_seq(
+                            five_prime_utr_seq.as_deref(),
+                            translateable_seq.as_deref(),
+                            three_prime_utr_seq.as_deref(),
+                            cdna_coding_start,
+                            cdna_coding_end,
+                            cdna_seq.as_deref(),
+                        )
+                    });
+                let mut refseq_edits = refseq_edits_idx
+                    .map(|idx| refseq_edits_from_list_column(batch.column(idx).as_ref(), row))
+                    .unwrap_or_default();
+                refseq_edits.sort_by(|left, right| {
+                    left.start
+                        .cmp(&right.start)
+                        .then(left.end.cmp(&right.end))
+                        .then(left.replacement_len.cmp(&right.replacement_len))
+                });
+                let source_col = source_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .filter(|source| !source.is_empty() && source != "-");
+                let source_cache = source_cache_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .filter(|source| !source.is_empty() && source != "-")
+                    .or_else(|| source_col.clone());
+                let source = source_cache
+                    .as_deref()
+                    .and_then(normalize_source_label)
+                    .or_else(|| source_col.as_deref().and_then(normalize_source_label));
+                let gene_hgnc_id_native = gene_hgnc_id_native_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let gene_hgnc_id = gene_hgnc_id_native.clone().or_else(|| {
+                    gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                });
+                let transcript_uid =
+                    transcript_uid_idx.and_then(|idx| uint32_at(batch.column(idx).as_ref(), row));
+
+                out.push(TranscriptFeature {
+                    transcript_id,
+                    transcript_uid,
+                    chrom,
+                    start,
+                    end,
+                    strand: if strand_raw >= 0 { 1 } else { -1 },
+                    biotype,
+                    cds_start,
+                    cds_end,
+                    cdna_coding_start,
+                    cdna_coding_end,
+                    cdna_mapper_segments,
+                    mature_mirna_regions,
+                    gene_stable_id: gene_stable_id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    gene_symbol: gene_symbol_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    gene_symbol_source: gene_symbol_source_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    gene_hgnc_id_native,
+                    gene_hgnc_id,
+                    display_xref_id: display_xref_id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    source,
+                    source_cache,
+                    refseq_match: refseq_match_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    refseq_edits,
+                    is_gencode_basic: is_gencode_basic_idx
+                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or(false),
+                    is_gencode_primary: is_gencode_primary_idx
+                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or(false),
+                    bam_edit_status: bam_edit_status_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    has_non_polya_rna_edit: has_non_polya_rna_edit_idx
+                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or(false),
+                    spliced_seq,
+                    five_prime_utr_seq,
+                    three_prime_utr_seq,
+                    translateable_seq,
+                    cdna_seq,
+                    version: version_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .and_then(|v| i32::try_from(v).ok()),
+                    cds_start_nf,
+                    cds_end_nf,
+                    flags_str: flags_str_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf)),
+                    is_canonical: is_canonical_idx
+                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or(false),
+                    tsl: tsl_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .and_then(|v| i32::try_from(v).ok()),
+                    mane_select: mane_select_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    mane_plus_clinical: mane_plus_clinical_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    translation_stable_id: translation_stable_id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    gene_phenotype: gene_phenotype_idx
+                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or(false),
+                    ccds: ccds_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    swissprot: swissprot_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    trembl: trembl_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    uniparc: uniparc_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    uniprot_isoform: uniprot_isoform_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    appris: appris_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    ncrna_structure: ncrna_structure_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    cdna_coords_cache: GeometryCache::default(),
+                });
+            }
+        }
+        Ok((out, translateable_seq_by_tx))
+    }
+
+    fn parse_lance_exon_batches(table: &str, batches: &[RecordBatch]) -> Result<Vec<ExonFeature>> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "annotate_vep(): exon table '{table}' is missing required column transcript_id (or stable_id)"
+                    ))
+                })?;
+            let exon_idx = schema.index_of("exon_number").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): exon table '{table}' is missing required column exon_number"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): exon table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): exon table '{table}' is missing required column end"
+                ))
+            })?;
+            for row in 0..batch.num_rows() {
+                let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(exon_number_raw) = int64_at(batch.column(exon_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                out.push(ExonFeature {
+                    transcript_id,
+                    exon_number: i32::try_from(exon_number_raw).unwrap_or(i32::MAX),
+                    start,
+                    end,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_lance_translation_batches(
+        table: &str,
+        batches: &[RecordBatch],
+    ) -> Result<Vec<TranslationFeature>> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "annotate_vep(): translation table '{table}' is missing required column transcript_id (or stable_id)"
+                    ))
+                })?;
+            let cds_len_idx = schema
+                .index_of("cds_len")
+                .or_else(|_| schema.index_of("cds_length"))
+                .ok();
+            let protein_len_idx = schema.index_of("protein_len").ok();
+            let translation_seq_idx = schema.index_of("translation_seq").ok();
+            let translation_seq_canonical_idx = schema.index_of("translation_seq_canonical").ok();
+            let cds_seq_idx = schema
+                .index_of("cds_sequence")
+                .or_else(|_| schema.index_of("cds_seq"))
+                .or_else(|_| schema.index_of("coding_sequence"))
+                .ok();
+            let cds_seq_canonical_idx = schema.index_of("cds_sequence_canonical").ok();
+            let tl_stable_id_idx = schema.index_of("stable_id").ok();
+            let tl_version_idx = schema.index_of("version").ok();
+            let pf_idx = schema.index_of("protein_features").ok();
+            for row in 0..batch.num_rows() {
+                let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                out.push(TranslationFeature {
+                    transcript_id,
+                    cds_len: cds_len_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .and_then(|v| usize::try_from(v).ok()),
+                    protein_len: protein_len_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .and_then(|v| usize::try_from(v).ok()),
+                    translation_seq: translation_seq_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    cds_sequence: cds_seq_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    translation_seq_canonical: translation_seq_canonical_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    cds_sequence_canonical: cds_seq_canonical_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    stable_id: tl_stable_id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    version: tl_version_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .and_then(|v| i32::try_from(v).ok()),
+                    protein_features: pf_idx
+                        .map(|idx| read_protein_features(batch.column(idx).as_ref(), row))
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_lance_regulatory_batches(
+        table: &str,
+        batches: &[RecordBatch],
+    ) -> Result<Vec<RegulatoryFeature>> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let id_idx = schema
+                .index_of("stable_id")
+                .or_else(|_| schema.index_of("feature_id"))
+                .ok();
+            let ft_idx = schema.index_of("feature_type").ok();
+            let chrom_idx = schema.index_of("chrom").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): regulatory table '{table}' is missing required column chrom"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): regulatory table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): regulatory table '{table}' is missing required column end"
+                ))
+            })?;
+            for row in 0..batch.num_rows() {
+                let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                out.push(RegulatoryFeature {
+                    feature_id: id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or_else(|| "reg".to_string()),
+                    chrom,
+                    start,
+                    end,
+                    feature_type: ft_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_lance_motif_batches(
+        table: &str,
+        batches: &[RecordBatch],
+    ) -> Result<Vec<MotifFeature>> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let id_idx = schema
+                .index_of("motif_id")
+                .or_else(|_| schema.index_of("feature_id"))
+                .ok();
+            let chrom_idx = schema.index_of("chrom").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): motif table '{table}' is missing required column chrom"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): motif table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): motif table '{table}' is missing required column end"
+                ))
+            })?;
+            for row in 0..batch.num_rows() {
+                let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                out.push(MotifFeature {
+                    motif_id: id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or_else(|| "motif".to_string()),
+                    chrom,
+                    start,
+                    end,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     async fn load_mirna_features(
         &self,
         table: &str,
@@ -4238,13 +5462,16 @@ impl AnnotateProvider {
     #[allow(clippy::too_many_arguments)]
     async fn scan_with_transcript_engine_partitioned(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         requested_columns: &[&str],
         extended_probes: bool,
-        cache: &PartitionedParquetCache,
+        cache: PartitionedAnnotationCache,
         translations_sift_table: Option<&str>,
         #[cfg(feature = "kv-cache")] kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
+        #[cfg(feature = "kv-cache")] use_indexed_parquet: bool,
+        #[cfg(feature = "lance-cache")] use_lance: bool,
+        #[cfg(feature = "kv-cache")] indexed_variation_schema: Option<Schema>,
         fetch_limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if profiling_enabled() {
@@ -4271,6 +5498,54 @@ impl AnnotateProvider {
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0)
             .unwrap_or(VEP_INPUT_BUFFER_SIZE);
+        let worker_forks = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "forks"))
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0);
+        let target_partitions = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "target_partitions"))
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
+        let chromosome_lanes = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "contig_parallelism"))
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| if worker_forks > 0 { worker_forks } else { 1 });
+        let chromosome_lanes = if fetch_limit.is_some() {
+            1
+        } else {
+            chromosome_lanes
+        };
+        let inline_lookup = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_bool_option(opts, "inline_lookup"))
+            .unwrap_or(worker_forks == 0);
+        // Number of parallel window workers for the CPU-bound annotation step
+        // within a contig. Additive to the partition-lookup knobs above:
+        // `threads <= 1` keeps the serial inline annotation path.
+        let annotation_threads = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "threads"))
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
+        // The single `threads` knob drives BOTH stages: with threads>1 the
+        // lookup runs as N spawned, position-ordered partitions (so it isn't a
+        // serial bottleneck) and annotation runs as N parallel window workers.
+        let (inline_lookup, target_partitions) = if annotation_threads > 1 {
+            (false, annotation_threads.max(target_partitions))
+        } else {
+            (inline_lookup, target_partitions)
+        };
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
 
@@ -4280,7 +5555,8 @@ impl AnnotateProvider {
         // Build expanded cache chrom set with both bare and chr-prefixed forms
         // so that VCF "chr1" matches cache "1" and vice versa.
         let mut cache_chroms: HashSet<String> = HashSet::new();
-        for c in cache.available_chroms() {
+        let available_chroms = cache.available_chroms();
+        for c in &available_chroms {
             cache_chroms.insert(c.clone());
             if let Some(bare) = c.strip_prefix("chr") {
                 cache_chroms.insert(bare.to_string());
@@ -4299,7 +5575,7 @@ impl AnnotateProvider {
             format!(
                 "{} VCF contigs, {} in cache, {} to process",
                 vcf_contigs.len(),
-                cache.available_chroms().len(),
+                available_chroms.len(),
                 contigs.len()
             )
         );
@@ -4309,6 +5585,23 @@ impl AnnotateProvider {
             Arc::new(self.schema.project(indices)?)
         } else {
             self.schema.clone()
+        };
+        #[cfg(feature = "kv-cache")]
+        let indexed_parquet_cache_root =
+            use_indexed_parquet.then(|| cache.base_dir().to_path_buf());
+        #[cfg(feature = "lance-cache")]
+        let lance_cache_root = use_lance.then(|| cache.base_dir().to_path_buf());
+        #[cfg(feature = "kv-cache")]
+        let sift_prediction_store = if let Some(store) = kv_store.as_ref() {
+            if let Some(parent) = store.root_path().parent() {
+                open_sift_prediction_store(parent)?
+            } else {
+                None
+            }
+        } else if use_indexed_parquet {
+            open_sift_prediction_store(cache.base_dir())?
+        } else {
+            None
         };
 
         let config = ContigAnnotationConfig {
@@ -4327,29 +5620,36 @@ impl AnnotateProvider {
             upstream_distance,
             downstream_distance,
             input_buffer_size,
+            target_partitions,
             projection: projection.cloned(),
             annotation_column_count: self.annotation_column_count(),
             fetch_limit,
+            chromosome_lanes,
+            inline_lookup,
+            annotation_threads,
+            deregister_global_kv_on_finish: chromosome_lanes <= 1,
             #[cfg(feature = "kv-cache")]
             use_fjall: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
-            sift_kv_store: kv_store.as_ref().and_then(|store| {
-                let parent = store.root_path().parent()?;
-                let sift_path = parent.join("translation_sift.fjall");
-                crate::kv_cache::SiftKvStore::open_path(&sift_path)
-                    .ok()
-                    .flatten()
-            }),
+            indexed_parquet_cache_root,
+            #[cfg(feature = "lance-cache")]
+            lance_cache_root,
+            #[cfg(feature = "kv-cache")]
+            indexed_variation_schema,
+            #[cfg(feature = "kv-cache")]
+            sift_prediction_store,
             #[cfg(feature = "kv-cache")]
             kv_store,
+            vcf_shard_ctx: self.vcf_shard_ctx.clone(),
         };
 
         let exec = ContigAnnotationExec::new(
             projected_schema,
             self.schema.clone(),
             contigs,
+            chromosome_lanes,
             Arc::clone(&self.session),
-            Arc::new(cache.clone()),
+            Arc::new(cache),
             config,
         );
 
@@ -4370,7 +5670,7 @@ impl AnnotateProvider {
         ctx: &PreparedContext<'_>,
         colocated_map: &HashMap<ColocatedKey, ColocatedData>,
         sift_cache: &mut SiftPolyphenCache,
-        #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
+        #[cfg(feature = "kv-cache")] sift_store: &Option<SiftPredictionStoreRef>,
         #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
         skip_csq: bool,
         skip_typed_cols: bool,
@@ -4505,80 +5805,82 @@ impl AnnotateProvider {
         /// Append NULL to all annotation column builders for the selected mode.
         macro_rules! append_null_annotation_row {
             () => {
-                b_allele.append_null();
-                b_consequence.append(false);
-                b_impact.append(false);
-                b_symbol.append(false);
-                b_gene.append(false);
-                b_feature_type.append(false);
-                b_feature.append(false);
-                b_biotype.append(false);
-                b_exon.append(false);
-                b_intron.append(false);
-                b_hgvsc.append(false);
-                b_hgvsp.append(false);
-                b_cdna_position.append(false);
-                b_cds_position.append(false);
-                b_protein_position.append(false);
-                b_amino_acids.append(false);
-                b_codons.append(false);
-                b_existing_variation.append(false);
-                b_distance.append(false);
-                b_strand.append(false);
-                b_flags.append(false);
-                b_pick.append(false);
-                b_variant_class.append_null();
-                b_symbol_source.append(false);
-                b_hgnc_id.append(false);
-                b_canonical.append(false);
-                b_mane.append(false);
-                b_mane_select.append(false);
-                b_mane_plus_clinical.append(false);
-                b_tsl.append(false);
-                b_appris.append(false);
-                b_ccds.append(false);
-                b_ensp.append(false);
-                b_swissprot.append(false);
-                b_trembl.append(false);
-                b_uniparc.append(false);
-                b_uniprot_isoform.append(false);
-                if include_refseq_fields {
-                    b_refseq_match.append(false);
-                    if include_source_field {
-                        b_source.append(false);
+                if !skip_typed_cols {
+                    b_allele.append_null();
+                    b_consequence.append(false);
+                    b_impact.append(false);
+                    b_symbol.append(false);
+                    b_gene.append(false);
+                    b_feature_type.append(false);
+                    b_feature.append(false);
+                    b_biotype.append(false);
+                    b_exon.append(false);
+                    b_intron.append(false);
+                    b_hgvsc.append(false);
+                    b_hgvsp.append(false);
+                    b_cdna_position.append(false);
+                    b_cds_position.append(false);
+                    b_protein_position.append(false);
+                    b_amino_acids.append(false);
+                    b_codons.append(false);
+                    b_existing_variation.append(false);
+                    b_distance.append(false);
+                    b_strand.append(false);
+                    b_flags.append(false);
+                    b_pick.append(false);
+                    b_variant_class.append_null();
+                    b_symbol_source.append(false);
+                    b_hgnc_id.append(false);
+                    b_canonical.append(false);
+                    b_mane.append(false);
+                    b_mane_select.append(false);
+                    b_mane_plus_clinical.append(false);
+                    b_tsl.append(false);
+                    b_appris.append(false);
+                    b_ccds.append(false);
+                    b_ensp.append(false);
+                    b_swissprot.append(false);
+                    b_trembl.append(false);
+                    b_uniparc.append(false);
+                    b_uniprot_isoform.append(false);
+                    if include_refseq_fields {
+                        b_refseq_match.append(false);
+                        if include_source_field {
+                            b_source.append(false);
+                        }
+                        b_refseq_offset.append(false);
+                        b_given_ref.append(false);
+                        b_used_ref.append(false);
+                        b_bam_edit.append(false);
                     }
-                    b_refseq_offset.append(false);
-                    b_given_ref.append(false);
-                    b_used_ref.append(false);
-                    b_bam_edit.append(false);
+                    b_gene_pheno.append(false);
+                    b_sift.append(false);
+                    b_polyphen.append(false);
+                    b_domains.append(false);
+                    b_mirna.append(false);
+                    b_hgvs_offset.append(false);
+                    for af_b in b_af.iter_mut() {
+                        af_b.append_null();
+                    }
+                    b_max_af.append_null();
+                    b_max_af_pops.append_null();
+                    b_clin_sig.append(false);
+                    b_somatic.append_null();
+                    b_pheno.append_null();
+                    b_pubmed.append(false);
+                    b_motif_name.append_null();
+                    b_motif_pos.append_null();
+                    b_high_inf_pos.append_null();
+                    b_motif_score_change.append_null();
+                    b_transcription_factors.append(false);
+                    b_clin_sig_allele.append(false);
+                    b_clinical_impact.append_null();
+                    b_minor_allele.append_null();
+                    b_minor_allele_freq.append_null();
+                    b_clinvar_ids.append(false);
+                    b_cosmic_ids.append(false);
+                    b_dbsnp_ids.append(false);
                 }
-                b_gene_pheno.append(false);
-                b_sift.append(false);
-                b_polyphen.append(false);
-                b_domains.append(false);
-                b_mirna.append(false);
-                b_hgvs_offset.append(false);
-                for af_b in b_af.iter_mut() {
-                    af_b.append_null();
-                }
-                b_max_af.append_null();
-                b_max_af_pops.append_null();
-                b_clin_sig.append(false);
-                b_somatic.append_null();
-                b_pheno.append_null();
-                b_pubmed.append(false);
-                b_motif_name.append_null();
-                b_motif_pos.append_null();
-                b_high_inf_pos.append_null();
-                b_motif_score_change.append_null();
-                b_transcription_factors.append(false);
-                b_clin_sig_allele.append(false);
-                b_clinical_impact.append_null();
-                b_minor_allele.append_null();
-                b_minor_allele_freq.append_null();
-                b_clinvar_ids.append(false);
-                b_cosmic_ids.append(false);
-                b_dbsnp_ids.append(false);
             };
         }
 
@@ -4597,15 +5899,32 @@ impl AnnotateProvider {
             transcript_selection,
             include_pick_output,
         );
+        let engine_profile_enabled = engine_profiling_enabled();
+        let mut engine_profile = EngineAnnotationProfile::new(
+            batch.num_rows(),
+            skip_csq,
+            skip_typed_cols,
+            flags.everything,
+        );
+        let mut tx_engine_profile = engine_profile_enabled.then(TranscriptEngineProfile::default);
 
         for row in 0..batch.num_rows() {
+            let row_setup_started = engine_profile_enabled.then(Instant::now);
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                if let Some(started) = row_setup_started {
+                    engine_profile.null_chrom_rows += 1;
+                    engine_profile.row_setup += started.elapsed();
+                }
                 csq_builder.append_null();
                 most_builder.append_null();
                 append_null_annotation_row!();
                 continue;
             };
             let Some(alt_allele) = string_at(batch.column(alt_idx).as_ref(), row) else {
+                if let Some(started) = row_setup_started {
+                    engine_profile.null_alt_rows += 1;
+                    engine_profile.row_setup += started.elapsed();
+                }
                 csq_builder.append_null();
                 most_builder.append_null();
                 append_null_annotation_row!();
@@ -4614,6 +5933,10 @@ impl AnnotateProvider {
 
             // VEP skips star alleles entirely — no CSQ produced.
             if alt_allele == "*" {
+                if let Some(started) = row_setup_started {
+                    engine_profile.star_allele_rows += 1;
+                    engine_profile.row_setup += started.elapsed();
+                }
                 csq_builder.append_null();
                 most_builder.append_null();
                 append_null_annotation_row!();
@@ -4634,6 +5957,9 @@ impl AnnotateProvider {
             let _variation_name = variation_name_idx
                 .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 .unwrap_or_default();
+            if let Some(started) = row_setup_started {
+                engine_profile.row_setup += started.elapsed();
+            }
 
             // --- Batch 3: per-variant fields (same for every transcript entry) ---
             // Look up co-located variant aggregation (all variants at same position).
@@ -4645,6 +5971,7 @@ impl AnnotateProvider {
             //
             // VEP keys the existing-variant overlap/matching flow in parser/input
             // coordinate space, not the fully minimized VEP-normalized allele space.
+            let colocated_started = engine_profile_enabled.then(Instant::now);
             let start_val = int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0);
             let end_val = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(0);
             let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
@@ -4657,53 +5984,39 @@ impl AnnotateProvider {
                 end_val,
                 input_allele_string,
             ));
-            let (variant_fields, frequency_fields) = if flags.check_existing {
+            let mut frequency_fields_storage = None;
+            let variant_fields = if flags.check_existing {
                 if let Some(data) = coloc {
-                    (
-                        data.variant_fields(
-                            &vep_allele,
-                            data.variant_match_output_allele(&vep_allele),
-                            flags.pubmed,
-                        ),
-                        data.frequency_fields(
-                            &vep_allele,
-                            data.frequency_match_output_allele(&vep_allele),
-                            flags,
-                        ),
+                    frequency_fields_storage = Some(data.frequency_fields(
+                        &vep_allele,
+                        data.frequency_match_output_allele(&vep_allele),
+                        flags,
+                    ));
+                    data.variant_fields(
+                        &vep_allele,
+                        data.variant_match_output_allele(&vep_allele),
+                        flags.pubmed,
                     )
                 } else {
-                    (
-                        ColocatedVariantFields::default(),
-                        ColocatedFrequencyFields {
-                            af_values: vec![String::new(); AF_COLUMNS.len()],
-                            max_af: String::new(),
-                            max_af_pops: String::new(),
-                        },
-                    )
+                    ColocatedVariantFields::default()
                 }
             } else {
-                (
-                    ColocatedVariantFields::default(),
-                    ColocatedFrequencyFields {
-                        af_values: vec![String::new(); AF_COLUMNS.len()],
-                        max_af: String::new(),
-                        max_af_pops: String::new(),
-                    },
-                )
+                ColocatedVariantFields::default()
             };
+            let frequency_fields = frequency_fields_storage
+                .as_ref()
+                .map(ColocatedFrequencyFieldRef::Resolved)
+                .unwrap_or(ColocatedFrequencyFieldRef::Empty);
             let existing_var = variant_fields.existing_variation.as_str();
+            if let Some(started) = colocated_started {
+                engine_profile.colocated_fields += started.elapsed();
+            }
 
             // Build the 33-field Batch 3 suffix (positions 41-73) shared across all transcripts.
-            let batch3_suffix = format!(
-                "{}|{}|{}|{}|{}|{}|{}",
-                frequency_fields.af_values.join("|"),
-                frequency_fields.max_af,
-                frequency_fields.max_af_pops,
-                variant_fields.clin_sig,
-                variant_fields.somatic,
-                variant_fields.pheno,
-                variant_fields.pubmed,
-            );
+            let batch3_suffix =
+                engine_profile_time!(engine_profile_enabled, engine_profile, batch3_suffix, {
+                    batch3_suffix_for_csq(frequency_fields, &variant_fields)
+                });
 
             let most_str;
             // Store assignment results from cache-miss path for annotation column population.
@@ -4717,9 +6030,16 @@ impl AnnotateProvider {
             }
             let use_cached_fast_path = cached_most.is_some() && !require_transcript_annotations;
             if use_cached_fast_path {
+                let cached_fast_started = engine_profile_enabled.then(Instant::now);
+                if engine_profile_enabled {
+                    engine_profile.cached_fast_rows += 1;
+                }
                 use std::fmt::Write;
                 let most_val = cached_most.as_deref().unwrap_or_default();
                 if !skip_csq {
+                    if engine_profile_enabled {
+                        engine_profile.csq_entries += 1;
+                    }
                     let csq_val = cached_csq.unwrap_or_default();
                     let impact = SoTerm::from_str(most_val)
                         .map(|t| impact_label(t.impact()))
@@ -4730,28 +6050,44 @@ impl AnnotateProvider {
                         impact,
                         existing_variation: existing_var,
                         variant_class,
-                        frequency_fields: &frequency_fields,
+                        frequency_fields,
                         variant_fields: &variant_fields,
                     };
                     placeholder_layout.append_entry(&mut csq_buf, &entry);
                 }
                 most_str = most_val.to_string();
+                if let Some(started) = cached_fast_started {
+                    engine_profile.cached_fast_path += started.elapsed();
+                }
             } else {
+                if engine_profile_enabled {
+                    engine_profile.engine_rows += 1;
+                }
                 use std::fmt::Write;
                 // Cache miss — compute via transcript engine and produce per-transcript CSQ.
+                let variant_construct_started = engine_profile_enabled.then(Instant::now);
                 let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    if let Some(started) = variant_construct_started {
+                        engine_profile.variant_construct += started.elapsed();
+                    }
                     csq_builder.append_null();
                     most_builder.append_null();
                     append_null_annotation_row!();
                     continue;
                 };
                 let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    if let Some(started) = variant_construct_started {
+                        engine_profile.variant_construct += started.elapsed();
+                    }
                     csq_builder.append_null();
                     most_builder.append_null();
                     append_null_annotation_row!();
                     continue;
                 };
                 let Some(ref_allele) = string_at(batch.column(ref_idx).as_ref(), row) else {
+                    if let Some(started) = variant_construct_started {
+                        engine_profile.variant_construct += started.elapsed();
+                    }
                     csq_builder.append_null();
                     most_builder.append_null();
                     append_null_annotation_row!();
@@ -4773,8 +6109,12 @@ impl AnnotateProvider {
                     ref_allele,
                     alt_allele.clone(),
                 );
+                if let Some(started) = variant_construct_started {
+                    engine_profile.variant_construct += started.elapsed();
+                }
                 // Only compute genomic shift for indels (ref != alt length).
                 // SNVs/MNVs don't shift and skipping avoids allele normalization overhead.
+                let hgvs_shift_started = engine_profile_enabled.then(Instant::now);
                 if let Some(reader) = hgvs_reference_reader.as_mut() {
                     if ref_al.len() != alt_allele.len() {
                         let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
@@ -4801,13 +6141,31 @@ impl AnnotateProvider {
                         )?;
                     }
                 }
-                let assignments = engine.evaluate_variant_prepared(&variant, ctx);
+                if let Some(started) = hgvs_shift_started {
+                    engine_profile.hgvs_shift += started.elapsed();
+                }
+                let assignments = engine_profile_time!(
+                    engine_profile_enabled,
+                    engine_profile,
+                    evaluate_prepared,
+                    {
+                        if let Some(profile) = tx_engine_profile.as_mut() {
+                            engine.evaluate_variant_prepared_profiled(&variant, ctx, profile)
+                        } else {
+                            engine.evaluate_variant_prepared(&variant, ctx)
+                        }
+                    }
+                );
+                if engine_profile_enabled {
+                    engine_profile.assignments += assignments.len();
+                }
 
                 // Derive the local scalar `most_severe_consequence` from all
                 // computed assignments, even when pick filtering later reduces
                 // emitted CSQ/typed entries. Ensembl VEP VCF output has no
                 // equivalent scalar field, so this preserves the existing
                 // annotate_vep API contract.
+                let collapse_pick_sort_started = engine_profile_enabled.then(Instant::now);
                 let mut all_terms =
                     TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
                 if all_terms.is_empty() {
@@ -4816,7 +6174,42 @@ impl AnnotateProvider {
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
                 most_str = most.as_str().to_string();
                 row_assignments = apply_pick_mode(assignments, ctx, pick_flags, &vep_allele);
+                if engine_profile_enabled {
+                    engine_profile.picked_assignments += row_assignments.len();
+                }
                 row_variant = Some(variant);
+
+                // Batch the position-sliced SIFT demand fetch: collect this
+                // row's missense `(transcript_uid, position)` keys and warm the
+                // store in a single `take_rows`, so the per-consequence
+                // `lookup_sift_polyphen` calls below (CSQ + typed columns) hit
+                // the memoized cache instead of issuing one take per
+                // consequence. Only the position-sliced store benefits; the
+                // legacy transcript-id store ignores this. SIFT is emitted only
+                // under `--everything`.
+                #[cfg(feature = "kv-cache")]
+                if flags.everything {
+                    if let Some(store) = sift_store {
+                        if store.is_position_sliced() {
+                            let mut warm_keys: Vec<u64> = Vec::new();
+                            for tc in &row_assignments {
+                                let uid = tc
+                                    .transcript_idx
+                                    .and_then(|idx| ctx.transcripts[idx].transcript_uid);
+                                if let Some(key) = sift_position_key(
+                                    uid,
+                                    tc.protein_position.as_deref(),
+                                    tc.amino_acids.as_deref(),
+                                ) {
+                                    warm_keys.push(key);
+                                }
+                            }
+                            if !warm_keys.is_empty() {
+                                let _ = store.get_position_predictions(&warm_keys);
+                            }
+                        }
+                    }
+                }
 
                 // Build VEP-compatible sorted permutation index.
                 // Used by both CSQ serialization and typed annotation columns
@@ -4847,10 +6240,17 @@ impl AnnotateProvider {
                             })
                     });
                 }
+                if let Some(started) = collapse_pick_sort_started {
+                    engine_profile.collapse_pick_sort += started.elapsed();
+                }
 
                 // Build per-transcript CSQ entries into reusable buffer (already cleared above).
                 // Skip the entire CSQ formatting when the csq column is not projected.
+                let csq_format_started = engine_profile_enabled.then(Instant::now);
                 if !skip_csq {
+                    if engine_profile_enabled {
+                        engine_profile.csq_entries += sorted_indices.len();
+                    }
                     for &si in &sorted_indices {
                         let tc = &row_assignments[si];
                         terms_buf.clear();
@@ -5025,15 +6425,23 @@ impl AnnotateProvider {
                             // Traceability:
                             // - VEP OutputFactory.pm SIFT/PolyPhen output
                             //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799
-                            let (sift_str, polyphen_str) = lookup_sift_polyphen(
-                                tc.transcript_id.as_deref(),
-                                tc.protein_position.as_deref(),
-                                tc.amino_acids.as_deref(),
-                                sift_cache,
-                                #[cfg(feature = "kv-cache")]
-                                sift_kv,
-                                #[cfg(not(feature = "kv-cache"))]
-                                _sift_kv,
+                            let (sift_str, polyphen_str) = engine_profile_time!(
+                                engine_profile_enabled,
+                                engine_profile,
+                                sift_polyphen,
+                                {
+                                    lookup_sift_polyphen(
+                                        tc.transcript_id.as_deref(),
+                                        tx_opt.and_then(|tx| tx.transcript_uid),
+                                        tc.protein_position.as_deref(),
+                                        tc.amino_acids.as_deref(),
+                                        sift_cache,
+                                        #[cfg(feature = "kv-cache")]
+                                        sift_store,
+                                        #[cfg(not(feature = "kv-cache"))]
+                                        _sift_kv,
+                                    )
+                                }
                             );
                             // DOMAINS: overlapping protein domain features.
                             // VEP gates DOMAINS on $pre->{coding} which requires
@@ -5046,98 +6454,120 @@ impl AnnotateProvider {
                             let is_coding =
                                 tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
                             let domains = if is_coding {
-                                lookup_domains(
-                                    tc.transcript_id.as_deref(),
-                                    tc.protein_position.as_deref(),
-                                    tc.amino_acids.as_deref(),
-                                    ctx,
+                                engine_profile_time!(
+                                    engine_profile_enabled,
+                                    engine_profile,
+                                    domains,
+                                    {
+                                        lookup_domains(
+                                            tc.transcript_id.as_deref(),
+                                            tc.protein_position.as_deref(),
+                                            tc.amino_acids.as_deref(),
+                                            ctx,
+                                        )
+                                    }
                                 )
                             } else {
                                 String::new()
                             };
                             // miRNA: ncRNA secondary structure overlap.
-                            let mirna_str = {
-                                let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
-                                // Parse cDNA position range from the "N" or "N-M" string.
-                                let (cs, ce) = tc
-                                    .cdna_position
-                                    .as_deref()
-                                    .and_then(|p| {
-                                        if let Some((a, b)) = p.split_once('-') {
-                                            Some((
-                                                a.parse::<usize>().ok()?,
-                                                b.parse::<usize>().ok()?,
-                                            ))
-                                        } else {
-                                            let v = p.parse::<usize>().ok()?;
-                                            Some((v, v))
-                                        }
-                                    })
-                                    .unwrap_or((0, 0));
-                                if cs > 0 {
-                                    mirna_structure_field(ncrna, biotype, Some(cs), Some(ce))
-                                } else {
-                                    String::new()
+                            let mirna_str = engine_profile_time!(
+                                engine_profile_enabled,
+                                engine_profile,
+                                mirna,
+                                {
+                                    let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
+                                    // Parse cDNA position range from the "N" or "N-M" string.
+                                    let (cs, ce) = tc
+                                        .cdna_position
+                                        .as_deref()
+                                        .and_then(|p| {
+                                            if let Some((a, b)) = p.split_once('-') {
+                                                Some((
+                                                    a.parse::<usize>().ok()?,
+                                                    b.parse::<usize>().ok()?,
+                                                ))
+                                            } else {
+                                                let v = p.parse::<usize>().ok()?;
+                                                Some((v, v))
+                                            }
+                                        })
+                                        .unwrap_or((0, 0));
+                                    if cs > 0 {
+                                        mirna_structure_field(ncrna, biotype, Some(cs), Some(ce))
+                                    } else {
+                                        String::new()
+                                    }
                                 }
-                            };
+                            );
                             // 80-field CSQ base layout, with optional PICK and RefSeq fields.
                             // Traceability:
                             // - VEP Constants.pm CSQ field order for --everything
                             //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
-                            let pick_field = if include_pick_output {
-                                format!("|{pick_str}")
-                            } else {
-                                String::new()
-                            };
-                            let refseq_block = if include_source_field {
-                                format!(
-                                    "|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else if include_refseq_fields {
-                                format!(
-                                    "|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else {
-                                String::new()
-                            };
                             let _ = write!(
                                 csq_buf,
                                 "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                             {existing_var}|{distance}|{strand_str}|{tc_flags}{pick_field}|\
+                             {existing_var}|{distance}|{strand_str}|{tc_flags}"
+                            );
+                            if include_pick_output {
+                                let _ = write!(csq_buf, "|{pick_str}");
+                            }
+                            let _ = write!(
+                                csq_buf,
+                                "|\
                              {variant_class}|{symbol_source}|{hgnc_id}|\
                              {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                             {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}{refseq_block}|{gene_pheno}|\
+                             {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}"
+                            );
+                            if include_source_field {
+                                let _ = write!(
+                                    csq_buf,
+                                    "|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                );
+                            } else if include_refseq_fields {
+                                let _ = write!(
+                                    csq_buf,
+                                    "|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                );
+                            }
+                            let _ = write!(
+                                csq_buf,
+                                "|{gene_pheno}|\
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
                              {batch3_suffix}|||||"
                             );
                         } else {
                             // 74-field CSQ base layout, with optional PICK and RefSeq fields.
-                            let pick_field = if include_pick_output {
-                                format!("|{pick_str}")
-                            } else {
-                                String::new()
-                            };
-                            let source_block = if include_source_field {
-                                format!(
-                                    "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else if include_refseq_fields {
-                                format!(
-                                    "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else {
-                                format!("|||||{source_val}")
-                            };
                             let _ = write!(
                                 csq_buf,
                                 "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                             {existing_var}|{distance}|{strand_str}|{tc_flags}{pick_field}|{symbol_source}|{hgnc_id}|\
-                             {source_block}|\
+                             {existing_var}|{distance}|{strand_str}|{tc_flags}"
+                            );
+                            if include_pick_output {
+                                let _ = write!(csq_buf, "|{pick_str}");
+                            }
+                            let _ = write!(csq_buf, "|{symbol_source}|{hgnc_id}|");
+                            if include_source_field {
+                                let _ = write!(
+                                    csq_buf,
+                                    "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                );
+                            } else if include_refseq_fields {
+                                let _ = write!(
+                                    csq_buf,
+                                    "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                );
+                            } else {
+                                let _ = write!(csq_buf, "|||||{source_val}");
+                            }
+                            let _ = write!(
+                                csq_buf,
+                                "|\
                              {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                              {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                              {batch3_suffix}"
@@ -5145,6 +6575,9 @@ impl AnnotateProvider {
                         }
                     }
                     if csq_buf.is_empty() {
+                        if engine_profile_enabled {
+                            engine_profile.csq_entries += 1;
+                        }
                         let impact = impact_label(SoImpact::Modifier);
                         let entry = CsqPlaceholderEntry {
                             allele: &vep_allele,
@@ -5152,26 +6585,37 @@ impl AnnotateProvider {
                             impact,
                             existing_variation: existing_var,
                             variant_class,
-                            frequency_fields: &frequency_fields,
+                            frequency_fields,
                             variant_fields: &variant_fields,
                         };
                         placeholder_layout.append_entry(&mut csq_buf, &entry);
                     }
                 } // end if !skip_csq (cache-miss CSQ formatting)
+                if let Some(started) = csq_format_started {
+                    engine_profile.csq_format += started.elapsed();
+                }
             };
 
+            let append_scalars_started = engine_profile_enabled.then(Instant::now);
             if skip_csq {
                 csq_builder.append_null();
             } else {
                 csq_builder.append_value(&csq_buf);
             }
             most_builder.append_value(&most_str);
+            if let Some(started) = append_scalars_started {
+                engine_profile.append_scalars += started.elapsed();
+            }
 
             // --- Populate structured annotation column builders for this row ---
             // Skip all typed column work when they're not in the projection.
             if skip_typed_cols {
-                append_null_annotation_row!();
+                // Typed columns are emitted as all-null arrays after the row loop.
             } else {
+                let typed_columns_started = engine_profile_enabled.then(Instant::now);
+                if engine_profile_enabled {
+                    engine_profile.typed_rows += 1;
+                }
                 // -- Transcript-level columns (42, or 43 with PICK) --
                 // Allele (scalar, same for all transcripts)
                 b_allele.append_value(&vep_allele);
@@ -5447,11 +6891,12 @@ impl AnnotateProvider {
                         if flags.everything {
                             let (sift_str, polyphen_str) = lookup_sift_polyphen(
                                 tc.transcript_id.as_deref(),
+                                tx_opt.and_then(|tx| tx.transcript_uid),
                                 tc.protein_position.as_deref(),
                                 tc.amino_acids.as_deref(),
                                 sift_cache,
                                 #[cfg(feature = "kv-cache")]
-                                sift_kv,
+                                sift_store,
                                 #[cfg(not(feature = "kv-cache"))]
                                 _sift_kv,
                             );
@@ -5662,38 +7107,35 @@ impl AnnotateProvider {
 
                 // -- Frequency columns (29) --
                 // AF columns: parse resolved frequency strings to Float32.
-                for (i, af_val) in frequency_fields.af_values.iter().enumerate() {
-                    if i < b_af.len() {
-                        if af_val.is_empty() {
-                            b_af[i].append_null();
-                        } else {
-                            match af_val.parse::<f32>() {
-                                Ok(v) => b_af[i].append_value(v),
-                                Err(_) => b_af[i].append_null(),
-                            }
+                for (i, af_b) in b_af.iter_mut().enumerate() {
+                    let af_val = frequency_fields.af_value(i);
+                    if af_val.is_empty() {
+                        af_b.append_null();
+                    } else {
+                        match af_val.parse::<f32>() {
+                            Ok(v) => af_b.append_value(v),
+                            Err(_) => af_b.append_null(),
                         }
                     }
                 }
-                // Pad any missing AF columns (if frequency_fields has fewer than 27 entries).
-                for i in frequency_fields.af_values.len()..b_af.len() {
-                    b_af[i].append_null();
-                }
                 // MAX_AF
-                if frequency_fields.max_af.is_empty() {
+                let max_af = frequency_fields.max_af();
+                if max_af.is_empty() {
                     b_max_af.append_null();
                 } else {
-                    match frequency_fields.max_af.parse::<f32>() {
+                    match max_af.parse::<f32>() {
                         Ok(v) => b_max_af.append_value(v),
                         Err(_) => b_max_af.append_null(),
                     }
                 }
                 // MAX_AF_POPS
+                let max_af_pops = frequency_fields.max_af_pops();
                 append_opt_str(
                     &mut b_max_af_pops,
-                    if frequency_fields.max_af_pops.is_empty() {
+                    if max_af_pops.is_empty() {
                         None
                     } else {
-                        Some(&frequency_fields.max_af_pops)
+                        Some(max_af_pops)
                     },
                 );
 
@@ -5837,10 +7279,14 @@ impl AnnotateProvider {
                     }
                     _ => b_dbsnp_ids.append(false),
                 }
+                if let Some(started) = typed_columns_started {
+                    engine_profile.typed_columns += started.elapsed();
+                }
             } // end if !skip_typed_cols
         } // end per-row loop
 
         // --- Build output columns ---
+        let finish_builders_started = engine_profile_enabled.then(Instant::now);
         let mut out_cols =
             Vec::with_capacity(self.vcf_field_count() + self.annotation_column_count());
         for name in self.vcf_field_names() {
@@ -5948,7 +7394,15 @@ impl AnnotateProvider {
             "annotate_vep(): output column builder order is out of sync with provider schema"
         );
 
-        Ok(RecordBatch::try_new(self.schema.clone(), out_cols)?)
+        let batch = RecordBatch::try_new(self.schema.clone(), out_cols)?;
+        if let Some(started) = finish_builders_started {
+            engine_profile.finish_builders += started.elapsed();
+            eprintln!("{}", engine_profile.summary_line());
+            if let Some(profile) = tx_engine_profile {
+                eprintln!("{}", profile.summary_line());
+            }
+        }
+        Ok(batch)
     }
 }
 
@@ -6000,8 +7454,8 @@ fn parse_sv_event_kind(value: &str) -> Option<SvEventKind> {
     }
 }
 
-/// Reconstruct `FLAGS` string from promoted boolean columns when the ordered
-/// transcript attributes are unavailable in `raw_object_json`.
+/// Reconstruct `FLAGS` string from promoted boolean columns when `flags_str`
+/// is unavailable.
 fn flags_str_from_bools(cds_start_nf: bool, cds_end_nf: bool) -> Option<String> {
     match (cds_start_nf, cds_end_nf) {
         (true, true) => Some("cds_start_NF&cds_end_NF".to_string()),
@@ -6009,28 +7463,6 @@ fn flags_str_from_bools(cds_start_nf: bool, cds_end_nf: bool) -> Option<String> 
         (false, true) => Some("cds_end_NF".to_string()),
         (false, false) => None,
     }
-}
-
-fn gene_stable_id_from_raw_object_json(raw_object_json: Option<&str>) -> Option<String> {
-    let raw_object_json = raw_object_json?;
-    let parsed: Value = serde_json::from_str(raw_object_json).ok()?;
-    let transcript = parsed.get("__value")?;
-
-    // Traceability:
-    // - Ensembl VEP release 115 groups by `transcript->{_gene_stable_id}` and
-    //   otherwise fetches the gene stable ID from the transcript's gene object
-    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L849-L851>
-    transcript
-        .get("_gene_stable_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            transcript
-                .get("_gene")
-                .and_then(|gene| gene.get("stable_id"))
-                .and_then(Value::as_str)
-        })
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 fn normalize_source_label(source: &str) -> Option<String> {
@@ -6048,25 +7480,6 @@ fn normalize_source_label(source: &str) -> Option<String> {
         value if matches!(value, "BestRefSeq" | "RefSeq" | "Gnomon") => Some("RefSeq".to_string()),
         other => Some(other.to_string()),
     }
-}
-
-fn json_unwrap_value(value: &Value) -> &Value {
-    value.get("__value").unwrap_or(value)
-}
-
-fn json_extract_seq(value: &Value) -> Option<String> {
-    let value = json_unwrap_value(value);
-    value
-        .get("seq")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            value
-                .get("primary_seq")
-                .map(json_unwrap_value)
-                .and_then(|seq| seq.get("seq"))
-                .and_then(Value::as_str)
-        })
-        .map(|seq| seq.to_ascii_uppercase())
 }
 
 fn synthesize_spliced_seq(
@@ -6100,213 +7513,6 @@ fn synthesize_spliced_seq(
         spliced_seq.push_str(seq);
     }
     (!spliced_seq.is_empty()).then_some(spliced_seq.to_ascii_uppercase())
-}
-
-fn push_unique_string(out: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
-    if seen.insert(value.to_string()) {
-        out.push(value.to_string());
-    }
-}
-
-fn parse_refseq_edit_attribute(attribute: &Value) -> Option<RefSeqEdit> {
-    let value = attribute.get("value").and_then(Value::as_str)?;
-    let parts: Vec<&str> = value.split_whitespace().collect();
-    if !matches!(parts.len(), 2 | 3) {
-        return None;
-    }
-
-    let start = parts[0].parse::<i64>().ok()?;
-    let end = parts[1].parse::<i64>().ok()?;
-    let replacement_len = (parts.len() == 3).then(|| parts[2].len());
-    let same_len_substitution = replacement_len.is_some_and(|len| end - start + 1 == len as i64);
-    let op_x_edit = attribute
-        .get("description")
-        .and_then(Value::as_str)
-        .is_some_and(|description| description.contains("op=X"));
-
-    Some(RefSeqEdit {
-        start,
-        end,
-        replacement_len,
-        skip_refseq_offset: same_len_substitution || op_x_edit,
-    })
-}
-
-fn parse_raw_cdna_mapper_segments(vef_cache: Option<&Value>) -> Vec<TranscriptCdnaMapperSegment> {
-    let Some(pairs) = vef_cache
-        .and_then(|cache| cache.get("mapper"))
-        .map(json_unwrap_value)
-        .and_then(|mapper| mapper.get("exon_coord_mapper"))
-        .map(json_unwrap_value)
-        .and_then(|mapper| mapper.get("_pair_cdna"))
-        .map(json_unwrap_value)
-        .and_then(|pairs| pairs.get("CDNA"))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-
-    let mut segments = Vec::with_capacity(pairs.len());
-    for pair in pairs {
-        let pair = json_unwrap_value(pair);
-        let Some(from) = pair.get("from").map(json_unwrap_value) else {
-            continue;
-        };
-        let Some(to) = pair.get("to").map(json_unwrap_value) else {
-            continue;
-        };
-        let Some(ori) = pair
-            .get("ori")
-            .and_then(Value::as_i64)
-            .and_then(|v| i8::try_from(v).ok())
-        else {
-            continue;
-        };
-        let Some(cdna_start) = from
-            .get("start")
-            .and_then(Value::as_i64)
-            .and_then(|v| usize::try_from(v).ok())
-        else {
-            continue;
-        };
-        let Some(cdna_end) = from
-            .get("end")
-            .and_then(Value::as_i64)
-            .and_then(|v| usize::try_from(v).ok())
-        else {
-            continue;
-        };
-        let Some(genomic_start) = to.get("start").and_then(Value::as_i64) else {
-            continue;
-        };
-        let Some(genomic_end) = to.get("end").and_then(Value::as_i64) else {
-            continue;
-        };
-        segments.push(TranscriptCdnaMapperSegment {
-            genomic_start,
-            genomic_end,
-            cdna_start,
-            cdna_end,
-            ori,
-        });
-    }
-    segments.sort_by_key(|segment| {
-        (
-            segment.genomic_start,
-            segment.genomic_end,
-            segment.cdna_start,
-        )
-    });
-    // Ensembl TranscriptMapper can encode transcript-only insertions or other
-    // complex gap semantics as multiple adjacent genomic pairs with cDNA jumps.
-    // Our current fallback only replays simple monotonic pair mappings; if the
-    // serialized mapper contains an internal cDNA discontinuity across
-    // contiguous genomic bases, keep using the exon-based fallback until we
-    // implement full Mapper gap semantics.
-    // Traceability:
-    // - Ensembl `Bio::EnsEMBL::Mapper` stores both Pair and Gap units
-    // - VEP reuses the live TranscriptMapper via `genomic2cdna`
-    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L492
-    segments
-}
-
-fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata {
-    let Ok(root) = serde_json::from_str::<Value>(raw_object_json) else {
-        return TranscriptRawMetadata::default();
-    };
-    let tx = json_unwrap_value(&root);
-    let vef_cache = tx
-        .get("_variation_effect_feature_cache")
-        .map(json_unwrap_value);
-    let display_xref_id = tx
-        .get("display_xref")
-        .map(json_unwrap_value)
-        .and_then(|xref| xref.get("display_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let source_cache = tx
-        .get("_source_cache")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && *value != "-")
-        .map(str::to_string);
-    let source = source_cache.as_deref().and_then(normalize_source_label);
-    let cdna_mapper_segments = parse_raw_cdna_mapper_segments(vef_cache);
-    let gene_hgnc_id_native = tx
-        .get("_gene_hgnc_id")
-        .or_else(|| tx.get("gene_hgnc_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let spliced_seq = tx.get("spliced_seq").and_then(json_extract_seq);
-    let five_prime_utr_seq = vef_cache
-        .and_then(|cache| cache.get("five_prime_utr"))
-        .and_then(json_extract_seq);
-    let three_prime_utr_seq = tx
-        .get("three_prime_utr")
-        .or_else(|| vef_cache.and_then(|cache| cache.get("three_prime_utr")))
-        .and_then(json_extract_seq);
-    let translateable_seq = tx
-        .get("translateable_seq")
-        .or_else(|| vef_cache.and_then(|cache| cache.get("translateable_seq")))
-        .and_then(|value| match value {
-            Value::String(seq) => Some(seq.to_ascii_uppercase()),
-            _ => json_extract_seq(value),
-        });
-
-    let mut refseq_match_codes = Vec::new();
-    let mut seen_refseq_match_codes = HashSet::new();
-    let mut flags = Vec::new();
-    let mut seen_flags = HashSet::new();
-    let mut refseq_edits = Vec::new();
-    let mut is_gencode_basic = false;
-    let mut is_gencode_primary = false;
-
-    if let Some(attributes) = tx.get("attributes").and_then(Value::as_array) {
-        for attribute in attributes {
-            let attribute = json_unwrap_value(attribute);
-            let Some(code) = attribute.get("code").and_then(Value::as_str) else {
-                continue;
-            };
-            match code {
-                "gencode_basic" => is_gencode_basic = true,
-                "gencode_primary" => is_gencode_primary = true,
-                "cds_start_NF" | "cds_end_NF" => {
-                    push_unique_string(&mut flags, &mut seen_flags, code)
-                }
-                _ if code.starts_with("rseq") => {
-                    push_unique_string(&mut refseq_match_codes, &mut seen_refseq_match_codes, code);
-                }
-                _ if code.starts_with("_rna_edit") => {
-                    if let Some(edit) = parse_refseq_edit_attribute(attribute) {
-                        refseq_edits.push(edit);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    refseq_edits.sort_by(|left, right| {
-        left.start
-            .cmp(&right.start)
-            .then(left.end.cmp(&right.end))
-            .then(left.replacement_len.cmp(&right.replacement_len))
-    });
-
-    TranscriptRawMetadata {
-        display_xref_id,
-        source,
-        source_cache,
-        gene_hgnc_id_native,
-        refseq_match: (!refseq_match_codes.is_empty()).then(|| refseq_match_codes.join("&")),
-        refseq_edits,
-        cdna_mapper_segments,
-        spliced_seq,
-        five_prime_utr_seq,
-        three_prime_utr_seq,
-        translateable_seq,
-        flags_str: (!flags.is_empty()).then(|| flags.join("&")),
-        is_gencode_basic,
-        is_gencode_primary,
-    }
 }
 
 fn row_source_is_refseq(tx: &TranscriptFeature) -> bool {
@@ -6449,18 +7655,8 @@ fn passes_transcript_selection(
     }
 }
 
-/// Parse mature miRNA genomic regions from the `raw_object_json` transcript
-/// attribute.  VEP stores miRNA cDNA coordinates in the transcript's attribute
-/// array as `{code: "miRNA", value: "42-59"}`.  We map those cDNA coords to
-/// genomic coordinates using the strand and transcript boundaries.
-///
-/// miRNA transcripts are almost always single-exon, so the mapping is trivial:
-/// - Plus strand:  `genomic = tx.start + cdna - 1`
-/// - Minus strand: `genomic_start = tx.end - cdna_end + 1`, `genomic_end = tx.end - cdna_start + 1`
-
 /// Read mature miRNA genomic regions from a promoted `List<Struct<start,end>>`
-/// column.  Returns `None` if the cell is NULL (letting the caller fall back
-/// to JSON parsing if needed).
+/// column. Returns `None` if the cell is NULL.
 fn read_mirna_regions(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<Vec<(i64, i64)>> {
     let col = batch.column(col_idx);
     if col.is_null(row) {
@@ -7266,22 +8462,12 @@ fn interval_overlaps_any(intervals: &[(i64, i64)], start: i64, end: i64) -> bool
     idx < intervals.len() && intervals[idx].0 <= end
 }
 
-/// Parse cached TranscriptMapper exon-to-cDNA pairs from serialized transcript
-/// `raw_object_json`.
-///
-/// Traceability:
-/// - Ensembl VEP `AnnotationSource::Database::Transcript::prefetch_transcript_data()`
-///   caches `mapper` on `_variation_effect_feature_cache`
-///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L333-L352>
-/// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
-///   resolves transcript positions through TranscriptMapper `genomic2cdna`
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765>
 /// Read cdna_mapper_segments from a promoted List<Struct> parquet column.
 fn cdna_mapper_segments_from_list_column(
     col: &dyn Array,
     row: usize,
 ) -> Vec<TranscriptCdnaMapperSegment> {
-    use datafusion::arrow::array::{AsArray, Int8Array, Int64Array, ListArray, StructArray};
+    use datafusion::arrow::array::{Int8Array, Int64Array, ListArray, StructArray};
 
     let list_array = col.as_any().downcast_ref::<ListArray>();
     let Some(list_array) = list_array else {
@@ -7329,6 +8515,61 @@ fn cdna_mapper_segments_from_list_column(
         });
     }
     segments
+}
+
+fn refseq_edits_from_list_column(col: &dyn Array, row: usize) -> Vec<RefSeqEdit> {
+    use datafusion::arrow::array::{BooleanArray, Int64Array, ListArray, StructArray};
+
+    let Some(list_array) = col.as_any().downcast_ref::<ListArray>() else {
+        return Vec::new();
+    };
+    if list_array.is_null(row) {
+        return Vec::new();
+    }
+    let start = list_array.value_offsets()[row] as usize;
+    let end = list_array.value_offsets()[row + 1] as usize;
+    if start == end {
+        return Vec::new();
+    }
+    let Some(struct_array) = list_array.values().as_any().downcast_ref::<StructArray>() else {
+        return Vec::new();
+    };
+    let start_col = struct_array
+        .column_by_name("start")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let end_col = struct_array
+        .column_by_name("end")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let replacement_len_col = struct_array
+        .column_by_name("replacement_len")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let skip_refseq_offset_col = struct_array
+        .column_by_name("skip_refseq_offset")
+        .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+    let (Some(start_col), Some(end_col)) = (start_col, end_col) else {
+        return Vec::new();
+    };
+
+    let mut edits = Vec::with_capacity(end - start);
+    for i in start..end {
+        if struct_array.is_null(i) || start_col.is_null(i) || end_col.is_null(i) {
+            continue;
+        }
+        let replacement_len = replacement_len_col
+            .filter(|col| col.is_valid(i))
+            .and_then(|col| usize::try_from(col.value(i)).ok());
+        let skip_refseq_offset = skip_refseq_offset_col
+            .filter(|col| col.is_valid(i))
+            .map(|col| col.value(i))
+            .unwrap_or(false);
+        edits.push(RefSeqEdit {
+            start: start_col.value(i),
+            end: end_col.value(i),
+            replacement_len,
+            skip_refseq_offset,
+        });
+    }
+    edits
 }
 
 fn apply_cds_phase_padding(existing_cds: Option<&str>, mut hydrated_cds: String) -> String {
@@ -7402,6 +8643,12 @@ pub(crate) fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
     None
 }
 
+/// Read a `transcript_uid`-style dense identity column as `u32`, accepting any
+/// integer encoding. Returns `None` for null or out-of-range values.
+pub(crate) fn uint32_at(array: &dyn Array, row: usize) -> Option<u32> {
+    int64_at(array, row).and_then(|v| u32::try_from(v).ok())
+}
+
 pub(crate) fn string_at(array: &dyn Array, row: usize) -> Option<String> {
     if array.is_null(row) {
         return None;
@@ -7470,20 +8717,90 @@ struct ContigAnnotationConfig {
     upstream_distance: i64,
     downstream_distance: i64,
     input_buffer_size: usize,
+    /// Independent cold-Parquet lookup readers; does not repartition context scans.
+    target_partitions: usize,
     projection: Option<Vec<usize>>,
     annotation_column_count: usize,
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
+    /// Maximum number of active chromosome lanes in the enclosing execution plan.
+    chromosome_lanes: usize,
+    /// Poll lookup streams inline instead of spawning lookup tasks.
+    inline_lookup: bool,
+    /// Number of parallel window workers for the annotation step within a
+    /// contig. `<= 1` keeps the serial inline path. Additive to the
+    /// partition-lookup knobs above (lookup partitioning is unchanged).
+    annotation_threads: usize,
+    /// Whether this stream owns the shared global Fjall variation table.
+    deregister_global_kv_on_finish: bool,
     pick_flags: PickFlags,
     /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
     #[cfg(feature = "kv-cache")]
     use_fjall: bool,
+    /// Root of an indexed parquet cache. When set, variation uses the warm/cold
+    /// indexed parquet lookup path and SIFT uses compact translation_sift parquet.
+    #[cfg(feature = "kv-cache")]
+    indexed_parquet_cache_root: Option<std::path::PathBuf>,
+    #[cfg(feature = "lance-cache")]
+    lance_cache_root: Option<std::path::PathBuf>,
+    #[cfg(feature = "kv-cache")]
+    indexed_variation_schema: Option<Schema>,
     /// Shared fjall KV store handle (opened once, reused across contigs).
     #[cfg(feature = "kv-cache")]
     kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
-    /// Shared fjall SIFT store (opened once, reused across contigs).
+    /// Shared transcript-id SIFT store (opened once, reused across contigs).
     #[cfg(feature = "kv-cache")]
-    sift_kv_store: Option<crate::kv_cache::SiftKvStore>,
+    sift_prediction_store: Option<SiftPredictionStoreRef>,
+    /// When `Some`, the `threads>1` path is sharded-VCF-output mode: each fused
+    /// worker serializes its annotated batches directly into its own VCF body
+    /// shard (no ordered drain / output channel). Set only by the `vcf_sink`
+    /// direct-plan entry; `None` for the normal RecordBatch-streaming path.
+    vcf_shard_ctx: Option<Arc<crate::vcf_sink::VcfShardContext>>,
+}
+
+#[derive(Clone)]
+enum PartitionedAnnotationCache {
+    Parquet(PartitionedParquetCache),
+    #[cfg(feature = "lance-cache")]
+    Lance(PartitionedLanceCache),
+}
+
+impl PartitionedAnnotationCache {
+    fn available_chroms(&self) -> Vec<String> {
+        match self {
+            Self::Parquet(cache) => cache.available_chroms().to_vec(),
+            #[cfg(feature = "lance-cache")]
+            Self::Lance(cache) => cache
+                .available_chroms()
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+        }
+    }
+
+    fn base_dir(&self) -> &std::path::Path {
+        match self {
+            Self::Parquet(cache) => cache.base_dir(),
+            #[cfg(feature = "lance-cache")]
+            Self::Lance(cache) => cache.base_dir(),
+        }
+    }
+
+    fn as_parquet(&self) -> Option<&PartitionedParquetCache> {
+        match self {
+            Self::Parquet(cache) => Some(cache),
+            #[cfg(feature = "lance-cache")]
+            Self::Lance(_) => None,
+        }
+    }
+
+    #[cfg(feature = "lance-cache")]
+    fn as_lance(&self) -> Option<&PartitionedLanceCache> {
+        match self {
+            Self::Parquet(_) => None,
+            Self::Lance(cache) => Some(cache),
+        }
+    }
 }
 
 /// Leaf `ExecutionPlan` that processes contigs one at a time via a state-machine
@@ -7491,11 +8808,11 @@ struct ContigAnnotationConfig {
 struct ContigAnnotationExec {
     projected_schema: SchemaRef,
     full_schema: SchemaRef,
-    contigs: Vec<String>,
+    contig_partitions: Vec<Vec<String>>,
     session: Arc<SessionContext>,
-    cache: Arc<PartitionedParquetCache>,
+    cache: Arc<PartitionedAnnotationCache>,
     config: ContigAnnotationConfig,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ContigAnnotationExec {
@@ -7503,20 +8820,22 @@ impl ContigAnnotationExec {
         projected_schema: SchemaRef,
         full_schema: SchemaRef,
         contigs: Vec<String>,
+        chromosome_lanes: usize,
         session: Arc<SessionContext>,
-        cache: Arc<PartitionedParquetCache>,
+        cache: Arc<PartitionedAnnotationCache>,
         config: ContigAnnotationConfig,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let contig_partitions = partition_contigs_for_execution(contigs, chromosome_lanes);
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(contig_partitions.len()),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             projected_schema,
             full_schema,
-            contigs,
+            contig_partitions,
             session,
             cache,
             config,
@@ -7529,8 +8848,9 @@ impl Debug for ContigAnnotationExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ContigAnnotationExec {{ contigs: {}, schema_fields: {} }}",
-            self.contigs.len(),
+            "ContigAnnotationExec {{ contig_partitions: {}, contigs: {}, schema_fields: {} }}",
+            self.contig_partitions.len(),
+            self.contig_partitions.iter().map(Vec::len).sum::<usize>(),
             self.projected_schema.fields().len()
         )
     }
@@ -7538,7 +8858,12 @@ impl Debug for ContigAnnotationExec {
 
 impl DisplayAs for ContigAnnotationExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ContigAnnotationExec: contigs={}", self.contigs.len())
+        write!(
+            f,
+            "ContigAnnotationExec: contig_partitions={} contigs={}",
+            self.contig_partitions.len(),
+            self.contig_partitions.iter().map(Vec::len).sum::<usize>()
+        )
     }
 }
 
@@ -7555,7 +8880,7 @@ impl ExecutionPlan for ContigAnnotationExec {
         self.projected_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -7572,18 +8897,41 @@ impl ExecutionPlan for ContigAnnotationExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let contigs = self
+            .contig_partitions
+            .get(partition)
+            .cloned()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "ContigAnnotationExec partition {partition} out of range ({} partitions)",
+                    self.contig_partitions.len()
+                ))
+            })?;
         Ok(Box::pin(ContigAnnotationStream::new(
             self.projected_schema.clone(),
             self.full_schema.clone(),
-            self.contigs.clone(),
+            contigs,
             Arc::clone(&self.session),
             Arc::clone(&self.cache),
             self.config.clone(),
         )))
     }
+}
+
+fn partition_contigs_for_execution(
+    contigs: Vec<String>,
+    requested_parallelism: usize,
+) -> Vec<Vec<String>> {
+    if contigs.is_empty() {
+        return vec![Vec::new()];
+    }
+    if requested_parallelism <= 1 {
+        return vec![contigs];
+    }
+    contigs.into_iter().map(|contig| vec![contig]).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -7594,6 +8942,8 @@ impl ExecutionPlan for ContigAnnotationExec {
 /// Each window triggers a PreparedContext rebuild (~22ms).
 /// With ~30 rows/batch: 1000 batches ≈ 30K variants per window.
 const HYDRATION_WINDOW_SIZE: usize = 1000;
+/// Number of looked-up batches each background lookup partition may buffer.
+const LOOKUP_PARTITION_QUEUE_BATCHES: usize = 2;
 /// Ensembl VEP release/115 default `buffer_size`.
 const VEP_INPUT_BUFFER_SIZE: usize = 5000;
 /// Ensembl VEP transcript cache region size (`cache_region_size`).
@@ -7607,13 +8957,534 @@ struct TranscriptCacheRegion {
 
 type PersistedBufferTranscripts =
     HashMap<TranscriptCacheRegion, HashMap<String, TranscriptFeature>>;
+type LoadedContigContext = (
+    Vec<TranscriptFeature>,
+    HashMap<String, String>,
+    Vec<ExonFeature>,
+    Vec<TranslationFeature>,
+    Vec<RegulatoryFeature>,
+    Vec<MotifFeature>,
+);
+
+#[derive(Debug, Default)]
+struct SharedContextIndexes {
+    exons_by_transcript: HashMap<String, Vec<usize>>,
+    translation_by_transcript: HashMap<String, usize>,
+}
+
+impl SharedContextIndexes {
+    fn new(exons: &[ExonFeature], translations: &[TranslationFeature]) -> Self {
+        let mut exons_by_transcript: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, exon) in exons.iter().enumerate() {
+            exons_by_transcript
+                .entry(exon.transcript_id.clone())
+                .or_default()
+                .push(idx);
+        }
+
+        let mut translation_by_transcript = HashMap::new();
+        for (idx, translation) in translations.iter().enumerate() {
+            translation_by_transcript.insert(translation.transcript_id.clone(), idx);
+        }
+
+        Self {
+            exons_by_transcript,
+            translation_by_transcript,
+        }
+    }
+
+    fn exon_indices_for_transcripts(&self, tx_ids: &HashSet<&str>) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for tx_id in tx_ids {
+            if let Some(exon_indices) = self.exons_by_transcript.get(*tx_id) {
+                indices.extend(exon_indices.iter().copied());
+            }
+        }
+        indices.sort_unstable();
+        indices
+    }
+
+    fn translation_indices_for_transcripts(&self, tx_ids: &HashSet<&str>) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for tx_id in tx_ids {
+            if let Some(idx) = self.translation_by_transcript.get(*tx_id) {
+                indices.push(*idx);
+            }
+        }
+        indices.sort_unstable();
+        indices
+    }
+}
 
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
+type SharedContigPipelineProfile = Arc<Mutex<ContigPipelineProfile>>;
+
+#[derive(Debug, Default)]
+struct ContigPipelineProfile {
+    context_load: Duration,
+    context_transcripts: Duration,
+    context_exons: Duration,
+    context_translations: Duration,
+    context_regulatory: Duration,
+    context_motifs: Duration,
+    worker_init: Duration,
+    lookup_wait: Duration,
+    hydration: Duration,
+    annotation_compute: Duration,
+    input_buffer: Duration,
+    variant_bounds: Duration,
+    transcript_window: Duration,
+    exon_filter: Duration,
+    translation_filter: Duration,
+    prepared_context: Duration,
+    sift_load: Duration,
+    engine: Duration,
+    projection: Duration,
+    send_wait: Duration,
+    ordered_drain_wait: Duration,
+    lookup_partitions: usize,
+    lookup_batches: usize,
+    lookup_buffered_batches_max: usize,
+    lookup_buffered_partitions_max: usize,
+    input_buffers: usize,
+    output_batches: usize,
+    output_rows: usize,
+}
+
+impl ContigPipelineProfile {
+    fn summary_line(&self, chrom: &str) -> String {
+        format!(
+            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} context_load={:.3}s context_tx={:.3}s context_exons={:.3}s context_tl={:.3}s context_reg={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s",
+            self.lookup_partitions,
+            self.lookup_batches,
+            self.lookup_buffered_batches_max,
+            self.lookup_buffered_partitions_max,
+            self.input_buffers,
+            self.output_batches,
+            self.output_rows,
+            self.context_load.as_secs_f64(),
+            self.context_transcripts.as_secs_f64(),
+            self.context_exons.as_secs_f64(),
+            self.context_translations.as_secs_f64(),
+            self.context_regulatory.as_secs_f64(),
+            self.context_motifs.as_secs_f64(),
+            self.worker_init.as_secs_f64(),
+            self.lookup_wait.as_secs_f64(),
+            self.hydration.as_secs_f64(),
+            self.annotation_compute.as_secs_f64(),
+            self.input_buffer.as_secs_f64(),
+            self.variant_bounds.as_secs_f64(),
+            self.transcript_window.as_secs_f64(),
+            self.exon_filter.as_secs_f64(),
+            self.translation_filter.as_secs_f64(),
+            self.prepared_context.as_secs_f64(),
+            self.sift_load.as_secs_f64(),
+            self.engine.as_secs_f64(),
+            self.projection.as_secs_f64(),
+            self.send_wait.as_secs_f64(),
+            self.ordered_drain_wait.as_secs_f64(),
+        )
+    }
+}
+
+fn record_contig_profile(
+    profile: &Option<SharedContigPipelineProfile>,
+    update: impl FnOnce(&mut ContigPipelineProfile),
+) {
+    if !profiling_enabled() {
+        return;
+    }
+    let Some(profile) = profile else {
+        return;
+    };
+    if let Ok(mut guard) = profile.lock() {
+        update(&mut guard);
+    }
+}
+
+fn emit_contig_pipeline_profile(profile: &Option<SharedContigPipelineProfile>, chrom: &str) {
+    if !profiling_enabled() {
+        return;
+    }
+    let Some(profile) = profile else {
+        return;
+    };
+    if let Ok(guard) = profile.lock() {
+        eprintln!("{}", guard.summary_line(chrom));
+    }
+}
+
+#[cfg(feature = "lance-cache")]
+async fn load_lance_contig_context(
+    cache: &PartitionedLanceCache,
+    chrom: &str,
+    config: &ContigAnnotationConfig,
+    profile: &Option<SharedContigPipelineProfile>,
+) -> Result<LoadedContigContext> {
+    let tx_batches = scan_lance_context_entity(
+        cache,
+        "transcript",
+        chrom,
+        &[
+            "transcript_id",
+            "stable_id",
+            "chrom",
+            "start",
+            "\"end\"",
+            "strand",
+            "biotype",
+            "cds_start",
+            "cds_end",
+            "cdna_coding_start",
+            "cdna_coding_end",
+            "gene_stable_id",
+            "gene_symbol",
+            "gene_symbol_source",
+            "gene_hgnc_id_native",
+            "gene_hgnc_id",
+            "source",
+            "source_cache",
+            "display_xref_id",
+            "version",
+            "cds_start_nf",
+            "cds_end_nf",
+            "mature_mirna_regions",
+            "cdna_seq",
+            "bam_edit_status",
+            "has_non_polya_rna_edit",
+            "spliced_seq",
+            "five_prime_utr_seq",
+            "three_prime_utr_seq",
+            "translateable_seq",
+            "flags_str",
+            "refseq_match",
+            "refseq_edits",
+            "is_gencode_basic",
+            "is_gencode_primary",
+            "cdna_mapper_segments",
+            "is_canonical",
+            "tsl",
+            "mane_select",
+            "mane_plus_clinical",
+            "translation_stable_id",
+            "gene_phenotype",
+            "ccds",
+            "swissprot",
+            "trembl",
+            "uniparc",
+            "uniprot_isoform",
+            "appris",
+            "ncrna_structure",
+            "transcript_uid",
+        ],
+    )
+    .await?;
+    let started = Instant::now();
+    let (tx, translateable_seq) =
+        AnnotateProvider::parse_lance_transcript_batches("transcript.lance", &tx_batches)?;
+    let tx_vec: Vec<_> = tx
+        .into_iter()
+        .filter(|t| passes_transcript_selection(t, config.transcript_selection))
+        .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_transcripts += started.elapsed();
+    });
+    let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
+
+    let ex_batches = scan_lance_context_entity(
+        cache,
+        "exon",
+        chrom,
+        &[
+            "transcript_id",
+            "stable_id",
+            "exon_number",
+            "start",
+            "\"end\"",
+            "chrom",
+        ],
+    )
+    .await?;
+    let started = Instant::now();
+    let ex: Vec<_> = AnnotateProvider::parse_lance_exon_batches("exon.lance", &ex_batches)?
+        .into_iter()
+        .filter(|exon| tx_ids.contains(&exon.transcript_id))
+        .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_exons += started.elapsed();
+    });
+
+    let tl_batches = scan_lance_context_entity(
+        cache,
+        "translation_core",
+        chrom,
+        &[
+            "transcript_id",
+            "stable_id",
+            "chrom",
+            "start",
+            "\"end\"",
+            "cds_len",
+            "cds_length",
+            "protein_len",
+            "translation_seq",
+            "cds_sequence",
+            "cds_seq",
+            "coding_sequence",
+            "translation_seq_canonical",
+            "cds_sequence_canonical",
+            "version",
+            "protein_features",
+        ],
+    )
+    .await?;
+    let started = Instant::now();
+    let tl: Vec<_> =
+        AnnotateProvider::parse_lance_translation_batches("translation_core.lance", &tl_batches)?
+            .into_iter()
+            .filter(|translation| tx_ids.contains(&translation.transcript_id))
+            .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_translations += started.elapsed();
+    });
+
+    let rg_batches = scan_lance_context_entity(
+        cache,
+        "regulatory",
+        chrom,
+        &[
+            "stable_id",
+            "feature_id",
+            "feature_type",
+            "chrom",
+            "start",
+            "\"end\"",
+        ],
+    )
+    .await?;
+    let started = Instant::now();
+    let rg = AnnotateProvider::parse_lance_regulatory_batches("regulatory.lance", &rg_batches)?;
+    record_contig_profile(profile, |profile| {
+        profile.context_regulatory += started.elapsed();
+    });
+
+    let mt_batches = scan_lance_context_entity(
+        cache,
+        "motif",
+        chrom,
+        &["motif_id", "feature_id", "chrom", "start", "\"end\""],
+    )
+    .await?;
+    let started = Instant::now();
+    let mt = AnnotateProvider::parse_lance_motif_batches("motif.lance", &mt_batches)?;
+    record_contig_profile(profile, |profile| {
+        profile.context_motifs += started.elapsed();
+    });
+
+    Ok((tx_vec, translateable_seq, ex, tl, rg, mt))
+}
+
+#[cfg(feature = "lance-cache")]
+async fn scan_lance_context_entity(
+    cache: &PartitionedLanceCache,
+    entity: &str,
+    chrom: &str,
+    columns: &[&str],
+) -> Result<Vec<RecordBatch>> {
+    let Some(path) = cache.context_path(entity, chrom) else {
+        return Ok(Vec::new());
+    };
+    crate::lance_cache::context_runtime::scan_projected_existing_columns(&path, columns).await
+}
+
+struct SharedContigAnnotationContext {
+    config: ContigAnnotationConfig,
+    profile: Option<SharedContigPipelineProfile>,
+    base_transcripts: Arc<Vec<TranscriptFeature>>,
+    base_translations: Arc<Vec<TranslationFeature>>,
+    exons: Arc<Vec<ExonFeature>>,
+    indexes: Arc<SharedContextIndexes>,
+    regulatory: Arc<Vec<RegulatoryFeature>>,
+    motifs: Arc<Vec<MotifFeature>>,
+    mirnas: Arc<Vec<MirnaFeature>>,
+    structural: Arc<Vec<StructuralFeature>>,
+    translateable_seq_by_tx: Arc<HashMap<String, String>>,
+    transcript_cache_regions: Arc<HashMap<String, Vec<TranscriptCacheRegion>>>,
+    tmp_provider: Arc<AnnotateProvider>,
+    engine: Arc<TranscriptConsequenceEngine>,
+    sift_direct: Option<Arc<SiftDirectReader>>,
+    #[cfg(feature = "kv-cache")]
+    sift_prediction_store: Option<SiftPredictionStoreRef>,
+}
+
+struct AnnotationWorkerState {
+    shared: Arc<SharedContigAnnotationContext>,
+    transcript_overrides: HashMap<String, TranscriptPartitionState>,
+    translation_overrides: HashMap<String, TranslationPartitionState>,
+    persisted_buffer_transcripts: PersistedBufferTranscripts,
+    colocated_map: Arc<HashMap<ColocatedKey, ColocatedData>>,
+    hydrated_cds_tx_ids: HashSet<String>,
+    hgvs_reader: Option<FastaReader>,
+    sift_cache: SiftPolyphenCache,
+    sift_direct: Option<Arc<SiftDirectReader>>,
+    loaded_sift_windows: HashSet<(String, i64)>,
+    input_buffer_accumulator: InputBufferAccumulator,
+    next_input_buffer_id: usize,
+    window_buffer: Vec<RecordBatch>,
+    lookup_done: bool,
+}
+
+struct LookupBatchMessage {
+    batch: RecordBatch,
+    colocated_delta: HashMap<ColocatedKey, ColocatedData>,
+    partition_id: usize,
+    batch_id: usize,
+}
+
+struct SpawnedLookupPartitionHandle {
+    partition_id: usize,
+    // Option so the threads>1 path can `.take()` the parts out (the enum has a
+    // Drop that aborts, which blocks moving fields out by pattern).
+    receiver: Option<tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>>,
+    join_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
+struct InlineLookupPartitionHandle {
+    partition_id: usize,
+    chrom: String,
+    stream: SendableRecordBatchStream,
+    sink: ColocatedSink,
+    next_batch_id: usize,
+}
+
+enum LookupPartitionHandle {
+    Spawned(SpawnedLookupPartitionHandle),
+    Inline(InlineLookupPartitionHandle),
+}
+
+impl LookupPartitionHandle {
+    fn partition_id(&self) -> usize {
+        match self {
+            LookupPartitionHandle::Spawned(handle) => handle.partition_id,
+            LookupPartitionHandle::Inline(handle) => handle.partition_id,
+        }
+    }
+
+    fn abort(&mut self) {
+        if let LookupPartitionHandle::Spawned(handle) = self {
+            if let Some(jh) = &handle.join_handle {
+                jh.abort();
+            }
+        }
+    }
+
+    /// Take a Spawned handle's (receiver, join_handle) out, leaving it empty so
+    /// its Drop won't abort the still-running lookup worker. The threads>1 path
+    /// keeps the worker alive (feeding an annotation pipeline) and aborts via
+    /// its own retained join handle. Returns None for Inline handles.
+    #[allow(clippy::type_complexity)]
+    fn take_spawned_parts(
+        &mut self,
+    ) -> Option<(
+        tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
+        if let LookupPartitionHandle::Spawned(handle) = self {
+            match (handle.receiver.take(), handle.join_handle.take()) {
+                (Some(r), Some(j)) => Some((r, j)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+}
+
+struct LookupPartitionState {
+    handle: Option<LookupPartitionHandle>,
+    ready: VecDeque<LookupBatchMessage>,
+    done_delta: Option<HashMap<ColocatedKey, ColocatedData>>,
+}
+
+impl LookupPartitionState {
+    fn new(handle: LookupPartitionHandle) -> Self {
+        Self {
+            handle: Some(handle),
+            ready: VecDeque::new(),
+            done_delta: None,
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.handle.is_none() && self.done_delta.is_some()
+    }
+}
+
+struct LookupPartitionFanIn {
+    partitions: Vec<LookupPartitionState>,
+    next_output_partition: usize,
+    queue_batches: usize,
+}
+
+impl LookupPartitionFanIn {
+    fn new(partitions: VecDeque<LookupPartitionHandle>, queue_batches: usize) -> Self {
+        let mut partitions: Vec<_> = partitions.into_iter().collect();
+        partitions.sort_by_key(LookupPartitionHandle::partition_id);
+        Self {
+            partitions: partitions
+                .into_iter()
+                .map(LookupPartitionState::new)
+                .collect(),
+            next_output_partition: 0,
+            queue_batches: queue_batches.max(1),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.partitions.len()
+    }
+
+    fn abort(&mut self) {
+        for partition in &mut self.partitions {
+            if let Some(handle) = &mut partition.handle {
+                handle.abort();
+            }
+        }
+    }
+
+    fn buffered_batch_count(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(|partition| partition.ready.len())
+            .sum()
+    }
+
+    fn buffered_partition_count(&self) -> usize {
+        self.partitions
+            .iter()
+            .filter(|partition| !partition.ready.is_empty())
+            .count()
+    }
+
+    fn has_buffered_after_next(&self) -> bool {
+        self.partitions
+            .iter()
+            .skip(self.next_output_partition.saturating_add(1))
+            .any(|partition| !partition.ready.is_empty() || partition.is_done())
+    }
+}
+
+impl Drop for LookupPartitionHandle {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
 
 #[derive(Default)]
 struct InputBufferAccumulator {
     pending_batches: VecDeque<RecordBatch>,
     pending_rows: usize,
+    pending_input_units: usize,
 }
 
 impl InputBufferAccumulator {
@@ -7621,73 +9492,216 @@ impl InputBufferAccumulator {
         self.pending_rows
     }
 
+    fn has_ready_input_buffer(&self, input_unit_limit: usize) -> bool {
+        self.pending_input_units >= input_unit_limit.max(1)
+    }
+
+    fn ready_input_buffer_count(&self, input_unit_limit: usize) -> usize {
+        self.ready_input_buffer_count_with_batches(input_unit_limit, &[])
+    }
+
+    fn ready_input_buffer_count_with_batches(
+        &self,
+        input_unit_limit: usize,
+        additional_batches: &[RecordBatch],
+    ) -> usize {
+        count_ready_input_buffers(
+            self.pending_batches.iter().chain(additional_batches.iter()),
+            input_unit_limit,
+        )
+    }
+
     fn push_window_and_drain_ready(
         &mut self,
         batches: Vec<RecordBatch>,
-        row_limit: usize,
+        input_unit_limit: usize,
         flush_partial: bool,
+    ) -> Vec<Vec<RecordBatch>> {
+        self.push_window_and_drain_ready_limited(
+            batches,
+            input_unit_limit,
+            flush_partial,
+            usize::MAX,
+        )
+    }
+
+    fn push_window_and_drain_ready_limited(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        input_unit_limit: usize,
+        flush_partial: bool,
+        max_ready_buffers: usize,
     ) -> Vec<Vec<RecordBatch>> {
         for batch in batches {
             let rows = batch.num_rows();
             if rows == 0 {
                 continue;
             }
+            let input_units = batch_input_units(&batch);
             self.pending_rows += rows;
+            self.pending_input_units += input_units;
             self.pending_batches.push_back(batch);
         }
 
-        let row_limit = row_limit.max(1);
+        let input_unit_limit = input_unit_limit.max(1);
+        let max_ready_buffers = max_ready_buffers.max(1);
         let mut ready = Vec::new();
-        while self.pending_rows >= row_limit {
-            ready.push(self.drain_rows(row_limit));
+        while self.pending_input_units >= input_unit_limit && ready.len() < max_ready_buffers {
+            ready.push(self.drain_input_units(input_unit_limit));
         }
-        if flush_partial && self.pending_rows > 0 {
-            ready.push(self.drain_rows(self.pending_rows));
+        if flush_partial && self.pending_rows > 0 && ready.len() < max_ready_buffers {
+            ready.push(self.drain_input_units(self.pending_input_units));
         }
         ready
     }
 
-    fn drain_rows(&mut self, rows: usize) -> Vec<RecordBatch> {
-        debug_assert!(rows > 0);
-        debug_assert!(rows <= self.pending_rows);
+    fn drain_input_units(&mut self, input_units: usize) -> Vec<RecordBatch> {
+        debug_assert!(input_units > 0);
+        debug_assert!(input_units <= self.pending_input_units);
 
-        let mut remaining = rows;
+        let mut remaining_units = input_units;
+        let mut drained_rows = 0usize;
+        let mut drained_units = 0usize;
         let mut drained = Vec::new();
-        while remaining > 0 {
+        while remaining_units > 0 {
             let batch = self
                 .pending_batches
                 .pop_front()
                 .expect("pending row count must match pending batches");
             let batch_rows = batch.num_rows();
-            if batch_rows <= remaining {
-                remaining -= batch_rows;
+            let batch_units = batch_input_units(&batch);
+            if batch_units <= remaining_units {
+                remaining_units -= batch_units;
+                drained_rows += batch_rows;
+                drained_units += batch_units;
                 drained.push(batch);
             } else {
-                drained.push(batch.slice(0, remaining));
+                let (take_rows, take_units) = rows_covering_input_units(&batch, remaining_units);
+                debug_assert!(take_rows > 0);
+                debug_assert!(take_rows <= batch_rows);
+                drained.push(batch.slice(0, take_rows));
                 self.pending_batches
-                    .push_front(batch.slice(remaining, batch_rows - remaining));
-                remaining = 0;
+                    .push_front(batch.slice(take_rows, batch_rows - take_rows));
+                drained_rows += take_rows;
+                drained_units += take_units;
+                remaining_units = remaining_units.saturating_sub(take_units);
             }
         }
 
-        self.pending_rows -= rows;
+        self.pending_rows -= drained_rows;
+        self.pending_input_units -= drained_units;
         drained
     }
+}
+
+enum AltColumnView<'a> {
+    Utf8(&'a StringArray),
+    Utf8View(&'a StringViewArray),
+    LargeUtf8(&'a LargeStringArray),
+}
+
+impl<'a> AltColumnView<'a> {
+    fn from_batch(batch: &'a RecordBatch) -> Option<Self> {
+        let idx = batch.schema().index_of("alt").ok()?;
+        let col = batch.column(idx);
+        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+            Some(Self::Utf8(arr))
+        } else if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+            Some(Self::Utf8View(arr))
+        } else {
+            col.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .map(Self::LargeUtf8)
+        }
+    }
+
+    fn input_units_at(&self, row: usize) -> usize {
+        let value = match self {
+            Self::Utf8(arr) => {
+                if arr.is_null(row) {
+                    return 1;
+                }
+                arr.value(row)
+            }
+            Self::Utf8View(arr) => {
+                if arr.is_null(row) {
+                    return 1;
+                }
+                arr.value(row)
+            }
+            Self::LargeUtf8(arr) => {
+                if arr.is_null(row) {
+                    return 1;
+                }
+                arr.value(row)
+            }
+        };
+        alt_input_units(value)
+    }
+}
+
+fn alt_input_units(alt: &str) -> usize {
+    let alt = alt.trim();
+    if alt.is_empty() || alt == "." {
+        return 1;
+    }
+    alt.split([',', '|'])
+        .filter(|allele| !allele.is_empty() && *allele != ".")
+        .count()
+        .max(1)
+}
+
+fn batch_input_units(batch: &RecordBatch) -> usize {
+    // VEP's buffer_size is applied to parsed VariationFeatures, so a
+    // multi-allelic VCF row contributes one input unit per ALT allele.
+    let Some(alts) = AltColumnView::from_batch(batch) else {
+        return batch.num_rows();
+    };
+    (0..batch.num_rows())
+        .map(|row| alts.input_units_at(row))
+        .sum()
+}
+
+fn count_ready_input_buffers<'a>(
+    batches: impl Iterator<Item = &'a RecordBatch>,
+    input_unit_limit: usize,
+) -> usize {
+    let input_unit_limit = input_unit_limit.max(1);
+    let mut ready = 0usize;
+    let mut units = 0usize;
+    for batch in batches {
+        let alts = AltColumnView::from_batch(batch);
+        for row in 0..batch.num_rows() {
+            units += alts.as_ref().map_or(1, |alts| alts.input_units_at(row));
+            if units >= input_unit_limit {
+                ready += 1;
+                units = 0;
+            }
+        }
+    }
+    ready
+}
+
+fn rows_covering_input_units(batch: &RecordBatch, input_units: usize) -> (usize, usize) {
+    let Some(alts) = AltColumnView::from_batch(batch) else {
+        let rows = input_units.min(batch.num_rows());
+        return (rows, rows);
+    };
+
+    let mut rows = 0usize;
+    let mut units = 0usize;
+    while rows < batch.num_rows() && units < input_units {
+        units += alts.input_units_at(rows);
+        rows += 1;
+    }
+    (rows, units)
 }
 
 /// Everything needed to start streaming annotation for a contig.
 /// Produced by `prepare_contig_context()`.
 struct ContigReadyState {
-    lookup_stream: SendableRecordBatchStream,
-    coloc_sink: ColocatedSink,
-    transcripts: Vec<TranscriptFeature>,
-    translateable_seq_by_tx: HashMap<String, String>,
-    exons: Vec<ExonFeature>,
-    translations: Vec<TranslationFeature>,
-    regulatory: Vec<RegulatoryFeature>,
-    motifs: Vec<MotifFeature>,
-    mirnas: Vec<MirnaFeature>,
-    structural: Vec<StructuralFeature>,
+    lookup_partitions: VecDeque<LookupPartitionHandle>,
+    shared_context: Arc<SharedContigAnnotationContext>,
     ephemeral_tables: Vec<String>,
     chrom: String,
     t_contig: Instant,
@@ -7695,60 +9709,137 @@ struct ContigReadyState {
 
 /// Mutable annotation state for window-based streaming within a single contig.
 struct ContigAnnotationState {
-    /// Dropped after exhaustion to reclaim BuildSide memory (COITrees, hash
-    /// indices, concatenated VCF batch).
-    lookup_stream: Option<SendableRecordBatchStream>,
-    // Context data (transcripts/translations mutated by HGVS hydration).
-    transcripts: Vec<TranscriptFeature>,
-    translateable_seq_by_tx: HashMap<String, String>,
-    exons: Vec<ExonFeature>,
-    translations: Vec<TranslationFeature>,
-    regulatory: Vec<RegulatoryFeature>,
-    motifs: Vec<MotifFeature>,
-    mirnas: Vec<MirnaFeature>,
-    structural: Vec<StructuralFeature>,
-    transcript_cache_regions: HashMap<String, Vec<TranscriptCacheRegion>>,
-    persisted_buffer_transcripts: PersistedBufferTranscripts,
-    // Colocated (built lazily from sink on first window).
-    colocated_map: HashMap<ColocatedKey, ColocatedData>,
-    colocated_map_built: bool,
-    coloc_sink: ColocatedSink,
-    // HGVS hydration tracking — already-hydrated transcripts are skipped.
-    hydrated_cds_tx_ids: HashSet<String>,
-    hgvs_reader: Option<FastaReader>,
-    // SIFT state (same sliding-window pattern as before).
-    sift_cache: SiftPolyphenCache,
-    sift_direct: Option<SiftDirectReader>,
-    loaded_sift_windows: HashSet<(String, i64)>,
-    /// Fjall-backed SIFT store for lazy per-transcript lookups (used when use_fjall=true).
-    #[cfg(feature = "kv-cache")]
-    sift_kv: Option<crate::kv_cache::SiftKvStore>,
-    // Annotation engine + provider.
-    tmp_provider: AnnotateProvider,
-    engine: TranscriptConsequenceEngine,
-    // Window buffer.
-    window_buffer: Vec<RecordBatch>,
-    input_buffer_accumulator: InputBufferAccumulator,
-    lookup_done: bool,
+    lookup_partitions: LookupPartitionFanIn,
+    worker: AnnotationWorkerState,
     // Cleanup + profiling.
     ephemeral_tables: Vec<String>,
     chrom: String,
     config: ContigAnnotationConfig,
     session: Arc<SessionContext>,
-    cache: Arc<PartitionedParquetCache>,
     t_contig: Instant,
     contig_rows: usize,
+    lookup_wait_started: Option<Instant>,
+    ordered_lookup_wait_started: Option<Instant>,
+    /// In-flight fused window-annotation tasks, FIFO (= window/output order).
+    /// Up to `config.annotation_threads` run concurrently on the blocking pool.
+    inflight: VecDeque<tokio::task::JoinHandle<Result<VecDeque<RecordBatch>>>>,
+}
+
+/// State for the threads>1 path: N independent per-partition fused pipelines,
+/// drained in partition-id order (= position order). No central poll loop /
+/// cumulative colocated map.
+/// State for the `threads>1` sharded-VCF-output path: N fused workers each
+/// stream their annotated batches directly into their own position-ordered VCF
+/// body shard (no ordered drain, no output channel). The stream drives
+/// `join_fut` to completion (all shards written + flushed) and yields no row
+/// batches — the VCF body lives in the shard files, assembled by `vcf_sink`.
+struct ParallelContigState {
+    /// Resolves when every shard worker has finished (Ok = total output rows
+    /// across the contig's shards). The workers' `JoinHandle`s live inside this
+    /// future; `abort_handles` is used to abort them on the error path while the
+    /// future is still held.
+    join_fut: ShardJoinFuture,
+    /// Abort handles for the shard workers (error / drop cleanup).
+    abort_handles: Vec<tokio::task::AbortHandle>,
+    /// Per-partition lookup worker tasks (aborted on cleanup).
+    lookup_join: Vec<tokio::task::JoinHandle<Result<()>>>,
+    ephemeral_tables: Vec<String>,
+    chrom: String,
+    config: ContigAnnotationConfig,
+    session: Arc<SessionContext>,
+    t_contig: Instant,
+    shared: Arc<SharedContigAnnotationContext>,
+}
+
+impl ParallelContigState {
+    fn abort(&mut self) {
+        for h in &self.abort_handles {
+            h.abort();
+        }
+        for h in &self.lookup_join {
+            h.abort();
+        }
+    }
+}
+
+/// Copy-on-write transcript: the same borrowed-or-owned shape as
+/// `std::borrow::Cow`, but the `Borrowed` arm stores an *index* into
+/// `SharedContigAnnotationContext::base_transcripts` instead of a reference, so
+/// the value owns no lifetime and can be stored in `BufferAnnotationContext`.
+/// `Borrowed` = no clone, geometry cache shared with the base instance;
+/// `Owned` = a clone mutated by buffer-local HGNC propagation / partition
+/// overrides. Replaces the former unconditional `Vec<TranscriptFeature>` clone
+/// of every in-range transcript.
+enum CowTranscript {
+    Borrowed(usize),
+    Owned(Box<TranscriptFeature>),
+}
+
+impl CowTranscript {
+    /// Resolve to a borrowed transcript, indexing into `base` for `Borrowed`.
+    /// Like `Cow::as_ref`, but resolves the index against `base` rather than
+    /// dereferencing a stored reference.
+    fn as_ref<'a>(&'a self, base: &'a [TranscriptFeature]) -> &'a TranscriptFeature {
+        match self {
+            CowTranscript::Borrowed(idx) => &base[*idx],
+            CowTranscript::Owned(tx) => tx,
+        }
+    }
+
+    fn transcript_id<'a>(&'a self, base: &'a [TranscriptFeature]) -> &'a str {
+        self.as_ref(base).transcript_id.as_str()
+    }
+
+    /// Get a mutable transcript, converting `Borrowed` -> `Owned` (one clone
+    /// from `base`) on first call. Idempotent for an already-`Owned` value.
+    /// Mirrors `Cow::to_mut`.
+    fn to_mut(&mut self, base: &[TranscriptFeature]) -> &mut TranscriptFeature {
+        if let CowTranscript::Borrowed(idx) = self {
+            *self = CowTranscript::Owned(Box::new(base[*idx].clone()));
+        }
+        match self {
+            CowTranscript::Owned(tx) => tx,
+            CowTranscript::Borrowed(_) => unreachable!("converted to Owned above"),
+        }
+    }
+
+    /// Materialize into an owned `TranscriptFeature` (clones a `Borrowed`).
+    /// Mirrors `Cow::into_owned`. Used only by the owned-returning test wrapper
+    /// `build_*_local_transcripts`.
+    fn into_owned(self, base: &[TranscriptFeature]) -> TranscriptFeature {
+        match self {
+            CowTranscript::Borrowed(idx) => base[idx].clone(),
+            CowTranscript::Owned(tx) => *tx,
+        }
+    }
+}
+
+struct BufferAnnotationContext {
+    transcripts: Vec<CowTranscript>,
+    exon_indices: Vec<usize>,
+    translation_indices: Vec<usize>,
+    translation_overrides: HashMap<String, TranslationPartitionState>,
 }
 
 type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>>> + Send>>;
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+/// Resolves when all `threads>1` shard workers for a contig have finished,
+/// yielding the total output-row count (or the first worker error).
+type ShardJoinFuture = Pin<Box<dyn Future<Output = Result<usize>> + Send>>;
 
 enum StreamState {
     StartContig,
     /// Async setup: register tables, parallel context load + lookup stream creation.
     PreparingContig(PrepareFuture),
-    /// Pull from lookup stream, accumulate windows, hydrate + annotate.
+    /// Pull from lookup stream, accumulate windows, dispatch fused window tasks.
     AnnotatingContig(ContigAnnotationState),
+    /// threads>1: drain N independent per-partition pipelines in partition order.
+    AnnotatingParallel(ParallelContigState),
+    /// Await the oldest in-flight fused window task (FIFO preserves output order).
+    AwaitingWindow {
+        handle: tokio::task::JoinHandle<Result<VecDeque<RecordBatch>>>,
+        annotation_state: ContigAnnotationState,
+    },
     /// Yield annotated batches from the current window, then resume annotation.
     DrainingWindow {
         batches: VecDeque<RecordBatch>,
@@ -7780,16 +9871,313 @@ fn deregister_tables_sync(session: &SessionContext, tables: &[String]) {
     }
 }
 
+fn spawn_lookup_partition_worker(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+    partition_id: usize,
+    chrom: String,
+    sink: ColocatedSink,
+    queue_batches: usize,
+    profile: Option<SharedContigPipelineProfile>,
+) -> LookupPartitionHandle {
+    let (sender, receiver) = tokio::sync::mpsc::channel(queue_batches.max(1));
+    let join_handle = tokio::spawn(async move {
+        let mut stream = plan.execute(partition_id, task_ctx)?;
+        let mut next_batch_id = 0usize;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            let colocated_delta = drain_colocated_sink(&sink)?;
+            let rows = batch.num_rows();
+            let batch_id = next_batch_id;
+            next_batch_id += 1;
+            pipeline_trace::emit(
+                "lookup",
+                "ready",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("partition_id", TraceValue::Usize(partition_id)),
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(rows)),
+                    ("colocated_delta", TraceValue::Usize(colocated_delta.len())),
+                ],
+            );
+            let send_started = profiling_enabled().then(Instant::now);
+            let send_result = sender
+                .send(Ok(LookupBatchMessage {
+                    batch,
+                    colocated_delta,
+                    partition_id,
+                    batch_id,
+                }))
+                .await;
+            if let Some(started) = send_started {
+                record_contig_profile(&profile, |profile| {
+                    profile.send_wait += started.elapsed();
+                });
+            }
+            if send_result.is_err() {
+                return Ok(());
+            }
+        }
+
+        let colocated_delta = drain_colocated_sink(&sink)?;
+        if !colocated_delta.is_empty() {
+            let send_started = profiling_enabled().then(Instant::now);
+            let send_result = sender
+                .send(Ok(LookupBatchMessage {
+                    batch: RecordBatch::new_empty(plan.schema()),
+                    colocated_delta,
+                    partition_id,
+                    batch_id: next_batch_id,
+                }))
+                .await;
+            if let Some(started) = send_started {
+                record_contig_profile(&profile, |profile| {
+                    profile.send_wait += started.elapsed();
+                });
+            }
+            let _ = send_result;
+        }
+        Ok(())
+    });
+
+    LookupPartitionHandle::Spawned(SpawnedLookupPartitionHandle {
+        partition_id,
+        receiver: Some(receiver),
+        join_handle: Some(join_handle),
+    })
+}
+
+fn spawn_lookup_stream_worker(
+    mut stream: SendableRecordBatchStream,
+    schema: SchemaRef,
+    chrom: String,
+    sink: ColocatedSink,
+    queue_batches: usize,
+    profile: Option<SharedContigPipelineProfile>,
+) -> LookupPartitionHandle {
+    let (sender, receiver) = tokio::sync::mpsc::channel(queue_batches.max(1));
+    let join_handle = tokio::spawn(async move {
+        let partition_id = 0usize;
+        let mut next_batch_id = 0usize;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            let colocated_delta = drain_colocated_sink(&sink)?;
+            let rows = batch.num_rows();
+            let batch_id = next_batch_id;
+            next_batch_id += 1;
+            pipeline_trace::emit(
+                "lookup",
+                "ready",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("partition_id", TraceValue::Usize(partition_id)),
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(rows)),
+                    ("colocated_delta", TraceValue::Usize(colocated_delta.len())),
+                ],
+            );
+            let send_started = profiling_enabled().then(Instant::now);
+            let send_result = sender
+                .send(Ok(LookupBatchMessage {
+                    batch,
+                    colocated_delta,
+                    partition_id,
+                    batch_id,
+                }))
+                .await;
+            if let Some(started) = send_started {
+                record_contig_profile(&profile, |profile| {
+                    profile.send_wait += started.elapsed();
+                });
+            }
+            if send_result.is_err() {
+                return Ok(());
+            }
+        }
+
+        let colocated_delta = drain_colocated_sink(&sink)?;
+        if !colocated_delta.is_empty() {
+            let send_started = profiling_enabled().then(Instant::now);
+            let send_result = sender
+                .send(Ok(LookupBatchMessage {
+                    batch: RecordBatch::new_empty(schema),
+                    colocated_delta,
+                    partition_id,
+                    batch_id: next_batch_id,
+                }))
+                .await;
+            if let Some(started) = send_started {
+                record_contig_profile(&profile, |profile| {
+                    profile.send_wait += started.elapsed();
+                });
+            }
+            let _ = send_result;
+        }
+        Ok(())
+    });
+
+    LookupPartitionHandle::Spawned(SpawnedLookupPartitionHandle {
+        partition_id: 0,
+        receiver: Some(receiver),
+        join_handle: Some(join_handle),
+    })
+}
+
+/// Per-partition fused worker (threads>1 path): consume ONE lookup partition's
+/// stream into a LOCAL colocated map (never shared → `Arc::make_mut` never
+/// deep-clones) and annotate windows INLINE (`block_in_place`), streaming
+/// annotated batches. N of these run concurrently with no central poll-loop,
+/// no cumulative colocated map, and no `AwaitingWindow` block. Output of
+/// partition i is drained in id order (= position order, contiguous ranges).
+/// `threads>1` sharded-output worker: drains its lookup partition, annotates
+/// full windows inline (same fused lookup→hydrate→annotate pipeline as before),
+/// and streams each annotated batch directly into its own VCF body shard via
+/// [`crate::vcf_sink::VcfBodyShardWriter`] — no output channel, no ordered
+/// drain. Returns the number of output rows written (for contig row
+/// accounting). On error the shard may be left partially written; the
+/// orchestrator aborts the sibling workers and surfaces the error before any
+/// concat, so no partial shard is ever assembled.
+fn spawn_annotation_from_lookup_sharded(
+    shared: Arc<SharedContigAnnotationContext>,
+    mut lookup_rx: tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
+    cache_source_type: CacheSourceType,
+    projection: Option<Vec<usize>>,
+    input_buffer_size: usize,
+    shard_ctx: Arc<crate::vcf_sink::VcfShardContext>,
+    shard_path: std::path::PathBuf,
+) -> tokio::task::JoinHandle<Result<usize>> {
+    tokio::spawn(async move {
+        let mut worker = AnnotationWorkerState::new(shared)?;
+        let mut shard = crate::vcf_sink::VcfBodyShardWriter::create(
+            &shard_path,
+            Arc::clone(&shard_ctx.vcf_info_fields),
+            Arc::clone(&shard_ctx.unique_format_tags),
+            Arc::clone(&shard_ctx.sample_names),
+            shard_ctx.coordinate_zero_based,
+        )?;
+        let mut buf_rows = 0usize;
+        // Drain lookup → local colocated map → annotate full windows inline →
+        // format + write to the shard (all on the blocking thread).
+        while let Some(msg) = lookup_rx.recv().await {
+            let msg = msg?;
+            merge_colocated_delta(&mut worker.colocated_map, msg.colocated_delta);
+            let rows = msg.batch.num_rows();
+            if rows > 0 {
+                buf_rows += rows;
+                worker.window_buffer.push(msg.batch);
+            }
+            if buf_rows >= input_buffer_size {
+                let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
+                buf_rows = 0;
+                tokio::task::block_in_place(|| -> Result<()> {
+                    hydrate_worker_window(&mut worker, &window, cache_source_type)?;
+                    let out = annotate_worker_window(&mut worker, &window, projection.as_deref())?;
+                    for b in out {
+                        shard.write_batch(b)?;
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        // Final flush: lookup closed → annotate the remaining partial window.
+        worker.lookup_done = true;
+        let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
+        tokio::task::block_in_place(|| -> Result<()> {
+            if !window.is_empty() {
+                hydrate_worker_window(&mut worker, &window, cache_source_type)?;
+            }
+            let out = annotate_worker_window(&mut worker, &window, projection.as_deref())?;
+            for b in out {
+                shard.write_batch(b)?;
+            }
+            Ok(())
+        })?;
+        let rows = shard.input_rows;
+        shard.finish()?;
+        Ok(rows)
+    })
+}
+
+fn inline_lookup_partition(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+    partition_id: usize,
+    chrom: String,
+    sink: ColocatedSink,
+) -> Result<LookupPartitionHandle> {
+    let stream = plan.execute(partition_id, task_ctx)?;
+    Ok(LookupPartitionHandle::Inline(InlineLookupPartitionHandle {
+        partition_id,
+        chrom,
+        stream,
+        sink,
+        next_batch_id: 0,
+    }))
+}
+
+fn abort_lookup_partitions(partitions: &mut VecDeque<LookupPartitionHandle>) {
+    for mut handle in partitions.drain(..) {
+        handle.abort();
+    }
+}
+
+fn abort_annotation_lookup_partitions(ann: &mut ContigAnnotationState) {
+    ann.lookup_partitions.abort();
+}
+
+impl AnnotationWorkerState {
+    fn new(shared: Arc<SharedContigAnnotationContext>) -> Result<Self> {
+        let init_started = Instant::now();
+        let profile = shared.profile.clone();
+        let hgvs_reader = shared
+            .config
+            .reference_fasta_path
+            .as_deref()
+            .and_then(|path| {
+                fasta::io::indexed_reader::Builder::default()
+                    .build_from_path(path)
+                    .ok()
+            });
+        let sift_direct = shared.sift_direct.clone();
+
+        let state = Self {
+            shared,
+            transcript_overrides: HashMap::new(),
+            translation_overrides: HashMap::new(),
+            persisted_buffer_transcripts: HashMap::new(),
+            colocated_map: Arc::new(HashMap::new()),
+            hydrated_cds_tx_ids: HashSet::new(),
+            hgvs_reader,
+            sift_cache: SiftPolyphenCache::new(),
+            sift_direct,
+            loaded_sift_windows: HashSet::new(),
+            input_buffer_accumulator: InputBufferAccumulator::default(),
+            next_input_buffer_id: 0,
+            window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
+            lookup_done: false,
+        };
+        record_contig_profile(&profile, |profile| {
+            profile.worker_init += init_started.elapsed();
+        });
+        Ok(state)
+    }
+}
+
 struct ContigAnnotationStream {
     projected_schema: SchemaRef,
     full_schema: SchemaRef,
     contigs: VecDeque<String>,
     session: Arc<SessionContext>,
-    cache: Arc<PartitionedParquetCache>,
+    cache: Arc<PartitionedAnnotationCache>,
     config: ContigAnnotationConfig,
     state: StreamState,
     /// Rows emitted so far (for LIMIT pushdown).
     rows_emitted: usize,
+    /// Next global, position-ordered VCF body shard id (contig-major,
+    /// worker-minor) for the `threads>1` sharded-output path. Monotonic across
+    /// contigs so `vcf_sink` concatenates shards in ascending = position order.
+    next_global_shard_id: usize,
 }
 
 impl ContigAnnotationStream {
@@ -7798,7 +10186,7 @@ impl ContigAnnotationStream {
         full_schema: SchemaRef,
         contigs: Vec<String>,
         session: Arc<SessionContext>,
-        cache: Arc<PartitionedParquetCache>,
+        cache: Arc<PartitionedAnnotationCache>,
         config: ContigAnnotationConfig,
     ) -> Self {
         Self {
@@ -7810,14 +10198,16 @@ impl ContigAnnotationStream {
             config,
             state: StreamState::StartContig,
             rows_emitted: 0,
+            next_global_shard_id: 0,
         }
     }
 
     fn cleanup_registered_tables_on_drop(&mut self) {
         match &mut self.state {
             StreamState::AnnotatingContig(ann) => {
+                abort_annotation_lookup_partitions(ann);
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
-                if ann.config.use_fjall {
+                if ann.config.use_fjall && ann.config.deregister_global_kv_on_finish {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
                 }
                 ann.ephemeral_tables.clear();
@@ -7825,15 +10215,28 @@ impl ContigAnnotationStream {
             StreamState::DrainingWindow {
                 annotation_state: ann,
                 ..
+            }
+            | StreamState::AwaitingWindow {
+                annotation_state: ann,
+                ..
             } => {
+                abort_annotation_lookup_partitions(ann);
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
-                if ann.config.use_fjall {
+                if ann.config.use_fjall && ann.config.deregister_global_kv_on_finish {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
                 }
                 ann.ephemeral_tables.clear();
             }
+            StreamState::AnnotatingParallel(state) => {
+                state.abort();
+                deregister_tables_sync(&state.session, &state.ephemeral_tables);
+                if state.config.use_fjall && state.config.deregister_global_kv_on_finish {
+                    let _ = state.session.deregister_table("__vep_kv_variation");
+                }
+                state.ephemeral_tables.clear();
+            }
             StreamState::CleaningUp(_) | StreamState::ErrorCleaningUp(_, _) => {
-                if self.config.use_fjall {
+                if self.config.use_fjall && self.config.deregister_global_kv_on_finish {
                     let _ = self.session.deregister_table("__vep_kv_variation");
                 }
             }
@@ -7841,7 +10244,7 @@ impl ContigAnnotationStream {
             | StreamState::PreparingContig(_)
             | StreamState::FinalCleanup(_)
             | StreamState::Done => {
-                if self.config.use_fjall {
+                if self.config.use_fjall && self.config.deregister_global_kv_on_finish {
                     let _ = self.session.deregister_table("__vep_kv_variation");
                 }
             }
@@ -7918,6 +10321,336 @@ fn hydrate_window(
             hydrated_cds_tx_ids.len()
         );
     }
+    Ok(())
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TranscriptPartitionState {
+    refseq_edits: Vec<RefSeqEdit>,
+    spliced_seq: Option<String>,
+    five_prime_utr_seq: Option<String>,
+    three_prime_utr_seq: Option<String>,
+    translateable_seq: Option<String>,
+    cdna_seq: Option<String>,
+}
+
+impl TranscriptPartitionState {
+    fn from_transcript(tx: &TranscriptFeature) -> Self {
+        Self {
+            refseq_edits: tx.refseq_edits.clone(),
+            spliced_seq: tx.spliced_seq.clone(),
+            five_prime_utr_seq: tx.five_prime_utr_seq.clone(),
+            three_prime_utr_seq: tx.three_prime_utr_seq.clone(),
+            translateable_seq: tx.translateable_seq.clone(),
+            cdna_seq: tx.cdna_seq.clone(),
+        }
+    }
+
+    fn apply_to(&self, tx: &mut TranscriptFeature) {
+        tx.refseq_edits = self.refseq_edits.clone();
+        tx.spliced_seq = self.spliced_seq.clone();
+        tx.five_prime_utr_seq = self.five_prime_utr_seq.clone();
+        tx.three_prime_utr_seq = self.three_prime_utr_seq.clone();
+        tx.translateable_seq = self.translateable_seq.clone();
+        tx.cdna_seq = self.cdna_seq.clone();
+    }
+}
+
+fn apply_partition_transcript_overrides(
+    transcripts: &mut [TranscriptFeature],
+    overrides: &HashMap<String, TranscriptPartitionState>,
+) {
+    for tx in transcripts {
+        let Some(override_state) = overrides.get(&tx.transcript_id) else {
+            continue;
+        };
+        override_state.apply_to(tx);
+    }
+}
+
+/// CoW variant for the production buffer path: applies partition overrides to
+/// `Vec<CowTranscript>`, converting only the overridden transcripts to `Owned`.
+fn apply_partition_transcript_overrides_cow(
+    transcripts: &mut [CowTranscript],
+    base: &[TranscriptFeature],
+    overrides: &HashMap<String, TranscriptPartitionState>,
+) {
+    for bt in transcripts {
+        let Some(override_state) = overrides.get(bt.transcript_id(base)) else {
+            continue;
+        };
+        override_state.apply_to(bt.to_mut(base));
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TranslationPartitionState {
+    cds_sequence: Option<String>,
+}
+
+impl TranslationPartitionState {
+    fn from_translation(translation: &TranslationFeature) -> Self {
+        Self {
+            cds_sequence: translation.cds_sequence.clone(),
+        }
+    }
+
+    fn apply_to(&self, translation: &mut TranslationFeature) {
+        translation.cds_sequence = self.cds_sequence.clone();
+    }
+}
+
+fn apply_partition_translation_override(
+    translation: &mut TranslationFeature,
+    override_state: &TranslationPartitionState,
+) {
+    override_state.apply_to(translation);
+}
+
+fn materialize_buffer_translations(
+    base_translations: &[TranslationFeature],
+    overrides: &HashMap<String, TranslationPartitionState>,
+    buffer_tx_ids: &HashSet<&str>,
+) -> Vec<TranslationFeature> {
+    base_translations
+        .iter()
+        .filter(|translation| buffer_tx_ids.contains(translation.transcript_id.as_str()))
+        .map(|translation| {
+            let mut translation = translation.clone();
+            if let Some(override_state) = overrides.get(&translation.transcript_id) {
+                apply_partition_translation_override(&mut translation, override_state);
+            }
+            translation
+        })
+        .collect()
+}
+
+fn prepare_buffer_annotation_context(
+    worker: &mut AnnotationWorkerState,
+    buffer_batches: &[RecordBatch],
+    chrom: &str,
+    min_start: i64,
+    max_end: i64,
+) -> Result<BufferAnnotationContext> {
+    let shared = Arc::clone(&worker.shared);
+    let profile = shared.profile.clone();
+    let config = &shared.config;
+
+    let tx_window_started = Instant::now();
+    let mut transcripts = build_stateful_buffer_local_transcripts_cow(
+        &shared.base_transcripts,
+        &shared.transcript_cache_regions,
+        &mut worker.persisted_buffer_transcripts,
+        buffer_batches,
+        chrom,
+        min_start,
+        max_end,
+        config.upstream_distance,
+        config.downstream_distance,
+    )?;
+    apply_partition_transcript_overrides_cow(
+        &mut transcripts,
+        &shared.base_transcripts,
+        &worker.transcript_overrides,
+    );
+    let buffer_tx_ids: HashSet<&str> = transcripts
+        .iter()
+        .map(|bt| bt.transcript_id(&shared.base_transcripts))
+        .collect();
+    record_contig_profile(&profile, |profile| {
+        profile.transcript_window += tx_window_started.elapsed();
+    });
+
+    let exon_filter_started = Instant::now();
+    let exon_indices = shared.indexes.exon_indices_for_transcripts(&buffer_tx_ids);
+    record_contig_profile(&profile, |profile| {
+        profile.exon_filter += exon_filter_started.elapsed();
+    });
+
+    let translation_filter_started = Instant::now();
+    let translation_indices = shared
+        .indexes
+        .translation_indices_for_transcripts(&buffer_tx_ids);
+    let translation_overrides =
+        selected_translation_overrides(&worker.translation_overrides, &buffer_tx_ids);
+    record_contig_profile(&profile, |profile| {
+        profile.translation_filter += translation_filter_started.elapsed();
+    });
+
+    Ok(BufferAnnotationContext {
+        transcripts,
+        exon_indices,
+        translation_indices,
+        translation_overrides,
+    })
+}
+
+fn selected_translation_overrides(
+    overrides: &HashMap<String, TranslationPartitionState>,
+    buffer_tx_ids: &HashSet<&str>,
+) -> HashMap<String, TranslationPartitionState> {
+    overrides
+        .iter()
+        .filter(|(tx_id, _)| buffer_tx_ids.contains(tx_id.as_str()))
+        .map(|(tx_id, override_state)| (tx_id.clone(), override_state.clone()))
+        .collect()
+}
+
+fn materialize_buffer_context_translations(
+    shared: &SharedContigAnnotationContext,
+    buffer_context: &BufferAnnotationContext,
+) -> Vec<TranslationFeature> {
+    if buffer_context.translation_overrides.is_empty() {
+        return Vec::new();
+    }
+
+    buffer_context
+        .translation_indices
+        .iter()
+        .filter_map(|&idx| {
+            let base_translation = &shared.base_translations[idx];
+            let override_state = buffer_context
+                .translation_overrides
+                .get(&base_translation.transcript_id)?;
+            let mut translation = base_translation.clone();
+            apply_partition_translation_override(&mut translation, override_state);
+            Some(translation)
+        })
+        .collect()
+}
+
+fn prepared_context_from_buffer<'a>(
+    buffer_context: &'a BufferAnnotationContext,
+    shared: &'a SharedContigAnnotationContext,
+    materialized_translations: &'a [TranslationFeature],
+) -> PreparedContext<'a> {
+    let transcript_refs = buffer_context
+        .transcripts
+        .iter()
+        .map(|bt| bt.as_ref(&shared.base_transcripts))
+        .collect();
+    let exon_refs = buffer_context
+        .exon_indices
+        .iter()
+        .map(|&idx| &shared.exons[idx])
+        .collect();
+    let materialized_by_tx: HashMap<&str, &TranslationFeature> = materialized_translations
+        .iter()
+        .map(|translation| (translation.transcript_id.as_str(), translation))
+        .collect();
+    let translation_refs = buffer_context
+        .translation_indices
+        .iter()
+        .map(|&idx| {
+            let base_translation = &shared.base_translations[idx];
+            materialized_by_tx
+                .get(base_translation.transcript_id.as_str())
+                .copied()
+                .unwrap_or(base_translation)
+        })
+        .collect();
+
+    PreparedContext::new_from_refs(
+        transcript_refs,
+        exon_refs,
+        translation_refs,
+        &shared.regulatory,
+        &shared.motifs,
+        &shared.mirnas,
+        &shared.structural,
+    )
+}
+
+fn hydrate_worker_window(
+    worker: &mut AnnotationWorkerState,
+    window_batches: &[RecordBatch],
+    cache_source_type: CacheSourceType,
+) -> Result<()> {
+    if worker.hgvs_reader.is_none() {
+        return Ok(());
+    }
+    let shared = Arc::clone(&worker.shared);
+    let Some((chrom, min_start, max_end)) = buffer_variant_bounds(window_batches)? else {
+        return Ok(());
+    };
+
+    let mut window_transcripts = select_buffer_local_transcripts(
+        &shared.base_transcripts,
+        &chrom,
+        min_start,
+        max_end,
+        shared.config.upstream_distance,
+        shared.config.downstream_distance,
+    );
+    apply_partition_transcript_overrides(&mut window_transcripts, &worker.transcript_overrides);
+    let before_transcript_states: HashMap<String, TranscriptPartitionState> = window_transcripts
+        .iter()
+        .map(|tx| {
+            (
+                tx.transcript_id.clone(),
+                TranscriptPartitionState::from_transcript(tx),
+            )
+        })
+        .collect();
+
+    let window_tx_ids: HashSet<&str> = window_transcripts
+        .iter()
+        .map(|tx| tx.transcript_id.as_str())
+        .collect();
+    let mut window_translations = materialize_buffer_translations(
+        &shared.base_translations,
+        &worker.translation_overrides,
+        &window_tx_ids,
+    );
+    let before_translation_cds: HashMap<String, Option<String>> = window_translations
+        .iter()
+        .map(|translation| {
+            (
+                translation.transcript_id.clone(),
+                translation.cds_sequence.clone(),
+            )
+        })
+        .collect();
+
+    hydrate_window(
+        &mut window_transcripts,
+        &shared.exons,
+        &mut window_translations,
+        &shared.translateable_seq_by_tx,
+        &mut worker.hgvs_reader,
+        &mut worker.hydrated_cds_tx_ids,
+        window_batches,
+        cache_source_type,
+    )?;
+
+    for tx in window_transcripts {
+        let after = TranscriptPartitionState::from_transcript(&tx);
+        let changed = before_transcript_states
+            .get(&tx.transcript_id)
+            .is_some_and(|before| before != &after);
+        if changed || worker.transcript_overrides.contains_key(&tx.transcript_id) {
+            worker
+                .transcript_overrides
+                .insert(tx.transcript_id.clone(), after);
+        }
+    }
+
+    for translation in window_translations {
+        let changed = before_translation_cds
+            .get(&translation.transcript_id)
+            .is_some_and(|before| before != &translation.cds_sequence);
+        if changed
+            || worker
+                .translation_overrides
+                .contains_key(&translation.transcript_id)
+        {
+            let after = TranslationPartitionState::from_translation(&translation);
+            worker
+                .translation_overrides
+                .insert(translation.transcript_id.clone(), after);
+        }
+    }
+
     Ok(())
 }
 
@@ -8094,13 +10827,40 @@ fn select_buffer_local_transcripts(
         .filter(|tx| {
             let tx_chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
             tx_chrom == chrom_norm
-                // VEP fetches broad 1 Mb cache regions, but it filters those
-                // cached features against the input-buffer min/max window
-                // before merge_features() can propagate HGNC values.
+                // Only transcripts close enough to produce CSQ rows are
+                // emitted. HGNC-only merge donors from the broader active
+                // cache region are handled separately below.
                 && tx.end >= query_start
                 && tx.start <= query_end
         })
         .cloned()
+        .collect()
+}
+
+/// Same range filter as `select_buffer_local_transcripts`, but returns shared
+/// indices (`CowTranscript::Borrowed`) into `transcripts` instead of clones.
+/// The predicate MUST stay literally identical to `select_buffer_local_transcripts`.
+fn select_buffer_local_indices(
+    transcripts: &[TranscriptFeature],
+    chrom: &str,
+    min_start: i64,
+    max_end: i64,
+    upstream_distance: i64,
+    downstream_distance: i64,
+) -> Vec<CowTranscript> {
+    let chrom_norm = chrom.strip_prefix("chr").unwrap_or(chrom);
+    let up_down_size = upstream_distance.max(downstream_distance);
+    let query_start = min_start.saturating_sub(up_down_size);
+    let query_end = max_end.saturating_add(up_down_size);
+
+    transcripts
+        .iter()
+        .enumerate()
+        .filter(|(_, tx)| {
+            let tx_chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
+            tx_chrom == chrom_norm && tx.end >= query_start && tx.start <= query_end
+        })
+        .map(|(idx, _)| CowTranscript::Borrowed(idx))
         .collect()
 }
 
@@ -8112,7 +10872,7 @@ fn build_buffer_local_transcripts(
     upstream_distance: i64,
     downstream_distance: i64,
 ) -> Vec<TranscriptFeature> {
-    let mut buffer_transcripts = select_buffer_local_transcripts(
+    let mut buffer = select_buffer_local_indices(
         transcripts,
         chrom,
         min_start,
@@ -8120,11 +10880,16 @@ fn build_buffer_local_transcripts(
         upstream_distance,
         downstream_distance,
     );
-    reset_buffer_local_hgnc_effective_values(&mut buffer_transcripts);
-    apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
-    buffer_transcripts
+    reset_buffer_local_hgnc_effective_values(&mut buffer, transcripts);
+    apply_buffer_local_hgnc_propagation(&mut buffer, transcripts);
+    buffer
+        .into_iter()
+        .map(|bt| bt.into_owned(transcripts))
+        .collect()
 }
 
+/// Owned-returning wrapper preserving the original signature for the unit
+/// tests. Production code calls `_cow` directly (see prepare_buffer_annotation_context).
 fn build_stateful_buffer_local_transcripts(
     transcripts: &[TranscriptFeature],
     transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
@@ -8136,11 +10901,39 @@ fn build_stateful_buffer_local_transcripts(
     upstream_distance: i64,
     downstream_distance: i64,
 ) -> Result<Vec<TranscriptFeature>> {
+    let buffer = build_stateful_buffer_local_transcripts_cow(
+        transcripts,
+        transcript_cache_regions,
+        persisted_transcripts,
+        buffer_batches,
+        chrom,
+        min_start,
+        max_end,
+        upstream_distance,
+        downstream_distance,
+    )?;
+    Ok(buffer
+        .into_iter()
+        .map(|bt| bt.into_owned(transcripts))
+        .collect())
+}
+
+fn build_stateful_buffer_local_transcripts_cow(
+    transcripts: &[TranscriptFeature],
+    transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
+    persisted_transcripts: &mut PersistedBufferTranscripts,
+    buffer_batches: &[RecordBatch],
+    chrom: &str,
+    min_start: i64,
+    max_end: i64,
+    upstream_distance: i64,
+    downstream_distance: i64,
+) -> Result<Vec<CowTranscript>> {
     let active_regions =
         collect_buffer_cache_regions(buffer_batches, upstream_distance, downstream_distance)?;
     prune_persisted_buffer_transcripts(persisted_transcripts, &active_regions);
 
-    let mut buffer_transcripts = select_buffer_local_transcripts(
+    let mut buffer = select_buffer_local_indices(
         transcripts,
         chrom,
         min_start,
@@ -8151,7 +10944,8 @@ fn build_stateful_buffer_local_transcripts(
 
     // Reuse the same transcript objects across adjacent input buffers while
     // their 1 Mb cache regions remain active, matching Ensembl VEP's region
-    // cache plus in-place `merge_features()` mutation behavior.
+    // cache plus in-place `merge_features()` mutation behavior. A restored
+    // persisted copy is a genuine divergence from base, so it becomes Owned.
     //
     // Traceability:
     // - Ensembl VEP `AnnotationSource::get_features_by_regions_uncached()`
@@ -8160,25 +10954,51 @@ fn build_stateful_buffer_local_transcripts(
     // - Ensembl VEP `AnnotationType::Transcript::merge_features()`
     //   mutates transcript objects in place
     //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L246-L310>
-    for tx in &mut buffer_transcripts {
+    for bt in &mut buffer {
+        let id = bt.transcript_id(transcripts);
         let persisted = active_regions.iter().find_map(|region| {
             persisted_transcripts
                 .get(region)
-                .and_then(|by_transcript| by_transcript.get(&tx.transcript_id))
+                .and_then(|by_transcript| by_transcript.get(id))
         });
         if let Some(persisted) = persisted {
-            *tx = persisted.clone();
+            *bt = CowTranscript::Owned(Box::new(persisted.clone()));
         }
     }
 
     reset_persisted_hgnc_effective_values_outside_start_region(
-        &mut buffer_transcripts,
+        &mut buffer,
+        transcripts,
         transcript_cache_regions,
         &active_regions,
     );
-    apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
+    // Build the HGNC donor maps from the FULL active cache-region transcript
+    // set (partition-invariant), not just the buffer-range-overlapping
+    // `buffer`. Otherwise a recipient's native-HGNC donor that
+    // falls outside this partition's buffer range is missed (t8 parity bug).
+    let region_donors: Vec<&TranscriptFeature> = transcripts
+        .iter()
+        .filter(|tx| {
+            transcript_cache_regions
+                .get(&tx.transcript_id)
+                .is_some_and(|regions| regions.iter().any(|r| active_regions.contains(r)))
+        })
+        .collect();
+    let (hgnc_by_symbol, gene_fill_by_stable_id) = collect_hgnc_donors(region_donors);
+    apply_hgnc_donors(
+        &mut buffer,
+        transcripts,
+        &hgnc_by_symbol,
+        &gene_fill_by_stable_id,
+    );
 
-    for tx in &buffer_transcripts {
+    // Re-persist only the transcripts that actually diverged from base (Owned).
+    // Borrowed transcripts equal base, so restoring them next buffer is a no-op;
+    // skipping them is behavior-preserving and avoids a clone into the persist map.
+    for bt in &buffer {
+        let CowTranscript::Owned(tx) = bt else {
+            continue;
+        };
         if let Some(regions) = transcript_cache_regions.get(&tx.transcript_id) {
             for region in regions
                 .iter()
@@ -8187,27 +11007,36 @@ fn build_stateful_buffer_local_transcripts(
                 persisted_transcripts
                     .entry(region.clone())
                     .or_default()
-                    .insert(tx.transcript_id.clone(), tx.clone());
+                    .insert(tx.transcript_id.clone(), (**tx).clone());
             }
         }
     }
 
-    Ok(buffer_transcripts)
+    Ok(buffer)
 }
 
-fn reset_buffer_local_hgnc_effective_values(transcripts: &mut [TranscriptFeature]) {
-    for tx in transcripts {
-        tx.gene_hgnc_id = tx.gene_hgnc_id_native.clone();
+fn reset_buffer_local_hgnc_effective_values(
+    transcripts: &mut [CowTranscript],
+    base: &[TranscriptFeature],
+) {
+    for bt in transcripts {
+        let cur = bt.as_ref(base);
+        let desired = cur.gene_hgnc_id_native.clone();
+        if cur.gene_hgnc_id != desired {
+            bt.to_mut(base).gene_hgnc_id = desired;
+        }
     }
 }
 
 fn reset_persisted_hgnc_effective_values_outside_start_region(
-    transcripts: &mut [TranscriptFeature],
+    transcripts: &mut [CowTranscript],
+    base: &[TranscriptFeature],
     transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
     active_regions: &HashSet<TranscriptCacheRegion>,
 ) {
-    for tx in transcripts {
-        let Some(regions) = transcript_cache_regions.get(&tx.transcript_id) else {
+    for bt in transcripts {
+        let cur = bt.as_ref(base);
+        let Some(regions) = transcript_cache_regions.get(&cur.transcript_id) else {
             continue;
         };
         let Some(start_region) = regions.first() else {
@@ -8215,7 +11044,10 @@ fn reset_persisted_hgnc_effective_values_outside_start_region(
         };
         let spans_multiple_regions = regions.len() > 1;
         if spans_multiple_regions && !active_regions.contains(start_region) {
-            tx.gene_hgnc_id = tx.gene_hgnc_id_native.clone();
+            let desired = cur.gene_hgnc_id_native.clone();
+            if cur.gene_hgnc_id != desired {
+                bt.to_mut(base).gene_hgnc_id = desired;
+            }
         }
     }
 }
@@ -8226,18 +11058,24 @@ fn reset_persisted_hgnc_effective_values_outside_start_region(
 /// Traceability:
 /// - Ensembl VEP `AnnotationType::Transcript::merge_features()`
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L246-L310>
-fn apply_buffer_local_hgnc_propagation(transcripts: &mut [TranscriptFeature]) {
-    #[derive(Default)]
-    struct GeneFill {
-        gene_symbol: Option<String>,
-        gene_symbol_source: Option<String>,
-        gene_hgnc_id_native: Option<String>,
-    }
+#[derive(Default)]
+struct HgncGeneFill {
+    gene_symbol: Option<String>,
+    gene_symbol_source: Option<String>,
+    gene_hgnc_id_native: Option<String>,
+}
 
+/// Build the HGNC/gene donor maps from a donor source. To be partition
+/// INVARIANT, the donor source must be the full active cache-region transcript
+/// set (not just buffer-range-overlapping ones) — otherwise a recipient's
+/// native-HGNC donor that falls outside a partition's buffer range is missed,
+/// dropping the donated HGNC id (the t8 parity bug).
+fn collect_hgnc_donors<'a>(
+    donors: impl IntoIterator<Item = &'a TranscriptFeature>,
+) -> (HashMap<String, String>, HashMap<String, HgncGeneFill>) {
     let mut hgnc_by_symbol: HashMap<String, String> = HashMap::new();
-    let mut gene_fill_by_stable_id: HashMap<String, GeneFill> = HashMap::new();
-
-    for tx in transcripts.iter() {
+    let mut gene_fill_by_stable_id: HashMap<String, HgncGeneFill> = HashMap::new();
+    for tx in donors {
         if let (Some(symbol), Some(hgnc_id)) =
             (tx.gene_symbol.as_deref(), tx.gene_hgnc_id_native.as_deref())
         {
@@ -8245,7 +11083,6 @@ fn apply_buffer_local_hgnc_propagation(transcripts: &mut [TranscriptFeature]) {
                 .entry(symbol.to_string())
                 .or_insert_with(|| hgnc_id.to_string());
         }
-
         if let Some(gene_stable_id) = tx.gene_stable_id.as_deref() {
             let fill = gene_fill_by_stable_id
                 .entry(gene_stable_id.to_string())
@@ -8261,209 +11098,562 @@ fn apply_buffer_local_hgnc_propagation(transcripts: &mut [TranscriptFeature]) {
             }
         }
     }
+    (hgnc_by_symbol, gene_fill_by_stable_id)
+}
 
-    for tx in transcripts.iter_mut() {
-        tx.gene_hgnc_id = tx
+fn apply_buffer_local_hgnc_propagation(
+    transcripts: &mut [CowTranscript],
+    base: &[TranscriptFeature],
+) {
+    let (hgnc_by_symbol, gene_fill_by_stable_id) =
+        collect_hgnc_donors(transcripts.iter().map(|bt| bt.as_ref(base)));
+    apply_hgnc_donors(transcripts, base, &hgnc_by_symbol, &gene_fill_by_stable_id);
+}
+
+fn apply_hgnc_donors(
+    transcripts: &mut [CowTranscript],
+    base: &[TranscriptFeature],
+    hgnc_by_symbol: &HashMap<String, String>,
+    gene_fill_by_stable_id: &HashMap<String, HgncGeneFill>,
+) {
+    // Pass 1: effective HGNC id = native, else current, else symbol-donated.
+    for bt in transcripts.iter_mut() {
+        let cur = bt.as_ref(base);
+        let mut desired = cur
             .gene_hgnc_id_native
             .clone()
-            .or_else(|| tx.gene_hgnc_id.clone());
-
-        if tx.gene_hgnc_id.is_none() {
-            if let Some(hgnc_id) = tx
+            .or_else(|| cur.gene_hgnc_id.clone());
+        if desired.is_none() {
+            if let Some(hgnc_id) = cur
                 .gene_symbol
                 .as_deref()
                 .and_then(|symbol| hgnc_by_symbol.get(symbol))
             {
-                tx.gene_hgnc_id = Some(hgnc_id.clone());
+                desired = Some(hgnc_id.clone());
             }
+        }
+        if desired != cur.gene_hgnc_id {
+            bt.to_mut(base).gene_hgnc_id = desired;
         }
     }
 
-    for tx in transcripts.iter_mut() {
-        let Some(gene_stable_id) = tx.gene_stable_id.as_deref() else {
+    // Pass 2: gene-stable-id fill of symbol / source / hgnc when still None.
+    for bt in transcripts.iter_mut() {
+        let cur = bt.as_ref(base);
+        let Some(gene_stable_id) = cur.gene_stable_id.as_deref() else {
             continue;
         };
         let Some(fill) = gene_fill_by_stable_id.get(gene_stable_id) else {
             continue;
         };
 
-        if tx.gene_symbol.is_none() {
-            tx.gene_symbol = fill.gene_symbol.clone();
-        }
-        if tx.gene_symbol_source.is_none() {
-            tx.gene_symbol_source = fill.gene_symbol_source.clone();
-        }
-        if tx.gene_hgnc_id.is_none() {
-            tx.gene_hgnc_id = fill.gene_hgnc_id_native.clone();
+        let new_symbol = if cur.gene_symbol.is_none() {
+            fill.gene_symbol.clone()
+        } else {
+            cur.gene_symbol.clone()
+        };
+        let new_source = if cur.gene_symbol_source.is_none() {
+            fill.gene_symbol_source.clone()
+        } else {
+            cur.gene_symbol_source.clone()
+        };
+        let new_hgnc = if cur.gene_hgnc_id.is_none() {
+            fill.gene_hgnc_id_native.clone()
+        } else {
+            cur.gene_hgnc_id.clone()
+        };
+        if new_symbol != cur.gene_symbol
+            || new_source != cur.gene_symbol_source
+            || new_hgnc != cur.gene_hgnc_id
+        {
+            let tx = bt.to_mut(base);
+            tx.gene_symbol = new_symbol;
+            tx.gene_symbol_source = new_source;
+            tx.gene_hgnc_id = new_hgnc;
         }
     }
 }
 
-/// Annotate a window of batches: build PreparedContext, run SIFT loading,
-/// annotate each batch, apply projection.
-fn annotate_window(
-    ann: &mut ContigAnnotationState,
+fn load_sift_for_batch(
+    batch: &RecordBatch,
+    pick_requires_full_annotations: bool,
+    sift_direct: Option<&SiftDirectReader>,
+    loaded_sift_windows: &mut HashSet<(String, i64)>,
+    sift_cache: &mut SiftPolyphenCache,
+) -> Result<()> {
+    let Some(direct) = sift_direct else {
+        return Ok(());
+    };
+
+    let batch_needs_engine = if pick_requires_full_annotations {
+        true
+    } else {
+        batch
+            .schema()
+            .index_of("cache_most_severe_consequence")
+            .ok()
+            .map_or(true, |idx| batch.column(idx).null_count() > 0)
+    };
+    if !batch_needs_engine {
+        return Ok(());
+    }
+
+    let schema = batch.schema();
+    let (Ok(ci), Ok(si), Ok(ei)) = (
+        schema.index_of("chrom"),
+        schema.index_of("start"),
+        schema.index_of("end"),
+    ) else {
+        return Ok(());
+    };
+
+    let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+    for row in 0..batch.num_rows() {
+        if let (Some(c), Some(s), Some(e)) = (
+            string_at(batch.column(ci).as_ref(), row),
+            int64_at(batch.column(si).as_ref(), row),
+            int64_at(batch.column(ei).as_ref(), row),
+        ) {
+            let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
+            let entry = batch_chrom_bounds
+                .entry(c_norm)
+                .or_insert((i64::MAX, i64::MIN));
+            entry.0 = entry.0.min(s);
+            entry.1 = entry.1.max(e);
+        }
+    }
+
+    for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
+        let window_start =
+            (batch_max / AnnotateProvider::SIFT_WINDOW_SIZE) * AnnotateProvider::SIFT_WINDOW_SIZE;
+        let min_window_start =
+            (batch_min / AnnotateProvider::SIFT_WINDOW_SIZE) * AnnotateProvider::SIFT_WINDOW_SIZE;
+        let mut ws = min_window_start;
+        while ws <= window_start + AnnotateProvider::SIFT_WINDOW_SIZE {
+            let key = (ch.clone(), ws);
+            if !loaded_sift_windows.contains(&key) {
+                direct.load_window(ch, ws, ws + AnnotateProvider::SIFT_WINDOW_SIZE, sift_cache)?;
+                loaded_sift_windows.insert(key);
+            }
+            ws += AnnotateProvider::SIFT_WINDOW_SIZE;
+        }
+        sift_cache.evict_before(*batch_min);
+    }
+
+    Ok(())
+}
+
+/// Annotate a window of batches inside one partition worker: build
+/// PreparedContext, run SIFT loading, annotate each batch, apply projection.
+fn annotate_worker_window(
+    worker: &mut AnnotationWorkerState,
     window_batches: &[RecordBatch],
     projection: Option<&[usize]>,
 ) -> Result<VecDeque<RecordBatch>> {
-    let engine = &ann.engine;
-    let csq_col_idx = ann.tmp_provider.vcf_field_count();
+    let annotation_started = Instant::now();
+    let shared = Arc::clone(&worker.shared);
+    let profile = shared.profile.clone();
+    let config = &shared.config;
+    let tmp_provider = shared.tmp_provider.as_ref();
+    let engine = shared.engine.as_ref();
+    let csq_col_idx = tmp_provider.vcf_field_count();
     let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
     let typed_cols_start = csq_col_idx + 2;
-    let typed_cols_end = typed_cols_start + ann.tmp_provider.annotation_column_defs.len();
+    let typed_cols_end = typed_cols_start + tmp_provider.annotation_column_defs.len();
     let skip_typed_cols = projection.map_or(false, |indices| {
         !indices
             .iter()
             .any(|&i| i >= typed_cols_start && i < typed_cols_end)
     });
-    let pick_requires_full_annotations = ann
-        .config
+    let pick_requires_full_annotations = config
         .pick_flags
         .requires_transcript_annotations(skip_csq, skip_typed_cols);
-    let sift_enabled = ann.config.flags.everything;
+    let sift_enabled = config.flags.everything;
     let mut out = VecDeque::with_capacity(window_batches.len());
 
-    let flush_partial = ann.lookup_done && ann.window_buffer.is_empty();
-    let ready_input_buffers = ann.input_buffer_accumulator.push_window_and_drain_ready(
+    let flush_partial = worker.lookup_done && worker.window_buffer.is_empty();
+    let input_buffer_started = Instant::now();
+    let ready_input_buffers = worker.input_buffer_accumulator.push_window_and_drain_ready(
         window_batches.to_vec(),
-        ann.config.input_buffer_size,
+        config.input_buffer_size,
         flush_partial,
     );
+    let ready_input_buffer_count = ready_input_buffers.len();
+    record_contig_profile(&profile, |profile| {
+        profile.input_buffer += input_buffer_started.elapsed();
+        profile.input_buffers += ready_input_buffer_count;
+    });
 
     for buffer_batches in ready_input_buffers {
+        let bounds_started = Instant::now();
         let Some((chrom, min_start, max_end)) = buffer_variant_bounds(&buffer_batches)? else {
             continue;
         };
-        let buffer_transcripts = build_stateful_buffer_local_transcripts(
-            &ann.transcripts,
-            &ann.transcript_cache_regions,
-            &mut ann.persisted_buffer_transcripts,
-            &buffer_batches,
-            &chrom,
-            min_start,
-            max_end,
-            ann.config.upstream_distance,
-            ann.config.downstream_distance,
-        )?;
-        let buffer_tx_ids: HashSet<&str> = buffer_transcripts
-            .iter()
-            .map(|tx| tx.transcript_id.as_str())
-            .collect();
-        let buffer_exons: Vec<ExonFeature> = ann
-            .exons
-            .iter()
-            .filter(|exon| buffer_tx_ids.contains(exon.transcript_id.as_str()))
-            .cloned()
-            .collect();
-        let buffer_translations: Vec<TranslationFeature> = ann
-            .translations
-            .iter()
-            .filter(|translation| buffer_tx_ids.contains(translation.transcript_id.as_str()))
-            .cloned()
-            .collect();
-        let ctx = PreparedContext::new(
-            &buffer_transcripts,
-            &buffer_exons,
-            &buffer_translations,
-            &ann.regulatory,
-            &ann.motifs,
-            &ann.mirnas,
-            &ann.structural,
-        );
+        record_contig_profile(&profile, |profile| {
+            profile.variant_bounds += bounds_started.elapsed();
+        });
+        let buffer_context =
+            prepare_buffer_annotation_context(worker, &buffer_batches, &chrom, min_start, max_end)?;
+        let prepared_context_started = Instant::now();
+        let materialized_translations =
+            materialize_buffer_context_translations(&shared, &buffer_context);
+        let ctx =
+            prepared_context_from_buffer(&buffer_context, &shared, &materialized_translations);
+        record_contig_profile(&profile, |profile| {
+            profile.prepared_context += prepared_context_started.elapsed();
+        });
 
         for batch in &buffer_batches {
             // Lazy SIFT window loading (same pattern as before).
-            if sift_enabled && ann.sift_direct.is_some() {
-                let batch_needs_engine = if pick_requires_full_annotations {
-                    true
-                } else {
-                    batch
-                        .schema()
-                        .index_of("cache_most_severe_consequence")
-                        .ok()
-                        .map_or(true, |idx| batch.column(idx).null_count() > 0)
-                };
-                if batch_needs_engine {
-                    let schema = batch.schema();
-                    if let (Ok(ci), Ok(si), Ok(ei)) = (
-                        schema.index_of("chrom"),
-                        schema.index_of("start"),
-                        schema.index_of("end"),
-                    ) {
-                        let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
-                        for row in 0..batch.num_rows() {
-                            if let (Some(c), Some(s), Some(e)) = (
-                                string_at(batch.column(ci).as_ref(), row),
-                                int64_at(batch.column(si).as_ref(), row),
-                                int64_at(batch.column(ei).as_ref(), row),
-                            ) {
-                                let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
-                                let entry = batch_chrom_bounds
-                                    .entry(c_norm)
-                                    .or_insert((i64::MAX, i64::MIN));
-                                entry.0 = entry.0.min(s);
-                                entry.1 = entry.1.max(e);
-                            }
-                        }
-                        for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
-                            let window_start = (batch_max / AnnotateProvider::SIFT_WINDOW_SIZE)
-                                * AnnotateProvider::SIFT_WINDOW_SIZE;
-                            let min_window_start = (batch_min / AnnotateProvider::SIFT_WINDOW_SIZE)
-                                * AnnotateProvider::SIFT_WINDOW_SIZE;
-                            let mut ws = min_window_start;
-                            while ws <= window_start + AnnotateProvider::SIFT_WINDOW_SIZE {
-                                let key = (ch.clone(), ws);
-                                if !ann.loaded_sift_windows.contains(&key) {
-                                    if let Some(ref direct) = ann.sift_direct {
-                                        direct.load_window(
-                                            ch,
-                                            ws,
-                                            ws + AnnotateProvider::SIFT_WINDOW_SIZE,
-                                            &mut ann.sift_cache,
-                                        )?;
-                                    }
-                                    ann.loaded_sift_windows.insert(key);
-                                }
-                                ws += AnnotateProvider::SIFT_WINDOW_SIZE;
-                            }
-                            ann.sift_cache.evict_before(*batch_min);
-                        }
-                    }
-                }
+            if sift_enabled && worker.sift_direct.is_some() {
+                let sift_started = Instant::now();
+                load_sift_for_batch(
+                    batch,
+                    pick_requires_full_annotations,
+                    worker.sift_direct.as_deref(),
+                    &mut worker.loaded_sift_windows,
+                    &mut worker.sift_cache,
+                )?;
+                record_contig_profile(&profile, |profile| {
+                    profile.sift_load += sift_started.elapsed();
+                });
             }
+            // SIFT/PolyPhen predictions are fetched on demand by the transcript
+            // engine (`lookup_sift_polyphen`), which only queries the store for
+            // single-amino-acid substitutions and memoizes per transcript. Eagerly
+            // pre-loading predictions for every transcript overlapping the window
+            // was a large over-fetch (SIFT applies to <1% of overlaps); the demand
+            // path reads only the transcripts that actually need predictions.
 
             #[cfg(not(feature = "kv-cache"))]
             let sift_kv: Option<()> = None;
             #[cfg(feature = "kv-cache")]
-            let sift_kv = &ann.sift_kv;
+            let sift_store = &shared.sift_prediction_store;
 
-            let annotated = ann.tmp_provider.annotate_batch_with_transcript_engine(
+            let engine_started = Instant::now();
+            let annotated = tmp_provider.annotate_batch_with_transcript_engine(
                 batch,
                 engine,
                 &ctx,
-                &ann.colocated_map,
-                &mut ann.sift_cache,
+                &worker.colocated_map,
+                &mut worker.sift_cache,
                 #[cfg(feature = "kv-cache")]
-                sift_kv,
+                sift_store,
                 #[cfg(not(feature = "kv-cache"))]
                 &sift_kv,
                 skip_csq,
                 skip_typed_cols,
-                &ann.config.flags,
-                &ann.config.hgvs_flags,
-                ann.config.transcript_selection,
-                &ann.config.pick_flags,
-                &mut ann.hgvs_reader,
+                &config.flags,
+                &config.hgvs_flags,
+                config.transcript_selection,
+                &config.pick_flags,
+                &mut worker.hgvs_reader,
             )?;
+            record_contig_profile(&profile, |profile| {
+                profile.engine += engine_started.elapsed();
+            });
 
             if let Some(indices) = projection {
-                out.push_back(annotated.project(indices)?);
+                let projection_started = Instant::now();
+                let projected = annotated.project(indices)?;
+                record_contig_profile(&profile, |profile| {
+                    profile.projection += projection_started.elapsed();
+                });
+                out.push_back(projected);
             } else {
                 out.push_back(annotated);
             }
         }
     }
+    record_contig_profile(&profile, |profile| {
+        profile.annotation_compute += annotation_started.elapsed();
+    });
     Ok(out)
+}
+
+/// Annotate one window on a *fresh* worker, seeded with a snapshot of the
+/// already-complete `colocated_map`. Self-contained (own hydration caches),
+/// so it can run on a blocking thread concurrently with other windows.
+///
+/// Correctness: each looked-up batch arrives together with its `colocated`
+/// delta (see `apply_lookup_batch_message`) and input is position-sorted, so
+/// by the time a window's batches are buffered, every colocated entry for those
+/// variants is already present in `colocated_snapshot`. Hydration is rebuilt
+/// per window (a fresh worker), which only re-does work for boundary
+/// transcripts — an accepted, bounded cost.
+fn annotate_window_owned(
+    shared: Arc<SharedContigAnnotationContext>,
+    colocated_snapshot: Arc<HashMap<ColocatedKey, ColocatedData>>,
+    window_batches: Vec<RecordBatch>,
+    cache_source_type: CacheSourceType,
+    projection: Option<Vec<usize>>,
+) -> Result<VecDeque<RecordBatch>> {
+    let mut worker = AnnotationWorkerState::new(shared)?;
+    worker.colocated_map = colocated_snapshot;
+    worker.lookup_done = true;
+    hydrate_worker_window(&mut worker, &window_batches, cache_source_type)?;
+    annotate_worker_window(&mut worker, &window_batches, projection.as_deref())
+}
+
+enum LookupPartitionPoll {
+    Batch(LookupBatchMessage),
+    Done(HashMap<ColocatedKey, ColocatedData>),
+}
+
+fn poll_lookup_partition(
+    active: &mut LookupPartitionHandle,
+    cx: &mut TaskCtx<'_>,
+) -> Poll<Result<LookupPartitionPoll>> {
+    match active {
+        LookupPartitionHandle::Spawned(active) => match active.receiver.as_mut() {
+            None => Poll::Ready(Ok(LookupPartitionPoll::Done(HashMap::new()))),
+            Some(receiver) => match receiver.poll_recv(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Some(Ok(message))) => {
+                    Poll::Ready(Ok(LookupPartitionPoll::Batch(message)))
+                }
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+                Poll::Ready(None) => match active.join_handle.as_mut() {
+                    None => Poll::Ready(Ok(LookupPartitionPoll::Done(HashMap::new()))),
+                    Some(jh) => match Pin::new(jh).poll(cx) {
+                        Poll::Ready(Ok(Ok(()))) => {
+                            Poll::Ready(Ok(LookupPartitionPoll::Done(HashMap::new())))
+                        }
+                        Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(DataFusionError::Execution(
+                            format!("lookup partition {} task failed: {e}", active.partition_id),
+                        ))),
+                        Poll::Pending => Poll::Pending,
+                    },
+                },
+            },
+        },
+        LookupPartitionHandle::Inline(active) => match active.stream.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(batch))) => {
+                let rows = batch.num_rows();
+                let partition_id = active.partition_id;
+                let batch_id = active.next_batch_id;
+                active.next_batch_id += 1;
+                let result = drain_colocated_sink(&active.sink).map(|colocated_delta| {
+                    pipeline_trace::emit(
+                        "lookup",
+                        "ready",
+                        &[
+                            ("chrom", TraceValue::Str(&active.chrom)),
+                            ("partition_id", TraceValue::Usize(partition_id)),
+                            ("batch_id", TraceValue::Usize(batch_id)),
+                            ("rows", TraceValue::Usize(rows)),
+                            ("colocated_delta", TraceValue::Usize(colocated_delta.len())),
+                        ],
+                    );
+                    LookupPartitionPoll::Batch(LookupBatchMessage {
+                        batch,
+                        colocated_delta,
+                        partition_id,
+                        batch_id,
+                    })
+                });
+                Poll::Ready(result)
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(DataFusionError::Execution(format!(
+                "lookup partition {} stream failed: {e}",
+                active.partition_id
+            )))),
+            Poll::Ready(None) => {
+                Poll::Ready(drain_colocated_sink(&active.sink).map(LookupPartitionPoll::Done))
+            }
+        },
+    }
+}
+
+fn apply_lookup_batch_message(ann: &mut ContigAnnotationState, message: LookupBatchMessage) {
+    record_contig_profile(&ann.worker.shared.profile, |profile| {
+        profile.lookup_batches += 1;
+    });
+    let rows = message.batch.num_rows();
+    pipeline_trace::emit(
+        "lookup",
+        "ordered_batch",
+        &[
+            ("chrom", TraceValue::Str(&ann.chrom)),
+            ("partition_id", TraceValue::Usize(message.partition_id)),
+            ("batch_id", TraceValue::Usize(message.batch_id)),
+            ("rows", TraceValue::Usize(rows)),
+            (
+                "colocated_delta",
+                TraceValue::Usize(message.colocated_delta.len()),
+            ),
+        ],
+    );
+    merge_colocated_delta(&mut ann.worker.colocated_map, message.colocated_delta);
+    if rows > 0 {
+        ann.contig_rows += rows;
+        ann.worker.window_buffer.push(message.batch);
+    }
+}
+
+fn record_lookup_fan_in_profile(
+    profile: &Option<SharedContigPipelineProfile>,
+    fan_in: &LookupPartitionFanIn,
+) {
+    if !profiling_enabled() {
+        return;
+    }
+    let buffered_batches = fan_in.buffered_batch_count();
+    let buffered_partitions = fan_in.buffered_partition_count();
+    record_contig_profile(profile, |profile| {
+        profile.lookup_buffered_batches_max =
+            profile.lookup_buffered_batches_max.max(buffered_batches);
+        profile.lookup_buffered_partitions_max = profile
+            .lookup_buffered_partitions_max
+            .max(buffered_partitions);
+    });
+}
+
+fn finish_lookup_waits(ann: &mut ContigAnnotationState) {
+    let profile = ann.worker.shared.profile.clone();
+    if let Some(started) = ann.lookup_wait_started.take() {
+        record_contig_profile(&profile, |profile| {
+            profile.lookup_wait += started.elapsed();
+        });
+    }
+    if let Some(started) = ann.ordered_lookup_wait_started.take() {
+        record_contig_profile(&profile, |profile| {
+            profile.ordered_drain_wait += started.elapsed();
+        });
+    }
+}
+
+fn start_lookup_waits(ann: &mut ContigAnnotationState, ordered_blocked: bool) {
+    if ann.lookup_wait_started.is_none() {
+        ann.lookup_wait_started = Some(Instant::now());
+    }
+    if ordered_blocked && ann.ordered_lookup_wait_started.is_none() {
+        ann.ordered_lookup_wait_started = Some(Instant::now());
+    }
+}
+
+fn poll_lookup_fan_in(
+    fan_in: &mut LookupPartitionFanIn,
+    cx: &mut TaskCtx<'_>,
+) -> Poll<Result<Option<LookupPartitionPoll>>> {
+    for partition in &mut fan_in.partitions {
+        while partition.ready.len() < fan_in.queue_batches {
+            let Some(handle) = partition.handle.as_mut() else {
+                break;
+            };
+            match poll_lookup_partition(handle, cx) {
+                Poll::Ready(Ok(LookupPartitionPoll::Batch(message))) => {
+                    partition.ready.push_back(message);
+                }
+                Poll::Ready(Ok(LookupPartitionPoll::Done(colocated_delta))) => {
+                    partition.done_delta = Some(colocated_delta);
+                    partition.handle = None;
+                    break;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => break,
+            }
+        }
+    }
+
+    let Some(partition) = fan_in.partitions.get_mut(fan_in.next_output_partition) else {
+        return Poll::Ready(Ok(None));
+    };
+    if let Some(message) = partition.ready.pop_front() {
+        return Poll::Ready(Ok(Some(LookupPartitionPoll::Batch(message))));
+    }
+    if partition.is_done() {
+        fan_in.next_output_partition += 1;
+        let colocated_delta = partition.done_delta.take().unwrap_or_default();
+        return Poll::Ready(Ok(Some(LookupPartitionPoll::Done(colocated_delta))));
+    }
+    Poll::Pending
+}
+
+fn poll_lookup_partitions(
+    ann: &mut ContigAnnotationState,
+    cx: &mut TaskCtx<'_>,
+) -> Poll<Result<()>> {
+    let mut made_progress = false;
+    while !ann.worker.lookup_done && ann.worker.window_buffer.len() < HYDRATION_WINDOW_SIZE {
+        let profile = ann.worker.shared.profile.clone();
+        record_lookup_fan_in_profile(&profile, &ann.lookup_partitions);
+        match poll_lookup_fan_in(&mut ann.lookup_partitions, cx) {
+            Poll::Pending => {
+                record_lookup_fan_in_profile(&profile, &ann.lookup_partitions);
+                let ordered_blocked = ann.lookup_partitions.has_buffered_after_next();
+                if made_progress {
+                    return Poll::Ready(Ok(()));
+                }
+                if ordered_blocked {
+                    pipeline_trace::emit(
+                        "lookup",
+                        "ordered_blocked",
+                        &[
+                            ("chrom", TraceValue::Str(&ann.chrom)),
+                            (
+                                "next_partition",
+                                TraceValue::Usize(ann.lookup_partitions.next_output_partition),
+                            ),
+                            (
+                                "buffered_batches",
+                                TraceValue::Usize(ann.lookup_partitions.buffered_batch_count()),
+                            ),
+                            (
+                                "buffered_partitions",
+                                TraceValue::Usize(ann.lookup_partitions.buffered_partition_count()),
+                            ),
+                        ],
+                    );
+                }
+                start_lookup_waits(ann, ordered_blocked);
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(Some(LookupPartitionPoll::Batch(message)))) => {
+                finish_lookup_waits(ann);
+                apply_lookup_batch_message(ann, message);
+                made_progress = true;
+            }
+            Poll::Ready(Ok(Some(LookupPartitionPoll::Done(colocated_delta)))) => {
+                finish_lookup_waits(ann);
+                pipeline_trace::emit(
+                    "lookup",
+                    "partition_done",
+                    &[
+                        ("chrom", TraceValue::Str(&ann.chrom)),
+                        (
+                            "partition_id",
+                            TraceValue::Usize(
+                                ann.lookup_partitions
+                                    .next_output_partition
+                                    .saturating_sub(1),
+                            ),
+                        ),
+                        ("colocated_delta", TraceValue::Usize(colocated_delta.len())),
+                    ],
+                );
+                if !colocated_delta.is_empty() {
+                    merge_colocated_delta(&mut ann.worker.colocated_map, colocated_delta);
+                }
+                made_progress = true;
+            }
+            Poll::Ready(Ok(None)) => {
+                finish_lookup_waits(ann);
+                ann.worker.lookup_done = true;
+                profile_end!(
+                    &format!("{}: 1. variation_lookup", ann.chrom),
+                    ann.t_contig,
+                    format!("{} rows", ann.contig_rows)
+                );
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+        }
+    }
+
+    Poll::Ready(Ok(()))
 }
 
 impl Stream for ContigAnnotationStream {
@@ -8487,7 +11677,7 @@ impl Stream for ContigAnnotationStream {
                         // variation table if fjall was used, via async cleanup
                         // future (safe on any Tokio runtime flavor).
                         #[cfg(feature = "kv-cache")]
-                        if self.config.use_fjall {
+                        if self.config.use_fjall && self.config.deregister_global_kv_on_finish {
                             let session = Arc::clone(&self.session);
                             let fut: CleanupFuture = Box::pin(async move {
                                 crate::partitioned_cache::deregister_table(
@@ -8527,160 +11717,228 @@ impl Stream for ContigAnnotationStream {
                         // Contig skipped (no variation table).
                         self.state = StreamState::StartContig;
                     }
-                    Poll::Ready(Ok(Some(ready))) => {
-                        let projected_schema = self.projected_schema.clone();
-                        let full_schema = self.full_schema.clone();
+                    Poll::Ready(Ok(Some(mut ready))) => {
                         let session = Arc::clone(&self.session);
-                        let cache = Arc::clone(&self.cache);
                         let config = self.config.clone();
-
-                        // Derive VCF-only schema for AnnotateProvider.
-                        let vcf_field_count = full_schema
-                            .fields()
-                            .len()
-                            .saturating_sub(config.annotation_column_count);
-                        let vcf_only_schema =
-                            Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
-
-                        let tmp_provider = match AnnotateProvider::new(
-                            Arc::clone(&session),
-                            config.vcf_table.clone(),
-                            String::new(),
-                            AnnotationBackend::Parquet,
-                            config.cache_source_type,
-                            config.options_json.clone(),
-                            vcf_only_schema,
-                        ) {
-                            Ok(provider) => provider,
-                            Err(e) => {
+                        if config.annotation_threads > 1 {
+                            // threads>1 == sharded VCF output: build N independent
+                            // per-partition fused pipelines (own lookup partition +
+                            // LOCAL colocated map + inline annotate), each streaming
+                            // its annotated batches directly into its own
+                            // position-ordered VCF body shard. No ordered drain, no
+                            // output channel. Entered only via vcf_sink (the sole
+                            // producer of the "threads" option), which sets
+                            // vcf_shard_ctx.
+                            let Some(shard_ctx) = config.vcf_shard_ctx.clone() else {
                                 self.state = StreamState::Done;
-                                return Poll::Ready(Some(Err(e)));
-                            }
-                        };
-                        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
-                            config.upstream_distance,
-                            config.downstream_distance,
-                            config.hgvs_flags.shift_hgvs,
-                        );
-                        let hgvs_reader = config.reference_fasta_path.as_deref().and_then(|path| {
-                            fasta::io::indexed_reader::Builder::default()
-                                .build_from_path(path)
-                                .ok()
-                        });
-                        // SIFT source: when use_fjall, use SiftKvStore from fjall
-                        // for lazy per-transcript lookups; otherwise use parquet
-                        // SiftDirectReader.
-                        #[cfg(feature = "kv-cache")]
-                        let use_fjall_sift = config.use_fjall;
-                        #[cfg(not(feature = "kv-cache"))]
-                        let use_fjall_sift = false;
-
-                        let sift_direct: Option<SiftDirectReader> = if config.flags.everything
-                            && !use_fjall_sift
-                        {
-                            config
-                                .translations_sift_table
-                                .as_deref()
-                                .and_then(|table| {
-                                    let path = std::path::Path::new(table);
-                                    if path.exists() {
-                                        AnnotateProvider::build_sift_direct_reader(table)
-                                    } else {
-                                        None
+                                return Poll::Ready(Some(Err(DataFusionError::Internal(
+                                    "parallel annotation (threads>1) requires a VCF shard \
+                                     context; it is only supported via the VCF output sink"
+                                        .to_string(),
+                                ))));
+                            };
+                            let shared = Arc::clone(&ready.shared_context);
+                            let mut handles: Vec<LookupPartitionHandle> =
+                                ready.lookup_partitions.drain(..).collect();
+                            handles.sort_by_key(LookupPartitionHandle::partition_id);
+                            let mut shard_handles: Vec<tokio::task::JoinHandle<Result<usize>>> =
+                                Vec::with_capacity(handles.len());
+                            let mut lookup_join = Vec::with_capacity(handles.len());
+                            let mut inline_seen = false;
+                            for mut handle in handles {
+                                match handle.take_spawned_parts() {
+                                    Some((lookup_rx, lookup_jh)) => {
+                                        lookup_join.push(lookup_jh);
+                                        // Global position-ordered shard id
+                                        // (contig-major, worker-minor) so the
+                                        // ascending-id concat in vcf_sink is sorted.
+                                        let shard_id = self.next_global_shard_id;
+                                        self.next_global_shard_id += 1;
+                                        let shard_path = shard_ctx
+                                            .tempdir
+                                            .join(format!("partition_{shard_id:04}.vcf.body"));
+                                        shard_handles.push(spawn_annotation_from_lookup_sharded(
+                                            Arc::clone(&shared),
+                                            lookup_rx,
+                                            config.cache_source_type,
+                                            config.projection.clone(),
+                                            config.input_buffer_size,
+                                            Arc::clone(&shard_ctx),
+                                            shard_path,
+                                        ));
                                     }
-                                })
-                                .or_else(|| {
-                                    cache
-                                        .context_path("translation_sift", &ready.chrom)
-                                        .and_then(|p| {
-                                            AnnotateProvider::build_sift_direct_reader(p.to_str()?)
-                                        })
-                                })
+                                    None => {
+                                        handle.abort();
+                                        inline_seen = true;
+                                    }
+                                }
+                            }
+                            if inline_seen {
+                                for h in &shard_handles {
+                                    h.abort();
+                                }
+                                for h in &lookup_join {
+                                    h.abort();
+                                }
+                                self.state = StreamState::Done;
+                                return Poll::Ready(Some(Err(DataFusionError::Internal(
+                                    "parallel annotation (threads>1) requires spawned lookup \
+                                     partitions (inline_lookup must be false)"
+                                        .to_string(),
+                                ))));
+                            }
+                            let abort_handles: Vec<tokio::task::AbortHandle> =
+                                shard_handles.iter().map(|h| h.abort_handle()).collect();
+                            // Join all workers; first error wins (the future is
+                            // dropped on error, detaching the rest — abort_handles
+                            // aborts the still-running siblings).
+                            let join_fut: ShardJoinFuture = Box::pin(async move {
+                                let mut total = 0usize;
+                                for h in shard_handles {
+                                    match h.await {
+                                        Ok(Ok(rows)) => total += rows,
+                                        Ok(Err(e)) => return Err(e),
+                                        Err(join_err) => {
+                                            return Err(DataFusionError::External(Box::new(
+                                                join_err,
+                                            )));
+                                        }
+                                    }
+                                }
+                                Ok(total)
+                            });
+                            let state = ParallelContigState {
+                                join_fut,
+                                abort_handles,
+                                lookup_join,
+                                ephemeral_tables: ready.ephemeral_tables,
+                                chrom: ready.chrom,
+                                config,
+                                session,
+                                t_contig: ready.t_contig,
+                                shared,
+                            };
+                            self.state = StreamState::AnnotatingParallel(state);
                         } else {
-                            None
-                        };
-
-                        // Reuse the pre-opened SiftKvStore from config (opened
-                        // once, shared across contigs) rather than re-opening
-                        // the fjall DB every contig.
-                        #[cfg(feature = "kv-cache")]
-                        let sift_kv = if use_fjall_sift && config.flags.everything {
-                            config.sift_kv_store.clone()
-                        } else {
-                            None
-                        };
-
-                        self.state = StreamState::AnnotatingContig(ContigAnnotationState {
-                            lookup_stream: Some(ready.lookup_stream),
-                            transcript_cache_regions: ready
-                                .transcripts
-                                .iter()
-                                .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
-                                .collect(),
-                            persisted_buffer_transcripts: HashMap::new(),
-                            transcripts: ready.transcripts,
-                            translateable_seq_by_tx: ready.translateable_seq_by_tx,
-                            exons: ready.exons,
-                            translations: ready.translations,
-                            regulatory: ready.regulatory,
-                            motifs: ready.motifs,
-                            mirnas: ready.mirnas,
-                            structural: ready.structural,
-                            colocated_map: HashMap::new(),
-                            colocated_map_built: false,
-                            coloc_sink: ready.coloc_sink,
-                            hydrated_cds_tx_ids: HashSet::new(),
-                            hgvs_reader,
-                            sift_cache: SiftPolyphenCache::new(),
-                            sift_direct,
-                            loaded_sift_windows: HashSet::new(),
-                            #[cfg(feature = "kv-cache")]
-                            sift_kv,
-                            tmp_provider,
-                            engine,
-                            window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
-                            input_buffer_accumulator: InputBufferAccumulator::default(),
-                            lookup_done: false,
-                            ephemeral_tables: ready.ephemeral_tables,
-                            chrom: ready.chrom,
-                            config,
-                            session,
-                            cache,
-                            t_contig: ready.t_contig,
-                            contig_rows: 0,
-                        });
+                            let worker =
+                                match AnnotationWorkerState::new(Arc::clone(&ready.shared_context))
+                                {
+                                    Ok(worker) => worker,
+                                    Err(e) => {
+                                        abort_lookup_partitions(&mut ready.lookup_partitions);
+                                        self.state = StreamState::Done;
+                                        return Poll::Ready(Some(Err(e)));
+                                    }
+                                };
+                            let ann = ContigAnnotationState {
+                                lookup_partitions: LookupPartitionFanIn::new(
+                                    ready.lookup_partitions,
+                                    LOOKUP_PARTITION_QUEUE_BATCHES,
+                                ),
+                                worker,
+                                ephemeral_tables: ready.ephemeral_tables,
+                                chrom: ready.chrom,
+                                config,
+                                session,
+                                t_contig: ready.t_contig,
+                                contig_rows: 0,
+                                lookup_wait_started: None,
+                                ordered_lookup_wait_started: None,
+                                inflight: VecDeque::new(),
+                            };
+                            self.state = StreamState::AnnotatingContig(ann);
+                        }
                     }
                 },
 
+                StreamState::AnnotatingParallel(_) => {
+                    let StreamState::AnnotatingParallel(mut state) =
+                        std::mem::replace(&mut self.state, StreamState::Done)
+                    else {
+                        unreachable!()
+                    };
+                    // Sharded output: the workers write the VCF body directly to
+                    // their shard files; this arm only drives them to completion
+                    // (all shards written + flushed) and yields no row batches.
+                    match state.join_fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.state = StreamState::AnnotatingParallel(state);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(contig_rows)) => {
+                            // Lookups have all closed by now; abort any stragglers.
+                            for h in &state.lookup_join {
+                                h.abort();
+                            }
+                            profile_end!(
+                                &format!("{}: TOTAL", state.chrom),
+                                state.t_contig,
+                                format!("{contig_rows} rows")
+                            );
+                            emit_contig_pipeline_profile(&state.shared.profile, &state.chrom);
+                            let fut = make_cleanup_future(
+                                Arc::clone(&state.session),
+                                std::mem::take(&mut state.ephemeral_tables),
+                            );
+                            self.state = StreamState::CleaningUp(fut);
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => {
+                            state.abort();
+                            let fut = make_cleanup_future(
+                                Arc::clone(&state.session),
+                                std::mem::take(&mut state.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            continue;
+                        }
+                    }
+                }
+
                 StreamState::AnnotatingContig(ann) => {
-                    // Pull batches from lookup stream into window buffer.
-                    //
-                    // Both VariantLookupExec (parquet) and KvLookupExec (fjall)
-                    // buffer matched rows internally and only emit after the
-                    // input is exhausted, ensuring the colocated sink is fully
-                    // populated when the first batch arrives here.
+                    // Pull looked-up batches into the window buffer. For fjall,
+                    // lookup partitions run concurrently, but this state machine
+                    // drains their bounded receivers strictly by partition id.
                     //
                     // LIMIT pushdown: once we have enough buffered rows to
                     // satisfy the limit, stop pulling from the lookup stream
                     // to avoid unnecessary annotation work.
-                    let buffered_rows: usize = ann.window_buffer.iter().map(|b| b.num_rows()).sum();
+                    let buffered_rows: usize =
+                        ann.worker.window_buffer.iter().map(|b| b.num_rows()).sum();
                     let limit_buffered =
                         fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit);
-                    if !ann.lookup_done && !limit_buffered {
-                        let stream = ann
-                            .lookup_stream
-                            .as_mut()
-                            .expect("stream alive during lookup");
-                        match stream.as_mut().poll_next(cx) {
-                            Poll::Pending => return Poll::Pending,
-                            Poll::Ready(Some(Ok(batch))) => {
-                                ann.contig_rows += batch.num_rows();
-                                ann.window_buffer.push(batch);
-                                if ann.window_buffer.len() < HYDRATION_WINDOW_SIZE {
-                                    continue; // Keep filling window.
+                    let ready_input_buffer_count = ann
+                        .worker
+                        .input_buffer_accumulator
+                        .ready_input_buffer_count_with_batches(
+                            ann.config.input_buffer_size,
+                            &ann.worker.window_buffer,
+                        );
+                    let has_target_ready_input_buffers = ready_input_buffer_count >= 1;
+                    let window_full = ann.worker.window_buffer.len() >= HYDRATION_WINDOW_SIZE;
+                    if !ann.worker.lookup_done
+                        && !limit_buffered
+                        && !has_target_ready_input_buffers
+                        && !window_full
+                    {
+                        match poll_lookup_partitions(ann, cx) {
+                            Poll::Pending => {
+                                let ready_after_poll = ann
+                                    .worker
+                                    .input_buffer_accumulator
+                                    .ready_input_buffer_count_with_batches(
+                                        ann.config.input_buffer_size,
+                                        &ann.worker.window_buffer,
+                                    );
+                                // Only park if there's no window to form AND no
+                                // in-flight fused task whose result we can drain.
+                                if ready_after_poll == 0 && ann.inflight.is_empty() {
+                                    return Poll::Pending;
                                 }
                             }
-                            Poll::Ready(Some(Err(e))) => {
+                            Poll::Ready(Ok(())) => {}
+                            Poll::Ready(Err(e)) => {
+                                abort_annotation_lookup_partitions(ann);
                                 let session = Arc::clone(&ann.session);
                                 let tables = ann.ephemeral_tables.clone();
                                 self.state = StreamState::ErrorCleaningUp(
@@ -8688,22 +11946,6 @@ impl Stream for ContigAnnotationStream {
                                     e,
                                 );
                                 continue;
-                            }
-                            Poll::Ready(None) => {
-                                ann.lookup_done = true;
-                                // Drop the lookup stream to reclaim BuildSide
-                                // memory (COITrees, hash indices, concatenated
-                                // VCF batch) — no longer needed.
-                                ann.lookup_stream = None;
-                                // NOTE: colocated sink is cleared AFTER the
-                                // colocated map is built (below), not here.
-                                // Clearing here would lose data for backends
-                                // like fjall that emit batches immediately.
-                                profile_end!(
-                                    &format!("{}: 1. variation_lookup", ann.chrom),
-                                    ann.t_contig,
-                                    format!("{} rows", ann.contig_rows)
-                                );
                             }
                         }
                     }
@@ -8716,100 +11958,143 @@ impl Stream for ContigAnnotationStream {
                         unreachable!()
                     };
 
-                    // LIMIT pushdown: skip remaining windows if limit reached.
+                    // LIMIT pushdown: stop producing new windows once reached.
+                    let threads = ann.config.annotation_threads.max(1);
                     let limit_reached = fetch_limit.is_some_and(|limit| rows_emitted >= limit);
-                    let has_pending_input_buffer = ann.input_buffer_accumulator.pending_rows() > 0;
+                    let has_pending_input_buffer =
+                        ann.worker.input_buffer_accumulator.pending_rows() > 0;
+                    let window_available = !limit_reached
+                        && (!ann.worker.window_buffer.is_empty() || has_pending_input_buffer);
 
-                    if limit_reached || (ann.window_buffer.is_empty() && !has_pending_input_buffer)
-                    {
-                        // No more data (or limit reached) — clean up.
-                        // Drop heavy state eagerly before the async cleanup future runs.
-                        profile_end!(
-                            &format!("{}: TOTAL", ann.chrom),
-                            ann.t_contig,
-                            format!("{} rows", ann.contig_rows)
-                        );
-                        if profiling_enabled() {
-                            eprintln!("[VEP_PROFILE] ------ contig {} END ------", ann.chrom);
+                    // Dispatch one fused window task while the pool has capacity.
+                    // Each task runs on a fresh worker seeded with the current
+                    // colocated snapshot (complete for this window's variants),
+                    // hydrating + annotating independently on the blocking pool.
+                    if window_available && ann.inflight.len() < threads {
+                        // Cut a window at ~input_buffer_size rows (not the full
+                        // HYDRATION_WINDOW_SIZE batch budget) so a contig yields
+                        // many windows to spread across the worker pool.
+                        let target_rows = ann.config.input_buffer_size.max(1);
+                        let mut window_end = 0usize;
+                        let mut acc_rows = 0usize;
+                        for batch in &ann.worker.window_buffer {
+                            window_end += 1;
+                            acc_rows += batch.num_rows();
+                            if acc_rows >= target_rows {
+                                break;
+                            }
                         }
-                        // Eagerly reclaim per-contig memory.
-                        ann.colocated_map = HashMap::new();
-                        ann.transcripts = Vec::new();
-                        ann.exons = Vec::new();
-                        ann.translations = Vec::new();
-                        ann.regulatory = Vec::new();
-                        ann.motifs = Vec::new();
-                        let fut = make_cleanup_future(
-                            Arc::clone(&ann.session),
-                            std::mem::take(&mut ann.ephemeral_tables),
-                        );
-                        self.state = StreamState::CleaningUp(fut);
+                        let window_end = window_end.min(ann.worker.window_buffer.len()).max(1);
+                        let window_batches: Vec<RecordBatch> =
+                            ann.worker.window_buffer.drain(..window_end).collect();
+                        let projection = ann.config.projection.clone();
+                        let shared = Arc::clone(&ann.worker.shared);
+                        let colocated = Arc::clone(&ann.worker.colocated_map);
+                        let cache_source_type = ann.config.cache_source_type;
+                        let handle = tokio::task::spawn_blocking(move || {
+                            annotate_window_owned(
+                                shared,
+                                colocated,
+                                window_batches,
+                                cache_source_type,
+                                projection,
+                            )
+                        });
+                        ann.inflight.push_back(handle);
+                        self.state = StreamState::AnnotatingContig(ann);
                         continue;
                     }
 
-                    // Build colocated map once (sink is fully populated now
-                    // that the entire lookup stream has been drained).
-                    if !ann.colocated_map_built {
-                        if ann.config.flags.check_existing {
-                            let mut guard = ann.coloc_sink.lock().unwrap();
-                            ann.colocated_map = build_colocated_map_from_sink(&guard);
-                            // Clear sink now that data has been copied to the map.
-                            guard.clear();
-                        }
-                        ann.colocated_map_built = true;
+                    // Pool full, or no more windows to form: drain the oldest
+                    // in-flight task (FIFO preserves window/output order).
+                    if let Some(handle) = ann.inflight.pop_front() {
+                        self.state = StreamState::AwaitingWindow {
+                            handle,
+                            annotation_state: ann,
+                        };
+                        continue;
                     }
 
-                    // Take one window's worth of batches from the buffer.
-                    let window_end = ann.window_buffer.len().min(HYDRATION_WINDOW_SIZE);
-                    let window_batches: Vec<RecordBatch> =
-                        ann.window_buffer.drain(..window_end).collect();
-
-                    // Window-based HGVS hydration (like SIFT sliding window).
-                    if !window_batches.is_empty() {
-                        if let Err(e) = hydrate_window(
-                            &mut ann.transcripts,
-                            &ann.exons,
-                            &mut ann.translations,
-                            &ann.translateable_seq_by_tx,
-                            &mut ann.hgvs_reader,
-                            &mut ann.hydrated_cds_tx_ids,
-                            &window_batches,
-                            ann.config.cache_source_type,
-                        ) {
-                            let fut = make_cleanup_future(
-                                Arc::clone(&ann.session),
-                                std::mem::take(&mut ann.ephemeral_tables),
-                            );
-                            self.state = StreamState::ErrorCleaningUp(fut, e);
-                            continue;
-                        }
+                    // No window to produce and nothing in flight — contig done.
+                    abort_annotation_lookup_partitions(&mut ann);
+                    // Drop heavy state eagerly before the async cleanup future runs.
+                    profile_end!(
+                        &format!("{}: TOTAL", ann.chrom),
+                        ann.t_contig,
+                        format!("{} rows", ann.contig_rows)
+                    );
+                    emit_contig_pipeline_profile(&ann.worker.shared.profile, &ann.chrom);
+                    if profiling_enabled() {
+                        eprintln!("[VEP_PROFILE] ------ contig {} END ------", ann.chrom);
                     }
+                    // Eagerly reclaim per-contig memory.
+                    ann.worker.colocated_map = Arc::new(HashMap::new());
+                    ann.worker.transcript_overrides = HashMap::new();
+                    ann.worker.translation_overrides = HashMap::new();
+                    let fut = make_cleanup_future(
+                        Arc::clone(&ann.session),
+                        std::mem::take(&mut ann.ephemeral_tables),
+                    );
+                    self.state = StreamState::CleaningUp(fut);
+                    continue;
+                }
 
-                    // Annotate window.
-                    let projection = ann.config.projection.clone();
-                    match annotate_window(&mut ann, &window_batches, projection.as_deref()) {
-                        Err(e) => {
-                            let fut = make_cleanup_future(
-                                Arc::clone(&ann.session),
-                                std::mem::take(&mut ann.ephemeral_tables),
-                            );
-                            self.state = StreamState::ErrorCleaningUp(fut, e);
-                            continue;
+                StreamState::AwaitingWindow {
+                    handle,
+                    annotation_state,
+                } => {
+                    let StreamState::AwaitingWindow {
+                        mut handle,
+                        annotation_state: mut ann,
+                    } = std::mem::replace(&mut self.state, StreamState::Done)
+                    else {
+                        unreachable!()
+                    };
+                    match std::pin::Pin::new(&mut handle).poll(cx) {
+                        Poll::Pending => {
+                            self.state = StreamState::AwaitingWindow {
+                                handle,
+                                annotation_state: ann,
+                            };
+                            return Poll::Pending;
                         }
-                        Ok(batches) => {
+                        Poll::Ready(Ok(Ok(batches))) => {
                             self.state = StreamState::DrainingWindow {
                                 batches,
                                 annotation_state: ann,
                             };
+                            continue;
+                        }
+                        Poll::Ready(Ok(Err(e))) => {
+                            abort_annotation_lookup_partitions(&mut ann);
+                            let fut = make_cleanup_future(
+                                Arc::clone(&ann.session),
+                                std::mem::take(&mut ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            continue;
+                        }
+                        Poll::Ready(Err(join_err)) => {
+                            abort_annotation_lookup_partitions(&mut ann);
+                            let fut = make_cleanup_future(
+                                Arc::clone(&ann.session),
+                                std::mem::take(&mut ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(
+                                fut,
+                                DataFusionError::External(Box::new(join_err)),
+                            );
+                            continue;
                         }
                     }
                 }
 
                 StreamState::DrainingWindow {
                     batches,
-                    annotation_state: _,
+                    annotation_state,
                 } => {
                     if let Some(batch) = batches.pop_front() {
+                        let profile = annotation_state.worker.shared.profile.clone();
                         // LIMIT pushdown: truncate or stop if we've reached the limit.
                         if let Some(limit) = fetch_limit {
                             let remaining = limit.saturating_sub(rows_emitted);
@@ -8822,10 +12107,18 @@ impl Stream for ContigAnnotationStream {
                             }
                             if batch.num_rows() > remaining {
                                 self.rows_emitted += remaining;
+                                record_contig_profile(&profile, |profile| {
+                                    profile.output_batches += 1;
+                                    profile.output_rows += remaining;
+                                });
                                 return Poll::Ready(Some(Ok(batch.slice(0, remaining))));
                             }
                         }
                         self.rows_emitted += batch.num_rows();
+                        record_contig_profile(&profile, |profile| {
+                            profile.output_batches += 1;
+                            profile.output_rows += batch.num_rows();
+                        });
                         return Poll::Ready(Some(Ok(batch)));
                     }
                     // Window drained — back to AnnotatingContig for next window
@@ -8888,12 +12181,14 @@ impl Stream for ContigAnnotationStream {
 /// Returns `None` if the contig has no variation table (skip).
 async fn prepare_contig_context(
     session: Arc<SessionContext>,
-    cache: Arc<PartitionedParquetCache>,
+    cache: Arc<PartitionedAnnotationCache>,
     chrom: String,
     config: ContigAnnotationConfig,
     full_schema: SchemaRef,
 ) -> Result<Option<ContigReadyState>> {
     let t_contig = profile_start!();
+    let pipeline_profile =
+        profiling_enabled().then(|| Arc::new(Mutex::new(ContigPipelineProfile::default())));
     if profiling_enabled() {
         eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
     }
@@ -8913,6 +12208,16 @@ async fn prepare_contig_context(
     let use_fjall = config.use_fjall;
     #[cfg(not(feature = "kv-cache"))]
     let use_fjall = false;
+    #[cfg(feature = "kv-cache")]
+    let use_indexed_parquet = config.indexed_parquet_cache_root.is_some();
+    #[cfg(not(feature = "kv-cache"))]
+    let use_indexed_parquet = false;
+    #[cfg(feature = "lance-cache")]
+    let use_lance = config.lance_cache_root.is_some();
+    #[cfg(not(feature = "lance-cache"))]
+    let use_lance = false;
+
+    let parquet_cache = cache.as_parquet();
 
     let var_table = if use_fjall {
         #[cfg(feature = "kv-cache")]
@@ -8935,10 +12240,21 @@ async fn prepare_contig_context(
         {
             unreachable!("use_fjall requires kv-cache feature")
         }
+    } else if use_indexed_parquet || use_lance {
+        "__vep_indexed_variation".to_string()
     } else {
-        let var_table =
-            crate::partitioned_cache::register_chrom_parquet(&session, &cache, "variation", &chrom)
-                .await?;
+        let parquet_cache = parquet_cache.ok_or_else(|| {
+            DataFusionError::Execution(
+                "parquet variation registration requires a parquet cache layout".to_string(),
+            )
+        })?;
+        let var_table = crate::partitioned_cache::register_chrom_parquet(
+            &session,
+            parquet_cache,
+            "variation",
+            &chrom,
+        )
+        .await?;
         let Some(var_table) = var_table else {
             if profiling_enabled() {
                 eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (no variation) ------");
@@ -8948,95 +12264,141 @@ async fn prepare_contig_context(
         ephemeral_tables.push(var_table.clone());
         var_table
     };
-    validate_partitioned_cache_source(
-        &cache,
-        "variation",
-        &chrom,
-        "variation",
-        config.cache_source_type,
-    )?;
+    if !use_indexed_parquet && !use_lance {
+        let parquet_cache = parquet_cache.ok_or_else(|| {
+            DataFusionError::Execution(
+                "parquet variation validation requires a parquet cache layout".to_string(),
+            )
+        })?;
+        validate_partitioned_cache_source(
+            parquet_cache,
+            "variation",
+            &chrom,
+            "variation",
+            config.cache_source_type,
+        )?;
+    }
 
-    let tx_table =
-        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "transcript", &chrom)
+    let (tx_table, ex_table, tl_table, rg_table, mt_table) =
+        if let Some(parquet_cache) = parquet_cache {
+            let tx_table = crate::partitioned_cache::register_chrom_parquet(
+                &session,
+                parquet_cache,
+                "transcript",
+                &chrom,
+            )
             .await?;
-    if let Some(ref t) = tx_table {
-        validate_partitioned_cache_source(
-            &cache,
-            "transcript",
-            &chrom,
-            "transcript",
-            config.cache_source_type,
-        )?;
-        ephemeral_tables.push(t.clone());
-    }
-    let ex_table =
-        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "exon", &chrom).await?;
-    if let Some(ref t) = ex_table {
-        validate_partitioned_cache_source(
-            &cache,
-            "exon",
-            &chrom,
-            "exon",
-            config.cache_source_type,
-        )?;
-        ephemeral_tables.push(t.clone());
-    }
-    let tl_table = crate::partitioned_cache::register_chrom_parquet(
-        &session,
-        &cache,
-        "translation_core",
-        &chrom,
-    )
-    .await?;
-    if let Some(ref t) = tl_table {
-        validate_partitioned_cache_source(
-            &cache,
-            "translation_core",
-            &chrom,
-            "translation_core",
-            config.cache_source_type,
-        )?;
-        ephemeral_tables.push(t.clone());
-    }
-    let rg_table =
-        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "regulatory", &chrom)
+            if let Some(ref t) = tx_table {
+                validate_partitioned_cache_source(
+                    parquet_cache,
+                    "transcript",
+                    &chrom,
+                    "transcript",
+                    config.cache_source_type,
+                )?;
+                ephemeral_tables.push(t.clone());
+            }
+            let ex_table = crate::partitioned_cache::register_chrom_parquet(
+                &session,
+                parquet_cache,
+                "exon",
+                &chrom,
+            )
             .await?;
-    if let Some(ref t) = rg_table {
-        validate_partitioned_cache_source(
-            &cache,
-            "regulatory",
-            &chrom,
-            "regulatory",
-            config.cache_source_type,
-        )?;
-        ephemeral_tables.push(t.clone());
-    }
-    let mt_table =
-        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "motif", &chrom).await?;
-    if let Some(ref t) = mt_table {
-        validate_partitioned_cache_source(
-            &cache,
-            "motif",
-            &chrom,
-            "motif",
-            config.cache_source_type,
-        )?;
-        ephemeral_tables.push(t.clone());
-    }
+            if let Some(ref t) = ex_table {
+                validate_partitioned_cache_source(
+                    parquet_cache,
+                    "exon",
+                    &chrom,
+                    "exon",
+                    config.cache_source_type,
+                )?;
+                ephemeral_tables.push(t.clone());
+            }
+            let tl_table = crate::partitioned_cache::register_chrom_parquet(
+                &session,
+                parquet_cache,
+                "translation_core",
+                &chrom,
+            )
+            .await?;
+            if let Some(ref t) = tl_table {
+                validate_partitioned_cache_source(
+                    parquet_cache,
+                    "translation_core",
+                    &chrom,
+                    "translation_core",
+                    config.cache_source_type,
+                )?;
+                ephemeral_tables.push(t.clone());
+            }
+            let rg_table = crate::partitioned_cache::register_chrom_parquet(
+                &session,
+                parquet_cache,
+                "regulatory",
+                &chrom,
+            )
+            .await?;
+            if let Some(ref t) = rg_table {
+                validate_partitioned_cache_source(
+                    parquet_cache,
+                    "regulatory",
+                    &chrom,
+                    "regulatory",
+                    config.cache_source_type,
+                )?;
+                ephemeral_tables.push(t.clone());
+            }
+            let mt_table = crate::partitioned_cache::register_chrom_parquet(
+                &session,
+                parquet_cache,
+                "motif",
+                &chrom,
+            )
+            .await?;
+            if let Some(ref t) = mt_table {
+                validate_partitioned_cache_source(
+                    parquet_cache,
+                    "motif",
+                    &chrom,
+                    "motif",
+                    config.cache_source_type,
+                )?;
+                ephemeral_tables.push(t.clone());
+            }
+            (tx_table, ex_table, tl_table, rg_table, mt_table)
+        } else {
+            (None, None, None, None, None)
+        };
 
     // 2. Create lookup stream + load context data.
     let worklist = MissWorklist::for_chrom(&chrom);
 
     // Lookup arm: build LookupProvider, create stream (cheap — build+probe
     // happens on first poll, NOT here).
-    let coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+    let fallback_coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
     let vcf_schema = session
         .table(&config.vcf_table)
         .await?
         .schema()
         .as_arrow()
         .clone();
-    let cache_schema = session.table(&var_table).await?.schema().as_arrow().clone();
+    let cache_schema = if use_indexed_parquet || use_lance {
+        #[cfg(feature = "kv-cache")]
+        {
+            config.indexed_variation_schema.clone().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "indexed variation lookup missing cache schema".to_string(),
+                )
+            })?
+        }
+        #[cfg(not(feature = "kv-cache"))]
+        {
+            unreachable!("indexed_parquet requires kv-cache feature")
+        }
+    } else {
+        session.table(&var_table).await?.schema().as_arrow().clone()
+    };
     let mut provider = LookupProvider::new(
         Arc::clone(&session),
         config.vcf_table.clone(),
@@ -9046,18 +12408,250 @@ async fn prepare_contig_context(
         config.cache_columns.clone(),
         config.extended_probes,
         config.allowed_failed,
-        None, // reference_fasta_path is for HGVS hydration, not lookup
+        config.reference_fasta_path.clone(),
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
-    if config.flags.check_existing {
-        provider.set_colocated_sink(Arc::clone(&coloc_sink));
+    provider.set_target_partitions(config.target_partitions);
+    #[cfg(feature = "kv-cache")]
+    if let Some(root) = &config.indexed_parquet_cache_root {
+        provider.set_indexed_parquet_cache_root(root.clone());
     }
-    let session_state = session.state();
-    let plan = provider.scan(&session_state, None, &[], None).await?;
-    let lookup_stream = plan.execute(0, session.task_ctx())?;
+    #[cfg(feature = "lance-cache")]
+    if let Some(root) = &config.lance_cache_root {
+        provider.set_lance_cache_root(root.clone());
+    }
+    let parallel_lookup = use_fjall || use_indexed_parquet || use_lance;
+    let mut lookup_partitions = if parallel_lookup {
+        let session_state = session.state();
+        let mut plan = provider.scan(&session_state, None, &[], None).await?;
+        let mut partition_count = plan.output_partitioning().partition_count().max(1);
+        let partition_coloc_sinks: Vec<ColocatedSink> = if config.flags.check_existing {
+            let sinks = (0..partition_count)
+                .map(|_| Arc::new(Mutex::new(HashMap::new())) as ColocatedSink)
+                .collect::<Vec<_>>();
+            provider.set_partition_colocated_sinks(sinks.clone());
+            plan = provider.scan(&session_state, None, &[], None).await?;
+            partition_count = plan.output_partitioning().partition_count().max(1);
+            if partition_count > sinks.len() {
+                return Err(DataFusionError::Execution(format!(
+                    "lookup plan produced {partition_count} partitions but only {} colocated sinks were configured",
+                    sinks.len()
+                )));
+            }
+            sinks
+        } else {
+            Vec::new()
+        };
+
+        let task_ctx = session.task_ctx();
+        let mut handles = VecDeque::with_capacity(partition_count);
+        for partition_id in 0..partition_count {
+            let sink = partition_coloc_sinks
+                .get(partition_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+            if config.inline_lookup {
+                handles.push_back(inline_lookup_partition(
+                    Arc::clone(&plan),
+                    Arc::clone(&task_ctx),
+                    partition_id,
+                    chrom.to_string(),
+                    sink,
+                )?);
+            } else {
+                handles.push_back(spawn_lookup_partition_worker(
+                    Arc::clone(&plan),
+                    Arc::clone(&task_ctx),
+                    partition_id,
+                    chrom.to_string(),
+                    sink,
+                    LOOKUP_PARTITION_QUEUE_BATCHES,
+                    pipeline_profile.clone(),
+                ));
+            }
+        }
+        handles
+    } else {
+        if config.flags.check_existing {
+            provider.set_colocated_sink(Arc::clone(&fallback_coloc_sink));
+        }
+        let session_state = session.state();
+        let plan = provider.scan(&session_state, None, &[], None).await?;
+        let lookup_stream = plan.execute(0, session.task_ctx())?;
+        if config.inline_lookup {
+            VecDeque::from([LookupPartitionHandle::Inline(InlineLookupPartitionHandle {
+                partition_id: 0,
+                chrom: chrom.to_string(),
+                stream: lookup_stream,
+                sink: fallback_coloc_sink,
+                next_batch_id: 0,
+            })])
+        } else {
+            VecDeque::from([spawn_lookup_stream_worker(
+                lookup_stream,
+                plan.schema(),
+                chrom.to_string(),
+                fallback_coloc_sink,
+                LOOKUP_PARTITION_QUEUE_BATCHES,
+                pipeline_profile.clone(),
+            )])
+        }
+    };
+    record_contig_profile(&pipeline_profile, |profile| {
+        profile.lookup_partitions = lookup_partitions.len();
+    });
 
     // Context arm: load transcripts, exons, translations, etc.
-    let t_ctx = profile_start!();
+    let context_result: Result<LoadedContigContext> = async {
+        let t_ctx = profile_start!();
+        pipeline_trace::emit("context", "start", &[("chrom", TraceValue::Str(&chrom))]);
+        #[cfg(feature = "lance-cache")]
+        if use_lance {
+            let lance_cache = cache.as_lance().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Lance context loading requires a Lance cache layout".to_string(),
+                )
+            })?;
+            let loaded =
+                load_lance_contig_context(lance_cache, &chrom, &config, &pipeline_profile).await?;
+            let context_elapsed = t_ctx.elapsed();
+            pipeline_trace::emit(
+                "context",
+                "done",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("transcripts", TraceValue::Usize(loaded.0.len())),
+                    ("exons", TraceValue::Usize(loaded.2.len())),
+                    ("translations", TraceValue::Usize(loaded.3.len())),
+                    ("regulatory", TraceValue::Usize(loaded.4.len())),
+                    ("motifs", TraceValue::Usize(loaded.5.len())),
+                    ("elapsed", TraceValue::Duration(context_elapsed)),
+                ],
+            );
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_load += context_elapsed;
+            });
+            if profiling_enabled() {
+                eprintln!(
+                    "[VEP_PROFILE] {:.<50} {:>8.1}ms",
+                    format!("{chrom}: context_load"),
+                    context_elapsed.as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(loaded);
+        }
+        let tmp_provider = AnnotateProvider::new(
+            Arc::clone(&session),
+            config.vcf_table.clone(),
+            String::new(),
+            AnnotationBackend::Parquet,
+            config.cache_source_type,
+            config.options_json.clone(),
+            vcf_only_schema.clone(),
+        )?;
+
+        let tx = if let Some(ref table) = tx_table {
+            let started = Instant::now();
+            let (tx, seq) = tmp_provider.load_transcripts(table, &worklist).await?;
+            let filtered: Vec<_> = tx
+                .into_iter()
+                .filter(|t| passes_transcript_selection(t, config.transcript_selection))
+                .collect();
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_transcripts += started.elapsed();
+            });
+            (filtered, seq)
+        } else {
+            (Vec::new(), HashMap::new())
+        };
+        let (tx_vec, translateable_seq) = tx;
+        let tx_ids: HashSet<String> = tx_vec.iter().map(|t| t.transcript_id.clone()).collect();
+
+        let ex = if let Some(ref table) = ex_table {
+            let started = Instant::now();
+            let raw = tmp_provider.load_exons(table, &worklist).await?;
+            let ex: Vec<_> = raw
+                .into_iter()
+                .filter(|e| tx_ids.contains(&e.transcript_id))
+                .collect();
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_exons += started.elapsed();
+            });
+            ex
+        } else {
+            Vec::new()
+        };
+        let tl = if let Some(ref table) = tl_table {
+            let started = Instant::now();
+            let raw = tmp_provider.load_translations(table, &worklist).await?;
+            let tl: Vec<_> = raw
+                .into_iter()
+                .filter(|t| tx_ids.contains(&t.transcript_id))
+                .collect();
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_translations += started.elapsed();
+            });
+            tl
+        } else {
+            Vec::new()
+        };
+        let rg = if let Some(ref table) = rg_table {
+            let started = Instant::now();
+            let rg = tmp_provider
+                .load_regulatory_features(table, &worklist)
+                .await?;
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_regulatory += started.elapsed();
+            });
+            rg
+        } else {
+            Vec::new()
+        };
+        let mt = if let Some(ref table) = mt_table {
+            let started = Instant::now();
+            let mt = tmp_provider.load_motif_features(table, &worklist).await?;
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_motifs += started.elapsed();
+            });
+            mt
+        } else {
+            Vec::new()
+        };
+        let context_elapsed = t_ctx.elapsed();
+        pipeline_trace::emit(
+            "context",
+            "done",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("transcripts", TraceValue::Usize(tx_vec.len())),
+                ("exons", TraceValue::Usize(ex.len())),
+                ("translations", TraceValue::Usize(tl.len())),
+                ("regulatory", TraceValue::Usize(rg.len())),
+                ("motifs", TraceValue::Usize(mt.len())),
+                ("elapsed", TraceValue::Duration(context_elapsed)),
+            ],
+        );
+        record_contig_profile(&pipeline_profile, |profile| {
+            profile.context_load += context_elapsed;
+        });
+        if profiling_enabled() {
+            eprintln!(
+                "[VEP_PROFILE] {:.<50} {:>8.1}ms",
+                format!("{chrom}: context_load"),
+                context_elapsed.as_secs_f64() * 1000.0
+            );
+        }
+        Ok((tx_vec, translateable_seq, ex, tl, rg, mt))
+    }
+    .await;
+    let (tx_vec, translateable_seq, ex, tl, rg, mt) = match context_result {
+        Ok(context) => context,
+        Err(e) => {
+            abort_lookup_partitions(&mut lookup_partitions);
+            return Err(e);
+        }
+    };
+
     let tmp_provider = AnnotateProvider::new(
         Arc::clone(&session),
         config.vcf_table.clone(),
@@ -9067,63 +12661,108 @@ async fn prepare_contig_context(
         config.options_json.clone(),
         vcf_only_schema,
     )?;
+    let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
+        config.upstream_distance,
+        config.downstream_distance,
+        config.hgvs_flags.shift_hgvs,
+    );
 
-    let tx = if let Some(ref table) = tx_table {
-        let (tx, seq) = tmp_provider.load_transcripts(table, &worklist).await?;
-        let filtered: Vec<_> = tx
-            .into_iter()
-            .filter(|t| passes_transcript_selection(t, config.transcript_selection))
-            .collect();
-        (filtered, seq)
-    } else {
-        (Vec::new(), HashMap::new())
+    // SIFT source: indexed parquet and legacy fjall use a shared transcript-id
+    // prediction store. The old interval parquet path uses direct genomic-window
+    // parquet reads.
+    #[cfg(feature = "kv-cache")]
+    let use_lookup_sift = config.use_fjall || config.indexed_parquet_cache_root.is_some() || {
+        #[cfg(feature = "lance-cache")]
+        {
+            config.lance_cache_root.is_some()
+        }
+        #[cfg(not(feature = "lance-cache"))]
+        {
+            false
+        }
     };
-    let (tx_vec, translateable_seq) = tx;
-    let tx_ids: HashSet<String> = tx_vec.iter().map(|t| t.transcript_id.clone()).collect();
+    #[cfg(not(feature = "kv-cache"))]
+    let use_lookup_sift = false;
 
-    let ex = if let Some(ref table) = ex_table {
-        let raw = tmp_provider.load_exons(table, &worklist).await?;
-        raw.into_iter()
-            .filter(|e| tx_ids.contains(&e.transcript_id))
-            .collect()
+    let sift_direct_path = if config.flags.everything && !use_lookup_sift {
+        config
+            .translations_sift_table
+            .as_deref()
+            .and_then(|table| {
+                if std::path::Path::new(table).exists() {
+                    Some(table.to_string())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                cache
+                    .as_parquet()
+                    .and_then(|cache| cache.context_path("translation_sift", &chrom))
+                    .and_then(|path| path.to_str().map(ToString::to_string))
+            })
     } else {
-        Vec::new()
+        None
     };
-    let tl = if let Some(ref table) = tl_table {
-        let raw = tmp_provider.load_translations(table, &worklist).await?;
-        raw.into_iter()
-            .filter(|t| tx_ids.contains(&t.transcript_id))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let rg = if let Some(ref table) = rg_table {
-        tmp_provider
-            .load_regulatory_features(table, &worklist)
-            .await?
-    } else {
-        Vec::new()
-    };
-    let mt = if let Some(ref table) = mt_table {
-        tmp_provider.load_motif_features(table, &worklist).await?
-    } else {
-        Vec::new()
-    };
-    profile_end!(&format!("{chrom}: context_load"), t_ctx);
+    let sift_direct = sift_direct_path
+        .as_deref()
+        .and_then(AnnotateProvider::build_sift_direct_reader)
+        .map(Arc::new);
 
-    Ok(Some(ContigReadyState {
-        lookup_stream,
-        coloc_sink,
-        transcripts: tx_vec,
-        translateable_seq_by_tx: translateable_seq,
-        exons: ex,
-        translations: tl,
-        regulatory: rg,
-        motifs: mt,
+    #[cfg(feature = "kv-cache")]
+    let sift_prediction_store = if use_lookup_sift && config.flags.everything {
+        #[cfg(feature = "lance-cache")]
+        if use_lance {
+            let lance_cache = cache.as_lance().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Lance SIFT store requires a Lance cache layout".to_string(),
+                )
+            })?;
+            load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?
+        } else {
+            config.sift_prediction_store.clone()
+        }
+        #[cfg(not(feature = "lance-cache"))]
+        {
+            config.sift_prediction_store.clone()
+        }
+    } else {
+        None
+    };
+
+    let base_transcripts = Arc::new(tx_vec);
+    let transcript_cache_regions = Arc::new(
+        base_transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect(),
+    );
+    let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
+    let shared_context = Arc::new(SharedContigAnnotationContext {
+        config: config.clone(),
+        profile: pipeline_profile,
+        base_transcripts,
+        base_translations: Arc::new(tl),
+        exons: Arc::new(ex),
+        indexes,
+        regulatory: Arc::new(rg),
+        motifs: Arc::new(mt),
         // TODO: miRNA and structural features are not yet partitioned —
         // these are rare and handled by the monolithic path only.
-        mirnas: Vec::new(),
-        structural: Vec::new(),
+        mirnas: Arc::new(Vec::new()),
+        structural: Arc::new(Vec::new()),
+        translateable_seq_by_tx: Arc::new(translateable_seq),
+        transcript_cache_regions,
+        tmp_provider: Arc::new(tmp_provider),
+        engine: Arc::new(engine),
+        sift_direct,
+        #[cfg(feature = "kv-cache")]
+        sift_prediction_store,
+    });
+
+    Ok(Some(ContigReadyState {
+        lookup_partitions,
+        shared_context,
         ephemeral_tables,
         chrom,
         t_contig,
@@ -9153,16 +12792,57 @@ impl TableProvider for AnnotateProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let _store = build_store(self.backend, self.cache_source.clone());
 
-        // Parse use_fjall option — when true, use fjall KV store for variation
-        // lookup + SIFT while keeping context from partitioned parquet.
+        // Parse cache format. The backend argument selects the default while
+        // `cache_format` remains accepted for existing callers.
         #[cfg(feature = "kv-cache")]
-        let use_fjall = self
+        let legacy_use_fjall = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "use_fjall"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self.backend == AnnotationBackend::Fjall;
+        #[cfg(feature = "kv-cache")]
+        let default_cache_format = match self.backend {
+            AnnotationBackend::Parquet => "indexed_parquet",
+            AnnotationBackend::Fjall => "legacy_fjall",
+            AnnotationBackend::Lance => "lance",
+        };
+        #[cfg(feature = "kv-cache")]
+        let cache_format = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_string_option(opts, "cache_format"))
+            .unwrap_or_else(|| default_cache_format.to_string());
+        #[cfg(feature = "kv-cache")]
+        let use_fjall = legacy_use_fjall || cache_format == "legacy_fjall";
+        #[cfg(feature = "kv-cache")]
+        let use_indexed_parquet = !use_fjall && cache_format == "indexed_parquet";
+        #[cfg(feature = "lance-cache")]
+        let use_lance =
+            !use_fjall && (cache_format == "lance" || self.backend == AnnotationBackend::Lance);
+        #[cfg(all(feature = "kv-cache", not(feature = "lance-cache")))]
+        let use_lance = false;
         #[cfg(not(feature = "kv-cache"))]
         let use_fjall = false;
+        #[cfg(not(feature = "kv-cache"))]
+        let use_indexed_parquet = false;
+        #[cfg(not(feature = "kv-cache"))]
+        let use_lance = false;
+        #[cfg(feature = "kv-cache")]
+        if !matches!(
+            cache_format.as_str(),
+            "indexed_parquet" | "legacy_fjall" | "lance"
+        ) {
+            return Err(DataFusionError::Execution(format!(
+                "cache_format must be 'indexed_parquet', 'legacy_fjall', or 'lance', got '{cache_format}'"
+            )));
+        }
+        #[cfg(all(feature = "kv-cache", not(feature = "lance-cache")))]
+        if cache_format == "lance" {
+            return Err(DataFusionError::Execution(
+                "cache_format='lance' requires the lance-cache feature".to_string(),
+            ));
+        }
 
         // Check for partitioned per-chromosome cache layout.
         // Opt-in/out via "partitioned": true/false in options_json.
@@ -9171,29 +12851,87 @@ impl TableProvider for AnnotateProvider {
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "partitioned"));
-        let partitioned_cache = if partitioned_opt != Some(false) {
+        #[cfg(feature = "lance-cache")]
+        let partitioned_lance_cache = if use_lance && partitioned_opt != Some(false) {
+            crate::partitioned_cache::PartitionedLanceCache::detect(&self.cache_source)
+        } else {
+            None
+        };
+        let partitioned_cache = if !use_lance && partitioned_opt != Some(false) {
             PartitionedParquetCache::detect(&self.cache_source)
         } else {
             None
         };
+        #[cfg(feature = "lance-cache")]
+        let partitioned_annotation_cache = partitioned_lance_cache
+            .map(PartitionedAnnotationCache::Lance)
+            .or_else(|| {
+                partitioned_cache
+                    .clone()
+                    .map(PartitionedAnnotationCache::Parquet)
+            });
+        #[cfg(not(feature = "lance-cache"))]
+        let partitioned_annotation_cache = partitioned_cache
+            .clone()
+            .map(PartitionedAnnotationCache::Parquet);
+
         // When explicitly requested or auto-detected, use partitioned path.
-        if let Some(ref cache) = partitioned_cache {
+        if let Some(cache) = partitioned_annotation_cache {
+            let available_chroms = cache.available_chroms();
             if profiling_enabled() {
                 eprintln!(
-                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {}{}",
-                    cache.available_chroms().len(),
+                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {}{}{}",
+                    available_chroms.len(),
                     self.cache_source,
                     if use_fjall {
                         " [fjall variation+sift]"
                     } else {
                         ""
                     },
+                    if use_lance { " [lance]" } else { "" },
                 );
             }
 
             // Determine requested cache columns.
-            // When using fjall, get schema from the KV store; otherwise from
-            // a sample variation parquet file.
+            // For indexed parquet, read schema from a warm/cold tier file.
+            #[cfg(feature = "kv-cache")]
+            let indexed_variation_schema: Option<Schema> = if use_indexed_parquet {
+                let parquet_cache = cache.as_parquet().ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "indexed_parquet cache format requires a parquet cache layout".to_string(),
+                    )
+                })?;
+                let sample_chrom = &available_chroms[0];
+                let sample_path = indexed_variation_parquet_path(parquet_cache, sample_chrom).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "indexed_parquet cache has no warm/cold variation parquet for sample chrom {sample_chrom}"
+                    ))
+                })?;
+                Some(read_variation_parquet_schema(&sample_path)?)
+            } else if use_lance {
+                #[cfg(feature = "lance-cache")]
+                {
+                    let lance_cache = cache.as_lance().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "lance cache format requires a Lance cache layout".to_string(),
+                        )
+                    })?;
+                    let sample_chrom = &available_chroms[0];
+                    let sample_path = lance_cache.variation_path(sample_chrom).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "Lance cache has no variation dataset for sample chrom {sample_chrom}"
+                        ))
+                    })?;
+                    Some(read_lance_dataset_schema(&sample_path).await?)
+                }
+                #[cfg(not(feature = "lance-cache"))]
+                {
+                    None
+                }
+            } else {
+                None
+            };
+
             #[cfg(feature = "kv-cache")]
             let kv_store_arc: Option<Arc<crate::kv_cache::VepKvStore>> = if use_fjall {
                 let fjall_path = std::path::Path::new(&self.cache_source).join("variation.fjall");
@@ -9203,10 +12941,20 @@ impl TableProvider for AnnotateProvider {
                         fjall_path.display()
                     )));
                 }
-                Some(Arc::new(crate::kv_cache::VepKvStore::open(&fjall_path)?))
+                Some(crate::kv_cache::VepKvStore::open_shared(&fjall_path)?)
             } else {
                 None
             };
+
+            #[cfg(feature = "kv-cache")]
+            if use_fjall && !self.session.table_exist("__vep_kv_variation")? {
+                let store = kv_store_arc
+                    .as_ref()
+                    .expect("kv_store must be set when use_fjall=true");
+                let kv_provider = KvCacheTableProvider::from_store(Arc::clone(store));
+                self.session
+                    .register_table("__vep_kv_variation", Arc::new(kv_provider))?;
+            }
 
             let (available_cache_columns, sample_table_to_deregister) = if use_fjall {
                 #[cfg(feature = "kv-cache")]
@@ -9224,11 +12972,33 @@ impl TableProvider for AnnotateProvider {
                 {
                     unreachable!("use_fjall requires kv-cache feature")
                 }
+            } else if use_indexed_parquet || use_lance {
+                #[cfg(feature = "kv-cache")]
+                {
+                    let cache_schema = indexed_variation_schema.as_ref().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "indexed variation schema was not loaded".to_string(),
+                        )
+                    })?;
+                    let cols: HashSet<String> = cache_schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect();
+                    (cols, None)
+                }
+                #[cfg(not(feature = "kv-cache"))]
+                {
+                    unreachable!("indexed_parquet requires kv-cache feature")
+                }
             } else {
-                let sample_chrom = &cache.available_chroms()[0];
+                let parquet_cache = cache
+                    .as_parquet()
+                    .expect("non-indexed partitioned path requires parquet cache");
+                let sample_chrom = &available_chroms[0];
                 let sample_table = crate::partitioned_cache::register_chrom_parquet(
                     &self.session,
-                    cache,
+                    parquet_cache,
                     "variation",
                     sample_chrom,
                 )
@@ -9239,7 +13009,7 @@ impl TableProvider for AnnotateProvider {
                     )
                 })?;
                 validate_partitioned_cache_source(
-                    cache,
+                    parquet_cache,
                     "variation",
                     sample_chrom,
                     "variation",
@@ -9266,10 +13036,30 @@ impl TableProvider for AnnotateProvider {
                     preferred_columns.push(c);
                 }
             }
+            // CacheOnly structured columns are not part of the CSQ string. Only
+            // read them from the cache when the query's projection actually
+            // selects the corresponding output column (projection pushdown).
+            // A `None` projection means "all columns" → keep them.
+            let output_schema = self.schema();
+            let cache_only_selected = |name: &str| -> bool {
+                if !CACHE_ONLY_CSQ_SKIPPABLE_COLUMNS.contains(&name) {
+                    return true;
+                }
+                match projection {
+                    None => true,
+                    Some(proj) => match output_schema.index_of(name) {
+                        Ok(idx) => proj.contains(&idx),
+                        // Column not present in the output schema → projection can
+                        // never select it; safe to skip reading it from the cache.
+                        Err(_) => false,
+                    },
+                }
+            };
             let requested_columns: Vec<&str> = preferred_columns
                 .iter()
                 .copied()
                 .filter(|name| available_cache_columns.contains(*name))
+                .filter(|name| cache_only_selected(name))
                 .collect();
 
             let extended_probes = self
@@ -9298,16 +13088,29 @@ impl TableProvider for AnnotateProvider {
                     translations_sift_table.as_deref(),
                     #[cfg(feature = "kv-cache")]
                     kv_store_arc,
+                    #[cfg(feature = "kv-cache")]
+                    use_indexed_parquet,
+                    #[cfg(feature = "lance-cache")]
+                    use_lance,
+                    #[cfg(feature = "kv-cache")]
+                    indexed_variation_schema,
                     limit,
                 )
                 .await;
         }
 
-        Err(DataFusionError::Execution(format!(
-            "annotate_vep(): no partitioned cache detected at '{}'. \
-             Expected a directory with a variation/ subdirectory containing per-chromosome parquet files.",
-            self.cache_source
-        )))
+        let message = if use_lance {
+            format!(
+                "annotate_vep(): no partitioned Lance cache detected at '{}'. Expected a directory with variation.lance/chrom_manifest.json.",
+                self.cache_source
+            )
+        } else {
+            format!(
+                "annotate_vep(): no partitioned cache detected at '{}'. Expected a directory with a variation/ subdirectory containing per-chromosome parquet files.",
+                self.cache_source
+            )
+        };
+        Err(DataFusionError::Execution(message))
     }
 }
 
@@ -9317,6 +13120,341 @@ mod tests {
     use crate::transcript_consequence::{
         CachedPredictions, FeatureType, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
     };
+
+    #[test]
+    fn draining_colocated_sink_leaves_sink_empty() {
+        let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut guard = sink.lock().unwrap();
+            guard.insert(
+                ("1".to_string(), 100, 100, "A/G".to_string()),
+                ColocatedSinkValue {
+                    entries: Vec::new(),
+                    compare_output_allele: Some("G".to_string()),
+                    unshifted_output_allele: None,
+                },
+            );
+        }
+
+        let drained = drain_colocated_sink(&sink).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(sink.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn colocated_repeat_indel_id_fallback_does_not_drive_frequency_fields() {
+        let mut af_values = vec![String::new(); AF_COLUMNS.len()];
+        af_values[0] = "AAAAAAAAAAAA:0.3031".to_string();
+        af_values[1] = "AAAAAAAAAAAA:0.4024".to_string();
+        af_values[16] = "AAAAAAAAAAAA:0.2803".to_string();
+        af_values[17] = "AAAAAAAAAAAA:0.3704".to_string();
+
+        let data = ColocatedData {
+            entries: vec![ColocatedEntry {
+                variation_name: "rs34467003".to_string(),
+                allele_string: "AAAAAAAAAAAAA/AAAAAAAAAA/AAAAAAAAAAA/AAAAAAAAAAAA/AAAAAAAAAAAAAA"
+                    .to_string(),
+                matched_alleles: vec![MatchedVariantAllele {
+                    a_allele: "A".to_string(),
+                    a_index: 0,
+                    b_allele: "AAAAAAAAAAAA".to_string(),
+                    b_index: 2,
+                }],
+                somatic: 0,
+                pheno: 0,
+                clin_sig: None,
+                clin_sig_allele: None,
+                pubmed: None,
+                af_values,
+            }],
+            compare_output_allele: Some("A".to_string()),
+            unshifted_output_allele: None,
+        };
+        let flags = VepFlags::from_options_json(Some("{\"everything\":true}"));
+
+        let variant_fields = data.variant_fields("-", data.variant_match_output_allele("-"), false);
+        assert_eq!(variant_fields.existing_variation, "rs34467003");
+
+        let frequency_fields =
+            data.frequency_fields("-", data.frequency_match_output_allele("-"), &flags);
+        assert!(
+            frequency_fields
+                .af_values
+                .iter()
+                .all(|value| value.is_empty())
+        );
+        assert!(frequency_fields.max_af.is_empty());
+        assert!(frequency_fields.max_af_pops.is_empty());
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test]
+    async fn lance_cache_format_is_accepted() {
+        let session = Arc::new(SessionContext::new());
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = AnnotateProvider::new(
+            Arc::clone(&session),
+            "vcf".to_string(),
+            tmp.path().to_string_lossy().to_string(),
+            AnnotationBackend::Lance,
+            CacheSourceType::Merged,
+            Some(r#"{"partitioned":true,"cache_format":"lance","everything":true}"#.to_string()),
+            vcf_schema,
+        )
+        .unwrap();
+
+        let state = session.state();
+        let err = provider
+            .scan(&state, None, &[], None)
+            .await
+            .expect_err("missing partitioned cache should fail");
+        let message = err.to_string();
+        assert!(
+            !message.contains("cache_format must"),
+            "lance cache_format was rejected: {message}"
+        );
+        assert!(message.contains("no partitioned Lance cache detected"));
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[tokio::test]
+    async fn lance_backend_detects_lance_manifest_without_parquet_variation_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let variation = tmp.path().join("variation.lance");
+        std::fs::create_dir_all(variation.join("chr1.lance")).unwrap();
+        crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+        ])
+        .write_to_entity_dir(&variation)
+        .unwrap();
+
+        assert!(
+            crate::partitioned_cache::PartitionedLanceCache::detect(tmp.path().to_str().unwrap())
+                .is_some()
+        );
+        assert!(
+            crate::partitioned_cache::PartitionedParquetCache::detect(tmp.path().to_str().unwrap())
+                .is_none()
+        );
+    }
+
+    fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
+        ContigAnnotationConfig {
+            vcf_table: "vcf".to_string(),
+            options_json: None,
+            cache_columns: Vec::new(),
+            extended_probes: true,
+            translations_sift_table: None,
+            flags: VepFlags::from_options_json(None),
+            hgvs_flags: HgvsFlags::default(),
+            cache_source_type: CacheSourceType::Ensembl,
+            transcript_selection: TranscriptSelectionFlags::default(),
+            allowed_failed: 0,
+            reference_fasta_path: None,
+            upstream_distance: 5000,
+            downstream_distance: 5000,
+            input_buffer_size: VEP_INPUT_BUFFER_SIZE,
+            target_partitions: 1,
+            projection: None,
+            annotation_column_count: 0,
+            fetch_limit: None,
+            chromosome_lanes: 1,
+            inline_lookup: false,
+            annotation_threads: 1,
+            deregister_global_kv_on_finish: true,
+            pick_flags: PickFlags::default(),
+            #[cfg(feature = "kv-cache")]
+            use_fjall: true,
+            #[cfg(feature = "kv-cache")]
+            indexed_parquet_cache_root: None,
+            #[cfg(feature = "lance-cache")]
+            lance_cache_root: None,
+            #[cfg(feature = "kv-cache")]
+            indexed_variation_schema: None,
+            #[cfg(feature = "kv-cache")]
+            kv_store: None,
+            #[cfg(feature = "kv-cache")]
+            sift_prediction_store: None,
+            vcf_shard_ctx: None,
+        }
+    }
+
+    fn minimal_shared_contig_annotation_context_with_features(
+        transcripts: Vec<TranscriptFeature>,
+        translations: Vec<TranslationFeature>,
+    ) -> Arc<SharedContigAnnotationContext> {
+        minimal_shared_contig_annotation_context_with_context(transcripts, translations, Vec::new())
+    }
+
+    fn minimal_shared_contig_annotation_context_with_context(
+        transcripts: Vec<TranscriptFeature>,
+        translations: Vec<TranslationFeature>,
+        exons: Vec<ExonFeature>,
+    ) -> Arc<SharedContigAnnotationContext> {
+        let session = Arc::new(SessionContext::new());
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let tmp_provider = AnnotateProvider::new(
+            session,
+            "vcf".to_string(),
+            String::new(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Ensembl,
+            None,
+            vcf_schema,
+        )
+        .unwrap();
+
+        Arc::new(SharedContigAnnotationContext {
+            config: minimal_contig_annotation_config(),
+            profile: None,
+            base_transcripts: Arc::new(transcripts),
+            indexes: Arc::new(SharedContextIndexes::new(&exons, &translations)),
+            base_translations: Arc::new(translations),
+            exons: Arc::new(exons),
+            regulatory: Arc::new(Vec::new()),
+            motifs: Arc::new(Vec::new()),
+            mirnas: Arc::new(Vec::new()),
+            structural: Arc::new(Vec::new()),
+            translateable_seq_by_tx: Arc::new(HashMap::new()),
+            transcript_cache_regions: Arc::new(HashMap::new()),
+            tmp_provider: Arc::new(tmp_provider),
+            engine: Arc::new(TranscriptConsequenceEngine::new_with_hgvs_shift(
+                5000, 5000, false,
+            )),
+            sift_direct: None,
+            #[cfg(feature = "kv-cache")]
+            sift_prediction_store: None,
+        })
+    }
+
+    fn minimal_shared_contig_annotation_context() -> Arc<SharedContigAnnotationContext> {
+        minimal_shared_contig_annotation_context_with_features(Vec::new(), Vec::new())
+    }
+
+    fn minimal_contig_annotation_state(config: ContigAnnotationConfig) -> ContigAnnotationState {
+        let mut shared = minimal_shared_contig_annotation_context();
+        Arc::get_mut(&mut shared).unwrap().config = config.clone();
+        let worker = AnnotationWorkerState::new(shared).unwrap();
+
+        ContigAnnotationState {
+            lookup_partitions: LookupPartitionFanIn::new(
+                VecDeque::new(),
+                LOOKUP_PARTITION_QUEUE_BATCHES,
+            ),
+            worker,
+            ephemeral_tables: Vec::new(),
+            chrom: "chr1".to_string(),
+            config,
+            session: Arc::new(SessionContext::new()),
+            t_contig: Instant::now(),
+            contig_rows: 0,
+            lookup_wait_started: None,
+            ordered_lookup_wait_started: None,
+            inflight: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn annotation_worker_state_starts_with_partition_local_mutable_state() {
+        let shared = minimal_shared_contig_annotation_context();
+        let mut left = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+        let right = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+
+        left.hydrated_cds_tx_ids.insert("left_tx".to_string());
+        left.loaded_sift_windows.insert(("1".to_string(), 0));
+        left.persisted_buffer_transcripts.insert(
+            TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 0,
+            },
+            HashMap::new(),
+        );
+
+        assert!(right.hydrated_cds_tx_ids.is_empty());
+        assert!(right.loaded_sift_windows.is_empty());
+        assert!(right.persisted_buffer_transcripts.is_empty());
+
+        assert!(Arc::ptr_eq(&left.shared.exons, &right.shared.exons));
+        assert!(Arc::ptr_eq(
+            &left.shared.regulatory,
+            &right.shared.regulatory
+        ));
+        assert!(Arc::ptr_eq(&left.shared.motifs, &right.shared.motifs));
+    }
+
+    #[test]
+    fn annotation_worker_state_shares_base_features_with_empty_partition_overlays() {
+        let shared = minimal_shared_contig_annotation_context_with_features(
+            vec![make_tx(
+                "tx1",
+                Some("gene1"),
+                Some("GENE1"),
+                Some("HGNC"),
+                Some("1"),
+            )],
+            vec![make_translation("tx1", Vec::new())],
+        );
+
+        let worker = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+
+        assert_eq!(worker.shared.base_transcripts.len(), 1);
+        assert_eq!(worker.shared.base_translations.len(), 1);
+        assert!(worker.transcript_overrides.is_empty());
+        assert!(worker.translation_overrides.is_empty());
+    }
+
+    #[test]
+    fn partition_overrides_replace_only_selected_buffer_features() {
+        let base_tx = make_tx("tx1", Some("gene1"), Some("GENE1"), Some("HGNC"), Some("1"));
+        let other_tx = make_tx("tx2", Some("gene2"), Some("GENE2"), Some("HGNC"), Some("2"));
+        let mut hydrated_tx = base_tx.clone();
+        hydrated_tx.spliced_seq = Some("ACGT".to_string());
+        let mut transcript_overrides = HashMap::new();
+        transcript_overrides.insert(
+            hydrated_tx.transcript_id.clone(),
+            TranscriptPartitionState::from_transcript(&hydrated_tx),
+        );
+        let mut buffer_transcripts = vec![base_tx, other_tx];
+
+        apply_partition_transcript_overrides(&mut buffer_transcripts, &transcript_overrides);
+
+        assert_eq!(buffer_transcripts[0].spliced_seq.as_deref(), Some("ACGT"));
+        assert!(buffer_transcripts[1].spliced_seq.is_none());
+
+        let base_translation = make_translation("tx1", Vec::new());
+        let other_translation = make_translation("tx2", Vec::new());
+        let mut hydrated_translation = base_translation.clone();
+        hydrated_translation.cds_sequence = Some("ATG".to_string());
+        let mut translation_overrides = HashMap::new();
+        translation_overrides.insert(
+            hydrated_translation.transcript_id.clone(),
+            TranslationPartitionState::from_translation(&hydrated_translation),
+        );
+        let buffer_tx_ids = HashSet::from(["tx1"]);
+
+        let buffer_translations = materialize_buffer_translations(
+            &[base_translation, other_translation],
+            &translation_overrides,
+            &buffer_tx_ids,
+        );
+
+        assert_eq!(buffer_translations.len(), 1);
+        assert_eq!(buffer_translations[0].transcript_id, "tx1");
+        assert_eq!(buffer_translations[0].cds_sequence.as_deref(), Some("ATG"));
+    }
 
     // ── format_appris ──────────────────────────────────────────────────
 
@@ -9410,21 +13548,336 @@ mod tests {
         assert!(err.contains("pick_order must contain at least one criterion"));
     }
 
-    #[test]
-    fn test_gene_stable_id_from_raw_object_json_prefers_transcript_slot_then_gene_slot() {
-        let from_transcript = r#"{"__class":"Bio::EnsEMBL::Transcript","__value":{"_gene_stable_id":"ENSG00000001","_gene":{"stable_id":"ENSGSHOULDNOTWIN"}}}"#;
-        assert_eq!(
-            gene_stable_id_from_raw_object_json(Some(from_transcript)).as_deref(),
-            Some("ENSG00000001")
-        );
+    fn refseq_edit_list_data_type() -> DataType {
+        let fields = datafusion::arrow::datatypes::Fields::from(vec![
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("replacement_len", DataType::Int64, true),
+            Field::new("skip_refseq_offset", DataType::Boolean, false),
+        ]);
+        DataType::List(Arc::new(Field::new("item", DataType::Struct(fields), true)))
+    }
 
-        let from_gene = r#"{"__class":"Bio::EnsEMBL::Transcript","__value":{"_gene":{"stable_id":"ENSG00000002"}}}"#;
-        assert_eq!(
-            gene_stable_id_from_raw_object_json(Some(from_gene)).as_deref(),
-            Some("ENSG00000002")
-        );
+    fn refseq_edit_array(rows: Vec<Option<Vec<RefSeqEdit>>>) -> Arc<dyn Array> {
+        use datafusion::arrow::array::{ArrayBuilder, BooleanBuilder, StructBuilder};
 
-        assert_eq!(gene_stable_id_from_raw_object_json(None), None);
+        let fields = vec![
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("replacement_len", DataType::Int64, true),
+            Field::new("skip_refseq_offset", DataType::Boolean, false),
+        ];
+        let struct_builder = StructBuilder::new(
+            fields,
+            vec![
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(BooleanBuilder::new()) as Box<dyn ArrayBuilder>,
+            ],
+        );
+        let mut list_builder = ListBuilder::new(struct_builder);
+
+        for row in rows {
+            match row {
+                Some(edits) => {
+                    for edit in edits {
+                        let values = list_builder.values();
+                        values
+                            .field_builder::<Int64Builder>(0)
+                            .unwrap()
+                            .append_value(edit.start);
+                        values
+                            .field_builder::<Int64Builder>(1)
+                            .unwrap()
+                            .append_value(edit.end);
+                        let replacement = values.field_builder::<Int64Builder>(2).unwrap();
+                        match edit.replacement_len {
+                            Some(len) => replacement.append_value(len as i64),
+                            None => replacement.append_null(),
+                        }
+                        values
+                            .field_builder::<BooleanBuilder>(3)
+                            .unwrap()
+                            .append_value(edit.skip_refseq_offset);
+                        values.append(true);
+                    }
+                    list_builder.append(true);
+                }
+                None => list_builder.append(false),
+            }
+        }
+
+        Arc::new(list_builder.finish())
+    }
+
+    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    type TestCompactPrediction = (i32, &'static str, &'static str, f32);
+
+    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    fn compact_prediction_array(rows: Vec<Option<Vec<TestCompactPrediction>>>) -> Arc<dyn Array> {
+        use datafusion::arrow::array::{ArrayBuilder, Float32Builder, Int32Builder, StructBuilder};
+
+        let fields = vec![
+            Field::new("position", DataType::Int32, false),
+            Field::new("amino_acid", DataType::Utf8, false),
+            Field::new("prediction", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, false),
+        ];
+        let struct_builder = StructBuilder::new(
+            fields,
+            vec![
+                Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Float32Builder::new()) as Box<dyn ArrayBuilder>,
+            ],
+        );
+        let mut list_builder = ListBuilder::new(struct_builder);
+
+        for row in rows {
+            match row {
+                Some(predictions) => {
+                    for (position, amino_acid, prediction, score) in predictions {
+                        let values = list_builder.values();
+                        values
+                            .field_builder::<Int32Builder>(0)
+                            .unwrap()
+                            .append_value(position);
+                        values
+                            .field_builder::<StringBuilder>(1)
+                            .unwrap()
+                            .append_value(amino_acid);
+                        values
+                            .field_builder::<StringBuilder>(2)
+                            .unwrap()
+                            .append_value(prediction);
+                        values
+                            .field_builder::<Float32Builder>(3)
+                            .unwrap()
+                            .append_value(score);
+                        values.append(true);
+                    }
+                    list_builder.append(true);
+                }
+                None => list_builder.append(false),
+            }
+        }
+
+        Arc::new(list_builder.finish())
+    }
+
+    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lance_sift_prediction_store_reads_binary_predictions_by_transcript_id() {
+        use crate::kv_cache::sift_store::serialize_predictions;
+        use datafusion::arrow::array::BinaryArray;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let entity_dir = tmp.path().join("translation_sift.lance");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("predictions", DataType::Binary, false),
+        ]));
+
+        for (chrom, tx) in [("chr1", "tx1"), ("chr2", "tx2")] {
+            let mut predictions = CachedPredictions::default();
+            predictions.sift = vec![CompactPrediction {
+                position: 1,
+                amino_acid: CompactPrediction::encode_amino_acid("A").unwrap(),
+                prediction: CompactPrediction::encode_prediction("tolerated"),
+                score: 0.1,
+            }];
+            predictions.polyphen = vec![CompactPrediction {
+                position: 1,
+                amino_acid: CompactPrediction::encode_amino_acid("A").unwrap(),
+                prediction: CompactPrediction::encode_prediction("benign"),
+                score: 0.2,
+            }];
+            predictions.sort();
+            let blob = serialize_predictions(&predictions);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec![tx])),
+                    Arc::new(BinaryArray::from_iter_values(vec![blob])),
+                ],
+            )
+            .unwrap();
+            let dataset = entity_dir.join(format!("{chrom}.lance"));
+            crate::lance_cache::write::write_record_batches_to_lance(
+                &dataset,
+                vec![batch],
+                crate::lance_cache::write::LanceIndexKind::TranscriptId,
+            )
+            .await
+            .unwrap();
+        }
+        crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr2", "chr2.lance", 1),
+        ])
+        .write_to_entity_dir(&entity_dir)
+        .unwrap();
+        let variation = tmp.path().join("variation.lance");
+        std::fs::create_dir_all(variation.join("chr1.lance")).unwrap();
+        crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+        ])
+        .write_to_entity_dir(&variation)
+        .unwrap();
+        let cache =
+            crate::partitioned_cache::PartitionedLanceCache::detect(tmp.path().to_str().unwrap())
+                .unwrap();
+
+        let store = load_lance_sift_prediction_store_for_chrom(&cache, "chr1")
+            .await
+            .unwrap()
+            .unwrap();
+        let loaded = store
+            .get_many(&["tx1".to_string(), "tx2".to_string()])
+            .unwrap();
+
+        let tx1 = loaded.get("tx1").expect("tx1 predictions from chr1");
+        assert_eq!(tx1.lookup_sift(1, "A"), Some(("tolerated", 0.1)));
+        assert_eq!(tx1.lookup_polyphen(1, "A"), Some(("benign", 0.2)));
+        assert!(!loaded.contains_key("tx2"));
+
+        std::fs::remove_dir_all(entity_dir.join("chr1.lance")).unwrap();
+        let cached = store.get_many(&["tx1".to_string()]).unwrap();
+        let tx1 = cached.get("tx1").expect("tx1 predictions from cache");
+        assert_eq!(tx1.lookup_sift(1, "A"), Some(("tolerated", 0.1)));
+    }
+
+    #[tokio::test]
+    async fn load_transcripts_uses_typed_raw_free_columns_when_raw_json_is_present() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("strand", DataType::Int64, false),
+            Field::new("biotype", DataType::Utf8, false),
+            Field::new("gene_stable_id", DataType::Utf8, true),
+            Field::new("gene_symbol", DataType::Utf8, true),
+            Field::new("gene_symbol_source", DataType::Utf8, true),
+            Field::new("gene_hgnc_id_native", DataType::Utf8, true),
+            Field::new("source", DataType::Utf8, true),
+            Field::new("source_cache", DataType::Utf8, true),
+            Field::new("display_xref_id", DataType::Utf8, true),
+            Field::new("refseq_match", DataType::Utf8, true),
+            Field::new("refseq_edits", refseq_edit_list_data_type(), true),
+            Field::new("is_gencode_basic", DataType::Boolean, false),
+            Field::new("is_gencode_primary", DataType::Boolean, false),
+            Field::new("cdna_coding_start", DataType::Int64, true),
+            Field::new("cdna_coding_end", DataType::Int64, true),
+            Field::new("cdna_seq", DataType::Utf8, true),
+            Field::new("translateable_seq", DataType::Utf8, true),
+            Field::new("five_prime_utr_seq", DataType::Utf8, true),
+            Field::new("three_prime_utr_seq", DataType::Utf8, true),
+            Field::new("spliced_seq", DataType::Utf8, true),
+            Field::new("flags_str", DataType::Utf8, true),
+            Field::new("raw_object_json", DataType::Utf8, true),
+        ]));
+        let raw = r#"{
+          "__class":"Bio::EnsEMBL::Transcript",
+          "__value":{
+            "_source_cache":"Ensembl",
+            "_gene_stable_id":"ENSG_RAW",
+            "_gene_hgnc_id":"HGNC:RAW",
+            "display_xref":{"display_id":"RAW_DISPLAY"},
+            "attributes":[
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"rseq_raw","value":"1"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_primary","value":"1"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"99 99 A"}}
+            ]
+          }
+        }"#;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["NM_TYPED.1"])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["1"])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![100_i64])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![200_i64])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![1_i64])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["protein_coding"])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("ENSG_TYPED")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("GENE_TYPED")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("HGNC")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("HGNC:TYPED")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("Ensembl")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("BestRefSeq")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("TYPED_DISPLAY")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("rseq_typed")])) as Arc<dyn Array>,
+                refseq_edit_array(vec![Some(vec![RefSeqEdit {
+                    start: 4,
+                    end: 4,
+                    replacement_len: Some(1),
+                    skip_refseq_offset: true,
+                }])]),
+                Arc::new(BooleanArray::from(vec![true])) as Arc<dyn Array>,
+                Arc::new(BooleanArray::from(vec![false])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![Some(4_i64)])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![Some(6_i64)])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("AAAATGGGG")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("ATG")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("AAA")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("GGG")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![None::<&str>])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("cds_start_NF")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some(raw)])) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap();
+
+        let session = Arc::new(SessionContext::new());
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        session.register_table("tx", Arc::new(table)).unwrap();
+        let provider = AnnotateProvider::new(
+            Arc::clone(&session),
+            "vcf".to_string(),
+            String::new(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Ensembl,
+            None,
+            Schema::new(Vec::<Field>::new()),
+        )
+        .unwrap();
+
+        let (transcripts, translateable_seq_by_tx) = provider
+            .load_transcripts("tx", &MissWorklist::for_chrom("1"))
+            .await
+            .unwrap();
+
+        assert_eq!(transcripts.len(), 1);
+        let tx = &transcripts[0];
+        assert_eq!(tx.gene_stable_id.as_deref(), Some("ENSG_TYPED"));
+        assert_eq!(tx.gene_hgnc_id_native.as_deref(), Some("HGNC:TYPED"));
+        assert_eq!(tx.display_xref_id.as_deref(), Some("TYPED_DISPLAY"));
+        assert_eq!(tx.source_cache.as_deref(), Some("BestRefSeq"));
+        assert_eq!(tx.source.as_deref(), Some("RefSeq"));
+        assert_eq!(tx.refseq_match.as_deref(), Some("rseq_typed"));
+        assert_eq!(
+            tx.refseq_edits,
+            vec![RefSeqEdit {
+                start: 4,
+                end: 4,
+                replacement_len: Some(1),
+                skip_refseq_offset: true,
+            }]
+        );
+        assert!(tx.is_gencode_basic);
+        assert!(!tx.is_gencode_primary);
+        assert_eq!(tx.five_prime_utr_seq.as_deref(), Some("AAA"));
+        assert_eq!(tx.three_prime_utr_seq.as_deref(), Some("GGG"));
+        assert_eq!(tx.spliced_seq.as_deref(), Some("AAAATGGGG"));
+        assert_eq!(
+            translateable_seq_by_tx
+                .get("NM_TYPED.1")
+                .map(String::as_str),
+            Some("ATG")
+        );
     }
 
     #[test]
@@ -9980,6 +14433,7 @@ mod tests {
         )]);
         let (sift, polyphen) = lookup_sift_polyphen(
             Some("ENST00000001"),
+            None,
             Some("42"),
             Some("V/I"),
             &mut cache,
@@ -10003,6 +14457,7 @@ mod tests {
         // Multi-char alt amino acid — not a single substitution.
         let (sift, polyphen) = lookup_sift_polyphen(
             Some("ENST00000001"),
+            None,
             Some("42"),
             Some("V/IL"),
             &mut cache,
@@ -10014,6 +14469,7 @@ mod tests {
         // Range position — indel, should be skipped.
         let (sift, polyphen) = lookup_sift_polyphen(
             Some("ENST00000001"),
+            None,
             Some("42-43"),
             Some("V/I"),
             &mut cache,
@@ -10028,6 +14484,7 @@ mod tests {
         let mut cache = SiftPolyphenCache::new();
         let (sift, polyphen) = lookup_sift_polyphen(
             Some("ENST_MISSING"),
+            None,
             Some("42"),
             Some("V/I"),
             &mut cache,
@@ -10035,6 +14492,226 @@ mod tests {
         );
         assert!(sift.is_empty());
         assert!(polyphen.is_empty());
+    }
+
+    #[test]
+    fn sift_position_key_matches_lookup_gating() {
+        // Single substitution + valid position + uid → packed key.
+        assert_eq!(
+            sift_position_key(Some(7), Some("42"), Some("V/I")),
+            Some((7u64 << 32) | 42)
+        );
+        // No uid (position-sliced store cannot build a key) → None.
+        assert_eq!(sift_position_key(None, Some("42"), Some("V/I")), None);
+        // Multi-char alt amino acid (not a single substitution) → None.
+        assert_eq!(sift_position_key(Some(7), Some("42"), Some("V/IL")), None);
+        // Range position (indel) → None.
+        assert_eq!(sift_position_key(Some(7), Some("42-43"), Some("V/I")), None);
+        // Missing amino acids / position → None.
+        assert_eq!(sift_position_key(Some(7), Some("42"), None), None);
+        assert_eq!(sift_position_key(Some(7), None, Some("V/I")), None);
+    }
+
+    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    #[test]
+    fn position_predictions_from_batch_decodes_key_and_payloads() {
+        use crate::kv_cache::sift_store::serialize_position_entries;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let pos = 42i32;
+        let uid = 7u32;
+        let key = ((uid as u64) << 32) | (pos as u64);
+        let sift = vec![CompactPrediction {
+            position: pos,
+            amino_acid: CompactPrediction::encode_amino_acid("I").unwrap(),
+            prediction: CompactPrediction::encode_prediction("deleterious"),
+            score: 0.01,
+        }];
+        let poly = vec![CompactPrediction {
+            position: pos,
+            amino_acid: CompactPrediction::encode_amino_acid("I").unwrap(),
+            prediction: CompactPrediction::encode_prediction("probably damaging"),
+            score: 0.999,
+        }];
+        let sift_bytes = serialize_position_entries(&sift);
+        let poly_bytes = serialize_position_entries(&poly);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt64, false),
+            Field::new("sift", DataType::Binary, true),
+            Field::new("poly", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![key])),
+                Arc::new(BinaryArray::from_opt_vec(vec![Some(sift_bytes.as_ref())])),
+                Arc::new(BinaryArray::from_opt_vec(vec![Some(poly_bytes.as_ref())])),
+            ],
+        )
+        .unwrap();
+
+        let decoded = position_predictions_from_batch(&batch).unwrap();
+        let preds = decoded.get(&key).expect("key present");
+        // Position is recovered from the low 32 bits of the key.
+        assert_eq!(preds.sift[0].position, pos);
+        assert_eq!(preds.lookup_sift(pos, "I"), Some(("deleterious", 0.01)));
+        assert_eq!(
+            preds.lookup_polyphen(pos, "I"),
+            Some(("probably damaging", 0.999))
+        );
+    }
+
+    /// Opt-in data-parity gate for the position-sliced SIFT layout. Decodes the
+    /// legacy per-transcript `predictions` blob and, for every
+    /// `(transcript, position)`, compares it against the new position-sliced
+    /// store (resolved by `key = (transcript_uid << 32) | position`) — asserting
+    /// byte-identical `(amino_acid, prediction, score)` entries for both SIFT and
+    /// PolyPhen, and a bijection between legacy positions and new rows.
+    ///
+    /// Skipped unless all three dataset dirs are provided:
+    ///   VEP_PARITY_LEGACY_SIFT  = .../translation_sift.lance/<chrom>.lance  (legacy blob)
+    ///   VEP_PARITY_NEW_SIFT     = .../translation_sift.lance/<chrom>.lance  (position-sliced)
+    ///   VEP_PARITY_NEW_TX       = .../transcript.lance/<chrom>.lance        (carries transcript_uid)
+    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn position_sliced_sift_matches_legacy_blob_parity() {
+        use crate::kv_cache::SiftPredictionStore;
+        use std::path::PathBuf;
+
+        let (Some(legacy_sift), Some(new_sift), Some(new_tx)) = (
+            std::env::var_os("VEP_PARITY_LEGACY_SIFT"),
+            std::env::var_os("VEP_PARITY_NEW_SIFT"),
+            std::env::var_os("VEP_PARITY_NEW_TX"),
+        ) else {
+            eprintln!(
+                "skipping position_sliced_sift_matches_legacy_blob_parity \
+                 (set VEP_PARITY_LEGACY_SIFT / VEP_PARITY_NEW_SIFT / VEP_PARITY_NEW_TX)"
+            );
+            return;
+        };
+        let legacy_sift = PathBuf::from(legacy_sift);
+        let new_sift = PathBuf::from(new_sift);
+        let new_tx = PathBuf::from(new_tx);
+
+        // stable_id -> transcript_uid (authoritative map written into transcript.lance).
+        let tx_batches = crate::lance_cache::context_runtime::scan_projected_existing_columns(
+            &new_tx,
+            &["stable_id", "transcript_uid"],
+        )
+        .await
+        .unwrap();
+        let mut uid_map: HashMap<String, u32> = HashMap::new();
+        for batch in &tx_batches {
+            let schema = batch.schema();
+            let id_idx = schema.index_of("stable_id").unwrap();
+            let uid_idx = schema.index_of("transcript_uid").unwrap();
+            for row in 0..batch.num_rows() {
+                if let (Some(id), Some(uid)) = (
+                    string_at(batch.column(id_idx).as_ref(), row),
+                    uint32_at(batch.column(uid_idx).as_ref(), row),
+                ) {
+                    uid_map.insert(id, uid);
+                }
+            }
+        }
+        assert!(!uid_map.is_empty(), "transcript_uid map is empty");
+
+        // Legacy per-transcript predictions blob.
+        let legacy_batches = crate::lance_cache::context_runtime::scan_projected_existing_columns(
+            &legacy_sift,
+            &["transcript_id", "predictions"],
+        )
+        .await
+        .unwrap();
+        let mut legacy: HashMap<String, CachedPredictions> = HashMap::new();
+        for batch in &legacy_batches {
+            legacy.extend(sift_predictions_from_binary_batch(batch).unwrap());
+        }
+        assert!(!legacy.is_empty(), "legacy predictions are empty");
+
+        // New position-sliced store.
+        let lookup = crate::lance_cache::context_runtime::KeyU64LanceLookup::open(
+            &new_sift,
+            vec!["key".to_string(), "sift".to_string(), "poly".to_string()],
+        )
+        .await
+        .unwrap();
+        let new_rows = lookup.keys_len();
+        let store = PositionSlicedLanceSiftStore {
+            lookup: Arc::new(lookup),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let entries_at = |preds: &[CompactPrediction], pos: i32| -> Vec<(u8, u8, u32)> {
+            let mut v: Vec<(u8, u8, u32)> = preds
+                .iter()
+                .filter(|p| p.position == pos)
+                .map(|p| (p.amino_acid, p.prediction, p.score.to_bits()))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        let mut compared_transcripts = 0usize;
+        let mut matched_positions = 0usize;
+        let mut mismatches = 0usize;
+        for (tx_id, lp) in &legacy {
+            // Distinct positions present in the legacy blob for this transcript.
+            let mut positions: Vec<i32> = lp
+                .sift
+                .iter()
+                .chain(lp.polyphen.iter())
+                .map(|p| p.position)
+                .collect();
+            positions.sort_unstable();
+            positions.dedup();
+            if positions.is_empty() {
+                continue; // non-coding transcript: no rows expected
+            }
+            let Some(&uid) = uid_map.get(tx_id) else {
+                mismatches += 1;
+                eprintln!(
+                    "PARITY: legacy transcript {tx_id} has predictions but no transcript_uid"
+                );
+                continue;
+            };
+            compared_transcripts += 1;
+
+            let keys: Vec<u64> = positions
+                .iter()
+                .map(|&pos| ((uid as u64) << 32) | (pos as u64))
+                .collect();
+            let new = store.get_position_predictions(&keys).unwrap();
+
+            for &pos in &positions {
+                let key = ((uid as u64) << 32) | (pos as u64);
+                let Some(np) = new.get(&key) else {
+                    mismatches += 1;
+                    eprintln!("PARITY: missing new row for {tx_id} pos {pos} (key {key})");
+                    continue;
+                };
+                matched_positions += 1;
+                if entries_at(&lp.sift, pos) != entries_at(&np.sift, pos) {
+                    mismatches += 1;
+                    eprintln!("PARITY: SIFT mismatch {tx_id} pos {pos}");
+                }
+                if entries_at(&lp.polyphen, pos) != entries_at(&np.polyphen, pos) {
+                    mismatches += 1;
+                    eprintln!("PARITY: PolyPhen mismatch {tx_id} pos {pos}");
+                }
+            }
+        }
+
+        eprintln!(
+            "parity: transcripts={compared_transcripts} matched_positions={matched_positions} \
+             new_rows={new_rows} mismatches={mismatches}"
+        );
+        assert_eq!(mismatches, 0, "SIFT/PolyPhen parity mismatches found");
+        assert_eq!(
+            matched_positions, new_rows,
+            "legacy positions and new rows are not a bijection (extra/missing rows)"
+        );
     }
 
     // ── lookup_domains ─────────────────────────────────────────────────
@@ -10172,6 +14849,7 @@ mod tests {
     ) -> TranscriptFeature {
         TranscriptFeature {
             transcript_id: id.to_string(),
+            transcript_uid: None,
             chrom: "chr2".to_string(),
             start: 1,
             end: 100,
@@ -10219,6 +14897,7 @@ mod tests {
             uniprot_isoform: None,
             appris: None,
             ncrna_structure: None,
+            cdna_coords_cache: GeometryCache::default(),
         }
     }
 
@@ -10229,6 +14908,41 @@ mod tests {
         tx.source = source.map(str::to_string);
         tx.source_cache = source.map(str::to_string);
         tx
+    }
+
+    /// Test helper: run buffer-local HGNC propagation over an owned transcript
+    /// vec via the CoW API, mutating in place (the `Borrowed` indices reference a
+    /// snapshot of the input, `to_mut` clones from it on a real change).
+    fn propagate_owned(transcripts: &mut Vec<TranscriptFeature>) {
+        let base = transcripts.clone();
+        let mut cow: Vec<CowTranscript> = (0..base.len()).map(CowTranscript::Borrowed).collect();
+        apply_buffer_local_hgnc_propagation(&mut cow, &base);
+        *transcripts = cow.into_iter().map(|bt| bt.into_owned(&base)).collect();
+    }
+
+    #[test]
+    fn cow_transcript_borrowed_resolves_to_base_owned_overrides() {
+        let base = vec![
+            make_tx("ENST1", None, None, None, Some("HGNC:1")),
+            make_tx("ENST2", None, None, None, Some("HGNC:2")),
+        ];
+
+        // Borrowed resolves to the base entry by index.
+        let borrowed0 = CowTranscript::Borrowed(0);
+        assert_eq!(borrowed0.as_ref(&base).transcript_id, "ENST1");
+        assert_eq!(borrowed0.transcript_id(&base), "ENST1");
+
+        // to_mut converts Borrowed -> Owned by cloning the base entry, then
+        // mutates the owned copy without touching base.
+        let mut bt = CowTranscript::Borrowed(1);
+        bt.to_mut(&base).gene_hgnc_id = Some("HGNC:999".to_string());
+        assert_eq!(bt.as_ref(&base).gene_hgnc_id.as_deref(), Some("HGNC:999"));
+        assert!(matches!(bt, CowTranscript::Owned(_)));
+        assert_eq!(base[1].gene_hgnc_id.as_deref(), Some("HGNC:2")); // base untouched
+
+        // into_owned materializes a Borrowed into a clone equal to base.
+        let owned = CowTranscript::Borrowed(0).into_owned(&base);
+        assert_eq!(owned, base[0]);
     }
 
     #[test]
@@ -10289,6 +15003,26 @@ mod tests {
         .unwrap()
     }
 
+    fn make_buffer_batch_many_with_alts(chrom: &str, starts: &[i64], alts: &[&str]) -> RecordBatch {
+        assert_eq!(starts.len(), alts.len());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![chrom; starts.len()])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(starts.to_vec())) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(starts.to_vec())) as Arc<dyn Array>,
+                Arc::new(StringArray::from(alts.to_vec())) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_input_buffer_accumulator_carries_partial_rows_across_windows() {
         let mut accumulator = InputBufferAccumulator::default();
@@ -10320,6 +15054,229 @@ mod tests {
             Some(("chr2".to_string(), 6, 7))
         );
         assert_eq!(accumulator.pending_rows(), 0);
+    }
+
+    #[test]
+    fn test_input_buffer_accumulator_counts_alt_alleles_like_vep_buffers() {
+        let mut accumulator = InputBufferAccumulator::default();
+
+        let ready = accumulator.push_window_and_drain_ready(
+            vec![make_buffer_batch_many_with_alts(
+                "chr2",
+                &[10, 20, 30],
+                &["C", "G,A", "T"],
+            )],
+            3,
+            false,
+        );
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            buffer_variant_bounds(&ready[0]).unwrap(),
+            Some(("chr2".to_string(), 10, 20))
+        );
+        assert_eq!(accumulator.pending_rows(), 1);
+    }
+
+    #[test]
+    fn test_input_buffer_accumulator_limits_ready_buffers() {
+        let mut accumulator = InputBufferAccumulator::default();
+        let starts: Vec<i64> = (1..=15).collect();
+
+        let ready = accumulator.push_window_and_drain_ready_limited(
+            vec![make_buffer_batch_many("chr1", &starts)],
+            5,
+            false,
+            2,
+        );
+
+        assert_eq!(ready.len(), 2);
+        assert_eq!(
+            buffer_variant_bounds(&ready[0]).unwrap(),
+            Some(("chr1".to_string(), 1, 5))
+        );
+        assert_eq!(
+            buffer_variant_bounds(&ready[1]).unwrap(),
+            Some(("chr1".to_string(), 6, 10))
+        );
+        assert_eq!(accumulator.pending_rows(), 5);
+        assert!(accumulator.has_ready_input_buffer(5));
+
+        let next = accumulator.push_window_and_drain_ready_limited(Vec::new(), 5, false, 2);
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            buffer_variant_bounds(&next[0]).unwrap(),
+            Some(("chr1".to_string(), 11, 15))
+        );
+        assert_eq!(accumulator.pending_rows(), 0);
+        assert!(!accumulator.has_ready_input_buffer(5));
+    }
+
+    #[test]
+    fn test_input_buffer_accumulator_counts_ready_buffers_without_draining() {
+        let mut accumulator = InputBufferAccumulator::default();
+
+        accumulator.push_window_and_drain_ready(
+            vec![make_buffer_batch_many_with_alts(
+                "chr1",
+                &[1, 2, 3, 4, 5],
+                &["A", "C,G", "T", "A,C,G,T", "G"],
+            )],
+            20,
+            false,
+        );
+
+        assert_eq!(accumulator.ready_input_buffer_count(3), 2);
+        assert_eq!(accumulator.ready_input_buffer_count(4), 2);
+        assert_eq!(accumulator.ready_input_buffer_count(10), 0);
+        assert_eq!(accumulator.pending_rows(), 5);
+    }
+
+    #[test]
+    fn test_prepare_buffer_annotation_context_selects_buffer_features() {
+        let included_tx = make_tx("tx1", None, None, None, None);
+        let mut skipped_tx = make_tx("tx2", None, None, None, None);
+        skipped_tx.start = 1_000_000;
+        skipped_tx.end = 1_000_100;
+        let translations = vec![
+            make_translation("tx1", Vec::new()),
+            make_translation("tx2", Vec::new()),
+        ];
+        let exons = vec![
+            ExonFeature {
+                transcript_id: "tx1".to_string(),
+                exon_number: 1,
+                start: 1,
+                end: 50,
+            },
+            ExonFeature {
+                transcript_id: "tx2".to_string(),
+                exon_number: 1,
+                start: 1_000_000,
+                end: 1_000_050,
+            },
+        ];
+        let shared = minimal_shared_contig_annotation_context_with_context(
+            vec![included_tx, skipped_tx],
+            translations,
+            exons,
+        );
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        let batches = vec![make_buffer_batch("chr2", 10, 10)];
+
+        let prepared =
+            prepare_buffer_annotation_context(&mut worker, &batches, "chr2", 10, 10).unwrap();
+
+        assert_eq!(
+            prepared
+                .transcripts
+                .iter()
+                .map(|tx| tx.transcript_id(&worker.shared.base_transcripts))
+                .collect::<Vec<_>>(),
+            vec!["tx1"]
+        );
+        assert_eq!(
+            prepared
+                .exon_indices
+                .iter()
+                .map(|&idx| worker.shared.exons[idx].transcript_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tx1"]
+        );
+        assert_eq!(
+            prepared
+                .translation_indices
+                .iter()
+                .map(|&idx| worker.shared.base_translations[idx].transcript_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tx1"]
+        );
+        assert!(prepared.translation_overrides.is_empty());
+    }
+
+    #[test]
+    fn test_prepared_context_from_buffer_materializes_only_overridden_translations() {
+        let tx1 = make_tx("tx1", None, None, None, None);
+        let tx2 = make_tx("tx2", None, None, None, None);
+        let base_translation = make_translation("tx1", Vec::new());
+        let other_translation = make_translation("tx2", Vec::new());
+        let mut overridden_translation = base_translation.clone();
+        overridden_translation.cds_sequence = Some("ATG".to_string());
+        let shared = minimal_shared_contig_annotation_context_with_features(
+            vec![tx1, tx2],
+            vec![base_translation, other_translation],
+        );
+        // base_transcripts == [tx1, tx2] at indices 0, 1; reference them as
+        // shared (Borrowed) CowTranscripts.
+        let buffer_context = BufferAnnotationContext {
+            transcripts: vec![CowTranscript::Borrowed(0), CowTranscript::Borrowed(1)],
+            exon_indices: Vec::new(),
+            translation_indices: vec![0, 1],
+            translation_overrides: HashMap::from([(
+                "tx1".to_string(),
+                TranslationPartitionState::from_translation(&overridden_translation),
+            )]),
+        };
+
+        let materialized = materialize_buffer_context_translations(&shared, &buffer_context);
+        let prepared = prepared_context_from_buffer(&buffer_context, &shared, &materialized);
+
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].transcript_id, "tx1");
+        assert_eq!(
+            prepared
+                .translation_by_tx
+                .get("tx1")
+                .and_then(|translation| translation.cds_sequence.as_deref()),
+            Some("ATG")
+        );
+        assert_eq!(
+            prepared
+                .translation_by_tx
+                .get("tx2")
+                .and_then(|translation| translation.cds_sequence.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_shared_context_indexes_select_feature_indices_in_source_order() {
+        let exons = vec![
+            ExonFeature {
+                transcript_id: "tx1".to_string(),
+                exon_number: 1,
+                start: 10,
+                end: 20,
+            },
+            ExonFeature {
+                transcript_id: "tx2".to_string(),
+                exon_number: 1,
+                start: 30,
+                end: 40,
+            },
+            ExonFeature {
+                transcript_id: "tx1".to_string(),
+                exon_number: 2,
+                start: 50,
+                end: 60,
+            },
+        ];
+        let translations = vec![
+            make_translation("tx1", Vec::new()),
+            make_translation("tx3", Vec::new()),
+            make_translation("tx2", Vec::new()),
+        ];
+        let indexes = SharedContextIndexes::new(&exons, &translations);
+        let buffer_tx_ids = HashSet::from(["tx1", "tx3"]);
+
+        assert_eq!(
+            indexes.exon_indices_for_transcripts(&buffer_tx_ids),
+            vec![0, 2]
+        );
+        assert_eq!(
+            indexes.translation_indices_for_transcripts(&buffer_tx_ids),
+            vec![0, 1]
+        );
     }
 
     #[test]
@@ -10415,7 +15372,7 @@ mod tests {
             impact: "MODIFIER",
             existing_variation: variant_fields.existing_variation.as_str(),
             variant_class: "SNV",
-            frequency_fields: &frequency_fields,
+            frequency_fields: ColocatedFrequencyFieldRef::Resolved(&frequency_fields),
             variant_fields: &variant_fields,
         };
 
@@ -10471,65 +15428,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_transcript_raw_metadata_uses_direct_refseq_match_codes() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "_source_cache":"RefSeq",
-            "_gene_hgnc_id":"HGNC:5",
-            "display_xref":{"display_id":"NM_000001"},
-            "attributes":[
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_basic","value":"1"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_primary","value":"1"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only,ENST00000619216:whole_transcript"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"rseq_ens_match_cds","value":"1"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_start_NF","value":"1"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"10 9 AAA"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"20 20 G"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"30 31"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"40 40 T","description":"op=X"}}
-            ]
-          }
-        }"#;
+    fn test_empty_batch3_suffix_uses_static_no_colocated_path() {
+        let variant_fields = ColocatedVariantFields::default();
+        let suffix = batch3_suffix_for_csq(ColocatedFrequencyFieldRef::Empty, &variant_fields);
 
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
-        assert_eq!(metadata.source_cache.as_deref(), Some("RefSeq"));
-        assert_eq!(metadata.display_xref_id.as_deref(), Some("NM_000001"));
-        assert_eq!(metadata.gene_hgnc_id_native.as_deref(), Some("HGNC:5"));
-        assert_eq!(metadata.refseq_match.as_deref(), Some("rseq_ens_match_cds"));
-        assert_eq!(metadata.flags_str.as_deref(), Some("cds_start_NF"));
-        assert!(metadata.is_gencode_basic);
-        assert!(metadata.is_gencode_primary);
-        assert_eq!(
-            metadata.refseq_edits,
-            vec![
-                RefSeqEdit {
-                    start: 10,
-                    end: 9,
-                    replacement_len: Some(3),
-                    skip_refseq_offset: false,
-                },
-                RefSeqEdit {
-                    start: 20,
-                    end: 20,
-                    replacement_len: Some(1),
-                    skip_refseq_offset: true,
-                },
-                RefSeqEdit {
-                    start: 30,
-                    end: 31,
-                    replacement_len: None,
-                    skip_refseq_offset: false,
-                },
-                RefSeqEdit {
-                    start: 40,
-                    end: 40,
-                    replacement_len: Some(1),
-                    skip_refseq_offset: true,
-                },
-            ]
-        );
+        assert!(matches!(suffix, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(suffix.len(), AF_COLUMNS.len() + 5);
+        assert!(suffix.chars().all(|ch| ch == '|'));
     }
 
     #[test]
@@ -10573,49 +15478,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_transcript_raw_metadata_sorts_refseq_edits_by_cdna_position() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "_source_cache":"BestRefSeq",
-            "attributes":[
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"3723 3723 "}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"3228 3228 A"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"1258 1258 "}}
-            ]
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-
-        assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
-        assert_eq!(metadata.source_cache.as_deref(), Some("BestRefSeq"));
-        assert_eq!(
-            metadata.refseq_edits,
-            vec![
-                RefSeqEdit {
-                    start: 1258,
-                    end: 1258,
-                    replacement_len: None,
-                    skip_refseq_offset: false,
-                },
-                RefSeqEdit {
-                    start: 3228,
-                    end: 3228,
-                    replacement_len: Some(1),
-                    skip_refseq_offset: true,
-                },
-                RefSeqEdit {
-                    start: 3723,
-                    end: 3723,
-                    replacement_len: None,
-                    skip_refseq_offset: false,
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn test_refseq_misalignment_offset_counts_same_coordinate_multibase_edit_as_full_insertion() {
         let mut tx = make_selection_tx("NM_001172437.2", Some("RefSeq"));
         tx.refseq_edits = vec![RefSeqEdit {
@@ -10644,176 +15506,6 @@ mod tests {
         tx.cdna_coding_end = Some(473);
         tx.cdna_seq = Some(format!("N{}TTAA", "A".repeat(473)));
         assert!(cdna_seq_has_explicit_three_prime_utr(&tx));
-    }
-
-    #[test]
-    fn test_parse_transcript_raw_metadata_ignores_refseq_compare_without_direct_code() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "attributes":[
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only"}}
-            ]
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(metadata.refseq_match, None);
-    }
-
-    #[test]
-    fn test_parse_transcript_raw_metadata_reads_gene_hgnc_id_fallback_key() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "gene_hgnc_id":"HGNC:1100"
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(metadata.gene_hgnc_id_native.as_deref(), Some("HGNC:1100"));
-    }
-
-    #[test]
-    fn test_parse_transcript_raw_metadata_reads_nested_transcript_sequences() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "_variation_effect_feature_cache":{
-              "five_prime_utr":{
-                "__class":"Bio::Seq",
-                "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"aaaccc"}}}
-              },
-              "three_prime_utr":{
-                "__class":"Bio::Seq",
-                "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"gggttt"}}}
-              },
-              "translateable_seq":"atggcc"
-            },
-            "spliced_seq":{
-              "__class":"Bio::Seq",
-              "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"aaacccatggccgggttt"}}}
-            }
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(metadata.five_prime_utr_seq.as_deref(), Some("AAACCC"));
-        assert_eq!(metadata.three_prime_utr_seq.as_deref(), Some("GGGTTT"));
-        assert_eq!(metadata.translateable_seq.as_deref(), Some("ATGGCC"));
-        assert_eq!(metadata.spliced_seq.as_deref(), Some("AAACCCATGGCCGGGTTT"));
-    }
-
-    #[test]
-    fn test_parse_transcript_raw_metadata_reads_nested_cdna_mapper_segments() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "_variation_effect_feature_cache":{
-              "mapper":{
-                "__class":"Bio::EnsEMBL::TranscriptMapper",
-                "__value":{
-                  "exon_coord_mapper":{
-                    "__class":"Bio::EnsEMBL::Mapper",
-                    "__value":{
-                      "_pair_cdna":{
-                        "CDNA":[
-                          {
-                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":1,"end":10,"id":"cdna"}},
-                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":101,"end":110,"id":"genome"}},
-                            "ori":1
-                          },
-                          {
-                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":11,"end":20,"id":"cdna"}},
-                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":201,"end":210,"id":"genome"}},
-                            "ori":1
-                          }
-                        ]
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(
-            metadata.cdna_mapper_segments,
-            vec![
-                TranscriptCdnaMapperSegment {
-                    genomic_start: 101,
-                    genomic_end: 110,
-                    cdna_start: 1,
-                    cdna_end: 10,
-                    ori: 1,
-                },
-                TranscriptCdnaMapperSegment {
-                    genomic_start: 201,
-                    genomic_end: 210,
-                    cdna_start: 11,
-                    cdna_end: 20,
-                    ori: 1,
-                }
-            ]
-        );
-    }
-
-    #[test]
-    fn test_parse_transcript_raw_metadata_preserves_gapped_cdna_mapper_segments() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "_variation_effect_feature_cache":{
-              "mapper":{
-                "__class":"Bio::EnsEMBL::TranscriptMapper",
-                "__value":{
-                  "exon_coord_mapper":{
-                    "__class":"Bio::EnsEMBL::Mapper",
-                    "__value":{
-                      "_pair_cdna":{
-                        "CDNA":[
-                          {
-                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":1,"end":10,"id":"cdna"}},
-                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":101,"end":110,"id":"genome"}},
-                            "ori":1
-                          },
-                          {
-                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":17,"end":20,"id":"cdna"}},
-                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":111,"end":114,"id":"genome"}},
-                            "ori":1
-                          }
-                        ]
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(
-            metadata.cdna_mapper_segments,
-            vec![
-                TranscriptCdnaMapperSegment {
-                    genomic_start: 101,
-                    genomic_end: 110,
-                    cdna_start: 1,
-                    cdna_end: 10,
-                    ori: 1,
-                },
-                TranscriptCdnaMapperSegment {
-                    genomic_start: 111,
-                    genomic_end: 114,
-                    cdna_start: 17,
-                    cdna_end: 20,
-                    ori: 1,
-                }
-            ]
-        );
     }
 
     #[test]
@@ -11006,7 +15698,7 @@ mod tests {
         tx_refseq.source = Some("RefSeq".to_string());
 
         let mut transcripts = vec![tx_donor, tx_refseq];
-        apply_buffer_local_hgnc_propagation(&mut transcripts);
+        propagate_owned(&mut transcripts);
         assert_eq!(transcripts[1].gene_hgnc_id.as_deref(), Some("HGNC:15625"));
     }
 
@@ -11030,7 +15722,7 @@ mod tests {
         tx_refseq.source = Some("RefSeq".to_string());
 
         let mut transcripts = vec![tx_promoted, tx_refseq];
-        apply_buffer_local_hgnc_propagation(&mut transcripts);
+        propagate_owned(&mut transcripts);
         assert_eq!(
             transcripts[1].gene_hgnc_id, None,
             "cache-promoted HGNC IDs must not seed VEP-style propagation"
@@ -11049,7 +15741,7 @@ mod tests {
         let tx_missing = make_tx("ENST00000222222", Some("ENSG00000123456"), None, None, None);
 
         let mut transcripts = vec![tx_with_symbol, tx_missing];
-        apply_buffer_local_hgnc_propagation(&mut transcripts);
+        propagate_owned(&mut transcripts);
         assert_eq!(transcripts[1].gene_symbol.as_deref(), Some("BRCA1"));
         assert_eq!(transcripts[1].gene_symbol_source.as_deref(), Some("HGNC"));
         assert_eq!(transcripts[1].gene_hgnc_id.as_deref(), Some("HGNC:1100"));
@@ -11162,6 +15854,192 @@ mod tests {
         let recipient = scoped
             .iter()
             .find(|tx| tx.transcript_id == "NR_160941.1")
+            .unwrap();
+        assert_eq!(recipient.gene_hgnc_id, None);
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_uses_protein_coding_cache_region_hgnc_donor() {
+        let mut tx_recipient = make_tx(
+            "XM_017001769.3",
+            Some("55791"),
+            Some("LRIF1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr1".to_string();
+        tx_recipient.start = 110_874_957;
+        tx_recipient.end = 110_963_922;
+        tx_recipient.biotype = "protein_coding".to_string();
+
+        let mut tx_donor = make_tx(
+            "ENST00000369763",
+            Some("ENSG00000121931"),
+            Some("LRIF1"),
+            Some("HGNC"),
+            Some("HGNC:30299"),
+        );
+        tx_donor.chrom = "chr1".to_string();
+        tx_donor.start = 110_947_190;
+        tx_donor.end = 110_963_922;
+        tx_donor.biotype = "protein_coding".to_string();
+
+        let transcripts = vec![tx_recipient, tx_donor];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let buffer = vec![make_buffer_batch_many(
+            "chr1",
+            &[109_528_491, 110_870_290, 110_947_275, 112_649_983],
+        )];
+        let scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &buffer,
+            "chr1",
+            109_528_491,
+            112_649_983,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+
+        let recipient = scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "XM_017001769.3")
+            .unwrap();
+        assert_eq!(recipient.gene_hgnc_id.as_deref(), Some("HGNC:30299"));
+        assert!(
+            scoped
+                .iter()
+                .any(|tx| tx.transcript_id == "ENST00000369763"),
+            "donor must be present in the VEP input-buffer min/max feature set"
+        );
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_uses_lnc_rna_cache_region_hgnc_donor() {
+        let mut tx_recipient = make_tx(
+            "NR_040773.1",
+            Some("100505666"),
+            Some("DCST1-AS1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr1".to_string();
+        tx_recipient.start = 155_045_191;
+        tx_recipient.end = 155_063_991;
+        tx_recipient.biotype = "lncRNA".to_string();
+
+        let mut tx_donor = make_tx(
+            "ENST00000452962",
+            Some("ENSG00000232093"),
+            Some("DCST1-AS1"),
+            Some("HGNC"),
+            Some("HGNC:41147"),
+        );
+        tx_donor.chrom = "chr1".to_string();
+        tx_donor.start = 155_045_191;
+        tx_donor.end = 155_051_172;
+        tx_donor.biotype = "lncRNA".to_string();
+
+        let transcripts = vec![tx_recipient, tx_donor];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let buffer = vec![make_buffer_batch_many(
+            "chr1",
+            &[153_588_407, 155_051_172, 155_059_192, 157_723_924],
+        )];
+        let scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &buffer,
+            "chr1",
+            153_588_407,
+            157_723_924,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+
+        let recipient = scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "NR_040773.1")
+            .unwrap();
+        assert_eq!(recipient.gene_hgnc_id.as_deref(), Some("HGNC:41147"));
+        assert!(
+            scoped
+                .iter()
+                .any(|tx| tx.transcript_id == "ENST00000452962"),
+            "donor must be present in the VEP input-buffer min/max feature set"
+        );
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_filters_far_linc02663_hgnc_donor() {
+        let mut tx_recipient = make_tx(
+            "XR_930643.2",
+            Some("105376402"),
+            Some("LINC02663"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr10".to_string();
+        tx_recipient.start = 9_443_281;
+        tx_recipient.end = 9_878_094;
+        tx_recipient.biotype = "lncRNA".to_string();
+
+        let mut tx_donor = make_tx(
+            "ENST00000659451",
+            Some("ENSG00000228636"),
+            Some("LINC02663"),
+            Some("HGNC"),
+            Some("HGNC:54149"),
+        );
+        tx_donor.chrom = "chr10".to_string();
+        tx_donor.start = 9_758_779;
+        tx_donor.end = 9_759_281;
+        tx_donor.biotype = "lncRNA".to_string();
+
+        let transcripts = vec![tx_recipient, tx_donor];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        // Real chr10 VEP buffer around the mismatch spans 6,971,266..9,489,052.
+        // The donor is in the active 9 Mb cache region, but outside VEP's
+        // min/max +/- 5 kb feature filter and therefore must not seed HGNC.
+        let buffer = vec![make_buffer_batch_many(
+            "chr10",
+            &[6_971_266, 9_438_618, 9_439_215, 9_489_052],
+        )];
+        let scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &buffer,
+            "chr10",
+            6_971_266,
+            9_489_052,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+
+        let recipient = scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "XR_930643.2")
             .unwrap();
         assert_eq!(recipient.gene_hgnc_id, None);
     }
@@ -11623,5 +16501,78 @@ mod tests {
         assert_eq!(escaped, val);
         // Should be a borrowed Cow (no allocation)
         assert!(matches!(escaped, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_contig_pipeline_profile_summary_formats_stage_timings() {
+        let mut profile = ContigPipelineProfile::default();
+        profile.context_load += std::time::Duration::from_millis(10);
+        profile.worker_init += std::time::Duration::from_millis(20);
+        profile.lookup_wait += std::time::Duration::from_millis(30);
+        profile.hydration += std::time::Duration::from_millis(40);
+        profile.annotation_compute += std::time::Duration::from_millis(50);
+        profile.send_wait += std::time::Duration::from_millis(60);
+        profile.ordered_drain_wait += std::time::Duration::from_millis(70);
+        profile.lookup_partitions = 2;
+        profile.lookup_batches = 3;
+        profile.lookup_buffered_batches_max = 6;
+        profile.lookup_buffered_partitions_max = 2;
+        profile.output_batches = 4;
+        profile.output_rows = 5;
+
+        let line = profile.summary_line("chr1");
+
+        assert!(line.contains("[VEP_PROFILE] chr1: pipeline_profile"));
+        assert!(line.contains("lookup_partitions=2"));
+        assert!(line.contains("lookup_batches=3"));
+        assert!(line.contains("lookup_buffered_batches_max=6"));
+        assert!(line.contains("lookup_buffered_partitions_max=2"));
+        assert!(line.contains("output_batches=4"));
+        assert!(line.contains("output_rows=5"));
+        assert!(line.contains("context_load=0.010s"));
+        assert!(line.contains("worker_init=0.020s"));
+        assert!(line.contains("lookup_wait=0.030s"));
+        assert!(line.contains("hydrate=0.040s"));
+        assert!(line.contains("annotate=0.050s"));
+        assert!(line.contains("send_wait=0.060s"));
+        assert!(line.contains("ordered_drain_wait=0.070s"));
+    }
+
+    #[test]
+    fn test_contig_pipeline_profile_summary_formats_nested_hotspots() {
+        let mut profile = ContigPipelineProfile::default();
+        profile.context_transcripts += std::time::Duration::from_millis(1);
+        profile.context_exons += std::time::Duration::from_millis(2);
+        profile.context_translations += std::time::Duration::from_millis(3);
+        profile.context_regulatory += std::time::Duration::from_millis(4);
+        profile.context_motifs += std::time::Duration::from_millis(5);
+        profile.input_buffer += std::time::Duration::from_millis(6);
+        profile.variant_bounds += std::time::Duration::from_millis(7);
+        profile.transcript_window += std::time::Duration::from_millis(8);
+        profile.exon_filter += std::time::Duration::from_millis(9);
+        profile.translation_filter += std::time::Duration::from_millis(10);
+        profile.prepared_context += std::time::Duration::from_millis(11);
+        profile.sift_load += std::time::Duration::from_millis(12);
+        profile.engine += std::time::Duration::from_millis(13);
+        profile.projection += std::time::Duration::from_millis(14);
+        profile.input_buffers = 15;
+
+        let line = profile.summary_line("chr2");
+
+        assert!(line.contains("context_tx=0.001s"));
+        assert!(line.contains("context_exons=0.002s"));
+        assert!(line.contains("context_tl=0.003s"));
+        assert!(line.contains("context_reg=0.004s"));
+        assert!(line.contains("context_motif=0.005s"));
+        assert!(line.contains("input_buffer=0.006s"));
+        assert!(line.contains("variant_bounds=0.007s"));
+        assert!(line.contains("tx_window=0.008s"));
+        assert!(line.contains("exon_filter=0.009s"));
+        assert!(line.contains("tl_filter=0.010s"));
+        assert!(line.contains("prepared_ctx=0.011s"));
+        assert!(line.contains("sift_load=0.012s"));
+        assert!(line.contains("engine=0.013s"));
+        assert!(line.contains("projection=0.014s"));
+        assert!(line.contains("input_buffers=15"));
     }
 }

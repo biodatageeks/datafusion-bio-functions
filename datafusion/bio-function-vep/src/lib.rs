@@ -34,7 +34,8 @@
     clippy::assigning_clones,
     clippy::map_entry,
     clippy::cloned_ref_to_slice_refs,
-    clippy::unwrap_or_default
+    clippy::unwrap_or_default,
+    clippy::needless_option_as_deref
 )]
 
 pub mod allele;
@@ -50,15 +51,22 @@ pub mod golden_benchmark;
 pub mod hgvs;
 #[cfg(feature = "kv-cache")]
 pub mod kv_cache;
+#[cfg(feature = "lance-cache")]
+pub mod lance_cache;
 pub mod lookup_provider;
 pub mod miss_worklist;
+pub(crate) mod ordered_drain;
 pub mod partitioned_cache;
+pub(crate) mod pipeline_trace;
 pub mod schema_contract;
 pub mod so_terms;
 pub mod table_function;
 pub mod transcript_consequence;
 pub mod variant_lookup_exec;
 pub mod vcf_sink;
+#[cfg(feature = "kv-cache")]
+pub mod warm_cache;
+pub(crate) mod window_planner;
 
 pub use config::AnnotationConfig;
 

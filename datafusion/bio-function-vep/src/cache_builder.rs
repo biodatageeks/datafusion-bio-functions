@@ -1,25 +1,28 @@
-//! Cache builder: converts raw Ensembl VEP cache to parquet + fjall.
+//! Cache builder: converts raw Ensembl VEP cache to indexed parquet or Lance.
 //!
 //! Ported from vepyr `convert.rs` and extended with:
-//! - Fjall dual-sink for `variation` (single pass via `start_ingestion()`)
-//! - Fjall second pass for `translation_sift` (re-sorted by `transcript_id`)
+//! - Indexed warm/cold variation parquet with sidecar indexes
+//! - Single-path Lance cache generation
+//! - Compact parquet-backed `translation_sift` lookup by `transcript_id`
+//! - Legacy fjall generation as an explicit opt-in
 //! - Progress callback for driving tqdm bars in Python wrappers
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use datafusion::arrow::array::{
-    Array, AsArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    Array, ArrayRef, AsArray, BinaryArray, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::basic::Compression;
+use datafusion::parquet::file::metadata::SortingColumn;
 use datafusion::parquet::file::properties::WriterProperties;
-use datafusion::parquet::format::SortingColumn;
 use datafusion::parquet::schema::types::ColumnPath;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -37,8 +40,12 @@ use crate::kv_cache::LoadStats;
 use crate::kv_cache::key_encoding::{chrom_to_code, encode_position_key};
 use crate::kv_cache::kv_store::VepKvStore;
 use crate::kv_cache::position_entry::serialize_position_entry;
-use crate::kv_cache::sift_store::SiftKvStore;
+use crate::kv_cache::sift_store::{SiftKvStore, serialize_predictions};
 use crate::transcript_consequence::CachedPredictions;
+use crate::warm_cache::build::{
+    WarmVariationTierOptions, WarmVariationTierPartsOptions, build_warm_variation_tier,
+    build_warm_variation_tier_from_parts,
+};
 
 /// Progress callback: `(entity, format, batch_rows, total_rows, total_expected)`.
 ///
@@ -60,6 +67,43 @@ const CHROM_CODE_ORDER: &[&str] = &[
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
     "18", "19", "20", "21", "22", "X", "Y", "MT",
 ];
+const DEFAULT_VARIATION_WARM_ROW_GROUP_ROWS: usize = 500_000;
+const DEFAULT_VARIATION_COLD_ROW_GROUP_ROWS: usize = 8_192;
+const DEFAULT_VARIATION_COLD_DATA_PAGE_ROW_COUNT: usize = 1_024;
+const DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS: usize = 16;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheFormat {
+    #[default]
+    IndexedParquet,
+    LegacyFjall,
+    Lance,
+}
+
+impl CacheFormat {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "indexed_parquet" => Ok(Self::IndexedParquet),
+            "legacy_fjall" => Ok(Self::LegacyFjall),
+            "lance" => Ok(Self::Lance),
+            other => Err(DataFusionError::Execution(format!(
+                "cache_format must be 'indexed_parquet', 'legacy_fjall', or 'lance', got '{other}'"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IndexedParquet => "indexed_parquet",
+            Self::LegacyFjall => "legacy_fjall",
+            Self::Lance => "lance",
+        }
+    }
+
+    fn builds_legacy_fjall(self) -> bool {
+        matches!(self, Self::LegacyFjall)
+    }
+}
 
 fn transcript_region_start_expr(start_col: &str) -> String {
     format!(
@@ -101,11 +145,19 @@ pub struct CacheBuilder {
     cache_root: String,
     output_dir: String,
     partitions: usize,
+    cache_format: CacheFormat,
     build_fjall: bool,
     overwrite: bool,
     zstd_level: i32,
     dict_size_kb: u32,
     cache_source_type: BioFormatsCacheSourceType,
+    variation_af_threshold: f64,
+    variation_position_radius: i64,
+    variation_warm_row_group_rows: usize,
+    variation_cold_row_group_rows: usize,
+    variation_cold_data_page_row_count: usize,
+    variation_tier_batch_size: usize,
+    chrom_filter: Option<Vec<String>>,
     on_progress: Option<Arc<OnProgress>>,
 }
 
@@ -115,11 +167,19 @@ impl CacheBuilder {
             cache_root: cache_root.into(),
             output_dir: output_dir.into(),
             partitions: 8,
-            build_fjall: true,
+            cache_format: CacheFormat::default(),
+            build_fjall: CacheFormat::default().builds_legacy_fjall(),
             overwrite: false,
             zstd_level: 3,
             dict_size_kb: 112,
             cache_source_type: BioFormatsCacheSourceType::Ensembl,
+            variation_af_threshold: 0.01,
+            variation_position_radius: 1,
+            variation_warm_row_group_rows: DEFAULT_VARIATION_WARM_ROW_GROUP_ROWS,
+            variation_cold_row_group_rows: DEFAULT_VARIATION_COLD_ROW_GROUP_ROWS,
+            variation_cold_data_page_row_count: DEFAULT_VARIATION_COLD_DATA_PAGE_ROW_COUNT,
+            variation_tier_batch_size: 65_536,
+            chrom_filter: None,
             on_progress: None,
         }
     }
@@ -129,8 +189,32 @@ impl CacheBuilder {
         self
     }
 
+    /// Restrict the build to the given chromosomes (matched after stripping any
+    /// `chr` prefix). Useful for scoped rebuilds such as a single-chromosome
+    /// profiling or parity build. An empty list is treated as "no filter".
+    pub fn with_chrom_filter<I, S>(mut self, chroms: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let chroms: Vec<String> = chroms.into_iter().map(Into::into).collect();
+        self.chrom_filter = (!chroms.is_empty()).then_some(chroms);
+        self
+    }
+
     pub fn with_build_fjall(mut self, enabled: bool) -> Self {
+        self.cache_format = if enabled {
+            CacheFormat::LegacyFjall
+        } else {
+            CacheFormat::IndexedParquet
+        };
         self.build_fjall = enabled;
+        self
+    }
+
+    pub fn with_cache_format(mut self, cache_format: CacheFormat) -> Self {
+        self.cache_format = cache_format;
+        self.build_fjall = cache_format.builds_legacy_fjall();
         self
     }
 
@@ -151,6 +235,53 @@ impl CacheBuilder {
 
     pub fn with_cache_source_type(mut self, cache_source_type: BioFormatsCacheSourceType) -> Self {
         self.cache_source_type = cache_source_type;
+        self
+    }
+
+    pub fn with_variation_tier_options(
+        mut self,
+        af_threshold: f64,
+        position_radius: i64,
+        row_group_rows: usize,
+        batch_size: usize,
+    ) -> Self {
+        self.variation_af_threshold = af_threshold;
+        self.variation_position_radius = position_radius;
+        self.variation_warm_row_group_rows = row_group_rows.max(1);
+        self.variation_cold_row_group_rows = row_group_rows.max(1);
+        self.variation_tier_batch_size = batch_size.max(1);
+        self
+    }
+
+    pub fn with_variation_tier_filter_options(
+        mut self,
+        af_threshold: f64,
+        position_radius: i64,
+    ) -> Self {
+        self.variation_af_threshold = af_threshold;
+        self.variation_position_radius = position_radius;
+        self
+    }
+
+    pub fn with_indexed_variation_layout_options(
+        mut self,
+        warm_row_group_rows: usize,
+        cold_row_group_rows: usize,
+        cold_data_page_row_count: usize,
+    ) -> Self {
+        self.variation_warm_row_group_rows = warm_row_group_rows.max(1);
+        self.variation_cold_row_group_rows = cold_row_group_rows.max(1);
+        self.variation_cold_data_page_row_count = cold_data_page_row_count.max(1);
+        self
+    }
+
+    pub fn with_indexed_variation_cold_layout_options(
+        mut self,
+        cold_row_group_rows: usize,
+        cold_data_page_row_count: usize,
+    ) -> Self {
+        self.variation_cold_row_group_rows = cold_row_group_rows.max(1);
+        self.variation_cold_data_page_row_count = cold_data_page_row_count.max(1);
         self
     }
 
@@ -196,6 +327,28 @@ impl CacheBuilder {
     pub async fn build_entity(&self, entity: &str) -> Result<Vec<EntityStats>> {
         let kind = parse_entity(entity)
             .ok_or_else(|| DataFusionError::Execution(format!("Unknown entity: {entity}")))?;
+
+        if self.cache_format == CacheFormat::Lance {
+            #[cfg(feature = "lance-cache")]
+            {
+                let options = crate::lance_cache::build::LanceCacheBuildOptions {
+                    cache_root: self.cache_root.clone(),
+                    output_dir: self.output_dir.clone(),
+                    partitions: self.partitions,
+                    cache_source_type: self.cache_source_type,
+                    overwrite: self.overwrite,
+                    chrom_filter: self.chrom_filter.clone(),
+                };
+                return crate::lance_cache::build::build_lance_entity(&options, kind).await;
+            }
+
+            #[cfg(not(feature = "lance-cache"))]
+            {
+                return Err(DataFusionError::Execution(
+                    "cache_format='lance' requires the lance-cache feature".to_string(),
+                ));
+            }
+        }
 
         // Create output directories.
         // Translation outputs to translation_core/ and translation_sift/,
@@ -256,12 +409,13 @@ impl CacheBuilder {
         let kind = EnsemblEntityKind::Variation;
         let table_name = "var";
         let parquet_dir = format!("{}/variation", self.output_dir);
-        let parquet_exists = dir_has_parquet_files(&parquet_dir);
+        let base_parquet_exists = dir_has_base_variation_parquet_files(&parquet_dir);
+        let variation_tier_exists = dir_has_variation_tier_files(&parquet_dir);
         let fjall_dir_path = format!("{}/variation.fjall", self.output_dir);
         let fjall_exists = Path::new(&fjall_dir_path).exists();
 
         if !self.overwrite {
-            let need_parquet = !parquet_exists;
+            let need_parquet = base_parquet_exists || !variation_tier_exists;
             let need_fjall = self.build_fjall && !fjall_exists;
 
             if !need_parquet && !need_fjall {
@@ -273,9 +427,32 @@ impl CacheBuilder {
                 }]);
             }
 
+            // Legacy cache exists as chrN.parquet / other.parquet. Convert it
+            // in place to chrN_warm.parquet + chrN_cold.parquet before any
+            // fjall rebuild, then remove the old base files.
+            if need_parquet && base_parquet_exists {
+                info!(
+                    "variation: base parquet exists, building warm/cold tier from existing files"
+                );
+                let parquet_results = self.build_variation_tier_from_base_parquet(&parquet_dir)?;
+                let fjall_stats = if need_fjall {
+                    let fjall_result = self.build_variation_fjall_from_parquet().await?;
+                    fjall_result.into_iter().next().and_then(|s| s.fjall_stats)
+                } else {
+                    None
+                };
+                return Ok(vec![EntityStats {
+                    entity: "variation".to_string(),
+                    parquet_files: parquet_results,
+                    fjall_stats,
+                }]);
+            }
+
             // Parquet exists but fjall missing → rebuild fjall from parquet
             if !need_parquet && need_fjall {
-                info!("variation: parquet exists, building fjall from existing parquet files");
+                info!(
+                    "variation: warm/cold parquet exists, building fjall from existing parquet files"
+                );
                 return self.build_variation_fjall_from_parquet().await;
             }
         }
@@ -381,9 +558,12 @@ impl CacheBuilder {
             };
 
             let mut chrom_rows = 0usize;
+            let mut variation_tier_written = false;
 
             if let Some(inner) = inner_plan.filter(|_| num_partitions > 1 && !is_other) {
-                // --- Parallel path: write N temp parquet files, then merge ---
+                // --- Parallel path: write N temp parquet files, then build
+                // warm/cold tiers directly from those parts. This avoids the
+                // previous serial chrN.parquet -> warm/cold split pass.
                 let temp_dir = format!("{}/variation/_tmp_{chrom}", self.output_dir);
                 std::fs::create_dir_all(&temp_dir).map_err(|e| {
                     DataFusionError::Execution(format!("Failed to create temp dir: {e}"))
@@ -439,14 +619,9 @@ impl CacheBuilder {
                     num_partitions
                 );
 
-                // Phase 2: Merge temp parquet files by appending row groups
-                // (no decompression/recompression — just copies raw bytes).
-                //
-                // Close the main writer first (it wrote nothing yet), then
-                // concatenate row groups from each partition file into the
-                // final output file.
+                // Close and remove the empty base parquet writer; the final
+                // output for main chromosomes is chrN_warm/chrN_cold.
                 {
-                    // Drop the empty ArrowWriter so we can overwrite the file
                     let empty_writer = main_writer.take().unwrap();
                     empty_writer.close().map_err(|e| {
                         DataFusionError::Execution(format!(
@@ -454,20 +629,27 @@ impl CacheBuilder {
                         ))
                     })?;
                 }
+                if let Err(error) = std::fs::remove_file(output_file) {
+                    log::debug!(
+                        "variation: failed to remove empty base parquet {output_file}: {error}"
+                    );
+                }
 
-                let part_paths: Vec<String> = part_files
-                    .iter()
-                    .map(|(_, part_file, _)| part_file.clone())
-                    .collect();
-                let merged_rows =
-                    merge_parquet_row_groups(&part_paths, output_file, Some(self.zstd_level))?;
-                if merged_rows != parallel_rows {
+                let tier_results = self.build_variation_tier_from_partition_parquets(
+                    chrom,
+                    &part_files,
+                    Path::new(&temp_dir).join("tier"),
+                )?;
+                let tier_rows: usize = tier_results.iter().map(|(_, rows)| *rows).sum();
+                if tier_rows != parallel_rows {
                     return Err(DataFusionError::Execution(format!(
-                        "merged parquet row count mismatch for {output_file}: copied {merged_rows}, expected {parallel_rows}"
+                        "warm/cold tier row count mismatch for {chrom}: wrote {tier_rows}, expected {parallel_rows}"
                     )));
                 }
-                chrom_rows += merged_rows;
-                total_parquet_rows += merged_rows;
+                chrom_rows += tier_rows;
+                total_parquet_rows += tier_rows;
+                parquet_results.extend(tier_results);
+                variation_tier_written = true;
 
                 if let Some(ref cb) = self.on_progress {
                     cb("variation", "parquet", chrom_rows, total_parquet_rows, 0);
@@ -515,9 +697,13 @@ impl CacheBuilder {
 
             if *is_other {
                 other_total_rows += chrom_rows;
-            } else if chrom_rows > 0 {
-                parquet_results.push((output_file.clone(), chrom_rows));
+            } else if variation_tier_written {
                 info!("variation: {chrom} {} rows", format_rows(chrom_rows));
+            } else if chrom_rows > 0 {
+                parquet_results.extend(self.split_variation_base_parquet(output_file)?);
+                info!("variation: {chrom} {} rows", format_rows(chrom_rows));
+            } else if let Err(error) = std::fs::remove_file(output_file) {
+                log::debug!("variation: failed to remove empty parquet {output_file}: {error}");
             }
         }
 
@@ -529,7 +715,7 @@ impl CacheBuilder {
         }
         if other_total_rows > 0 {
             let other_out = format!("{}/variation/other.parquet", self.output_dir);
-            parquet_results.push((other_out, other_total_rows));
+            parquet_results.extend(self.split_variation_base_parquet(&other_out)?);
             info!(
                 "variation: other {} rows ({} contigs)",
                 format_rows(other_total_rows),
@@ -561,6 +747,96 @@ impl CacheBuilder {
         }])
     }
 
+    fn build_variation_tier_from_base_parquet(
+        &self,
+        parquet_dir: &str,
+    ) -> Result<Vec<(String, usize)>> {
+        let mut parquet_results = Vec::new();
+        for path in base_variation_parquet_files(parquet_dir)? {
+            parquet_results.extend(self.split_variation_base_parquet(&path)?);
+        }
+        Ok(parquet_results)
+    }
+
+    fn build_variation_tier_from_partition_parquets(
+        &self,
+        chrom: &str,
+        part_files: &[(usize, String, usize)],
+        work_dir: impl AsRef<Path>,
+    ) -> Result<Vec<(String, usize)>> {
+        let output_dir = Path::new(&self.output_dir).join("variation");
+        let chrom_name = format!("chr{chrom}");
+        let inputs: Vec<PathBuf> = part_files
+            .iter()
+            .map(|(_, path, _)| PathBuf::from(path))
+            .collect();
+        let mut options = WarmVariationTierPartsOptions::new(
+            inputs,
+            &output_dir,
+            work_dir.as_ref().to_path_buf(),
+            chrom_name,
+        );
+        options.af_threshold = self.variation_af_threshold;
+        options.position_radius = self.variation_position_radius;
+        options.warm_row_group_rows = self.variation_warm_row_group_rows;
+        options.cold_row_group_rows = self.variation_cold_row_group_rows;
+        options.cold_data_page_row_count = self.variation_cold_data_page_row_count;
+        options.batch_size = self.variation_tier_batch_size;
+
+        let stats = build_warm_variation_tier_from_parts(options).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to build warm/cold variation tier from partition parquets for {chrom}: {error}"
+            ))
+        })?;
+
+        let warm = output_dir.join(format!("{}_warm.parquet", stats.chrom));
+        let cold = output_dir.join(format!("{}_cold.parquet", stats.chrom));
+        Ok(vec![
+            (warm.to_string_lossy().to_string(), stats.warm_rows),
+            (cold.to_string_lossy().to_string(), stats.cold_rows),
+        ])
+    }
+
+    fn split_variation_base_parquet(
+        &self,
+        input: impl AsRef<Path>,
+    ) -> Result<Vec<(String, usize)>> {
+        let input = input.as_ref();
+        let output_dir = input.parent().ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "variation parquet has no parent directory: {}",
+                input.display()
+            ))
+        })?;
+        let mut options = WarmVariationTierOptions::new(input, output_dir);
+        options.af_threshold = self.variation_af_threshold;
+        options.position_radius = self.variation_position_radius;
+        options.warm_row_group_rows = self.variation_warm_row_group_rows;
+        options.cold_row_group_rows = self.variation_cold_row_group_rows;
+        options.cold_data_page_row_count = self.variation_cold_data_page_row_count;
+        options.batch_size = self.variation_tier_batch_size;
+
+        let stats = build_warm_variation_tier(options).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to build warm/cold variation tier from {}: {error}",
+                input.display()
+            ))
+        })?;
+        std::fs::remove_file(input).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to remove base variation parquet {} after tier split: {error}",
+                input.display()
+            ))
+        })?;
+
+        let warm = output_dir.join(format!("{}_warm.parquet", stats.chrom));
+        let cold = output_dir.join(format!("{}_cold.parquet", stats.chrom));
+        Ok(vec![
+            (warm.to_string_lossy().to_string(), stats.warm_rows),
+            (cold.to_string_lossy().to_string(), stats.cold_rows),
+        ])
+    }
+
     /// Build variation fjall from existing parquet files.
     ///
     /// Reads chr*.parquet and other.parquet in chrom_code order and feeds fjall.
@@ -568,32 +844,7 @@ impl CacheBuilder {
         let parquet_dir = format!("{}/variation", self.output_dir);
         let fjall_dir = format!("{}/variation.fjall", self.output_dir);
 
-        // Discover parquet files and sort in chrom_code order
-        let mut parquet_files: Vec<(u16, String)> = Vec::new();
-        for entry in std::fs::read_dir(&parquet_dir).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to read dir {parquet_dir}: {e}"))
-        })? {
-            let entry = entry.map_err(|e| {
-                DataFusionError::Execution(format!("Failed to read dir entry: {e}"))
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
-                continue;
-            }
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            // chr1.parquet → "1", other.parquet → sort last
-            let chrom = stem.strip_prefix("chr").unwrap_or(stem);
-            let code = if chrom == "other" {
-                u16::MAX
-            } else {
-                chrom_to_code(chrom)
-            };
-            parquet_files.push((code, path.to_string_lossy().to_string()));
-        }
-        parquet_files.sort_by_key(|(code, _)| *code);
+        let parquet_files = discover_variation_parquet_files_for_fjall(&parquet_dir)?;
 
         if parquet_files.is_empty() {
             return Err(DataFusionError::Execution(
@@ -622,7 +873,8 @@ impl CacheBuilder {
             .register_parquet("_probe", &parquet_files[0].1, Default::default())
             .await?;
         let probe_df = read_ctx.sql("SELECT * FROM _probe LIMIT 0").await?;
-        let schema: SchemaRef = Arc::new(probe_df.schema().as_arrow().clone());
+        let file_schema: SchemaRef = Arc::new(probe_df.schema().as_arrow().clone());
+        let schema = variation_cache_schema_without_tier_helpers(&file_schema);
         read_ctx.deregister_table("_probe")?;
 
         let store = VepKvStore::create(Path::new(&fjall_dir), schema.clone())?;
@@ -690,11 +942,18 @@ impl CacheBuilder {
                 .await?
         };
 
-        let chrom_col_idx = schema.index_of("chrom")?;
-        let start_col_idx = schema.index_of("start")?;
-        let allele_col_idx = schema.index_of("allele_string")?;
-        let col_indices: Vec<usize> = (0..schema.fields().len())
-            .filter(|&i| i != chrom_col_idx && i != start_col_idx)
+        let chrom_col_idx = file_schema.index_of("chrom")?;
+        let start_col_idx = file_schema.index_of("start")?;
+        let allele_col_idx = file_schema.index_of("allele_string")?;
+        let col_indices: Vec<usize> = (0..file_schema.fields().len())
+            .filter(|&i| {
+                i != chrom_col_idx
+                    && i != start_col_idx
+                    && !matches!(
+                        file_schema.field(i).name().as_str(),
+                        "position_key" | "variant_keys"
+                    )
+            })
             .collect();
 
         let mut total_positions = 0u64;
@@ -1161,51 +1420,57 @@ impl CacheBuilder {
         })?;
 
         // translation_sift
-        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
-            false,
-            self.cache_source_type,
-        );
-        let sift_select = sift_schema
-            .fields()
-            .iter()
-            .map(|f| format!("\"{}\"", f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
         let sift_file = format!("{}/translation_sift/chr{chrom}.parquet", self.output_dir);
-        let sift_query = format!("SELECT {sift_select} FROM _tl_deduped ORDER BY chrom, start");
+        let sift_rows = if self.cache_format == CacheFormat::IndexedParquet {
+            self.write_compact_sift_from_deduped(&split_ctx, &sift_file)
+                .await?
+        } else {
+            let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
+                false,
+                self.cache_source_type,
+            );
+            let sift_select = sift_schema
+                .fields()
+                .iter()
+                .map(|f| format!("\"{}\"", f.name()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sift_query = format!("SELECT {sift_select} FROM _tl_deduped ORDER BY chrom, start");
 
-        let mut w = create_writer(
-            &sift_file,
-            &sift_schema,
-            kind,
-            &["chrom", "start"],
-            Some(256),
-        )?;
-        let sift_df = split_ctx.sql(&sift_query).await?;
-        let mut stream = sift_df.execute_stream().await?;
-        let mut sift_rows = 0usize;
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let batch = project_batch(&batch, &sift_schema)?;
-            sift_rows += batch.num_rows();
-            w.write(&batch)?;
+            let mut w = create_writer(
+                &sift_file,
+                &sift_schema,
+                kind,
+                &["chrom", "start"],
+                Some(256),
+            )?;
+            let sift_df = split_ctx.sql(&sift_query).await?;
+            let mut stream = sift_df.execute_stream().await?;
+            let mut sift_rows = 0usize;
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let batch = project_batch(&batch, &sift_schema)?;
+                sift_rows += batch.num_rows();
+                w.write(&batch)?;
 
-            if let Some(ref cb) = self.on_progress {
-                cb(
-                    "translation_sift",
-                    "parquet",
-                    batch.num_rows(),
-                    sift_rows,
-                    0,
-                );
+                if let Some(ref cb) = self.on_progress {
+                    cb(
+                        "translation_sift",
+                        "parquet",
+                        batch.num_rows(),
+                        sift_rows,
+                        0,
+                    );
+                }
             }
-        }
-        w.close().map_err(|e| {
-            DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
-        })?;
+            w.close().map_err(|e| {
+                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+            })?;
+            sift_rows
+        };
 
         info!(
             "translation: chr{chrom} core={} sift={}",
@@ -1294,36 +1559,42 @@ impl CacheBuilder {
             DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
         })?;
 
-        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
-            false,
-            self.cache_source_type,
-        );
-        let sift_select = sift_schema
-            .fields()
-            .iter()
-            .map(|f| format!("\"{}\"", f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
         let sift_file = format!("{}/translation_sift/other.parquet", self.output_dir);
-        let mut w = create_writer(
-            &sift_file,
-            &sift_schema,
-            kind,
-            &["chrom", "start"],
-            Some(256),
-        )?;
-        let sift_rows = stream_to_writer_with_progress(
-            &split_ctx,
-            &format!("SELECT {sift_select} FROM _tl_deduped ORDER BY chrom, start"),
-            &mut w,
-            false,
-            self.on_progress.as_deref(),
-            "translation_sift",
-        )
-        .await?;
-        w.close().map_err(|e| {
-            DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
-        })?;
+        let sift_rows = if self.cache_format == CacheFormat::IndexedParquet {
+            self.write_compact_sift_from_deduped(&split_ctx, &sift_file)
+                .await?
+        } else {
+            let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
+                false,
+                self.cache_source_type,
+            );
+            let sift_select = sift_schema
+                .fields()
+                .iter()
+                .map(|f| format!("\"{}\"", f.name()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut w = create_writer(
+                &sift_file,
+                &sift_schema,
+                kind,
+                &["chrom", "start"],
+                Some(256),
+            )?;
+            let sift_rows = stream_to_writer_with_progress(
+                &split_ctx,
+                &format!("SELECT {sift_select} FROM _tl_deduped ORDER BY chrom, start"),
+                &mut w,
+                false,
+                self.on_progress.as_deref(),
+                "translation_sift",
+            )
+            .await?;
+            w.close().map_err(|e| {
+                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+            })?;
+            sift_rows
+        };
 
         info!(
             "translation: other ({} contigs) core={} sift={}",
@@ -1343,6 +1614,69 @@ impl CacheBuilder {
             None
         };
         Ok((core_result, sift_result))
+    }
+
+    async fn write_compact_sift_from_deduped(
+        &self,
+        split_ctx: &SessionContext,
+        sift_file: &str,
+    ) -> Result<usize> {
+        let schema = compact_translation_sift_schema();
+        let mut writer = create_compact_sift_writer(sift_file, &schema)?;
+        let df = split_ctx
+            .sql(
+                "SELECT transcript_id, sift_predictions, polyphen_predictions \
+                 FROM _tl_deduped ORDER BY transcript_id",
+            )
+            .await?;
+        let mut stream = df.execute_stream().await?;
+        let mut ids = Vec::with_capacity(DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS);
+        let mut blobs = Vec::with_capacity(DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS);
+        let mut rows = 0usize;
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let batch_schema = batch.schema();
+            let tid_idx = batch_schema.index_of("transcript_id")?;
+            let sift_idx = batch_schema.index_of("sift_predictions").ok();
+            let poly_idx = batch_schema.index_of("polyphen_predictions").ok();
+
+            for row in 0..batch.num_rows() {
+                if batch.column(tid_idx).is_null(row) {
+                    continue;
+                }
+                let transcript_id = string_value(batch.column(tid_idx).as_ref(), row);
+                let mut predictions = CachedPredictions::default();
+                if let Some(idx) = sift_idx {
+                    predictions.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                if let Some(idx) = poly_idx {
+                    predictions.polyphen =
+                        read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                predictions.sort();
+                ids.push(transcript_id.to_string());
+                blobs.push(serialize_predictions(&predictions));
+                rows += 1;
+
+                if ids.len() >= DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS {
+                    flush_compact_sift_batch(&mut writer, schema.clone(), &mut ids, &mut blobs)?;
+                }
+            }
+
+            if let Some(ref cb) = self.on_progress {
+                cb("translation_sift", "parquet", batch.num_rows(), rows, 0);
+            }
+        }
+
+        flush_compact_sift_batch(&mut writer, schema, &mut ids, &mut blobs)?;
+        writer.close().map_err(|e| {
+            DataFusionError::Execution(format!("Failed to close compact sift parquet writer: {e}"))
+        })?;
+        Ok(rows)
     }
 
     /// Build fjall for translation_sift: re-read parquet sorted by transcript_id,
@@ -1884,9 +2218,11 @@ fn sorting_columns_for(schema: &SchemaRef, sort_columns: &[&str]) -> Option<Vec<
     let cols: Vec<SortingColumn> = sort_columns
         .iter()
         .filter_map(|name| {
-            schema
-                .column_with_name(name)
-                .map(|(idx, _)| SortingColumn::new(idx as i32, false, false))
+            schema.column_with_name(name).map(|(idx, _)| SortingColumn {
+                column_idx: idx as i32,
+                descending: false,
+                nulls_first: false,
+            })
         })
         .collect();
     if cols.len() == sort_columns.len() {
@@ -1907,7 +2243,7 @@ fn writer_properties(
 
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(rg_size)
+        .set_max_row_group_row_count(Some(rg_size))
         .set_sorting_columns(sorting);
 
     if matches!(
@@ -2100,6 +2436,149 @@ fn dir_has_parquet_files(dir: &str) -> bool {
             .unwrap_or(false)
 }
 
+fn dir_has_variation_tier_files(dir: &str) -> bool {
+    Path::new(dir).is_dir()
+        && std::fs::read_dir(dir)
+            .ok()
+            .map(|entries| {
+                let mut has_warm = false;
+                let mut has_cold = false;
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
+                        continue;
+                    }
+                    let stem = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("");
+                    has_warm |= stem.ends_with("_warm");
+                    has_cold |= stem.ends_with("_cold");
+                }
+                has_warm && has_cold
+            })
+            .unwrap_or(false)
+}
+
+fn dir_has_base_variation_parquet_files(dir: &str) -> bool {
+    base_variation_parquet_files(dir)
+        .map(|files| !files.is_empty())
+        .unwrap_or(false)
+}
+
+fn base_variation_parquet_files(dir: &str) -> Result<Vec<PathBuf>> {
+    if !Path::new(dir).is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|error| {
+        DataFusionError::Execution(format!("Failed to read variation dir {dir}: {error}"))
+    })? {
+        let path = entry
+            .map_err(|error| {
+                DataFusionError::Execution(format!("Failed to read variation dir entry: {error}"))
+            })?
+            .path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        if stem.ends_with("_warm") || stem.ends_with("_cold") {
+            continue;
+        }
+        files.push(path);
+    }
+    files.sort_by_key(|path| {
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        variation_chrom_sort_code(stem)
+    });
+    Ok(files)
+}
+
+fn discover_variation_parquet_files_for_fjall(dir: &str) -> Result<Vec<(u16, String)>> {
+    if !Path::new(dir).is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut split_files: Vec<(u16, u8, String)> = Vec::new();
+    let mut base_files: Vec<(u16, String)> = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .map_err(|error| DataFusionError::Execution(format!("Failed to read dir {dir}: {error}")))?
+    {
+        let path = entry
+            .map_err(|error| {
+                DataFusionError::Execution(format!("Failed to read dir entry: {error}"))
+            })?
+            .path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        if let Some(base) = stem.strip_suffix("_warm") {
+            split_files.push((
+                variation_chrom_sort_code(base),
+                0,
+                path.to_string_lossy().to_string(),
+            ));
+        } else if let Some(base) = stem.strip_suffix("_cold") {
+            split_files.push((
+                variation_chrom_sort_code(base),
+                1,
+                path.to_string_lossy().to_string(),
+            ));
+        } else {
+            base_files.push((
+                variation_chrom_sort_code(stem),
+                path.to_string_lossy().to_string(),
+            ));
+        }
+    }
+
+    if !split_files.is_empty() {
+        split_files.sort_by_key(|(code, tier, path)| (*code, *tier, path.clone()));
+        return Ok(split_files
+            .into_iter()
+            .map(|(code, _, path)| (code, path))
+            .collect());
+    }
+
+    base_files.sort_by_key(|(code, path)| (*code, path.clone()));
+    Ok(base_files)
+}
+
+fn variation_chrom_sort_code(stem: &str) -> u16 {
+    let chrom = stem.strip_prefix("chr").unwrap_or(stem);
+    if chrom == "other" {
+        u16::MAX
+    } else {
+        chrom_to_code(chrom)
+    }
+}
+
+fn variation_cache_schema_without_tier_helpers(schema: &SchemaRef) -> SchemaRef {
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .filter(|field| {
+            !matches!(
+                field.name().as_str(),
+                "position_key" | "variant_keys" | "region_bin"
+            )
+        })
+        .cloned()
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
 fn make_ctx_and_register(
     cache_root: &str,
     kind: EnsemblEntityKind,
@@ -2129,6 +2608,47 @@ fn create_writer(
         .map_err(|e| DataFusionError::Execution(format!("Failed to create file {path}: {e}")))?;
     ArrowWriter::try_new(file, schema.clone(), Some(props))
         .map_err(|e| DataFusionError::Execution(format!("Failed to create ArrowWriter: {e}")))
+}
+
+fn compact_translation_sift_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("transcript_id", DataType::Utf8, false),
+        Field::new("predictions", DataType::Binary, false),
+    ]))
+}
+
+fn create_compact_sift_writer(path: &str, schema: &SchemaRef) -> Result<ArrowWriter<File>> {
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS))
+        .set_dictionary_enabled(false)
+        .set_compression(Compression::UNCOMPRESSED)
+        .build();
+    let file = File::create(path)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to create file {path}: {e}")))?;
+    ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| {
+        DataFusionError::Execution(format!("Failed to create compact sift ArrowWriter: {e}"))
+    })
+}
+
+fn flush_compact_sift_batch(
+    writer: &mut ArrowWriter<File>,
+    schema: SchemaRef,
+    ids: &mut Vec<String>,
+    blobs: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(std::mem::take(ids))) as ArrayRef,
+            Arc::new(BinaryArray::from_iter_values(std::mem::take(blobs))) as ArrayRef,
+        ],
+    )
+    .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
+    writer.write(&batch)?;
+    Ok(())
 }
 
 async fn stream_to_writer_with_progress(
@@ -2832,23 +3352,94 @@ mod tests {
         assert_eq!(builder.cache_root, "/cache");
         assert_eq!(builder.output_dir, "/output");
         assert_eq!(builder.partitions, 8);
-        assert!(builder.build_fjall);
+        assert_eq!(builder.cache_format, CacheFormat::IndexedParquet);
+        assert!(!builder.build_fjall);
+        assert_eq!(
+            builder.variation_warm_row_group_rows,
+            DEFAULT_VARIATION_WARM_ROW_GROUP_ROWS
+        );
+        assert_eq!(
+            builder.variation_cold_row_group_rows,
+            DEFAULT_VARIATION_COLD_ROW_GROUP_ROWS
+        );
+        assert_eq!(
+            builder.variation_cold_data_page_row_count,
+            DEFAULT_VARIATION_COLD_DATA_PAGE_ROW_COUNT
+        );
         assert_eq!(builder.zstd_level, 3);
         assert_eq!(builder.dict_size_kb, 112);
         assert!(builder.on_progress.is_none());
     }
 
     #[test]
+    fn lance_cache_format_does_not_build_legacy_fjall() {
+        let builder = CacheBuilder::new("/cache", "/output").with_cache_format(CacheFormat::Lance);
+        assert_eq!(builder.cache_format, CacheFormat::Lance);
+        assert!(!builder.build_fjall);
+    }
+
+    #[test]
     fn test_cache_builder_with_overrides() {
         let builder = CacheBuilder::new("/cache", "/output")
             .with_partitions(4)
-            .with_build_fjall(false)
+            .with_cache_format(CacheFormat::LegacyFjall)
             .with_zstd_level(9)
             .with_dict_size_kb(256);
         assert_eq!(builder.partitions, 4);
-        assert!(!builder.build_fjall);
+        assert_eq!(builder.cache_format, CacheFormat::LegacyFjall);
+        assert!(builder.build_fjall);
         assert_eq!(builder.zstd_level, 9);
         assert_eq!(builder.dict_size_kb, 256);
+    }
+
+    #[test]
+    fn variation_tier_filter_options_preserve_layout_defaults() {
+        let builder =
+            CacheBuilder::new("/cache", "/output").with_variation_tier_filter_options(0.05, 2);
+
+        assert_eq!(builder.variation_af_threshold, 0.05);
+        assert_eq!(builder.variation_position_radius, 2);
+        assert_eq!(
+            builder.variation_warm_row_group_rows,
+            DEFAULT_VARIATION_WARM_ROW_GROUP_ROWS
+        );
+        assert_eq!(
+            builder.variation_cold_row_group_rows,
+            DEFAULT_VARIATION_COLD_ROW_GROUP_ROWS
+        );
+        assert_eq!(
+            builder.variation_cold_data_page_row_count,
+            DEFAULT_VARIATION_COLD_DATA_PAGE_ROW_COUNT
+        );
+        assert_eq!(builder.variation_tier_batch_size, 65_536);
+    }
+
+    #[test]
+    fn indexed_variation_cold_layout_options_preserve_warm_and_batch_defaults() {
+        let builder = CacheBuilder::new("/cache", "/output")
+            .with_indexed_variation_cold_layout_options(4_096, 512);
+
+        assert_eq!(
+            builder.variation_warm_row_group_rows,
+            DEFAULT_VARIATION_WARM_ROW_GROUP_ROWS
+        );
+        assert_eq!(builder.variation_cold_row_group_rows, 4_096);
+        assert_eq!(builder.variation_cold_data_page_row_count, 512);
+        assert_eq!(builder.variation_tier_batch_size, 65_536);
+    }
+
+    #[test]
+    fn cache_format_parser_accepts_default_and_legacy_names() {
+        assert_eq!(
+            CacheFormat::parse("indexed_parquet").unwrap(),
+            CacheFormat::IndexedParquet
+        );
+        assert_eq!(
+            CacheFormat::parse("legacy_fjall").unwrap(),
+            CacheFormat::LegacyFjall
+        );
+        assert_eq!(CacheFormat::parse("lance").unwrap(), CacheFormat::Lance);
+        assert!(CacheFormat::parse("rocksdb").is_err());
     }
 
     #[test]
@@ -2923,7 +3514,7 @@ mod tests {
             &["chrom", "start"],
             None,
         );
-        assert_eq!(props.max_row_group_size(), 100_000);
+        assert_eq!(props.max_row_group_row_count(), Some(100_000));
     }
 
     #[test]
@@ -2935,7 +3526,7 @@ mod tests {
             &["chrom", "start"],
             Some(256),
         );
-        assert_eq!(props.max_row_group_size(), 256);
+        assert_eq!(props.max_row_group_row_count(), Some(256));
     }
 
     fn test_cached_predictions(sift_len: usize, polyphen_len: usize) -> CachedPredictions {
@@ -3583,6 +4174,65 @@ mod tests {
         assert!(!dir_has_parquet_files(dir.path().to_str().unwrap()));
     }
 
+    #[test]
+    fn test_variation_tier_files_are_detected_separately_from_base_parquet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chr1_warm.parquet"), b"PAR1").unwrap();
+        std::fs::write(dir.path().join("chr1_cold.parquet"), b"PAR1").unwrap();
+
+        assert!(dir_has_variation_tier_files(dir.path().to_str().unwrap()));
+        assert!(!dir_has_base_variation_parquet_files(
+            dir.path().to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_variation_fjall_discovery_prefers_split_files_over_base_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chr1.parquet"), b"PAR1").unwrap();
+        std::fs::write(dir.path().join("chr1_warm.parquet"), b"PAR1").unwrap();
+        std::fs::write(dir.path().join("chr1_cold.parquet"), b"PAR1").unwrap();
+
+        let files = discover_variation_parquet_files_for_fjall(dir.path().to_str().unwrap())
+            .expect("discover variation parquet files");
+        let names: Vec<_> = files
+            .iter()
+            .map(|(_, path)| {
+                Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(names, vec!["chr1_warm.parquet", "chr1_cold.parquet"]);
+    }
+
+    #[test]
+    fn test_variation_cache_schema_drops_tier_helper_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, true),
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new(
+                "variant_keys",
+                DataType::List(Arc::new(Field::new_list_field(DataType::UInt64, true))),
+                false,
+            ),
+        ]));
+
+        let projected = variation_cache_schema_without_tier_helpers(&schema);
+        let names: Vec<_> = projected
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+
+        assert_eq!(names, vec!["chrom", "start", "allele_string"]);
+    }
+
     // -----------------------------------------------------------------------
     // overwrite flag
     // -----------------------------------------------------------------------
@@ -3650,14 +4300,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().to_str().unwrap();
 
-        // Create fake variation parquet + fjall
+        // Create fake warm/cold variation parquet + fjall
         let var_dir = dir.path().join("variation");
         std::fs::create_dir_all(&var_dir).unwrap();
-        std::fs::write(var_dir.join("chr1.parquet"), b"PAR1").unwrap();
+        std::fs::write(var_dir.join("chr1_warm.parquet"), b"PAR1").unwrap();
+        std::fs::write(var_dir.join("chr1_cold.parquet"), b"PAR1").unwrap();
         let fjall_dir = dir.path().join("variation.fjall");
         std::fs::create_dir_all(&fjall_dir).unwrap();
 
-        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        let builder = CacheBuilder::new("/nonexistent_cache", output)
+            .with_cache_format(CacheFormat::LegacyFjall);
         let result = builder.build_entity("variation").await;
         assert!(result.is_ok());
         let stats = result.unwrap();
@@ -3670,12 +4322,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().to_str().unwrap();
 
-        // Create fake variation parquet but NO fjall
+        // Create fake warm/cold variation parquet but NO fjall
         let var_dir = dir.path().join("variation");
         std::fs::create_dir_all(&var_dir).unwrap();
-        std::fs::write(var_dir.join("chr1.parquet"), b"PAR1").unwrap();
+        std::fs::write(var_dir.join("chr1_warm.parquet"), b"PAR1").unwrap();
+        std::fs::write(var_dir.join("chr1_cold.parquet"), b"PAR1").unwrap();
 
-        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        let builder = CacheBuilder::new("/nonexistent_cache", output)
+            .with_cache_format(CacheFormat::LegacyFjall);
         let result = builder.build_entity("variation").await;
         // Will try to rebuild fjall from parquet but fail because the
         // parquet file is not a real parquet file
@@ -4103,7 +4757,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
 
-        // Write a parquet file with small max_row_group_size to force multiple row groups
+        // Write a parquet file with small row groups to force multiple row groups
         let batch = make_batch(
             vec!["1", "1", "1", "1", "1"],
             vec![10, 20, 30, 40, 50],
@@ -4115,7 +4769,7 @@ mod tests {
         let src_path = format!("{}/src.parquet", dir.path().display());
         let file = File::create(&src_path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(2) // 2 rows per row group
+            .set_max_row_group_row_count(Some(2)) // 2 rows per row group
             .build();
         let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
         w.write(&batch).unwrap();

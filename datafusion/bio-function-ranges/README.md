@@ -362,8 +362,8 @@ datafusion-bio-function-ranges = { git = "https://github.com/biodatageeks/datafu
 
 | Dependency | Version |
 |-----------|---------|
-| DataFusion | 50.3.0 |
-| Arrow | 56.1.0 |
+| DataFusion | 53.1.0 |
+| Arrow | 58.3.0 |
 | Rust edition | 2024 |
 
 These versions must stay in sync with `datafusion-bio-formats` and `polars-bio`.

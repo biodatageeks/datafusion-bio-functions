@@ -139,12 +139,12 @@ impl TableProvider for ClusterProvider {
             min_dist: self.min_dist,
             strict: self.filter_op == FilterOp::Strict,
             has_extra_cols: self.has_extra_cols,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -159,7 +159,7 @@ struct ClusterExec {
     min_dist: i64,
     strict: bool,
     has_extra_cols: bool,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl DisplayAs for ClusterExec {
@@ -181,7 +181,7 @@ impl ExecutionPlan for ClusterExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -217,14 +217,14 @@ impl ExecutionPlan for ClusterExec {
             min_dist: self.min_dist,
             strict: self.strict,
             has_extra_cols: self.has_extra_cols,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(
                     children[0].output_partitioning().partition_count(),
                 ),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 

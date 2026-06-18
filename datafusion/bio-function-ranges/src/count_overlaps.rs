@@ -159,12 +159,12 @@ impl TableProvider for CountOverlapsProvider {
             right: right_plan,
             columns_2: Arc::new(self.columns_2.clone()),
             filter_op: self.filter_op.clone(),
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema().clone()),
                 Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -175,7 +175,7 @@ struct CountOverlapsExec {
     right: Arc<dyn ExecutionPlan>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl Debug for CountOverlapsExec {
@@ -199,7 +199,7 @@ impl ExecutionPlan for CountOverlapsExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -223,14 +223,14 @@ impl ExecutionPlan for CountOverlapsExec {
             right: Arc::clone(&children[0]),
             columns_2: Arc::clone(&self.columns_2),
             filter_op: self.filter_op.clone(),
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(
                     children[0].output_partitioning().partition_count(),
                 ),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 

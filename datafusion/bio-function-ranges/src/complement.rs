@@ -109,8 +109,11 @@ impl TableProvider for ComplementProvider {
         } else {
             None
         };
-
-        let output_partitions = input_plan.output_partitioning().partition_count();
+        let output_partitions = if view_plan.is_some() {
+            1
+        } else {
+            input_plan.output_partitioning().partition_count()
+        };
 
         Ok(Arc::new(ComplementExec {
             schema: self.schema.clone(),
@@ -119,12 +122,12 @@ impl TableProvider for ComplementProvider {
             columns: Arc::new(self.columns.clone()),
             view_columns: Arc::new(self.view_columns.clone()),
             strict: self.filter_op == FilterOp::Strict,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -137,7 +140,7 @@ struct ComplementExec {
     columns: Arc<(String, String, String)>,
     view_columns: Arc<(String, String, String)>,
     strict: bool,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl DisplayAs for ComplementExec {
@@ -155,22 +158,19 @@ impl ExecutionPlan for ComplementExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        let mut distributions = vec![Distribution::HashPartitioned(vec![Arc::new(Column::new(
-            self.columns.0.as_str(),
-            0,
-        ))])];
         if self.view.is_some() {
-            distributions.push(Distribution::HashPartitioned(vec![Arc::new(Column::new(
-                self.view_columns.0.as_str(),
+            vec![Distribution::SinglePartition, Distribution::SinglePartition]
+        } else {
+            vec![Distribution::HashPartitioned(vec![Arc::new(Column::new(
+                self.columns.0.as_str(),
                 0,
-            ))]));
+            ))])]
         }
-        distributions
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -197,6 +197,11 @@ impl ExecutionPlan for ComplementExec {
         } else {
             None
         };
+        let output_partitions = if new_view.is_some() {
+            1
+        } else {
+            children[0].output_partitioning().partition_count()
+        };
 
         Ok(Arc::new(Self {
             schema: self.schema.clone(),
@@ -205,14 +210,12 @@ impl ExecutionPlan for ComplementExec {
             columns: Arc::clone(&self.columns),
             view_columns: Arc::clone(&self.view_columns),
             strict: self.strict,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
-                Partitioning::UnknownPartitioning(
-                    children[0].output_partitioning().partition_count(),
-                ),
+                Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 

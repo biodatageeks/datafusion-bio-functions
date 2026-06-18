@@ -11,10 +11,14 @@ pub mod key_encoding;
 pub mod kv_store;
 pub mod loader;
 pub mod position_entry;
+pub mod position_index;
+pub mod sift_parquet_store;
 pub mod sift_store;
+pub mod variant_bloom_index;
 
 pub use cache_provider::KvCacheTableProvider;
 pub use context_store::{ExonKvStore, TranslationKvStore};
 pub use kv_store::VepKvStore;
 pub use loader::{CacheLoader, LoadStats};
-pub use sift_store::SiftKvStore;
+pub use sift_parquet_store::SiftParquetStore;
+pub use sift_store::{SiftKvStore, SiftPredictionStore};

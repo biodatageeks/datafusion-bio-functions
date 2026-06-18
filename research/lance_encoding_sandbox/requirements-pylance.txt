@@ -1,0 +1,8 @@
+pylance
+pyarrow
+pandas
+rich
+jupyter
+ipykernel
+nbformat
+tabulate

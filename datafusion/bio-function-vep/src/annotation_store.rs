@@ -10,16 +10,18 @@ use datafusion::common::{DataFusionError, Result};
 pub enum AnnotationBackend {
     Parquet,
     Fjall,
+    Lance,
 }
 
 impl AnnotationBackend {
     /// Parse backend from UDTF argument.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
-            "parquet" => Ok(Self::Parquet),
-            "fjall" => Ok(Self::Fjall),
+            "parquet" | "indexed_parquet" => Ok(Self::Parquet),
+            "fjall" | "legacy_fjall" => Ok(Self::Fjall),
+            "lance" => Ok(Self::Lance),
             other => Err(DataFusionError::Plan(format!(
-                "annotate_vep() backend must be one of: parquet, fjall; got: {other}"
+                "annotate_vep() backend must be one of: indexed_parquet, legacy_fjall, lance; got: {other}"
             ))),
         }
     }
@@ -29,6 +31,7 @@ impl AnnotationBackend {
         match self {
             Self::Parquet => "parquet",
             Self::Fjall => "fjall",
+            Self::Lance => "lance",
         }
     }
 }
@@ -87,17 +90,40 @@ impl AnnotationStore for FjallAnnotationStore {
     }
 }
 
+/// Lance-backed annotation store descriptor.
+#[derive(Debug, Clone)]
+pub struct LanceAnnotationStore {
+    source: String,
+}
+
+impl LanceAnnotationStore {
+    pub fn new(source: String) -> Self {
+        Self { source }
+    }
+}
+
+impl AnnotationStore for LanceAnnotationStore {
+    fn backend(&self) -> AnnotationBackend {
+        AnnotationBackend::Lance
+    }
+
+    fn source(&self) -> &str {
+        &self.source
+    }
+}
+
 /// Build a store descriptor for the selected backend.
 pub fn build_store(backend: AnnotationBackend, source: String) -> Box<dyn AnnotationStore> {
     match backend {
         AnnotationBackend::Parquet => Box::new(ParquetAnnotationStore::new(source)),
         AnnotationBackend::Fjall => Box::new(FjallAnnotationStore::new(source)),
+        AnnotationBackend::Lance => Box::new(LanceAnnotationStore::new(source)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::AnnotationBackend;
+    use super::{AnnotationBackend, build_store};
 
     #[test]
     fn backend_parse_ok() {
@@ -109,11 +135,30 @@ mod tests {
             AnnotationBackend::parse("fjall").unwrap(),
             AnnotationBackend::Fjall
         );
+        assert_eq!(
+            AnnotationBackend::parse("indexed_parquet").unwrap(),
+            AnnotationBackend::Parquet
+        );
+        assert_eq!(
+            AnnotationBackend::parse("legacy_fjall").unwrap(),
+            AnnotationBackend::Fjall
+        );
+        assert_eq!(
+            AnnotationBackend::parse("lance").unwrap(),
+            AnnotationBackend::Lance
+        );
     }
 
     #[test]
     fn backend_parse_rejects_unknown() {
         let err = AnnotationBackend::parse("unknown").unwrap_err().to_string();
         assert!(err.contains("annotate_vep() backend must be one of"));
+    }
+
+    #[test]
+    fn build_store_preserves_lance_backend() {
+        let store = build_store(AnnotationBackend::Lance, "/cache".to_string());
+        assert_eq!(store.backend(), AnnotationBackend::Lance);
+        assert_eq!(store.source(), "/cache");
     }
 }

@@ -8,8 +8,9 @@
 //!   [sift_count × 10B CompactPrediction]
 //!   [polyphen_count × 10B CompactPrediction]
 
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use datafusion::common::{DataFusionError, Result};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
@@ -25,7 +26,40 @@ fn fjall_err(e: fjall::Error) -> DataFusionError {
 /// Store for SIFT/PolyPhen predictions keyed by transcript_id.
 #[derive(Clone)]
 pub struct SiftKvStore {
+    inner: Arc<SiftKvStoreInner>,
+}
+
+pub trait SiftPredictionStore: Send + Sync {
+    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>>;
+
+    /// True when this store resolves predictions by the position-sliced packed
+    /// key `(transcript_uid << 32) | protein_position` rather than by
+    /// transcript id. The annotation engine routes to [`Self::get_position_predictions`]
+    /// instead of [`Self::get_many`] for these stores.
+    fn is_position_sliced(&self) -> bool {
+        false
+    }
+
+    /// Resolve position-sliced predictions for the given packed keys. Each
+    /// returned [`CachedPredictions`] holds only the entries for that key's
+    /// single protein position. Keys with no predictions are simply absent from
+    /// the map. Transcript-id-keyed stores do not implement this.
+    fn get_position_predictions(&self, _keys: &[u64]) -> Result<HashMap<u64, CachedPredictions>> {
+        Err(DataFusionError::Execution(
+            "get_position_predictions called on a transcript-id-keyed SIFT store".into(),
+        ))
+    }
+}
+
+struct SiftKvStoreInner {
     sift_ks: Keyspace,
+}
+
+static SHARED_SIFT_STORES: LazyLock<Mutex<HashMap<PathBuf, Weak<SiftKvStoreInner>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn canonical_store_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 impl SiftKvStore {
@@ -38,12 +72,25 @@ impl SiftKvStore {
         if !path.exists() {
             return Ok(None);
         }
-        let db = Database::builder(path)
+        let path = canonical_store_path(path);
+        let mut stores = SHARED_SIFT_STORES.lock().map_err(|e| {
+            DataFusionError::Execution(format!("shared fjall sift registry lock poisoned: {e}"))
+        })?;
+        stores.retain(|_, weak| weak.strong_count() > 0);
+        if let Some(inner) = stores.get(&path).and_then(Weak::upgrade) {
+            return Ok(Some(Self { inner }));
+        }
+
+        let db = Database::builder(&path)
             .cache_size(64 * 1024 * 1024)
             .worker_threads(1)
             .open()
             .map_err(fjall_err)?;
-        Self::open(&db)
+        let store = Self::open(&db)?;
+        if let Some(store) = &store {
+            stores.insert(path, Arc::downgrade(&store.inner));
+        }
+        Ok(store)
     }
 
     /// Open sift keyspace from an existing fjall database.
@@ -58,7 +105,9 @@ impl SiftKvStore {
         if ks.is_empty().unwrap_or(true) {
             Ok(None)
         } else {
-            Ok(Some(Self { sift_ks: ks }))
+            Ok(Some(Self {
+                inner: Arc::new(SiftKvStoreInner { sift_ks: ks }),
+            }))
         }
     }
 
@@ -74,18 +123,21 @@ impl SiftKvStore {
                     .data_block_compression_policy(fjall::config::CompressionPolicy::disabled())
             })
             .map_err(fjall_err)?;
-        Ok(Self { sift_ks })
+        Ok(Self {
+            inner: Arc::new(SiftKvStoreInner { sift_ks }),
+        })
     }
 
     /// Access the underlying keyspace (e.g. for compaction).
     pub fn keyspace(&self) -> &Keyspace {
-        &self.sift_ks
+        &self.inner.sift_ks
     }
 
     /// Store predictions for a transcript.
     pub fn put(&self, transcript_id: &str, preds: &CachedPredictions) -> Result<()> {
         let value = serialize_predictions(preds);
-        self.sift_ks
+        self.inner
+            .sift_ks
             .insert(transcript_id.as_bytes(), value)
             .map_err(fjall_err)?;
         Ok(())
@@ -100,7 +152,7 @@ impl SiftKvStore {
         sorted_iter: impl Iterator<Item = (String, CachedPredictions)>,
     ) -> Result<Self> {
         let store = Self::create(db)?;
-        let mut ingestion = store.sift_ks.start_ingestion().map_err(fjall_err)?;
+        let mut ingestion = store.inner.sift_ks.start_ingestion().map_err(fjall_err)?;
         for (transcript_id, preds) in sorted_iter {
             let value = serialize_predictions(&preds);
             ingestion
@@ -114,6 +166,7 @@ impl SiftKvStore {
     /// Retrieve predictions for a transcript. Returns None on miss.
     pub fn get(&self, transcript_id: &str) -> Result<Option<CachedPredictions>> {
         let Some(raw) = self
+            .inner
             .sift_ks
             .get(transcript_id.as_bytes())
             .map_err(fjall_err)?
@@ -121,6 +174,21 @@ impl SiftKvStore {
             return Ok(None);
         };
         deserialize_predictions(&raw).map(Some)
+    }
+}
+
+impl SiftPredictionStore for SiftKvStore {
+    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+        let mut out = HashMap::with_capacity(transcript_ids.len());
+        for transcript_id in transcript_ids {
+            if out.contains_key(transcript_id) {
+                continue;
+            }
+            if let Some(predictions) = self.get(transcript_id)? {
+                out.insert(transcript_id.clone(), predictions);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -147,7 +215,7 @@ pub(crate) fn serialize_predictions(preds: &CachedPredictions) -> Vec<u8> {
     buf
 }
 
-fn deserialize_predictions(data: &[u8]) -> Result<CachedPredictions> {
+pub(crate) fn deserialize_predictions(data: &[u8]) -> Result<CachedPredictions> {
     if data.len() < 8 {
         return Err(DataFusionError::Execution(
             "sift entry too short".to_string(),
@@ -191,6 +259,61 @@ fn deserialize_predictions(data: &[u8]) -> Result<CachedPredictions> {
     Ok(CachedPredictions { sift, polyphen })
 }
 
+/// Serialize one protein position's predictions for a single predictor, *without*
+/// the position field — in the position-sliced Lance layout the position is
+/// implicit from the row key, so each entry is 6 bytes:
+///   [amino_acid u8][prediction u8][score f32 LE]
+/// Entry count is recovered from the byte length (`len / 6`). The caller groups
+/// entries by position; entries are expected pre-sorted by `amino_acid`.
+pub(crate) fn serialize_position_entries(entries: &[CompactPrediction]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(entries.len() * 6);
+    for p in entries {
+        buf.push(p.amino_acid);
+        buf.push(p.prediction);
+        buf.extend_from_slice(&p.score.to_le_bytes());
+    }
+    buf
+}
+
+/// Inverse of [`serialize_position_entries`]: reconstruct entries for one
+/// position from a 6-bytes-per-entry payload.
+pub(crate) fn deserialize_position_entries(
+    position: i32,
+    data: &[u8],
+) -> Result<Vec<CompactPrediction>> {
+    if !data.len().is_multiple_of(6) {
+        return Err(DataFusionError::Execution(format!(
+            "position prediction payload length {} is not a multiple of 6",
+            data.len()
+        )));
+    }
+    let count = data.len() / 6;
+    let mut out = Vec::with_capacity(count);
+    let mut offset = 0;
+    for _ in 0..count {
+        out.push(CompactPrediction {
+            position,
+            amino_acid: data[offset],
+            prediction: data[offset + 1],
+            score: f32::from_le_bytes(data[offset + 2..offset + 6].try_into().unwrap()),
+        });
+        offset += 6;
+    }
+    Ok(out)
+}
+
+/// Build a single-position [`CachedPredictions`] from its `sift`/`poly` payloads.
+pub(crate) fn deserialize_position_predictions(
+    position: i32,
+    sift: &[u8],
+    poly: &[u8],
+) -> Result<CachedPredictions> {
+    Ok(CachedPredictions {
+        sift: deserialize_position_entries(position, sift)?,
+        polyphen: deserialize_position_entries(position, poly)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +341,54 @@ mod tests {
                 score: 0.88,
             }],
         }
+    }
+
+    #[test]
+    fn position_entries_roundtrip_without_position_field() {
+        let sift = vec![
+            CompactPrediction {
+                position: 42,
+                amino_acid: 0,
+                prediction: 0,
+                score: 0.30,
+            },
+            CompactPrediction {
+                position: 42,
+                amino_acid: 2,
+                prediction: 1,
+                score: 0.01,
+            },
+        ];
+        let poly = vec![CompactPrediction {
+            position: 42,
+            amino_acid: 0,
+            prediction: 4,
+            score: 0.05,
+        }];
+
+        let sift_bytes = serialize_position_entries(&sift);
+        let poly_bytes = serialize_position_entries(&poly);
+        // 6 bytes per entry, position not stored.
+        assert_eq!(sift_bytes.len(), sift.len() * 6);
+        assert_eq!(poly_bytes.len(), poly.len() * 6);
+
+        let decoded = deserialize_position_predictions(42, &sift_bytes, &poly_bytes).unwrap();
+        assert_eq!(decoded.sift.len(), 2);
+        assert_eq!(decoded.polyphen.len(), 1);
+        for p in decoded.sift.iter().chain(decoded.polyphen.iter()) {
+            assert_eq!(p.position, 42);
+        }
+        assert_eq!(decoded.sift[1].amino_acid, 2);
+        assert_eq!(decoded.sift[1].prediction, 1);
+        assert!((decoded.sift[1].score - 0.01).abs() < f32::EPSILON);
+        assert_eq!(decoded.polyphen[0].prediction, 4);
+
+        // Empty payload (a position with no predictions of that kind) is valid.
+        let empty = deserialize_position_predictions(7, &[], &[]).unwrap();
+        assert!(empty.sift.is_empty() && empty.polyphen.is_empty());
+
+        // Malformed length is rejected.
+        assert!(deserialize_position_entries(1, &[0u8; 5]).is_err());
     }
 
     #[test]
@@ -319,6 +490,26 @@ mod tests {
     }
 
     #[test]
+    fn test_open_path_reuses_live_store() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let db = fjall::Database::builder(dir.path())
+                .cache_size(64 * 1024 * 1024)
+                .open()
+                .unwrap();
+            let store = SiftKvStore::create(&db).unwrap();
+            store.put("ENST00000111111", &make_predictions()).unwrap();
+            db.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+
+        let first = SiftKvStore::open_path(dir.path()).unwrap().unwrap();
+        let second = SiftKvStore::open_path(dir.path()).unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
+    }
+
+    #[test]
     fn test_clone_shares_data() {
         let dir = tempfile::tempdir().unwrap();
         let db = fjall::Database::builder(dir.path())
@@ -349,6 +540,32 @@ mod tests {
         };
         cloned.put("ENST00000333333", &extra).unwrap();
         assert!(store.get("ENST00000333333").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_sift_prediction_store_get_many_returns_found_and_skips_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+
+        let store = SiftKvStore::create(&db).unwrap();
+        store.put("ENST00000111111", &make_predictions()).unwrap();
+        store.put("ENST00000222222", &make_predictions()).unwrap();
+
+        let ids = vec![
+            "ENST00000111111".to_string(),
+            "missing".to_string(),
+            "ENST00000111111".to_string(),
+            "ENST00000222222".to_string(),
+        ];
+        let found = SiftPredictionStore::get_many(&store, &ids).unwrap();
+
+        assert_eq!(found.len(), 2);
+        assert!(found.contains_key("ENST00000111111"));
+        assert!(found.contains_key("ENST00000222222"));
+        assert!(!found.contains_key("missing"));
     }
 
     /// Verify that `SiftKvStore::create()` only creates the "sift" keyspace

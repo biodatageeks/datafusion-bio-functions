@@ -3,8 +3,7 @@ use std::time::Instant;
 
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::prelude::*;
-use datafusion_bio_format_bam::table_provider::BamTableProvider;
-use datafusion_bio_function_pileup::cigar;
+use datafusion_bio_function_pileup::{cigar, open_bam_provider_for_pileup};
 use futures::StreamExt;
 
 /// Measures time spent in CIGAR string parsing vs total pipeline.
@@ -17,7 +16,7 @@ async fn main() {
     }
     let bam_path = &args[1];
 
-    let table = BamTableProvider::new(bam_path.clone(), None, true, None, false)
+    let table = open_bam_provider_for_pileup(bam_path.clone(), true, false)
         .await
         .expect("Failed to open BAM file");
 

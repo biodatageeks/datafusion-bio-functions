@@ -12,13 +12,20 @@
 //!     [--everything] \
 //!     [--extended-probes] \
 //!     [--reference-fasta <path>] \
+//!     [--forks <n>]              # chromosome lanes \
+//!     [--buffer-size <n>] \
 //!     [--compression none|gzip|bgzf] \
-//!     [--limit <n>]
+//!     [--limit <n>] \
+//!     [--no-progress]
 
 use std::time::Instant;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use datafusion::common::Result;
 use datafusion_bio_format_vcf::VcfCompressionType;
+use datafusion_bio_function_vep::golden_benchmark::sample_gz_vcf_first_n;
 use datafusion_bio_function_vep::vcf_sink;
 
 struct Args {
@@ -29,8 +36,12 @@ struct Args {
     everything: bool,
     extended_probes: bool,
     reference_fasta: Option<String>,
+    forks: Option<usize>,
+    threads: usize,
+    buffer_size: usize,
     compression: VcfCompressionType,
     limit: Option<usize>,
+    show_progress: bool,
 }
 
 fn parse_args() -> Args {
@@ -42,8 +53,12 @@ fn parse_args() -> Args {
     let mut everything = false;
     let mut extended_probes = false;
     let mut reference_fasta = None;
+    let mut forks = None;
+    let mut threads = 1usize;
+    let mut buffer_size = vcf_sink::VEP_DEFAULT_BUFFER_SIZE;
     let mut compression = VcfCompressionType::Plain;
     let mut limit = None;
+    let mut show_progress = true;
 
     let mut i = 1;
     while i < args.len() {
@@ -70,6 +85,18 @@ fn parse_args() -> Args {
                 i += 1;
                 reference_fasta = Some(args[i].clone());
             }
+            "--forks" => {
+                i += 1;
+                forks = args[i].parse().ok();
+            }
+            "--threads" => {
+                i += 1;
+                threads = args[i].parse().unwrap_or(1);
+            }
+            "--buffer-size" => {
+                i += 1;
+                buffer_size = args[i].parse().unwrap_or(vcf_sink::VEP_DEFAULT_BUFFER_SIZE);
+            }
             "--compression" => {
                 i += 1;
                 compression = match args[i].as_str() {
@@ -82,6 +109,8 @@ fn parse_args() -> Args {
                 i += 1;
                 limit = args[i].parse().ok();
             }
+            "--no-progress" => show_progress = false,
+            "--progress" => show_progress = true,
             other => {
                 eprintln!("Unknown argument: {other}");
                 std::process::exit(1);
@@ -114,8 +143,12 @@ fn parse_args() -> Args {
         everything,
         extended_probes,
         reference_fasta,
+        forks,
+        threads,
+        buffer_size,
         compression,
         limit,
+        show_progress,
     }
 }
 
@@ -135,6 +168,13 @@ async fn main() -> Result<()> {
         args.reference_fasta.as_deref().unwrap_or("(none)")
     );
     eprintln!(
+        "  forks:      {} (chromosome lanes)",
+        args.forks
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "0".to_string())
+    );
+    eprintln!("  buffer_size: {}", args.buffer_size);
+    eprintln!(
         "  compress:   {}",
         match args.compression {
             VcfCompressionType::Gzip => "gzip",
@@ -145,24 +185,48 @@ async fn main() -> Result<()> {
     if let Some(n) = args.limit {
         eprintln!("  limit:      {n}");
     }
+    eprintln!("  progress:   {}", args.show_progress);
 
-    // ── Annotate + stream to VCF (with built-in progress bar) ──
+    let mut input_for_run = args.input.clone();
+    let _sample_dir = if let Some(limit) = args.limit {
+        let sample_dir = tempfile::tempdir().map_err(|e| {
+            datafusion::common::DataFusionError::Execution(format!(
+                "failed to create sample tempdir: {e}"
+            ))
+        })?;
+        let sampled_vcf = sample_dir.path().join("sampled.vcf");
+        let sampled =
+            sample_gz_vcf_first_n(std::path::Path::new(&args.input), &sampled_vcf, limit)?;
+        eprintln!(
+            "  sampled:    {sampled} variants -> {}",
+            sampled_vcf.display()
+        );
+        input_for_run = sampled_vcf.display().to_string();
+        Some(sample_dir)
+    } else {
+        None
+    };
+
+    // ── Annotate + stream to VCF ──
     let t0 = Instant::now();
     let annotate_config = vcf_sink::AnnotateVcfConfig {
         everything: args.everything,
         extended_probes: args.extended_probes,
         reference_fasta_path: args.reference_fasta.clone(),
         use_fjall: args.backend == "fjall",
+        forks: Some(args.forks.unwrap_or(0)),
+        threads: args.threads,
+        buffer_size: args.buffer_size,
         compression: args.compression,
-        show_progress: true,
+        show_progress: args.show_progress,
         ..Default::default()
     };
 
     let t_annotate = Instant::now();
     let rows = vcf_sink::annotate_to_vcf(
-        &args.input,
+        &input_for_run,
         &args.cache,
-        "parquet",
+        &args.backend,
         &args.output,
         &annotate_config,
     )

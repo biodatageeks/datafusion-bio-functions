@@ -7,6 +7,7 @@
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -75,6 +76,8 @@ pub struct LookupProvider {
     cache_table: String,
     /// Columns to select from the cache table.
     cache_columns: Vec<String>,
+    /// Full variation cache schema.
+    cache_schema: SchemaRef,
     /// Coordinate normalizer for handling different coordinate systems.
     coord_normalizer: CoordinateNormalizer,
     /// When true, use interval-overlap matching instead of exact coordinate match.
@@ -88,9 +91,32 @@ pub struct LookupProvider {
     schema: SchemaRef,
     /// Optional sink for co-located data collection during probe phase.
     colocated_sink: Option<ColocatedSink>,
+    /// Optional partition-local sinks for fjall co-located data collection.
+    partition_colocated_sinks: Option<Vec<ColocatedSink>>,
+    /// Root of an indexed parquet cache. When set, variation lookup uses
+    /// warm/cold parquet tiers plus sidecar indexes, not the legacy interval join.
+    #[cfg(feature = "kv-cache")]
+    indexed_parquet_cache_root: Option<PathBuf>,
+    /// Root of a Lance variation cache. When set, variation lookup uses
+    /// `variation.lance/chrN.lance` plus the sidecar position/bloom indexes.
+    #[cfg(feature = "lance-cache")]
+    lance_cache_root: Option<PathBuf>,
+    /// Maximum number of independent cold-Parquet readers used by lookup.
+    target_partitions: usize,
     /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
     /// for per-contig partitioned annotation).
     vcf_filter: Option<Expr>,
+}
+
+/// Runtime settings needed to execute a Fjall batch lookup outside the
+/// `LookupProvider` execution plan wrapper.
+#[cfg(feature = "kv-cache")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FjallLookupBatchSettings {
+    pub(crate) vcf_has_chr: bool,
+    pub(crate) vcf_zero_based: bool,
+    pub(crate) cache_zero_based: bool,
+    pub(crate) reference_fasta_path: Option<String>,
 }
 
 fn normalize_cache_output_type(data_type: &DataType) -> DataType {
@@ -148,12 +174,19 @@ impl LookupProvider {
             vcf_table,
             cache_table,
             cache_columns,
+            cache_schema: cache_schema_ref,
             coord_normalizer,
             extended_probes,
             allowed_failed,
             reference_fasta_path,
             schema,
             colocated_sink: None,
+            partition_colocated_sinks: None,
+            #[cfg(feature = "kv-cache")]
+            indexed_parquet_cache_root: None,
+            #[cfg(feature = "lance-cache")]
+            lance_cache_root: None,
+            target_partitions: 1,
             vcf_filter: None,
         })
     }
@@ -163,6 +196,25 @@ impl LookupProvider {
         self.colocated_sink = Some(sink);
     }
 
+    /// Set partition-local co-located data sinks for fjall lookup execution.
+    pub fn set_partition_colocated_sinks(&mut self, sinks: Vec<ColocatedSink>) {
+        self.partition_colocated_sinks = Some(sinks);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    pub fn set_indexed_parquet_cache_root(&mut self, root: impl Into<PathBuf>) {
+        self.indexed_parquet_cache_root = Some(root.into());
+    }
+
+    #[cfg(feature = "lance-cache")]
+    pub fn set_lance_cache_root(&mut self, root: impl Into<PathBuf>) {
+        self.lance_cache_root = Some(root.into());
+    }
+
+    pub fn set_target_partitions(&mut self, target_partitions: usize) {
+        self.target_partitions = target_partitions.max(1);
+    }
+
     /// Set an optional filter to apply to VCF input before lookup.
     ///
     /// Used by the partitioned annotation path to scope VCF reading to a
@@ -170,6 +222,18 @@ impl LookupProvider {
     /// tabix-indexed seeks in the VCF table provider.
     pub fn set_vcf_filter(&mut self, filter: Option<Expr>) {
         self.vcf_filter = filter;
+    }
+
+    /// Resolve the exact Fjall lookup settings used by the normal
+    /// `LookupProvider` scan path so direct per-buffer lookup can share them.
+    #[cfg(feature = "kv-cache")]
+    pub(crate) async fn fjall_batch_settings(&self) -> Result<FjallLookupBatchSettings> {
+        Ok(FjallLookupBatchSettings {
+            vcf_has_chr: has_chr_prefix(&self.session, &self.vcf_table).await?,
+            vcf_zero_based: self.coord_normalizer.input_zero_based,
+            cache_zero_based: self.coord_normalizer.cache_zero_based,
+            reference_fasta_path: self.reference_fasta_path.clone(),
+        })
     }
 }
 
@@ -231,6 +295,77 @@ impl TableProvider for LookupProvider {
             use crate::kv_cache::KvCacheTableProvider;
             use crate::kv_cache::cache_exec::{KvLookupExec, KvMatchMode};
 
+            if let Some(cache_root) = &self.indexed_parquet_cache_root {
+                let settings = self.fjall_batch_settings().await?;
+                let vcf_df = self.session.table(&self.vcf_table).await?;
+                let vcf_df = if let Some(ref filter) = self.vcf_filter {
+                    vcf_df.filter(filter.clone())?
+                } else {
+                    vcf_df
+                };
+                let vcf_plan = vcf_df.create_physical_plan().await?;
+
+                let mut exec = KvLookupExec::new_indexed_parquet(
+                    vcf_plan,
+                    cache_root.clone(),
+                    self.cache_schema.clone(),
+                    self.cache_columns.clone(),
+                    KvMatchMode::Exact,
+                    allele_matches as fn(&str, &str, &str) -> bool,
+                    settings.vcf_has_chr,
+                    settings.vcf_zero_based,
+                    settings.cache_zero_based,
+                    self.extended_probes,
+                    self.allowed_failed,
+                )?;
+                exec = exec.with_reference_fasta_path(settings.reference_fasta_path);
+                exec = exec.with_target_partitions(self.target_partitions);
+                if let Some(ref sink) = self.colocated_sink {
+                    exec = exec.with_colocated_sink(Arc::clone(sink));
+                }
+                if let Some(ref sinks) = self.partition_colocated_sinks {
+                    exec = exec.with_colocated_partition_sinks(sinks.clone());
+                }
+                let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
+                return wrap_with_projection(plan, projection);
+            }
+
+            #[cfg(feature = "lance-cache")]
+            if let Some(cache_root) = &self.lance_cache_root {
+                let settings = self.fjall_batch_settings().await?;
+                let vcf_df = self.session.table(&self.vcf_table).await?;
+                let vcf_df = if let Some(ref filter) = self.vcf_filter {
+                    vcf_df.filter(filter.clone())?
+                } else {
+                    vcf_df
+                };
+                let vcf_plan = vcf_df.create_physical_plan().await?;
+
+                let mut exec = KvLookupExec::new_lance(
+                    vcf_plan,
+                    cache_root.clone(),
+                    self.cache_schema.clone(),
+                    self.cache_columns.clone(),
+                    KvMatchMode::Exact,
+                    allele_matches as fn(&str, &str, &str) -> bool,
+                    settings.vcf_has_chr,
+                    settings.vcf_zero_based,
+                    settings.cache_zero_based,
+                    self.extended_probes,
+                    self.allowed_failed,
+                )?;
+                exec = exec.with_reference_fasta_path(settings.reference_fasta_path);
+                exec = exec.with_target_partitions(self.target_partitions);
+                if let Some(ref sink) = self.colocated_sink {
+                    exec = exec.with_colocated_sink(Arc::clone(sink));
+                }
+                if let Some(ref sinks) = self.partition_colocated_sinks {
+                    exec = exec.with_colocated_partition_sinks(sinks.clone());
+                }
+                let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
+                return wrap_with_projection(plan, projection);
+            }
+
             let table_ref = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(self.session.table_provider(&self.cache_table))
@@ -240,7 +375,7 @@ impl TableProvider for LookupProvider {
                 {
                     let store = kv_provider.store().clone();
 
-                    let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
+                    let fjall_settings = self.fjall_batch_settings().await?;
 
                     let vcf_df = self.session.table(&self.vcf_table).await?;
                     let vcf_df = if let Some(ref filter) = self.vcf_filter {
@@ -256,15 +391,19 @@ impl TableProvider for LookupProvider {
                         self.cache_columns.clone(),
                         KvMatchMode::Exact,
                         allele_matches as fn(&str, &str, &str) -> bool,
-                        vcf_has_chr,
-                        self.coord_normalizer.input_zero_based,
-                        self.coord_normalizer.cache_zero_based,
+                        fjall_settings.vcf_has_chr,
+                        fjall_settings.vcf_zero_based,
+                        fjall_settings.cache_zero_based,
                         self.extended_probes,
                         self.allowed_failed,
                     )?;
-                    exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
+                    exec =
+                        exec.with_reference_fasta_path(fjall_settings.reference_fasta_path.clone());
                     if let Some(ref sink) = self.colocated_sink {
                         exec = exec.with_colocated_sink(Arc::clone(sink));
+                    }
+                    if let Some(ref sinks) = self.partition_colocated_sinks {
+                        exec = exec.with_colocated_partition_sinks(sinks.clone());
                     }
                     let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
                     return wrap_with_projection(plan, projection);
@@ -327,6 +466,8 @@ impl TableProvider for LookupProvider {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "kv-cache")]
+    use super::LookupProvider;
     use crate::create_vep_session;
     #[cfg(feature = "kv-cache")]
     use crate::kv_cache::{
@@ -442,6 +583,70 @@ mod tests {
         )
         .unwrap();
         MemTable::try_new(schema, vec![vec![batch]]).unwrap()
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fjall_batch_settings_match_lookup_provider_metadata() {
+        let ctx = create_vep_session();
+        let vcf_schema = schema_with_coord_metadata(
+            vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+            ],
+            true,
+        );
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"])),
+                Arc::new(Int64Array::from(vec![99])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema.clone(), vec![vec![vcf_batch]]).unwrap();
+        ctx.register_table("vcf_fjall_settings", Arc::new(vcf))
+            .unwrap();
+
+        let cache_schema = schema_with_coord_metadata(
+            vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("variation_name", DataType::Utf8, true),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("failed", DataType::Int64, false),
+            ],
+            false,
+        );
+        let provider = LookupProvider::new(
+            Arc::new(ctx),
+            "vcf_fjall_settings".to_string(),
+            "cache_fjall_settings".to_string(),
+            vcf_schema.as_ref().clone(),
+            cache_schema.as_ref().clone(),
+            vec!["variation_name".to_string()],
+            true,
+            0,
+            Some("/tmp/reference.fa".to_string()),
+        )
+        .unwrap();
+
+        let settings = provider.fjall_batch_settings().await.unwrap();
+
+        assert!(settings.vcf_has_chr);
+        assert!(settings.vcf_zero_based);
+        assert!(!settings.cache_zero_based);
+        assert_eq!(
+            settings.reference_fasta_path.as_deref(),
+            Some("/tmp/reference.fa")
+        );
     }
 
     #[cfg(feature = "kv-cache")]

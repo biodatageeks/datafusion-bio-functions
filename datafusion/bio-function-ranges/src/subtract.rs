@@ -162,12 +162,12 @@ impl TableProvider for SubtractProvider {
             left_contig_col_idx: contig_col_idx,
             strict: self.filter_op == FilterOp::Strict,
             has_extra_cols: self.has_extra_cols,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -182,7 +182,7 @@ struct SubtractExec {
     left_contig_col_idx: usize,
     strict: bool,
     has_extra_cols: bool,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl DisplayAs for SubtractExec {
@@ -200,7 +200,7 @@ impl ExecutionPlan for SubtractExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -240,14 +240,14 @@ impl ExecutionPlan for SubtractExec {
             left_contig_col_idx: self.left_contig_col_idx,
             strict: self.strict,
             has_extra_cols: self.has_extra_cols,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(
                     children[0].output_partitioning().partition_count(),
                 ),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 
