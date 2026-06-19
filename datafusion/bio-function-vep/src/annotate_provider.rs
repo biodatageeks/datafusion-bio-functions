@@ -180,7 +180,6 @@ use crate::allele::{
 };
 use crate::annotation_store::AnnotationBackend;
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
-use crate::config;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 #[cfg(feature = "lance-cache")]

@@ -46,7 +46,6 @@ pub mod annotation_store;
 pub mod cache_builder;
 pub(crate) mod cache_common;
 pub(crate) mod cache_source;
-pub mod config;
 pub mod coordinate;
 pub mod golden_benchmark;
 pub mod hgvs;
@@ -64,8 +63,6 @@ pub mod transcript_consequence;
 pub mod variant_lookup_exec;
 pub mod vcf_sink;
 pub(crate) mod window_planner;
-
-pub use config::AnnotationConfig;
 
 use std::sync::Arc;
 
