@@ -31,6 +31,10 @@ use crate::allele::{
     vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::cache_common::AlleleMatcher;
+use crate::colocated::{
+    AF_COL_NAMES, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
+    compare_existing_variant_alleles, output_allele_from_allele_string, read_reference_sequence,
+};
 use crate::lance_cache::key_encoding::chrom_to_code;
 use crate::lance_cache::variant_key::{
     position_key_from_code as warm_position_key_from_code,
@@ -38,10 +42,6 @@ use crate::lance_cache::variant_key::{
 };
 use crate::lance_cache::variation_runtime::SinglePathLanceVariationLookup;
 use crate::partitioned_cache::PartitionedLanceCache;
-use crate::variant_lookup_exec::{
-    AF_COL_NAMES, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
-    compare_existing_variant_alleles, output_allele_from_allele_string, read_reference_sequence,
-};
 use tokio::sync::OnceCell;
 
 const DEFAULT_LANCE_LOOKUP_PROCESS_BATCH_ROWS: usize = 5_000;
@@ -330,7 +330,7 @@ impl ExecutionPlan for KvLookupExec {
 /// When a colocated sink is present, batches are buffered during the probe
 /// phase and only emitted after the input stream is exhausted. This ensures
 /// the colocated sink is fully populated before downstream consumers build
-/// the colocated map — matching the buffering behavior of `VariantLookupExec`.
+/// the colocated map.
 struct KvLookupStream {
     input: SendableRecordBatchStream,
     variation_storage: VariationLookupStorage,
@@ -473,7 +473,7 @@ fn cold_parquet_projection_columns(
         ] {
             push_unique_column(&mut columns, name);
         }
-        for name in crate::variant_lookup_exec::AF_COL_NAMES {
+        for name in crate::colocated::AF_COL_NAMES {
             push_unique_column(&mut columns, name);
         }
     }

@@ -1,10 +1,10 @@
 //! Provider for `annotate_vep()` table function.
 //!
 //! Runtime behavior:
-//! - always starts from `lookup_variants()` for known-variant metadata,
-//! - when transcript/exon tables are available, computes transcript-driven
+//! - starts from the Lance variation cache lookup for known-variant metadata,
+//! - when transcript/exon context is available, computes transcript-driven
 //!   consequence terms and most-severe ranking,
-//! - otherwise falls back to phase-1.5 known-variant CSQ placeholders.
+//! - otherwise falls back to known-variant CSQ placeholders.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -180,6 +180,7 @@ use crate::allele::{
 };
 use crate::annotation_store::AnnotationBackend;
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
+use crate::colocated::{ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue};
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::MissWorklist;
 #[cfg(feature = "lance-cache")]
@@ -193,9 +194,6 @@ use crate::transcript_consequence::{
     TranscriptConsequence, TranscriptConsequenceEngine, TranscriptEngineProfile, TranscriptFeature,
     TranslationFeature, VariantInput, infer_refseq_deletion_edits_from_sequences,
     refseq_edit_offset_delta,
-};
-use crate::variant_lookup_exec::{
-    ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
 };
 
 #[cfg(feature = "lance-cache")]
@@ -2077,8 +2075,8 @@ impl ColocatedData {
 
 /// Build co-located variant aggregation from the piggybacked collection sink.
 ///
-/// Converts `ColocatedCacheEntry` entries (collected during `VariantLookupExec`
-/// probe phase) into the same `ColocatedData` format used by the CSQ assembler,
+/// Converts `ColocatedCacheEntry` entries (collected during Lance variation
+/// lookup) into the same `ColocatedData` format used by the CSQ assembler,
 /// preserving the per-input-allele separation VEP keeps between different
 /// parser/decomposed alleles at the same locus.
 ///

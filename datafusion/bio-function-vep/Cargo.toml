@@ -55,10 +55,6 @@ name = "vcf_batch_stats"
 required-features = []
 
 [[example]]
-name = "lookup_parquet_bench"
-required-features = []
-
-[[example]]
 name = "build_lance_variation_chrom"
 required-features = ["lance-cache", "cache-builder"]
 

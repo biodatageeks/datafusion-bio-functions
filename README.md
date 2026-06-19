@@ -15,7 +15,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 |-------|-------------|--------|
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
 | **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations | ✅ |
-| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via `lookup_variants()` table function with parquet + Fjall KV cache backends | ✅ |
+| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via the `annotate_vep()` table function over a Lance cache backend | ✅ |
 
 ## Features
 
@@ -43,15 +43,13 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Multiple Algorithms**: Coitrees (default), IntervalTree, ArrayIntervalTree, Lapper, SuperIntervals — selectable via `SET bio.interval_join_algorithm`
 - **Transparent Optimization**: Hash/nested-loop joins with range conditions are automatically replaced with interval joins
 
-### VEP Annotation (lookup + consequence scaffolding)
+### VEP Annotation
 
-- **`lookup_variants()` Table Function**: SQL-based variant annotation against a pre-built VEP cache
-- **KV Cache Backend**: fjall LSM-tree store with zstd dictionary compression for compact on-disk storage
-- **Match Modes**: `exact`, `exact_or_colocated_ids`, `exact_or_vep_existing` (indel-aware relaxed matching)
-- **`annotate_vep()` Table Function**: backend-unified consequence annotation entrypoint (`parquet` or `fjall`) with phased CSQ rollout
-- **Session Configuration**: Tunable parameters via SQL `SET` statements under the `bio.annotation` namespace
+- **`annotate_vep()` Table Function**: SQL entrypoint that annotates a VCF against a pre-built **Lance** VEP cache — known-variant lookup plus transcript-aware consequence annotation (Ensembl-VEP-style CSQ fields).
+- **Lance cache backend**: the single cache/lookup path. Per-chromosome Lance datasets hold the variation cache, transcript/exon/regulatory context, and SIFT/PolyPhen predictions.
+- **Within-contig parallelism**: a single `threads` knob fuses and parallelizes lookup, annotation, and output.
 
-#### `annotate_vep` API (Phase 1)
+#### `annotate_vep` API
 
 ```sql
 annotate_vep(
@@ -63,100 +61,40 @@ annotate_vep(
 ```
 
 - `vcf_table`: registered input VCF table.
-- `cache_source`: backend-specific source path/identifier.
-- `backend`: `parquet` or `fjall`.
-- `options_json` (optional): backend/runtime options. Current keys:
-  - `transcripts_table`: registered table name with transcript intervals/coding context.
-  - `exons_table`: registered table name with exon intervals/order.
-  - `regulatory_table`: registered table name with regulatory intervals.
-  - `motif_table`: registered table name with motif/TFBS intervals.
-  - `mirna_table`: registered table name with mature miRNA intervals.
-  - `sv_table`: registered table name with structural-event overlaps.
+- `cache_source`: path to the partitioned Lance cache directory (containing `variation.lance/`).
+- `backend`: must be `lance` (the only supported backend).
+- `options_json` (optional): JSON object of annotation/runtime options, e.g. `everything`, `pick`, `pick_allele`, `per_gene`, `hgvs`, `refseq`, `merged`, `gencode_basic`, `threads`. The cache-source mode (`ensembl` / `merged` / `refseq`) is read from Arrow schema metadata on the Lance variation dataset.
 
-Current phase behavior:
-- pass-through VCF rows,
-- derive known-variant metadata via `lookup_variants`,
-- if transcript/exon context tables are available (auto-discovery or `options_json`), compute transcript-aware SO terms and ranked `most_severe_consequence`,
-- otherwise fall back to initial cache-hit CSQ placeholder (`sequence_variant`) for matched rows and keep unmatched rows as `NULL`.
+Annotation behavior:
+- known-variant metadata from the Lance variation cache (co-located IDs, clinical significance, allele frequencies),
+- transcript-aware SO terms and ranked `most_severe_consequence` from the partitioned Lance transcript/exon/regulatory context,
+- HGVSc/HGVSp, SIFT/PolyPhen, and the full `--everything` CSQ field set when requested,
+- unmatched rows pass through with `NULL` annotations.
 
-#### Ensembl-VEP Porting Plan
-
-Detailed analysis and implementation plan are in:
-- **[datafusion/bio-function-vep/PORTING_PLAN.md](datafusion/bio-function-vep/PORTING_PLAN.md)**
-
-Feature comparison snapshot:
+#### Ensembl-VEP feature snapshot
 
 | Capability | Ensembl-VEP (release 115) | bio-functions-vep (current) |
 |------------|----------------------------|-----------------------------|
-| Known-variant cache lookup | ✅ (`--check_existing`, colocated behavior) | ✅ (`lookup_variants` + match modes) |
-| Transcript consequence engine | ✅ (full SO consequence model) | 🚧 transcript/exon phase-2 baseline merged (not full VEP parity) |
-| Supported consequence terms | 41/41 | 🚧 41/41 term handlers wired; codon-accurate parity still in progress |
-| Most severe consequence output | ✅ | 🚧 ranked SO output when transcript/exon context is available; fallback placeholder otherwise |
-| Backend abstraction | Cache/files in VEP ecosystem | ✅ unified API for `parquet` + `fjall` entrypoint |
+| Known-variant cache lookup | ✅ (`--check_existing`, colocated behavior) | ✅ (Lance variation lookup) |
+| Transcript consequence engine | ✅ (full SO consequence model) | ✅ ranked SO output from the Lance transcript/exon context |
+| Supported consequence terms | 41/41 | 41/41 term handlers wired |
+| HGVSc/HGVSp, SIFT/PolyPhen, `--everything` | ✅ | ✅ |
 | Native SQL execution in DataFusion | ❌ | ✅ |
-| Fjall KV backend | ❌ | ✅ |
 
-#### Golden Benchmark (`annotate_vep` vs Ensembl VEP 115)
+#### End-to-end annotation & comparison vs Ensembl VEP 115
 
-Benchmark input copied into this repo:
-- `vep-benchmark/data/HG002_chr22.vcf.gz`
-- `vep-benchmark/data/HG002_chr22.vcf.gz.tbi`
-
-Run the golden benchmark (samples first 1000 variants, runs Ensembl VEP 115 in Docker, runs `annotate_vep`, and writes a comparison report):
+End-to-end annotation and parity comparison against Ensembl VEP are driven from
+the [`vepyr`](https://github.com/biodatageeks/vepyr) Python wrapper, which calls
+`annotate_vep` over the Lance cache and diffs the output VCF against the
+reference Ensembl VEP output:
 
 ```bash
-cargo run -p datafusion-bio-function-vep --example annotate_vep_golden_bench --release -- \
-  vep-benchmark/data/HG002_chr22.vcf.gz \
-  /Users/mwiewior/research/data/vep/115_GRCh38_variants.parquet \
-  parquet \
-  1000 \
-  /Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/cache \
-  vep-benchmark/data/HG002_chr22.vcf.gz \
-  /tmp/annotate_vep_golden_bench
+# in the vepyr repo
+RUSTFLAGS="-C target-cpu=native" uv sync --reinstall-package vepyr
+uv run python run_annotation_fast.py chr1 --cache merged --force --backend lance --threads 8
 ```
 
-Output report:
-- `/tmp/annotate_vep_golden_bench/HG002_chr22_1000_comparison_report.txt`
-
-#### Cache Backend Selection (`lookup_variants`)
-
-`lookup_variants(vcf_table, cache_table, ...)` supports both backends through the same API:
-
-- **Parquet or other scan-capable table providers**: uses interval-join execution.
-- **Fjall `KvCacheTableProvider`**: dispatches to direct KV lookup execution.
-
-Both cache backends must expose the same required cache column names:
-`chrom`, `start`, `end`, `variation_name`, `allele_string`.
-
-#### `lookup_variants` API
-
-```sql
-lookup_variants(
-  vcf_table,
-  cache_table
-  [, columns]
-  [, match_mode]
-  [, extended_probes]
-)
-```
-
-- `vcf_table`: registered VCF input table name.
-- `cache_table`: registered annotation cache table/provider name (Parquet or Fjall).
-- `columns` (optional): comma-separated cache columns to project. Default: all cache columns except `chrom,start,end` and `source_*`.
-- `match_mode` (optional, default `exact`):
-  - `exact`: interval overlap + exact allele matching only.
-  - `exact_or_colocated_ids`: runs `exact`; for unmatched rows, fills fallback-capable columns (`variation_name`, `somatic`) from co-located overlap IDs.
-  - `exact_or_vep_existing`: runs `exact`; for unmatched rows, fills fallback-capable columns from indel-aware relaxed allele-compatible co-located rows (prefers `rs*` IDs for `variation_name`).
-- `extended_probes` (optional, default `false`): enables wider coordinate probing for VEP-style insertion/deletion coordinate encodings.
-
-Example:
-
-```sql
-SELECT *
-FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig', 'exact');
-```
-
-**Parquet-backed cache table:**
+#### Usage from Rust
 
 ```rust
 use datafusion::prelude::SessionContext;
@@ -165,102 +103,22 @@ use datafusion_bio_function_vep::register_vep_functions;
 let ctx = SessionContext::new();
 register_vep_functions(&ctx);
 
-ctx.register_parquet("var_cache", "/path/to/variation_cache.parquet", Default::default()).await?;
+// `vcf` is a registered VCF table; `/path/to/cache` contains `variation.lance/`.
 let df = ctx
-    .sql("SELECT * FROM lookup_variants('vcf', 'var_cache', 'variation_name,clin_sig')")
+    .sql("SELECT * FROM annotate_vep('vcf', '/path/to/cache', 'lance', '{\"everything\":true}')")
     .await?;
 ```
 
-**Fjall-backed cache provider:**
+#### Building the Lance cache
 
-```rust
-use std::sync::Arc;
-use datafusion::prelude::SessionContext;
-use datafusion_bio_function_vep::register_vep_functions;
-use datafusion_bio_function_vep::kv_cache::KvCacheTableProvider;
-
-let ctx = SessionContext::new();
-register_vep_functions(&ctx);
-
-let kv_cache = KvCacheTableProvider::open("/path/to/variation_fjall")?;
-ctx.register_table("var_cache", Arc::new(kv_cache))?;
-let df = ctx
-    .sql("SELECT * FROM lookup_variants('vcf', 'var_cache', 'variation_name,clin_sig')")
-    .await?;
-```
-
-#### Create Fjall Cache
-
-Create a full Fjall cache from a Parquet variation cache:
+The partitioned Lance cache is built from a raw Ensembl VEP cache via
+`CacheBuilder` (requires the `cache-builder` feature). This is normally driven
+through vepyr's cache-build entrypoint; a per-chromosome build example is also
+provided:
 
 ```bash
-cargo run -p datafusion-bio-function-vep --example load_cache_full --features kv-cache --release -- \
-  /path/to/115_GRCh38_variants.parquet \
-  /path/to/variation_fjall \
-  8
-```
-
-- Third argument is thread count (`target_partitions` + loader parallelism).
-- Output path is recreated if it already exists.
-
-Create a filtered cache (single chromosome) and optionally tune compression:
-
-```bash
-cargo run -p datafusion-bio-function-vep --example load_cache --features kv-cache --release -- \
-  /path/to/115_GRCh38_variants.parquet \
-  /path/to/variation_fjall_chr22 \
-  22 \
-  8 \
-  9 \
-  256
-```
-
-- Args: `<parquet_path> <fjall_output_path> [chrom_filter] [partitions] [zstd_level] [dict_size_kb]`
-- Defaults for `load_cache`: `zstd_level=3`, `dict_size_kb=112`.
-
-#### Annotation Configuration
-
-Register `AnnotationConfig` on the session to enable SQL-level parameter overrides. If not registered, compiled defaults apply.
-
-```sql
--- fjall block cache size in MB (default: 1024)
--- Larger values reduce cold-start latency by caching more LSM block index
--- pages and data blocks in memory.
-SET bio.annotation.cache_size_mb = 2048;
-
--- Zstd compression level for cache writes (default: 3)
--- Higher levels produce smaller caches at the cost of slower writes.
--- Decompression speed is constant regardless of level.
--- Level 9 is a good balance for write-once caches.
-SET bio.annotation.zstd_level = 9;
-
--- Zstd dictionary size in KB for cache writes (default: 112)
--- Larger dictionaries can improve compression ratio.
--- 256 KB is recommended with level 9.
-SET bio.annotation.dict_size_kb = 256;
-```
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `bio.annotation.cache_size_mb` | `1024` | fjall block cache size in MB for reads |
-| `bio.annotation.zstd_level` | `3` | Zstd compression level for cache writes (1–19) |
-| `bio.annotation.dict_size_kb` | `112` | Zstd dictionary size in KB for cache writes |
-
-**Registration from downstream (e.g., polars-bio):**
-
-```rust
-use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_bio_function_vep::{AnnotationConfig, register_vep_functions};
-use datafusion_bio_function_vep::config::resolve;
-
-// Register the config extension on the session
-let config = SessionConfig::new()
-    .with_option_extension(AnnotationConfig::default());
-let ctx = SessionContext::new_with_config(config);
-register_vep_functions(&ctx);
-
-// Read resolved values (SQL overrides or defaults)
-let ann = resolve(&ctx);
+cargo run -p datafusion-bio-function-vep --example build_lance_variation_chrom \
+  --features "lance-cache,cache-builder" --release
 ```
 
 ## Installation
