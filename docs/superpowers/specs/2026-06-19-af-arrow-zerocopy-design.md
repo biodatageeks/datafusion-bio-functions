@@ -171,6 +171,37 @@ packed, with ~27 allocations/batch instead of ~54/variant.
 - **G4 No regressions:** `cargo test -p datafusion-bio-function-vep` green;
   clippy clean.
 
+## 7b. Measured results (2026-06-19, chr1 merged, post-implementation)
+
+Commits: `39dcc68` (AfColumns, pre-swap) → `f0dbb1b` (zero-copy swap wired in).
+
+- **G1 Parity (t8):** ✅ PASS. ALL 86 shared CSQ fields 100%, 0 mismatch over
+  4,737,090 rows (every AF column, MAX_AF, MAX_AF_POPS, CLIN_SIG, …). Byte-identical.
+- **G4 Tests/clippy:** ✅ 756 lib tests pass; clippy `-D warnings` clean.
+- **G3 Peak RSS (t8):** ~7.9 GB (in-proc getrusage) / 8.3 GB (`/usr/bin/time -l`),
+  vs prior ~8–12 GB. **Modest / net-neutral.** Root cause: this change trades many
+  small live `String`s for fewer, larger Arc-retained full-batch AF columns (R1).
+  Churn/CPU ↓ but live working set ~flat → peak barely moves. (The `colocated_MB`
+  probe over-counts shared Arcs — not a leak.)
+- **G2 Allocations (dhat, t2):** NOT completed. dhat heap instrumentation slows the
+  pipeline ~700× (≈78 var/s vs ≈50k), so a full chr1 t2 run is ~70 min and the
+  Total/t-gmax summary only prints on profiler drop (no partial read). Killed at ~28%.
+  **Predicted (not measured):** Total ↓ by the AF portion only — ~54 allocs/variant of
+  ~1,440/variant ≈ **~4%** of the 466M baseline; t-gmax ~flat (consistent with G3).
+- **Regression sweep (t1–t8 A/B, before `39dcc68` vs after `f0dbb1b`, probes dormant):**
+  ✅ No regression. Throughput after ≈ before within <1% at every thread count
+  (t1 12.6k, t2 28.5k, t4 44.8k, t8 63.8k var/s); scaling intact (~5.1× t1→t8).
+
+**Conclusion.** The refactor is correct, byte-identical, and throughput-neutral, and it
+removes a real (if small, ~4%) source of allocation churn. But AF zero-copy is a
+**churn/CPU lever applied to a peak-RSS-bound problem** — so it does not move the
+headline RSS number, and the R1 full-batch retention slightly offsets the churn win on
+peak. **Keep the commit** (no downside, clean foundation). Next lever for peak/throughput
+is the **engine CSQ output path** (per-variant `Vec<String>`/`join` → reused byte buffer /
+byte-chunk output), which is both the dominant churn source (~the rest of the 1,440/variant)
+and a live-set reducer. If peak RSS specifically is the target, the deferred
+`arrow::compute::take` matched-rows gather would *reverse* R1 and cut retention.
+
 ## 8. Rollout
 
 Internal change, public API unchanged → no vepyr edit, rebuild only. No on-disk
