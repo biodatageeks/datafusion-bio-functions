@@ -208,6 +208,12 @@ fn fnv1a_code(chrom: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process-global non-canonical contig
+    /// registry (which `register_non_canonical_contigs`/`load_non_canonical_registry`
+    /// clear-and-repopulate), so parallel test scheduling cannot interleave them.
+    static REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_position_key_roundtrip() {
@@ -296,6 +302,7 @@ mod tests {
 
     #[test]
     fn test_register_non_canonical_contigs_no_collisions() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let contigs = vec!["LRG_1278", "LRG_8", "GL000220.1", "KI270733.1"];
         let mapping = register_non_canonical_contigs(&contigs);
 
@@ -319,6 +326,7 @@ mod tests {
 
     #[test]
     fn test_register_solves_real_collision() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // LRG_1278 and LRG_8 collide under FNV-1a
         assert_eq!(fnv1a_code("LRG_1278"), fnv1a_code("LRG_8"));
 
@@ -335,6 +343,7 @@ mod tests {
 
     #[test]
     fn test_register_skips_canonical_contigs() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mapping = register_non_canonical_contigs(&["1", "GL000220.1", "X"]);
         // Only GL000220.1 should be in the mapping
         assert_eq!(mapping.len(), 1);
@@ -343,12 +352,14 @@ mod tests {
 
     #[test]
     fn test_register_deduplicates() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mapping = register_non_canonical_contigs(&["GL000220.1", "GL000220.1", "KI270733.1"]);
         assert_eq!(mapping.len(), 2);
     }
 
     #[test]
     fn test_load_registry_roundtrip() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let contigs = vec!["LRG_1278", "LRG_8", "GL000220.1"];
         let mapping = register_non_canonical_contigs(&contigs);
 
@@ -367,6 +378,7 @@ mod tests {
 
     #[test]
     fn test_sequential_codes_are_ascending() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let contigs = vec!["ZZZ", "AAA", "MMM"];
         let mapping = register_non_canonical_contigs(&contigs);
         // Sorted lexicographically: AAA, MMM, ZZZ
@@ -378,6 +390,7 @@ mod tests {
 
     #[test]
     fn test_code_to_chrom_non_canonical_after_register() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         register_non_canonical_contigs(&["HG1012_PATCH"]);
         let code = chrom_to_code("HG1012_PATCH");
         let name = code_to_chrom(code).unwrap();

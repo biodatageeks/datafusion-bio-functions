@@ -5,6 +5,9 @@ edition = "2024"
 
 [workspace]
 
+# Stock lance-encoding 7.0.0 (matches the production cache, now built with stock lance).
+# The fork patch was only needed while testing the miniblock u32 fix.
+
 [dependencies]
 anyhow = "1"
 arrow-array = "58.0.0"

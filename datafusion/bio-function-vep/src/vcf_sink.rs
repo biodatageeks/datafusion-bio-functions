@@ -816,8 +816,6 @@ pub struct AnnotateVcfConfig {
     pub extended_probes: bool,
     /// Path to indexed reference FASTA (required for `everything` / `hgvs`).
     pub reference_fasta_path: Option<String>,
-    /// Use fjall KV store for variation lookup + SIFT.
-    pub use_fjall: bool,
     /// Enable HGVS notation.
     pub hgvs: bool,
     /// Enable transcript HGVS notation explicitly.
@@ -885,7 +883,6 @@ impl Default for AnnotateVcfConfig {
             pick_order: None,
             extended_probes: false,
             reference_fasta_path: None,
-            use_fjall: false,
             hgvs: false,
             hgvsc: false,
             hgvsp: false,
@@ -962,9 +959,6 @@ impl AnnotateVcfConfig {
                 "reference_fasta_path".into(),
                 serde_json::Value::String(fasta.clone()),
             );
-        }
-        if self.use_fjall {
-            opts.insert("use_fjall".into(), serde_json::Value::Bool(true));
         }
         if self.hgvs {
             opts.insert("hgvs".into(), serde_json::Value::Bool(true));
@@ -1055,33 +1049,26 @@ impl AnnotateVcfConfig {
     }
 }
 
-fn cache_format_for_backend(backend: &str) -> &str {
-    match backend {
-        "parquet" => "indexed_parquet",
-        "fjall" => "legacy_fjall",
-        other => other,
-    }
+fn cache_format_for_backend(_backend: &str) -> &str {
+    // Lance is the only supported backend.
+    "lance"
 }
 
 fn cache_source_type_from_cache_source_for_backend(
     cache_source: &str,
-    backend: &str,
+    _backend: &str,
 ) -> Result<CacheSourceType> {
-    match cache_format_for_backend(backend) {
-        "lance" => {
-            #[cfg(feature = "lance-cache")]
-            {
-                CacheSourceType::from_partitioned_lance_cache_source(cache_source)
-            }
-            #[cfg(not(feature = "lance-cache"))]
-            {
-                Err(DataFusionError::Plan(
-                    "annotate_to_vcf(): Lance cache source metadata requires the lance-cache feature"
-                        .to_string(),
-                ))
-            }
-        }
-        _ => CacheSourceType::from_partitioned_cache_source(cache_source),
+    #[cfg(feature = "lance-cache")]
+    {
+        CacheSourceType::from_partitioned_lance_cache_source(cache_source)
+    }
+    #[cfg(not(feature = "lance-cache"))]
+    {
+        let _ = cache_source;
+        Err(DataFusionError::Plan(
+            "annotate_to_vcf(): Lance cache source metadata requires the lance-cache feature"
+                .to_string(),
+        ))
     }
 }
 

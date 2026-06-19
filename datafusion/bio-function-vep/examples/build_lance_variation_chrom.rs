@@ -34,6 +34,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = env_logger::try_init();
     let args = parse_args()?;
     let started = Instant::now();
     let options = LanceCacheBuildOptions {

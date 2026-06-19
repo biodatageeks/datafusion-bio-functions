@@ -26,6 +26,9 @@ use log::info;
 use tokio::sync::mpsc;
 
 use crate::cache_builder::EntityStats;
+use crate::cache_common::{
+    FrequencyFields, PositionFrequency, max_global_af, select_warm_positions,
+};
 use crate::lance_cache::manifest::{
     CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest, canonical_chrom_label, dataset_dir_name,
 };
@@ -38,9 +41,6 @@ use crate::lance_cache::write::{
     write_record_batch_stream_to_lance_with_mode_and_version,
     write_record_batch_stream_to_lance_with_version,
     write_record_batches_to_lance_with_mode_and_version,
-};
-use crate::warm_cache::split::{
-    FrequencyFields, PositionFrequency, max_global_af, select_warm_positions,
 };
 use crate::{
     annotate_provider::{read_compact_predictions, string_at},
@@ -1498,10 +1498,10 @@ fn append_translation_sift_position_rows(
             pi += 1;
         }
         keys.push(((uid as u64) << 32) | (next_pos as u64));
-        sift_blobs.push(crate::kv_cache::sift_store::serialize_position_entries(
+        sift_blobs.push(crate::cache_common::serialize_position_entries(
             &sift[s_start..si],
         ));
-        poly_blobs.push(crate::kv_cache::sift_store::serialize_position_entries(
+        poly_blobs.push(crate::cache_common::serialize_position_entries(
             &poly[p_start..pi],
         ));
     }
@@ -2166,7 +2166,7 @@ mod tests {
 
     #[test]
     fn translation_sift_position_rows_group_by_position_with_unique_keys() {
-        use crate::kv_cache::sift_store::deserialize_position_predictions;
+        use crate::cache_common::deserialize_position_predictions;
         use crate::transcript_consequence::CompactPrediction;
 
         // sift at positions 1 & 2, polyphen only at position 2.

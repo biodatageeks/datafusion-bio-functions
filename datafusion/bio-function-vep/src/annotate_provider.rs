@@ -178,16 +178,13 @@ use std::fmt::Write;
 use crate::allele::{
     MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
-use crate::annotation_store::{AnnotationBackend, build_store};
+use crate::annotation_store::AnnotationBackend;
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 use crate::config;
-#[cfg(feature = "kv-cache")]
-use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 #[cfg(feature = "lance-cache")]
 use crate::partitioned_cache::PartitionedLanceCache;
-use crate::partitioned_cache::PartitionedParquetCache;
 use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
@@ -202,8 +199,8 @@ use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
 };
 
-#[cfg(feature = "kv-cache")]
-type SiftPredictionStoreRef = Arc<dyn crate::kv_cache::SiftPredictionStore>;
+#[cfg(feature = "lance-cache")]
+use crate::cache_common::SiftPredictionStoreRef;
 
 /// Column categories for typed non-meta annotation columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2974,8 +2971,8 @@ fn lookup_sift_polyphen(
     protein_position: Option<&str>,
     amino_acids: Option<&str>,
     cache: &mut SiftPolyphenCache,
-    #[cfg(feature = "kv-cache")] sift_store: &Option<SiftPredictionStoreRef>,
-    #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
+    #[cfg(feature = "lance-cache")] sift_store: &Option<SiftPredictionStoreRef>,
+    #[cfg(not(feature = "lance-cache"))] _sift_kv: &Option<()>,
 ) -> (String, String) {
     let empty = || (String::new(), String::new());
 
@@ -3004,7 +3001,7 @@ fn lookup_sift_polyphen(
     // reading only this amino-acid position's payload. `transcript_id` is not
     // used on this path; without a `transcript_uid` we cannot build the key, so
     // skip SIFT rather than guess.
-    #[cfg(feature = "kv-cache")]
+    #[cfg(feature = "lance-cache")]
     if let Some(store) = sift_store {
         if store.is_position_sliced() {
             let Some(uid) = transcript_uid else {
@@ -3035,7 +3032,7 @@ fn lookup_sift_polyphen(
 
     // Lazy load from the configured transcript-id prediction store on cache miss.
     if cache.get(tx_id).is_none() {
-        #[cfg(feature = "kv-cache")]
+        #[cfg(feature = "lance-cache")]
         if let Some(store) = sift_store {
             let ids = [tx_id.to_string()];
             if let Ok(mut found) = store.get_many(&ids) {
@@ -3062,81 +3059,6 @@ fn lookup_sift_polyphen(
     (sift, polyphen)
 }
 
-#[cfg(feature = "kv-cache")]
-fn open_sift_prediction_store(parent: &std::path::Path) -> Result<Option<SiftPredictionStoreRef>> {
-    if let Some(path) = std::env::var_os("VEP_SIFT_LOOKUP_PARQUET_DIR") {
-        let path = std::path::PathBuf::from(path);
-        return crate::kv_cache::SiftParquetStore::open_dir(&path)?
-            .map(|store| Arc::new(store) as SiftPredictionStoreRef)
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "VEP_SIFT_LOOKUP_PARQUET_DIR is set to '{}' but no lookup parquet files were found",
-                    path.display()
-                ))
-            })
-            .map(Some);
-    }
-
-    for path in [
-        parent.join("translation_sift_lookup"),
-        parent.join("translation_sift.lookup"),
-        parent.join("translation_sift"),
-    ] {
-        match crate::kv_cache::SiftParquetStore::open_dir(&path) {
-            Ok(Some(store)) => return Ok(Some(Arc::new(store) as SiftPredictionStoreRef)),
-            Ok(None) => {}
-            Err(error)
-                if path.file_name().and_then(|name| name.to_str()) == Some("translation_sift") =>
-            {
-                log::debug!(
-                    "translation_sift is not a compact SIFT lookup parquet directory: {error}"
-                );
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    let sift_path = parent.join("translation_sift.fjall");
-    crate::kv_cache::SiftKvStore::open_path(&sift_path)
-        .map(|store| store.map(|store| Arc::new(store) as SiftPredictionStoreRef))
-}
-
-#[cfg(feature = "kv-cache")]
-fn indexed_variation_parquet_path(
-    cache: &PartitionedParquetCache,
-    chrom: &str,
-) -> Option<std::path::PathBuf> {
-    for suffix in ["_warm", "_cold"] {
-        let path = cache
-            .base_dir()
-            .join("variation")
-            .join(format!("{chrom}{suffix}.parquet"));
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-#[cfg(feature = "kv-cache")]
-fn read_variation_parquet_schema(path: &std::path::Path) -> Result<Schema> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    let file = std::fs::File::open(path).map_err(|error| {
-        DataFusionError::Execution(format!(
-            "failed to open variation parquet schema sample '{}': {error}",
-            path.display()
-        ))
-    })?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
-        DataFusionError::Execution(format!(
-            "failed to read variation parquet schema sample '{}': {error}",
-            path.display()
-        ))
-    })?;
-    Ok(builder.schema().as_ref().clone())
-}
-
 #[cfg(feature = "lance-cache")]
 async fn read_lance_dataset_schema(path: &std::path::Path) -> Result<Schema> {
     let dataset = lance::Dataset::open(path.to_string_lossy().as_ref())
@@ -3150,14 +3072,14 @@ async fn read_lance_dataset_schema(path: &std::path::Path) -> Result<Schema> {
     Ok(dataset.schema().into())
 }
 
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[cfg(feature = "lance-cache")]
 #[derive(Clone)]
 struct InMemorySiftPredictionStore {
     predictions: Arc<HashMap<String, CachedPredictions>>,
 }
 
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
-impl crate::kv_cache::SiftPredictionStore for InMemorySiftPredictionStore {
+#[cfg(feature = "lance-cache")]
+impl crate::cache_common::SiftPredictionStore for InMemorySiftPredictionStore {
     fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
         if transcript_ids.is_empty() {
             return Ok(HashMap::new());
@@ -3175,15 +3097,15 @@ impl crate::kv_cache::SiftPredictionStore for InMemorySiftPredictionStore {
     }
 }
 
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[cfg(feature = "lance-cache")]
 #[derive(Clone)]
 struct LanceBinarySiftPredictionStore {
     lookup: Arc<crate::lance_cache::context_runtime::TranscriptIdLanceLookup>,
     predictions: Arc<Mutex<HashMap<String, Option<CachedPredictions>>>>,
 }
 
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
-impl crate::kv_cache::SiftPredictionStore for LanceBinarySiftPredictionStore {
+#[cfg(feature = "lance-cache")]
+impl crate::cache_common::SiftPredictionStore for LanceBinarySiftPredictionStore {
     fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
         if transcript_ids.is_empty() {
             return Ok(HashMap::new());
@@ -3238,15 +3160,15 @@ impl crate::kv_cache::SiftPredictionStore for LanceBinarySiftPredictionStore {
 /// missense lookup reads only the needed amino-acid position's payload instead
 /// of the transcript's whole substitution matrix. Memoizes resolved keys
 /// (including misses) to avoid repeated `take_rows`.
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[cfg(feature = "lance-cache")]
 #[derive(Clone)]
 struct PositionSlicedLanceSiftStore {
     lookup: Arc<crate::lance_cache::context_runtime::KeyU64LanceLookup>,
     cache: Arc<Mutex<HashMap<u64, Option<CachedPredictions>>>>,
 }
 
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
-impl crate::kv_cache::SiftPredictionStore for PositionSlicedLanceSiftStore {
+#[cfg(feature = "lance-cache")]
+impl crate::cache_common::SiftPredictionStore for PositionSlicedLanceSiftStore {
     fn get_many(&self, _transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
         // Position-sliced stores are keyed by `(uid, position)`; the engine
         // resolves them via `get_position_predictions`, never by transcript id.
@@ -3309,7 +3231,7 @@ impl crate::kv_cache::SiftPredictionStore for PositionSlicedLanceSiftStore {
 /// Decode a position-sliced SIFT take batch (`key: UInt64`, `sift: Binary`,
 /// `poly: Binary`) into per-key [`CachedPredictions`]. The protein position is
 /// recovered from the low 32 bits of `key`.
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[cfg(feature = "lance-cache")]
 fn position_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<u64, CachedPredictions>> {
     let schema = batch.schema();
     let key_idx = schema.index_of("key")?;
@@ -3338,14 +3260,13 @@ fn position_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<u64, C
             Some(idx) => binary_at(batch.column(idx).as_ref(), row)?.unwrap_or(&[]),
             None => &[],
         };
-        let cached =
-            crate::kv_cache::sift_store::deserialize_position_predictions(position, sift, poly)?;
+        let cached = crate::cache_common::deserialize_position_predictions(position, sift, poly)?;
         predictions.insert(key, cached);
     }
     Ok(predictions)
 }
 
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[cfg(feature = "lance-cache")]
 async fn load_lance_sift_prediction_store_for_chrom(
     cache: &PartitionedLanceCache,
     chrom: &str,
@@ -3417,7 +3338,7 @@ async fn load_lance_sift_prediction_store_for_chrom(
     }) as SiftPredictionStoreRef))
 }
 
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[cfg(feature = "lance-cache")]
 fn sift_predictions_from_binary_batch(
     batch: &RecordBatch,
 ) -> Result<HashMap<String, CachedPredictions>> {
@@ -3435,13 +3356,13 @@ fn sift_predictions_from_binary_batch(
         let Some(bytes) = binary_at(batch.column(predictions_idx).as_ref(), row)? else {
             continue;
         };
-        let cached = crate::kv_cache::sift_store::deserialize_predictions(bytes)?;
+        let cached = crate::cache_common::deserialize_predictions(bytes)?;
         predictions.insert(transcript_id, cached);
     }
     Ok(predictions)
 }
 
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[cfg(feature = "lance-cache")]
 fn binary_at(array: &dyn Array, row: usize) -> Result<Option<&[u8]>> {
     if row >= array.len() || array.is_null(row) {
         return Ok(None);
@@ -3458,7 +3379,7 @@ fn binary_at(array: &dyn Array, row: usize) -> Result<Option<&[u8]>> {
     )))
 }
 
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[cfg(feature = "lance-cache")]
 fn sift_predictions_from_batches(
     batches: &[RecordBatch],
 ) -> Result<HashMap<String, CachedPredictions>> {
@@ -3469,7 +3390,7 @@ fn sift_predictions_from_batches(
     Ok(predictions)
 }
 
-#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[cfg(feature = "lance-cache")]
 fn sift_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<String, CachedPredictions>> {
     let schema = batch.schema();
     let tx_idx = schema
@@ -3502,7 +3423,7 @@ fn sift_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<String, Ca
     Ok(predictions)
 }
 
-#[cfg(feature = "kv-cache")]
+#[cfg(feature = "lance-cache")]
 /// Format a SIFT/PolyPhen prediction as `prediction(score)` with spaces→underscores.
 ///
 /// VEP uses `--sift b` / `--polyphen b` format (both prediction and score).
@@ -5468,10 +5389,7 @@ impl AnnotateProvider {
         extended_probes: bool,
         cache: PartitionedAnnotationCache,
         translations_sift_table: Option<&str>,
-        #[cfg(feature = "kv-cache")] kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
-        #[cfg(feature = "kv-cache")] use_indexed_parquet: bool,
         #[cfg(feature = "lance-cache")] use_lance: bool,
-        #[cfg(feature = "kv-cache")] indexed_variation_schema: Option<Schema>,
         fetch_limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if profiling_enabled() {
@@ -5586,23 +5504,8 @@ impl AnnotateProvider {
         } else {
             self.schema.clone()
         };
-        #[cfg(feature = "kv-cache")]
-        let indexed_parquet_cache_root =
-            use_indexed_parquet.then(|| cache.base_dir().to_path_buf());
         #[cfg(feature = "lance-cache")]
         let lance_cache_root = use_lance.then(|| cache.base_dir().to_path_buf());
-        #[cfg(feature = "kv-cache")]
-        let sift_prediction_store = if let Some(store) = kv_store.as_ref() {
-            if let Some(parent) = store.root_path().parent() {
-                open_sift_prediction_store(parent)?
-            } else {
-                None
-            }
-        } else if use_indexed_parquet {
-            open_sift_prediction_store(cache.base_dir())?
-        } else {
-            None
-        };
 
         let config = ContigAnnotationConfig {
             vcf_table: self.vcf_table.clone(),
@@ -5628,18 +5531,10 @@ impl AnnotateProvider {
             inline_lookup,
             annotation_threads,
             deregister_global_kv_on_finish: chromosome_lanes <= 1,
-            #[cfg(feature = "kv-cache")]
-            use_fjall: kv_store.is_some(),
-            #[cfg(feature = "kv-cache")]
-            indexed_parquet_cache_root,
             #[cfg(feature = "lance-cache")]
             lance_cache_root,
-            #[cfg(feature = "kv-cache")]
-            indexed_variation_schema,
-            #[cfg(feature = "kv-cache")]
-            sift_prediction_store,
-            #[cfg(feature = "kv-cache")]
-            kv_store,
+            #[cfg(feature = "lance-cache")]
+            sift_prediction_store: None,
             vcf_shard_ctx: self.vcf_shard_ctx.clone(),
         };
 
@@ -5670,8 +5565,8 @@ impl AnnotateProvider {
         ctx: &PreparedContext<'_>,
         colocated_map: &HashMap<ColocatedKey, ColocatedData>,
         sift_cache: &mut SiftPolyphenCache,
-        #[cfg(feature = "kv-cache")] sift_store: &Option<SiftPredictionStoreRef>,
-        #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
+        #[cfg(feature = "lance-cache")] sift_store: &Option<SiftPredictionStoreRef>,
+        #[cfg(not(feature = "lance-cache"))] _sift_kv: &Option<()>,
         skip_csq: bool,
         skip_typed_cols: bool,
         flags: &VepFlags,
@@ -6187,7 +6082,7 @@ impl AnnotateProvider {
                 // consequence. Only the position-sliced store benefits; the
                 // legacy transcript-id store ignores this. SIFT is emitted only
                 // under `--everything`.
-                #[cfg(feature = "kv-cache")]
+                #[cfg(feature = "lance-cache")]
                 if flags.everything {
                     if let Some(store) = sift_store {
                         if store.is_position_sliced() {
@@ -6436,9 +6331,9 @@ impl AnnotateProvider {
                                         tc.protein_position.as_deref(),
                                         tc.amino_acids.as_deref(),
                                         sift_cache,
-                                        #[cfg(feature = "kv-cache")]
+                                        #[cfg(feature = "lance-cache")]
                                         sift_store,
-                                        #[cfg(not(feature = "kv-cache"))]
+                                        #[cfg(not(feature = "lance-cache"))]
                                         _sift_kv,
                                     )
                                 }
@@ -6895,9 +6790,9 @@ impl AnnotateProvider {
                                 tc.protein_position.as_deref(),
                                 tc.amino_acids.as_deref(),
                                 sift_cache,
-                                #[cfg(feature = "kv-cache")]
+                                #[cfg(feature = "lance-cache")]
                                 sift_store,
-                                #[cfg(not(feature = "kv-cache"))]
+                                #[cfg(not(feature = "lance-cache"))]
                                 _sift_kv,
                             );
                             append_opt_str(
@@ -8243,35 +8138,6 @@ fn apply_translateable_seq_overrides(
     }
 }
 
-fn validate_partitioned_cache_source(
-    cache: &PartitionedParquetCache,
-    context_type: &str,
-    chrom: &str,
-    role: &str,
-    expected: CacheSourceType,
-) -> Result<()> {
-    let Some(path) = cache.context_path(context_type, chrom) else {
-        return Ok(());
-    };
-    // This validates the co-located shard used for the current chromosome.
-    // Mixed metadata across other shards is caught when those shards are read.
-    let actual = CacheSourceType::from_parquet_file(&path).map_err(|err| {
-        DataFusionError::Plan(format!(
-            "annotate_vep(): {role} table '{}' has invalid cache source metadata: {err}",
-            path.display()
-        ))
-    })?;
-    if actual != expected {
-        return Err(DataFusionError::Plan(format!(
-            "annotate_vep(): {role} table '{}' has {CACHE_SOURCE_METADATA_KEY}='{}' but variation cache has {CACHE_SOURCE_METADATA_KEY}='{}'",
-            path.display(),
-            actual.as_str(),
-            expected.as_str()
-        )));
-    }
-    Ok(())
-}
-
 fn is_refseq_transcript_for_hydration(
     tx: &TranscriptFeature,
     cache_source_type: CacheSourceType,
@@ -8734,22 +8600,10 @@ struct ContigAnnotationConfig {
     /// Whether this stream owns the shared global Fjall variation table.
     deregister_global_kv_on_finish: bool,
     pick_flags: PickFlags,
-    /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
-    #[cfg(feature = "kv-cache")]
-    use_fjall: bool,
-    /// Root of an indexed parquet cache. When set, variation uses the warm/cold
-    /// indexed parquet lookup path and SIFT uses compact translation_sift parquet.
-    #[cfg(feature = "kv-cache")]
-    indexed_parquet_cache_root: Option<std::path::PathBuf>,
     #[cfg(feature = "lance-cache")]
     lance_cache_root: Option<std::path::PathBuf>,
-    #[cfg(feature = "kv-cache")]
-    indexed_variation_schema: Option<Schema>,
-    /// Shared fjall KV store handle (opened once, reused across contigs).
-    #[cfg(feature = "kv-cache")]
-    kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
     /// Shared transcript-id SIFT store (opened once, reused across contigs).
-    #[cfg(feature = "kv-cache")]
+    #[cfg(feature = "lance-cache")]
     sift_prediction_store: Option<SiftPredictionStoreRef>,
     /// When `Some`, the `threads>1` path is sharded-VCF-output mode: each fused
     /// worker serializes its annotated batches directly into its own VCF body
@@ -8760,7 +8614,6 @@ struct ContigAnnotationConfig {
 
 #[derive(Clone)]
 enum PartitionedAnnotationCache {
-    Parquet(PartitionedParquetCache),
     #[cfg(feature = "lance-cache")]
     Lance(PartitionedLanceCache),
 }
@@ -8768,7 +8621,6 @@ enum PartitionedAnnotationCache {
 impl PartitionedAnnotationCache {
     fn available_chroms(&self) -> Vec<String> {
         match self {
-            Self::Parquet(cache) => cache.available_chroms().to_vec(),
             #[cfg(feature = "lance-cache")]
             Self::Lance(cache) => cache
                 .available_chroms()
@@ -8780,24 +8632,14 @@ impl PartitionedAnnotationCache {
 
     fn base_dir(&self) -> &std::path::Path {
         match self {
-            Self::Parquet(cache) => cache.base_dir(),
             #[cfg(feature = "lance-cache")]
             Self::Lance(cache) => cache.base_dir(),
-        }
-    }
-
-    fn as_parquet(&self) -> Option<&PartitionedParquetCache> {
-        match self {
-            Self::Parquet(cache) => Some(cache),
-            #[cfg(feature = "lance-cache")]
-            Self::Lance(_) => None,
         }
     }
 
     #[cfg(feature = "lance-cache")]
     fn as_lance(&self) -> Option<&PartitionedLanceCache> {
         match self {
-            Self::Parquet(_) => None,
             Self::Lance(cache) => Some(cache),
         }
     }
@@ -9313,7 +9155,7 @@ struct SharedContigAnnotationContext {
     tmp_provider: Arc<AnnotateProvider>,
     engine: Arc<TranscriptConsequenceEngine>,
     sift_direct: Option<Arc<SiftDirectReader>>,
-    #[cfg(feature = "kv-cache")]
+    #[cfg(feature = "lance-cache")]
     sift_prediction_store: Option<SiftPredictionStoreRef>,
 }
 
@@ -10207,9 +10049,6 @@ impl ContigAnnotationStream {
             StreamState::AnnotatingContig(ann) => {
                 abort_annotation_lookup_partitions(ann);
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
-                if ann.config.use_fjall && ann.config.deregister_global_kv_on_finish {
-                    let _ = ann.session.deregister_table("__vep_kv_variation");
-                }
                 ann.ephemeral_tables.clear();
             }
             StreamState::DrainingWindow {
@@ -10222,32 +10061,18 @@ impl ContigAnnotationStream {
             } => {
                 abort_annotation_lookup_partitions(ann);
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
-                if ann.config.use_fjall && ann.config.deregister_global_kv_on_finish {
-                    let _ = ann.session.deregister_table("__vep_kv_variation");
-                }
                 ann.ephemeral_tables.clear();
             }
             StreamState::AnnotatingParallel(state) => {
                 state.abort();
                 deregister_tables_sync(&state.session, &state.ephemeral_tables);
-                if state.config.use_fjall && state.config.deregister_global_kv_on_finish {
-                    let _ = state.session.deregister_table("__vep_kv_variation");
-                }
                 state.ephemeral_tables.clear();
             }
-            StreamState::CleaningUp(_) | StreamState::ErrorCleaningUp(_, _) => {
-                if self.config.use_fjall && self.config.deregister_global_kv_on_finish {
-                    let _ = self.session.deregister_table("__vep_kv_variation");
-                }
-            }
+            StreamState::CleaningUp(_) | StreamState::ErrorCleaningUp(_, _) => {}
             StreamState::StartContig
             | StreamState::PreparingContig(_)
             | StreamState::FinalCleanup(_)
-            | StreamState::Done => {
-                if self.config.use_fjall && self.config.deregister_global_kv_on_finish {
-                    let _ = self.session.deregister_table("__vep_kv_variation");
-                }
-            }
+            | StreamState::Done => {}
         }
     }
 }
@@ -11325,9 +11150,9 @@ fn annotate_worker_window(
             // was a large over-fetch (SIFT applies to <1% of overlaps); the demand
             // path reads only the transcripts that actually need predictions.
 
-            #[cfg(not(feature = "kv-cache"))]
+            #[cfg(not(feature = "lance-cache"))]
             let sift_kv: Option<()> = None;
-            #[cfg(feature = "kv-cache")]
+            #[cfg(feature = "lance-cache")]
             let sift_store = &shared.sift_prediction_store;
 
             let engine_started = Instant::now();
@@ -11337,9 +11162,9 @@ fn annotate_worker_window(
                 &ctx,
                 &worker.colocated_map,
                 &mut worker.sift_cache,
-                #[cfg(feature = "kv-cache")]
+                #[cfg(feature = "lance-cache")]
                 sift_store,
-                #[cfg(not(feature = "kv-cache"))]
+                #[cfg(not(feature = "lance-cache"))]
                 &sift_kv,
                 skip_csq,
                 skip_typed_cols,
@@ -11673,26 +11498,7 @@ impl Stream for ContigAnnotationStream {
                         return Poll::Ready(None);
                     }
                     let Some(chrom) = self.contigs.pop_front() else {
-                        // All contigs processed. Deregister the global KV
-                        // variation table if fjall was used, via async cleanup
-                        // future (safe on any Tokio runtime flavor).
-                        #[cfg(feature = "kv-cache")]
-                        if self.config.use_fjall && self.config.deregister_global_kv_on_finish {
-                            let session = Arc::clone(&self.session);
-                            let fut: CleanupFuture = Box::pin(async move {
-                                crate::partitioned_cache::deregister_table(
-                                    &session,
-                                    "__vep_kv_variation",
-                                )
-                                .await
-                                .ok();
-                                Ok(())
-                            });
-                            // Transition to FinalCleanup which goes to Done
-                            // (not StartContig, avoiding the infinite loop).
-                            self.state = StreamState::FinalCleanup(fut);
-                            continue;
-                        }
+                        // All contigs processed.
                         self.state = StreamState::Done;
                         return Poll::Ready(None);
                     };
@@ -12200,179 +12006,23 @@ async fn prepare_contig_context(
         .saturating_sub(config.annotation_column_count);
     let vcf_only_schema = Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
 
-    // 1. Register ALL ephemeral tables upfront (variation + context).
-    let mut ephemeral_tables: Vec<String> = Vec::new();
+    // Lance loads variation + context directly; no ephemeral tables are
+    // registered, but the field is retained for the cleanup state machine.
+    let ephemeral_tables: Vec<String> = Vec::new();
 
-    // Variation table: either per-chrom parquet or global fjall KV store.
-    #[cfg(feature = "kv-cache")]
-    let use_fjall = config.use_fjall;
-    #[cfg(not(feature = "kv-cache"))]
-    let use_fjall = false;
-    #[cfg(feature = "kv-cache")]
-    let use_indexed_parquet = config.indexed_parquet_cache_root.is_some();
-    #[cfg(not(feature = "kv-cache"))]
-    let use_indexed_parquet = false;
+    // Variation table: Lance variation cache (per-chrom dataset under
+    // `variation.lance/`). The KvLookupExec resolves the dataset itself via
+    // the cache root, so a placeholder table name is sufficient.
     #[cfg(feature = "lance-cache")]
     let use_lance = config.lance_cache_root.is_some();
     #[cfg(not(feature = "lance-cache"))]
     let use_lance = false;
 
-    let parquet_cache = cache.as_parquet();
+    let var_table = "__vep_indexed_variation".to_string();
 
-    let var_table = if use_fjall {
-        #[cfg(feature = "kv-cache")]
-        {
-            // Register the shared fjall KV store as a table (idempotent).
-            let kv_table_name = "__vep_kv_variation".to_string();
-            if !session.table_exist(&kv_table_name)? {
-                let store = config
-                    .kv_store
-                    .as_ref()
-                    .expect("kv_store must be set when use_fjall=true");
-                let kv_provider = KvCacheTableProvider::from_store(Arc::clone(store));
-                session.register_table(&kv_table_name, Arc::new(kv_provider))?;
-            }
-            // Don't add to ephemeral_tables — the global KV table persists
-            // across contigs and is deregistered after the last contig.
-            kv_table_name
-        }
-        #[cfg(not(feature = "kv-cache"))]
-        {
-            unreachable!("use_fjall requires kv-cache feature")
-        }
-    } else if use_indexed_parquet || use_lance {
-        "__vep_indexed_variation".to_string()
-    } else {
-        let parquet_cache = parquet_cache.ok_or_else(|| {
-            DataFusionError::Execution(
-                "parquet variation registration requires a parquet cache layout".to_string(),
-            )
-        })?;
-        let var_table = crate::partitioned_cache::register_chrom_parquet(
-            &session,
-            parquet_cache,
-            "variation",
-            &chrom,
-        )
-        .await?;
-        let Some(var_table) = var_table else {
-            if profiling_enabled() {
-                eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (no variation) ------");
-            }
-            return Ok(None);
-        };
-        ephemeral_tables.push(var_table.clone());
-        var_table
-    };
-    if !use_indexed_parquet && !use_lance {
-        let parquet_cache = parquet_cache.ok_or_else(|| {
-            DataFusionError::Execution(
-                "parquet variation validation requires a parquet cache layout".to_string(),
-            )
-        })?;
-        validate_partitioned_cache_source(
-            parquet_cache,
-            "variation",
-            &chrom,
-            "variation",
-            config.cache_source_type,
-        )?;
-    }
-
-    let (tx_table, ex_table, tl_table, rg_table, mt_table) =
-        if let Some(parquet_cache) = parquet_cache {
-            let tx_table = crate::partitioned_cache::register_chrom_parquet(
-                &session,
-                parquet_cache,
-                "transcript",
-                &chrom,
-            )
-            .await?;
-            if let Some(ref t) = tx_table {
-                validate_partitioned_cache_source(
-                    parquet_cache,
-                    "transcript",
-                    &chrom,
-                    "transcript",
-                    config.cache_source_type,
-                )?;
-                ephemeral_tables.push(t.clone());
-            }
-            let ex_table = crate::partitioned_cache::register_chrom_parquet(
-                &session,
-                parquet_cache,
-                "exon",
-                &chrom,
-            )
-            .await?;
-            if let Some(ref t) = ex_table {
-                validate_partitioned_cache_source(
-                    parquet_cache,
-                    "exon",
-                    &chrom,
-                    "exon",
-                    config.cache_source_type,
-                )?;
-                ephemeral_tables.push(t.clone());
-            }
-            let tl_table = crate::partitioned_cache::register_chrom_parquet(
-                &session,
-                parquet_cache,
-                "translation_core",
-                &chrom,
-            )
-            .await?;
-            if let Some(ref t) = tl_table {
-                validate_partitioned_cache_source(
-                    parquet_cache,
-                    "translation_core",
-                    &chrom,
-                    "translation_core",
-                    config.cache_source_type,
-                )?;
-                ephemeral_tables.push(t.clone());
-            }
-            let rg_table = crate::partitioned_cache::register_chrom_parquet(
-                &session,
-                parquet_cache,
-                "regulatory",
-                &chrom,
-            )
-            .await?;
-            if let Some(ref t) = rg_table {
-                validate_partitioned_cache_source(
-                    parquet_cache,
-                    "regulatory",
-                    &chrom,
-                    "regulatory",
-                    config.cache_source_type,
-                )?;
-                ephemeral_tables.push(t.clone());
-            }
-            let mt_table = crate::partitioned_cache::register_chrom_parquet(
-                &session,
-                parquet_cache,
-                "motif",
-                &chrom,
-            )
-            .await?;
-            if let Some(ref t) = mt_table {
-                validate_partitioned_cache_source(
-                    parquet_cache,
-                    "motif",
-                    &chrom,
-                    "motif",
-                    config.cache_source_type,
-                )?;
-                ephemeral_tables.push(t.clone());
-            }
-            (tx_table, ex_table, tl_table, rg_table, mt_table)
-        } else {
-            (None, None, None, None, None)
-        };
-
-    // 2. Create lookup stream + load context data.
-    let worklist = MissWorklist::for_chrom(&chrom);
+    // 2. Create lookup stream + load context data. Lance loads
+    // transcript/exon/translation/regulatory/motif context via
+    // `load_lance_contig_context`; no per-chrom parquet tables are registered.
 
     // Lookup arm: build LookupProvider, create stream (cheap — build+probe
     // happens on first poll, NOT here).
@@ -12383,22 +12033,24 @@ async fn prepare_contig_context(
         .schema()
         .as_arrow()
         .clone();
-    let cache_schema = if use_indexed_parquet || use_lance {
-        #[cfg(feature = "kv-cache")]
-        {
-            config.indexed_variation_schema.clone().ok_or_else(|| {
-                DataFusionError::Execution(
-                    "indexed variation lookup missing cache schema".to_string(),
-                )
-            })?
-        }
-        #[cfg(not(feature = "kv-cache"))]
-        {
-            unreachable!("indexed_parquet requires kv-cache feature")
-        }
-    } else {
-        session.table(&var_table).await?.schema().as_arrow().clone()
+    // Lance variation lookup reads the cache schema directly from the per-chrom
+    // Lance dataset; the KvLookupExec resolves the dataset path via the root.
+    #[cfg(feature = "lance-cache")]
+    let cache_schema = {
+        let lance_cache = cache.as_lance().ok_or_else(|| {
+            DataFusionError::Execution(
+                "Lance variation lookup requires a Lance cache layout".to_string(),
+            )
+        })?;
+        let variation_path = lance_cache.variation_path(&chrom).ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "Lance cache has no variation dataset for chrom {chrom}"
+            ))
+        })?;
+        read_lance_dataset_schema(&variation_path).await?
     };
+    #[cfg(not(feature = "lance-cache"))]
+    let cache_schema: Schema = unreachable!("lance-cache feature is required");
     let mut provider = LookupProvider::new(
         Arc::clone(&session),
         config.vcf_table.clone(),
@@ -12412,15 +12064,11 @@ async fn prepare_contig_context(
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
     provider.set_target_partitions(config.target_partitions);
-    #[cfg(feature = "kv-cache")]
-    if let Some(root) = &config.indexed_parquet_cache_root {
-        provider.set_indexed_parquet_cache_root(root.clone());
-    }
     #[cfg(feature = "lance-cache")]
     if let Some(root) = &config.lance_cache_root {
         provider.set_lance_cache_root(root.clone());
     }
-    let parallel_lookup = use_fjall || use_indexed_parquet || use_lance;
+    let parallel_lookup = use_lance;
     let mut lookup_partitions = if parallel_lookup {
         let session_state = session.state();
         let mut plan = provider.scan(&session_state, None, &[], None).await?;
@@ -12501,12 +12149,13 @@ async fn prepare_contig_context(
         profile.lookup_partitions = lookup_partitions.len();
     });
 
-    // Context arm: load transcripts, exons, translations, etc.
+    // Context arm: load transcripts, exons, translations, etc. (Lance only).
     let context_result: Result<LoadedContigContext> = async {
         let t_ctx = profile_start!();
         pipeline_trace::emit("context", "start", &[("chrom", TraceValue::Str(&chrom))]);
+        let _ = use_lance;
         #[cfg(feature = "lance-cache")]
-        if use_lance {
+        {
             let lance_cache = cache.as_lance().ok_or_else(|| {
                 DataFusionError::Execution(
                     "Lance context loading requires a Lance cache layout".to_string(),
@@ -12538,110 +12187,12 @@ async fn prepare_contig_context(
                     context_elapsed.as_secs_f64() * 1000.0
                 );
             }
-            return Ok(loaded);
+            Ok(loaded)
         }
-        let tmp_provider = AnnotateProvider::new(
-            Arc::clone(&session),
-            config.vcf_table.clone(),
-            String::new(),
-            AnnotationBackend::Parquet,
-            config.cache_source_type,
-            config.options_json.clone(),
-            vcf_only_schema.clone(),
-        )?;
-
-        let tx = if let Some(ref table) = tx_table {
-            let started = Instant::now();
-            let (tx, seq) = tmp_provider.load_transcripts(table, &worklist).await?;
-            let filtered: Vec<_> = tx
-                .into_iter()
-                .filter(|t| passes_transcript_selection(t, config.transcript_selection))
-                .collect();
-            record_contig_profile(&pipeline_profile, |profile| {
-                profile.context_transcripts += started.elapsed();
-            });
-            (filtered, seq)
-        } else {
-            (Vec::new(), HashMap::new())
-        };
-        let (tx_vec, translateable_seq) = tx;
-        let tx_ids: HashSet<String> = tx_vec.iter().map(|t| t.transcript_id.clone()).collect();
-
-        let ex = if let Some(ref table) = ex_table {
-            let started = Instant::now();
-            let raw = tmp_provider.load_exons(table, &worklist).await?;
-            let ex: Vec<_> = raw
-                .into_iter()
-                .filter(|e| tx_ids.contains(&e.transcript_id))
-                .collect();
-            record_contig_profile(&pipeline_profile, |profile| {
-                profile.context_exons += started.elapsed();
-            });
-            ex
-        } else {
-            Vec::new()
-        };
-        let tl = if let Some(ref table) = tl_table {
-            let started = Instant::now();
-            let raw = tmp_provider.load_translations(table, &worklist).await?;
-            let tl: Vec<_> = raw
-                .into_iter()
-                .filter(|t| tx_ids.contains(&t.transcript_id))
-                .collect();
-            record_contig_profile(&pipeline_profile, |profile| {
-                profile.context_translations += started.elapsed();
-            });
-            tl
-        } else {
-            Vec::new()
-        };
-        let rg = if let Some(ref table) = rg_table {
-            let started = Instant::now();
-            let rg = tmp_provider
-                .load_regulatory_features(table, &worklist)
-                .await?;
-            record_contig_profile(&pipeline_profile, |profile| {
-                profile.context_regulatory += started.elapsed();
-            });
-            rg
-        } else {
-            Vec::new()
-        };
-        let mt = if let Some(ref table) = mt_table {
-            let started = Instant::now();
-            let mt = tmp_provider.load_motif_features(table, &worklist).await?;
-            record_contig_profile(&pipeline_profile, |profile| {
-                profile.context_motifs += started.elapsed();
-            });
-            mt
-        } else {
-            Vec::new()
-        };
-        let context_elapsed = t_ctx.elapsed();
-        pipeline_trace::emit(
-            "context",
-            "done",
-            &[
-                ("chrom", TraceValue::Str(&chrom)),
-                ("transcripts", TraceValue::Usize(tx_vec.len())),
-                ("exons", TraceValue::Usize(ex.len())),
-                ("translations", TraceValue::Usize(tl.len())),
-                ("regulatory", TraceValue::Usize(rg.len())),
-                ("motifs", TraceValue::Usize(mt.len())),
-                ("elapsed", TraceValue::Duration(context_elapsed)),
-            ],
-        );
-        record_contig_profile(&pipeline_profile, |profile| {
-            profile.context_load += context_elapsed;
-        });
-        if profiling_enabled() {
-            eprintln!(
-                "[VEP_PROFILE] {:.<50} {:>8.1}ms",
-                format!("{chrom}: context_load"),
-                context_elapsed.as_secs_f64() * 1000.0
-            );
+        #[cfg(not(feature = "lance-cache"))]
+        {
+            unreachable!("lance-cache feature is required")
         }
-        Ok((tx_vec, translateable_seq, ex, tl, rg, mt))
     }
     .await;
     let (tx_vec, translateable_seq, ex, tl, rg, mt) = match context_result {
@@ -12656,7 +12207,7 @@ async fn prepare_contig_context(
         Arc::clone(&session),
         config.vcf_table.clone(),
         String::new(),
-        AnnotationBackend::Parquet,
+        AnnotationBackend::Lance,
         config.cache_source_type,
         config.options_json.clone(),
         vcf_only_schema,
@@ -12667,40 +12218,22 @@ async fn prepare_contig_context(
         config.hgvs_flags.shift_hgvs,
     );
 
-    // SIFT source: indexed parquet and legacy fjall use a shared transcript-id
-    // prediction store. The old interval parquet path uses direct genomic-window
-    // parquet reads.
-    #[cfg(feature = "kv-cache")]
-    let use_lookup_sift = config.use_fjall || config.indexed_parquet_cache_root.is_some() || {
-        #[cfg(feature = "lance-cache")]
-        {
-            config.lance_cache_root.is_some()
-        }
-        #[cfg(not(feature = "lance-cache"))]
-        {
-            false
-        }
-    };
-    #[cfg(not(feature = "kv-cache"))]
+    // SIFT source: the Lance backend uses a shared transcript-id prediction
+    // store loaded per-contig. When no lookup SIFT store is available, fall
+    // back to a direct genomic-window reader over `translations_sift_table`.
+    #[cfg(feature = "lance-cache")]
+    let use_lookup_sift = config.lance_cache_root.is_some();
+    #[cfg(not(feature = "lance-cache"))]
     let use_lookup_sift = false;
 
     let sift_direct_path = if config.flags.everything && !use_lookup_sift {
-        config
-            .translations_sift_table
-            .as_deref()
-            .and_then(|table| {
-                if std::path::Path::new(table).exists() {
-                    Some(table.to_string())
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                cache
-                    .as_parquet()
-                    .and_then(|cache| cache.context_path("translation_sift", &chrom))
-                    .and_then(|path| path.to_str().map(ToString::to_string))
-            })
+        config.translations_sift_table.as_deref().and_then(|table| {
+            if std::path::Path::new(table).exists() {
+                Some(table.to_string())
+            } else {
+                None
+            }
+        })
     } else {
         None
     };
@@ -12709,23 +12242,12 @@ async fn prepare_contig_context(
         .and_then(AnnotateProvider::build_sift_direct_reader)
         .map(Arc::new);
 
-    #[cfg(feature = "kv-cache")]
+    #[cfg(feature = "lance-cache")]
     let sift_prediction_store = if use_lookup_sift && config.flags.everything {
-        #[cfg(feature = "lance-cache")]
-        if use_lance {
-            let lance_cache = cache.as_lance().ok_or_else(|| {
-                DataFusionError::Execution(
-                    "Lance SIFT store requires a Lance cache layout".to_string(),
-                )
-            })?;
-            load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?
-        } else {
-            config.sift_prediction_store.clone()
-        }
-        #[cfg(not(feature = "lance-cache"))]
-        {
-            config.sift_prediction_store.clone()
-        }
+        let lance_cache = cache.as_lance().ok_or_else(|| {
+            DataFusionError::Execution("Lance SIFT store requires a Lance cache layout".to_string())
+        })?;
+        load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?
     } else {
         None
     };
@@ -12756,7 +12278,7 @@ async fn prepare_contig_context(
         tmp_provider: Arc::new(tmp_provider),
         engine: Arc::new(engine),
         sift_direct,
-        #[cfg(feature = "kv-cache")]
+        #[cfg(feature = "lance-cache")]
         sift_prediction_store,
     });
 
@@ -12790,245 +12312,72 @@ impl TableProvider for AnnotateProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let _store = build_store(self.backend, self.cache_source.clone());
-
-        // Parse cache format. The backend argument selects the default while
-        // `cache_format` remains accepted for existing callers.
-        #[cfg(feature = "kv-cache")]
-        let legacy_use_fjall = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_bool_option(opts, "use_fjall"))
-            .unwrap_or(false)
-            || self.backend == AnnotationBackend::Fjall;
-        #[cfg(feature = "kv-cache")]
-        let default_cache_format = match self.backend {
-            AnnotationBackend::Parquet => "indexed_parquet",
-            AnnotationBackend::Fjall => "legacy_fjall",
-            AnnotationBackend::Lance => "lance",
-        };
-        #[cfg(feature = "kv-cache")]
+        // Lance is the only supported backend. `backend` is validated at
+        // construction; here we additionally reject a non-`lance` `cache_format`.
         let cache_format = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "cache_format"))
-            .unwrap_or_else(|| default_cache_format.to_string());
-        #[cfg(feature = "kv-cache")]
-        let use_fjall = legacy_use_fjall || cache_format == "legacy_fjall";
-        #[cfg(feature = "kv-cache")]
-        let use_indexed_parquet = !use_fjall && cache_format == "indexed_parquet";
-        #[cfg(feature = "lance-cache")]
-        let use_lance =
-            !use_fjall && (cache_format == "lance" || self.backend == AnnotationBackend::Lance);
-        #[cfg(all(feature = "kv-cache", not(feature = "lance-cache")))]
-        let use_lance = false;
-        #[cfg(not(feature = "kv-cache"))]
-        let use_fjall = false;
-        #[cfg(not(feature = "kv-cache"))]
-        let use_indexed_parquet = false;
-        #[cfg(not(feature = "kv-cache"))]
-        let use_lance = false;
-        #[cfg(feature = "kv-cache")]
-        if !matches!(
-            cache_format.as_str(),
-            "indexed_parquet" | "legacy_fjall" | "lance"
-        ) {
-            return Err(DataFusionError::Execution(format!(
-                "cache_format must be 'indexed_parquet', 'legacy_fjall', or 'lance', got '{cache_format}'"
+            .unwrap_or_else(|| "lance".to_string());
+        if cache_format != "lance" {
+            return Err(DataFusionError::Plan(format!(
+                "annotate_vep(): cache_format must be 'lance', got '{cache_format}'"
             )));
         }
-        #[cfg(all(feature = "kv-cache", not(feature = "lance-cache")))]
-        if cache_format == "lance" {
-            return Err(DataFusionError::Execution(
-                "cache_format='lance' requires the lance-cache feature".to_string(),
-            ));
-        }
 
-        // Check for partitioned per-chromosome cache layout.
-        // Opt-in/out via "partitioned": true/false in options_json.
-        // Both parquet-only and fjall paths require partitioned context parquet.
+        // Detect the partitioned per-chromosome Lance cache layout.
+        // Opt-out via "partitioned": false in options_json.
         let partitioned_opt = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "partitioned"));
-        #[cfg(feature = "lance-cache")]
-        let partitioned_lance_cache = if use_lance && partitioned_opt != Some(false) {
-            crate::partitioned_cache::PartitionedLanceCache::detect(&self.cache_source)
-        } else {
-            None
-        };
-        let partitioned_cache = if !use_lance && partitioned_opt != Some(false) {
-            PartitionedParquetCache::detect(&self.cache_source)
-        } else {
-            None
-        };
-        #[cfg(feature = "lance-cache")]
-        let partitioned_annotation_cache = partitioned_lance_cache
-            .map(PartitionedAnnotationCache::Lance)
-            .or_else(|| {
-                partitioned_cache
-                    .clone()
-                    .map(PartitionedAnnotationCache::Parquet)
-            });
-        #[cfg(not(feature = "lance-cache"))]
-        let partitioned_annotation_cache = partitioned_cache
-            .clone()
-            .map(PartitionedAnnotationCache::Parquet);
 
-        // When explicitly requested or auto-detected, use partitioned path.
+        #[cfg(feature = "lance-cache")]
+        let partitioned_annotation_cache = if partitioned_opt != Some(false) {
+            crate::partitioned_cache::PartitionedLanceCache::detect(&self.cache_source)
+                .map(PartitionedAnnotationCache::Lance)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "lance-cache"))]
+        let partitioned_annotation_cache: Option<PartitionedAnnotationCache> = {
+            let _ = partitioned_opt;
+            None
+        };
+
         if let Some(cache) = partitioned_annotation_cache {
             let available_chroms = cache.available_chroms();
             if profiling_enabled() {
                 eprintln!(
-                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {}{}{}",
+                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {} [lance]",
                     available_chroms.len(),
                     self.cache_source,
-                    if use_fjall {
-                        " [fjall variation+sift]"
-                    } else {
-                        ""
-                    },
-                    if use_lance { " [lance]" } else { "" },
                 );
             }
 
-            // Determine requested cache columns.
-            // For indexed parquet, read schema from a warm/cold tier file.
-            #[cfg(feature = "kv-cache")]
-            let indexed_variation_schema: Option<Schema> = if use_indexed_parquet {
-                let parquet_cache = cache.as_parquet().ok_or_else(|| {
+            // Read available variation columns from a sample Lance dataset.
+            #[cfg(feature = "lance-cache")]
+            let available_cache_columns: HashSet<String> = {
+                let lance_cache = cache.as_lance().ok_or_else(|| {
                     DataFusionError::Execution(
-                        "indexed_parquet cache format requires a parquet cache layout".to_string(),
+                        "lance cache format requires a Lance cache layout".to_string(),
                     )
                 })?;
                 let sample_chrom = &available_chroms[0];
-                let sample_path = indexed_variation_parquet_path(parquet_cache, sample_chrom).ok_or_else(|| {
+                let sample_path = lance_cache.variation_path(sample_chrom).ok_or_else(|| {
                     DataFusionError::Execution(format!(
-                        "indexed_parquet cache has no warm/cold variation parquet for sample chrom {sample_chrom}"
+                        "Lance cache has no variation dataset for sample chrom {sample_chrom}"
                     ))
                 })?;
-                Some(read_variation_parquet_schema(&sample_path)?)
-            } else if use_lance {
-                #[cfg(feature = "lance-cache")]
-                {
-                    let lance_cache = cache.as_lance().ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "lance cache format requires a Lance cache layout".to_string(),
-                        )
-                    })?;
-                    let sample_chrom = &available_chroms[0];
-                    let sample_path = lance_cache.variation_path(sample_chrom).ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "Lance cache has no variation dataset for sample chrom {sample_chrom}"
-                        ))
-                    })?;
-                    Some(read_lance_dataset_schema(&sample_path).await?)
-                }
-                #[cfg(not(feature = "lance-cache"))]
-                {
-                    None
-                }
-            } else {
-                None
-            };
-
-            #[cfg(feature = "kv-cache")]
-            let kv_store_arc: Option<Arc<crate::kv_cache::VepKvStore>> = if use_fjall {
-                let fjall_path = std::path::Path::new(&self.cache_source).join("variation.fjall");
-                if !fjall_path.exists() {
-                    return Err(DataFusionError::Execution(format!(
-                        "annotate_vep(): use_fjall=true but no fjall store found at '{}'",
-                        fjall_path.display()
-                    )));
-                }
-                Some(crate::kv_cache::VepKvStore::open_shared(&fjall_path)?)
-            } else {
-                None
-            };
-
-            #[cfg(feature = "kv-cache")]
-            if use_fjall && !self.session.table_exist("__vep_kv_variation")? {
-                let store = kv_store_arc
-                    .as_ref()
-                    .expect("kv_store must be set when use_fjall=true");
-                let kv_provider = KvCacheTableProvider::from_store(Arc::clone(store));
-                self.session
-                    .register_table("__vep_kv_variation", Arc::new(kv_provider))?;
-            }
-
-            let (available_cache_columns, sample_table_to_deregister) = if use_fjall {
-                #[cfg(feature = "kv-cache")]
-                {
-                    let store = kv_store_arc.as_ref().unwrap();
-                    let cols: HashSet<String> = store
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().clone())
-                        .collect();
-                    (cols, None)
-                }
-                #[cfg(not(feature = "kv-cache"))]
-                {
-                    unreachable!("use_fjall requires kv-cache feature")
-                }
-            } else if use_indexed_parquet || use_lance {
-                #[cfg(feature = "kv-cache")]
-                {
-                    let cache_schema = indexed_variation_schema.as_ref().ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "indexed variation schema was not loaded".to_string(),
-                        )
-                    })?;
-                    let cols: HashSet<String> = cache_schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().clone())
-                        .collect();
-                    (cols, None)
-                }
-                #[cfg(not(feature = "kv-cache"))]
-                {
-                    unreachable!("indexed_parquet requires kv-cache feature")
-                }
-            } else {
-                let parquet_cache = cache
-                    .as_parquet()
-                    .expect("non-indexed partitioned path requires parquet cache");
-                let sample_chrom = &available_chroms[0];
-                let sample_table = crate::partitioned_cache::register_chrom_parquet(
-                    &self.session,
-                    parquet_cache,
-                    "variation",
-                    sample_chrom,
-                )
-                .await?;
-                let sample_table = sample_table.ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "partitioned cache: no variation parquet for sample chrom".to_string(),
-                    )
-                })?;
-                validate_partitioned_cache_source(
-                    parquet_cache,
-                    "variation",
-                    sample_chrom,
-                    "variation",
-                    self.cache_source_type,
-                )?;
-                let cache_schema = self
-                    .session
-                    .table(&sample_table)
-                    .await?
-                    .schema()
-                    .as_arrow()
-                    .clone();
-                let cols: HashSet<String> = cache_schema
+                let cache_schema = read_lance_dataset_schema(&sample_path).await?;
+                cache_schema
                     .fields()
                     .iter()
                     .map(|f| f.name().clone())
-                    .collect();
-                (cols, Some(sample_table))
+                    .collect()
             };
+            #[cfg(not(feature = "lance-cache"))]
+            let available_cache_columns: HashSet<String> = HashSet::new();
 
             let mut preferred_columns = vec!["consequence_types", "most_severe_consequence"];
             for c in cache_lookup_column_names() {
@@ -13073,11 +12422,6 @@ impl TableProvider for AnnotateProvider {
                 .as_deref()
                 .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"));
 
-            // Deregister sample table (will be re-registered per contig).
-            if let Some(ref tbl) = sample_table_to_deregister {
-                crate::partitioned_cache::deregister_table(&self.session, tbl).await?;
-            }
-
             return self
                 .scan_with_transcript_engine_partitioned(
                     state,
@@ -13086,31 +12430,17 @@ impl TableProvider for AnnotateProvider {
                     extended_probes,
                     cache,
                     translations_sift_table.as_deref(),
-                    #[cfg(feature = "kv-cache")]
-                    kv_store_arc,
-                    #[cfg(feature = "kv-cache")]
-                    use_indexed_parquet,
                     #[cfg(feature = "lance-cache")]
-                    use_lance,
-                    #[cfg(feature = "kv-cache")]
-                    indexed_variation_schema,
+                    true,
                     limit,
                 )
                 .await;
         }
 
-        let message = if use_lance {
-            format!(
-                "annotate_vep(): no partitioned Lance cache detected at '{}'. Expected a directory with variation.lance/chrom_manifest.json.",
-                self.cache_source
-            )
-        } else {
-            format!(
-                "annotate_vep(): no partitioned cache detected at '{}'. Expected a directory with a variation/ subdirectory containing per-chromosome parquet files.",
-                self.cache_source
-            )
-        };
-        Err(DataFusionError::Execution(message))
+        Err(DataFusionError::Execution(format!(
+            "annotate_vep(): no partitioned Lance cache detected at '{}'. Expected a directory with variation.lance/chrom_manifest.json.",
+            self.cache_source
+        )))
     }
 }
 
@@ -13187,7 +12517,7 @@ mod tests {
         assert!(frequency_fields.max_af_pops.is_empty());
     }
 
-    #[cfg(feature = "kv-cache")]
+    #[cfg(feature = "lance-cache")]
     #[tokio::test]
     async fn lance_cache_format_is_accepted() {
         let session = Arc::new(SessionContext::new());
@@ -13239,10 +12569,6 @@ mod tests {
             crate::partitioned_cache::PartitionedLanceCache::detect(tmp.path().to_str().unwrap())
                 .is_some()
         );
-        assert!(
-            crate::partitioned_cache::PartitionedParquetCache::detect(tmp.path().to_str().unwrap())
-                .is_none()
-        );
     }
 
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
@@ -13270,17 +12596,9 @@ mod tests {
             annotation_threads: 1,
             deregister_global_kv_on_finish: true,
             pick_flags: PickFlags::default(),
-            #[cfg(feature = "kv-cache")]
-            use_fjall: true,
-            #[cfg(feature = "kv-cache")]
-            indexed_parquet_cache_root: None,
             #[cfg(feature = "lance-cache")]
             lance_cache_root: None,
-            #[cfg(feature = "kv-cache")]
-            indexed_variation_schema: None,
-            #[cfg(feature = "kv-cache")]
-            kv_store: None,
-            #[cfg(feature = "kv-cache")]
+            #[cfg(feature = "lance-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: None,
         }
@@ -13310,7 +12628,7 @@ mod tests {
             session,
             "vcf".to_string(),
             String::new(),
-            AnnotationBackend::Parquet,
+            AnnotationBackend::Lance,
             CacheSourceType::Ensembl,
             None,
             vcf_schema,
@@ -13335,7 +12653,7 @@ mod tests {
                 5000, 5000, false,
             )),
             sift_direct: None,
-            #[cfg(feature = "kv-cache")]
+            #[cfg(feature = "lance-cache")]
             sift_prediction_store: None,
         })
     }
@@ -13611,10 +12929,10 @@ mod tests {
         Arc::new(list_builder.finish())
     }
 
-    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    #[cfg(feature = "lance-cache")]
     type TestCompactPrediction = (i32, &'static str, &'static str, f32);
 
-    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    #[cfg(feature = "lance-cache")]
     fn compact_prediction_array(rows: Vec<Option<Vec<TestCompactPrediction>>>) -> Arc<dyn Array> {
         use datafusion::arrow::array::{ArrayBuilder, Float32Builder, Int32Builder, StructBuilder};
 
@@ -13667,10 +12985,10 @@ mod tests {
         Arc::new(list_builder.finish())
     }
 
-    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    #[cfg(feature = "lance-cache")]
     #[tokio::test(flavor = "multi_thread")]
     async fn lance_sift_prediction_store_reads_binary_predictions_by_transcript_id() {
-        use crate::kv_cache::sift_store::serialize_predictions;
+        use crate::cache_common::serialize_predictions;
         use datafusion::arrow::array::BinaryArray;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -13838,7 +13156,7 @@ mod tests {
             Arc::clone(&session),
             "vcf".to_string(),
             String::new(),
-            AnnotationBackend::Parquet,
+            AnnotationBackend::Lance,
             CacheSourceType::Ensembl,
             None,
             Schema::new(Vec::<Field>::new()),
@@ -14512,10 +13830,10 @@ mod tests {
         assert_eq!(sift_position_key(Some(7), None, Some("V/I")), None);
     }
 
-    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    #[cfg(feature = "lance-cache")]
     #[test]
     fn position_predictions_from_batch_decodes_key_and_payloads() {
-        use crate::kv_cache::sift_store::serialize_position_entries;
+        use crate::cache_common::serialize_position_entries;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
         let pos = 42i32;
@@ -14573,10 +13891,10 @@ mod tests {
     ///   VEP_PARITY_LEGACY_SIFT  = .../translation_sift.lance/<chrom>.lance  (legacy blob)
     ///   VEP_PARITY_NEW_SIFT     = .../translation_sift.lance/<chrom>.lance  (position-sliced)
     ///   VEP_PARITY_NEW_TX       = .../transcript.lance/<chrom>.lance        (carries transcript_uid)
-    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    #[cfg(feature = "lance-cache")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn position_sliced_sift_matches_legacy_blob_parity() {
-        use crate::kv_cache::SiftPredictionStore;
+        use crate::cache_common::SiftPredictionStore;
         use std::path::PathBuf;
 
         let (Some(legacy_sift), Some(new_sift), Some(new_tx)) = (
@@ -15807,58 +15125,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stateful_buffer_local_transcripts_filters_same_region_hgnc_donor() {
-        let mut tx_recipient = make_tx(
-            "NR_160941.1",
-            Some("106479023"),
-            Some("H3P4"),
-            Some("EntrezGene"),
-            None,
-        );
-        tx_recipient.chrom = "chr1".to_string();
-        tx_recipient.start = 121_059_763;
-        tx_recipient.end = 121_118_626;
-
-        let mut tx_donor = make_tx(
-            "ENST00000401004",
-            Some("ENSG00000213244"),
-            Some("H3P4"),
-            Some("HGNC"),
-            Some("HGNC:43797"),
-        );
-        tx_donor.chrom = "chr1".to_string();
-        tx_donor.start = 121_118_195;
-        tx_donor.end = 121_118_610;
-
-        let transcripts = vec![tx_recipient, tx_donor];
-        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
-            .iter()
-            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
-            .collect();
-        let mut persisted_transcripts = HashMap::new();
-
-        let buffer = vec![make_buffer_batch("chr1", 121_096_952, 121_096_952)];
-        let scoped = build_stateful_buffer_local_transcripts(
-            &transcripts,
-            &transcript_regions,
-            &mut persisted_transcripts,
-            &buffer,
-            "chr1",
-            121_096_952,
-            121_096_952,
-            5_000,
-            5_000,
-        )
-        .unwrap();
-
-        let recipient = scoped
-            .iter()
-            .find(|tx| tx.transcript_id == "NR_160941.1")
-            .unwrap();
-        assert_eq!(recipient.gene_hgnc_id, None);
-    }
-
-    #[test]
     fn test_stateful_buffer_local_transcripts_uses_protein_coding_cache_region_hgnc_donor() {
         let mut tx_recipient = make_tx(
             "XM_017001769.3",
@@ -15982,142 +15248,6 @@ mod tests {
                 .any(|tx| tx.transcript_id == "ENST00000452962"),
             "donor must be present in the VEP input-buffer min/max feature set"
         );
-    }
-
-    #[test]
-    fn test_stateful_buffer_local_transcripts_filters_far_linc02663_hgnc_donor() {
-        let mut tx_recipient = make_tx(
-            "XR_930643.2",
-            Some("105376402"),
-            Some("LINC02663"),
-            Some("EntrezGene"),
-            None,
-        );
-        tx_recipient.chrom = "chr10".to_string();
-        tx_recipient.start = 9_443_281;
-        tx_recipient.end = 9_878_094;
-        tx_recipient.biotype = "lncRNA".to_string();
-
-        let mut tx_donor = make_tx(
-            "ENST00000659451",
-            Some("ENSG00000228636"),
-            Some("LINC02663"),
-            Some("HGNC"),
-            Some("HGNC:54149"),
-        );
-        tx_donor.chrom = "chr10".to_string();
-        tx_donor.start = 9_758_779;
-        tx_donor.end = 9_759_281;
-        tx_donor.biotype = "lncRNA".to_string();
-
-        let transcripts = vec![tx_recipient, tx_donor];
-        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
-            .iter()
-            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
-            .collect();
-        let mut persisted_transcripts = HashMap::new();
-
-        // Real chr10 VEP buffer around the mismatch spans 6,971,266..9,489,052.
-        // The donor is in the active 9 Mb cache region, but outside VEP's
-        // min/max +/- 5 kb feature filter and therefore must not seed HGNC.
-        let buffer = vec![make_buffer_batch_many(
-            "chr10",
-            &[6_971_266, 9_438_618, 9_439_215, 9_489_052],
-        )];
-        let scoped = build_stateful_buffer_local_transcripts(
-            &transcripts,
-            &transcript_regions,
-            &mut persisted_transcripts,
-            &buffer,
-            "chr10",
-            6_971_266,
-            9_489_052,
-            5_000,
-            5_000,
-        )
-        .unwrap();
-
-        let recipient = scoped
-            .iter()
-            .find(|tx| tx.transcript_id == "XR_930643.2")
-            .unwrap();
-        assert_eq!(recipient.gene_hgnc_id, None);
-    }
-
-    #[test]
-    fn test_stateful_buffer_local_transcripts_filters_anapc1p1_donor_before_boundary() {
-        let mut tx_recipient = make_tx(
-            "NR_037931.2",
-            Some("100286979"),
-            Some("ANAPC1P1"),
-            Some("EntrezGene"),
-            None,
-        );
-        tx_recipient.chrom = "chr2".to_string();
-        tx_recipient.start = 86_861_787;
-        tx_recipient.end = 86_912_978;
-
-        let mut tx_donor = make_tx(
-            "ENST00000426186",
-            Some("ENSG00000233673"),
-            Some("ANAPC1P1"),
-            Some("HGNC"),
-            Some("HGNC:44150"),
-        );
-        tx_donor.chrom = "chr2".to_string();
-        tx_donor.start = 86_871_301;
-        tx_donor.end = 86_912_978;
-
-        let transcripts = vec![tx_recipient, tx_donor];
-        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
-            .iter()
-            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
-            .collect();
-        let mut persisted_transcripts = HashMap::new();
-
-        let first_buffer = vec![make_buffer_batch_many(
-            "chr2",
-            &[
-                86_856_985, 86_857_793, 86_858_475, 86_858_518, 86_858_619, 86_859_060, 86_859_741,
-                86_860_097, 86_860_689, 86_861_077, 86_861_757, 86_861_841, 86_862_499,
-            ],
-        )];
-        let first_scoped = build_stateful_buffer_local_transcripts(
-            &transcripts,
-            &transcript_regions,
-            &mut persisted_transcripts,
-            &first_buffer,
-            "chr2",
-            86_856_985,
-            86_862_499,
-            5_000,
-            5_000,
-        )
-        .unwrap();
-        let first_recipient = first_scoped
-            .iter()
-            .find(|tx| tx.transcript_id == "NR_037931.2")
-            .unwrap();
-        assert_eq!(first_recipient.gene_hgnc_id, None);
-
-        let second_buffer = vec![make_buffer_batch_many("chr2", &[86_862_550, 86_871_302])];
-        let second_scoped = build_stateful_buffer_local_transcripts(
-            &transcripts,
-            &transcript_regions,
-            &mut persisted_transcripts,
-            &second_buffer,
-            "chr2",
-            86_862_550,
-            86_871_302,
-            5_000,
-            5_000,
-        )
-        .unwrap();
-        let second_recipient = second_scoped
-            .iter()
-            .find(|tx| tx.transcript_id == "NR_037931.2")
-            .unwrap();
-        assert_eq!(second_recipient.gene_hgnc_id.as_deref(), Some("HGNC:44150"));
     }
 
     #[test]
@@ -16326,145 +15456,6 @@ mod tests {
         .unwrap();
         assert_eq!(second_scoped.len(), 1);
         assert_eq!(second_scoped[0].transcript_id, "XR_REGION1");
-        assert_eq!(second_scoped[0].gene_hgnc_id, None);
-    }
-
-    #[test]
-    fn test_stateful_buffer_local_transcripts_do_not_carry_same_transcript_across_regions() {
-        let mut tx_donor = make_tx(
-            "ENST_DONOR",
-            Some("ENSG00000181143"),
-            Some("MUC16"),
-            Some("HGNC"),
-            Some("HGNC:15582"),
-        );
-        tx_donor.chrom = "chr19".to_string();
-        tx_donor.start = 8_848_844;
-        tx_donor.end = 9_010_390;
-
-        let mut tx_recipient = make_tx(
-            "NM_001414686.1",
-            Some("94025"),
-            Some("MUC16"),
-            Some("EntrezGene"),
-            None,
-        );
-        tx_recipient.chrom = "chr19".to_string();
-        tx_recipient.start = 8_848_844;
-        tx_recipient.end = 9_065_751;
-
-        let transcripts = vec![tx_donor, tx_recipient];
-        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
-            .iter()
-            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
-            .collect();
-        let mut persisted_transcripts = HashMap::new();
-
-        let first_buffer = vec![make_buffer_batch("chr19", 8_900_000, 8_900_000)];
-        let first_scoped = build_stateful_buffer_local_transcripts(
-            &transcripts,
-            &transcript_regions,
-            &mut persisted_transcripts,
-            &first_buffer,
-            "chr19",
-            8_900_000,
-            8_900_000,
-            50,
-            50,
-        )
-        .unwrap();
-        let first_recipient = first_scoped
-            .iter()
-            .find(|tx| tx.transcript_id == "NM_001414686.1")
-            .unwrap();
-        assert_eq!(first_recipient.gene_hgnc_id.as_deref(), Some("HGNC:15582"));
-
-        let second_buffer = vec![make_buffer_batch("chr19", 9_058_432, 9_058_432)];
-        let second_scoped = build_stateful_buffer_local_transcripts(
-            &transcripts,
-            &transcript_regions,
-            &mut persisted_transcripts,
-            &second_buffer,
-            "chr19",
-            9_058_432,
-            9_058_432,
-            50,
-            50,
-        )
-        .unwrap();
-        assert_eq!(second_scoped.len(), 1);
-        assert_eq!(second_scoped[0].transcript_id, "NM_001414686.1");
-        assert_eq!(second_scoped[0].gene_hgnc_id, None);
-    }
-
-    #[test]
-    fn test_stateful_buffer_local_transcripts_clears_promoted_hgnc_before_later_muc16_buffer() {
-        let mut tx_donor = make_tx(
-            "ENST_DONOR",
-            Some("ENSG00000181143"),
-            Some("MUC16"),
-            Some("HGNC"),
-            Some("HGNC:15582"),
-        );
-        tx_donor.chrom = "chr19".to_string();
-        tx_donor.start = 8_848_844;
-        tx_donor.end = 9_010_390;
-
-        let mut tx_recipient = make_tx(
-            "NM_001414686.1",
-            Some("94025"),
-            Some("MUC16"),
-            Some("EntrezGene"),
-            None,
-        );
-        tx_recipient.chrom = "chr19".to_string();
-        tx_recipient.start = 8_848_844;
-        tx_recipient.end = 9_065_751;
-
-        let transcripts = vec![tx_donor, tx_recipient];
-        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
-            .iter()
-            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
-            .collect();
-        let mut persisted_transcripts = HashMap::new();
-
-        let first_buffer = vec![
-            make_buffer_batch("chr19", 8_900_000, 8_900_000),
-            make_buffer_batch("chr19", 9_058_364, 9_058_364),
-        ];
-        let first_scoped = build_stateful_buffer_local_transcripts(
-            &transcripts,
-            &transcript_regions,
-            &mut persisted_transcripts,
-            &first_buffer,
-            "chr19",
-            8_900_000,
-            9_058_364,
-            50,
-            50,
-        )
-        .unwrap();
-        let first_recipient = first_scoped
-            .iter()
-            .find(|tx| tx.transcript_id == "NM_001414686.1")
-            .unwrap();
-        assert_eq!(first_recipient.gene_hgnc_id.as_deref(), Some("HGNC:15582"));
-
-        let second_buffer = vec![make_buffer_batch("chr19", 9_058_432, 9_058_432)];
-        let second_scoped = build_stateful_buffer_local_transcripts(
-            &transcripts,
-            &transcript_regions,
-            &mut persisted_transcripts,
-            &second_buffer,
-            "chr19",
-            9_058_432,
-            9_058_432,
-            50,
-            50,
-        )
-        .unwrap();
-        assert_eq!(second_scoped.len(), 1);
-        assert_eq!(second_scoped[0].transcript_id, "NM_001414686.1");
         assert_eq!(second_scoped[0].gene_hgnc_id, None);
     }
 

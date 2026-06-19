@@ -44,13 +44,12 @@ pub mod annotate_table_function;
 pub mod annotation_store;
 #[cfg(feature = "cache-builder")]
 pub mod cache_builder;
+pub(crate) mod cache_common;
 pub(crate) mod cache_source;
 pub mod config;
 pub mod coordinate;
 pub mod golden_benchmark;
 pub mod hgvs;
-#[cfg(feature = "kv-cache")]
-pub mod kv_cache;
 #[cfg(feature = "lance-cache")]
 pub mod lance_cache;
 pub mod lookup_provider;
@@ -64,8 +63,6 @@ pub mod table_function;
 pub mod transcript_consequence;
 pub mod variant_lookup_exec;
 pub mod vcf_sink;
-#[cfg(feature = "kv-cache")]
-pub mod warm_cache;
 pub(crate) mod window_planner;
 
 pub use config::AnnotationConfig;

@@ -14,7 +14,6 @@ tokio.workspace = true
 futures.workspace = true
 log.workspace = true
 async-trait = "0.1.88"
-fjall = { version = "3.1.1", optional = true }
 arrow-ipc = { version = "=58.0.0", features = ["lz4", "zstd"], optional = true }
 lz4_flex = { version = "0.12.1", optional = true }
 zstd = { version = "0.13.3", optional = true }
@@ -60,30 +59,6 @@ name = "lookup_parquet_bench"
 required-features = []
 
 [[example]]
-name = "lookup_kv_bench"
-required-features = ["kv-cache"]
-
-[[example]]
-name = "load_cache"
-required-features = ["kv-cache"]
-
-[[example]]
-name = "load_cache_full"
-required-features = ["kv-cache"]
-
-[[example]]
-name = "load_sift_cache"
-required-features = ["kv-cache"]
-
-[[example]]
-name = "bench_annotate"
-required-features = ["kv-cache"]
-
-[[example]]
-name = "bench_fjall_gets"
-required-features = ["kv-cache"]
-
-[[example]]
 name = "annotate_vep_golden_bench"
 required-features = []
 
@@ -96,22 +71,6 @@ name = "bench_annotate_vcf"
 required-features = []
 
 [[example]]
-name = "build_warm_variation_cache"
-required-features = ["kv-cache"]
-
-[[example]]
-name = "build_variation_position_index"
-required-features = ["kv-cache"]
-
-[[example]]
-name = "build_variation_variant_bloom_index"
-required-features = ["kv-cache"]
-
-[[example]]
-name = "build_lance_variation_cache"
-required-features = ["lance-cache"]
-
-[[example]]
 name = "build_lance_variation_chrom"
 required-features = ["lance-cache", "cache-builder"]
 
@@ -119,26 +78,12 @@ required-features = ["lance-cache", "cache-builder"]
 name = "build_lance_chrom_context"
 required-features = ["lance-cache", "cache-builder"]
 
-[[example]]
-name = "bench_warm_tier_chr1"
-required-features = ["kv-cache"]
-
-[[example]]
-name = "bench_lance_variation_chr1_workload"
-required-features = ["lance-cache"]
-
-[[example]]
-name = "bench_lance_cold_batching"
-required-features = ["lance-cache"]
-
-[[example]]
-name = "bench_arrow_mmap_cold_lookup"
-required-features = ["lance-cache"]
-
 [features]
-default = ["kv-cache"]
-kv-cache = [
-    "dep:fjall",
+default = ["lance-cache"]
+lance-cache = [
+    "dep:lance",
+    "dep:lance-file",
+    "dep:lance-index",
     "dep:arrow-ipc",
     "dep:lz4_flex",
     "dep:zstd",
@@ -148,8 +93,7 @@ kv-cache = [
     "dep:rapidhash",
     "dep:smallvec",
 ]
-cache-builder = ["kv-cache", "dep:datafusion-bio-format-ensembl-cache"]
-lance-cache = ["kv-cache", "dep:lance", "dep:lance-file", "dep:lance-index"]
+cache-builder = ["lance-cache", "dep:datafusion-bio-format-ensembl-cache"]
 
 # Regression tests that bake per-transcript sequence fixtures via
 # `include_str!(".tmp_*.txt")` are gated behind the raw `cfg(dev_fixtures)`

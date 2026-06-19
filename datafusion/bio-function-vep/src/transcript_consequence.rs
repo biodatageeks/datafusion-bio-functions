@@ -130,7 +130,7 @@ impl VariantInput {
 }
 
 /// Lazily-populated, per-transcript cache of the genomic→cDNA coordinate table
-/// (the expensive `to_vec()` + sort in [`transcript_cdna_coords`]). Mirrors
+/// (the expensive `to_vec()` + sort in `transcript_cdna_coords`). Mirrors
 /// Ensembl's `Transcript->{_variation_effect_feature_cache}`: built by the first
 /// variant that touches the transcript, reused by every later variant and ALT
 /// allele. Lives on [`TranscriptFeature`] so all the `&TranscriptFeature` leaf

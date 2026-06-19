@@ -213,7 +213,6 @@ async fn main() -> Result<()> {
         everything: args.everything,
         extended_probes: args.extended_probes,
         reference_fasta_path: args.reference_fasta.clone(),
-        use_fjall: args.backend == "fjall",
         forks: Some(args.forks.unwrap_or(0)),
         threads: args.threads,
         buffer_size: args.buffer_size,

@@ -93,6 +93,57 @@ enum Command {
         #[arg(long)]
         output_dir: Option<PathBuf>,
     },
+    /// Read a parquet file and write it as a single-fragment Lance dataset, stamping
+    /// `lance-encoding:structural-encoding=fullzip` metadata onto the named columns.
+    /// Used to (re)write the bundled-AF candidate via the patched/fixed lance writer.
+    WriteLanceBundle {
+        #[arg(long)]
+        input_parquet: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "2.2")]
+        version: String,
+        #[arg(long, value_delimiter = ',')]
+        fullzip_cols: Vec<String>,
+        /// "overwrite" (default) or "append" — append builds a multi-fragment dataset
+        /// one source fragment at a time (preserving fragment order/addresses).
+        #[arg(long, default_value = "overwrite")]
+        mode: String,
+        /// "none" (default, lets Lance pick e.g. FSST) or "zstd" — stamps
+        /// `lance-encoding:compression` on the fullzip columns to match a zstd baseline.
+        #[arg(long, default_value = "none")]
+        compression: String,
+    },
+    /// Time `dataset.take_rows(row_ids, projection)` for an explicit row-address
+    /// set and column projection. Used for the AF-bundling encoding A/B
+    /// (separate-miniblock columns vs bundled-fullzip lists).
+    TakeColsBench {
+        #[arg(long)]
+        dataset_path: PathBuf,
+        /// File of u64 Lance row addresses (fragment<<32 | offset), one per line.
+        #[arg(long)]
+        rowids_file: PathBuf,
+        /// Comma-separated projection columns.
+        #[arg(long, value_delimiter = ',')]
+        columns: Vec<String>,
+        #[arg(long, default_value_t = 5)]
+        iterations: usize,
+        /// Materialize each taken column to bytes (force full decode).
+        #[arg(long, default_value_t = true)]
+        materialize: bool,
+    },
+    /// Replay a batch-delimited row-address file (blank line between batches) as N separate
+    /// take_rows calls — the realistic per-batch lookup pattern. Sums disk bytes / IOPS / time.
+    TakeBatchesBench {
+        #[arg(long)]
+        dataset_path: PathBuf,
+        #[arg(long)]
+        batches_file: PathBuf,
+        #[arg(long, value_delimiter = ',')]
+        columns: Vec<String>,
+        #[arg(long, default_value_t = 2)]
+        iterations: usize,
+    },
     PayloadPeek {
         #[arg(long)]
         db_path: PathBuf,
@@ -275,6 +326,34 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Command::TakeColsBench {
+            dataset_path,
+            rowids_file,
+            columns,
+            iterations,
+            materialize,
+        } => {
+            take_cols_bench(&dataset_path, &rowids_file, &columns, iterations, materialize).await?;
+        }
+        Command::TakeBatchesBench {
+            dataset_path,
+            batches_file,
+            columns,
+            iterations,
+        } => {
+            take_batches_bench(&dataset_path, &batches_file, &columns, iterations).await?;
+        }
+        Command::WriteLanceBundle {
+            input_parquet,
+            out,
+            version,
+            fullzip_cols,
+            mode,
+            compression,
+        } => {
+            write_lance_bundle(&input_parquet, &out, &version, &fullzip_cols, &mode, &compression)
+                .await?;
+        }
         Command::PayloadPeek {
             db_path,
             positions_file,
@@ -416,6 +495,251 @@ fn write_benchmark_report(
         (None, true) => report::write_benchmark_for_tier(cfg, benchmark),
         (None, false) => report::write_benchmark(cfg, benchmark),
     }
+}
+
+async fn write_lance_bundle(
+    input_parquet: &Path,
+    out: &Path,
+    version: &str,
+    fullzip_cols: &[String],
+    mode: &str,
+    compression: &str,
+) -> Result<()> {
+    use arrow_schema::{Field, Schema};
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance_file::version::LanceFileVersion;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    let data_storage_version = match version {
+        "2.1" => LanceFileVersion::V2_1,
+        "2.2" => LanceFileVersion::V2_2,
+        other => anyhow::bail!("unsupported lance version '{other}'"),
+    };
+    let write_mode = match mode {
+        "overwrite" => WriteMode::Overwrite,
+        "append" => WriteMode::Append,
+        other => anyhow::bail!("unsupported write mode '{other}'"),
+    };
+
+    let file = File::open(input_parquet)
+        .with_context(|| format!("failed to open '{}'", input_parquet.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
+    anyhow::ensure!(!batches.is_empty(), "parquet file produced no batches");
+    let orig_schema = batches[0].schema();
+
+    // Stamp fullzip structural-encoding metadata onto the requested columns.
+    let fullzip: std::collections::HashSet<&str> =
+        fullzip_cols.iter().map(String::as_str).collect();
+    let new_fields = orig_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if fullzip.contains(f.name().as_str()) {
+                let mut md = f.metadata().clone();
+                md.insert(
+                    "lance-encoding:structural-encoding".to_string(),
+                    "fullzip".to_string(),
+                );
+                if compression == "zstd" {
+                    md.insert("lance-encoding:compression".to_string(), "zstd".to_string());
+                    md.insert(
+                        "lance-encoding:compression-level".to_string(),
+                        "3".to_string(),
+                    );
+                }
+                Arc::new(Field::clone(f).with_metadata(md))
+            } else {
+                f.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        orig_schema.metadata().clone(),
+    ));
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let restamped = batches
+        .into_iter()
+        .map(|b| arrow_array::RecordBatch::try_new(schema.clone(), b.columns().to_vec()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    eprintln!(
+        "WriteLanceBundle: rows={total_rows} version={version} fullzip_cols={fullzip_cols:?} -> {}",
+        out.display()
+    );
+
+    let reader = arrow_array::RecordBatchIterator::new(restamped.into_iter().map(Ok), schema);
+    let params = WriteParams {
+        mode: write_mode,
+        data_storage_version: Some(data_storage_version),
+        max_rows_per_file: total_rows + 1,
+        ..Default::default()
+    };
+    lance::Dataset::write(reader, out.to_string_lossy().as_ref(), Some(params))
+        .await
+        .with_context(|| format!("failed to write '{}'", out.display()))?;
+    eprintln!("wrote {} ({total_rows} rows)", out.display());
+    Ok(())
+}
+
+async fn take_cols_bench(
+    dataset_path: &Path,
+    rowids_file: &Path,
+    columns: &[String],
+    iterations: usize,
+    materialize: bool,
+) -> Result<()> {
+    use arrow_array::Array;
+    use lance::dataset::ProjectionRequest;
+
+    let row_ids = read_positions_file(rowids_file)?;
+    let dataset = Dataset::open(
+        dataset_path
+            .to_str()
+            .context("dataset path is not valid UTF-8")?,
+    )
+    .await?;
+
+    eprintln!(
+        "TakeColsBench: dataset={}, row_ids={}, columns={:?}, iterations={}",
+        dataset_path.display(),
+        row_ids.len(),
+        columns,
+        iterations
+    );
+
+    let mut wall_secs = Vec::with_capacity(iterations);
+    let mut cpu_secs = Vec::with_capacity(iterations);
+    let mut decoded_bytes = 0usize;
+    let mut taken_rows = 0usize;
+
+    for iter in 0..iterations {
+        let projection =
+            ProjectionRequest::from_columns(columns.iter().map(String::as_str), dataset.schema());
+        let io_bytes_before = lance_io::bytes_read_counter();
+        let io_iops_before = lance_io::iops_counter();
+        let usage_before = ResourceUsage::snapshot();
+        let started = Instant::now();
+        let batch = dataset.take_rows(&row_ids, projection).await?;
+        // force full materialization of every projected column
+        let mut bytes = 0usize;
+        if materialize {
+            for col in batch.columns() {
+                bytes += col.get_array_memory_size();
+            }
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let usage = ResourceUsage::snapshot().delta(usage_before);
+        let cpu = usage.user_seconds + usage.system_seconds;
+        let disk_bytes = lance_io::bytes_read_counter().saturating_sub(io_bytes_before);
+        let iops = lance_io::iops_counter().saturating_sub(io_iops_before);
+        taken_rows = batch.num_rows();
+        decoded_bytes = bytes;
+        wall_secs.push(elapsed);
+        cpu_secs.push(cpu);
+        eprintln!(
+            "  iter {}: wall={:.4}s cpu={:.4}s rows={} decoded={} disk_bytes_read={} iops={} major_faults={}",
+            iter, elapsed, cpu, batch.num_rows(), bytes, disk_bytes, iops, usage.major_faults
+        );
+    }
+
+    let best_wall = wall_secs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let best_cpu = cpu_secs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let med_wall = med(&mut wall_secs);
+    let med_cpu = med(&mut cpu_secs);
+    println!(
+        "RESULT dataset={} columns={} rows={} decoded_bytes={} best_wall_s={:.4} med_wall_s={:.4} best_cpu_s={:.4} med_cpu_s={:.4} us_per_row_cpu={:.3}",
+        dataset_path.display(),
+        columns.len(),
+        taken_rows,
+        decoded_bytes,
+        best_wall,
+        med_wall,
+        best_cpu,
+        med_cpu,
+        best_cpu * 1_000_000.0 / taken_rows.max(1) as f64
+    );
+    Ok(())
+}
+
+/// Parse a batch-delimited address file: blank line separates batches.
+fn read_batches_file(path: &Path) -> Result<Vec<Vec<u64>>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read batches file '{}'", path.display()))?;
+    let mut batches = Vec::new();
+    let mut cur = Vec::new();
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            if !cur.is_empty() {
+                batches.push(std::mem::take(&mut cur));
+            }
+        } else if !t.starts_with('#') {
+            cur.push(t.parse::<u64>()?);
+        }
+    }
+    if !cur.is_empty() {
+        batches.push(cur);
+    }
+    Ok(batches)
+}
+
+/// Replay the per-batch take pattern: one take_rows() per batch, summing disk bytes/IOPS/time.
+async fn take_batches_bench(
+    dataset_path: &Path,
+    batches_file: &Path,
+    columns: &[String],
+    iterations: usize,
+) -> Result<()> {
+    use lance::dataset::ProjectionRequest;
+
+    let batches = read_batches_file(batches_file)?;
+    let dataset = Dataset::open(dataset_path.to_str().context("path not utf-8")?).await?;
+    let total_ids: usize = batches.iter().map(Vec::len).sum();
+    eprintln!(
+        "TakeBatchesBench: dataset={}, batches={}, total_ids={}, columns={:?}",
+        dataset_path.display(),
+        batches.len(),
+        total_ids,
+        columns
+    );
+
+    for iter in 0..iterations {
+        let io_b0 = lance_io::bytes_read_counter();
+        let io_i0 = lance_io::iops_counter();
+        let usage0 = ResourceUsage::snapshot();
+        let started = Instant::now();
+        let mut rows = 0usize;
+        let mut decoded = 0usize;
+        for batch_ids in &batches {
+            let projection =
+                ProjectionRequest::from_columns(columns.iter().map(String::as_str), dataset.schema());
+            let b = dataset.take_rows(batch_ids, projection).await?;
+            rows += b.num_rows();
+            for col in b.columns() {
+                decoded += col.get_array_memory_size();
+            }
+        }
+        let wall = started.elapsed().as_secs_f64();
+        let usage = ResourceUsage::snapshot().delta(usage0);
+        let cpu = usage.user_seconds + usage.system_seconds;
+        let disk_bytes = lance_io::bytes_read_counter().saturating_sub(io_b0);
+        let iops = lance_io::iops_counter().saturating_sub(io_i0);
+        eprintln!(
+            "  iter {iter}: batches={} rows={rows} decoded={decoded} wall={wall:.4}s cpu={cpu:.4}s disk_bytes_read={disk_bytes} iops={iops} major_faults={}",
+            batches.len(),
+            usage.major_faults
+        );
+    }
+    Ok(())
 }
 
 fn write_benchmark_progress(
