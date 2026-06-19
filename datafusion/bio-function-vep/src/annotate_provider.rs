@@ -1146,100 +1146,6 @@ const AF_COLUMNS: &[AfColumn] = &[
 ///
 /// Traceability:
 /// - Ensembl VEP `Config.pm` `--everything` expansion
-/// Cached parquet metadata for direct sift/polyphen window reads, bypassing DataFusion SQL.
-struct SiftDirectReader {
-    path: String,
-    arrow_meta: parquet::arrow::arrow_reader::ArrowReaderMetadata,
-    projection: parquet::arrow::ProjectionMask,
-    rg_ranges: Vec<(i64, i64)>,
-}
-
-impl SiftDirectReader {
-    /// Read a single genomic window directly from parquet, skipping DataFusion SQL planning.
-    fn load_window(
-        &self,
-        chrom: &str,
-        win_start: i64,
-        win_end: i64,
-        cache: &mut SiftPolyphenCache,
-    ) -> Result<()> {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-        let matching_rgs: Vec<usize> = self
-            .rg_ranges
-            .iter()
-            .enumerate()
-            .filter(|(_, (s, e))| *s <= win_end && *e >= win_start)
-            .map(|(i, _)| i)
-            .collect();
-
-        if matching_rgs.is_empty() {
-            return Ok(());
-        }
-
-        let file = std::fs::File::open(&self.path).map_err(|e| {
-            DataFusionError::Execution(format!("failed to open sift file '{}': {e}", self.path))
-        })?;
-        let reader =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.arrow_meta.clone())
-                .with_projection(self.projection.clone())
-                .with_row_groups(matching_rgs)
-                .build()
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("failed to build sift reader: {e}"))
-                })?;
-
-        let chrom_norm = chrom.strip_prefix("chr").unwrap_or(chrom);
-
-        for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| DataFusionError::Execution(format!("sift batch read error: {e}")))?;
-            let schema = batch.schema();
-            let tx_idx = schema
-                .index_of("transcript_id")
-                .or_else(|_| schema.index_of("stable_id"))
-                .ok();
-            let end_col_idx = schema.index_of("end").ok();
-            let chrom_col_idx = schema.index_of("chrom").ok();
-            let sift_col_idx = schema.index_of("sift_predictions").ok();
-            let pp_col_idx = schema.index_of("polyphen_predictions").ok();
-
-            let Some(tx_idx) = tx_idx else { continue };
-
-            for row in 0..batch.num_rows() {
-                // Filter by chromosome (the file may contain multiple chroms).
-                if let Some(ci) = chrom_col_idx {
-                    if let Some(row_chrom) = string_at(batch.column(ci).as_ref(), row) {
-                        let row_norm = row_chrom.strip_prefix("chr").unwrap_or(&row_chrom);
-                        if row_norm != chrom_norm {
-                            continue;
-                        }
-                    }
-                }
-                let Some(tx_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
-                    continue;
-                };
-                if cache.get(&tx_id).is_some() {
-                    continue;
-                }
-                let genomic_end = end_col_idx
-                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
-                    .unwrap_or(i64::MAX);
-                let mut preds = CachedPredictions::default();
-                if let Some(idx) = sift_col_idx {
-                    preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
-                }
-                if let Some(idx) = pp_col_idx {
-                    preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
-                }
-                preds.sort();
-                cache.insert(tx_id, preds, genomic_end);
-            }
-        }
-        Ok(())
-    }
-}
-
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L346-L374>
 #[derive(Debug, Clone)]
 struct VepFlags {
@@ -4393,145 +4299,6 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    /// Window size for sliding-window SIFT/PolyPhen loading (5MB).
-    const SIFT_WINDOW_SIZE: i64 = 5_000_000;
-
-    /// Try to build a direct parquet reader for sift windows, bypassing DataFusion SQL.
-    /// Returns cached metadata + projection + RG ranges if the file path can be resolved.
-    fn build_sift_direct_reader(path: &str) -> Option<SiftDirectReader> {
-        use parquet::arrow::ProjectionMask;
-        use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-        use parquet::file::statistics::Statistics;
-
-        let file = std::fs::File::open(path).ok()?;
-        let arrow_meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).ok()?;
-        let parquet_schema = arrow_meta.metadata().file_metadata().schema_descr_ptr();
-
-        // Find root column indices for projection
-        let arrow_schema = arrow_meta.schema();
-        let fields = arrow_schema.fields();
-        let find_idx = |name: &str| fields.iter().position(|f| f.name() == name);
-
-        let tid_root = find_idx("transcript_id")?;
-        let end_root = find_idx("end")?;
-        let sift_root = find_idx("sift_predictions")?;
-        let poly_root = find_idx("polyphen_predictions")?;
-        let chrom_root = find_idx("chrom");
-
-        let mut proj_indices = vec![tid_root, end_root, sift_root, poly_root];
-        if let Some(ci) = chrom_root {
-            proj_indices.push(ci);
-        }
-        let projection = ProjectionMask::roots(&parquet_schema, proj_indices);
-
-        // Pre-compute RG position ranges from column statistics
-        let num_rgs = arrow_meta.metadata().num_row_groups();
-        // Find physical column index for "start" and "end"
-        let leaf_cols = parquet_schema.columns();
-        let start_leaf = leaf_cols.iter().position(|c| c.name() == "start");
-        let end_leaf = leaf_cols.iter().position(|c| c.name() == "end");
-
-        let rg_ranges: Vec<(i64, i64)> = (0..num_rgs)
-            .map(|i| {
-                let rg = arrow_meta.metadata().row_group(i);
-                let min_start = start_leaf
-                    .and_then(|idx| rg.column(idx).statistics())
-                    .and_then(|s| match s {
-                        Statistics::Int64(v) => v.min_opt().copied(),
-                        _ => None,
-                    })
-                    .unwrap_or(i64::MIN);
-                let max_end = end_leaf
-                    .and_then(|idx| rg.column(idx).statistics())
-                    .and_then(|s| match s {
-                        Statistics::Int64(v) => v.max_opt().copied(),
-                        _ => None,
-                    })
-                    .unwrap_or(i64::MAX);
-                (min_start, max_end)
-            })
-            .collect();
-
-        Some(SiftDirectReader {
-            path: path.to_string(),
-            arrow_meta,
-            projection,
-            rg_ranges,
-        })
-    }
-
-    /// Load SIFT/PolyPhen predictions for a single genomic window into the cache.
-    ///
-    /// Queries translations whose CDS overlaps the window `[win_start, win_end)`:
-    /// ```sql
-    /// SELECT transcript_id, "end", sift_predictions, polyphen_predictions
-    /// FROM translations
-    /// WHERE chrom = '1' AND start <= win_end AND "end" >= win_start
-    /// ```
-    ///
-    /// Each window typically returns ~20-50 translations (~500K prediction
-    /// entries ~20MB).
-    ///
-    /// With sorted parquet + small row groups (bio-formats#129), DataFusion
-    /// uses row-group min/max statistics to skip non-matching row groups,
-    /// reading only 1-2 row groups per window query instead of all.
-    ///
-    /// See biodatageeks/datafusion-bio-functions#38.
-    async fn load_sift_window(
-        &self,
-        table: &str,
-        chrom: &str,
-        win_start: i64,
-        win_end: i64,
-        cache: &mut SiftPolyphenCache,
-    ) -> Result<()> {
-        let escaped_chrom = Self::escaped_sql_literal(chrom);
-        let query = format!(
-            "SELECT transcript_id, \"end\", sift_predictions, polyphen_predictions \
-             FROM `{table}` \
-             WHERE chrom = '{escaped_chrom}' \
-               AND start <= {win_end} AND \"end\" >= {win_start}"
-        );
-        let batches = self.session.sql(&query).await?.collect().await?;
-
-        for batch in &batches {
-            let schema = batch.schema();
-            let tx_idx = schema
-                .index_of("transcript_id")
-                .or_else(|_| schema.index_of("stable_id"))
-                .ok();
-            let end_col_idx = schema.index_of("end").ok();
-            let sift_col_idx = schema.index_of("sift_predictions").ok();
-            let pp_col_idx = schema.index_of("polyphen_predictions").ok();
-
-            let Some(tx_idx) = tx_idx else { continue };
-
-            for row in 0..batch.num_rows() {
-                let Some(tx_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
-                    continue;
-                };
-                // Skip if already cached (window overlap with previous window).
-                if cache.get(&tx_id).is_some() {
-                    continue;
-                }
-                let genomic_end = end_col_idx
-                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
-                    .unwrap_or(i64::MAX);
-                let mut preds = CachedPredictions::default();
-                if let Some(idx) = sift_col_idx {
-                    preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
-                }
-                if let Some(idx) = pp_col_idx {
-                    preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
-                }
-                preds.sort();
-                cache.insert(tx_id, preds, genomic_end);
-            }
-        }
-
-        Ok(())
-    }
-
     async fn load_regulatory_features(
         &self,
         table: &str,
@@ -5529,7 +5296,6 @@ impl AnnotateProvider {
             chromosome_lanes,
             inline_lookup,
             annotation_threads,
-            deregister_global_kv_on_finish: chromosome_lanes <= 1,
             #[cfg(feature = "lance-cache")]
             lance_cache_root,
             #[cfg(feature = "lance-cache")]
@@ -8596,8 +8362,6 @@ struct ContigAnnotationConfig {
     /// contig. `<= 1` keeps the serial inline path. Additive to the
     /// partition-lookup knobs above (lookup partitioning is unchanged).
     annotation_threads: usize,
-    /// Whether this stream owns the shared global Fjall variation table.
-    deregister_global_kv_on_finish: bool,
     pick_flags: PickFlags,
     #[cfg(feature = "lance-cache")]
     lance_cache_root: Option<std::path::PathBuf>,
@@ -9193,7 +8957,6 @@ struct SharedContigAnnotationContext {
     transcript_cache_regions: Arc<HashMap<String, Vec<TranscriptCacheRegion>>>,
     tmp_provider: Arc<AnnotateProvider>,
     engine: Arc<TranscriptConsequenceEngine>,
-    sift_direct: Option<Arc<SiftDirectReader>>,
     #[cfg(feature = "lance-cache")]
     sift_prediction_store: Option<SiftPredictionStoreRef>,
 }
@@ -9207,8 +8970,6 @@ struct AnnotationWorkerState {
     hydrated_cds_tx_ids: HashSet<String>,
     hgvs_reader: Option<FastaReader>,
     sift_cache: SiftPolyphenCache,
-    sift_direct: Option<Arc<SiftDirectReader>>,
-    loaded_sift_windows: HashSet<(String, i64)>,
     input_buffer_accumulator: InputBufferAccumulator,
     next_input_buffer_id: usize,
     window_buffer: Vec<RecordBatch>,
@@ -10020,7 +9781,6 @@ impl AnnotationWorkerState {
                     .build_from_path(path)
                     .ok()
             });
-        let sift_direct = shared.sift_direct.clone();
 
         let state = Self {
             shared,
@@ -10031,8 +9791,6 @@ impl AnnotationWorkerState {
             hydrated_cds_tx_ids: HashSet::new(),
             hgvs_reader,
             sift_cache: SiftPolyphenCache::new(),
-            sift_direct,
-            loaded_sift_windows: HashSet::new(),
             input_buffer_accumulator: InputBufferAccumulator::default(),
             next_input_buffer_id: 0,
             window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
@@ -11038,75 +10796,6 @@ fn apply_hgnc_donors(
     }
 }
 
-fn load_sift_for_batch(
-    batch: &RecordBatch,
-    pick_requires_full_annotations: bool,
-    sift_direct: Option<&SiftDirectReader>,
-    loaded_sift_windows: &mut HashSet<(String, i64)>,
-    sift_cache: &mut SiftPolyphenCache,
-) -> Result<()> {
-    let Some(direct) = sift_direct else {
-        return Ok(());
-    };
-
-    let batch_needs_engine = if pick_requires_full_annotations {
-        true
-    } else {
-        batch
-            .schema()
-            .index_of("cache_most_severe_consequence")
-            .ok()
-            .map_or(true, |idx| batch.column(idx).null_count() > 0)
-    };
-    if !batch_needs_engine {
-        return Ok(());
-    }
-
-    let schema = batch.schema();
-    let (Ok(ci), Ok(si), Ok(ei)) = (
-        schema.index_of("chrom"),
-        schema.index_of("start"),
-        schema.index_of("end"),
-    ) else {
-        return Ok(());
-    };
-
-    let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
-    for row in 0..batch.num_rows() {
-        if let (Some(c), Some(s), Some(e)) = (
-            string_at(batch.column(ci).as_ref(), row),
-            int64_at(batch.column(si).as_ref(), row),
-            int64_at(batch.column(ei).as_ref(), row),
-        ) {
-            let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
-            let entry = batch_chrom_bounds
-                .entry(c_norm)
-                .or_insert((i64::MAX, i64::MIN));
-            entry.0 = entry.0.min(s);
-            entry.1 = entry.1.max(e);
-        }
-    }
-
-    for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
-        let window_start =
-            (batch_max / AnnotateProvider::SIFT_WINDOW_SIZE) * AnnotateProvider::SIFT_WINDOW_SIZE;
-        let min_window_start =
-            (batch_min / AnnotateProvider::SIFT_WINDOW_SIZE) * AnnotateProvider::SIFT_WINDOW_SIZE;
-        let mut ws = min_window_start;
-        while ws <= window_start + AnnotateProvider::SIFT_WINDOW_SIZE {
-            let key = (ch.clone(), ws);
-            if !loaded_sift_windows.contains(&key) {
-                direct.load_window(ch, ws, ws + AnnotateProvider::SIFT_WINDOW_SIZE, sift_cache)?;
-                loaded_sift_windows.insert(key);
-            }
-            ws += AnnotateProvider::SIFT_WINDOW_SIZE;
-        }
-        sift_cache.evict_before(*batch_min);
-    }
-
-    Ok(())
-}
-
 /// Annotate a window of batches inside one partition worker: build
 /// PreparedContext, run SIFT loading, annotate each batch, apply projection.
 fn annotate_worker_window(
@@ -11129,10 +10818,6 @@ fn annotate_worker_window(
             .iter()
             .any(|&i| i >= typed_cols_start && i < typed_cols_end)
     });
-    let pick_requires_full_annotations = config
-        .pick_flags
-        .requires_transcript_annotations(skip_csq, skip_typed_cols);
-    let sift_enabled = config.flags.everything;
     let mut out = VecDeque::with_capacity(window_batches.len());
 
     let flush_partial = worker.lookup_done && worker.window_buffer.is_empty();
@@ -11168,20 +10853,6 @@ fn annotate_worker_window(
         });
 
         for batch in &buffer_batches {
-            // Lazy SIFT window loading (same pattern as before).
-            if sift_enabled && worker.sift_direct.is_some() {
-                let sift_started = Instant::now();
-                load_sift_for_batch(
-                    batch,
-                    pick_requires_full_annotations,
-                    worker.sift_direct.as_deref(),
-                    &mut worker.loaded_sift_windows,
-                    &mut worker.sift_cache,
-                )?;
-                record_contig_profile(&profile, |profile| {
-                    profile.sift_load += sift_started.elapsed();
-                });
-            }
             // SIFT/PolyPhen predictions are fetched on demand by the transcript
             // engine (`lookup_sift_polyphen`), which only queries the store for
             // single-amino-acid substitutions and memoizes per transcript. Eagerly
@@ -12267,28 +11938,11 @@ async fn prepare_contig_context(
     );
 
     // SIFT source: the Lance backend uses a shared transcript-id prediction
-    // store loaded per-contig. When no lookup SIFT store is available, fall
-    // back to a direct genomic-window reader over `translations_sift_table`.
+    // store loaded per-contig.
     #[cfg(feature = "lance-cache")]
     let use_lookup_sift = config.lance_cache_root.is_some();
     #[cfg(not(feature = "lance-cache"))]
     let use_lookup_sift = false;
-
-    let sift_direct_path = if config.flags.everything && !use_lookup_sift {
-        config.translations_sift_table.as_deref().and_then(|table| {
-            if std::path::Path::new(table).exists() {
-                Some(table.to_string())
-            } else {
-                None
-            }
-        })
-    } else {
-        None
-    };
-    let sift_direct = sift_direct_path
-        .as_deref()
-        .and_then(AnnotateProvider::build_sift_direct_reader)
-        .map(Arc::new);
 
     #[cfg(feature = "lance-cache")]
     let sift_prediction_store = if use_lookup_sift && config.flags.everything {
@@ -12331,7 +11985,6 @@ async fn prepare_contig_context(
         transcript_cache_regions,
         tmp_provider: Arc::new(tmp_provider),
         engine: Arc::new(engine),
-        sift_direct,
         #[cfg(feature = "lance-cache")]
         sift_prediction_store,
     });
@@ -12655,7 +12308,6 @@ mod tests {
             chromosome_lanes: 1,
             inline_lookup: false,
             annotation_threads: 1,
-            deregister_global_kv_on_finish: true,
             pick_flags: PickFlags::default(),
             #[cfg(feature = "lance-cache")]
             lance_cache_root: None,
@@ -12713,7 +12365,6 @@ mod tests {
             engine: Arc::new(TranscriptConsequenceEngine::new_with_hgvs_shift(
                 5000, 5000, false,
             )),
-            sift_direct: None,
             #[cfg(feature = "lance-cache")]
             sift_prediction_store: None,
         })
@@ -12753,7 +12404,6 @@ mod tests {
         let right = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
 
         left.hydrated_cds_tx_ids.insert("left_tx".to_string());
-        left.loaded_sift_windows.insert(("1".to_string(), 0));
         left.persisted_buffer_transcripts.insert(
             TranscriptCacheRegion {
                 chrom: "1".to_string(),
@@ -12763,7 +12413,6 @@ mod tests {
         );
 
         assert!(right.hydrated_cds_tx_ids.is_empty());
-        assert!(right.loaded_sift_windows.is_empty());
         assert!(right.persisted_buffer_transcripts.is_empty());
 
         assert!(Arc::ptr_eq(&left.shared.exons, &right.shared.exons));
