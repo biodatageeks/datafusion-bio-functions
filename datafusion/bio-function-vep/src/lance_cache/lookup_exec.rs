@@ -40,7 +40,9 @@ use crate::lance_cache::variant_key::{
     position_key_from_code as warm_position_key_from_code,
     variant_key_from_position as warm_variant_key_from_position,
 };
-use crate::lance_cache::variation_runtime::SinglePathLanceVariationLookup;
+use crate::lance_cache::variation_runtime::{
+    SinglePathLanceVariationLookup, StreamingPositionCursor,
+};
 use crate::partitioned_cache::PartitionedLanceCache;
 use tokio::sync::OnceCell;
 
@@ -85,9 +87,10 @@ pub struct KvLookupExec {
     /// matching (parity with parquet path's two-pass allele matching).
     reference_fasta_path: Option<String>,
     target_partitions: usize,
-    /// Per-contig lance variation lookup (dataset + PositionRowIdIndex), built
-    /// once and shared across all per-partition streams via the Arc. Single-flight
-    /// via OnceCell so simultaneous fan-out probes build it exactly once.
+    /// Per-contig lance variation lookup (dataset + page directory + streaming
+    /// reader), built once and shared across all per-partition streams via the
+    /// Arc. Single-flight via OnceCell so simultaneous fan-out probes build it
+    /// exactly once. Each partition derives its own streaming cursor.
     #[cfg(feature = "lance-cache")]
     lance_lookup_cell: Arc<OnceCell<Arc<SinglePathLanceVariationLookup>>>,
 }
@@ -353,9 +356,10 @@ struct KvLookupStream {
     /// Shared (Arc-cloned from the exec) per-contig variation lookup, built once.
     #[cfg(feature = "lance-cache")]
     lance_lookup_cell: Arc<OnceCell<Arc<SinglePathLanceVariationLookup>>>,
-    /// Per-partition forward walk cursor into the shared index (keyed by chrom).
+    /// Per-partition resolution cursor (eager offset or streaming page cursor),
+    /// keyed by chrom. Created lazily from the shared lookup's backend.
     #[cfg(feature = "lance-cache")]
-    lance_cursors: HashMap<String, usize>,
+    lance_cursors: HashMap<String, StreamingPositionCursor>,
     warm_cold_backend: WarmColdVariationBackend,
     warm_cold_index_mode: WarmColdVariationIndexMode,
     profile_enabled: bool,
@@ -1424,7 +1428,8 @@ impl KvLookupStream {
                 );
             }
         }
-        self.lance_cursors.entry(chrom.to_string()).or_insert(0);
+        // The per-partition cursor is created lazily on first probe (it depends
+        // on the lookup backend chosen during open()).
 
         Ok(())
     }
@@ -1701,7 +1706,11 @@ impl KvLookupStream {
                         "lance variation lookup not built for {chrom}"
                     ))
                 })?;
-                let cursor = self.lance_cursors.entry(chrom.clone()).or_default();
+                if !self.lance_cursors.contains_key(&chrom) {
+                    let cursor = lookup.new_cursor();
+                    self.lance_cursors.insert(chrom.clone(), cursor);
+                }
+                let cursor = self.lance_cursors.get_mut(&chrom).unwrap();
                 let take_started = self.profile_enabled.then(Instant::now);
                 let taken = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()

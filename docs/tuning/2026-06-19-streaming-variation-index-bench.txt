@@ -1,0 +1,14 @@
+=== STREAMING (=1) scaling t1..t8 ===
+flag=1 t=1 real=169.40s rss=8404MB lookup_wait=0.244s mismatch=0 parity=PASS
+flag=1 t=2 real=150.47s rss=9792MB lookup_wait=0.000s mismatch=0 parity=PASS
+flag=1 t=3 real=150.09s rss=9517MB lookup_wait=0.000s mismatch=0 parity=PASS
+flag=1 t=4 real=146.74s rss=10062MB lookup_wait=0.000s mismatch=0 parity=PASS
+flag=1 t=5 real=148.23s rss=9560MB lookup_wait=0.000s mismatch=0 parity=PASS
+flag=1 t=6 real=148.09s rss=7896MB lookup_wait=0.000s mismatch=0 parity=PASS
+flag=1 t=7 real=150.28s rss=7517MB lookup_wait=0.000s mismatch=0 parity=PASS
+flag=1 t=8 real=148.96s rss=10489MB lookup_wait=0.000s mismatch=0 parity=PASS
+=== EAGER (=0) baseline t1,t4,t8 ===
+flag=0 t=1 real=166.45s rss=8569MB lookup_wait=0.972s mismatch=0 parity=PASS
+flag=0 t=4 real=151.16s rss=8765MB lookup_wait=0.000s mismatch=0 parity=PASS
+flag=0 t=8 real=149.65s rss=10146MB lookup_wait=0.000s mismatch=0 parity=PASS
+=== DONE ===

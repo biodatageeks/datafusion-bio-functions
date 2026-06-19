@@ -11,11 +11,20 @@ use lance_index::IndexCriteria;
 use lance_index::scalar::{IndexStore, lance_format::LanceIndexStore};
 
 const BTREE_PAGE_DATA_FILE: &str = "page_data.lance";
+const BTREE_PAGE_LOOKUP_FILE: &str = "page_lookup.lance";
 const BTREE_VALUES_COLUMN: &str = "values";
 const BTREE_IDS_COLUMN: &str = "ids";
+const PAGE_LOOKUP_MIN_COLUMN: &str = "min";
+const PAGE_LOOKUP_PAGE_IDX_COLUMN: &str = "page_idx";
+const BATCH_SIZE_META_KEY: &str = "batch_size";
+const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 
+/// Fully-materialized u32 position→row_id index. Retained only as the test
+/// parity oracle for [`StreamingPositionCursor`]; production resolves positions
+/// lazily via the streaming cursor and never builds this.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PositionRowIdIndex {
+pub(crate) struct PositionRowIdIndex {
     positions: Vec<u32>,
     row_ids: Vec<u64>,
     unique_positions: usize,
@@ -45,6 +54,7 @@ pub struct ResolvedRowIds {
     pub row_ids: Vec<u64>,
 }
 
+#[cfg(test)]
 impl PositionRowIdIndex {
     #[cfg(test)]
     pub fn from_pairs_for_test(mut pairs: Vec<(u32, u64)>) -> Self {
@@ -225,7 +235,106 @@ impl U64RowIdIndex {
     }
 }
 
-pub async fn load_start_index_from_lance_btree(
+/// In-memory page directory loaded from `page_lookup.lance` (the BTree
+/// sub-index). Maps a u32 position to the page number whose `[min,max]` band may
+/// contain it, so a streaming cursor can seek straight to its band without
+/// scanning `page_data.lance`. Tiny (one record per 4096-row page).
+pub(crate) struct PositionPageDirectory {
+    /// `page_mins[i]` = minimum position stored in page `i`; ascending across
+    /// pages because `page_data` is globally sorted by position.
+    page_mins: Vec<u32>,
+    num_pages: u32,
+    batch_size: u64,
+    num_rows: usize,
+}
+
+impl PositionPageDirectory {
+    pub(crate) async fn load(dataset: &lance::Dataset) -> Result<Self> {
+        let segments = load_btree_segments(dataset, "start", "start_btree_idx").await?;
+        let store = LanceIndexStore::from_dataset_for_existing(dataset, &segments[0])
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("open index store: {e}")))?;
+
+        let lookup = store
+            .open_index_file(BTREE_PAGE_LOOKUP_FILE)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("open page_lookup: {e}")))?;
+        let batch_size = lookup
+            .schema()
+            .metadata
+            .get(BATCH_SIZE_META_KEY)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+        let n = lookup.num_rows();
+        let batch = lookup
+            .read_range(0..n, None)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("read page_lookup: {e}")))?;
+        let mins = batch
+            .column_by_name(PAGE_LOOKUP_MIN_COLUMN)
+            .ok_or_else(|| DataFusionError::Execution("page_lookup missing 'min'".into()))?
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| DataFusionError::Execution("page_lookup 'min' not u32".into()))?;
+        let pages = batch
+            .column_by_name(PAGE_LOOKUP_PAGE_IDX_COLUMN)
+            .ok_or_else(|| DataFusionError::Execution("page_lookup missing 'page_idx'".into()))?
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| DataFusionError::Execution("page_lookup 'page_idx' not u32".into()))?;
+
+        let num_pages = pages
+            .values()
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let mut page_mins = vec![u32::MAX; num_pages as usize];
+        for i in 0..mins.len() {
+            // `min` is nullable in the schema; positions are non-null in practice.
+            if mins.is_valid(i) {
+                page_mins[pages.value(i) as usize] = mins.value(i);
+            }
+        }
+
+        let data = store
+            .open_index_file(BTREE_PAGE_DATA_FILE)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("open page_data: {e}")))?;
+
+        Ok(Self {
+            page_mins,
+            num_pages,
+            batch_size,
+            num_rows: data.num_rows(),
+        })
+    }
+
+    pub(crate) fn num_pages(&self) -> u32 {
+        self.num_pages
+    }
+
+    pub(crate) fn batch_size(&self) -> u64 {
+        self.batch_size
+    }
+
+    pub(crate) fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    /// First page that may contain `position`: the last page whose `min <=
+    /// position` (clamped to page 0 when `position` precedes all page minima).
+    pub(crate) fn first_page_for(&self, position: u32) -> u32 {
+        match self.page_mins.partition_point(|&m| m <= position) {
+            0 => 0,
+            i => (i - 1) as u32,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn load_start_index_from_lance_btree(
     dataset: &lance::Dataset,
 ) -> Result<PositionRowIdIndex> {
     load_u32_btree_index(dataset, "start", "start_btree_idx").await
@@ -243,17 +352,36 @@ pub async fn load_transcript_id_index_from_lance_btree(
     load_string_btree_index(dataset, "transcript_id", "transcript_id_btree_idx").await
 }
 
+#[cfg(test)]
 async fn load_u32_btree_index(
     dataset: &lance::Dataset,
     column: &str,
     index_name: &str,
 ) -> Result<PositionRowIdIndex> {
+    let profile = std::env::var_os("VEP_LANCE_PROFILE").is_some();
+    let segments_started = profile.then(std::time::Instant::now);
     let index_segments = load_btree_segments(dataset, column, index_name).await?;
+    let segments_s = segments_started.map(|t| t.elapsed());
+    let pairs_started = profile.then(std::time::Instant::now);
     let mut pairs = Vec::<(u32, u64)>::new();
     for index_segment in &index_segments {
         append_btree_segment_pairs(dataset, index_segment, &mut pairs).await?;
     }
+    let pairs_read_s = pairs_started.map(|t| t.elapsed());
+    let sort_started = profile.then(std::time::Instant::now);
     pairs.sort_unstable_by_key(|(position, row_id)| (*position, *row_id));
+    let sort_s = sort_started.map(|t| t.elapsed());
+    if let (Some(segments_s), Some(pairs_read_s), Some(sort_s)) = (segments_s, pairs_read_s, sort_s)
+    {
+        eprintln!(
+            "[vep-lance-profile] u32_index_breakdown column={column} segments={} pairs={} segments_s={:.3} pairs_read_s={:.3} sort_s={:.3}",
+            index_segments.len(),
+            pairs.len(),
+            segments_s.as_secs_f64(),
+            pairs_read_s.as_secs_f64(),
+            sort_s.as_secs_f64(),
+        );
+    }
 
     let mut positions = Vec::with_capacity(pairs.len());
     let mut row_ids = Vec::with_capacity(pairs.len());
@@ -321,7 +449,7 @@ async fn load_string_btree_index(
     StringRowIdIndex::new(values, row_ids, unique_values)
 }
 
-async fn load_btree_segments(
+pub(crate) async fn load_btree_segments(
     dataset: &lance::Dataset,
     column: &str,
     index_name: &str,
@@ -355,6 +483,7 @@ async fn load_btree_segments(
     Ok(index_segments)
 }
 
+#[cfg(test)]
 async fn append_btree_segment_pairs(
     dataset: &lance::Dataset,
     index_segment: &IndexMetadata,
@@ -460,6 +589,7 @@ async fn append_btree_segment_string_pairs(
     Ok(())
 }
 
+#[cfg(test)]
 fn append_btree_page_row_id_pairs(batch: &RecordBatch, pairs: &mut Vec<(u32, u64)>) -> Result<()> {
     let value_array = batch
         .column_by_name(BTREE_VALUES_COLUMN)
