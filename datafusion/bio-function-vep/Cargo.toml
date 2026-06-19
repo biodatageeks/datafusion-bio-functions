@@ -59,18 +59,6 @@ name = "lookup_parquet_bench"
 required-features = []
 
 [[example]]
-name = "annotate_vep_golden_bench"
-required-features = []
-
-[[example]]
-name = "profile_annotation"
-required-features = []
-
-[[example]]
-name = "bench_annotate_vcf"
-required-features = []
-
-[[example]]
 name = "build_lance_variation_chrom"
 required-features = ["lance-cache", "cache-builder"]
 
