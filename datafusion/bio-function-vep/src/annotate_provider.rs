@@ -8710,6 +8710,32 @@ impl ContigPipelineProfile {
     }
 }
 
+/// Process peak resident set size in MB (`getrusage` `ru_maxrss`, monotonic
+/// high-water mark). macOS reports bytes; Linux reports kilobytes.
+fn peak_rss_mb() -> u64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0;
+    }
+    let max = usage.ru_maxrss as u64;
+    #[cfg(target_os = "macos")]
+    {
+        max / (1024 * 1024)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        max / 1024
+    }
+}
+
+/// Log the current peak RSS at a phase boundary (VEP_PROFILE only). Because
+/// `ru_maxrss` is monotonic, the phase at which it jumps is the peak driver.
+fn log_phase_rss(chrom: &str, label: &str) {
+    if profiling_enabled() {
+        eprintln!("[VEP_RSS] {chrom}: {label} peak_rss={}MB", peak_rss_mb());
+    }
+}
+
 fn record_contig_profile(
     profile: &Option<SharedContigPipelineProfile>,
     update: impl FnOnce(&mut ContigPipelineProfile),
@@ -9733,6 +9759,14 @@ fn spawn_annotation_from_lookup_sharded(
             }
             Ok(())
         })?;
+        if profiling_enabled() {
+            eprintln!(
+                "[VEP_RSS] shard partition done colocated_entries={} shard_rows={} peak_rss={}MB",
+                worker.colocated_map.len(),
+                shard.input_rows,
+                peak_rss_mb(),
+            );
+        }
         let rows = shard.input_rows;
         shard.finish()?;
         Ok(rows)
@@ -11919,6 +11953,7 @@ async fn prepare_contig_context(
             return Err(e);
         }
     };
+    log_phase_rss(&chrom, "after_context_load");
 
     let tmp_provider = AnnotateProvider::new(
         Arc::clone(&session),
@@ -11956,6 +11991,7 @@ async fn prepare_contig_context(
     } else {
         None
     };
+    log_phase_rss(&chrom, "after_sift_load");
 
     let shared_ctx_started = Instant::now();
     let base_transcripts = Arc::new(tx_vec);
@@ -11993,6 +12029,7 @@ async fn prepare_contig_context(
         profile.prepare_shared_ctx += shared_ctx_started.elapsed();
         profile.prepare_total += t_contig.elapsed();
     });
+    log_phase_rss(&chrom, "after_prepare");
 
     Ok(Some(ContigReadyState {
         lookup_partitions,

@@ -1470,6 +1470,7 @@ dependencies = [
  "lance",
  "lance-file",
  "lance-index",
+ "libc",
  "log",
  "lz4_flex",
  "memmap2",
