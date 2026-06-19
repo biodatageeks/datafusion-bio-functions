@@ -1752,6 +1752,31 @@ fn push_unique_value(values: &mut Vec<String>, value: &str) {
     }
 }
 
+/// Displays an `Option<T>` as the inner value (when `Some`) or nothing (when
+/// `None`) — byte-for-byte equal to `opt.map(|v| v.to_string()).unwrap_or_default()`
+/// but without allocating a `String` to feed a `write!`.
+struct OptDisplay<T>(Option<T>);
+impl<T: std::fmt::Display> std::fmt::Display for OptDisplay<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(v) = &self.0 {
+            write!(f, "{v}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Displays a `&str` ASCII-uppercased without allocating — byte-for-byte equal to
+/// `s.to_ascii_uppercase()` (ASCII letters uppercased, all other bytes unchanged).
+struct AsciiUpperDisplay<'a>(&'a str);
+impl std::fmt::Display for AsciiUpperDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for ch in self.0.chars() {
+            write!(f, "{}", ch.to_ascii_uppercase())?;
+        }
+        Ok(())
+    }
+}
+
 impl ColocatedEntry {
     /// Traceability:
     /// - Ensembl VEP `add_colocated_variant_info()`
@@ -5969,7 +5994,7 @@ impl AnnotateProvider {
                         if !csq_buf.is_empty() {
                             csq_buf.push(',');
                         }
-                        let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
+                        let distance = OptDisplay(tc.distance);
                         let tc_flags = tc.flags.as_deref().unwrap_or("");
                         let pick_str = if tc.picked { "1" } else { "" };
                         let hgvsc = if hgvs_flags.hgvsc {
@@ -5995,10 +6020,11 @@ impl AnnotateProvider {
                         let refseq_match = tx_opt
                             .and_then(|tx| tx.refseq_match.as_deref())
                             .unwrap_or("");
-                        let bam_edit = tx_opt
-                            .and_then(|tx| tx.bam_edit_status.as_deref())
-                            .map(str::to_ascii_uppercase)
-                            .unwrap_or_default();
+                        let bam_edit = AsciiUpperDisplay(
+                            tx_opt
+                                .and_then(|tx| tx.bam_edit_status.as_deref())
+                                .unwrap_or(""),
+                        );
                         let source_val = if include_source_field { source } else { "" };
                         let refseq_offset_value = tx_opt
                             .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
@@ -6010,9 +6036,7 @@ impl AnnotateProvider {
                                         refseq_misalignment_offset(tx, cdna_start)
                                     })
                             });
-                        let refseq_offset = refseq_offset_value
-                            .map(|offset| offset.to_string())
-                            .unwrap_or_default();
+                        let refseq_offset = OptDisplay(refseq_offset_value);
                         let given_ref = tc.given_ref.as_deref().unwrap_or("");
                         let used_ref = tc.used_ref.as_deref().unwrap_or("");
 
@@ -6020,10 +6044,7 @@ impl AnnotateProvider {
                         let canonical = tx_opt
                             .map(|tx| if tx.is_canonical { "YES" } else { "" })
                             .unwrap_or("");
-                        let tsl_str = tx_opt
-                            .and_then(|tx| tx.tsl)
-                            .map(|v| v.to_string())
-                            .unwrap_or_default();
+                        let tsl_str = OptDisplay(tx_opt.and_then(|tx| tx.tsl));
                         let mane_select = tx_opt
                             .and_then(|tx| tx.mane_select.as_deref())
                             .unwrap_or("");
@@ -6052,26 +6073,22 @@ impl AnnotateProvider {
                             // decision. RefSeq rows with failed BAM edit replay can
                             // still emit transcript-space HGVSc, but VEP suppresses
                             // the exposed genomic shift for those transcripts.
-                            let hgvs_offset = if hgvs_flags.hgvsc {
-                                tx_opt
-                                    .zip(row_variant.as_ref())
-                                    .and_then(|(tx, variant)| {
-                                        let ref_allele = tc
-                                            .used_ref
-                                            .as_deref()
-                                            .unwrap_or(variant.ref_allele.as_str());
-                                        crate::hgvs::hgvsc_offset_for_output(
-                                            tx,
-                                            variant,
-                                            ref_allele,
-                                            tc.hgvsc.as_deref(),
-                                        )
-                                    })
-                                    .map(|offset| offset.to_string())
-                                    .unwrap_or_default()
+                            let hgvs_offset = OptDisplay(if hgvs_flags.hgvsc {
+                                tx_opt.zip(row_variant.as_ref()).and_then(|(tx, variant)| {
+                                    let ref_allele = tc
+                                        .used_ref
+                                        .as_deref()
+                                        .unwrap_or(variant.ref_allele.as_str());
+                                    crate::hgvs::hgvsc_offset_for_output(
+                                        tx,
+                                        variant,
+                                        ref_allele,
+                                        tc.hgvsc.as_deref(),
+                                    )
+                                })
                             } else {
-                                String::new()
-                            };
+                                None
+                            });
                             // MANE generic: VEP emits "MANE_Select" or "MANE_Plus_Clinical"
                             // depending on the transcript's MANE annotation.
                             // Traceability:
