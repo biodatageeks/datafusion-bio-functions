@@ -198,6 +198,11 @@ pub(crate) struct VcfShardContext {
     pub(crate) sample_names: Arc<Vec<String>>,
     pub(crate) coordinate_zero_based: bool,
     pub(crate) tempdir: PathBuf,
+    /// Running count of input rows annotated across all shard workers. Polled by
+    /// `drive_sharded_vcf_annotation` to drive the progress bar / callback
+    /// incrementally during annotation (shards are written concurrently and only
+    /// concatenated at the end, so this is the only live progress signal).
+    pub(crate) rows_done: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn format_vcf_body_chunk(
@@ -1194,9 +1199,59 @@ async fn drive_sharded_vcf_annotation(
 
     // Drive the plan to completion: the workers write their shards; this stream
     // yields no row batches. `?` propagates the first worker error (no concat).
+    // Workers bump `shard_ctx.rows_done` as they annotate each window; a sibling
+    // OS thread polls it so the progress bar / callback advance DURING annotation
+    // rather than jumping only at concat. The poller uses `std::thread::sleep`
+    // (not a tokio timer) so it works regardless of whether the caller's runtime
+    // enabled the time driver.
+    use std::sync::atomic::Ordering::Relaxed;
     let mut stream = plan.execute(0, ctx.task_ctx())?;
-    while let Some(batch) = stream.next().await {
-        let _ = batch?;
+    let progress_started = Instant::now();
+    let progress_trace = std::env::var_os("VEP_PROFILE").is_some();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let reported = std::sync::atomic::AtomicUsize::new(0);
+    let drive_result: Result<()> = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let now = shard_ctx.rows_done.load(Relaxed);
+                let last = reported.load(Relaxed);
+                if now > last {
+                    reported.store(now, Relaxed);
+                    pb.set_position(now as u64);
+                    if progress_trace {
+                        eprintln!(
+                            "[VEP_PROGRESS] annotated {now}/{total_input} (+{}) at {:.1}s",
+                            now - last,
+                            progress_started.elapsed().as_secs_f64(),
+                        );
+                    }
+                    if let Some(ref cb) = config.on_batch_written {
+                        cb(now - last, now, total_input);
+                    }
+                }
+            }
+        });
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                while let Some(batch) = stream.next().await {
+                    let _ = batch?;
+                }
+                Ok::<(), DataFusionError>(())
+            })
+        });
+        stop.store(true, Relaxed);
+        res
+    });
+    drive_result?;
+    // Final flush: report any rows annotated since the poller's last tick.
+    let now = shard_ctx.rows_done.load(Relaxed);
+    let last = reported.load(Relaxed);
+    if now > last {
+        pb.set_position(now as u64);
+        if let Some(ref cb) = config.on_batch_written {
+            cb(now - last, now, total_input);
+        }
     }
 
     // Assemble: concat the body shards in ascending (= position) id order.
@@ -1224,15 +1279,14 @@ async fn drive_sharded_vcf_annotation(
     }
     shards.sort_by_key(|(id, _)| *id);
 
+    // Concat is just byte-copy assembly; progress was already reported during
+    // annotation above, so don't advance the bar / callback again here (the
+    // input-row count would otherwise be double-counted against output lines).
     let mut total_rows = 0usize;
     for (_, path) in shards {
         let lines = copy_body_file_counting_lines(&path, writer)?;
         let _ = std::fs::remove_file(&path);
         total_rows += lines;
-        pb.inc(lines as u64);
-        if let Some(ref cb) = config.on_batch_written {
-            cb(lines, total_rows, total_input);
-        }
     }
     Ok(total_rows)
 }
@@ -1513,6 +1567,7 @@ pub async fn annotate_to_vcf(
             sample_names: Arc::new(sample_names),
             coordinate_zero_based,
             tempdir: tempdir.path().to_path_buf(),
+            rows_done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         total_rows = drive_sharded_vcf_annotation(
             &ctx,

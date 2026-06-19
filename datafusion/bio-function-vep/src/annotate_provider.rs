@@ -9735,6 +9735,7 @@ fn spawn_annotation_from_lookup_sharded(
             }
             if buf_rows >= input_buffer_size {
                 let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
+                let window_input_rows = buf_rows;
                 buf_rows = 0;
                 tokio::task::block_in_place(|| -> Result<()> {
                     hydrate_worker_window(&mut worker, &window, cache_source_type)?;
@@ -9744,11 +9745,16 @@ fn spawn_annotation_from_lookup_sharded(
                     }
                     Ok(())
                 })?;
+                // Report annotated input rows so the progress bar advances live.
+                shard_ctx
+                    .rows_done
+                    .fetch_add(window_input_rows, std::sync::atomic::Ordering::Relaxed);
             }
         }
         // Final flush: lookup closed → annotate the remaining partial window.
         worker.lookup_done = true;
         let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
+        let window_input_rows: usize = window.iter().map(|b| b.num_rows()).sum();
         tokio::task::block_in_place(|| -> Result<()> {
             if !window.is_empty() {
                 hydrate_worker_window(&mut worker, &window, cache_source_type)?;
@@ -9759,6 +9765,9 @@ fn spawn_annotation_from_lookup_sharded(
             }
             Ok(())
         })?;
+        shard_ctx
+            .rows_done
+            .fetch_add(window_input_rows, std::sync::atomic::Ordering::Relaxed);
         if profiling_enabled() {
             eprintln!(
                 "[VEP_RSS] shard partition done colocated_entries={} shard_rows={} peak_rss={}MB",
