@@ -181,7 +181,7 @@ use crate::allele::{
 use crate::annotation_store::AnnotationBackend;
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 use crate::lookup_provider::LookupProvider;
-use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
+use crate::miss_worklist::MissWorklist;
 #[cfg(feature = "lance-cache")]
 use crate::partitioned_cache::PartitionedLanceCache;
 use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
