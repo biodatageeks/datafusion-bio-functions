@@ -95,23 +95,64 @@ packed, with ~27 allocations/batch instead of ~54/variant.
 4. Colocated matching (`compare_existing`, allele matching) unchanged — only the
    AF/string *storage* changes, not the matching logic.
 
-## 5. Interfaces (subject to Task 0 spike confirmation)
+## 5. Interfaces — confirmed by Task 0 spike (2026-06-19)
 
-- `colocated.rs`: `ColocatedCacheEntry.af_values: Vec<String>` →
-  `af: AfColumns, af_row: u32` (+ accessor). Same for the other string fields.
-- `colocated.rs`: `ColocatedSinkValue` carries `Arc`'d arrays + row index.
-- `annotate_provider.rs`: `ColocatedEntry` mirrors the above; `build_colocated_
-  map_from_sink` becomes `Arc::clone` not deep clone; consumers call
-  `entry.af_value(idx)` instead of `&entry.af_values[idx]`.
-- Lookup collect site (variant_lookup_exec.rs / lance_cache/lookup_exec.rs):
-  store array refs + row index instead of `.to_string()`.
+**Exact sites (all `datafusion/bio-function-vep/src/`):**
+
+- `ColocatedCacheEntry` struct: `colocated.rs:24-36`; field `af_values: Vec<String>` at `:35`.
+- `ColocatedEntry` (annotate side): `annotate_provider.rs:1599-1610`; `af_values` at `:1609`.
+- `ColocatedSinkValue`: `colocated.rs:329-341`; `ColocatedSink` (Arc<Mutex<HashMap<Key,Value>>>) `:344`.
+- **Collect site (the per-variant `.to_string()` loop):** `lookup_exec.rs:1133-1140`
+  builds `Vec<String>` via `batch_string_value(batch, *idx, row).unwrap_or_default()`;
+  pushes `ColocatedCacheEntry` at `:1141-1151`. Inside the per-row loop `for &row in rows`
+  (`:1079`), under the `if let (Some(buf), Some(prepared), Some(ci))` guard (`:1093`).
+  `WarmColocIndices.af_indices: Vec<Option<usize>>` (`lookup_exec.rs:388`); resolved
+  once per batch by `resolve_batch_coloc_indices` (`:1986`, `coloc_indices` at `:1072`).
+- **Second copy:** `build_colocated_map_from_sink` `annotate_provider.rs:2095-2144`;
+  deep clone `af_values: ce.af_values.clone()` at `:2130`. Source owned (drained via
+  `std::mem::take` in `drain_colocated_sink` `:2146`). Accumulates into a target map
+  via `merge_colocated_delta` (`:2161`).
+- **AF consumer:** the ONLY `ColocatedEntry.af_values` read is the
+  `ColocatedFrequencyFields` builder `annotate_provider.rs:1962` (`idx >= af_values.len()`)
+  + `:1966` (`let raw = &af_values[idx]`, then `raw.is_empty()`/`raw.split(',')`). Needs
+  `&str` only. (The `:1649/:1671` sites read the separate post-aggregation
+  `ColocatedVariantFields`/`ColocatedFrequencyFields`, NOT `ColocatedEntry` — unaffected.)
+- **Probe to update:** `colocated_map_bytes` `annotate_provider.rs:8762-8765` (the
+  `for af in &e.af_values { bytes += af.capacity() }` block).
+- **`batch_string_value`** (`lookup_exec.rs:1929`) downcasts to `StringArray` /
+  `StringViewArray` / `LargeStringArray`. Post-`unbundle_af_columns` (`af_bundle.rs:195`)
+  AF columns are concrete `StringArray` (Utf8), **null-free, empty-string-as-absent**
+  (`af_bundle.rs:123-141` appends `""` for absent). `AF_COL_NAMES` / `AF_COLUMNS` = 27 each.
+- **No `take_rows` exists** — collect reads the full `&RecordBatch` indexed by `row_usize`.
+
+**Design decisions locked from the spike:**
+
+1. **`AfColumns(Arc<Vec<ArrayRef>>)`, not `Arc<Vec<StringArray>>`.** Storing `ArrayRef`
+   + a read-time downcast lets the accessor handle all three string-array types exactly
+   like `batch_string_value` (byte-identical) and avoids any per-batch conversion. Absent
+   columns (`af_indices[i] == None`) get an empty `StringArray` placeholder; the accessor
+   returns `""` for null / `row >= len` / absent / non-string. 27 entries, indexed by
+   `AF_COL_NAMES` order.
+2. **AF field only in this slice.** `variation_name`/`allele_string`/`clin_sig`/
+   `clin_sig_allele`/`pubmed` stay `String`/`Option<String>` for now — `variation_name`
+   is a dedup HashMap key (`:2107/:2120`) and the rest are `Option<String>`, adding risk
+   for ~1/3 of the win. Deferred to the §7 follow-up, gated on G3.
 
 ## 6. Risks
 
-- **R1 — retained batch over-retention.** Holding `Arc<StringArray>` keeps that
-  column alive; ensure only the needed AF (+ string) columns are retained, not
-  the whole take_rows batch. Mitigation: build `AfColumns` by projecting/cloning
-  only the required columns (cheap — column `Arc` clone).
+- **R1 — retained batch over-retention (ELEVATED by spike).** Spec §3 assumed
+  `take_rows` yields matched-rows-only arrays. It does NOT — there is no `take_rows`;
+  the collect site reads the full `&RecordBatch`. So `Arc`-retaining a column keeps
+  ALL of that batch's rows alive, not just the matched ones, for as long as any entry
+  from that batch lives in the (accumulating) colocated map. Mitigation taken: build
+  `AfColumns` from only the 27 AF column `ArrayRef`s (one `Arc::clone` each — the whole
+  batch / other columns are NOT retained), and entries from the same batch+call SHARE
+  one `AfColumns` Arc. **Decision: accept full-batch AF-column retention** (it is the
+  only approach that meets the primary G2 allocation-count goal: ~2 allocs/batch vs
+  ~54 String allocs/variant), and **measure peak in Task 5 (G3)**. Fallback if G3
+  regresses: per-call `arrow::compute::take` to gather matched rows into compact
+  columns (bounds retention, but ~27 take ops/call ≈ no count win for the common
+  small-match case — hence not the default).
 - **R2 — exact collect/sink sites unknown.** The precise code building
   `ColocatedCacheEntry.af_values` from Arrow and the sink drain path are not yet
   read. Task 0 spike locates them.
