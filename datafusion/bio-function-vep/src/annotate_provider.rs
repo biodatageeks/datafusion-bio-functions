@@ -168,7 +168,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties,
 };
-use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext, col, lit};
+use datafusion::prelude::{Expr, SessionContext, col, lit};
 use futures::{Future, Stream, StreamExt};
 use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
@@ -8864,6 +8864,18 @@ type SharedContigPipelineProfile = Arc<Mutex<ContigPipelineProfile>>;
 #[derive(Debug, Default)]
 struct ContigPipelineProfile {
     context_load: Duration,
+    /// Total wall of prepare_contig_context (everything before workers start).
+    prepare_total: Duration,
+    /// Prepare phase before context load: schema reads + lookup plan build + worker spawn.
+    prepare_setup: Duration,
+    /// Building the shared annotation context (indexes, cache regions) after loads.
+    prepare_shared_ctx: Duration,
+    /// Per-entity Lance scan IO (separate from the parse timers below).
+    context_transcripts_scan: Duration,
+    context_exons_scan: Duration,
+    context_translations_scan: Duration,
+    context_regulatory_scan: Duration,
+    context_motifs_scan: Duration,
     context_transcripts: Duration,
     context_exons: Duration,
     context_translations: Duration,
@@ -8896,7 +8908,7 @@ struct ContigPipelineProfile {
 impl ContigPipelineProfile {
     fn summary_line(&self, chrom: &str) -> String {
         format!(
-            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} context_load={:.3}s context_tx={:.3}s context_exons={:.3}s context_tl={:.3}s context_reg={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s",
+            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} prepare_total={:.3}s prepare_setup={:.3}s prepare_shared_ctx={:.3}s context_load={:.3}s context_tx_scan={:.3}s context_tx={:.3}s context_exons_scan={:.3}s context_exons={:.3}s context_tl_scan={:.3}s context_tl={:.3}s context_reg_scan={:.3}s context_reg={:.3}s context_motif_scan={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s",
             self.lookup_partitions,
             self.lookup_batches,
             self.lookup_buffered_batches_max,
@@ -8904,11 +8916,19 @@ impl ContigPipelineProfile {
             self.input_buffers,
             self.output_batches,
             self.output_rows,
+            self.prepare_total.as_secs_f64(),
+            self.prepare_setup.as_secs_f64(),
+            self.prepare_shared_ctx.as_secs_f64(),
             self.context_load.as_secs_f64(),
+            self.context_transcripts_scan.as_secs_f64(),
             self.context_transcripts.as_secs_f64(),
+            self.context_exons_scan.as_secs_f64(),
             self.context_exons.as_secs_f64(),
+            self.context_translations_scan.as_secs_f64(),
             self.context_translations.as_secs_f64(),
+            self.context_regulatory_scan.as_secs_f64(),
             self.context_regulatory.as_secs_f64(),
+            self.context_motifs_scan.as_secs_f64(),
             self.context_motifs.as_secs_f64(),
             self.worker_init.as_secs_f64(),
             self.lookup_wait.as_secs_f64(),
@@ -8963,6 +8983,7 @@ async fn load_lance_contig_context(
     config: &ContigAnnotationConfig,
     profile: &Option<SharedContigPipelineProfile>,
 ) -> Result<LoadedContigContext> {
+    let scan_started = Instant::now();
     let tx_batches = scan_lance_context_entity(
         cache,
         "transcript",
@@ -9021,6 +9042,9 @@ async fn load_lance_contig_context(
         ],
     )
     .await?;
+    record_contig_profile(profile, |profile| {
+        profile.context_transcripts_scan += scan_started.elapsed();
+    });
     let started = Instant::now();
     let (tx, translateable_seq) =
         AnnotateProvider::parse_lance_transcript_batches("transcript.lance", &tx_batches)?;
@@ -9033,6 +9057,7 @@ async fn load_lance_contig_context(
     });
     let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
 
+    let scan_started = Instant::now();
     let ex_batches = scan_lance_context_entity(
         cache,
         "exon",
@@ -9047,6 +9072,9 @@ async fn load_lance_contig_context(
         ],
     )
     .await?;
+    record_contig_profile(profile, |profile| {
+        profile.context_exons_scan += scan_started.elapsed();
+    });
     let started = Instant::now();
     let ex: Vec<_> = AnnotateProvider::parse_lance_exon_batches("exon.lance", &ex_batches)?
         .into_iter()
@@ -9056,6 +9084,7 @@ async fn load_lance_contig_context(
         profile.context_exons += started.elapsed();
     });
 
+    let scan_started = Instant::now();
     let tl_batches = scan_lance_context_entity(
         cache,
         "translation_core",
@@ -9080,6 +9109,9 @@ async fn load_lance_contig_context(
         ],
     )
     .await?;
+    record_contig_profile(profile, |profile| {
+        profile.context_translations_scan += scan_started.elapsed();
+    });
     let started = Instant::now();
     let tl: Vec<_> =
         AnnotateProvider::parse_lance_translation_batches("translation_core.lance", &tl_batches)?
@@ -9090,6 +9122,7 @@ async fn load_lance_contig_context(
         profile.context_translations += started.elapsed();
     });
 
+    let scan_started = Instant::now();
     let rg_batches = scan_lance_context_entity(
         cache,
         "regulatory",
@@ -9104,12 +9137,16 @@ async fn load_lance_contig_context(
         ],
     )
     .await?;
+    record_contig_profile(profile, |profile| {
+        profile.context_regulatory_scan += scan_started.elapsed();
+    });
     let started = Instant::now();
     let rg = AnnotateProvider::parse_lance_regulatory_batches("regulatory.lance", &rg_batches)?;
     record_contig_profile(profile, |profile| {
         profile.context_regulatory += started.elapsed();
     });
 
+    let scan_started = Instant::now();
     let mt_batches = scan_lance_context_entity(
         cache,
         "motif",
@@ -9117,6 +9154,9 @@ async fn load_lance_contig_context(
         &["motif_id", "feature_id", "chrom", "start", "\"end\""],
     )
     .await?;
+    record_contig_profile(profile, |profile| {
+        profile.context_motifs_scan += scan_started.elapsed();
+    });
     let started = Instant::now();
     let mt = AnnotateProvider::parse_lance_motif_batches("motif.lance", &mt_batches)?;
     record_contig_profile(profile, |profile| {
@@ -11995,6 +12035,9 @@ async fn prepare_contig_context(
     let t_contig = profile_start!();
     let pipeline_profile =
         profiling_enabled().then(|| Arc::new(Mutex::new(ContigPipelineProfile::default())));
+    // Cloned handle so prepare_shared_ctx / prepare_total can still be recorded
+    // after `pipeline_profile` is moved into the shared context below.
+    let profile_handle = pipeline_profile.clone();
     if profiling_enabled() {
         eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
     }
@@ -12150,6 +12193,12 @@ async fn prepare_contig_context(
     });
 
     // Context arm: load transcripts, exons, translations, etc. (Lance only).
+    // Everything up to here (schema reads, lookup plan build, worker spawn) is
+    // setup that runs before any context data is loaded.
+    record_contig_profile(&pipeline_profile, |profile| {
+        profile.prepare_setup += t_contig.elapsed();
+    });
+
     let context_result: Result<LoadedContigContext> = async {
         let t_ctx = profile_start!();
         pipeline_trace::emit("context", "start", &[("chrom", TraceValue::Str(&chrom))]);
@@ -12247,11 +12296,17 @@ async fn prepare_contig_context(
         let lance_cache = cache.as_lance().ok_or_else(|| {
             DataFusionError::Execution("Lance SIFT store requires a Lance cache layout".to_string())
         })?;
-        load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?
+        let sift_started = Instant::now();
+        let store = load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?;
+        record_contig_profile(&pipeline_profile, |profile| {
+            profile.sift_load += sift_started.elapsed();
+        });
+        store
     } else {
         None
     };
 
+    let shared_ctx_started = Instant::now();
     let base_transcripts = Arc::new(tx_vec);
     let transcript_cache_regions = Arc::new(
         base_transcripts
@@ -12280,6 +12335,13 @@ async fn prepare_contig_context(
         sift_direct,
         #[cfg(feature = "lance-cache")]
         sift_prediction_store,
+    });
+
+    // `pipeline_profile` was moved into the shared context above; use the cloned
+    // handle to record the shared-context build cost and the total prepare wall.
+    record_contig_profile(&profile_handle, |profile| {
+        profile.prepare_shared_ctx += shared_ctx_started.elapsed();
+        profile.prepare_total += t_contig.elapsed();
     });
 
     Ok(Some(ContigReadyState {
@@ -15498,6 +15560,11 @@ mod tests {
     fn test_contig_pipeline_profile_summary_formats_stage_timings() {
         let mut profile = ContigPipelineProfile::default();
         profile.context_load += std::time::Duration::from_millis(10);
+        profile.prepare_total += std::time::Duration::from_millis(11);
+        profile.prepare_setup += std::time::Duration::from_millis(12);
+        profile.prepare_shared_ctx += std::time::Duration::from_millis(13);
+        profile.context_transcripts_scan += std::time::Duration::from_millis(14);
+        profile.sift_load += std::time::Duration::from_millis(15);
         profile.worker_init += std::time::Duration::from_millis(20);
         profile.lookup_wait += std::time::Duration::from_millis(30);
         profile.hydration += std::time::Duration::from_millis(40);
@@ -15521,6 +15588,11 @@ mod tests {
         assert!(line.contains("output_batches=4"));
         assert!(line.contains("output_rows=5"));
         assert!(line.contains("context_load=0.010s"));
+        assert!(line.contains("prepare_total=0.011s"));
+        assert!(line.contains("prepare_setup=0.012s"));
+        assert!(line.contains("prepare_shared_ctx=0.013s"));
+        assert!(line.contains("context_tx_scan=0.014s"));
+        assert!(line.contains("sift_load=0.015s"));
         assert!(line.contains("worker_init=0.020s"));
         assert!(line.contains("lookup_wait=0.030s"));
         assert!(line.contains("hydrate=0.040s"));

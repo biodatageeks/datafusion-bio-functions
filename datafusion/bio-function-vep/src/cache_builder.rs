@@ -10,12 +10,6 @@ use datafusion_bio_format_ensembl_cache::{
     CacheSourceType as BioFormatsCacheSourceType, EnsemblEntityKind,
 };
 
-/// Progress callback: `(entity, format, batch_rows, total_rows, total_expected)`.
-///
-/// Retained for API compatibility with Python wrappers that pass a tqdm
-/// progress callback. The Lance build path does not currently invoke it.
-pub type OnProgress = Box<dyn Fn(&str, &str, usize, usize, usize) + Send + Sync>;
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheFormat {
     #[default]
@@ -43,10 +37,10 @@ impl CacheFormat {
 #[derive(Debug, Clone)]
 pub struct EntityStats {
     pub entity: String,
+    /// Files written for this entity, as `(path, row_count)`. Named
+    /// `parquet_files` for backward compatibility with the Python wrapper;
+    /// now holds the entity's Lance dataset files.
     pub parquet_files: Vec<(String, usize)>,
-    /// Retained for backward-compatible struct shape; always `None` (the
-    /// legacy fjall backend has been removed).
-    pub fjall_stats: Option<()>,
 }
 
 /// Builder for converting a raw Ensembl VEP cache to the partitioned Lance cache.
@@ -88,12 +82,6 @@ impl CacheBuilder {
     {
         let chroms: Vec<String> = chroms.into_iter().map(Into::into).collect();
         self.chrom_filter = (!chroms.is_empty()).then_some(chroms);
-        self
-    }
-
-    /// Deprecated no-op: the legacy fjall backend has been removed. The cache
-    /// is always built in the Lance format regardless of this flag.
-    pub fn with_build_fjall(self, _enabled: bool) -> Self {
         self
     }
 
@@ -141,11 +129,8 @@ impl CacheBuilder {
 
     /// Build a single entity. Returns one or more EntityStats (translation splits into two).
     ///
-    /// When `overwrite` is false (default), skips entities whose output
-    /// already exists:
-    /// - For parquet-only entities: skips if the parquet directory contains `.parquet` files
-    /// - For variation: skips parquet if files exist, skips fjall if `variation.fjall` exists
-    /// - For translation: skips parquet if files exist, skips sift fjall if `translation_sift.fjall` exists
+    /// When `overwrite` is false (default), skips entities whose Lance output
+    /// already exists.
     pub async fn build_entity(&self, entity: &str) -> Result<Vec<EntityStats>> {
         let kind = parse_entity(entity)
             .ok_or_else(|| DataFusionError::Execution(format!("Unknown entity: {entity}")))?;
@@ -252,7 +237,6 @@ mod tests {
             .with_partitions(4)
             .with_cache_format(CacheFormat::Lance)
             .with_overwrite(true)
-            .with_build_fjall(true)
             .with_chrom_filter(["chr1", "chr2"]);
         assert_eq!(builder.partitions, 4);
         assert_eq!(builder.cache_format, CacheFormat::Lance);

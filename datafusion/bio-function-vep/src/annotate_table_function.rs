@@ -19,9 +19,8 @@ use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 /// Table function implementing
 /// `annotate_vep(vcf_table, cache_source, backend [, options_json])`.
 ///
-/// Cache source mode is read from Arrow schema metadata on the cache backend:
-/// parquet metadata under `{cache_source}/variation` or Lance metadata under
-/// `{cache_source}/variation.lance`.
+/// Cache source mode is read from Arrow schema metadata on the Lance cache
+/// backend under `{cache_source}/variation.lance`.
 pub struct AnnotateFunction {
     session: Arc<SessionContext>,
     /// Catalog list captured at registration time to avoid acquiring
@@ -81,23 +80,17 @@ impl TableFunctionImpl for AnnotateFunction {
             None
         };
         reject_options_json_source_selectors(options_json.as_deref())?;
-        let cache_format = options_json_string_value(options_json.as_deref(), "cache_format")?;
-        let use_lance_source =
-            backend == AnnotationBackend::Lance || cache_format.as_deref() == Some("lance");
-        let cache_source_type = if use_lance_source {
-            #[cfg(feature = "lance-cache")]
-            {
-                CacheSourceType::from_partitioned_lance_cache_source(&cache_source)?
-            }
-            #[cfg(not(feature = "lance-cache"))]
-            {
-                return Err(DataFusionError::Plan(
-                    "annotate_vep(): Lance cache source metadata requires the lance-cache feature"
-                        .to_string(),
-                ));
-            }
-        } else {
-            CacheSourceType::from_partitioned_cache_source(&cache_source)?
+        // Backend is always Lance (`AnnotationBackend::parse` rejects everything
+        // else), so the cache source is always the partitioned Lance cache.
+        #[cfg(feature = "lance-cache")]
+        let cache_source_type =
+            CacheSourceType::from_partitioned_lance_cache_source(&cache_source)?;
+        #[cfg(not(feature = "lance-cache"))]
+        let cache_source_type: CacheSourceType = {
+            return Err(DataFusionError::Plan(
+                "annotate_vep(): Lance cache source metadata requires the lance-cache feature"
+                    .to_string(),
+            ));
         };
 
         let vcf_schema = resolve_schema_from_catalog(

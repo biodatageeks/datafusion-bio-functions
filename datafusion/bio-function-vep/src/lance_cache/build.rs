@@ -124,7 +124,6 @@ async fn build_lance_variation(options: &LanceCacheBuildOptions) -> Result<Vec<E
         return Ok(vec![EntityStats {
             entity: "variation.lance".to_string(),
             parquet_files: vec![],
-            fjall_stats: None,
         }]);
     }
 
@@ -145,7 +144,6 @@ async fn build_lance_variation(options: &LanceCacheBuildOptions) -> Result<Vec<E
     Ok(vec![EntityStats {
         entity: "variation.lance".to_string(),
         parquet_files: files,
-        fjall_stats: None,
     }])
 }
 
@@ -390,7 +388,6 @@ async fn build_lance_context_entity(
         return Ok(vec![EntityStats {
             entity: lance_entity_dir_name(entity),
             parquet_files: vec![],
-            fjall_stats: None,
         }]);
     }
 
@@ -452,7 +449,6 @@ async fn build_lance_context_entity(
     Ok(vec![EntityStats {
         entity: lance_entity_dir_name(entity),
         parquet_files: files,
-        fjall_stats: None,
     }])
 }
 
@@ -475,7 +471,6 @@ async fn build_lance_translation_sift(options: &LanceCacheBuildOptions) -> Resul
         return Ok(EntityStats {
             entity: lance_entity_dir_name(entity),
             parquet_files: vec![],
-            fjall_stats: None,
         });
     }
 
@@ -520,7 +515,6 @@ async fn build_lance_translation_sift(options: &LanceCacheBuildOptions) -> Resul
     Ok(EntityStats {
         entity: lance_entity_dir_name(entity),
         parquet_files: files,
-        fjall_stats: None,
     })
 }
 
@@ -535,7 +529,6 @@ async fn build_lance_translation_split(
         return Ok(EntityStats {
             entity: lance_entity_dir_name(entity),
             parquet_files: vec![],
-            fjall_stats: None,
         });
     }
 
@@ -580,7 +573,6 @@ async fn build_lance_translation_split(
     Ok(EntityStats {
         entity: lance_entity_dir_name(entity),
         parquet_files: files,
-        fjall_stats: None,
     })
 }
 
