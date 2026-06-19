@@ -1746,10 +1746,9 @@ fn variant_prefix_rank(variation_name: &str) -> u8 {
     }
 }
 
-fn push_unique_value(values: &mut Vec<String>, value: impl Into<String>) {
-    let value = value.into();
-    if !values.iter().any(|existing| existing == &value) {
-        values.push(value);
+fn push_unique_value(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
     }
 }
 
@@ -1894,7 +1893,7 @@ impl ColocatedData {
                     slot.push_str(value);
                 }
                 if let Some(value) = allele_terms.get(output_allele) {
-                    push_unique_value(&mut clin_sig_allele_values, value.clone());
+                    push_unique_value(&mut clin_sig_allele_values, value);
                 }
                 clin_sig_allele_exists = true;
             }
@@ -2024,7 +2023,7 @@ impl ColocatedData {
                 };
 
                 if flags.af_group_enabled(column.flag_group) {
-                    push_unique_value(&mut per_column[idx], chosen.clone());
+                    push_unique_value(&mut per_column[idx], &chosen);
                 }
 
                 if flags.max_af {
@@ -2042,7 +2041,7 @@ impl ColocatedData {
                                     entry_max_af_pops.push(pop_name.to_string());
                                 }
                                 Some((current, _)) if (freq - current).abs() < f64::EPSILON => {
-                                    push_unique_value(&mut entry_max_af_pops, pop_name.to_string());
+                                    push_unique_value(&mut entry_max_af_pops, pop_name);
                                 }
                                 _ => {}
                             }
@@ -12245,6 +12244,16 @@ mod tests {
         let drained = drain_colocated_sink(&sink).unwrap();
         assert_eq!(drained.len(), 1);
         assert!(sink.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn push_unique_value_dedups_and_preserves_first_seen_order() {
+        let mut v: Vec<String> = Vec::new();
+        push_unique_value(&mut v, "a");
+        push_unique_value(&mut v, "b");
+        push_unique_value(&mut v, "a"); // duplicate -> ignored
+        push_unique_value(&mut v, "c");
+        assert_eq!(v, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
     }
 
     #[test]
