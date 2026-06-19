@@ -180,7 +180,9 @@ use crate::allele::{
 };
 use crate::annotation_store::AnnotationBackend;
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
-use crate::colocated::{ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue};
+use crate::colocated::{
+    AfColumns, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
+};
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::MissWorklist;
 #[cfg(feature = "lance-cache")]
@@ -1605,8 +1607,22 @@ struct ColocatedEntry {
     clin_sig: Option<String>,
     clin_sig_allele: Option<String>,
     pubmed: Option<String>,
-    /// Raw AF column values (same order as `AF_COL_NAMES` / `AF_COLUMNS`).
-    af_values: Vec<String>,
+    /// Zero-copy AF columns (shared by `Arc` from the source cache batch) +
+    /// this entry's row. Same column order as `AF_COL_NAMES` / `AF_COLUMNS`.
+    af: AfColumns,
+    af_row: u32,
+}
+
+impl ColocatedEntry {
+    /// Raw AF value for column `col` (`AF_COLUMNS` order); `""` if null/absent.
+    fn af_value(&self, col: usize) -> &str {
+        self.af.value(col, self.af_row as usize)
+    }
+
+    /// Number of AF columns.
+    fn af_len(&self) -> usize {
+        self.af.len()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1959,11 +1975,11 @@ impl ColocatedData {
 
             for (idx, column) in AF_COLUMNS.iter().enumerate() {
                 let should_process = flags.max_af || flags.af_group_enabled(column.flag_group);
-                if !should_process || idx >= entry.af_values.len() {
+                if !should_process || idx >= entry.af_len() {
                     continue;
                 }
 
-                let raw = &entry.af_values[idx];
+                let raw = entry.af_value(idx);
                 if raw.is_empty() {
                     continue;
                 }
@@ -2127,7 +2143,9 @@ fn build_colocated_map_from_sink(
                 clin_sig: ce.clin_sig.clone(),
                 clin_sig_allele: ce.clin_sig_allele.clone(),
                 pubmed: ce.pubmed.clone(),
-                af_values: ce.af_values.clone(),
+                // Arc ref-count bump — no AF string data copied (was a deep Vec<String> clone).
+                af: ce.af.clone(),
+                af_row: ce.af_row,
             });
         }
 
@@ -12230,12 +12248,52 @@ mod tests {
     }
 
     #[test]
+    fn build_colocated_map_from_sink_shares_af_arc_no_deep_copy() {
+        let af = AfColumns::new(
+            (0..AF_COLUMNS.len())
+                .map(|_| Arc::new(StringArray::from(vec!["X:0.5"])) as Arc<dyn Array>)
+                .collect(),
+        );
+        let ce = ColocatedCacheEntry {
+            variation_name: "rs1".to_string(),
+            allele_string: "A/G".to_string(),
+            matched_alleles: Vec::new(),
+            somatic: 0,
+            pheno: 0,
+            clin_sig: None,
+            clin_sig_allele: None,
+            pubmed: None,
+            af: af.clone(),
+            af_row: 0,
+        };
+        let mut sink: HashMap<ColocatedKey, ColocatedSinkValue> = HashMap::new();
+        sink.insert(
+            ("1".to_string(), 1, 1, "A/G".to_string()),
+            ColocatedSinkValue {
+                entries: vec![ce],
+                compare_output_allele: None,
+                unshifted_output_allele: None,
+            },
+        );
+
+        let map = build_colocated_map_from_sink(&sink);
+        let data = map.values().next().expect("one colocated entry");
+        assert_eq!(data.entries.len(), 1);
+        // No deep AF copy: annotate-side entry shares the same Arc allocation.
+        assert!(data.entries[0].af.ptr_eq(&af));
+        assert_eq!(data.entries[0].af_value(0), "X:0.5");
+    }
+
+    #[test]
     fn colocated_repeat_indel_id_fallback_does_not_drive_frequency_fields() {
-        let mut af_values = vec![String::new(); AF_COLUMNS.len()];
-        af_values[0] = "AAAAAAAAAAAA:0.3031".to_string();
-        af_values[1] = "AAAAAAAAAAAA:0.4024".to_string();
-        af_values[16] = "AAAAAAAAAAAA:0.2803".to_string();
-        af_values[17] = "AAAAAAAAAAAA:0.3704".to_string();
+        let mut af_cols: Vec<Arc<dyn Array>> = (0..AF_COLUMNS.len())
+            .map(|_| Arc::new(StringArray::from(vec![""])) as Arc<dyn Array>)
+            .collect();
+        af_cols[0] = Arc::new(StringArray::from(vec!["AAAAAAAAAAAA:0.3031"])) as Arc<dyn Array>;
+        af_cols[1] = Arc::new(StringArray::from(vec!["AAAAAAAAAAAA:0.4024"])) as Arc<dyn Array>;
+        af_cols[16] = Arc::new(StringArray::from(vec!["AAAAAAAAAAAA:0.2803"])) as Arc<dyn Array>;
+        af_cols[17] = Arc::new(StringArray::from(vec!["AAAAAAAAAAAA:0.3704"])) as Arc<dyn Array>;
+        let af = AfColumns::new(af_cols);
 
         let data = ColocatedData {
             entries: vec![ColocatedEntry {
@@ -12253,7 +12311,8 @@ mod tests {
                 clin_sig: None,
                 clin_sig_allele: None,
                 pubmed: None,
-                af_values,
+                af,
+                af_row: 0,
             }],
             compare_output_allele: Some("A".to_string()),
             unshifted_output_allele: None,

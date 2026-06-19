@@ -32,7 +32,7 @@ use crate::allele::{
 };
 use crate::cache_common::AlleleMatcher;
 use crate::colocated::{
-    AF_COL_NAMES, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
+    AF_COL_NAMES, AfColumns, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
     compare_existing_variant_alleles, output_allele_from_allele_string, read_reference_sequence,
 };
 use crate::lance_cache::key_encoding::chrom_to_code;
@@ -1074,6 +1074,11 @@ fn probe_lance_taken_batch_position(
     } else {
         None
     };
+    // Build zero-copy AF column refs ONCE per batch (Arc::clone of the 27 AF
+    // columns, no string copy); every matched entry shares this by Arc + row index.
+    let af_columns = coloc_indices
+        .as_ref()
+        .map(|ci| AfColumns::from_batch(batch, &ci.af_indices));
 
     let mut matched = false;
     for &row in rows {
@@ -1090,10 +1095,11 @@ fn probe_lance_taken_batch_position(
             metrics.exact_match_calls += 1;
         }
 
-        if let (Some(buf), Some(prepared), Some(ci)) = (
+        if let (Some(buf), Some(prepared), Some(ci), Some(af_cols)) = (
             coloc_buf.as_deref_mut(),
             prepared_coloc.as_ref(),
             coloc_indices.as_ref(),
+            af_columns.as_ref(),
         ) {
             let colocated_started = Instant::now();
             if profile_detailed {
@@ -1130,14 +1136,6 @@ fn probe_lance_taken_batch_position(
                         compare_output_allele: prepared.compare_output_allele.clone(),
                         unshifted_output_allele: prepared.unshifted_output_allele.clone(),
                     });
-                    let af_values: Vec<String> = ci
-                        .af_indices
-                        .iter()
-                        .map(|idx| {
-                            batch_string_value(batch, *idx, row_usize)
-                                .map(|value| value.unwrap_or_default())
-                        })
-                        .collect::<Result<Vec<_>>>()?;
                     sink_value.entries.push(ColocatedCacheEntry {
                         variation_name: var_name,
                         allele_string: allele_string.clone(),
@@ -1147,7 +1145,8 @@ fn probe_lance_taken_batch_position(
                         clin_sig: batch_string_value(batch, ci.clin_sig, row_usize)?,
                         clin_sig_allele: batch_string_value(batch, ci.clin_sig_allele, row_usize)?,
                         pubmed: batch_string_value(batch, ci.pubmed, row_usize)?,
-                        af_values,
+                        af: af_cols.clone(),
+                        af_row: row,
                     });
                     if profile_detailed {
                         metrics.colocated_entries += 1;
@@ -2791,13 +2790,7 @@ mod tests {
             .expect("colocated entry keyed by parser allele");
         assert_eq!(sink_value.entries.len(), 1);
         assert_eq!(sink_value.entries[0].variation_name, "rs58680543");
-        assert_eq!(
-            sink_value.entries[0].af_values[16],
-            "AAAAAAAAAAAAAAA:0.1017"
-        );
-        assert_eq!(
-            sink_value.entries[0].af_values[21],
-            "AAAAAAAAAAAAAAA:0.2402"
-        );
+        assert_eq!(sink_value.entries[0].af_value(16), "AAAAAAAAAAAAAAA:0.1017");
+        assert_eq!(sink_value.entries[0].af_value(21), "AAAAAAAAAAAAAAA:0.2402");
     }
 }

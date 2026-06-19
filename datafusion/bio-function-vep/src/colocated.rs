@@ -63,6 +63,11 @@ impl AfColumns {
         self.0.is_empty()
     }
 
+    /// True if both share the same underlying column allocation (no deep copy).
+    pub fn ptr_eq(&self, other: &AfColumns) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Zero-copy raw AF value for `(col, row)`. Returns `""` for an absent column,
     /// out-of-range col/row, a null cell, or a non-string column — matching the
     /// former `Vec<String>` path's `unwrap_or_default()` (`String::new()`).
@@ -106,9 +111,23 @@ pub struct ColocatedCacheEntry {
     pub clin_sig: Option<String>,
     pub clin_sig_allele: Option<String>,
     pub pubmed: Option<String>,
-    /// Raw AF column values (indexed same as `AF_COL_NAMES`).
-    /// Each entry is the raw string like "T:0.9301" or "" if absent.
-    pub af_values: Vec<String>,
+    /// Zero-copy AF columns shared across all entries from the same cache batch.
+    /// Indexed same as `AF_COL_NAMES`; read this row's value via [`Self::af_value`].
+    pub af: AfColumns,
+    /// This entry's row within `af`.
+    pub af_row: u32,
+}
+
+impl ColocatedCacheEntry {
+    /// Raw AF value for column `col` (`AF_COL_NAMES` order); `""` if null/absent.
+    pub fn af_value(&self, col: usize) -> &str {
+        self.af.value(col, self.af_row as usize)
+    }
+
+    /// Number of AF columns.
+    pub fn af_len(&self) -> usize {
+        self.af.len()
+    }
 }
 
 /// AF column names collected into `ColocatedCacheEntry.af_values`.
