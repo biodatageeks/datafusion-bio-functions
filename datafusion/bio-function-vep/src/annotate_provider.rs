@@ -1892,6 +1892,8 @@ impl ColocatedData {
         let mut somatic_values: Vec<&str> = Vec::new();
         let mut pheno_values: Vec<&str> = Vec::new();
         let mut pubmed_values: Vec<String> = Vec::new();
+        // Reused per entry (cleared each time) instead of allocated per entry.
+        let mut allele_terms: HashMap<String, String> = HashMap::new();
 
         for entry in self.sorted_entries() {
             if !entry.matches_output_allele(output_allele, output_allele_unshifted) {
@@ -1906,7 +1908,7 @@ impl ColocatedData {
             }
 
             if let Some(clin_sig_allele) = &entry.clin_sig_allele {
-                let mut allele_terms: HashMap<String, String> = HashMap::new();
+                allele_terms.clear();
                 for chunk in clin_sig_allele.split(';') {
                     let Some((allele, value)) = chunk.split_once(':') else {
                         continue;
@@ -1985,6 +1987,10 @@ impl ColocatedData {
         let mut per_column: Vec<Vec<String>> = vec![Vec::new(); AF_COLUMNS.len()];
         let mut max_af: Option<(f64, String)> = None;
         let mut max_af_pops: Vec<String> = Vec::new();
+        // Reused across every (entry x AF column) iteration (cleared each time)
+        // instead of allocated per iteration — was the dominant colocated churn.
+        let mut freq_data: HashMap<String, String> = HashMap::new();
+        let mut remaining: HashSet<String> = HashSet::new();
 
         for entry in self.sorted_entries() {
             let Some(matched_allele) =
@@ -2008,11 +2014,9 @@ impl ColocatedData {
                     continue;
                 }
 
-                let mut freq_data: HashMap<String, String> = HashMap::new();
-                let mut remaining: HashSet<String> = existing_alleles
-                    .iter()
-                    .map(|allele| (*allele).to_string())
-                    .collect();
+                freq_data.clear();
+                remaining.clear();
+                remaining.extend(existing_alleles.iter().map(|allele| (*allele).to_string()));
                 let mut total = 0.0_f64;
 
                 for pair in raw.split(',') {
@@ -2031,7 +2035,7 @@ impl ColocatedData {
 
                 let mut interpolated = false;
                 if existing_alleles.len() == 2 && remaining.len() == 1 && column.cache_col == "AF" {
-                    let remaining_allele = remaining.into_iter().next().unwrap();
+                    let remaining_allele = remaining.iter().next().unwrap().clone();
                     freq_data.insert(remaining_allele, format!("{}", 1.0 - total));
                     interpolated = true;
                 }
