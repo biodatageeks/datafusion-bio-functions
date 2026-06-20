@@ -11191,7 +11191,20 @@ fn poll_lookup_partitions(
     cx: &mut TaskCtx<'_>,
 ) -> Poll<Result<()>> {
     let mut made_progress = false;
-    while !ann.worker.lookup_done && ann.worker.window_buffer.len() < HYDRATION_WINDOW_SIZE {
+    // Stop pulling once the buffer holds at least one full input-buffer window, so
+    // the poll loop can dispatch it immediately and the next lookup batches overlap
+    // with annotation. Without this, the lookup races to completion (it rarely goes
+    // Pending and HYDRATION_WINDOW_SIZE is never hit) and the first window — hence
+    // first output — waits for the ENTIRE lookup to drain (the threads=1 path; the
+    // sharded threads>1 path already dispatches per input-buffer). Mirrors the outer
+    // `has_target_ready_input_buffers` guard so the two stay consistent.
+    while !ann.worker.lookup_done
+        && ann.worker.window_buffer.len() < HYDRATION_WINDOW_SIZE
+        && count_ready_input_buffers(
+            ann.worker.window_buffer.iter(),
+            ann.config.input_buffer_size,
+        ) < 1
+    {
         let profile = ann.worker.shared.profile.clone();
         record_lookup_fan_in_profile(&profile, &ann.lookup_partitions);
         match poll_lookup_fan_in(&mut ann.lookup_partitions, cx) {
