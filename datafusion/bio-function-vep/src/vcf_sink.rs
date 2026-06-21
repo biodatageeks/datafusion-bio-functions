@@ -81,19 +81,6 @@ struct FormattedVcfBatch {
     format_duration: Duration,
 }
 
-#[derive(Debug)]
-struct PartitionedVcfBody {
-    partition_id: usize,
-    path: PathBuf,
-    batches: usize,
-    input_rows: usize,
-    lines: usize,
-    bytes: usize,
-    stream_next: Duration,
-    format_duration: Duration,
-    temp_write_duration: Duration,
-}
-
 struct VcfBodyTempDir {
     path: PathBuf,
 }
@@ -132,44 +119,19 @@ impl Drop for VcfBodyTempDir {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VepConcurrencyPlan {
     lookup_partitions: usize,
-    chromosome_lanes: usize,
-    inline_lookup: bool,
     spawn_vcf_provider_open: bool,
 }
 
 impl VepConcurrencyPlan {
     fn from_config(config: &AnnotateVcfConfig) -> Self {
-        // Single `threads` knob: N position-ordered lookup partitions feeding
+        // Single `workers` knob: N position-ordered lookup partitions feeding
         // N independent annotation range pipelines, one contig at a time.
-        // Correctness relies on the indexed-input guard in annotate_to_vcf
-        // (contiguous, position-ordered partitions via balance_partitions).
-        if config.threads > 1 {
-            return Self {
-                lookup_partitions: config.threads,
-                chromosome_lanes: 1,
-                inline_lookup: false,
-                spawn_vcf_provider_open: true,
-            };
-        }
-        Self::from_forks(config.forks.unwrap_or(0), config.workers.max(1))
-    }
-
-    fn from_forks(forks: usize, lookup_partitions: usize) -> Self {
-        if forks == 0 {
-            return Self {
-                lookup_partitions: 1,
-                chromosome_lanes: 1,
-                inline_lookup: true,
-                spawn_vcf_provider_open: false,
-            };
-        }
-
-        let chromosome_lanes = forks.max(1);
+        // Correctness for workers>1 relies on the indexed-input guard in
+        // annotate_to_vcf (contiguous, position-ordered partitions).
+        let lookup_partitions = config.workers.max(1);
         Self {
             lookup_partitions,
-            chromosome_lanes,
-            inline_lookup: false,
-            spawn_vcf_provider_open: true,
+            spawn_vcf_provider_open: lookup_partitions > 1,
         }
     }
 }
@@ -333,16 +295,11 @@ fn copy_body_file_to_writer(path: &Path, writer: &mut VcfLocalWriter) -> Result<
     Ok(started.elapsed())
 }
 
-fn partition_body_job_limit(partition_count: usize, max_contig_jobs: usize) -> usize {
-    max_contig_jobs.max(1).min(partition_count.max(1))
-}
-
 /// Reusable streaming VCF body shard writer: owns a `BufWriter<File>` + the
 /// per-batch formatter context, and streams formatted batches into one shard
-/// file with no buffering of the batch. Used both by the `threads>1` engine
-/// workers (which call the sync [`write_batch`](Self::write_batch) inside
-/// `block_in_place`) and by [`write_vcf_partition_body`] (which formats
-/// off-thread via `spawn_blocking`, then calls [`write_formatted`](Self::write_formatted)).
+/// file with no buffering of the batch. Used by the `workers>1` engine workers
+/// (which call the sync [`write_batch`](Self::write_batch) inside
+/// `block_in_place`).
 pub(crate) struct VcfBodyShardWriter {
     writer: std::io::BufWriter<std::fs::File>,
     vcf_info_fields: Arc<Vec<String>>,
@@ -428,374 +385,6 @@ impl VcfBodyShardWriter {
     }
 }
 
-async fn write_vcf_partition_body(
-    partition_id: usize,
-    mut stream: datafusion::physical_plan::SendableRecordBatchStream,
-    path: PathBuf,
-    vcf_info_fields: Arc<Vec<String>>,
-    unique_format_tags: Arc<Vec<String>>,
-    sample_names: Arc<Vec<String>>,
-    coordinate_zero_based: bool,
-) -> Result<PartitionedVcfBody> {
-    let mut shard = VcfBodyShardWriter::create(
-        &path,
-        Arc::clone(&vcf_info_fields),
-        Arc::clone(&unique_format_tags),
-        Arc::clone(&sample_names),
-        coordinate_zero_based,
-    )?;
-    let mut batches = 0usize;
-    let mut stream_next = Duration::ZERO;
-    let mut format_duration = Duration::ZERO;
-    let mut temp_write_duration = Duration::ZERO;
-
-    use futures::StreamExt;
-    loop {
-        let stream_started = Instant::now();
-        let next_batch = stream.next().await;
-        stream_next += stream_started.elapsed();
-        let Some(batch_result) = next_batch else {
-            break;
-        };
-        let batch = batch_result?;
-        let batch_id = shard.next_batch_id();
-        let vcf_info_fields = Arc::clone(&vcf_info_fields);
-        let unique_format_tags = Arc::clone(&unique_format_tags);
-        let sample_names = Arc::clone(&sample_names);
-        let formatted = tokio::task::spawn_blocking(move || {
-            format_vcf_body_chunk(
-                batch_id,
-                batch,
-                vcf_info_fields,
-                unique_format_tags,
-                sample_names,
-                coordinate_zero_based,
-            )
-        })
-        .await
-        .map_err(|e| DataFusionError::Execution(format!("VCF formatter task failed: {e}")))??;
-        format_duration += formatted.format_duration;
-        temp_write_duration += shard.write_formatted(&formatted)?;
-        batches += 1;
-    }
-
-    let mut result = PartitionedVcfBody {
-        partition_id,
-        path,
-        batches,
-        input_rows: shard.input_rows,
-        lines: shard.lines,
-        bytes: shard.bytes,
-        stream_next,
-        format_duration,
-        temp_write_duration,
-    };
-
-    let flush_started = Instant::now();
-    shard.finish()?;
-    result.temp_write_duration += flush_started.elapsed();
-    Ok(result)
-}
-
-async fn schedule_partition_body_jobs(
-    streams: Vec<(usize, datafusion::physical_plan::SendableRecordBatchStream)>,
-    tempdir_path: PathBuf,
-    max_jobs: usize,
-    vcf_info_fields: Arc<Vec<String>>,
-    unique_format_tags: Arc<Vec<String>>,
-    sample_names: Arc<Vec<String>>,
-    coordinate_zero_based: bool,
-    completed: tokio::sync::mpsc::UnboundedSender<PartitionedVcfBody>,
-) -> Result<usize> {
-    let mut stream_iter = streams.into_iter();
-    let mut jobs = tokio::task::JoinSet::new();
-    let mut inflight_max = 0usize;
-    let max_jobs = max_jobs.max(1);
-
-    loop {
-        while jobs.len() < max_jobs {
-            let Some((partition_id, stream)) = stream_iter.next() else {
-                break;
-            };
-            let path = tempdir_path.join(format!("partition_{partition_id:04}.vcf.body"));
-            let vcf_info_fields = Arc::clone(&vcf_info_fields);
-            let unique_format_tags = Arc::clone(&unique_format_tags);
-            let sample_names = Arc::clone(&sample_names);
-            jobs.spawn(write_vcf_partition_body(
-                partition_id,
-                stream,
-                path,
-                vcf_info_fields,
-                unique_format_tags,
-                sample_names,
-                coordinate_zero_based,
-            ));
-            inflight_max = inflight_max.max(jobs.len());
-        }
-
-        if jobs.is_empty() {
-            break;
-        }
-
-        let Some(joined) = jobs.join_next().await else {
-            continue;
-        };
-        let body = joined.map_err(|e| {
-            DataFusionError::Execution(format!("VCF body shard task failed: {e}"))
-        })??;
-        if completed.send(body).is_err() {
-            break;
-        }
-    }
-
-    Ok(inflight_max)
-}
-
-fn spawn_partition_body_scheduler(
-    streams: Vec<(usize, datafusion::physical_plan::SendableRecordBatchStream)>,
-    tempdir_path: PathBuf,
-    max_jobs: usize,
-    vcf_info_fields: Arc<Vec<String>>,
-    unique_format_tags: Arc<Vec<String>>,
-    sample_names: Arc<Vec<String>>,
-    coordinate_zero_based: bool,
-) -> (
-    tokio::sync::mpsc::UnboundedReceiver<PartitionedVcfBody>,
-    tokio::task::JoinHandle<Result<usize>>,
-) {
-    let (completed_tx, completed_rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = tokio::spawn(schedule_partition_body_jobs(
-        streams,
-        tempdir_path,
-        max_jobs,
-        vcf_info_fields,
-        unique_format_tags,
-        sample_names,
-        coordinate_zero_based,
-        completed_tx,
-    ));
-    (completed_rx, handle)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn stream_vcf_partition_to_writer(
-    partition_id: usize,
-    mut stream: datafusion::physical_plan::SendableRecordBatchStream,
-    writer: &mut VcfLocalWriter,
-    pb: &ProgressBar,
-    config: &AnnotateVcfConfig,
-    total_input: usize,
-    total_rows: &mut usize,
-    vcf_info_fields: Arc<Vec<String>>,
-    unique_format_tags: Arc<Vec<String>>,
-    sample_names: Arc<Vec<String>>,
-    coordinate_zero_based: bool,
-    sink_profile: &mut Option<VcfSinkProfile>,
-) -> Result<()> {
-    let mut batch_id = 0usize;
-
-    // Pipeline formatting: keep up to `threads` batch formatters in flight on
-    // the blocking pool while writing their results FIFO (= input order). VCF
-    // text generation is CPU-heavy (the serial floor once lookup + annotation
-    // are parallel), so overlapping it with the stream + writes is the win.
-    let format_concurrency = config.threads.max(1);
-    let mut inflight: std::collections::VecDeque<(
-        usize,
-        tokio::task::JoinHandle<Result<FormattedVcfBatch>>,
-    )> = std::collections::VecDeque::new();
-
-    use futures::StreamExt;
-    let mut stream_done = false;
-    loop {
-        while inflight.len() < format_concurrency && !stream_done {
-            let stream_started = Instant::now();
-            let next_batch = stream.next().await;
-            let stream_elapsed = stream_started.elapsed();
-            if let Some(profile) = sink_profile.as_mut() {
-                profile.stream_next += stream_elapsed;
-            }
-            let Some(batch_result) = next_batch else {
-                stream_done = true;
-                break;
-            };
-            let batch = batch_result?;
-            let input_rows = batch.num_rows();
-            let id = batch_id;
-            batch_id += 1;
-            let vcf_info_fields = Arc::clone(&vcf_info_fields);
-            let unique_format_tags = Arc::clone(&unique_format_tags);
-            let sample_names = Arc::clone(&sample_names);
-            let handle = tokio::task::spawn_blocking(move || {
-                format_vcf_body_chunk(
-                    id,
-                    batch,
-                    vcf_info_fields,
-                    unique_format_tags,
-                    sample_names,
-                    coordinate_zero_based,
-                )
-            });
-            inflight.push_back((input_rows, handle));
-        }
-
-        let Some((input_rows, handle)) = inflight.pop_front() else {
-            break;
-        };
-        let formatted = handle
-            .await
-            .map_err(|e| DataFusionError::Execution(format!("VCF formatter task failed: {e}")))??;
-
-        let write_started = Instant::now();
-        write_vcf_body_chunk(writer, &formatted.bytes)?;
-        let write_elapsed = write_started.elapsed();
-        pipeline_trace::emit(
-            "vcf_write",
-            "done",
-            &[
-                ("partition_id", TraceValue::Usize(partition_id)),
-                ("batch_id", TraceValue::Usize(formatted.batch_id)),
-                ("rows", TraceValue::Usize(input_rows)),
-                ("lines", TraceValue::Usize(formatted.lines)),
-                ("bytes", TraceValue::Usize(formatted.bytes.len())),
-                ("elapsed", TraceValue::Duration(write_elapsed)),
-            ],
-        );
-
-        if let Some(profile) = sink_profile.as_mut() {
-            profile.batch_to_lines += formatted.format_duration;
-            profile.write_records += write_elapsed;
-            profile.batches += 1;
-            profile.rows += input_rows;
-            profile.lines += formatted.lines;
-            profile.body_chunk_bytes += formatted.bytes.len();
-            profile.format_jobs += 1;
-        }
-        *total_rows += formatted.lines;
-        pb.inc(formatted.lines as u64);
-        if let Some(ref cb) = config.on_batch_written {
-            cb(formatted.lines, *total_rows, total_input);
-        }
-    }
-
-    Ok(())
-}
-
-async fn stream_partitioned_vcf_body(
-    df: datafusion::dataframe::DataFrame,
-    writer: &mut VcfLocalWriter,
-    pb: &ProgressBar,
-    config: &AnnotateVcfConfig,
-    total_input: usize,
-    vcf_info_fields: Arc<Vec<String>>,
-    unique_format_tags: Arc<Vec<String>>,
-    sample_names: Arc<Vec<String>>,
-    coordinate_zero_based: bool,
-    max_contig_jobs: usize,
-    sink_profile: &mut Option<VcfSinkProfile>,
-) -> Result<usize> {
-    let streams = df.execute_stream_partitioned().await?;
-    let partition_count = streams.len();
-    if partition_count <= 1 {
-        if let Some(profile) = sink_profile.as_mut() {
-            profile.contig_partitions = partition_count;
-        }
-
-        let Some(stream) = streams.into_iter().next() else {
-            return Ok(0);
-        };
-        let mut total_rows = 0usize;
-        stream_vcf_partition_to_writer(
-            0,
-            stream,
-            writer,
-            pb,
-            config,
-            total_input,
-            &mut total_rows,
-            vcf_info_fields,
-            unique_format_tags,
-            sample_names,
-            coordinate_zero_based,
-            sink_profile,
-        )
-        .await?;
-        return Ok(total_rows);
-    }
-
-    let tempdir = VcfBodyTempDir::new()?;
-    let max_contig_jobs = partition_body_job_limit(partition_count, max_contig_jobs);
-    if let Some(profile) = sink_profile.as_mut() {
-        profile.contig_partitions = partition_count;
-    }
-
-    let streams = streams.into_iter().enumerate().collect::<Vec<_>>();
-    let mut total_rows = 0usize;
-    let tempdir_path = tempdir.path().to_path_buf();
-
-    let (mut body_rx, scheduler_handle) = spawn_partition_body_scheduler(
-        streams,
-        tempdir_path,
-        max_contig_jobs,
-        Arc::clone(&vcf_info_fields),
-        Arc::clone(&unique_format_tags),
-        Arc::clone(&sample_names),
-        coordinate_zero_based,
-    );
-
-    let mut scheduler_handle = Some(scheduler_handle);
-    let mut ready: BTreeMap<usize, PartitionedVcfBody> = BTreeMap::new();
-    let mut next_write_partition_id = 0usize;
-    while next_write_partition_id < partition_count {
-        if let Some(body) = ready.remove(&next_write_partition_id) {
-            let copy_duration = copy_body_file_to_writer(&body.path, writer)?;
-            let _ = std::fs::remove_file(&body.path);
-            if let Some(profile) = sink_profile.as_mut() {
-                profile.stream_next += body.stream_next;
-                profile.batch_to_lines += body.format_duration;
-                profile.write_records += body.temp_write_duration + copy_duration;
-                profile.batches += body.batches;
-                profile.rows += body.input_rows;
-                profile.lines += body.lines;
-                profile.body_chunk_bytes += body.bytes;
-                profile.format_jobs += body.batches;
-            }
-            total_rows += body.lines;
-            pb.inc(body.lines as u64);
-            if let Some(ref cb) = config.on_batch_written {
-                cb(body.lines, total_rows, total_input);
-            }
-            next_write_partition_id += 1;
-            continue;
-        }
-
-        let Some(body) = body_rx.recv().await else {
-            if let Some(handle) = scheduler_handle.take() {
-                handle.await.map_err(|e| {
-                    DataFusionError::Execution(format!("VCF body shard scheduler task failed: {e}"))
-                })??;
-            }
-            return Err(DataFusionError::Execution(format!(
-                "partitioned VCF body writer missing partition {next_write_partition_id}"
-            )));
-        };
-        ready.insert(body.partition_id, body);
-    }
-
-    let contig_inflight_max = if let Some(handle) = scheduler_handle.take() {
-        handle.await.map_err(|e| {
-            DataFusionError::Execution(format!("VCF body shard scheduler task failed: {e}"))
-        })??
-    } else {
-        0
-    };
-
-    if let Some(profile) = sink_profile.as_mut() {
-        profile.contig_inflight_max = profile.contig_inflight_max.max(contig_inflight_max);
-    }
-
-    Ok(total_rows)
-}
-
 /// Configuration for VCF annotation output.
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
@@ -853,17 +442,11 @@ pub struct AnnotateVcfConfig {
     pub distance: Option<String>,
     /// Number of input variants per VEP-style annotation buffer.
     pub buffer_size: usize,
-    /// User-facing chromosome lane count. Missing or `Some(0)` is a strict
-    /// single-lane path with no helper lookup task; `Some(n)` runs up to `n`
-    /// contigs concurrently.
-    pub forks: Option<usize>,
-    /// Number of annotation lookup workers per active contig.
-    pub workers: usize,
     /// Maximum number of independent cold-Parquet lookup shards per contig.
     pub target_partitions: usize,
-    /// Number of parallel fused window-annotation workers within a contig
-    /// (`1` = serial). The single within-contig parallelism knob.
-    pub threads: usize,
+    /// Number of parallel fused window-annotation pipelines within a contig
+    /// (`1` = serial). The single annotation-concurrency knob.
+    pub workers: usize,
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show an indicatif progress bar on stderr (for Rust CLI).
@@ -904,10 +487,8 @@ impl Default for AnnotateVcfConfig {
             failed: None,
             distance: None,
             buffer_size: VEP_DEFAULT_BUFFER_SIZE,
-            forks: Some(0),
-            workers: 1,
             target_partitions: 1,
-            threads: 1,
+            workers: 1,
             compression: VcfCompressionType::Plain,
             show_progress: false,
             on_batch_written: None,
@@ -920,7 +501,6 @@ impl std::fmt::Debug for AnnotateVcfConfig {
         f.debug_struct("AnnotateVcfConfig")
             .field("everything", &self.everything)
             .field("buffer_size", &self.buffer_size)
-            .field("forks", &self.forks)
             .field("workers", &self.workers)
             .field("target_partitions", &self.target_partitions)
             .field("compression", &self.compression)
@@ -1011,28 +591,13 @@ impl AnnotateVcfConfig {
             "buffer_size".into(),
             serde_json::Value::Number(serde_json::Number::from(self.buffer_size)),
         );
-        if let Some(forks) = self.forks {
-            opts.insert(
-                "forks".into(),
-                serde_json::Value::Number(serde_json::Number::from(if forks == 0 {
-                    0
-                } else {
-                    self.workers.max(1)
-                })),
-            );
-            opts.insert(
-                "contig_parallelism".into(),
-                serde_json::Value::Number(serde_json::Number::from(forks.max(1))),
-            );
-            opts.insert("inline_lookup".into(), serde_json::Value::Bool(forks == 0));
-        }
         opts.insert(
             "target_partitions".into(),
             serde_json::Value::Number(serde_json::Number::from(self.target_partitions.max(1))),
         );
         opts.insert(
-            "threads".into(),
-            serde_json::Value::Number(serde_json::Number::from(self.threads.max(1))),
+            "workers".into(),
+            serde_json::Value::Number(serde_json::Number::from(self.workers.max(1))),
         );
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
@@ -1313,38 +878,27 @@ pub async fn annotate_to_vcf(
             "annotate_to_vcf(): refseq and merged config fields are unsupported; cache source mode must come from cache schema metadata bio.vep.cache_source_type".to_string(),
         ));
     }
-    // Parallel annotation (threads>1) splits the contig into N position-range
+    // Parallel annotation (workers>1) splits the contig into N position-range
     // lookup partitions. That requires a bgzipped + tabix-indexed input so the
     // VCF scan yields contiguous, position-ordered partitions; an unindexed
     // input would force a round-robin repartition that scrambles output order.
-    if config.threads > 1
+    if config.workers > 1
         && !std::path::Path::new(&format!("{input_vcf}.tbi")).exists()
         && !std::path::Path::new(&format!("{input_vcf}.csi")).exists()
     {
         return Err(DataFusionError::Plan(format!(
-            "annotate_to_vcf(): threads>1 requires a tabix-indexed input (`{input_vcf}.tbi` or `.csi`); \
-             bgzip + tabix the VCF, or run with threads=1"
+            "annotate_to_vcf(): workers>1 requires a tabix-indexed input (`{input_vcf}.tbi` or `.csi`); \
+             bgzip + tabix the VCF, or run with workers=1"
         )));
-    }
-    // threads>1 (within-contig sharded output) and forks>0 (contig-lane
-    // parallelism) are distinct, mutually exclusive knobs. Combining them would
-    // give the engine multiple output partitions, each restarting shard ids
-    // from 0 and colliding on shard filenames. Reject early with a clear message.
-    if config.threads > 1 && config.forks.is_some_and(|forks| forks > 0) {
-        return Err(DataFusionError::Plan(
-            "annotate_to_vcf(): threads>1 and forks>0 are mutually exclusive".to_string(),
-        ));
     }
     let cache_source_type = cache_source_type_from_cache_source_for_backend(cache_source, backend)?;
     let concurrency_plan = VepConcurrencyPlan::from_config(config);
     if sink_profile_enabled() {
         eprintln!(
-            "[VEP_PROFILE] concurrency_plan lookup_partitions={} chromosome_lanes={} workers={} cold_parquet_target_partitions={} inline_lookup={} spawn_vcf_provider_open={}",
+            "[VEP_PROFILE] concurrency_plan lookup_partitions={} workers={} cold_parquet_target_partitions={} spawn_vcf_provider_open={}",
             concurrency_plan.lookup_partitions,
-            concurrency_plan.chromosome_lanes,
             config.workers,
             config.target_partitions,
-            concurrency_plan.inline_lookup,
             concurrency_plan.spawn_vcf_provider_open
         );
     }
@@ -1555,7 +1109,7 @@ pub async fn annotate_to_vcf(
     let mut total_rows = 0;
     let mut sink_profile = sink_profile_enabled().then(VcfSinkProfile::default);
 
-    if config.threads > 1 {
+    if config.workers > 1 {
         // Sharded VCF output: bypass the SQL/DataFrame execution and drive the
         // annotation plan directly with a VcfShardContext, so each fused worker
         // streams its own VCF body shard. The header was already written above;
@@ -1587,21 +1141,6 @@ pub async fn annotate_to_vcf(
         .await?;
         // tempdir (and any leftover shard files) removed on drop here.
         drop(tempdir);
-    } else if concurrency_plan.chromosome_lanes > 1 {
-        total_rows = stream_partitioned_vcf_body(
-            df,
-            &mut writer,
-            &pb,
-            config,
-            total_input,
-            Arc::new(vcf_info_fields),
-            Arc::new(unique_format_tags),
-            Arc::new(sample_names),
-            coordinate_zero_based,
-            concurrency_plan.chromosome_lanes,
-            &mut sink_profile,
-        )
-        .await?;
     } else {
         use futures::StreamExt;
         let mut stream = df.execute_stream().await?;
@@ -1705,34 +1244,6 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    use datafusion::arrow::datatypes::{Schema, SchemaRef};
-    use datafusion::execution::RecordBatchStream;
-    use datafusion::physical_plan::SendableRecordBatchStream;
-
-    struct EmptyBatchStream {
-        schema: SchemaRef,
-    }
-
-    impl futures::Stream for EmptyBatchStream {
-        type Item = Result<RecordBatch>;
-
-        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(None)
-        }
-    }
-
-    impl RecordBatchStream for EmptyBatchStream {
-        fn schema(&self) -> SchemaRef {
-            self.schema.clone()
-        }
-    }
-
-    fn empty_batch_stream() -> SendableRecordBatchStream {
-        Box::pin(EmptyBatchStream {
-            schema: Arc::new(Schema::empty()),
-        })
-    }
-
     #[test]
     fn test_to_options_json_emits_pick_flags() {
         let config = AnnotateVcfConfig {
@@ -1829,80 +1340,36 @@ mod tests {
     }
 
     #[test]
-    fn test_forks_zero_derives_strict_inline_concurrency_plan() {
-        let config = AnnotateVcfConfig {
-            forks: Some(0),
-            ..Default::default()
-        };
-
+    fn concurrency_plan_serial_uses_single_lookup_partition() {
+        let config = AnnotateVcfConfig::default();
         let plan = VepConcurrencyPlan::from_config(&config);
-
         assert_eq!(plan.lookup_partitions, 1);
-        assert_eq!(plan.chromosome_lanes, 1);
-        assert!(plan.inline_lookup);
         assert!(!plan.spawn_vcf_provider_open);
     }
 
     #[test]
-    fn test_forks_one_preserves_legacy_single_partition_plan() {
+    fn concurrency_plan_workers_drive_lookup_partitions() {
         let config = AnnotateVcfConfig {
-            forks: Some(1),
-            ..Default::default()
+            workers: 8,
+            ..AnnotateVcfConfig::default()
         };
-
         let plan = VepConcurrencyPlan::from_config(&config);
-
-        assert_eq!(plan.lookup_partitions, 1);
-        assert_eq!(plan.chromosome_lanes, 1);
-        assert!(!plan.inline_lookup);
+        assert_eq!(plan.lookup_partitions, 8);
         assert!(plan.spawn_vcf_provider_open);
     }
 
     #[test]
-    fn test_forks_nonzero_uses_fork_count_for_chromosome_lanes() {
+    fn to_options_json_emits_workers_not_threads_or_forks() {
         let config = AnnotateVcfConfig {
-            forks: Some(4),
-            workers: 3,
-            ..Default::default()
-        };
-
-        let plan = VepConcurrencyPlan::from_config(&config);
-
-        assert_eq!(plan.lookup_partitions, 3);
-        assert_eq!(plan.chromosome_lanes, 4);
-        assert!(!plan.inline_lookup);
-        assert!(plan.spawn_vcf_provider_open);
-    }
-
-    #[test]
-    fn test_to_options_json_emits_forks_plan_when_set() {
-        let config = AnnotateVcfConfig {
-            forks: Some(0),
-            ..Default::default()
-        };
-
-        let json = config.to_options_json();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(value["forks"], 0);
-        assert_eq!(value["inline_lookup"], true);
-    }
-
-    #[test]
-    fn test_to_options_json_keeps_workers_and_chromosome_lanes_separate() {
-        let config = AnnotateVcfConfig {
-            forks: Some(8),
             workers: 4,
-            target_partitions: 4,
-            ..Default::default()
+            ..AnnotateVcfConfig::default()
         };
-
-        let json = config.to_options_json();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(value["forks"], 4);
-        assert_eq!(value["contig_parallelism"], 8);
-        assert_eq!(value["target_partitions"], 4);
+        let json: serde_json::Value = serde_json::from_str(&config.to_options_json()).unwrap();
+        assert_eq!(json["workers"], 4);
+        assert!(json.get("threads").is_none());
+        assert!(json.get("forks").is_none());
+        assert!(json.get("contig_parallelism").is_none());
+        assert!(json.get("inline_lookup").is_none());
     }
 
     #[test]
@@ -1976,45 +1443,6 @@ mod tests {
         assert!(line.contains("format_wait=0.025s"));
         assert!(line.contains("write_records=0.030s"));
         assert!(line.contains("writer_finish=0.040s"));
-    }
-
-    #[test]
-    fn test_partitioned_body_writer_schedules_partition_zero_as_a_job() {
-        assert_eq!(partition_body_job_limit(22, 12), 12);
-        assert_eq!(partition_body_job_limit(3, 12), 3);
-        assert_eq!(partition_body_job_limit(22, 1), 1);
-        assert_eq!(partition_body_job_limit(0, 12), 1);
-    }
-
-    #[tokio::test]
-    async fn test_partition_body_scheduler_uses_full_job_limit() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let streams = (0..5)
-            .map(|partition_id| (partition_id, empty_batch_stream()))
-            .collect::<Vec<_>>();
-        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let inflight_max = schedule_partition_body_jobs(
-            streams,
-            tempdir.path().to_path_buf(),
-            2,
-            Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
-            Arc::new(Vec::new()),
-            false,
-            completed_tx,
-        )
-        .await
-        .unwrap();
-
-        let mut completed_ids = Vec::new();
-        while let Some(body) = completed_rx.recv().await {
-            completed_ids.push(body.partition_id);
-        }
-        completed_ids.sort_unstable();
-
-        assert_eq!(inflight_max, 2);
-        assert_eq!(completed_ids, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

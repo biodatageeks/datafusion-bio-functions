@@ -5226,12 +5226,6 @@ impl AnnotateProvider {
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0)
             .unwrap_or(VEP_INPUT_BUFFER_SIZE);
-        let worker_forks = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_i64_option(opts, "forks"))
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(0);
         let target_partitions = self
             .options_json
             .as_deref()
@@ -5239,40 +5233,20 @@ impl AnnotateProvider {
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0)
             .unwrap_or(1);
-        let chromosome_lanes = self
+        // The single `workers` knob drives BOTH stages: with workers>1 the
+        // lookup runs as N spawned, position-ordered partitions (so it isn't a
+        // serial bottleneck) and annotation runs as N parallel window workers.
+        let annotation_workers = self
             .options_json
             .as_deref()
-            .and_then(|opts| Self::parse_json_i64_option(opts, "contig_parallelism"))
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| if worker_forks > 0 { worker_forks } else { 1 });
-        let chromosome_lanes = if fetch_limit.is_some() {
-            1
-        } else {
-            chromosome_lanes
-        };
-        let inline_lookup = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_bool_option(opts, "inline_lookup"))
-            .unwrap_or(worker_forks == 0);
-        // Number of parallel window workers for the CPU-bound annotation step
-        // within a contig. Additive to the partition-lookup knobs above:
-        // `threads <= 1` keeps the serial inline annotation path.
-        let annotation_threads = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_i64_option(opts, "threads"))
+            .and_then(|opts| Self::parse_json_i64_option(opts, "workers"))
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0)
             .unwrap_or(1);
-        // The single `threads` knob drives BOTH stages: with threads>1 the
-        // lookup runs as N spawned, position-ordered partitions (so it isn't a
-        // serial bottleneck) and annotation runs as N parallel window workers.
-        let (inline_lookup, target_partitions) = if annotation_threads > 1 {
-            (false, annotation_threads.max(target_partitions))
+        let target_partitions = if annotation_workers > 1 {
+            annotation_workers.max(target_partitions)
         } else {
-            (inline_lookup, target_partitions)
+            target_partitions
         };
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
@@ -5337,9 +5311,7 @@ impl AnnotateProvider {
             projection: projection.cloned(),
             annotation_column_count: self.annotation_column_count(),
             fetch_limit,
-            chromosome_lanes,
-            inline_lookup,
-            annotation_threads,
+            annotation_workers,
             #[cfg(feature = "lance-cache")]
             lance_cache_root,
             #[cfg(feature = "lance-cache")]
@@ -5351,7 +5323,6 @@ impl AnnotateProvider {
             projected_schema,
             self.schema.clone(),
             contigs,
-            chromosome_lanes,
             Arc::clone(&self.session),
             Arc::new(cache),
             config,
@@ -8390,14 +8361,9 @@ struct ContigAnnotationConfig {
     annotation_column_count: usize,
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
-    /// Maximum number of active chromosome lanes in the enclosing execution plan.
-    chromosome_lanes: usize,
-    /// Poll lookup streams inline instead of spawning lookup tasks.
-    inline_lookup: bool,
     /// Number of parallel window workers for the annotation step within a
-    /// contig. `<= 1` keeps the serial inline path. Additive to the
-    /// partition-lookup knobs above (lookup partitioning is unchanged).
-    annotation_threads: usize,
+    /// contig. `<= 1` is serial (one spawned lookup partition).
+    annotation_workers: usize,
     pick_flags: PickFlags,
     #[cfg(feature = "lance-cache")]
     lance_cache_root: Option<std::path::PathBuf>,
@@ -8461,12 +8427,11 @@ impl ContigAnnotationExec {
         projected_schema: SchemaRef,
         full_schema: SchemaRef,
         contigs: Vec<String>,
-        chromosome_lanes: usize,
         session: Arc<SessionContext>,
         cache: Arc<PartitionedAnnotationCache>,
         config: ContigAnnotationConfig,
     ) -> Self {
-        let contig_partitions = partition_contigs_for_execution(contigs, chromosome_lanes);
+        let contig_partitions = partition_contigs_for_execution(contigs);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
             datafusion::physical_plan::Partitioning::UnknownPartitioning(contig_partitions.len()),
@@ -8562,17 +8527,11 @@ impl ExecutionPlan for ContigAnnotationExec {
     }
 }
 
-fn partition_contigs_for_execution(
-    contigs: Vec<String>,
-    requested_parallelism: usize,
-) -> Vec<Vec<String>> {
+fn partition_contigs_for_execution(contigs: Vec<String>) -> Vec<Vec<String>> {
     if contigs.is_empty() {
         return vec![Vec::new()];
     }
-    if requested_parallelism <= 1 {
-        return vec![contigs];
-    }
-    contigs.into_iter().map(|contig| vec![contig]).collect()
+    vec![contigs]
 }
 
 // ---------------------------------------------------------------------------
@@ -9053,39 +9012,28 @@ struct SpawnedLookupPartitionHandle {
     join_handle: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
-struct InlineLookupPartitionHandle {
-    partition_id: usize,
-    chrom: String,
-    stream: SendableRecordBatchStream,
-    sink: ColocatedSink,
-    next_batch_id: usize,
-}
-
 enum LookupPartitionHandle {
     Spawned(SpawnedLookupPartitionHandle),
-    Inline(InlineLookupPartitionHandle),
 }
 
 impl LookupPartitionHandle {
     fn partition_id(&self) -> usize {
         match self {
             LookupPartitionHandle::Spawned(handle) => handle.partition_id,
-            LookupPartitionHandle::Inline(handle) => handle.partition_id,
         }
     }
 
     fn abort(&mut self) {
-        if let LookupPartitionHandle::Spawned(handle) = self {
-            if let Some(jh) = &handle.join_handle {
-                jh.abort();
-            }
+        let LookupPartitionHandle::Spawned(handle) = self;
+        if let Some(jh) = &handle.join_handle {
+            jh.abort();
         }
     }
 
     /// Take a Spawned handle's (receiver, join_handle) out, leaving it empty so
-    /// its Drop won't abort the still-running lookup worker. The threads>1 path
+    /// its Drop won't abort the still-running lookup worker. The workers>1 path
     /// keeps the worker alive (feeding an annotation pipeline) and aborts via
-    /// its own retained join handle. Returns None for Inline handles.
+    /// its own retained join handle.
     #[allow(clippy::type_complexity)]
     fn take_spawned_parts(
         &mut self,
@@ -9093,13 +9041,10 @@ impl LookupPartitionHandle {
         tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
         tokio::task::JoinHandle<Result<()>>,
     )> {
-        if let LookupPartitionHandle::Spawned(handle) = self {
-            match (handle.receiver.take(), handle.join_handle.take()) {
-                (Some(r), Some(j)) => Some((r, j)),
-                _ => None,
-            }
-        } else {
-            None
+        let LookupPartitionHandle::Spawned(handle) = self;
+        match (handle.receiver.take(), handle.join_handle.take()) {
+            (Some(r), Some(j)) => Some((r, j)),
+            _ => None,
         }
     }
 }
@@ -9425,7 +9370,7 @@ struct ContigAnnotationState {
     lookup_wait_started: Option<Instant>,
     ordered_lookup_wait_started: Option<Instant>,
     /// In-flight fused window-annotation tasks, FIFO (= window/output order).
-    /// Up to `config.annotation_threads` run concurrently on the blocking pool.
+    /// Up to `config.annotation_workers` run concurrently on the blocking pool.
     inflight: VecDeque<tokio::task::JoinHandle<Result<VecDeque<RecordBatch>>>>,
 }
 
@@ -9818,23 +9763,6 @@ fn spawn_annotation_from_lookup_sharded(
         shard.finish()?;
         Ok(rows)
     })
-}
-
-fn inline_lookup_partition(
-    plan: Arc<dyn ExecutionPlan>,
-    task_ctx: Arc<TaskContext>,
-    partition_id: usize,
-    chrom: String,
-    sink: ColocatedSink,
-) -> Result<LookupPartitionHandle> {
-    let stream = plan.execute(partition_id, task_ctx)?;
-    Ok(LookupPartitionHandle::Inline(InlineLookupPartitionHandle {
-        partition_id,
-        chrom,
-        stream,
-        sink,
-        next_batch_id: 0,
-    }))
 }
 
 fn abort_lookup_partitions(partitions: &mut VecDeque<LookupPartitionHandle>) {
@@ -11042,42 +10970,6 @@ fn poll_lookup_partition(
                 },
             },
         },
-        LookupPartitionHandle::Inline(active) => match active.stream.as_mut().poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Ok(batch))) => {
-                let rows = batch.num_rows();
-                let partition_id = active.partition_id;
-                let batch_id = active.next_batch_id;
-                active.next_batch_id += 1;
-                let result = drain_colocated_sink(&active.sink).map(|colocated_delta| {
-                    pipeline_trace::emit(
-                        "lookup",
-                        "ready",
-                        &[
-                            ("chrom", TraceValue::Str(&active.chrom)),
-                            ("partition_id", TraceValue::Usize(partition_id)),
-                            ("batch_id", TraceValue::Usize(batch_id)),
-                            ("rows", TraceValue::Usize(rows)),
-                            ("colocated_delta", TraceValue::Usize(colocated_delta.len())),
-                        ],
-                    );
-                    LookupPartitionPoll::Batch(LookupBatchMessage {
-                        batch,
-                        colocated_delta,
-                        partition_id,
-                        batch_id,
-                    })
-                });
-                Poll::Ready(result)
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(DataFusionError::Execution(format!(
-                "lookup partition {} stream failed: {e}",
-                active.partition_id
-            )))),
-            Poll::Ready(None) => {
-                Poll::Ready(drain_colocated_sink(&active.sink).map(LookupPartitionPoll::Done))
-            }
-        },
     }
 }
 
@@ -11328,7 +11220,7 @@ impl Stream for ContigAnnotationStream {
                     Poll::Ready(Ok(Some(mut ready))) => {
                         let session = Arc::clone(&self.session);
                         let config = self.config.clone();
-                        if config.annotation_threads > 1 {
+                        if config.annotation_workers > 1 {
                             // threads>1 == sharded VCF output: build N independent
                             // per-partition fused pipelines (own lookup partition +
                             // LOCAL colocated map + inline annotate), each streaming
@@ -11567,7 +11459,7 @@ impl Stream for ContigAnnotationStream {
                     };
 
                     // LIMIT pushdown: stop producing new windows once reached.
-                    let threads = ann.config.annotation_threads.max(1);
+                    let threads = ann.config.annotation_workers.max(1);
                     let limit_reached = fetch_limit.is_some_and(|limit| rows_emitted >= limit);
                     let has_pending_input_buffer =
                         ann.worker.input_buffer_accumulator.pending_rows() > 0;
@@ -11903,25 +11795,15 @@ async fn prepare_contig_context(
                 .get(partition_id)
                 .cloned()
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
-            if config.inline_lookup {
-                handles.push_back(inline_lookup_partition(
-                    Arc::clone(&plan),
-                    Arc::clone(&task_ctx),
-                    partition_id,
-                    chrom.to_string(),
-                    sink,
-                )?);
-            } else {
-                handles.push_back(spawn_lookup_partition_worker(
-                    Arc::clone(&plan),
-                    Arc::clone(&task_ctx),
-                    partition_id,
-                    chrom.to_string(),
-                    sink,
-                    LOOKUP_PARTITION_QUEUE_BATCHES,
-                    pipeline_profile.clone(),
-                ));
-            }
+            handles.push_back(spawn_lookup_partition_worker(
+                Arc::clone(&plan),
+                Arc::clone(&task_ctx),
+                partition_id,
+                chrom.to_string(),
+                sink,
+                LOOKUP_PARTITION_QUEUE_BATCHES,
+                pipeline_profile.clone(),
+            ));
         }
         handles
     } else {
@@ -11931,24 +11813,14 @@ async fn prepare_contig_context(
         let session_state = session.state();
         let plan = provider.scan(&session_state, None, &[], None).await?;
         let lookup_stream = plan.execute(0, session.task_ctx())?;
-        if config.inline_lookup {
-            VecDeque::from([LookupPartitionHandle::Inline(InlineLookupPartitionHandle {
-                partition_id: 0,
-                chrom: chrom.to_string(),
-                stream: lookup_stream,
-                sink: fallback_coloc_sink,
-                next_batch_id: 0,
-            })])
-        } else {
-            VecDeque::from([spawn_lookup_stream_worker(
-                lookup_stream,
-                plan.schema(),
-                chrom.to_string(),
-                fallback_coloc_sink,
-                LOOKUP_PARTITION_QUEUE_BATCHES,
-                pipeline_profile.clone(),
-            )])
-        }
+        VecDeque::from([spawn_lookup_stream_worker(
+            lookup_stream,
+            plan.schema(),
+            chrom.to_string(),
+            fallback_coloc_sink,
+            LOOKUP_PARTITION_QUEUE_BATCHES,
+            pipeline_profile.clone(),
+        )])
     };
     record_contig_profile(&pipeline_profile, |profile| {
         profile.lookup_partitions = lookup_partitions.len();
@@ -12451,9 +12323,7 @@ mod tests {
             projection: None,
             annotation_column_count: 0,
             fetch_limit: None,
-            chromosome_lanes: 1,
-            inline_lookup: false,
-            annotation_threads: 1,
+            annotation_workers: 1,
             pick_flags: PickFlags::default(),
             #[cfg(feature = "lance-cache")]
             lance_cache_root: None,
