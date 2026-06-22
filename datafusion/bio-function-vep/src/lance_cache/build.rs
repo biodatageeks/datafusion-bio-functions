@@ -52,6 +52,10 @@ const DEFAULT_CHROMS: &[&str] = &[
     "18", "19", "20", "21", "22", "X", "Y", "MT",
 ];
 const LANCE_CONTEXT_WRITE_CHUNK_ROWS: usize = 4_096;
+/// Write chunk for the narrow translation datasets (translation_sift / _core).
+/// Large so the dataset lands in a few big fragments that compress well; the
+/// rows are small enough that buffering ~1M of them is cheap.
+const LANCE_TRANSLATION_WRITE_CHUNK_ROWS: usize = 1_048_576;
 const LANCE_VARIATION_STREAM_BATCH_ROWS: usize = 1_048_576;
 /// Warm/cold tier selection for the single-path variation layout. A genomic
 /// `start` is "warm" (tier 0) when its max global allele frequency across
@@ -71,8 +75,17 @@ enum LanceWriteStrategy {
 fn lance_write_strategy(kind: EnsemblEntityKind) -> LanceWriteStrategy {
     match kind {
         EnsemblEntityKind::Variation => LanceWriteStrategy::StreamFullDataset,
-        EnsemblEntityKind::Translation
-        | EnsemblEntityKind::Transcript
+        // Translation rows are narrow (translation_sift = key + two small Binary
+        // blobs; translation_core is tiny), so a large write chunk is cheap in
+        // memory and writes the dataset in a few big fragments. The small 4 096-row
+        // chunk used for the wide entities (transcript/exon, which carry long
+        // sequence strings) fragments translation_sift into thousands of tiny
+        // writes, which Lance's miniblock+zstd compresses far worse (~1.4x vs
+        // ~2.3x). Match variation's coalesced write unit instead.
+        EnsemblEntityKind::Translation => LanceWriteStrategy::ChunkedAppend {
+            chunk_rows: LANCE_TRANSLATION_WRITE_CHUNK_ROWS,
+        },
+        EnsemblEntityKind::Transcript
         | EnsemblEntityKind::Exon
         | EnsemblEntityKind::RegulatoryFeature
         | EnsemblEntityKind::MotifFeature => LanceWriteStrategy::ChunkedAppend {
@@ -2028,6 +2041,14 @@ mod tests {
             lance_write_strategy(EnsemblEntityKind::Transcript),
             LanceWriteStrategy::ChunkedAppend {
                 chunk_rows: LANCE_CONTEXT_WRITE_CHUNK_ROWS
+            }
+        );
+        // Translation (incl. translation_sift) writes in large chunks so the
+        // narrow dataset lands in a few big, well-compressed fragments.
+        assert_eq!(
+            lance_write_strategy(EnsemblEntityKind::Translation),
+            LanceWriteStrategy::ChunkedAppend {
+                chunk_rows: LANCE_TRANSLATION_WRITE_CHUNK_ROWS
             }
         );
     }
