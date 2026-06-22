@@ -507,6 +507,9 @@ async fn build_lance_translation_sift(options: &LanceCacheBuildOptions) -> Resul
         if rows == 0 {
             continue;
         }
+        // Collapse the per-batch fragments + stale versions left by the
+        // streaming append (free ~20% on the translation_sift dataset).
+        crate::lance_cache::write::compact_and_cleanup_sift_dataset(&dataset_path).await?;
         manifest_entries.push(ChromDatasetEntry::new(manifest_chrom, dataset_name, rows));
         files.push((dataset_path.to_string_lossy().to_string(), rows));
     }

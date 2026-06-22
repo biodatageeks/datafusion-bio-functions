@@ -188,6 +188,40 @@ pub async fn create_required_index(path: &Path, index_kind: LanceIndexKind) -> R
     Ok(())
 }
 
+/// Merge fragments and drop superseded versions for a freshly built dataset.
+/// The streaming SIFT build appends one fragment per batch (thousands per
+/// contig) and never compacts, leaving a large `_versions`/fragment overhead;
+/// this collapses them. Field encoding metadata is carried through compaction.
+pub async fn compact_and_cleanup_sift_dataset(path: &Path) -> Result<()> {
+    use lance::dataset::optimize::{CompactionOptions, compact_files};
+    let mut dataset = lance::Dataset::open(path.to_string_lossy().as_ref())
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!(
+                "failed to open Lance dataset for compaction '{}': {err}",
+                path.display()
+            ))
+        })?;
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!(
+                "failed to compact Lance dataset '{}': {err}",
+                path.display()
+            ))
+        })?;
+    dataset
+        .cleanup_old_versions(chrono::Duration::seconds(0), Some(true), None)
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!(
+                "failed to clean up old Lance versions for '{}': {err}",
+                path.display()
+            ))
+        })?;
+    Ok(())
+}
+
 /// Create a bitmap scalar index on the `tier` column. The runtime point-lookup
 /// path does not filter on `tier`; this index is forward-compatibility for a
 /// future in-memory warm-tier reader and is cheap relative to the dataset.
@@ -359,5 +393,59 @@ mod tests {
         assert_eq!(aligned.schema().field(0).name(), "chrom");
         assert_eq!(aligned.schema().field(1).name(), "start");
         assert_eq!(aligned.column(0).len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_reduces_fragment_count() {
+        use datafusion::arrow::array::{BinaryArray, UInt64Array};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.lance");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt64, false),
+            Field::new("sift", DataType::Binary, false),
+        ]));
+        // Write several small fragments (one per append) to mimic the build.
+        for i in 0..5u64 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(vec![i])),
+                    Arc::new(BinaryArray::from(vec![b"x".as_ref()])),
+                ],
+            )
+            .unwrap();
+            let reader = Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()));
+            let mode = if i == 0 {
+                WriteMode::Create
+            } else {
+                WriteMode::Append
+            };
+            lance::Dataset::write(
+                reader,
+                path.to_string_lossy().as_ref(),
+                Some(WriteParams {
+                    mode,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let before = lance::Dataset::open(path.to_string_lossy().as_ref())
+            .await
+            .unwrap()
+            .get_fragments()
+            .len();
+        assert!(before > 1, "expected multiple fragments, got {before}");
+        compact_and_cleanup_sift_dataset(&path).await.unwrap();
+        let after = lance::Dataset::open(path.to_string_lossy().as_ref())
+            .await
+            .unwrap()
+            .get_fragments()
+            .len();
+        assert!(
+            after < before,
+            "expected compaction to reduce {before} -> {after}"
+        );
     }
 }
