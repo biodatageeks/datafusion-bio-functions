@@ -58,10 +58,13 @@ pub(crate) mod ordered_drain;
 pub mod partitioned_cache;
 pub(crate) mod pipeline_trace;
 pub mod schema_contract;
+pub mod sift_decode;
 pub mod so_terms;
 pub mod transcript_consequence;
 pub mod vcf_sink;
 pub(crate) mod window_planner;
+
+pub use sift_decode::{register_vep_sift_functions, vep_decode_sift_predictions_udf};
 
 use std::sync::Arc;
 
