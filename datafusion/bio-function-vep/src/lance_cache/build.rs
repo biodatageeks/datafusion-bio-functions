@@ -1393,7 +1393,13 @@ fn compact_translation_sift_position_schema(source_type: &str) -> Schema {
     let key = Field::new("key", DataType::UInt64, false).with_metadata(meta.clone());
     let sift = Field::new("sift", DataType::Binary, false).with_metadata(meta.clone());
     let poly = Field::new("poly", DataType::Binary, false).with_metadata(meta);
-    with_cache_source_metadata(&Schema::new(vec![key, sift, poly]), source_type)
+    let schema = with_cache_source_metadata(&Schema::new(vec![key, sift, poly]), source_type);
+    let mut md = schema.metadata().clone();
+    md.insert(
+        crate::cache_common::SIFT_BLOB_VERSION_KEY.to_string(),
+        "2".to_string(),
+    );
+    Schema::new_with_metadata(schema.fields().clone(), md)
 }
 
 /// Explode each transcript's SIFT/PolyPhen matrices into one row per protein
@@ -1490,12 +1496,14 @@ fn append_translation_sift_position_rows(
             pi += 1;
         }
         keys.push(((uid as u64) << 32) | (next_pos as u64));
-        sift_blobs.push(crate::cache_common::serialize_position_entries(
+        sift_blobs.push(crate::cache_common::serialize_position_entries_v2(
             &sift[s_start..si],
-        ));
-        poly_blobs.push(crate::cache_common::serialize_position_entries(
+            crate::cache_common::SIFT_CODEC,
+        )?);
+        poly_blobs.push(crate::cache_common::serialize_position_entries_v2(
             &poly[p_start..pi],
-        ));
+            crate::cache_common::POLY_CODEC,
+        )?);
     }
     Ok(())
 }
@@ -2158,7 +2166,7 @@ mod tests {
 
     #[test]
     fn translation_sift_position_rows_group_by_position_with_unique_keys() {
-        use crate::cache_common::deserialize_position_predictions;
+        use crate::cache_common::{SiftBlobVersion, deserialize_position_predictions_versioned};
         use crate::transcript_consequence::CompactPrediction;
 
         // sift at positions 1 & 2, polyphen only at position 2.
@@ -2210,13 +2218,25 @@ mod tests {
         assert_eq!(sorted.len(), keys.len());
 
         // Position 1: sift only, no polyphen.
-        let p1 = deserialize_position_predictions(1, &sift_blobs[0], &poly_blobs[0]).unwrap();
+        let p1 = deserialize_position_predictions_versioned(
+            1,
+            &sift_blobs[0],
+            &poly_blobs[0],
+            SiftBlobVersion::V2DivIndex,
+        )
+        .unwrap();
         assert_eq!(p1.sift.len(), 1);
         assert!(p1.polyphen.is_empty());
         assert_eq!(p1.sift[0].position, 1);
 
         // Position 2: both sift and polyphen.
-        let p2 = deserialize_position_predictions(2, &sift_blobs[1], &poly_blobs[1]).unwrap();
+        let p2 = deserialize_position_predictions_versioned(
+            2,
+            &sift_blobs[1],
+            &poly_blobs[1],
+            SiftBlobVersion::V2DivIndex,
+        )
+        .unwrap();
         assert_eq!(p2.sift.len(), 1);
         assert_eq!(p2.polyphen.len(), 1);
         assert_eq!(p2.polyphen[0].prediction, 4);
@@ -2234,6 +2254,64 @@ mod tests {
                 .get("lance-encoding:structural-encoding")
                 .map(String::as_str),
             Some("fullzip")
+        );
+    }
+
+    #[test]
+    fn append_translation_sift_position_rows_emits_v2() {
+        use crate::cache_common::{POLY_CODEC, SIFT_CODEC, deserialize_position_entries_v2};
+        use crate::transcript_consequence::CompactPrediction;
+        let preds = CachedPredictions {
+            sift: vec![
+                CompactPrediction {
+                    position: 1,
+                    amino_acid: 0,
+                    prediction: 1,
+                    score: 0.03,
+                },
+                CompactPrediction {
+                    position: 1,
+                    amino_acid: 5,
+                    prediction: 0,
+                    score: 1.0,
+                },
+            ],
+            polyphen: vec![CompactPrediction {
+                position: 1,
+                amino_acid: 0,
+                prediction: 2,
+                score: 0.998,
+            }],
+        };
+        let mut keys = Vec::new();
+        let mut sift_blobs = Vec::new();
+        let mut poly_blobs = Vec::new();
+        append_translation_sift_position_rows(
+            42,
+            &preds,
+            &mut keys,
+            &mut sift_blobs,
+            &mut poly_blobs,
+        )
+        .unwrap();
+        assert_eq!(keys, vec![(42u64 << 32) | 1]);
+        // v2 sift: 2 entries * 3 bytes
+        assert_eq!(sift_blobs[0].len(), 6);
+        let s = deserialize_position_entries_v2(1, &sift_blobs[0], SIFT_CODEC).unwrap();
+        assert_eq!(s[1].score.to_bits(), 1.0f32.to_bits());
+        let p = deserialize_position_entries_v2(1, &poly_blobs[0], POLY_CODEC).unwrap();
+        assert_eq!(p[0].score.to_bits(), 0.998f32.to_bits());
+    }
+
+    #[test]
+    fn sift_position_schema_carries_v2_flag() {
+        let schema = compact_translation_sift_position_schema("ensembl");
+        assert_eq!(
+            schema
+                .metadata()
+                .get(crate::cache_common::SIFT_BLOB_VERSION_KEY)
+                .map(String::as_str),
+            Some("2")
         );
     }
 }
