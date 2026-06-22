@@ -948,9 +948,14 @@ fn coalesce_record_batch_stream(
 ) -> SendableRecordBatchStream {
     let adapter_schema = Arc::clone(&schema);
     let state = CoalesceRecordBatchStreamState::new(input, schema, target_rows);
+    // `.fuse()` so the stream keeps returning `None` if the downstream Lance
+    // writer polls it again after exhaustion. A bare `unfold` panics on
+    // poll-after-`None` ("Unfold must not be polled after it returned
+    // `Poll::Ready(None)`"), which crashed the full variation build mid-stream.
     let stream = futures::stream::unfold(state, |mut state| async move {
         state.next_batch().await.map(|batch| (batch, state))
-    });
+    })
+    .fuse();
     Box::pin(RecordBatchStreamAdapter::new(adapter_schema, stream))
 }
 
@@ -2118,6 +2123,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             [5, 6]
         );
+    }
+
+    #[tokio::test]
+    async fn coalesced_stream_tolerates_poll_after_none() {
+        // The Lance stream writer can poll the coalesced output stream again
+        // after it has already returned `None`. The unfold backing the stream
+        // must tolerate that (fused) rather than panic with
+        // "Unfold must not be polled after it returned `Poll::Ready(None)`".
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "start",
+            DataType::UInt32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt32Array::from(vec![1u32, 2, 3])) as ArrayRef],
+        )
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+        let mut coalesced = coalesce_record_batch_stream(stream, Arc::clone(&schema), 4);
+        assert_eq!(coalesced.next().await.unwrap().unwrap().num_rows(), 3);
+        assert!(coalesced.next().await.is_none());
+        // Extra polls after exhaustion must keep yielding None, not panic.
+        assert!(coalesced.next().await.is_none());
+        assert!(coalesced.next().await.is_none());
     }
 
     #[tokio::test]
