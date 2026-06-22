@@ -3118,6 +3118,7 @@ impl crate::cache_common::SiftPredictionStore for LanceBinarySiftPredictionStore
 struct PositionSlicedLanceSiftStore {
     lookup: Arc<crate::lance_cache::context_runtime::KeyU64LanceLookup>,
     cache: Arc<Mutex<HashMap<u64, Option<CachedPredictions>>>>,
+    blob_version: crate::cache_common::SiftBlobVersion,
 }
 
 #[cfg(feature = "lance-cache")]
@@ -3165,7 +3166,7 @@ impl crate::cache_common::SiftPredictionStore for PositionSlicedLanceSiftStore {
         let (batch, _present) = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.lookup.take_keys(&uncached))
         })?;
-        let fetched = position_predictions_from_batch(&batch)?;
+        let fetched = position_predictions_from_batch(&batch, self.blob_version)?;
         let mut cache = self.cache.lock().map_err(|error| {
             DataFusionError::Execution(format!("Lance SIFT position cache poisoned: {error}"))
         })?;
@@ -3185,7 +3186,10 @@ impl crate::cache_common::SiftPredictionStore for PositionSlicedLanceSiftStore {
 /// `poly: Binary`) into per-key [`CachedPredictions`]. The protein position is
 /// recovered from the low 32 bits of `key`.
 #[cfg(feature = "lance-cache")]
-fn position_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<u64, CachedPredictions>> {
+fn position_predictions_from_batch(
+    batch: &RecordBatch,
+    version: crate::cache_common::SiftBlobVersion,
+) -> Result<HashMap<u64, CachedPredictions>> {
     let schema = batch.schema();
     let key_idx = schema.index_of("key")?;
     let sift_idx = schema.index_of("sift").ok();
@@ -3213,7 +3217,9 @@ fn position_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<u64, C
             Some(idx) => binary_at(batch.column(idx).as_ref(), row)?.unwrap_or(&[]),
             None => &[],
         };
-        let cached = crate::cache_common::deserialize_position_predictions(position, sift, poly)?;
+        let cached = crate::cache_common::deserialize_position_predictions_versioned(
+            position, sift, poly, version,
+        )?;
         predictions.insert(key, cached);
     }
     Ok(predictions)
@@ -3239,9 +3245,11 @@ async fn load_lance_sift_prediction_store_for_chrom(
         if lookup.keys_len() == 0 {
             return Ok(None);
         }
+        let blob_version = crate::cache_common::sift_blob_version_from_metadata(schema.metadata());
         return Ok(Some(Arc::new(PositionSlicedLanceSiftStore {
             lookup: Arc::new(lookup),
             cache: Arc::new(Mutex::new(HashMap::new())),
+            blob_version,
         }) as SiftPredictionStoreRef));
     }
     if schema.index_of("predictions").is_ok() {
@@ -13602,7 +13610,11 @@ mod tests {
         )
         .unwrap();
 
-        let decoded = position_predictions_from_batch(&batch).unwrap();
+        let decoded = position_predictions_from_batch(
+            &batch,
+            crate::cache_common::SiftBlobVersion::V1Interleaved,
+        )
+        .unwrap();
         let preds = decoded.get(&key).expect("key present");
         // Position is recovered from the low 32 bits of the key.
         assert_eq!(preds.sift[0].position, pos);
@@ -13611,6 +13623,56 @@ mod tests {
             preds.lookup_polyphen(pos, "I"),
             Some(("probably damaging", 0.999))
         );
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[test]
+    fn position_predictions_from_batch_decodes_v2() {
+        use crate::cache_common::{
+            POLY_CODEC, SIFT_CODEC, SiftBlobVersion, serialize_position_entries_v2,
+        };
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let key = (3u64 << 32) | 11;
+        let sift = serialize_position_entries_v2(
+            &[CompactPrediction {
+                position: 11,
+                amino_acid: 2,
+                prediction: 1,
+                score: 0.07,
+            }],
+            SIFT_CODEC,
+        )
+        .unwrap();
+        let poly = serialize_position_entries_v2(
+            &[CompactPrediction {
+                position: 11,
+                amino_acid: 2,
+                prediction: 2,
+                score: 0.951,
+            }],
+            POLY_CODEC,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt64, false),
+            Field::new("sift", DataType::Binary, false),
+            Field::new("poly", DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![key])),
+                Arc::new(BinaryArray::from(vec![sift.as_slice()])),
+                Arc::new(BinaryArray::from(vec![poly.as_slice()])),
+            ],
+        )
+        .unwrap();
+        let out = position_predictions_from_batch(&batch, SiftBlobVersion::V2DivIndex).unwrap();
+        let cached = out.get(&key).unwrap();
+        assert_eq!(cached.sift[0].score.to_bits(), 0.07f32.to_bits());
+        assert_eq!(cached.polyphen[0].score.to_bits(), 0.951f32.to_bits());
+        assert_eq!(cached.sift[0].position, 11);
     }
 
     /// Opt-in data-parity gate for the position-sliced SIFT layout. Decodes the
@@ -13689,9 +13751,13 @@ mod tests {
         .await
         .unwrap();
         let new_rows = lookup.keys_len();
+        let new_schema = read_lance_dataset_schema(&new_sift).await.unwrap();
         let store = PositionSlicedLanceSiftStore {
             lookup: Arc::new(lookup),
             cache: Arc::new(Mutex::new(HashMap::new())),
+            blob_version: crate::cache_common::sift_blob_version_from_metadata(
+                new_schema.metadata(),
+            ),
         };
 
         let entries_at = |preds: &[CompactPrediction], pos: i32| -> Vec<(u8, u8, u32)> {
