@@ -177,6 +177,140 @@ pub(crate) fn deserialize_position_predictions(
     })
 }
 
+/// Schema-metadata key marking the position-sliced SIFT blob layout version.
+pub(crate) const SIFT_BLOB_VERSION_KEY: &str = "bio.vep.sift_blob_version";
+
+/// Per-predictor parameters for the v2 de-interleaved fixed-divisor layout.
+#[derive(Clone, Copy)]
+pub(crate) struct PredictorCodec {
+    /// Bytes per score index: 1 (`u8`, SIFT) or 2 (`u16` LE, PolyPhen).
+    pub idx_width: usize,
+    /// Score = index / divisor. 100.0 (SIFT, 0.01 grid) or 1000.0 (PolyPhen, 0.001 grid).
+    pub divisor: f32,
+}
+
+pub(crate) const SIFT_CODEC: PredictorCodec = PredictorCodec {
+    idx_width: 1,
+    divisor: 100.0,
+};
+pub(crate) const POLY_CODEC: PredictorCodec = PredictorCodec {
+    idx_width: 2,
+    divisor: 1000.0,
+};
+
+/// On-disk layout of the position-sliced SIFT/PolyPhen `Binary` blobs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SiftBlobVersion {
+    /// Interleaved 6-byte entries `[aa u8][pred u8][score f32 LE]`.
+    V1Interleaved,
+    /// De-interleaved `[aa u8 × n][pred u8 × n][score_idx × n]` with fixed-divisor index.
+    V2DivIndex,
+}
+
+pub(crate) fn sift_blob_version_from_metadata(meta: &HashMap<String, String>) -> SiftBlobVersion {
+    match meta.get(SIFT_BLOB_VERSION_KEY).map(String::as_str) {
+        Some("2") => SiftBlobVersion::V2DivIndex,
+        _ => SiftBlobVersion::V1Interleaved,
+    }
+}
+
+/// Serialize one protein position's predictions for a single predictor in the v2
+/// de-interleaved fixed-divisor layout: `[aa × n][pred × n][score_idx × n]`.
+/// Returns an error if any score is not bit-exactly representable as `k / divisor`
+/// or the index does not fit `idx_width` (preserves the lossless guarantee).
+pub(crate) fn serialize_position_entries_v2(
+    entries: &[CompactPrediction],
+    codec: PredictorCodec,
+) -> Result<Vec<u8>> {
+    let n = entries.len();
+    let mut buf = Vec::with_capacity(n * (2 + codec.idx_width));
+    for p in entries {
+        buf.push(p.amino_acid);
+    }
+    for p in entries {
+        buf.push(p.prediction);
+    }
+    let max = if codec.idx_width == 1 {
+        u8::MAX as i64
+    } else {
+        u16::MAX as i64
+    };
+    for p in entries {
+        let idx = (p.score * codec.divisor).round() as i64;
+        if idx < 0 || idx > max {
+            return Err(DataFusionError::Execution(format!(
+                "SIFT/PolyPhen score {} out of range for divisor {}",
+                p.score, codec.divisor
+            )));
+        }
+        if (idx as f32 / codec.divisor).to_bits() != p.score.to_bits() {
+            return Err(DataFusionError::Execution(format!(
+                "SIFT/PolyPhen score {} is not bit-exactly representable as k/{}",
+                p.score, codec.divisor
+            )));
+        }
+        if codec.idx_width == 1 {
+            buf.push(idx as u8);
+        } else {
+            buf.extend_from_slice(&(idx as u16).to_le_bytes());
+        }
+    }
+    Ok(buf)
+}
+
+/// Inverse of [`serialize_position_entries_v2`].
+pub(crate) fn deserialize_position_entries_v2(
+    position: i32,
+    data: &[u8],
+    codec: PredictorCodec,
+) -> Result<Vec<CompactPrediction>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stride = 2 + codec.idx_width;
+    if !data.len().is_multiple_of(stride) {
+        return Err(DataFusionError::Execution(format!(
+            "v2 SIFT payload length {} is not a multiple of stride {stride}",
+            data.len()
+        )));
+    }
+    let n = data.len() / stride;
+    let aa = &data[0..n];
+    let pred = &data[n..2 * n];
+    let idx = &data[2 * n..];
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let raw = if codec.idx_width == 1 {
+            idx[i] as u16
+        } else {
+            u16::from_le_bytes([idx[2 * i], idx[2 * i + 1]])
+        };
+        out.push(CompactPrediction {
+            position,
+            amino_acid: aa[i],
+            prediction: pred[i],
+            score: raw as f32 / codec.divisor,
+        });
+    }
+    Ok(out)
+}
+
+/// Decode both predictor blobs for one position, selecting the layout by version.
+pub(crate) fn deserialize_position_predictions_versioned(
+    position: i32,
+    sift: &[u8],
+    poly: &[u8],
+    version: SiftBlobVersion,
+) -> Result<CachedPredictions> {
+    match version {
+        SiftBlobVersion::V1Interleaved => deserialize_position_predictions(position, sift, poly),
+        SiftBlobVersion::V2DivIndex => Ok(CachedPredictions {
+            sift: deserialize_position_entries_v2(position, sift, SIFT_CODEC)?,
+            polyphen: deserialize_position_entries_v2(position, poly, POLY_CODEC)?,
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Allele-frequency helpers (warm-position selection for Lance cache build)
 // ---------------------------------------------------------------------------
@@ -262,4 +396,97 @@ where
     }
 
     warm_positions
+}
+
+#[cfg(test)]
+mod v2_codec_tests {
+    use super::*;
+    use crate::transcript_consequence::CompactPrediction;
+
+    fn cp(aa: u8, pred: u8, score: f32) -> CompactPrediction {
+        CompactPrediction {
+            position: 7,
+            amino_acid: aa,
+            prediction: pred,
+            score,
+        }
+    }
+
+    #[test]
+    fn v2_sift_roundtrip_bit_exact() {
+        let entries = vec![
+            cp(0, 1, 0.0),
+            cp(3, 0, 0.02),
+            cp(19, 1, 1.0),
+            cp(7, 0, 0.55),
+        ];
+        let bytes = serialize_position_entries_v2(&entries, SIFT_CODEC).unwrap();
+        assert_eq!(bytes.len(), entries.len() * 3);
+        let back = deserialize_position_entries_v2(7, &bytes, SIFT_CODEC).unwrap();
+        assert_eq!(back.len(), entries.len());
+        for (a, b) in entries.iter().zip(back.iter()) {
+            assert_eq!(a.amino_acid, b.amino_acid);
+            assert_eq!(a.prediction, b.prediction);
+            assert_eq!(a.score.to_bits(), b.score.to_bits(), "score not bit-exact");
+            assert_eq!(b.position, 7);
+        }
+    }
+
+    #[test]
+    fn v2_poly_roundtrip_bit_exact_u16() {
+        let entries = vec![cp(0, 2, 0.998), cp(5, 0, 0.001), cp(12, 1, 0.5)];
+        let bytes = serialize_position_entries_v2(&entries, POLY_CODEC).unwrap();
+        assert_eq!(bytes.len(), entries.len() * 4);
+        let back = deserialize_position_entries_v2(7, &bytes, POLY_CODEC).unwrap();
+        for (a, b) in entries.iter().zip(back.iter()) {
+            assert_eq!(a.score.to_bits(), b.score.to_bits());
+        }
+    }
+
+    #[test]
+    fn v2_empty_blob() {
+        let bytes = serialize_position_entries_v2(&[], SIFT_CODEC).unwrap();
+        assert!(bytes.is_empty());
+        assert!(
+            deserialize_position_entries_v2(1, &bytes, SIFT_CODEC)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v2_rejects_off_grid_score() {
+        let entries = vec![cp(0, 1, 0.005)];
+        assert!(serialize_position_entries_v2(&entries, SIFT_CODEC).is_err());
+    }
+
+    #[test]
+    fn version_from_metadata() {
+        let mut m = HashMap::new();
+        assert_eq!(
+            sift_blob_version_from_metadata(&m),
+            SiftBlobVersion::V1Interleaved
+        );
+        m.insert(SIFT_BLOB_VERSION_KEY.to_string(), "2".to_string());
+        assert_eq!(
+            sift_blob_version_from_metadata(&m),
+            SiftBlobVersion::V2DivIndex
+        );
+    }
+
+    #[test]
+    fn versioned_dispatch_v2() {
+        let sift = serialize_position_entries_v2(&[cp(1, 0, 0.04)], SIFT_CODEC).unwrap();
+        let poly = serialize_position_entries_v2(&[cp(1, 2, 0.7)], POLY_CODEC).unwrap();
+        let out = deserialize_position_predictions_versioned(
+            9,
+            &sift,
+            &poly,
+            SiftBlobVersion::V2DivIndex,
+        )
+        .unwrap();
+        assert_eq!(out.sift[0].score.to_bits(), 0.04f32.to_bits());
+        assert_eq!(out.polyphen[0].score.to_bits(), 0.7f32.to_bits());
+        assert_eq!(out.sift[0].position, 9);
+    }
 }
