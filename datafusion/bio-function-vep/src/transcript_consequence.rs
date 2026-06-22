@@ -1,5 +1,6 @@
 //! Transcript/exon-driven consequence evaluation (phase 2).
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -1190,16 +1191,22 @@ impl TranscriptConsequenceEngine {
                 let tx_idx = *GenericInterval::<usize>::metadata(node);
                 let tx = ctx.transcripts[tx_idx];
                 let exon_lookup_started = profiling.then(Instant::now);
+                // Source genomic-start-ordered exons so the per-output intron/exon
+                // helpers (`start_sorted`) borrow instead of re-sorting per call.
+                // The intron helpers derive introns from start-ordered pairs and
+                // `which_exon_str` is order-independent, so start order is correct
+                // for all consumers here.
                 let tx_exons = ctx
-                    .exons_by_tx
-                    .get(tx.transcript_id.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let tx_exons_for_hgvsc = ctx
                     .exons_by_tx_genomic
                     .get(tx.transcript_id.as_str())
                     .map(Vec::as_slice)
-                    .unwrap_or(tx_exons);
+                    .or_else(|| {
+                        ctx.exons_by_tx
+                            .get(tx.transcript_id.as_str())
+                            .map(Vec::as_slice)
+                    })
+                    .unwrap_or(&[]);
+                let tx_exons_for_hgvsc = tx_exons;
                 let tx_translation = ctx
                     .translation_by_tx
                     .get(tx.transcript_id.as_str())
@@ -2402,9 +2409,8 @@ impl TranscriptConsequenceEngine {
         if variant.ref_allele == "-" {
             return false;
         }
-        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted.sort_by_key(|e| e.start);
-        for e in &sorted {
+        let sorted = start_sorted(tx_exons);
+        for e in sorted.iter() {
             if !overlaps(variant.start, variant.end, e.start, e.end) {
                 continue;
             }
@@ -3010,8 +3016,7 @@ impl TranscriptConsequenceEngine {
         if tx_exons.len() < 2 {
             return false;
         }
-        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted.sort_by_key(|e| e.start);
+        let sorted = start_sorted(tx_exons);
         for pair in sorted.windows(2) {
             let intron_start = pair[0].end + 1;
             let intron_end = pair[1].start - 1;
@@ -3035,8 +3040,7 @@ impl TranscriptConsequenceEngine {
         if tx_exons.len() < 2 {
             return false;
         }
-        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted.sort_by_key(|e| e.start);
+        let sorted = start_sorted(tx_exons);
         sorted.windows(2).any(|pair| {
             let intron_start = pair[0].end + 1;
             let intron_end = pair[1].start - 1;
@@ -3088,8 +3092,7 @@ impl TranscriptConsequenceEngine {
         if tx_exons.len() < 2 {
             return false;
         }
-        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted.sort_by_key(|e| e.start);
+        let sorted = start_sorted(tx_exons);
         sorted.windows(2).any(|pair| {
             let intron_start = pair[0].end + 1;
             let intron_end = pair[1].start - 1;
@@ -3108,8 +3111,7 @@ impl TranscriptConsequenceEngine {
         if tx_exons.len() < 2 {
             return false;
         }
-        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted.sort_by_key(|e| e.start);
+        let sorted = start_sorted(tx_exons);
         for pair in sorted.windows(2) {
             let intron_start = pair[0].end + 1;
             let intron_end = pair[1].start - 1;
@@ -3161,8 +3163,7 @@ impl TranscriptConsequenceEngine {
             && !self.overlaps_exon_for_consequence_include(sv, tx_exons);
 
         // Derive introns from sorted exon pairs.
-        let mut sorted_exons: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted_exons.sort_by_key(|e| e.start);
+        let sorted_exons = start_sorted(tx_exons);
 
         for pair in sorted_exons.windows(2) {
             let intron_start = pair[0].end + 1;
@@ -7227,6 +7228,22 @@ fn format_codon_display(
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1414-L1445>
 /// - Ensembl Variation `BaseTranscriptVariation::exon_number()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L698-L724>
+/// Return `tx_exons` ordered by genomic `start`, borrowing when the slice is
+/// already start-ordered (the common case: callers pass `exons_by_tx_genomic`,
+/// pre-sorted once per transcript at context build). Avoids the per-output
+/// `Vec` allocation + sort that several intron/exon helpers used to repeat.
+/// Behavior-identical to `tx_exons.to_vec(); sort_by_key(|e| e.start)` for any
+/// input order (stable sort; ties keep input order).
+fn start_sorted<'a, 'e>(tx_exons: &'a [&'e ExonFeature]) -> Cow<'a, [&'e ExonFeature]> {
+    if tx_exons.windows(2).all(|w| w[0].start <= w[1].start) {
+        Cow::Borrowed(tx_exons)
+    } else {
+        let mut sorted = tx_exons.to_vec();
+        sorted.sort_by_key(|e| e.start);
+        Cow::Owned(sorted)
+    }
+}
+
 fn which_exon_str(variant: &VariantInput, tx_exons: &[&ExonFeature]) -> Option<String> {
     if tx_exons.is_empty() {
         return None;
@@ -7256,8 +7273,7 @@ fn which_intron_str(
     if tx_exons.len() < 2 {
         return None;
     }
-    let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-    sorted.sort_by_key(|e| e.start);
+    let sorted = start_sorted(tx_exons);
     let total_introns = sorted.len() - 1;
 
     for (i, pair) in sorted.windows(2).enumerate() {
@@ -7298,25 +7314,26 @@ fn which_intron_str(
     None
 }
 
-/// Build ordered exon segments for cDNA coordinate mapping.
-/// Returns (start, end) pairs ordered by transcript direction.
-fn exon_segments(tx_exons: &[&ExonFeature], strand: i8) -> Option<Vec<(i64, i64)>> {
+/// Map a genomic position to 1-based cDNA index (counting all exonic bases).
+///
+/// Walks exons in transcript direction (ascending genomic start on `+`,
+/// descending on `-`) directly over a start-ordered view, avoiding the owned
+/// `(start, end)` segment `Vec` that `exon_segments` allocated per call. Result
+/// is identical to `exon_segments(...)` then offset accumulation.
+fn genomic_to_cdna_index(tx_exons: &[&ExonFeature], strand: i8, pos: i64) -> Option<usize> {
     if tx_exons.is_empty() {
         return None;
     }
-    let mut segments: Vec<(i64, i64)> = tx_exons.iter().map(|e| (e.start, e.end)).collect();
-    segments.sort_by_key(|(s, _)| *s);
-    if strand < 0 {
-        segments.reverse();
-    }
-    Some(segments)
-}
-
-/// Map a genomic position to 1-based cDNA index (counting all exonic bases).
-fn genomic_to_cdna_index(tx_exons: &[&ExonFeature], strand: i8, pos: i64) -> Option<usize> {
-    let segments = exon_segments(tx_exons, strand)?;
+    let sorted = start_sorted(tx_exons);
+    let n = sorted.len();
     let mut offset = 0usize;
-    for (seg_start, seg_end) in segments {
+    for i in 0..n {
+        let e = if strand >= 0 {
+            sorted[i]
+        } else {
+            sorted[n - 1 - i]
+        };
+        let (seg_start, seg_end) = (e.start, e.end);
         let seg_len = usize::try_from(seg_end.saturating_sub(seg_start).saturating_add(1)).ok()?;
         if pos >= seg_start && pos <= seg_end {
             let local = if strand >= 0 {

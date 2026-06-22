@@ -1987,10 +1987,6 @@ impl ColocatedData {
         let mut per_column: Vec<Vec<String>> = vec![Vec::new(); AF_COLUMNS.len()];
         let mut max_af: Option<(f64, String)> = None;
         let mut max_af_pops: Vec<String> = Vec::new();
-        // Reused across every (entry x AF column) iteration (cleared each time)
-        // instead of allocated per iteration — was the dominant colocated churn.
-        let mut freq_data: HashMap<String, String> = HashMap::new();
-        let mut remaining: HashSet<String> = HashSet::new();
 
         for entry in self.sorted_entries() {
             let Some(matched_allele) =
@@ -2002,6 +1998,14 @@ impl ColocatedData {
             let existing_alleles: Vec<&str> = entry.allele_string.split('/').collect();
             let mut entry_max_af: Option<(f64, String)> = None;
             let mut entry_max_af_pops: Vec<String> = Vec::new();
+
+            // Borrowed-key scratch reused across this entry's AF columns (cleared
+            // each column). Keys/alleles borrow `entry` (af_value/allele_string
+            // are `&str`), so the per-(entry x column) `to_string()` storm that
+            // dominated colocated churn is gone; only the 4f-formatted and the
+            // interpolated values still allocate.
+            let mut freq_data: HashMap<&str, Cow<str>> = HashMap::new();
+            let mut remaining: HashSet<&str> = HashSet::new();
 
             for (idx, column) in AF_COLUMNS.iter().enumerate() {
                 let should_process = flags.max_af || flags.af_group_enabled(column.flag_group);
@@ -2016,7 +2020,7 @@ impl ColocatedData {
 
                 freq_data.clear();
                 remaining.clear();
-                remaining.extend(existing_alleles.iter().map(|allele| (*allele).to_string()));
+                remaining.extend(existing_alleles.iter().copied());
                 let mut total = 0.0_f64;
 
                 for pair in raw.split(',') {
@@ -2024,26 +2028,26 @@ impl ColocatedData {
                         continue;
                     };
                     let formatted = if column.format_4f {
-                        format_af_4f(freq)
+                        Cow::Owned(format_af_4f(freq))
                     } else {
-                        freq.to_string()
+                        Cow::Borrowed(freq)
                     };
-                    freq_data.insert(allele.to_string(), formatted);
+                    freq_data.insert(allele, formatted);
                     total += freq.parse::<f64>().unwrap_or(0.0);
                     remaining.remove(allele);
                 }
 
                 let mut interpolated = false;
                 if existing_alleles.len() == 2 && remaining.len() == 1 && column.cache_col == "AF" {
-                    let remaining_allele = remaining.iter().next().unwrap().clone();
-                    freq_data.insert(remaining_allele, format!("{}", 1.0 - total));
+                    let remaining_allele = *remaining.iter().next().unwrap();
+                    freq_data.insert(remaining_allele, Cow::Owned(format!("{}", 1.0 - total)));
                     interpolated = true;
                 }
 
-                let chosen = if let Some(value) = freq_data.get(&matched_allele.b_allele) {
-                    Some(value.clone())
+                let chosen = if let Some(value) = freq_data.get(matched_allele.b_allele.as_str()) {
+                    Some(value.to_string())
                 } else if interpolated {
-                    freq_data.get(output_allele).cloned()
+                    freq_data.get(output_allele).map(|value| value.to_string())
                 } else {
                     None
                 };
@@ -5693,7 +5697,10 @@ impl AnnotateProvider {
                     batch3_suffix_for_csq(frequency_fields, &variant_fields)
                 });
 
-            let most_str;
+            // `most_str` borrows for the row: `&'static` from `SoTerm::as_str()` on
+            // the cache-miss path, or `cached_most` (used by-ref) on the fast path.
+            // Avoids a per-row String allocation just to feed `append_value(&str)`.
+            let most_str: &str;
             // Store assignment results from cache-miss path for annotation column population.
             let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
             // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
@@ -5730,7 +5737,7 @@ impl AnnotateProvider {
                     };
                     placeholder_layout.append_entry(&mut csq_buf, &entry);
                 }
-                most_str = most_val.to_string();
+                most_str = most_val;
                 if let Some(started) = cached_fast_started {
                     engine_profile.cached_fast_path += started.elapsed();
                 }
@@ -5847,7 +5854,7 @@ impl AnnotateProvider {
                     all_terms.push(SoTerm::SequenceVariant);
                 }
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
-                most_str = most.as_str().to_string();
+                most_str = most.as_str();
                 row_assignments = apply_pick_mode(assignments, ctx, pick_flags, &vep_allele);
                 if engine_profile_enabled {
                     engine_profile.picked_assignments += row_assignments.len();
@@ -6269,7 +6276,7 @@ impl AnnotateProvider {
             } else {
                 csq_builder.append_value(&csq_buf);
             }
-            most_builder.append_value(&most_str);
+            most_builder.append_value(most_str);
             if let Some(started) = append_scalars_started {
                 engine_profile.append_scalars += started.elapsed();
             }
