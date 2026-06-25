@@ -5248,17 +5248,31 @@ impl AnnotateProvider {
         // The single `workers` knob drives BOTH stages: with workers>1 the
         // lookup runs as N spawned, position-ordered partitions (so it isn't a
         // serial bottleneck) and annotation runs as N parallel window workers.
-        let annotation_workers = self
+        let requested_workers = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_i64_option(opts, "workers"))
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0)
             .unwrap_or(1);
-        let target_partitions = if annotation_workers > 1 {
-            annotation_workers.max(target_partitions)
+        let target_partitions = if requested_workers > 1 {
+            requested_workers.max(target_partitions)
         } else {
             target_partitions
+        };
+        // Stateful Merged/RefSeq annotation must run as a single ordered,
+        // grid-aligned worker for VEP HGNC parity: the parallel partition path
+        // misaligns input buffers to the global 5000-unit grid and cannot carry
+        // donated HGNC across concurrent partitions (chr4 regressed to 8,281 at
+        // workers=4). Lookup stays partitioned (target_partitions) for IO
+        // parallelism; only the annotation stage is forced serial here.
+        let annotation_workers = if matches!(
+            self.cache_source_type,
+            CacheSourceType::Merged | CacheSourceType::RefSeq
+        ) {
+            1
+        } else {
+            requested_workers
         };
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
