@@ -9361,6 +9361,39 @@ fn rows_covering_input_units(batch: &RecordBatch, input_units: usize) -> (usize,
     (rows, units)
 }
 
+/// Total VEP input units (alt-allele count) across a window buffer of batches.
+fn window_buffer_input_units(window_buffer: &[RecordBatch]) -> usize {
+    window_buffer.iter().map(batch_input_units).sum()
+}
+
+/// Drain exactly `input_units` VEP input units from the front of `window_buffer`,
+/// slicing the boundary batch and pushing the remainder back. Mirrors
+/// `InputBufferAccumulator::drain_input_units` but on the window deque, so each
+/// dispatched window aligns to the contig-global 5000-unit grid (matching VEP's
+/// `InputBuffer` boundaries) instead of whole Arrow-batch (8192) boundaries.
+fn drain_window_input_units(
+    window_buffer: &mut Vec<RecordBatch>,
+    input_units: usize,
+) -> Vec<RecordBatch> {
+    let mut remaining = input_units;
+    let mut drained = Vec::new();
+    while remaining > 0 && !window_buffer.is_empty() {
+        let batch = window_buffer.remove(0);
+        let batch_units = batch_input_units(&batch);
+        if batch_units <= remaining {
+            remaining -= batch_units;
+            drained.push(batch);
+        } else {
+            let (take_rows, take_units) = rows_covering_input_units(&batch, remaining);
+            let total_rows = batch.num_rows();
+            drained.push(batch.slice(0, take_rows));
+            window_buffer.insert(0, batch.slice(take_rows, total_rows - take_rows));
+            remaining = remaining.saturating_sub(take_units);
+        }
+    }
+    drained
+}
+
 /// Everything needed to start streaming annotation for a contig.
 /// Produced by `prepare_contig_context()`.
 struct ContigReadyState {
@@ -10616,25 +10649,13 @@ fn build_stateful_buffer_local_transcripts_cow(
         transcript_cache_regions,
         &active_regions,
     );
-    // Build the HGNC donor maps from the FULL active cache-region transcript
-    // set (partition-invariant), not just the buffer-range-overlapping
-    // `buffer`. Otherwise a recipient's native-HGNC donor that
-    // falls outside this partition's buffer range is missed (t8 parity bug).
-    let region_donors: Vec<&TranscriptFeature> = transcripts
-        .iter()
-        .filter(|tx| {
-            transcript_cache_regions
-                .get(&tx.transcript_id)
-                .is_some_and(|regions| regions.iter().any(|r| active_regions.contains(r)))
-        })
-        .collect();
-    let (hgnc_by_symbol, gene_fill_by_stable_id) = collect_hgnc_donors(region_donors);
-    apply_hgnc_donors(
-        &mut buffer,
-        transcripts,
-        &hgnc_by_symbol,
-        &gene_fill_by_stable_id,
-    );
+    // Donor scope = the buffer-range (min/max) transcript set, matching Ensembl
+    // VEP's `filter_features_by_min_max($buffer->min_max)` before `merge_features`
+    // (AnnotationSource.pm). Region-wide donors over-donate: with grid-aligned
+    // buffers, the upstream TENM3 buffer (max 182,076,628) must NOT see the
+    // 182,143,918 Ensembl donor; region scope would still pull it in via the
+    // active 1Mb region (#108 false positives).
+    apply_buffer_local_hgnc_propagation(&mut buffer, transcripts);
 
     // Re-persist only the transcripts that actually diverged from base (Owned).
     // Borrowed transcripts equal base, so restoring them next buffer is a no-op;
@@ -11476,32 +11497,28 @@ impl Stream for ContigAnnotationStream {
                     // LIMIT pushdown: stop producing new windows once reached.
                     let threads = ann.config.annotation_workers.max(1);
                     let limit_reached = fetch_limit.is_some_and(|limit| rows_emitted >= limit);
-                    let has_pending_input_buffer =
-                        ann.worker.input_buffer_accumulator.pending_rows() > 0;
+                    let target_units = ann.config.input_buffer_size.max(1);
+                    let available_window_units =
+                        window_buffer_input_units(&ann.worker.window_buffer);
+                    // Dispatch a full input-buffer-sized window when one is ready,
+                    // or the final partial once the contig lookup is done. Never
+                    // dispatch a sub-buffer window mid-stream — that would misalign
+                    // the contig-global 5000-unit grid vs VEP's InputBuffer cuts.
                     let window_available = !limit_reached
-                        && (!ann.worker.window_buffer.is_empty() || has_pending_input_buffer);
+                        && (available_window_units >= target_units
+                            || (ann.worker.lookup_done && available_window_units > 0));
 
                     // Dispatch one fused window task while the pool has capacity.
                     // Each task runs on a fresh worker seeded with the current
                     // colocated snapshot (complete for this window's variants),
                     // hydrating + annotating independently on the blocking pool.
                     if window_available && ann.inflight.len() < threads {
-                        // Cut a window at ~input_buffer_size rows (not the full
-                        // HYDRATION_WINDOW_SIZE batch budget) so a contig yields
-                        // many windows to spread across the worker pool.
-                        let target_rows = ann.config.input_buffer_size.max(1);
-                        let mut window_end = 0usize;
-                        let mut acc_rows = 0usize;
-                        for batch in &ann.worker.window_buffer {
-                            window_end += 1;
-                            acc_rows += batch.num_rows();
-                            if acc_rows >= target_rows {
-                                break;
-                            }
-                        }
-                        let window_end = window_end.min(ann.worker.window_buffer.len()).max(1);
+                        // Cut a window of exactly input_buffer_size input UNITS,
+                        // aligned to the contig-global grid (matching VEP's
+                        // InputBuffer boundaries), slicing the boundary batch.
+                        let drain_units = available_window_units.min(target_units);
                         let window_batches: Vec<RecordBatch> =
-                            ann.worker.window_buffer.drain(..window_end).collect();
+                            drain_window_input_units(&mut ann.worker.window_buffer, drain_units);
                         let projection = ann.config.projection.clone();
                         let shared = Arc::clone(&ann.worker.shared);
                         let colocated = Arc::clone(&ann.worker.colocated_map);
