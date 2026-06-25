@@ -9419,8 +9419,12 @@ struct ContigAnnotationState {
     ordered_lookup_wait_started: Option<Instant>,
     /// In-flight fused window-annotation tasks, FIFO (= window/output order).
     /// Up to `config.annotation_workers` run concurrently on the blocking pool.
-    inflight: VecDeque<tokio::task::JoinHandle<Result<VecDeque<RecordBatch>>>>,
+    inflight: VecDeque<tokio::task::JoinHandle<WindowAnnotateResult>>,
 }
+
+/// Output of one fused window-annotation task: annotated batches plus the
+/// persisted HGNC carry state to seed the next sequential window.
+type WindowAnnotateResult = Result<(VecDeque<RecordBatch>, PersistedBufferTranscripts)>;
 
 /// State for the threads>1 path: N independent per-partition fused pipelines,
 /// drained in partition-id order (= position order). No central poll loop /
@@ -9534,7 +9538,7 @@ enum StreamState {
     AnnotatingParallel(ParallelContigState),
     /// Await the oldest in-flight fused window task (FIFO preserves output order).
     AwaitingWindow {
-        handle: tokio::task::JoinHandle<Result<VecDeque<RecordBatch>>>,
+        handle: tokio::task::JoinHandle<WindowAnnotateResult>,
         annotation_state: ContigAnnotationState,
     },
     /// Yield annotated batches from the current window, then resume annotation.
@@ -10965,12 +10969,19 @@ fn annotate_window_owned(
     window_batches: Vec<RecordBatch>,
     cache_source_type: CacheSourceType,
     projection: Option<Vec<usize>>,
-) -> Result<VecDeque<RecordBatch>> {
+    persisted_seed: PersistedBufferTranscripts,
+) -> Result<(VecDeque<RecordBatch>, PersistedBufferTranscripts)> {
     let mut worker = AnnotationWorkerState::new(shared)?;
     worker.colocated_map = colocated_snapshot;
     worker.lookup_done = true;
+    // Carry the donor-region HGNC persistence forward across sequential windows
+    // (VEP's region-cache object reuse). The dispatch loop threads window N's
+    // returned map into window N+1's seed; correct only while windows run
+    // sequentially (the stateful Merged/RefSeq path).
+    worker.persisted_buffer_transcripts = persisted_seed;
     hydrate_worker_window(&mut worker, &window_batches, cache_source_type)?;
-    annotate_worker_window(&mut worker, &window_batches, projection.as_deref())
+    let out = annotate_worker_window(&mut worker, &window_batches, projection.as_deref())?;
+    Ok((out, worker.persisted_buffer_transcripts))
 }
 
 enum LookupPartitionPoll {
@@ -11523,6 +11534,7 @@ impl Stream for ContigAnnotationStream {
                         let shared = Arc::clone(&ann.worker.shared);
                         let colocated = Arc::clone(&ann.worker.colocated_map);
                         let cache_source_type = ann.config.cache_source_type;
+                        let persisted_seed = ann.worker.persisted_buffer_transcripts.clone();
                         let handle = tokio::task::spawn_blocking(move || {
                             annotate_window_owned(
                                 shared,
@@ -11530,6 +11542,7 @@ impl Stream for ContigAnnotationStream {
                                 window_batches,
                                 cache_source_type,
                                 projection,
+                                persisted_seed,
                             )
                         });
                         ann.inflight.push_back(handle);
@@ -11590,7 +11603,8 @@ impl Stream for ContigAnnotationStream {
                             };
                             return Poll::Pending;
                         }
-                        Poll::Ready(Ok(Ok(batches))) => {
+                        Poll::Ready(Ok(Ok((batches, persisted)))) => {
+                            ann.worker.persisted_buffer_transcripts = persisted;
                             self.state = StreamState::DrainingWindow {
                                 batches,
                                 annotation_state: ann,
