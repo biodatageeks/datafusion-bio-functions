@@ -258,48 +258,59 @@ design's three invariant fixes**, both parallel-safe and committed:
 
 | Invariant (§3) | `e12e647` (before) | HEAD (now) | Parallel-safe? |
 |---|---|---|---|
-| 1. Seams on 5,000-unit buffer grid | whole-batch (8192) row cuts (`drain(..window_end)`) | `drain_window_input_units` cuts exact input-buffer units, slicing the boundary batch | ✅ committed |
-| 2. Donor scope = buffer `[min..max]` | `region_donors` (full 1 Mb active region) | `apply_buffer_local_hgnc_propagation` (buffer min/max) | ✅ committed |
-| 3. Carried state at seam | none (each window starts empty) | sequential `persisted_seed` threaded window N→N+1 | ❌ **serial-only** |
+| 1. Seams on 5,000-unit buffer grid | whole-batch (8192) row cuts | `drain_window_input_units` grid-cuts — **but only on the serial `AnnotatingContig` path** | ⚠️ serial path only |
+| 2. Donor scope = buffer `[min..max]` | `region_donors` (full 1 Mb active region) | `apply_buffer_local_hgnc_propagation` (buffer min/max) — runs on **both** paths | ✅ committed |
+| 3. Carried state at seam | none (each window starts empty) | sequential `persisted_seed` carry (serial path) | ❌ **serial-only** |
 
-So the design's **Step 1 (donor-scope revert, §5.3) and the grid-alignment are DONE.**
-The *only* reason workers>1 is gated to serial today is invariant 3: the carry is
-threaded sequentially (`annotate_window_owned`'s `persisted_seed` in/out, dispatch loop
-`:11551`/`:11617`), which is correct only with one window in flight — hence
-`annotation_workers = 1` for Merged/RefSeq (`:5276`, the perf regression).
+**Path correction (mapped 2026-06-26).** Merged/RefSeq is hard-pinned to
+`annotation_workers = 1` (`annotate_provider.rs:5269`), so at `workers>1` it runs the **serial
+`AnnotatingContig`** path — *not* the sharded `AnnotatingParallel` path. The sharded
+per-partition path (`ParallelContigState` / `spawn_annotation_from_lookup_sharded`,
+`:9756`) is the `e12e647` fast-but-wrong mechanism and is currently **unreached for
+Merged/RefSeq**. Both paths call the same `apply_buffer_local_hgnc_propagation` (so the
+donor-scope fix applies to both), but **buffer grid-alignment is NOT inherited by the
+sharded path**: each sharded worker runs its own `InputBufferAccumulator` counting input
+units from 0 *partition-locally*, and the DataFusion lookup partitions split at arbitrary
+index-driven positions, not on the contig-global 5,000-unit grid (`next_input_buffer_id` is
+write-only; no worker knows its contig-global rank).
 
-### Remaining work = Step 2 (bounded overlap) + drop the serial gate
+### Chosen approach: full per-partition independence (sharded path), grid-aligned
 
-The before-mechanism we are restoring is the `spawn_blocking` **whole-window** parallel
-dispatch (`ContigAnnotationStream` poll loop, `:11540`–`:11562`). It already ran N windows
-concurrently on the tokio blocking pool, so the existing demand-fetch SIFT path
-(`get_position_predictions` → `block_in_place(Handle::current().block_on(take_keys))`,
-`:3166`) **works unchanged on those threads — no pre-warm, no `std::thread` lanes, no SIFT
-machinery is needed.** (This is why Option A's "SIFT blocker" does not arise here: it was an
-artifact of Option A switching to raw `std::thread::scope` lanes that lose the runtime
-context.)
+Preserve the sharded model's two defining traits — (a) N independent per-partition
+pipelines each writing its own VCF body shard, and (b) no central poll loop — and make it
+correct by re-partitioning each contig on the global 5,000-input-unit grid plus per-worker
+bounded-overlap warm-up. This is Option O / §5 / §7 applied to `AnnotatingParallel`.
 
-Concrete integration points:
+Remaining work:
 
-1. **Remove the serial gate** (`:5266`–`:5276`): stop forcing `annotation_workers = 1` for
-   Merged/RefSeq; let it equal `requested_workers`, fail-closed per §8 if `overlap_width`
-   is uncomputable.
-2. **Replace the sequential carry with self-reconstructed carry.** Drop the
-   `persisted_seed` in/out threading between windows. Instead each window task warm-starts:
-   given its real range `[seam_k, seam_{k+1})`, it first runs **state-only** prepare
-   (`prepare_buffer_annotation_context` / `build_stateful_buffer_local_transcripts_cow`,
-   donation + persist, output discarded) over the whole buffers covering
-   `[seam_k − overlap_width, seam_k)`, then annotates its real range. Worker 0 (contig
-   start) skips warm-up.
-3. **Feed each window its warm-up prefix.** The dispatch loop drains windows sequentially
-   from `window_buffer`; retain a sliding tail of the last `overlap_width` input units (real
-   variant positions only — no Lance lookup/colocated needed for warm-up) and pass it,
-   read-only, ahead of window k's batches. Warm-up rows are dropped before emission.
+1. **Grid-aligned partition planner (the central new component).** Per contig, determine the
+   total input-unit count and map cumulative 5,000-unit ranks to genomic cut positions, so
+   each of N workers owns a contiguous **whole-buffer** rank range `[start_rank_k,
+   start_rank_{k+1})` with seams on 5,000-multiples (no buffer straddles a seam — Hazard 1).
+   Replaces DataFusion's index-driven seams for the annotation partitions.
+2. **Per-worker contig-global rank.** Each sharded worker learns its `start_rank_k` and
+   offsets its `InputBufferAccumulator` so its buffer boundaries coincide with the global
+   grid (not a partition-local 0 offset).
+3. **Per-worker bounded-overlap warm-up.** Worker k reads from `seam_pos_k − overlap_width`
+   and runs **state-only** prepare (`prepare_buffer_annotation_context` /
+   `build_stateful_buffer_local_transcripts_cow`, donation + persist, output discarded) over
+   the whole buffers covering the warm-up region, then annotates + emits its owned buffers
+   (Hazard 2). Worker 0 starts at the contig's first variant with empty state, no warm-up.
+   Warm-up reads variant **positions only** — no Lance variation/colocated lookup.
 4. **Compute `overlap_width`** once at context-load via a `max()` over `base_transcripts`
-   spans (§5.4) and store it on the shared/config struct.
-5. **Debug assertion (§8):** in test builds, assert a warm-up window's reconstructed
-   persisted state at its seam equals the serial state at that boundary.
+   spans + one cache-region width (§5.4); store on `SharedContigAnnotationContext`.
+5. **Drop the serial gate** (`:5266`–`:5276`): let `annotation_workers = requested_workers`
+   for Merged/RefSeq so the path routes to `AnnotatingParallel`. Fail-closed (§8) if
+   `overlap_width` is uncomputable or seams cannot be grid-aligned (non-indexed input).
+6. **Debug assertion (§8):** test-build assert a warm-up worker's reconstructed persisted
+   state at its seam equals the serial state at that boundary.
 
-Steps 2+3 land together with step 1; gates per §8 (chr4 + chr2 merged Lance workers∈{1,4}
-→ 0 `HGNC_ID` mismatches, byte-identical, on 3 consecutive runs to catch intermittent
-truncation), then the chr1-22 run and the workers {1,2,4,8} perf report.
+SIFT needs no special handling on this path: the sharded workers run on tokio
+`spawn_blocking` threads (runtime context present), so the existing demand-fetch
+(`get_position_predictions` → `block_in_place(Handle::current().block_on)`, `:3166`) works
+unchanged — the `std::thread` SIFT blocker is specific to the rejected intra-buffer-lane
+option.
+
+Gates per §8: chr4 + chr2 merged Lance at `workers∈{1,4}` → 0 `HGNC_ID` mismatches,
+byte-identical bodies, on **3 consecutive runs** (catch intermittent truncation); then the
+chr1-22 run at `workers=4`, and the `workers {1,2,4,8}` perf report.
