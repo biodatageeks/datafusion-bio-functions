@@ -5260,20 +5260,13 @@ impl AnnotateProvider {
         } else {
             target_partitions
         };
-        // Stateful Merged/RefSeq annotation must run as a single ordered,
-        // grid-aligned worker for VEP HGNC parity: the parallel partition path
-        // misaligns input buffers to the global 5000-unit grid and cannot carry
-        // donated HGNC across concurrent partitions (chr4 regressed to 8,281 at
-        // workers=4). Lookup stays partitioned (target_partitions) for IO
-        // parallelism; only the annotation stage is forced serial here.
-        let annotation_workers = if matches!(
-            self.cache_source_type,
-            CacheSourceType::Merged | CacheSourceType::RefSeq
-        ) {
-            1
-        } else {
-            requested_workers
-        };
+        // Stateful Merged/RefSeq now runs N grid-aligned sharded workers with
+        // bounded-overlap warm-up (design 2026-06-25 §5/§7): prepare_contig_context
+        // re-partitions each contig on the global 5000-unit buffer grid and each
+        // worker warm-starts its carried HGNC state before its seam, so the old
+        // single-ordered-worker fallback is no longer needed. Fails closed via the
+        // existing workers>1 guards (indexed input + VCF shard context required).
+        let annotation_workers = requested_workers;
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
 
