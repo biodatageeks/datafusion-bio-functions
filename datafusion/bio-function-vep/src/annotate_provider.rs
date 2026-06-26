@@ -8996,6 +8996,9 @@ struct SharedContigAnnotationContext {
     config: ContigAnnotationConfig,
     profile: Option<SharedContigPipelineProfile>,
     base_transcripts: Arc<Vec<TranscriptFeature>>,
+    /// Bounded-overlap warm-up distance for grid-aligned parallel annotation
+    /// (design §5.4); `max(transcript span)` + one cache-region width, in bp.
+    overlap_width_bp: i64,
     base_translations: Arc<Vec<TranslationFeature>>,
     exons: Arc<Vec<ExonFeature>>,
     indexes: Arc<SharedContextIndexes>,
@@ -10399,6 +10402,21 @@ fn normalized_chrom_name(chrom: &str) -> &str {
 
 fn cache_region_index(pos: i64) -> i64 {
     pos.saturating_sub(1) / VEP_TRANSCRIPT_CACHE_REGION_SIZE_BP
+}
+
+/// Bounded-overlap warm-up distance (design 2026-06-25 §5.4): a donor can
+/// influence a seam from at most one transcript span plus one cache-region width
+/// upstream. A pure `max()` reduction over the already-loaded base transcripts —
+/// zero IO, identical in every worker, so it needs no synchronisation and cannot
+/// under-read. Used by the grid-aligned parallel annotation path to size each
+/// worker's state-only warm-up before its seam.
+fn compute_overlap_width_bp(base_transcripts: &[TranscriptFeature]) -> i64 {
+    let max_span = base_transcripts
+        .iter()
+        .map(|tx| (tx.end - tx.start).abs())
+        .max()
+        .unwrap_or(0);
+    max_span + VEP_TRANSCRIPT_CACHE_REGION_SIZE_BP
 }
 
 fn cache_regions_for_coords(
@@ -11994,10 +12012,12 @@ async fn prepare_contig_context(
             .collect(),
     );
     let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
+    let overlap_width_bp = compute_overlap_width_bp(&base_transcripts);
     let shared_context = Arc::new(SharedContigAnnotationContext {
         config: config.clone(),
         profile: pipeline_profile,
         base_transcripts,
+        overlap_width_bp,
         base_translations: Arc::new(tl),
         exons: Arc::new(ex),
         indexes,
@@ -12428,6 +12448,7 @@ mod tests {
             config: minimal_contig_annotation_config(),
             profile: None,
             base_transcripts: Arc::new(transcripts),
+            overlap_width_bp: 0,
             indexes: Arc::new(SharedContextIndexes::new(&exons, &translations)),
             base_translations: Arc::new(translations),
             exons: Arc::new(exons),
@@ -14061,6 +14082,25 @@ mod tests {
             ncrna_structure: None,
             cdna_coords_cache: GeometryCache::default(),
         }
+    }
+
+    #[test]
+    fn overlap_width_is_max_span_plus_region() {
+        let mut a = make_tx("a", None, None, None, None); // start 1, end 100 → span 99
+        a.end = 100;
+        let mut b = make_tx("b", None, None, None, None);
+        b.start = 1000;
+        b.end = 1000 + 2_000_000; // span 2_000_000 (widest)
+        let w = compute_overlap_width_bp(&[a, b]);
+        assert_eq!(w, 2_000_000 + VEP_TRANSCRIPT_CACHE_REGION_SIZE_BP);
+    }
+
+    #[test]
+    fn overlap_width_empty_is_region_only() {
+        assert_eq!(
+            compute_overlap_width_bp(&[]),
+            VEP_TRANSCRIPT_CACHE_REGION_SIZE_BP
+        );
     }
 
     fn make_selection_tx(id: &str, source: Option<&str>) -> TranscriptFeature {
