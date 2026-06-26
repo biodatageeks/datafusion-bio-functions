@@ -7410,6 +7410,39 @@ fn prefers_exon_geometry_over_mapper(tx: &TranscriptFeature) -> bool {
         )
 }
 
+/// Return `tx.cdna_mapper_segments` in genomic-sorted order, borrowing the
+/// original slice when it is already sorted (the common case after build) and
+/// only cloning + sorting when it isn't. Centralizes the sort key shared by
+/// [`use_cdna_mapper_for_general_coords`] and [`mapper_deleted_gap_cdna_index`]
+/// so the per-call `collect + sort` heap churn is skipped on the hot path.
+fn sorted_mapper_segments(tx: &TranscriptFeature) -> Cow<'_, [TranscriptCdnaMapperSegment]> {
+    let segments = &tx.cdna_mapper_segments;
+    let already_sorted = segments.windows(2).all(|pair| {
+        (
+            pair[0].genomic_start,
+            pair[0].genomic_end,
+            pair[0].cdna_start,
+        ) <= (
+            pair[1].genomic_start,
+            pair[1].genomic_end,
+            pair[1].cdna_start,
+        )
+    });
+    if already_sorted {
+        Cow::Borrowed(segments.as_slice())
+    } else {
+        let mut owned = segments.clone();
+        owned.sort_by_key(|segment| {
+            (
+                segment.genomic_start,
+                segment.genomic_end,
+                segment.cdna_start,
+            )
+        });
+        Cow::Owned(owned)
+    }
+}
+
 pub(crate) fn mapper_deleted_gap_cdna_index(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -7424,17 +7457,10 @@ pub(crate) fn mapper_deleted_gap_cdna_index(
     {
         return None;
     }
-    let mut segments = tx.cdna_mapper_segments.iter().collect::<Vec<_>>();
-    segments.sort_by_key(|segment| {
-        (
-            segment.genomic_start,
-            segment.genomic_end,
-            segment.cdna_start,
-        )
-    });
+    let segments = sorted_mapper_segments(tx);
     for window in segments.windows(2) {
-        let prev = window[0];
-        let next = window[1];
+        let prev = &window[0];
+        let next = &window[1];
         let gap_len = next
             .genomic_start
             .saturating_sub(prev.genomic_end)
@@ -7504,17 +7530,10 @@ fn use_cdna_mapper_for_general_coords(tx: &TranscriptFeature) -> bool {
     // geometry for positions downstream of the gap — the same workaround
     // VEP applies when its mapper produces Gap entries for edit-inserted
     // cdna bases that have no genomic mapping.
-    let mut segments = tx.cdna_mapper_segments.iter().collect::<Vec<_>>();
-    segments.sort_by_key(|segment| {
-        (
-            segment.genomic_start,
-            segment.genomic_end,
-            segment.cdna_start,
-        )
-    });
+    let segments = sorted_mapper_segments(tx);
     for window in segments.windows(2) {
-        let prev = window[0];
-        let next = window[1];
+        let prev = &window[0];
+        let next = &window[1];
         if next.genomic_start == prev.genomic_end.saturating_add(1)
             && next.cdna_start != prev.cdna_end.saturating_add(1)
         {
