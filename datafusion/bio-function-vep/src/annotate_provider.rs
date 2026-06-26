@@ -9497,6 +9497,70 @@ fn plan_grid_partitions(
     slices
 }
 
+/// Replay the EXACT serial buffer-cut logic (`count_ready_input_buffers`) over a
+/// position-ordered stream of `start`(+`alt`) batches and record each global VEP
+/// input-buffer boundary as `(global_row, pos, rows_before_pos)`. Returns the
+/// boundaries (length `B+1`, terminal = contig end) and the total input-row count.
+/// `rows_before_pos` is how many already-seen rows share the boundary row's
+/// position (for position-tie seam handling). Pure — fed real batches by
+/// `count_contig_buffer_boundaries`, unit-tested directly.
+fn accumulate_boundaries(
+    batches: &[RecordBatch],
+    input_buffer_size: usize,
+) -> Result<(Vec<GridBufferBoundary>, usize)> {
+    let limit = input_buffer_size.max(1);
+    let mut boundaries: Vec<GridBufferBoundary> = Vec::new();
+    let mut global_row = 0usize;
+    let mut units = 0usize;
+    let mut starting_new_buffer = true; // first row opens buffer 0
+    let mut last_pos: Option<i64> = None;
+    let mut run = 0usize; // consecutive already-seen rows sharing last_pos
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let start_idx = batch.schema().index_of("start")?;
+        let start_col = batch
+            .column(start_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Execution("count pass: start column must be Int64".into())
+            })?;
+        let alts = AltColumnView::from_batch(batch);
+        for row in 0..batch.num_rows() {
+            let pos = start_col.value(row);
+            let before = if last_pos == Some(pos) { run } else { 0 };
+            if starting_new_buffer {
+                boundaries.push(GridBufferBoundary {
+                    global_row,
+                    pos,
+                    rows_before_pos: before,
+                });
+                starting_new_buffer = false;
+            }
+            if last_pos == Some(pos) {
+                run += 1;
+            } else {
+                last_pos = Some(pos);
+                run = 1;
+            }
+            units += alts.as_ref().map_or(1, |a| a.input_units_at(row));
+            global_row += 1;
+            if units >= limit {
+                units = 0;
+                starting_new_buffer = true;
+            }
+        }
+    }
+    boundaries.push(GridBufferBoundary {
+        global_row,
+        pos: i64::MAX,
+        rows_before_pos: 0,
+    });
+    Ok((boundaries, global_row))
+}
+
 /// Everything needed to start streaming annotation for a contig.
 /// Produced by `prepare_contig_context()`.
 struct ContigReadyState {
@@ -14250,6 +14314,34 @@ mod tests {
         // worker 1 warm-starts at buffer 2 (overlap 0) → inherits its tie skip.
         assert_eq!(slices[1].warm_up_start_row, 10000);
         assert_eq!(slices[1].skip_leading_rows, 3);
+    }
+
+    #[test]
+    fn boundaries_cut_every_buffer_size_units() {
+        // 4 single-unit rows, size 2 → buffers [10,20] [30,40]; boundaries at rows 0,2,4.
+        let batch = make_buffer_batch_many("chr2", &[10, 20, 30, 40]);
+        let (bs, total) = accumulate_boundaries(&[batch], 2).unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(
+            bs.iter().map(|x| x.global_row).collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
+        assert_eq!(bs[0].pos, 10);
+        assert_eq!(bs[1].pos, 30);
+        assert_eq!(bs[2].pos, i64::MAX);
+    }
+
+    #[test]
+    fn boundaries_record_rows_before_pos_for_ties() {
+        // size 2; rows at positions 50,50,50 (one unit each). Buffer 0 = rows 0,1
+        // (cut after row 1, units=2); buffer 1 opens at row 2, same pos 50 → two
+        // prior rows at pos 50 → rows_before_pos = 2.
+        let batch = make_buffer_batch_many("chr2", &[50, 50, 50]);
+        let (bs, total) = accumulate_boundaries(&[batch], 2).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(bs[0].global_row, 0);
+        assert_eq!(bs[1].global_row, 2);
+        assert_eq!(bs[1].rows_before_pos, 2);
     }
 
     fn make_selection_tx(id: &str, source: Option<&str>) -> TranscriptFeature {
