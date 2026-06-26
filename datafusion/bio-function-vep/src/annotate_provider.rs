@@ -11027,6 +11027,39 @@ fn apply_hgnc_donors(
 
 /// Annotate a window of batches inside one partition worker: build
 /// PreparedContext, run SIFT loading, annotate each batch, apply projection.
+/// Bounded-overlap warm-up (design §5.2): replay the serial buffer state
+/// transition over `warm_up_batches` (whole grid buffers strictly before a
+/// worker's seam) WITHOUT producing output. Each buffer is run through
+/// `prepare_buffer_annotation_context`, which mutates `worker.persisted_buffer_transcripts`
+/// exactly as the full path would — reconstructing the carried HGNC state the
+/// previous worker's buffers left at the seam. No engine, no lookup, no emit.
+///
+/// Uses a fresh `InputBufferAccumulator` so the worker's own accumulator (used
+/// for the emitted range) is untouched; `flush_partial = true` drains the final
+/// whole buffer. The warm-up rows must already be whole grid buffers (the caller
+/// splits the stream on the buffer-boundary `emit_start_row`).
+fn warm_up_worker_state(
+    worker: &mut AnnotationWorkerState,
+    warm_up_batches: Vec<RecordBatch>,
+) -> Result<()> {
+    if warm_up_batches.iter().all(|b| b.num_rows() == 0) {
+        return Ok(());
+    }
+    let input_buffer_size = worker.shared.config.input_buffer_size;
+    let mut acc = InputBufferAccumulator::default();
+    let buffers = acc.push_window_and_drain_ready(warm_up_batches, input_buffer_size, true);
+    for buffer_batches in buffers {
+        let Some((chrom, min_start, max_end)) = buffer_variant_bounds(&buffer_batches)? else {
+            continue;
+        };
+        // State-only: discard the prepared context; the side effect on
+        // `worker.persisted_buffer_transcripts` is the whole point.
+        let _ =
+            prepare_buffer_annotation_context(worker, &buffer_batches, &chrom, min_start, max_end)?;
+    }
+    Ok(())
+}
+
 fn annotate_worker_window(
     worker: &mut AnnotationWorkerState,
     window_batches: &[RecordBatch],
@@ -12594,6 +12627,14 @@ mod tests {
         )
         .unwrap();
 
+        // Derive cache regions from the transcripts (matching production), so the
+        // stateful persist/restore path is exercised by tests instead of being a
+        // no-op against an empty region map.
+        let cache_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+
         Arc::new(SharedContigAnnotationContext {
             config: minimal_contig_annotation_config(),
             profile: None,
@@ -12607,7 +12648,7 @@ mod tests {
             mirnas: Arc::new(Vec::new()),
             structural: Arc::new(Vec::new()),
             translateable_seq_by_tx: Arc::new(HashMap::new()),
-            transcript_cache_regions: Arc::new(HashMap::new()),
+            transcript_cache_regions: Arc::new(cache_regions),
             tmp_provider: Arc::new(tmp_provider),
             engine: Arc::new(TranscriptConsequenceEngine::new_with_hgvs_shift(
                 5000, 5000, false,
@@ -14329,6 +14370,65 @@ mod tests {
         assert_eq!(bs[0].pos, 10);
         assert_eq!(bs[1].pos, 30);
         assert_eq!(bs[2].pos, i64::MAX);
+    }
+
+    #[test]
+    fn warmup_reconstructs_serial_persisted_state() {
+        // LRIF1 donor + recipient (same gene symbol): a buffer covering both
+        // donates HGNC:30299 to the recipient and persists the divergence. The
+        // state-only warm-up must reproduce the exact persisted state the full
+        // prepare path produces (design §8 carry-equality assertion).
+        let mut tx_recipient = make_tx(
+            "XM_017001769.3",
+            Some("55791"),
+            Some("LRIF1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr1".to_string();
+        tx_recipient.start = 110_874_957;
+        tx_recipient.end = 110_963_922;
+        tx_recipient.biotype = "protein_coding".to_string();
+
+        let mut tx_donor = make_tx(
+            "ENST00000369763",
+            Some("ENSG00000121931"),
+            Some("LRIF1"),
+            Some("HGNC"),
+            Some("HGNC:30299"),
+        );
+        tx_donor.chrom = "chr1".to_string();
+        tx_donor.start = 110_947_190;
+        tx_donor.end = 110_963_922;
+        tx_donor.biotype = "protein_coding".to_string();
+
+        let shared = minimal_shared_contig_annotation_context_with_context(
+            vec![tx_recipient, tx_donor],
+            Vec::new(),
+            Vec::new(),
+        );
+        let buffer = vec![make_buffer_batch_many(
+            "chr1",
+            &[109_528_491, 110_870_290, 110_947_275, 112_649_983],
+        )];
+
+        // Path A — full prepare path's state transition.
+        let mut worker_a = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+        let (chrom, lo, hi) = buffer_variant_bounds(&buffer).unwrap().unwrap();
+        let _ = prepare_buffer_annotation_context(&mut worker_a, &buffer, &chrom, lo, hi).unwrap();
+
+        // Path B — state-only warm-up.
+        let mut worker_b = AnnotationWorkerState::new(shared).unwrap();
+        warm_up_worker_state(&mut worker_b, buffer.clone()).unwrap();
+
+        assert!(
+            !worker_a.persisted_buffer_transcripts.is_empty(),
+            "donation should persist state (otherwise the test is vacuous)"
+        );
+        assert_eq!(
+            worker_a.persisted_buffer_transcripts, worker_b.persisted_buffer_transcripts,
+            "warm-up must reconstruct the serial persisted carry exactly"
+        );
     }
 
     #[test]
