@@ -524,6 +524,37 @@ Expected: all green.
   - **RESOLVED 2026-06-26 (ran it):** current Merged+w4 produces **EMPTY output** (0 rows) — `vcf_sink:1112` drives the sharded path but the provider pins `annotation_workers=1` → `AnnotatingContig` yields batches that `drive_sharded` discards → no shards written. The handoff's "w4 verified 307,295" was incorrect. w1 = 307,295 variants, 100% field match vs the external VEP reference (`HG002_annotated_wgs_everything_hgvs_merged.vcf`), which is the byte-identical gate the harness already enforces. Task 7 (enabling the real parallel path) therefore also fixes this latent empty-output bug.
 - **Warm-up cost:** <1 buffer per worker (design §5.5); warm-up variants still pass through Lance lookup in this design (bounded, acceptable) — a future optimisation could scan warm-up positions without the variation lookup.
 
+## Execution results (2026-06-26)
+
+Tasks 0–7 implemented and committed; the grid-aligned parallel path is **correct
+and byte-identical**. chr4 merged Lance:
+
+| run | variants | Only-in-VEP | HGNC_ID mism. | 86 CSQ fields | annot wall |
+|---|---|---|---|---|---|
+| w1 (serial) | 307,295 | 0 | 0 | 100% | 14.1s |
+| w4 run a | 307,295 | 0 | 0 | 100% | 11.4s |
+| w4 run b | 307,295 | 0 | 0 | 100% | 11.0s |
+| w4 run c | 307,295 | 0 | 0 | 100% | 11.0s |
+
+**Correctness gate: PASS** — 0 HGNC mismatches, full count, all 86 fields 100%, on 3
+consecutive w4 runs (no intermittent truncation); w1 also 0.
+
+**Performance gate: NOT met** — w4 ≈ 1.28× w1 (target ~2×+). Root cause: the
+per-worker **lookup over-read**. The VCF provider's `start`-range region seek
+truncates streams (w3 `start>=147M` → 0 rows) and `target_partitions(1)` does not
+force a single partition, so each worker filters by **chrom only** and reads the
+whole contig's Lance lookup (`spawn_lookup_full_contig_worker`), selecting its rank
+range in the annotation layer. Worker k early-breaks at `emit_end`, so total lookup
+≈ 2.56× the contig (worker 0 ~1/4 … worker 3 all). Annotation engine work *is*
+parallelized; the lookup over-read caps scaling.
+
+**Next step to meet the perf gate (the real remaining work):** eliminate the
+over-read without the broken position filter — assign each worker a **contiguous
+subset of the byte-budget lookup partitions** covering its `[warm_up_start,
+emit_end)` rank range (record per-partition row counts in the count pass → partition
+rank boundaries → each worker executes only its partition subset + warm-up overlap).
+Reduces lookup to ≈1.0–1.2× the contig.
+
 ## Follow-ups (deferred optimizations — NOT in this plan)
 
 These were brainstormed 2026-06-26 and consciously deferred so the first correct, self-contained version lands without cross-repo or perf coupling. Revisit after the §8 gates are green.
