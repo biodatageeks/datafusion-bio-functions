@@ -539,21 +539,31 @@ and byte-identical**. chr4 merged Lance:
 **Correctness gate: PASS** — 0 HGNC mismatches, full count, all 86 fields 100%, on 3
 consecutive w4 runs (no intermittent truncation); w1 also 0.
 
-**Performance gate: NOT met** — w4 ≈ 1.28× w1 (target ~2×+). Root cause: the
-per-worker **lookup over-read**. The VCF provider's `start`-range region seek
-truncates streams (w3 `start>=147M` → 0 rows) and `target_partitions(1)` does not
-force a single partition, so each worker filters by **chrom only** and reads the
-whole contig's Lance lookup (`spawn_lookup_full_contig_worker`), selecting its rank
-range in the annotation layer. Worker k early-breaks at `emit_end`, so total lookup
-≈ 2.56× the contig (worker 0 ~1/4 … worker 3 all). Annotation engine work *is*
-parallelized; the lookup over-read caps scaling.
+**Over-read fixed (commit) → perf gate met.** The earlier truncation was reading
+only partition 0 of each worker's plan (`exec_partition=0`), **not** a broken
+position filter. Fix: restore the per-worker `[scan_lo_pos, scan_hi_pos)` filter and
+read **all** partitions of that filtered plan (`spawn_lookup_full_contig_worker`), so
+each worker's lookup covers exactly its range — `stream_end_rank ≈ emit_end`, no
+over-read. The single-threaded profile confirmed the pipeline is ~98% engine-bound
+(`engine` 10.9s vs `lookup_wait` 0.47s), so the over-read had turned overlapped
+"free" lookup into 2.56× redundant decode CPU competing with the engine.
 
-**Next step to meet the perf gate (the real remaining work):** eliminate the
-over-read without the broken position filter — assign each worker a **contiguous
-subset of the byte-budget lookup partitions** covering its `[warm_up_start,
-emit_end)` rank range (record per-partition row counts in the count pass → partition
-rank boundaries → each worker executes only its partition subset + warm-up overlap).
-Reduces lookup to ≈1.0–1.2× the contig.
+Final results (chr4 + chr2 merged Lance):
+
+| run | variants | Only-in-VEP | HGNC_ID mism. | wall |
+|---|---|---|---|---|
+| chr4 w4 ×3 | 307,295 | 0 | 0 | 5.8 / 6.0 / 6.0s |
+| chr2 w1 / w4 | 331,324 | 0 | 0 | 19.7s / 7.8s |
+| chr4 w1/w2/w4/w8 | 307,295 | 0 | 0 | 13.9 / 8.0 / 5.8 / 4.7s |
+
+**Correctness gate: PASS** (0 mismatches, full counts, all 86 CSQ fields 100%, 3
+consecutive w4 runs consistent). **Performance gate: PASS** — chr4 w4 ≈ 2.4×
+(13.9→5.8s), w8 ≈ 3.0× (4.7s), chr2 w4 ≈ 2.5×; clears the ~2× / 6–8s target and beats
+the old unsafe path (5.6s) while being correct. Diminishing returns past w4 reflect
+the per-contig serial floor (context load + count pass + colocated), as modeled.
+
+The partition-subset assignment (originally proposed here) is **unnecessary** — the
+position filter + read-all-partitions achieves no over-read directly.
 
 ## Follow-ups (deferred optimizations — NOT in this plan)
 
