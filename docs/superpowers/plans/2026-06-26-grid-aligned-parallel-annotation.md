@@ -521,6 +521,7 @@ Expected: all green.
 - **Spec coverage:** §5.1 partitioning → Task 2/3; §5.2 warm-up → Task 4/6; §5.3 donor scope → already committed; §5.4 overlap width → Task 1; §6 correctness (Hazard 1 grid seams / Hazard 2 warm-up) → Task 2 (seams on boundaries) + Task 4/6 (warm-up); §8 gates → Task 8; fail-closed → Task 7.
 - **Position-tie correctness:** seams tracked by global row index with `skip_leading_rows`, not by position alone — the one subtlety that a naive position filter would get wrong.
 - **Open risk to validate early (Task 0):** the `vcf_sink.rs:1112` / provider-gate interaction for current Merged+w4. If current w4 is degenerate, the w1 body is the byte-identical reference.
+  - **RESOLVED 2026-06-26 (ran it):** current Merged+w4 produces **EMPTY output** (0 rows) — `vcf_sink:1112` drives the sharded path but the provider pins `annotation_workers=1` → `AnnotatingContig` yields batches that `drive_sharded` discards → no shards written. The handoff's "w4 verified 307,295" was incorrect. w1 = 307,295 variants, 100% field match vs the external VEP reference (`HG002_annotated_wgs_everything_hgvs_merged.vcf`), which is the byte-identical gate the harness already enforces. Task 7 (enabling the real parallel path) therefore also fixes this latent empty-output bug.
 - **Warm-up cost:** <1 buffer per worker (design §5.5); warm-up variants still pass through Lance lookup in this design (bounded, acceptable) — a future optimisation could scan warm-up positions without the variation lookup.
 
 ## Follow-ups (deferred optimizations — NOT in this plan)
