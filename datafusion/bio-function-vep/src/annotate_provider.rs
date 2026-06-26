@@ -9411,6 +9411,92 @@ fn drain_window_input_units(
     drained
 }
 
+/// One VEP global input-buffer boundary discovered by the count pass. The
+/// cumulative input-unit rank at the boundary is `buffer_index * input_buffer_size`
+/// (approx — buffers cut at row boundaries once units >= size). `global_row` is
+/// the GLOBAL input-row index of the FIRST row of this buffer; `pos` is that
+/// row's `start`. `rows_before_pos` is how many rows at `pos` precede
+/// `global_row` (non-zero only when distinct rows share a start position across a
+/// buffer cut). The terminal boundary (one past the last buffer) carries the
+/// contig end: `global_row = total_rows`, `pos = i64::MAX`, `rows_before_pos = 0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridBufferBoundary {
+    global_row: usize,
+    pos: i64,
+    rows_before_pos: usize,
+}
+
+/// Per-worker assignment over the global buffer grid for parallel annotation. All
+/// three row marks fall on buffer boundaries: `warm_up_start_row <= emit_start_row
+/// < emit_end_row`. The worker scans the position superset `[scan_lo_pos,
+/// scan_hi_pos)`, drops `skip_leading_rows` leading tie-rows (belonging to the
+/// previous buffer), warm-starts state-only until `emit_start_row`, then emits
+/// `[emit_start_row, emit_end_row)` (rank-stopped). Seams fall on buffer
+/// boundaries so no buffer straddles a seam (design §6, Hazard 1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkerGridSlice {
+    worker_id: usize,
+    scan_lo_pos: i64,
+    scan_hi_pos: i64,
+    skip_leading_rows: usize,
+    warm_up_start_row: usize,
+    emit_start_row: usize,
+    emit_end_row: usize,
+}
+
+/// Slice the global buffer grid (`boundaries`, length `B+1`, ascending) into up
+/// to `workers` contiguous whole-buffer ranges, each with a bounded-overlap
+/// warm-up start (design §5.1/§5.2). Empty ranges (when `workers > B`) are
+/// skipped. `overlap_width_bp` sizes the warm-up reach. The upper scan bound is
+/// inclusive of the seam position (`+1`) so trailing tie-rows owned by a worker
+/// are not dropped; the worker rank-stops at `emit_end_row`.
+fn plan_grid_partitions(
+    boundaries: &[GridBufferBoundary],
+    workers: usize,
+    overlap_width_bp: i64,
+) -> Vec<WorkerGridSlice> {
+    let workers = workers.max(1);
+    if boundaries.len() < 2 {
+        return Vec::new();
+    }
+    let b = boundaries.len() - 1; // whole buffer count
+    let round_div = |k: usize| -> usize { (k * b + workers / 2) / workers };
+    let mut slices = Vec::with_capacity(workers);
+    for k in 0..workers {
+        let bk = round_div(k);
+        let bk1 = round_div(k + 1);
+        if bk >= bk1 {
+            continue; // empty range (more workers than buffers)
+        }
+        let emit_start_row = boundaries[bk].global_row;
+        let emit_end_row = boundaries[bk1].global_row;
+        // Warm-up: walk back to the lowest buffer whose start reaches
+        // seam_pos - overlap_width; clamp at the contig start (buffer 0).
+        let seam_pos = boundaries[bk].pos;
+        let target = seam_pos.saturating_sub(overlap_width_bp);
+        let mut wk = bk;
+        while wk > 0 && boundaries[wk].pos > target {
+            wk -= 1;
+        }
+        let is_last = bk1 == b;
+        let scan_hi_pos = if is_last {
+            i64::MAX
+        } else {
+            boundaries[bk1].pos.saturating_add(1)
+        };
+        slices.push(WorkerGridSlice {
+            worker_id: k,
+            scan_lo_pos: boundaries[wk].pos,
+            scan_hi_pos,
+            skip_leading_rows: boundaries[wk].rows_before_pos,
+            warm_up_start_row: boundaries[wk].global_row,
+            emit_start_row,
+            emit_end_row,
+        });
+    }
+    slices
+}
+
 /// Everything needed to start streaming annotation for a contig.
 /// Produced by `prepare_contig_context()`.
 struct ContigReadyState {
@@ -14101,6 +14187,69 @@ mod tests {
             compute_overlap_width_bp(&[]),
             VEP_TRANSCRIPT_CACHE_REGION_SIZE_BP
         );
+    }
+
+    fn gb(row: usize, pos: i64) -> GridBufferBoundary {
+        GridBufferBoundary {
+            global_row: row,
+            pos,
+            rows_before_pos: 0,
+        }
+    }
+
+    #[test]
+    fn plan_two_workers_even_split_no_overlap() {
+        let bs = vec![
+            gb(0, 0),
+            gb(5000, 100),
+            gb(10000, 200),
+            gb(15000, 300),
+            gb(20000, i64::MAX),
+        ];
+        let slices = plan_grid_partitions(&bs, 2, 0);
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].emit_start_row, 0);
+        assert_eq!(slices[0].emit_end_row, 10000);
+        assert_eq!(slices[0].warm_up_start_row, 0); // worker 0: no warm-up
+        assert_eq!(slices[1].emit_start_row, 10000);
+        assert_eq!(slices[1].emit_end_row, 20000);
+        assert_eq!(slices[1].warm_up_start_row, 10000); // overlap 0 → warm-up == seam
+        assert_eq!(slices[1].scan_lo_pos, 200);
+        assert_eq!(slices[1].scan_hi_pos, i64::MAX); // last worker reads to end
+    }
+
+    #[test]
+    fn plan_warmup_reaches_back_within_overlap() {
+        let bs = vec![
+            gb(0, 0),
+            gb(5000, 50),
+            gb(10000, 100),
+            gb(15000, 150),
+            gb(20000, i64::MAX),
+        ];
+        let slices = plan_grid_partitions(&bs, 2, 120);
+        assert_eq!(slices[1].emit_start_row, 10000);
+        assert_eq!(slices[1].warm_up_start_row, 0); // 100 - 120 < 0 → clamp to buffer 0
+        assert_eq!(slices[1].scan_lo_pos, 0);
+    }
+
+    #[test]
+    fn plan_skip_leading_for_tie() {
+        let bs = vec![
+            gb(0, 0),
+            gb(5000, 100),
+            GridBufferBoundary {
+                global_row: 10000,
+                pos: 200,
+                rows_before_pos: 3,
+            },
+            gb(15000, 300),
+            gb(20000, i64::MAX),
+        ];
+        let slices = plan_grid_partitions(&bs, 2, 0);
+        // worker 1 warm-starts at buffer 2 (overlap 0) → inherits its tie skip.
+        assert_eq!(slices[1].warm_up_start_row, 10000);
+        assert_eq!(slices[1].skip_leading_rows, 3);
     }
 
     fn make_selection_tx(id: &str, source: Option<&str>) -> TranscriptFeature {
