@@ -9513,16 +9513,12 @@ fn accumulate_boundaries(
             continue;
         }
         let start_idx = batch.schema().index_of("start")?;
-        let start_col = batch
-            .column(start_idx)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| {
-                DataFusionError::Execution("count pass: start column must be Int64".into())
-            })?;
+        let start_col = batch.column(start_idx).as_ref();
         let alts = AltColumnView::from_batch(batch);
         for row in 0..batch.num_rows() {
-            let pos = start_col.value(row);
+            let pos = int64_at(start_col, row).ok_or_else(|| {
+                DataFusionError::Execution("count pass: null/unsupported start value".into())
+            })?;
             let before = if last_pos == Some(pos) { run } else { 0 };
             if starting_new_buffer {
                 boundaries.push(GridBufferBoundary {
@@ -9817,6 +9813,73 @@ fn spawn_lookup_partition_worker(
     })
 }
 
+/// Like `spawn_lookup_partition_worker` but executes ALL partitions of `plan` in
+/// id order (= contig position order) into one ordered stream, so a grid worker
+/// reads its whole chrom-filtered contig (the VCF provider splits a contig into
+/// several byte-budget partitions even at target_partitions=1). The annotation
+/// layer then selects the worker's rank range. `partition_id` is the logical
+/// ordering / shard id.
+fn spawn_lookup_full_contig_worker(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+    partition_id: usize,
+    chrom: String,
+    sink: ColocatedSink,
+    queue_batches: usize,
+    profile: Option<SharedContigPipelineProfile>,
+) -> LookupPartitionHandle {
+    let (sender, receiver) = tokio::sync::mpsc::channel(queue_batches.max(1));
+    let join_handle = tokio::spawn(async move {
+        let pc = plan.output_partitioning().partition_count().max(1);
+        let mut next_batch_id = 0usize;
+        for p in 0..pc {
+            let mut stream = plan.execute(p, Arc::clone(&task_ctx))?;
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                let colocated_delta = drain_colocated_sink(&sink)?;
+                let batch_id = next_batch_id;
+                next_batch_id += 1;
+                let _ = &chrom;
+                let send_started = profiling_enabled().then(Instant::now);
+                let send_result = sender
+                    .send(Ok(LookupBatchMessage {
+                        batch,
+                        colocated_delta,
+                        partition_id,
+                        batch_id,
+                    }))
+                    .await;
+                if let Some(started) = send_started {
+                    record_contig_profile(&profile, |profile| {
+                        profile.send_wait += started.elapsed();
+                    });
+                }
+                if send_result.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        let colocated_delta = drain_colocated_sink(&sink)?;
+        if !colocated_delta.is_empty() {
+            let _ = sender
+                .send(Ok(LookupBatchMessage {
+                    batch: RecordBatch::new_empty(plan.schema()),
+                    colocated_delta,
+                    partition_id,
+                    batch_id: next_batch_id,
+                }))
+                .await;
+        }
+        Ok(())
+    });
+
+    LookupPartitionHandle::Spawned(SpawnedLookupPartitionHandle {
+        partition_id,
+        receiver: Some(receiver),
+        join_handle: Some(join_handle),
+    })
+}
+
 fn spawn_lookup_stream_worker(
     mut stream: SendableRecordBatchStream,
     schema: SchemaRef,
@@ -9926,53 +9989,41 @@ fn spawn_annotation_from_lookup_sharded(
             Arc::clone(&shard_ctx.sample_names),
             shard_ctx.coordinate_zero_based,
         )?;
-        // Grid bounds. Without a slice (byte-budget path) this degenerates to
-        // "emit the whole stream, no skip, no warm-up" — identical to before.
-        let (mut to_skip, warm_up_start, emit_start, emit_end) = match &slice {
-            Some(s) => (
-                s.skip_leading_rows,
-                s.warm_up_start_row,
-                s.emit_start_row,
-                s.emit_end_row,
-            ),
-            None => (0usize, 0usize, 0usize, usize::MAX),
+        // Grid bounds (global row ranks). Each worker reads the full ordered
+        // contig from rank 0; without a slice (byte-budget path) it emits the
+        // whole stream with no warm-up — identical to before.
+        let (warm_up_start, emit_start, emit_end) = match &slice {
+            Some(s) => (s.warm_up_start_row, s.emit_start_row, s.emit_end_row),
+            None => (0usize, 0usize, usize::MAX),
         };
-        let mut global_row = warm_up_start; // global rank of the next kept row
+        let mut global_row = 0usize; // full contig from the first row
         let mut warm_up_batches: Vec<RecordBatch> = Vec::new();
         let mut warmed_up = emit_start <= warm_up_start; // worker 0 / no warm-up region
         let mut buf_rows = 0usize;
-        // Drain lookup → local colocated map → (skip | warm-up state-only | emit)
+        // Drain lookup → local colocated map → 4-way split by global rank
+        // (discard <warm_up_start | warm-up state-only | emit | discard >=emit_end)
         // → annotate full emit windows inline → format + write to the shard.
         while let Some(msg) = lookup_rx.recv().await {
             let msg = msg?;
             merge_colocated_delta(&mut worker.colocated_map, msg.colocated_delta);
-            let mut batch = msg.batch;
+            let batch = msg.batch;
             if batch.num_rows() == 0 {
                 continue;
-            }
-            // Drop leading tie-rows that belong to the previous buffer (they share
-            // scan_lo_pos but have rank < warm_up_start).
-            if to_skip > 0 {
-                let drop = to_skip.min(batch.num_rows());
-                let remaining = batch.num_rows() - drop;
-                batch = batch.slice(drop, remaining);
-                to_skip -= drop;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
             }
             let n = batch.num_rows();
             let batch_start = global_row;
             let batch_end = global_row + n;
             global_row = batch_end;
 
-            // Split this batch by global rank: warm-up (< emit_start), emit
-            // ([emit_start, emit_end)), discard (>= emit_end).
-            let warm_end = emit_start.saturating_sub(batch_start).min(n);
-            let emit_from = warm_end;
+            // Split this batch by global rank into: leading discard
+            // ([batch_start, warm_up_start)), warm-up ([warm_up_start, emit_start)),
+            // emit ([emit_start, emit_end)), trailing discard (>= emit_end).
+            let warm_from = warm_up_start.saturating_sub(batch_start).min(n);
+            let warm_to = emit_start.saturating_sub(batch_start).min(n);
+            let emit_from = warm_to;
             let emit_to = emit_end.saturating_sub(batch_start).min(n);
-            if warm_end > 0 {
-                warm_up_batches.push(batch.slice(0, warm_end));
+            if warm_to > warm_from {
+                warm_up_batches.push(batch.slice(warm_from, warm_to - warm_from));
             }
             // Once we reach emit_start, replay the collected warm-up buffers
             // state-only so the carried HGNC state is correct before emitting.
@@ -10039,6 +10090,7 @@ fn spawn_annotation_from_lookup_sharded(
             );
         }
         let rows = shard.input_rows;
+        let _ = (emit_start, emit_end, global_row);
         shard.finish()?;
         Ok(rows)
     })
@@ -12334,6 +12386,7 @@ async fn prepare_contig_context(
         )
         .await?;
         let slices = plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp);
+        let _ = _total_rows;
         let task_ctx = session.task_ctx();
         for (i, slice) in slices.iter().enumerate() {
             let mut wprovider = LookupProvider::new(
@@ -12347,14 +12400,12 @@ async fn prepare_contig_context(
                 config.allowed_failed,
                 config.reference_fasta_path.clone(),
             )?;
-            let mut filter = col("chrom")
-                .eq(lit(&*chrom))
-                .and(col("start").gt_eq(lit(slice.scan_lo_pos)));
-            if slice.scan_hi_pos != i64::MAX {
-                filter = filter.and(col("start").lt(lit(slice.scan_hi_pos)));
-            }
-            wprovider.set_vcf_filter(Some(filter));
-            wprovider.set_target_partitions(1);
+            // Filter by chrom only: the VCF provider's start-range region seek
+            // truncates streams unreliably, so each worker reads the full ordered
+            // contig and selects its rank range in the annotation layer by global
+            // row index. (Over-reads the lookup; position pushdown is a follow-up.)
+            wprovider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
+            wprovider.set_target_partitions(config.target_partitions);
             #[cfg(feature = "lance-cache")]
             if let Some(root) = &config.lance_cache_root {
                 wprovider.set_lance_cache_root(root.clone());
@@ -12365,11 +12416,10 @@ async fn prepare_contig_context(
             }
             let session_state = session.state();
             let plan = wprovider.scan(&session_state, None, &[], None).await?;
-            lookup_partitions.push_back(spawn_lookup_partition_worker(
+            lookup_partitions.push_back(spawn_lookup_full_contig_worker(
                 Arc::clone(&plan),
                 Arc::clone(&task_ctx),
                 i, // logical id = shard / output order
-                0, // single-partition grid scan
                 chrom.to_string(),
                 sink,
                 LOOKUP_PARTITION_QUEUE_BATCHES,
