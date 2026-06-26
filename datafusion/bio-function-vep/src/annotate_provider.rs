@@ -5818,24 +5818,40 @@ impl AnnotateProvider {
                         let (vep_ref_norm, vep_alt_norm) = vcf_to_vep_allele(&ref_al, &alt_allele);
                         let vep_start = vep_norm_start(start, &ref_al, &alt_allele);
                         let vep_end = vep_norm_end(start, &ref_al, &alt_allele);
-                        variant.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+                        // The strand-independent prelude (indel parse + the two
+                        // 1000bp flank FASTA reads) is identical for both
+                        // strands; compute it once and reuse for fwd + rev.
+                        if let Some(prelude) = crate::hgvs::prepare_genomic_shift_prelude(
                             reader,
                             chrom_norm,
                             &vep_ref_norm,
                             &vep_alt_norm,
                             vep_start,
                             vep_end,
-                            1,
-                        )?;
-                        variant.hgvs_shift_reverse = crate::hgvs::build_hgvs_genomic_shift(
-                            reader,
-                            chrom_norm,
-                            &vep_ref_norm,
-                            &vep_alt_norm,
-                            vep_start,
-                            vep_end,
-                            -1,
-                        )?;
+                        )? {
+                            variant.hgvs_shift_forward =
+                                crate::hgvs::build_hgvs_genomic_shift_for_strand(
+                                    reader,
+                                    chrom_norm,
+                                    &prelude,
+                                    &vep_ref_norm,
+                                    &vep_alt_norm,
+                                    vep_start,
+                                    vep_end,
+                                    1,
+                                )?;
+                            variant.hgvs_shift_reverse =
+                                crate::hgvs::build_hgvs_genomic_shift_for_strand(
+                                    reader,
+                                    chrom_norm,
+                                    &prelude,
+                                    &vep_ref_norm,
+                                    &vep_alt_norm,
+                                    vep_start,
+                                    vep_end,
+                                    -1,
+                                )?;
+                        }
                     }
                 }
                 if let Some(started) = hgvs_shift_started {

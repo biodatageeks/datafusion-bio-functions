@@ -606,15 +606,32 @@ enum GenomicShiftKind {
 /// This materializes the simple-indel genomic shift hash VEP uses when
 /// transcript HGVS needs a precomputed genomic 3' shift outside transcript
 /// sequence (e.g. intronic repeat indels).
-pub fn build_hgvs_genomic_shift<R>(
+/// Strand-independent inputs for the HGVS genomic 3' shift.
+///
+/// `parse_shiftable_indel` and the 1000bp `pre_seq`/`post_seq` reference flank
+/// reads depend only on the variant coordinates and alleles, not on the
+/// transcript strand — so they are identical for the forward and reverse shift.
+/// Computing them once (via [`prepare_genomic_shift_prelude`]) and feeding both
+/// strand passes through [`build_hgvs_genomic_shift_for_strand`] avoids issuing
+/// the two flank FASTA queries twice per indel.
+pub(crate) struct GenomicShiftPrelude {
+    seq_to_check: Vec<u8>,
+    hgvs_output: Vec<u8>,
+    kind: GenomicShiftKind,
+    pre_seq: String,
+    post_seq: String,
+}
+
+/// Parse the shiftable indel and read the strand-independent reference flanks
+/// once. Returns `None` when the variant is not a shiftable indel.
+pub(crate) fn prepare_genomic_shift_prelude<R>(
     reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
     chrom: &str,
     ref_allele: &str,
     alt_allele: &str,
     start: i64,
     end: i64,
-    strand: i8,
-) -> Result<Option<HgvsGenomicShift>>
+) -> Result<Option<GenomicShiftPrelude>>
 where
     R: BufRead + Seek,
 {
@@ -645,15 +662,69 @@ where
         String::new()
     };
 
+    Ok(Some(GenomicShiftPrelude {
+        seq_to_check,
+        hgvs_output,
+        kind,
+        pre_seq,
+        post_seq,
+    }))
+}
+
+/// Convenience wrapper preserving the original single-call API: prepares the
+/// strand-independent prelude and builds the shift for one strand.
+pub fn build_hgvs_genomic_shift<R>(
+    reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
+    chrom: &str,
+    ref_allele: &str,
+    alt_allele: &str,
+    start: i64,
+    end: i64,
+    strand: i8,
+) -> Result<Option<HgvsGenomicShift>>
+where
+    R: BufRead + Seek,
+{
+    let Some(prelude) =
+        prepare_genomic_shift_prelude(reader, chrom, ref_allele, alt_allele, start, end)?
+    else {
+        return Ok(None);
+    };
+    build_hgvs_genomic_shift_for_strand(
+        reader, chrom, &prelude, ref_allele, alt_allele, start, end, strand,
+    )
+}
+
+/// Build the HGVS genomic shift for a single strand, reusing the
+/// strand-independent [`GenomicShiftPrelude`].
+pub(crate) fn build_hgvs_genomic_shift_for_strand<R>(
+    reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
+    chrom: &str,
+    prelude: &GenomicShiftPrelude,
+    ref_allele: &str,
+    alt_allele: &str,
+    start: i64,
+    end: i64,
+    strand: i8,
+) -> Result<Option<HgvsGenomicShift>>
+where
+    R: BufRead + Seek,
+{
+    let kind = prelude.kind;
+    let seq_to_check = &prelude.seq_to_check;
+    let hgvs_output = &prelude.hgvs_output;
+    let pre_seq = &prelude.pre_seq;
+    let post_seq = &prelude.post_seq;
+
     // Ensembl always passes `seq_strand = 1` to genomic `perform_shift()`
     // because the shift is computed on forward-strand coordinates.
     let genomic_seq_strand = 1i8;
     let (shift_length, shifted_seq, shifted_hgvs_output, shifted_start, shifted_end) =
         perform_shift_ensembl(
-            &seq_to_check,
-            &hgvs_output,
-            &post_seq,
-            &pre_seq,
+            seq_to_check,
+            hgvs_output,
+            post_seq,
+            pre_seq,
             start,
             end,
             strand < 0,
