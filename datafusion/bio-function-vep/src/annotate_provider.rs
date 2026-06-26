@@ -9565,6 +9565,10 @@ fn accumulate_boundaries(
 /// Produced by `prepare_contig_context()`.
 struct ContigReadyState {
     lookup_partitions: VecDeque<LookupPartitionHandle>,
+    /// Grid-aligned per-worker slices, indexed by lookup-partition id. Empty for
+    /// the byte-budget (non-grid) path — then sharded workers emit their whole
+    /// stream with no warm-up. Populated only for stateful Merged/RefSeq parallel.
+    grid_slices: Vec<WorkerGridSlice>,
     shared_context: Arc<SharedContigAnnotationContext>,
     ephemeral_tables: Vec<String>,
     chrom: String,
@@ -9743,6 +9747,7 @@ fn spawn_lookup_partition_worker(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
     partition_id: usize,
+    exec_partition: usize,
     chrom: String,
     sink: ColocatedSink,
     queue_batches: usize,
@@ -9750,7 +9755,10 @@ fn spawn_lookup_partition_worker(
 ) -> LookupPartitionHandle {
     let (sender, receiver) = tokio::sync::mpsc::channel(queue_batches.max(1));
     let join_handle = tokio::spawn(async move {
-        let mut stream = plan.execute(partition_id, task_ctx)?;
+        // `partition_id` is the logical ordering id (= output/shard order);
+        // `exec_partition` is the index into THIS plan (0 for single-partition
+        // grid scans, == partition_id for the byte-budget multi-partition plan).
+        let mut stream = plan.execute(exec_partition, task_ctx)?;
         let mut next_batch_id = 0usize;
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
@@ -9914,6 +9922,7 @@ fn spawn_annotation_from_lookup_sharded(
     input_buffer_size: usize,
     shard_ctx: Arc<crate::vcf_sink::VcfShardContext>,
     shard_path: std::path::PathBuf,
+    slice: Option<WorkerGridSlice>,
 ) -> tokio::task::JoinHandle<Result<usize>> {
     tokio::spawn(async move {
         let mut worker = AnnotationWorkerState::new(shared)?;
@@ -9924,16 +9933,65 @@ fn spawn_annotation_from_lookup_sharded(
             Arc::clone(&shard_ctx.sample_names),
             shard_ctx.coordinate_zero_based,
         )?;
+        // Grid bounds. Without a slice (byte-budget path) this degenerates to
+        // "emit the whole stream, no skip, no warm-up" — identical to before.
+        let (mut to_skip, warm_up_start, emit_start, emit_end) = match &slice {
+            Some(s) => (
+                s.skip_leading_rows,
+                s.warm_up_start_row,
+                s.emit_start_row,
+                s.emit_end_row,
+            ),
+            None => (0usize, 0usize, 0usize, usize::MAX),
+        };
+        let mut global_row = warm_up_start; // global rank of the next kept row
+        let mut warm_up_batches: Vec<RecordBatch> = Vec::new();
+        let mut warmed_up = emit_start <= warm_up_start; // worker 0 / no warm-up region
         let mut buf_rows = 0usize;
-        // Drain lookup → local colocated map → annotate full windows inline →
-        // format + write to the shard (all on the blocking thread).
+        // Drain lookup → local colocated map → (skip | warm-up state-only | emit)
+        // → annotate full emit windows inline → format + write to the shard.
         while let Some(msg) = lookup_rx.recv().await {
             let msg = msg?;
             merge_colocated_delta(&mut worker.colocated_map, msg.colocated_delta);
-            let rows = msg.batch.num_rows();
-            if rows > 0 {
-                buf_rows += rows;
-                worker.window_buffer.push(msg.batch);
+            let mut batch = msg.batch;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            // Drop leading tie-rows that belong to the previous buffer (they share
+            // scan_lo_pos but have rank < warm_up_start).
+            if to_skip > 0 {
+                let drop = to_skip.min(batch.num_rows());
+                let remaining = batch.num_rows() - drop;
+                batch = batch.slice(drop, remaining);
+                to_skip -= drop;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+            }
+            let n = batch.num_rows();
+            let batch_start = global_row;
+            let batch_end = global_row + n;
+            global_row = batch_end;
+
+            // Split this batch by global rank: warm-up (< emit_start), emit
+            // ([emit_start, emit_end)), discard (>= emit_end).
+            let warm_end = emit_start.saturating_sub(batch_start).min(n);
+            let emit_from = warm_end;
+            let emit_to = emit_end.saturating_sub(batch_start).min(n);
+            if warm_end > 0 {
+                warm_up_batches.push(batch.slice(0, warm_end));
+            }
+            // Once we reach emit_start, replay the collected warm-up buffers
+            // state-only so the carried HGNC state is correct before emitting.
+            if !warmed_up && batch_end >= emit_start {
+                let wbatches = std::mem::take(&mut warm_up_batches);
+                tokio::task::block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
+                warmed_up = true;
+            }
+            if emit_to > emit_from {
+                let emit_slice = batch.slice(emit_from, emit_to - emit_from);
+                buf_rows += emit_slice.num_rows();
+                worker.window_buffer.push(emit_slice);
             }
             if buf_rows >= input_buffer_size {
                 let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
@@ -9952,8 +10010,17 @@ fn spawn_annotation_from_lookup_sharded(
                     .rows_done
                     .fetch_add(window_input_rows, std::sync::atomic::Ordering::Relaxed);
             }
+            if batch_end >= emit_end {
+                break; // rank-stop: emitted this worker's whole range
+            }
         }
-        // Final flush: lookup closed → annotate the remaining partial window.
+        // Stream ended before the emit range was reached (e.g. tiny tail worker):
+        // still replay any pending warm-up so state is consistent.
+        if !warmed_up {
+            let wbatches = std::mem::take(&mut warm_up_batches);
+            tokio::task::block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
+        }
+        // Final flush: annotate the remaining partial emit window.
         worker.lookup_done = true;
         let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
         let window_input_rows: usize = window.iter().map(|b| b.num_rows()).sum();
@@ -11500,6 +11567,9 @@ impl Stream for ContigAnnotationStream {
                                 ))));
                             };
                             let shared = Arc::clone(&ready.shared_context);
+                            // Grid slices, indexed by lookup-partition logical id
+                            // (empty for the byte-budget path → no warm-up).
+                            let grid_slices = std::mem::take(&mut ready.grid_slices);
                             let mut handles: Vec<LookupPartitionHandle> =
                                 ready.lookup_partitions.drain(..).collect();
                             handles.sort_by_key(LookupPartitionHandle::partition_id);
@@ -11508,6 +11578,7 @@ impl Stream for ContigAnnotationStream {
                             let mut lookup_join = Vec::with_capacity(handles.len());
                             let mut inline_seen = false;
                             for mut handle in handles {
+                                let slice = grid_slices.get(handle.partition_id()).cloned();
                                 match handle.take_spawned_parts() {
                                     Some((lookup_rx, lookup_jh)) => {
                                         lookup_join.push(lookup_jh);
@@ -11527,6 +11598,7 @@ impl Stream for ContigAnnotationStream {
                                             config.input_buffer_size,
                                             Arc::clone(&shard_ctx),
                                             shard_path,
+                                            slice,
                                         ));
                                     }
                                     None => {
@@ -11940,6 +12012,47 @@ impl Stream for ContigAnnotationStream {
 /// Context loading completes before the lookup stream is first polled; the
 /// actual lookup I/O (build + probe) happens lazily on `poll_next`.
 /// Returns `None` if the contig has no variation table (skip).
+/// Count pass: scan the registered VCF for `chrom` (the provider applies the
+/// chrom region restriction via its tabix index), projecting only `start`(+`alt`),
+/// and replay the serial buffer-cut logic to discover the global input-buffer
+/// boundaries. Partitions are executed in id order (= position order) and
+/// concatenated, matching the annotation scan order; no Lance lookup, no
+/// annotation. Returns the boundaries (length `B+1`) and total input-row count.
+async fn count_contig_buffer_boundaries(
+    session: &Arc<SessionContext>,
+    vcf_table: &str,
+    chrom: &str,
+    input_buffer_size: usize,
+) -> Result<(Vec<GridBufferBoundary>, usize)> {
+    let provider = session.table_provider(vcf_table).await?;
+    let schema = provider.schema();
+    let mut proj = vec![schema.index_of("start")?];
+    if let Ok(alt_idx) = schema.index_of("alt") {
+        proj.push(alt_idx);
+    }
+    proj.sort_unstable();
+    let session_state = session.state();
+    let chrom_filter = col("chrom").eq(lit(chrom));
+    let plan = provider
+        .scan(
+            &session_state,
+            Some(&proj),
+            std::slice::from_ref(&chrom_filter),
+            None,
+        )
+        .await?;
+    let partition_count = plan.output_partitioning().partition_count().max(1);
+    let task_ctx = session.task_ctx();
+    let mut batches = Vec::new();
+    for partition_id in 0..partition_count {
+        let mut stream = plan.execute(partition_id, Arc::clone(&task_ctx))?;
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+    }
+    accumulate_boundaries(&batches, input_buffer_size)
+}
+
 async fn prepare_contig_context(
     session: Arc<SessionContext>,
     cache: Arc<PartitionedAnnotationCache>,
@@ -12009,6 +12122,18 @@ async fn prepare_contig_context(
     };
     #[cfg(not(feature = "lance-cache"))]
     let cache_schema: Schema = unreachable!("lance-cache feature is required");
+    // Stateful Merged/RefSeq at workers>1 runs N grid-aligned per-worker lookup
+    // scans (built after the context load below, once overlap_width is known),
+    // not the byte-budget partitioning. Keep schema clones for those providers.
+    let stateful_parallel = use_lance
+        && config.annotation_workers > 1
+        && matches!(
+            config.cache_source_type,
+            CacheSourceType::Merged | CacheSourceType::RefSeq
+        );
+    let mut grid_slices: Vec<WorkerGridSlice> = Vec::new();
+    let grid_vcf_schema = vcf_schema.clone();
+    let grid_cache_schema = cache_schema.clone();
     let mut provider = LookupProvider::new(
         Arc::clone(&session),
         config.vcf_table.clone(),
@@ -12027,7 +12152,12 @@ async fn prepare_contig_context(
         provider.set_lance_cache_root(root.clone());
     }
     let parallel_lookup = use_lance;
-    let mut lookup_partitions = if parallel_lookup {
+    let mut lookup_partitions = if stateful_parallel {
+        // Deferred: grid-aligned per-worker lookup scans are spawned after the
+        // context load below (once overlap_width_bp is known). The `provider`
+        // built above is unused on this path.
+        VecDeque::new()
+    } else if parallel_lookup {
         let session_state = session.state();
         let mut plan = provider.scan(&session_state, None, &[], None).await?;
         let mut partition_count = plan.output_partitioning().partition_count().max(1);
@@ -12059,6 +12189,7 @@ async fn prepare_contig_context(
             handles.push_back(spawn_lookup_partition_worker(
                 Arc::clone(&plan),
                 Arc::clone(&task_ctx),
+                partition_id,
                 partition_id,
                 chrom.to_string(),
                 sink,
@@ -12196,6 +12327,68 @@ async fn prepare_contig_context(
     );
     let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
     let overlap_width_bp = compute_overlap_width_bp(&base_transcripts);
+
+    // Grid-aligned parallel lookup (stateful Merged/RefSeq, workers>1): a count
+    // pass finds the global 5000-unit buffer boundaries; each worker gets a
+    // whole-buffer rank range with a bounded-overlap warm-up start, and a lookup
+    // scan filtered to its `[scan_lo_pos, scan_hi_pos)` position window.
+    if stateful_parallel {
+        let (boundaries, _total_rows) = count_contig_buffer_boundaries(
+            &session,
+            &config.vcf_table,
+            &chrom,
+            config.input_buffer_size,
+        )
+        .await?;
+        let slices = plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp);
+        let task_ctx = session.task_ctx();
+        for (i, slice) in slices.iter().enumerate() {
+            let mut wprovider = LookupProvider::new(
+                Arc::clone(&session),
+                config.vcf_table.clone(),
+                var_table.clone(),
+                grid_vcf_schema.clone(),
+                grid_cache_schema.clone(),
+                config.cache_columns.clone(),
+                config.extended_probes,
+                config.allowed_failed,
+                config.reference_fasta_path.clone(),
+            )?;
+            let mut filter = col("chrom")
+                .eq(lit(&*chrom))
+                .and(col("start").gt_eq(lit(slice.scan_lo_pos)));
+            if slice.scan_hi_pos != i64::MAX {
+                filter = filter.and(col("start").lt(lit(slice.scan_hi_pos)));
+            }
+            wprovider.set_vcf_filter(Some(filter));
+            wprovider.set_target_partitions(1);
+            #[cfg(feature = "lance-cache")]
+            if let Some(root) = &config.lance_cache_root {
+                wprovider.set_lance_cache_root(root.clone());
+            }
+            let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+            if config.flags.check_existing {
+                wprovider.set_colocated_sink(Arc::clone(&sink));
+            }
+            let session_state = session.state();
+            let plan = wprovider.scan(&session_state, None, &[], None).await?;
+            lookup_partitions.push_back(spawn_lookup_partition_worker(
+                Arc::clone(&plan),
+                Arc::clone(&task_ctx),
+                i, // logical id = shard / output order
+                0, // single-partition grid scan
+                chrom.to_string(),
+                sink,
+                LOOKUP_PARTITION_QUEUE_BATCHES,
+                pipeline_profile.clone(),
+            ));
+        }
+        grid_slices = slices;
+        record_contig_profile(&pipeline_profile, |profile| {
+            profile.lookup_partitions = lookup_partitions.len();
+        });
+    }
+
     let shared_context = Arc::new(SharedContigAnnotationContext {
         config: config.clone(),
         profile: pipeline_profile,
@@ -12228,6 +12421,7 @@ async fn prepare_contig_context(
 
     Ok(Some(ContigReadyState {
         lookup_partitions,
+        grid_slices,
         shared_context,
         ephemeral_tables,
         chrom,
