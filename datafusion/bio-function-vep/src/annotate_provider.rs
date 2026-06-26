@@ -12284,7 +12284,7 @@ async fn prepare_contig_context(
         profile.prepare_setup += t_contig.elapsed();
     });
 
-    let context_result: Result<LoadedContigContext> = async {
+    let context_fut = async {
         let t_ctx = profile_start!();
         pipeline_trace::emit("context", "start", &[("chrom", TraceValue::Str(&chrom))]);
         let _ = use_lance;
@@ -12327,8 +12327,28 @@ async fn prepare_contig_context(
         {
             unreachable!("lance-cache feature is required")
         }
-    }
-    .await;
+    };
+    // Run the grid count pass (VCF positions only) CONCURRENTLY with the context
+    // load (Lance transcripts/exons) — independent IO, so the count is hidden
+    // behind context load instead of running as a serial prelude before workers.
+    let count_fut = async {
+        if stateful_parallel {
+            Some(
+                count_contig_buffer_boundaries(
+                    &session,
+                    &config.vcf_table,
+                    &chrom,
+                    config.input_buffer_size,
+                )
+                .await,
+            )
+        } else {
+            None
+        }
+    };
+    let context_result: Result<LoadedContigContext>;
+    let grid_count;
+    (context_result, grid_count) = tokio::join!(context_fut, count_fut);
     let (tx_vec, translateable_seq, ex, tl, rg, mt) = match context_result {
         Ok(context) => context,
         Err(e) => {
@@ -12392,13 +12412,8 @@ async fn prepare_contig_context(
     // whole-buffer rank range with a bounded-overlap warm-up start, and a lookup
     // scan filtered to its `[scan_lo_pos, scan_hi_pos)` position window.
     if stateful_parallel {
-        let (boundaries, _total_rows) = count_contig_buffer_boundaries(
-            &session,
-            &config.vcf_table,
-            &chrom,
-            config.input_buffer_size,
-        )
-        .await?;
+        let (boundaries, _total_rows) =
+            grid_count.expect("stateful_parallel implies the count future ran")?;
         let slices = plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp);
         let _ = _total_rows;
         let task_ctx = session.task_ctx();
