@@ -96,7 +96,7 @@ impl AfColumns {
             .iter()
             .map(|a| a.get_array_memory_size())
             .sum::<usize>()
-            + self.0.capacity() * std::mem::size_of::<ArrayRef>()
+            + self.0.len() * std::mem::size_of::<ArrayRef>()
     }
 }
 

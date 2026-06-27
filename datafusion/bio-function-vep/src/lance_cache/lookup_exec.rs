@@ -1,5 +1,5 @@
 //! KvLookupExec: ExecutionPlan that streams VCF batches and probes
-//! a fjall KV store per-position for annotation.
+//! the Lance columnar variation dataset per-position for annotation.
 
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -57,7 +57,7 @@ pub enum KvMatchMode {
 
 /// Physical execution plan for KV-backed variant lookup.
 ///
-/// Takes a VCF input plan, probes a fjall KV store per-position,
+/// Takes a VCF input plan, probes the Lance variation dataset per-position,
 /// and emits LEFT JOIN output (unmatched VCF rows get NULL cache columns).
 pub struct KvLookupExec {
     input: Arc<dyn ExecutionPlan>,
@@ -1333,7 +1333,7 @@ impl KvLookupStream {
 
     /// Single-pass position-keyed lookup.
     ///
-    /// For each VCF row, fetch the per-position entry from fjall, match alleles,
+    /// For each VCF row, fetch the per-position entry from Lance, match alleles,
     /// and append matched column values directly into ArrayBuilders.
     #[allow(clippy::too_many_arguments)]
     fn probe_lance_warm_position(
@@ -1705,11 +1705,10 @@ impl KvLookupStream {
                         "lance variation lookup not built for {chrom}"
                     ))
                 })?;
-                if !self.lance_cursors.contains_key(&chrom) {
-                    let cursor = lookup.new_cursor();
-                    self.lance_cursors.insert(chrom.clone(), cursor);
-                }
-                let cursor = self.lance_cursors.get_mut(&chrom).unwrap();
+                let cursor = self
+                    .lance_cursors
+                    .entry(chrom.clone())
+                    .or_insert_with(|| lookup.new_cursor());
                 let take_started = self.profile_enabled.then(Instant::now);
                 let taken = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()

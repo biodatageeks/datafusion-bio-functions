@@ -4,9 +4,10 @@
 //! `target_variants` rows (no mid-batch slicing). The final window may be
 //! smaller. Windows are the unit of work handed to the parallel window pool.
 //
-// `allow(dead_code)`: the planner is consumed by the parallel window driver
-// added in a later phase; until then the items are crate-internal and unused
-// outside tests. Remove the allow once the driver wires it in.
+// TODO(parallel-window-driver): the planner is consumed by the parallel window
+// driver added in a later phase; until then the items are crate-internal and
+// unused outside tests. Remove this `allow(dead_code)` once the driver wires
+// it in.
 #![allow(dead_code)]
 
 use datafusion::arrow::record_batch::RecordBatch;

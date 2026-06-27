@@ -176,9 +176,28 @@ fn resolve_table_sync(
     table_name: &str,
 ) -> Result<Arc<dyn TableProvider>> {
     let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
+        // Multi-thread runtime: `block_in_place` is supported and cheapest.
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| handle.block_on(schema_provider.table(table_name)))
         }
+        // Current-thread runtime (e.g. `#[tokio::test]`, embedded callers):
+        // `block_in_place` would panic and we cannot nest a runtime on this
+        // thread, so resolve on a dedicated OS thread with its own runtime.
+        Ok(_handle) => std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    rt.block_on(schema_provider.table(table_name))
+                })
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(DataFusionError::Execution(
+                        "table resolution worker thread panicked".to_string(),
+                    ))
+                })
+        }),
+        // No runtime in scope: create one here.
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;

@@ -99,7 +99,10 @@ impl ScalarUDFImpl for SiftDecodeUdf {
                 other => return exec_err!("unknown predictor '{other}' (expected sift|polyphen)"),
             };
             // The position is not stored in the blob (it lives in the row key),
-            // so the decoded structs carry only amino_acid/prediction/score.
+            // so we pass 0 as a placeholder. The decoded structs' `position`
+            // field is therefore always 0 here, but it is intentionally not
+            // surfaced: the output schema (`item_fields`) exposes only
+            // amino_acid/prediction/score.
             let entries = deserialize_position_entries_v2(0, blobs.value(row), codec)?;
             let sb = list.values();
             for e in &entries {

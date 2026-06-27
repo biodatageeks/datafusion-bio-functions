@@ -175,7 +175,16 @@ pub async fn build_lance_variation_chrom(
     let manifest_chrom = canonical_chrom_label(chrom);
     let dataset_name = dataset_dir_name(&manifest_chrom);
     let dataset_path = entity_dir.join(&dataset_name);
-    if options.overwrite && dataset_path.exists() {
+    if dataset_path.exists() {
+        if !options.overwrite {
+            // The tiered writer's first pass uses `WriteMode::Overwrite`, so a
+            // rebuild would clobber the existing chromosome dataset regardless
+            // of this flag. Refuse instead of silently overwriting.
+            return Err(DataFusionError::Execution(format!(
+                "Lance dataset '{}' already exists and overwrite=false",
+                dataset_path.display()
+            )));
+        }
         std::fs::remove_dir_all(&dataset_path).map_err(|err| {
             DataFusionError::Execution(format!(
                 "failed to remove existing Lance dataset '{}': {err}",

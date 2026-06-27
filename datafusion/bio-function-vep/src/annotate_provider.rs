@@ -9401,21 +9401,33 @@ fn drain_window_input_units(
     window_buffer: &mut Vec<RecordBatch>,
     input_units: usize,
 ) -> Vec<RecordBatch> {
+    // Scan once to find how many whole front batches to drain and whether the
+    // boundary batch must be split, then mutate the buffer with a single
+    // `drain` (O(n) once) plus an in-place replace — instead of repeated
+    // `remove(0)`/`insert(0, …)`, which are each O(n).
     let mut remaining = input_units;
-    let mut drained = Vec::new();
-    while remaining > 0 && !window_buffer.is_empty() {
-        let batch = window_buffer.remove(0);
-        let batch_units = batch_input_units(&batch);
+    let mut whole = 0;
+    let mut partial: Option<usize> = None; // take_rows from the boundary batch
+    for batch in window_buffer.iter() {
+        if remaining == 0 {
+            break;
+        }
+        let batch_units = batch_input_units(batch);
         if batch_units <= remaining {
             remaining -= batch_units;
-            drained.push(batch);
+            whole += 1;
         } else {
-            let (take_rows, take_units) = rows_covering_input_units(&batch, remaining);
-            let total_rows = batch.num_rows();
-            drained.push(batch.slice(0, take_rows));
-            window_buffer.insert(0, batch.slice(take_rows, total_rows - take_rows));
-            remaining = remaining.saturating_sub(take_units);
+            let (take_rows, _take_units) = rows_covering_input_units(batch, remaining);
+            partial = Some(take_rows);
+            break;
         }
+    }
+    let mut drained: Vec<RecordBatch> = window_buffer.drain(..whole).collect();
+    if let Some(take_rows) = partial {
+        // The boundary batch is now at the front of `window_buffer`.
+        let total_rows = window_buffer[0].num_rows();
+        drained.push(window_buffer[0].slice(0, take_rows));
+        window_buffer[0] = window_buffer[0].slice(take_rows, total_rows - take_rows);
     }
     drained
 }
@@ -12683,6 +12695,66 @@ mod tests {
     use crate::transcript_consequence::{
         CachedPredictions, FeatureType, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
     };
+
+    /// `colocated::AF_COL_NAMES` is maintained by hand alongside `AF_COLUMNS`
+    /// here, and the two must stay in the same order (the colocated AF lookup
+    /// indexes one by the other's position). Fail loudly if they drift.
+    #[test]
+    fn af_col_names_match_af_columns_order() {
+        let cache_cols: Vec<&str> = AF_COLUMNS.iter().map(|c| c.cache_col).collect();
+        assert_eq!(
+            crate::colocated::AF_COL_NAMES,
+            cache_cols.as_slice(),
+            "AF_COL_NAMES (colocated.rs) and AF_COLUMNS (annotate_provider.rs) are out of sync"
+        );
+    }
+
+    #[test]
+    fn drain_window_input_units_splits_boundary_batch() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        // No ALT column → each row counts as one input unit.
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let make = |vals: &[i64]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vals.to_vec()))],
+            )
+            .unwrap()
+        };
+
+        // Two batches of 3 and 4 rows; drain 5 units → whole first batch plus a
+        // 2-row slice of the second, leaving a 2-row remainder at the front.
+        let mut buf = vec![make(&[0, 1, 2]), make(&[3, 4, 5, 6])];
+        let drained = drain_window_input_units(&mut buf, 5);
+        assert_eq!(
+            drained.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(
+            buf.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        // Exact whole-batch boundary → no split, no remainder pushed back.
+        let mut buf = vec![make(&[0, 1, 2]), make(&[3, 4, 5, 6])];
+        let drained = drain_window_input_units(&mut buf, 3);
+        assert_eq!(
+            drained.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(
+            buf.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            vec![4]
+        );
+
+        // Requesting more than available drains everything.
+        let mut buf = vec![make(&[0, 1, 2]), make(&[3, 4, 5, 6])];
+        let drained = drain_window_input_units(&mut buf, 100);
+        assert_eq!(drained.iter().map(|b| b.num_rows()).sum::<usize>(), 7);
+        assert!(buf.is_empty());
+    }
 
     #[test]
     fn draining_colocated_sink_leaves_sink_empty() {

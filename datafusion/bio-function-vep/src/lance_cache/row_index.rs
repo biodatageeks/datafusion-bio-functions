@@ -202,9 +202,12 @@ impl U64RowIdIndex {
                 "u64 row-id index arrays have different lengths".into(),
             ));
         }
-        if keys.windows(2).any(|pair| pair[0] > pair[1]) {
+        // Keys are unique by construction (one row per `(uid, position)`), so
+        // require strictly increasing — this also rejects duplicates, which
+        // `resolve()`'s binary search would otherwise silently collapse.
+        if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(DataFusionError::Execution(
-                "u64 row-id index keys are not sorted".into(),
+                "u64 row-id index keys are not strictly increasing (unsorted or duplicate)".into(),
             ));
         }
         Ok(Self { keys, row_ids })
@@ -784,5 +787,13 @@ mod tests {
         let (row_ids, present) = index.resolve(&[10, 30, 40, 50]);
         assert_eq!(row_ids, vec![100, 400]);
         assert_eq!(present, vec![10, 40]);
+    }
+
+    #[test]
+    fn u64_index_rejects_duplicate_keys() {
+        // Uniqueness is invariant by construction; duplicates would be silently
+        // collapsed by binary search, so the constructor must reject them.
+        let err = U64RowIdIndex::new(vec![10, 10, 20], vec![100, 101, 200]).unwrap_err();
+        assert!(err.to_string().contains("strictly increasing"));
     }
 }

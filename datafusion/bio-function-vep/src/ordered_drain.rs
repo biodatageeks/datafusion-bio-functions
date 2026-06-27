@@ -5,8 +5,8 @@
 //! lower-indexed window has been released, so output order is deterministic
 //! regardless of completion order.
 //
-// `allow(dead_code)`: consumed by the parallel window driver added in a later
-// phase; remove the allow once the driver wires it in.
+// TODO(parallel-window-driver): consumed by the parallel window driver added in
+// a later phase; remove this `allow(dead_code)` once the driver wires it in.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
