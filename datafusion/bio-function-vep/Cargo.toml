@@ -64,6 +64,10 @@ required-features = ["lance-cache", "cache-builder"]
 name = "build_lance_chrom_context"
 required-features = ["lance-cache", "cache-builder"]
 
+[[example]]
+name = "build_lance_full_cache"
+required-features = ["lance-cache", "cache-builder"]
+
 [features]
 default = ["lance-cache"]
 lance-cache = [
