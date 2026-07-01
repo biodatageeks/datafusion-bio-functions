@@ -3546,8 +3546,6 @@ impl AnnotateProvider {
     /// Set the VCF shard context, enabling the sharded-output `threads>1` path
     /// when this provider's plan is executed. Used by `vcf_sink`'s direct-plan
     /// entry; the normal UDTF/SQL path leaves this `None`.
-    // TODO(sharded-vcf): called from vcf_sink in Task 4.
-    #[allow(dead_code)]
     pub(crate) fn with_vcf_shard_ctx(mut self, ctx: Arc<crate::vcf_sink::VcfShardContext>) -> Self {
         self.vcf_shard_ctx = Some(ctx);
         self
@@ -12250,7 +12248,6 @@ async fn prepare_contig_context(
         config.cache_columns.clone(),
         config.extended_probes,
         config.allowed_failed,
-        config.reference_fasta_path.clone(),
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
     provider.set_target_partitions(config.target_partitions);
@@ -12475,7 +12472,6 @@ async fn prepare_contig_context(
                 config.cache_columns.clone(),
                 config.extended_probes,
                 config.allowed_failed,
-                config.reference_fasta_path.clone(),
             )?;
             // Restrict each worker to its [scan_lo_pos, scan_hi_pos) window so it
             // reads ONLY its range's lookup (warm-up + emit) — no over-read. The

@@ -73,9 +73,6 @@ pub struct LookupProvider {
     extended_probes: bool,
     /// Maximum allowed `failed` flag value from the cache.
     allowed_failed: i64,
-    /// Optional indexed reference FASTA used to materialize Ensembl genomic
-    /// shift state for colocated existing-variant matching.
-    reference_fasta_path: Option<String>,
     /// Output schema.
     schema: SchemaRef,
     /// Optional sink for co-located data collection during probe phase.
@@ -111,7 +108,6 @@ impl LookupProvider {
         cache_columns: Vec<String>,
         extended_probes: bool,
         allowed_failed: i64,
-        reference_fasta_path: Option<String>,
     ) -> Result<Self> {
         let cache_schema_ref: SchemaRef = Arc::new(cache_schema.clone());
         validate_variation_schema(&cache_schema_ref)?;
@@ -152,7 +148,6 @@ impl LookupProvider {
             coord_normalizer,
             extended_probes,
             allowed_failed,
-            reference_fasta_path,
             schema,
             colocated_sink: None,
             partition_colocated_sinks: None,
@@ -271,7 +266,6 @@ impl TableProvider for LookupProvider {
                 self.extended_probes,
                 self.allowed_failed,
             )?;
-            exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
             exec = exec.with_target_partitions(self.target_partitions);
             if let Some(ref sink) = self.colocated_sink {
                 exec = exec.with_colocated_sink(Arc::clone(sink));

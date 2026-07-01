@@ -166,37 +166,12 @@ pub(crate) fn output_allele_from_allele_string(allele_string: &str) -> Option<&s
     allele_string.split_once('/').map(|(_, alt)| alt)
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ShiftableIndelKind {
-    Insertion,
-    Deletion,
-}
-
 /// Traceability:
 /// - Ensembl Variation `create_shift_hash()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400>
 ///
-/// Genomic shift state is only defined for simple insertion/deletion allele
-/// strings. Substitutions and multi-ALT representations bypass this path.
-pub(crate) fn parse_shiftable_indel(
-    allele_string: &str,
-) -> Option<(&str, &str, ShiftableIndelKind)> {
-    let (ref_allele, alt_allele) = allele_string.split_once('/')?;
-    if ref_allele == "-" && !alt_allele.is_empty() && alt_allele != "-" {
-        return Some((ref_allele, alt_allele, ShiftableIndelKind::Insertion));
-    }
-    if alt_allele == "-" && !ref_allele.is_empty() && ref_allele != "-" {
-        return Some((ref_allele, alt_allele, ShiftableIndelKind::Deletion));
-    }
-    None
-}
-
-/// Traceability:
-/// - Ensembl Variation `create_shift_hash()`
-///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400>
-///
-/// Shift-state construction queries the indexed genomic reference by absolute
-/// chromosome coordinates before `_genomic_shift()` rotates repeat indels.
+/// Reference queries by absolute chromosome coordinates back the 3' repeat
+/// flank read used by the HGVS shift path (`hgvs.rs`).
 fn build_reference_region(chrom: &str, start: i64, end: i64) -> Result<Region> {
     let start = usize::try_from(start).map_err(|_| {
         DataFusionError::Execution(format!(
@@ -247,107 +222,6 @@ where
             "reference FASTA returned non-UTF8 sequence for {chrom}:{start}-{end}: {e}"
         ))
     })
-}
-
-/// Traceability:
-/// - Ensembl Variation `perform_shift()`
-///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351>
-///
-/// This is the source-equivalent positive-strand genomic branch of VEP's
-/// indel shifting loop. It rotates the shifted sequence through the 3' flank
-/// and advances genomic coordinates one base at a time until the next flank
-/// base no longer matches.
-pub(crate) fn perform_forward_genomic_shift(
-    seq_to_check: &str,
-    post_seq: &str,
-    start: i64,
-    end: i64,
-) -> (usize, String, i64, i64) {
-    let mut seq_to_check = seq_to_check.as_bytes().to_vec();
-    let post_seq = post_seq.as_bytes();
-    let indel_length = seq_to_check.len();
-    let mut shift_length = 0usize;
-    let mut start = start;
-    let mut end = end;
-
-    if indel_length == 0 || post_seq.len() < indel_length {
-        return (
-            0,
-            String::from_utf8(seq_to_check).unwrap_or_default(),
-            start,
-            end,
-        );
-    }
-
-    let loop_limiter = post_seq.len() - indel_length;
-    for n in 0..=loop_limiter {
-        let check_next = seq_to_check[0];
-        if check_next != post_seq[n] {
-            break;
-        }
-
-        shift_length += 1;
-        seq_to_check.rotate_left(1);
-        start += 1;
-        end += 1;
-    }
-
-    (
-        shift_length,
-        String::from_utf8(seq_to_check).unwrap_or_default(),
-        start,
-        end,
-    )
-}
-
-/// Traceability:
-/// - Ensembl Variation `create_shift_hash()`
-///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400>
-/// - Ensembl Variation `_genomic_shift()`
-///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L411-L466>
-///
-/// This materializes the VF-level genomic shift state VEP uses for colocated
-/// matching: active compare space becomes the shifted indel representation,
-/// while the original minimized representation is retained separately as
-/// `unshifted_*`.
-pub(crate) fn build_shifted_compare_state<R>(
-    reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
-    chrom: &str,
-    allele_string: &str,
-    start: i64,
-    end: i64,
-) -> Result<Option<(String, i64, i64)>>
-where
-    R: BufRead + Seek,
-{
-    let Some((ref_allele, alt_allele, kind)) = parse_shiftable_indel(allele_string) else {
-        return Ok(None);
-    };
-
-    let seq_to_check = match kind {
-        ShiftableIndelKind::Insertion => alt_allele,
-        ShiftableIndelKind::Deletion => ref_allele,
-    };
-
-    let flank_start = end + 1;
-    if flank_start <= 0 {
-        return Ok(None);
-    }
-    let flank_end = flank_start + 999;
-    let post_seq = read_reference_sequence(reader, chrom, flank_start, flank_end)?;
-    let (shift_length, shifted_seq, shifted_start, shifted_end) =
-        perform_forward_genomic_shift(seq_to_check, &post_seq, start, end);
-
-    if shift_length == 0 {
-        return Ok(None);
-    }
-
-    let shifted_allele_string = match kind {
-        ShiftableIndelKind::Insertion => format!("-/{shifted_seq}"),
-        ShiftableIndelKind::Deletion => format!("{shifted_seq}/-"),
-    };
-
-    Ok(Some((shifted_allele_string, shifted_start, shifted_end)))
 }
 
 /// Two-pass allele matching for colocated variant collection.
@@ -469,20 +343,6 @@ mod tests {
         assert_eq!(output_allele_from_allele_string("AA/-"), Some("-"));
         assert_eq!(output_allele_from_allele_string("-/AC"), Some("AC"));
         assert_eq!(output_allele_from_allele_string("AA"), None);
-    }
-
-    #[test]
-    fn parse_shiftable_indel_only_accepts_simple_insertions_and_deletions() {
-        assert!(matches!(
-            parse_shiftable_indel("-/AC"),
-            Some(("-", "AC", ShiftableIndelKind::Insertion))
-        ));
-        assert!(matches!(
-            parse_shiftable_indel("AC/-"),
-            Some(("AC", "-", ShiftableIndelKind::Deletion))
-        ));
-        assert!(parse_shiftable_indel("A/G").is_none());
-        assert!(parse_shiftable_indel("A/G/T").is_none());
     }
 
     #[test]

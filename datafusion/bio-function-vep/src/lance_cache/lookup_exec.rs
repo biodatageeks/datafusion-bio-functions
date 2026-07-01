@@ -120,9 +120,6 @@ pub struct KvLookupExec {
     colocated_sink: Option<ColocatedSink>,
     /// Optional partition-local sinks for co-located data collected during probe phase.
     colocated_partition_sinks: Option<Vec<ColocatedSink>>,
-    /// Optional indexed reference FASTA for genomic shift state in colocated
-    /// matching (parity with parquet path's two-pass allele matching).
-    reference_fasta_path: Option<String>,
     target_partitions: usize,
     /// Per-contig lance variation lookup (dataset + page directory + streaming
     /// reader), built once and shared across all per-partition streams via the
@@ -214,7 +211,6 @@ impl KvLookupExec {
             output_col_positions,
             colocated_sink: None,
             colocated_partition_sinks: None,
-            reference_fasta_path: None,
             target_partitions: 1,
             #[cfg(feature = "lance-cache")]
             lance_lookup_cell: Arc::new(OnceCell::new()),
@@ -235,12 +231,6 @@ impl KvLookupExec {
     /// Set one co-located data sink per input partition.
     pub fn with_colocated_partition_sinks(mut self, sinks: Vec<ColocatedSink>) -> Self {
         self.colocated_partition_sinks = Some(sinks);
-        self
-    }
-
-    /// Set the reference FASTA path for genomic shift state in colocated matching.
-    pub fn with_reference_fasta_path(mut self, path: Option<String>) -> Self {
-        self.reference_fasta_path = path;
         self
     }
 }
@@ -311,7 +301,6 @@ impl ExecutionPlan for KvLookupExec {
         if let Some(sinks) = &self.colocated_partition_sinks {
             exec = exec.with_colocated_partition_sinks(sinks.clone());
         }
-        exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
         exec = exec.with_target_partitions(self.target_partitions);
         // Carry the shared per-contig lance lookup (and any already-built index)
         // forward across re-planning instead of letting new_lance reset it.
@@ -350,7 +339,6 @@ impl ExecutionPlan for KvLookupExec {
             self.allowed_failed,
             self.output_col_positions.clone(),
             colocated_sink,
-            self.reference_fasta_path.clone(),
             self.target_partitions,
         );
 
@@ -386,9 +374,6 @@ struct KvLookupStream {
     allowed_failed: i64,
     output_col_positions: Vec<usize>,
     colocated_sink: Option<ColocatedSink>,
-    /// Optional indexed reference FASTA reader for genomic shift state.
-    reference_reader:
-        Option<noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>>,
     target_partitions: usize,
     /// Shared (Arc-cloned from the exec) per-contig variation lookup, built once.
     #[cfg(feature = "lance-cache")]
@@ -613,19 +598,6 @@ fn lance_variation_path_for_chrom(cache: &PartitionedLanceCache, chrom: &str) ->
                 }
             })
     })
-}
-
-/// Open an indexed FASTA reader from a file path.
-fn open_indexed_fasta(
-    path: &str,
-) -> Result<noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>> {
-    noodles_fasta::io::indexed_reader::Builder::default()
-        .build_from_path(path)
-        .map_err(|e| {
-            DataFusionError::Execution(format!(
-                "failed to open indexed reference FASTA '{path}': {e}"
-            ))
-        })
 }
 
 #[derive(Default)]
@@ -1292,25 +1264,8 @@ impl KvLookupStream {
         allowed_failed: i64,
         output_col_positions: Vec<usize>,
         colocated_sink: Option<ColocatedSink>,
-        reference_fasta_path: Option<String>,
         target_partitions: usize,
     ) -> Self {
-        // Open the reference FASTA reader if a path is provided and we have a
-        // colocated sink (shift state is only needed for colocated matching).
-        let reference_reader = if colocated_sink.is_some() {
-            reference_fasta_path.as_deref().and_then(|path| {
-                open_indexed_fasta(path)
-                    .map_err(|e| {
-                        eprintln!(
-                            "[KvLookupStream] warning: failed to open reference FASTA {path}: {e}"
-                        );
-                        e
-                    })
-                    .ok()
-            })
-        } else {
-            None
-        };
         let VariationLookupStorage::Lance { cache_root } = &variation_storage;
         let warm_cold_backend = WarmColdVariationBackend::Lance;
         let warm_cold_index_mode = WarmColdVariationIndexMode::PositionThenVariantBloom;
@@ -1349,7 +1304,6 @@ impl KvLookupStream {
             allowed_failed,
             output_col_positions,
             colocated_sink,
-            reference_reader,
             target_partitions: target_partitions.max(1),
             // Placeholder; execute() overwrites with the exec's shared cell.
             #[cfg(feature = "lance-cache")]
