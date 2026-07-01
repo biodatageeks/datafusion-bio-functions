@@ -1397,17 +1397,45 @@ impl KvLookupStream {
             let path_disp = path.display().to_string();
             let cell = Arc::clone(&self.lance_lookup_cell);
             let open_started = Instant::now();
-            let lookup = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    cell.get_or_try_init(|| async {
-                        SinglePathLanceVariationLookup::open(&path, projection)
-                            .await
-                            .map(Arc::new)
-                    })
-                    .await
-                    .cloned()
+            let open_fut = async {
+                cell.get_or_try_init(|| async {
+                    SinglePathLanceVariationLookup::open(&path, projection)
+                        .await
+                        .map(Arc::new)
                 })
-            })?;
+                .await
+                .cloned()
+            };
+            // `block_in_place` panics on a current-thread runtime, so branch on
+            // the runtime flavor exactly like the sync helpers in this crate:
+            // multi-thread → block in place; current-thread → resolve on a
+            // dedicated OS thread; no runtime → create one here.
+            let lookup = match tokio::runtime::Handle::try_current() {
+                Ok(handle)
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                {
+                    tokio::task::block_in_place(|| handle.block_on(open_fut))
+                }
+                Ok(_handle) => std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let rt = tokio::runtime::Runtime::new()
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            rt.block_on(open_fut)
+                        })
+                        .join()
+                        .unwrap_or_else(|_| {
+                            Err(DataFusionError::Execution(
+                                "lance variation lookup worker thread panicked".to_string(),
+                            ))
+                        })
+                }),
+                Err(_) => {
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    rt.block_on(open_fut)
+                }
+            }?;
             let open_elapsed = open_started.elapsed();
             if self.profile_enabled {
                 self.profile.position_index_load += open_elapsed;
