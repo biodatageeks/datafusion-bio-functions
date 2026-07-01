@@ -46,6 +46,43 @@ use crate::lance_cache::variation_runtime::{
 use crate::partitioned_cache::PartitionedLanceCache;
 use tokio::sync::OnceCell;
 
+/// Drive a Lance future to completion from a synchronous context regardless of
+/// the ambient Tokio runtime flavor. `block_in_place` panics on a current-thread
+/// runtime (`#[tokio::test]`'s default flavor, embedded single-thread callers),
+/// so fall back to a dedicated OS thread there; with no runtime in scope, create
+/// one. Keeps the multi-thread fast path (`block_in_place`) for production.
+#[cfg(feature = "lance-cache")]
+fn block_on_lance<T, F>(fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>> + Send,
+    T: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        Ok(_handle) => std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    rt.block_on(fut)
+                })
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(DataFusionError::Execution(
+                        "lance lookup worker thread panicked".to_string(),
+                    ))
+                })
+        }),
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            rt.block_on(fut)
+        }
+    }
+}
+
 const DEFAULT_LANCE_LOOKUP_PROCESS_BATCH_ROWS: usize = 5_000;
 
 /// Lookup match mode.
@@ -1406,36 +1443,7 @@ impl KvLookupStream {
                 .await
                 .cloned()
             };
-            // `block_in_place` panics on a current-thread runtime, so branch on
-            // the runtime flavor exactly like the sync helpers in this crate:
-            // multi-thread → block in place; current-thread → resolve on a
-            // dedicated OS thread; no runtime → create one here.
-            let lookup = match tokio::runtime::Handle::try_current() {
-                Ok(handle)
-                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-                {
-                    tokio::task::block_in_place(|| handle.block_on(open_fut))
-                }
-                Ok(_handle) => std::thread::scope(|scope| {
-                    scope
-                        .spawn(|| {
-                            let rt = tokio::runtime::Runtime::new()
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                            rt.block_on(open_fut)
-                        })
-                        .join()
-                        .unwrap_or_else(|_| {
-                            Err(DataFusionError::Execution(
-                                "lance variation lookup worker thread panicked".to_string(),
-                            ))
-                        })
-                }),
-                Err(_) => {
-                    let rt = tokio::runtime::Runtime::new()
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    rt.block_on(open_fut)
-                }
-            }?;
+            let lookup = block_on_lance(open_fut)?;
             let open_elapsed = open_started.elapsed();
             if self.profile_enabled {
                 self.profile.position_index_load += open_elapsed;
@@ -1738,10 +1746,7 @@ impl KvLookupStream {
                     .entry(chrom.clone())
                     .or_insert_with(|| lookup.new_cursor());
                 let take_started = self.profile_enabled.then(Instant::now);
-                let taken = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(lookup.resolve_and_take(&starts, cursor))
-                })?;
+                let taken = block_on_lance(lookup.resolve_and_take(&starts, cursor))?;
                 if let Some(t0) = take_started {
                     self.profile.cold_parquet_load += t0.elapsed();
                 }

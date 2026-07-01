@@ -10033,7 +10033,6 @@ fn spawn_annotation_from_lookup_sharded(
         let mut global_row = warm_up_start; // rank of the first kept row
         let mut warm_up_batches: Vec<RecordBatch> = Vec::new();
         let mut warmed_up = emit_start <= warm_up_start; // worker 0 / no warm-up region
-        let mut buf_rows = 0usize;
         // Drain lookup → local colocated map → (skip ties | warm-up state-only |
         // emit | discard >=emit_end) → annotate emit windows → write to the shard.
         while let Some(msg) = lookup_rx.recv().await {
@@ -10075,14 +10074,20 @@ fn spawn_annotation_from_lookup_sharded(
                 warmed_up = true;
             }
             if emit_to > emit_from {
-                let emit_slice = batch.slice(emit_from, emit_to - emit_from);
-                buf_rows += emit_slice.num_rows();
-                worker.window_buffer.push(emit_slice);
+                worker
+                    .window_buffer
+                    .push(batch.slice(emit_from, emit_to - emit_from));
             }
-            if buf_rows >= input_buffer_size {
-                let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
-                let window_input_rows = buf_rows;
-                buf_rows = 0;
+            // Cut windows at exactly `input_buffer_size` VEP INPUT UNITS (alt-allele
+            // count), matching the serial/grid buffer cuts: a multi-allelic row like
+            // `A,C` counts as two units. Counting Arrow rows here would misalign the
+            // shard-local cuts against the contig-global grid, changing buffer-local
+            // HGNC/transcript donation only under parallel VCF output. Mirrors the
+            // `AnnotatingContig` grid path's `window_buffer_input_units` +
+            // `drain_window_input_units`.
+            while window_buffer_input_units(&worker.window_buffer) >= input_buffer_size {
+                let window = drain_window_input_units(&mut worker.window_buffer, input_buffer_size);
+                let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
                 tokio::task::block_in_place(|| -> Result<()> {
                     hydrate_worker_window(&mut worker, &window, cache_source_type)?;
                     let out = annotate_worker_window(&mut worker, &window, projection.as_deref())?;
