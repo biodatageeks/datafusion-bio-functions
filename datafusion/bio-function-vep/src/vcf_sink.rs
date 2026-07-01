@@ -3,18 +3,23 @@
 //! Provides [`annotate_to_vcf`] — a single-call function that reads a VCF,
 //! annotates it, and streams results to an output VCF file.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion_bio_format_vcf::serializer::batch_to_vcf_lines;
+use datafusion_bio_format_vcf::serializer::{VcfRecordLine, batch_to_vcf_lines};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cache_source::CacheSourceType;
+use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
 
 /// Callback invoked after each batch is written to VCF.
 /// Arguments: (rows_in_batch, total_rows_written_so_far, total_input_rows).
@@ -24,6 +29,361 @@ pub type OnBatchWritten = Box<dyn Fn(usize, usize, usize) + Send + Sync>;
 
 /// Ensembl VEP release/115 default `--buffer_size`.
 pub const VEP_DEFAULT_BUFFER_SIZE: usize = 5000;
+
+fn sink_profile_enabled() -> bool {
+    std::env::var("VEP_PROFILE").is_ok() || std::env::var("VEP_VCF_PROFILE").is_ok()
+}
+
+#[derive(Debug, Default)]
+struct VcfSinkProfile {
+    stream_next: Duration,
+    batch_to_lines: Duration,
+    format_wait: Duration,
+    write_records: Duration,
+    writer_finish: Duration,
+    batches: usize,
+    rows: usize,
+    lines: usize,
+    body_chunk_bytes: usize,
+    format_jobs: usize,
+    format_inflight_max: usize,
+    contig_partitions: usize,
+    contig_inflight_max: usize,
+}
+
+impl VcfSinkProfile {
+    fn summary_line(&self) -> String {
+        format!(
+            "[VEP_PROFILE] vcf_sink_profile batches={} rows={} lines={} body_chunk_bytes={} format_jobs={} format_inflight_max={} contig_partitions={} contig_inflight_max={} stream_next={:.3}s batch_to_lines={:.3}s format_wait={:.3}s write_records={:.3}s writer_finish={:.3}s",
+            self.batches,
+            self.rows,
+            self.lines,
+            self.body_chunk_bytes,
+            self.format_jobs,
+            self.format_inflight_max,
+            self.contig_partitions,
+            self.contig_inflight_max,
+            self.stream_next.as_secs_f64(),
+            self.batch_to_lines.as_secs_f64(),
+            self.format_wait.as_secs_f64(),
+            self.write_records.as_secs_f64(),
+            self.writer_finish.as_secs_f64(),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct FormattedVcfBatch {
+    batch_id: usize,
+    input_rows: usize,
+    lines: usize,
+    bytes: Vec<u8>,
+    format_duration: Duration,
+}
+
+struct VcfBodyTempDir {
+    path: PathBuf,
+}
+
+impl VcfBodyTempDir {
+    fn new() -> Result<Self> {
+        let unique = format!(
+            "vep_vcf_body_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::create_dir(&path).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Failed to create VCF body shard tempdir {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for VcfBodyTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VepConcurrencyPlan {
+    lookup_partitions: usize,
+    spawn_vcf_provider_open: bool,
+}
+
+impl VepConcurrencyPlan {
+    fn from_config(config: &AnnotateVcfConfig) -> Self {
+        // Single `workers` knob: N position-ordered lookup partitions feeding
+        // N independent annotation range pipelines, one contig at a time.
+        // Correctness for workers>1 relies on the indexed-input guard in
+        // annotate_to_vcf (contiguous, position-ordered partitions).
+        let lookup_partitions = config.workers.max(1);
+        Self {
+            lookup_partitions,
+            spawn_vcf_provider_open: lookup_partitions > 1,
+        }
+    }
+}
+
+fn vcf_lines_to_body_chunk(lines: Vec<VcfRecordLine>) -> (Vec<u8>, usize) {
+    let line_count = lines.len();
+    let byte_len = lines.iter().map(|record| record.line.len() + 1).sum();
+    let mut bytes = Vec::with_capacity(byte_len);
+    for record in lines {
+        bytes.extend_from_slice(record.line.as_bytes());
+        bytes.push(b'\n');
+    }
+    (bytes, line_count)
+}
+
+/// Formatter context + tempdir threaded into the `threads>1` engine workers so
+/// each fused worker can serialize its annotated batches directly into its own
+/// VCF body shard (`format_vcf_body_chunk` + `BufWriter<File>`), removing the
+/// ordered drain / output channel. Derived in `annotate_to_vcf` from the VCF
+/// schema (independent of the SQL path) and injected via
+/// `AnnotateProvider` → `ContigAnnotationConfig`.
+#[derive(Clone)]
+pub(crate) struct VcfShardContext {
+    pub(crate) vcf_info_fields: Arc<Vec<String>>,
+    pub(crate) unique_format_tags: Arc<Vec<String>>,
+    pub(crate) sample_names: Arc<Vec<String>>,
+    pub(crate) coordinate_zero_based: bool,
+    pub(crate) tempdir: PathBuf,
+    /// Running count of input rows annotated across all shard workers. Polled by
+    /// `drive_sharded_vcf_annotation` to drive the progress bar / callback
+    /// incrementally during annotation (shards are written concurrently and only
+    /// concatenated at the end, so this is the only live progress signal).
+    pub(crate) rows_done: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn format_vcf_body_chunk(
+    batch_id: usize,
+    batch: RecordBatch,
+    vcf_info_fields: Arc<Vec<String>>,
+    unique_format_tags: Arc<Vec<String>>,
+    sample_names: Arc<Vec<String>>,
+    coordinate_zero_based: bool,
+) -> Result<FormattedVcfBatch> {
+    let input_rows = batch.num_rows();
+    let format_started = Instant::now();
+    pipeline_trace::emit(
+        "vcf_format",
+        "start",
+        &[
+            ("batch_id", TraceValue::Usize(batch_id)),
+            ("rows", TraceValue::Usize(input_rows)),
+        ],
+    );
+    let lines = batch_to_vcf_lines(
+        &batch,
+        vcf_info_fields.as_slice(),
+        unique_format_tags.as_slice(),
+        sample_names.as_slice(),
+        coordinate_zero_based,
+    )?;
+    let (bytes, line_count) = vcf_lines_to_body_chunk(lines);
+    pipeline_trace::emit(
+        "vcf_format",
+        "done",
+        &[
+            ("batch_id", TraceValue::Usize(batch_id)),
+            ("rows", TraceValue::Usize(input_rows)),
+            ("lines", TraceValue::Usize(line_count)),
+            ("bytes", TraceValue::Usize(bytes.len())),
+            ("elapsed", TraceValue::Duration(format_started.elapsed())),
+        ],
+    );
+    Ok(FormattedVcfBatch {
+        batch_id,
+        input_rows,
+        lines: line_count,
+        bytes,
+        format_duration: format_started.elapsed(),
+    })
+}
+
+fn write_vcf_body_chunk(writer: &mut VcfLocalWriter, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let write_result = match writer {
+        VcfLocalWriter::Plain(writer) => writer.write_all(bytes),
+        VcfLocalWriter::Gzip(writer) => writer.write_all(bytes),
+        VcfLocalWriter::Bgzf(writer) => writer.write_all(bytes),
+    };
+
+    write_result.map_err(|e| DataFusionError::Execution(format!("Failed to write VCF chunk: {e}")))
+}
+
+fn drain_ready_vcf_chunks(
+    ready: &mut BTreeMap<usize, FormattedVcfBatch>,
+    next_write_batch_id: &mut usize,
+    writer: &mut VcfLocalWriter,
+    pb: &ProgressBar,
+    config: &AnnotateVcfConfig,
+    total_input: usize,
+    total_rows: &mut usize,
+    sink_profile: &mut Option<VcfSinkProfile>,
+) -> Result<()> {
+    while let Some(chunk) = ready.remove(next_write_batch_id) {
+        let write_started = Instant::now();
+        write_vcf_body_chunk(writer, &chunk.bytes)?;
+        let write_elapsed = write_started.elapsed();
+        pipeline_trace::emit(
+            "vcf_write",
+            "done",
+            &[
+                ("batch_id", TraceValue::Usize(chunk.batch_id)),
+                ("rows", TraceValue::Usize(chunk.input_rows)),
+                ("lines", TraceValue::Usize(chunk.lines)),
+                ("bytes", TraceValue::Usize(chunk.bytes.len())),
+                ("elapsed", TraceValue::Duration(write_elapsed)),
+            ],
+        );
+        if let Some(profile) = sink_profile.as_mut() {
+            profile.write_records += write_elapsed;
+            profile.batch_to_lines += chunk.format_duration;
+            profile.batches += 1;
+            profile.rows += chunk.input_rows;
+            profile.lines += chunk.lines;
+            profile.body_chunk_bytes += chunk.bytes.len();
+        }
+        *total_rows += chunk.lines;
+        pb.inc(chunk.lines as u64);
+        if let Some(ref cb) = config.on_batch_written {
+            cb(chunk.lines, *total_rows, total_input);
+        }
+        *next_write_batch_id += 1;
+    }
+
+    Ok(())
+}
+
+fn copy_body_file_to_writer(path: &Path, writer: &mut VcfLocalWriter) -> Result<Duration> {
+    let started = Instant::now();
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "Failed to open VCF body shard {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mut buffer = vec![0u8; 8 * 1024 * 1024];
+    loop {
+        let bytes = file.read(&mut buffer).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Failed to read VCF body shard {}: {e}",
+                path.display()
+            ))
+        })?;
+        if bytes == 0 {
+            break;
+        }
+        write_vcf_body_chunk(writer, &buffer[..bytes])?;
+    }
+    Ok(started.elapsed())
+}
+
+/// Reusable streaming VCF body shard writer: owns a `BufWriter<File>` + the
+/// per-batch formatter context, and streams formatted batches into one shard
+/// file with no buffering of the batch. Used by the `workers>1` engine workers
+/// (which call the sync [`write_batch`](Self::write_batch) inside
+/// `block_in_place`).
+pub(crate) struct VcfBodyShardWriter {
+    writer: std::io::BufWriter<std::fs::File>,
+    vcf_info_fields: Arc<Vec<String>>,
+    unique_format_tags: Arc<Vec<String>>,
+    sample_names: Arc<Vec<String>>,
+    coordinate_zero_based: bool,
+    batch_id: usize,
+    pub(crate) lines: usize,
+    pub(crate) input_rows: usize,
+    pub(crate) bytes: usize,
+}
+
+impl VcfBodyShardWriter {
+    pub(crate) fn create(
+        path: &Path,
+        vcf_info_fields: Arc<Vec<String>>,
+        unique_format_tags: Arc<Vec<String>>,
+        sample_names: Arc<Vec<String>>,
+        coordinate_zero_based: bool,
+    ) -> Result<Self> {
+        let file = std::fs::File::create(path).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Failed to create VCF body shard {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Self {
+            writer: std::io::BufWriter::new(file),
+            vcf_info_fields,
+            unique_format_tags,
+            sample_names,
+            coordinate_zero_based,
+            batch_id: 0,
+            lines: 0,
+            input_rows: 0,
+            bytes: 0,
+        })
+    }
+
+    /// Format one batch with the owned context and stream it to the shard file.
+    /// Synchronous: callers must be on a thread where blocking is acceptable
+    /// (the engine workers run inside `block_in_place`). No batch buffering.
+    pub(crate) fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        let formatted = format_vcf_body_chunk(
+            self.batch_id,
+            batch,
+            Arc::clone(&self.vcf_info_fields),
+            Arc::clone(&self.unique_format_tags),
+            Arc::clone(&self.sample_names),
+            self.coordinate_zero_based,
+        )?;
+        self.batch_id += 1;
+        self.write_formatted(&formatted)?;
+        Ok(())
+    }
+
+    /// Allocate the next batch id (for callers that format off-thread).
+    fn next_batch_id(&mut self) -> usize {
+        let id = self.batch_id;
+        self.batch_id += 1;
+        id
+    }
+
+    /// Write already-formatted bytes and accumulate counters. Returns the IO
+    /// duration so async callers can attribute write time. Used by
+    /// [`write_vcf_partition_body`] which formats via `spawn_blocking`.
+    fn write_formatted(&mut self, formatted: &FormattedVcfBatch) -> Result<Duration> {
+        let started = Instant::now();
+        self.writer.write_all(&formatted.bytes).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to write VCF body shard: {e}"))
+        })?;
+        let elapsed = started.elapsed();
+        self.lines += formatted.lines;
+        self.input_rows += formatted.input_rows;
+        self.bytes += formatted.bytes.len();
+        Ok(elapsed)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        self.writer
+            .flush()
+            .map_err(|e| DataFusionError::Execution(format!("Failed to flush VCF body shard: {e}")))
+    }
+}
 
 /// Configuration for VCF annotation output.
 pub struct AnnotateVcfConfig {
@@ -50,8 +410,6 @@ pub struct AnnotateVcfConfig {
     pub extended_probes: bool,
     /// Path to indexed reference FASTA (required for `everything` / `hgvs`).
     pub reference_fasta_path: Option<String>,
-    /// Use fjall KV store for variation lookup + SIFT.
-    pub use_fjall: bool,
     /// Enable HGVS notation.
     pub hgvs: bool,
     /// Enable transcript HGVS notation explicitly.
@@ -84,6 +442,11 @@ pub struct AnnotateVcfConfig {
     pub distance: Option<String>,
     /// Number of input variants per VEP-style annotation buffer.
     pub buffer_size: usize,
+    /// Maximum number of independent cold-Parquet lookup shards per contig.
+    pub target_partitions: usize,
+    /// Number of parallel fused window-annotation pipelines within a contig
+    /// (`1` = serial). The single annotation-concurrency knob.
+    pub workers: usize,
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show an indicatif progress bar on stderr (for Rust CLI).
@@ -108,7 +471,6 @@ impl Default for AnnotateVcfConfig {
             pick_order: None,
             extended_probes: false,
             reference_fasta_path: None,
-            use_fjall: false,
             hgvs: false,
             hgvsc: false,
             hgvsp: false,
@@ -125,6 +487,8 @@ impl Default for AnnotateVcfConfig {
             failed: None,
             distance: None,
             buffer_size: VEP_DEFAULT_BUFFER_SIZE,
+            target_partitions: 1,
+            workers: 1,
             compression: VcfCompressionType::Plain,
             show_progress: false,
             on_batch_written: None,
@@ -137,6 +501,8 @@ impl std::fmt::Debug for AnnotateVcfConfig {
         f.debug_struct("AnnotateVcfConfig")
             .field("everything", &self.everything)
             .field("buffer_size", &self.buffer_size)
+            .field("workers", &self.workers)
+            .field("target_partitions", &self.target_partitions)
             .field("compression", &self.compression)
             .field("show_progress", &self.show_progress)
             .field("on_batch_written", &self.on_batch_written.is_some())
@@ -178,9 +544,6 @@ impl AnnotateVcfConfig {
                 "reference_fasta_path".into(),
                 serde_json::Value::String(fasta.clone()),
             );
-        }
-        if self.use_fjall {
-            opts.insert("use_fjall".into(), serde_json::Value::Bool(true));
         }
         if self.hgvs {
             opts.insert("hgvs".into(), serde_json::Value::Bool(true));
@@ -228,11 +591,54 @@ impl AnnotateVcfConfig {
             "buffer_size".into(),
             serde_json::Value::Number(serde_json::Number::from(self.buffer_size)),
         );
+        opts.insert(
+            "target_partitions".into(),
+            serde_json::Value::Number(serde_json::Number::from(self.target_partitions.max(1))),
+        );
+        opts.insert(
+            "workers".into(),
+            serde_json::Value::Number(serde_json::Number::from(self.workers.max(1))),
+        );
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
+    }
+
+    fn to_options_json_with_backend(&self, backend: &str) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&self.to_options_json()).expect("generated options JSON is valid");
+        if let Some(opts) = value.as_object_mut() {
+            opts.insert(
+                "cache_format".into(),
+                serde_json::Value::String(cache_format_for_backend(backend).to_string()),
+            );
+        }
+        value.to_string()
     }
 
     fn include_pick_output(&self) -> bool {
         self.flag_pick || self.flag_pick_allele || self.flag_pick_allele_gene
+    }
+}
+
+fn cache_format_for_backend(_backend: &str) -> &str {
+    // Lance is the only supported backend.
+    "lance"
+}
+
+fn cache_source_type_from_cache_source_for_backend(
+    cache_source: &str,
+    _backend: &str,
+) -> Result<CacheSourceType> {
+    #[cfg(feature = "lance-cache")]
+    {
+        CacheSourceType::from_partitioned_lance_cache_source(cache_source)
+    }
+    #[cfg(not(feature = "lance-cache"))]
+    {
+        let _ = cache_source;
+        Err(DataFusionError::Plan(
+            "annotate_to_vcf(): Lance cache source metadata requires the lance-cache feature"
+                .to_string(),
+        ))
     }
 }
 
@@ -261,13 +667,208 @@ fn csq_header_description(
 /// are NOT written to the VCF — only core VCF columns, original INFO/FORMAT
 /// fields, and the `csq` annotation are included.
 ///
-/// Cache source mode is read from Arrow schema metadata on a parquet file under
-/// `{cache_source}/variation`. That directory must be readable even when
-/// `backend` selects a non-parquet annotation store such as `fjall`.
+/// Cache source mode is read from Arrow schema metadata on the selected cache
+/// backend's variation table.
 ///
 /// # Returns
 ///
 /// The number of rows written.
+/// Copy one VCF body shard into `writer`, returning the number of body lines
+/// (each ends in `\n`, so the newline count is the line count). Used to assemble
+/// the sharded `threads>1` output, where shard line counts are not carried in a
+/// descriptor (the bodies live only as files in the shard tempdir).
+fn copy_body_file_counting_lines(path: &Path, writer: &mut VcfLocalWriter) -> Result<usize> {
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "Failed to open VCF body shard {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mut buffer = vec![0u8; 8 * 1024 * 1024];
+    let mut lines = 0usize;
+    loop {
+        let bytes = file.read(&mut buffer).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Failed to read VCF body shard {}: {e}",
+                path.display()
+            ))
+        })?;
+        if bytes == 0 {
+            break;
+        }
+        lines += bytecount(&buffer[..bytes], b'\n');
+        write_vcf_body_chunk(writer, &buffer[..bytes])?;
+    }
+    Ok(lines)
+}
+
+fn bytecount(haystack: &[u8], needle: u8) -> usize {
+    haystack.iter().filter(|&&b| b == needle).count()
+}
+
+/// Drive the `threads>1` sharded-VCF-output path: build the annotation plan
+/// directly (bypassing SQL) with a [`VcfShardContext`] so each fused worker
+/// streams its own position-ordered VCF body shard into `shard_ctx.tempdir`,
+/// then concatenate the shards in ascending id (= position) order into `writer`.
+/// Returns the total number of body lines written.
+#[allow(clippy::too_many_arguments)]
+async fn drive_sharded_vcf_annotation(
+    ctx: &SessionContext,
+    vcf_table: &str,
+    cache_source: &str,
+    backend: &str,
+    cache_source_type: CacheSourceType,
+    options_json: String,
+    vcf_schema: &Arc<datafusion::arrow::datatypes::Schema>,
+    projection_names: &[String],
+    shard_ctx: Arc<VcfShardContext>,
+    writer: &mut VcfLocalWriter,
+    pb: &ProgressBar,
+    config: &AnnotateVcfConfig,
+    total_input: usize,
+) -> Result<usize> {
+    use crate::annotate_provider::AnnotateProvider;
+    use crate::annotation_store::AnnotationBackend;
+    use datafusion::physical_plan::ExecutionPlan;
+    use futures::StreamExt;
+
+    let backend_enum = AnnotationBackend::parse(backend)?;
+    // Reuse AnnotateProvider::new + TableProvider::scan (crate-reachable, all
+    // inputs derived from vcf_schema, not SQL) and inject the shard context.
+    let provider = AnnotateProvider::new(
+        Arc::new(ctx.clone()),
+        vcf_table.to_string(),
+        cache_source.to_string(),
+        backend_enum,
+        cache_source_type,
+        Some(options_json),
+        (**vcf_schema).clone(),
+    )?
+    .with_vcf_shard_ctx(Arc::clone(&shard_ctx));
+
+    let full_schema = TableProvider::schema(&provider);
+    let projection: Vec<usize> = projection_names
+        .iter()
+        .map(|name| full_schema.index_of(name).map_err(DataFusionError::from))
+        .collect::<Result<_>>()?;
+
+    let state = ctx.state();
+    let plan = provider.scan(&state, Some(&projection), &[], None).await?;
+    let partition_count = plan.properties().output_partitioning().partition_count();
+    if partition_count != 1 {
+        return Err(DataFusionError::Internal(format!(
+            "sharded VCF output expects a single output partition, got {partition_count}; \
+             threads>1 must not be combined with forks/contig_parallelism"
+        )));
+    }
+
+    // Drive the plan to completion: the workers write their shards; this stream
+    // yields no row batches. `?` propagates the first worker error (no concat).
+    // Workers bump `shard_ctx.rows_done` as they annotate each window; a sibling
+    // OS thread polls it so the progress bar / callback advance DURING annotation
+    // rather than jumping only at concat. The poller uses `std::thread::sleep`
+    // (not a tokio timer) so it works regardless of whether the caller's runtime
+    // enabled the time driver.
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut stream = plan.execute(0, ctx.task_ctx())?;
+    let progress_started = Instant::now();
+    let progress_trace = std::env::var_os("VEP_PROFILE").is_some();
+    let mut last = 0usize;
+    let mut report = |now: usize| {
+        if now > last {
+            let prev = last;
+            last = now;
+            pb.set_position(now as u64);
+            if progress_trace {
+                eprintln!(
+                    "[VEP_PROGRESS] annotated {now}/{total_input} (+{}) at {:.1}s",
+                    now - prev,
+                    progress_started.elapsed().as_secs_f64(),
+                );
+            }
+            if let Some(ref cb) = config.on_batch_written {
+                cb(now - prev, now, total_input);
+            }
+        }
+    };
+
+    // The sharded stream yields no row batches — workers write shards directly
+    // and bump `shard_ctx.rows_done` as they annotate. A dedicated OS thread
+    // samples that counter every 150ms and forwards snapshots over a channel, so
+    // the progress bar / callback advance DURING annotation. We AWAIT the stream
+    // on the caller's runtime (instead of `block_in_place` + `block_on`, which
+    // panics on a current-thread runtime), keeping the worker tasks driven on
+    // whatever runtime spawned them. The poller uses `std::thread::sleep` (not a
+    // tokio timer) and an unbounded `mpsc`, so it needs no time driver.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tick_tx, mut tick_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let poller = {
+        let stop = Arc::clone(&stop);
+        let shard_ctx = Arc::clone(&shard_ctx);
+        std::thread::spawn(move || {
+            while !stop.load(Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let _ = tick_tx.send(shard_ctx.rows_done.load(Relaxed));
+            }
+        })
+    };
+
+    let drive_result: Result<()> = loop {
+        tokio::select! {
+            item = stream.next() => match item {
+                Some(batch) => {
+                    if let Err(e) = batch {
+                        break Err(e);
+                    }
+                }
+                None => break Ok(()),
+            },
+            Some(now) = tick_rx.recv() => report(now),
+        }
+    };
+    stop.store(true, Relaxed);
+    let _ = poller.join();
+    drive_result?;
+    // Final flush: report any rows annotated since the poller's last tick.
+    report(shard_ctx.rows_done.load(Relaxed));
+
+    // Assemble: concat the body shards in ascending (= position) id order.
+    let mut shards: Vec<(usize, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(&shard_ctx.tempdir).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "Failed to read VCF shard tempdir {}: {e}",
+            shard_ctx.tempdir.display()
+        ))
+    })? {
+        let path = entry
+            .map_err(|e| {
+                DataFusionError::Execution(format!("Failed to read VCF shard dir entry: {e}"))
+            })?
+            .path();
+        let id = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("partition_"))
+            .and_then(|name| name.strip_suffix(".vcf.body"))
+            .and_then(|name| name.parse::<usize>().ok());
+        if let Some(id) = id {
+            shards.push((id, path));
+        }
+    }
+    shards.sort_by_key(|(id, _)| *id);
+
+    // Concat is just byte-copy assembly; progress was already reported during
+    // annotation above, so don't advance the bar / callback again here (the
+    // input-row count would otherwise be double-counted against output lines).
+    let mut total_rows = 0usize;
+    for (_, path) in shards {
+        let lines = copy_body_file_counting_lines(&path, writer)?;
+        let _ = std::fs::remove_file(&path);
+        total_rows += lines;
+    }
+    Ok(total_rows)
+}
+
 pub async fn annotate_to_vcf(
     input_vcf: &str,
     cache_source: &str,
@@ -275,24 +876,62 @@ pub async fn annotate_to_vcf(
     output_vcf: &str,
     config: &AnnotateVcfConfig,
 ) -> Result<usize> {
+    if config.workers == 0 {
+        return Err(DataFusionError::Plan(
+            "annotate_to_vcf(): workers must be a positive integer".to_string(),
+        ));
+    }
+    if config.target_partitions == 0 {
+        return Err(DataFusionError::Plan(
+            "annotate_to_vcf(): target_partitions must be a positive integer".to_string(),
+        ));
+    }
     if config.refseq || config.merged {
         return Err(DataFusionError::Plan(
             "annotate_to_vcf(): refseq and merged config fields are unsupported; cache source mode must come from cache schema metadata bio.vep.cache_source_type".to_string(),
         ));
     }
-    let cache_source_type = CacheSourceType::from_partitioned_cache_source(cache_source)?;
+    // Parallel annotation (workers>1) splits the contig into N position-range
+    // lookup partitions. That requires a bgzipped + tabix-indexed input so the
+    // VCF scan yields contiguous, position-ordered partitions; an unindexed
+    // input would force a round-robin repartition that scrambles output order.
+    if config.workers > 1
+        && !std::path::Path::new(&format!("{input_vcf}.tbi")).exists()
+        && !std::path::Path::new(&format!("{input_vcf}.csi")).exists()
+    {
+        return Err(DataFusionError::Plan(format!(
+            "annotate_to_vcf(): workers>1 requires a tabix-indexed input (`{input_vcf}.tbi` or `.csi`); \
+             bgzip + tabix the VCF, or run with workers=1"
+        )));
+    }
+    let cache_source_type = cache_source_type_from_cache_source_for_backend(cache_source, backend)?;
+    let concurrency_plan = VepConcurrencyPlan::from_config(config);
+    if sink_profile_enabled() {
+        eprintln!(
+            "[VEP_PROFILE] concurrency_plan lookup_partitions={} workers={} cold_parquet_target_partitions={} spawn_vcf_provider_open={}",
+            concurrency_plan.lookup_partitions,
+            config.workers,
+            config.target_partitions,
+            concurrency_plan.spawn_vcf_provider_open
+        );
+    }
 
     // 1. Create session and register VCF table.
-    let session_config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+    let session_config = datafusion::prelude::SessionConfig::new()
+        .with_target_partitions(concurrency_plan.lookup_partitions);
     let ctx = SessionContext::new_with_config(session_config);
     crate::register_vep_functions(&ctx);
 
     let vcf_path = input_vcf.to_string();
-    let vcf_provider = tokio::task::spawn_blocking(move || {
-        VcfTableProvider::new(vcf_path, None, None, None, false)
-    })
-    .await
-    .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??;
+    let vcf_provider = if concurrency_plan.spawn_vcf_provider_open {
+        tokio::task::spawn_blocking(move || {
+            VcfTableProvider::new(vcf_path, None, None, None, false)
+        })
+        .await
+        .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??
+    } else {
+        VcfTableProvider::new(vcf_path, None, None, None, false)?
+    };
 
     let vcf_schema = vcf_provider.schema();
     ctx.register_table("__vep_vcf", Arc::new(vcf_provider))?;
@@ -405,13 +1044,24 @@ pub async fn annotate_to_vcf(
     }
     let select_list = select_cols.join(", ");
 
-    let options_json = config.to_options_json();
+    let options_json = config.to_options_json_with_backend(backend);
     let opts_clause = format!(", '{}'", options_json.replace('\'', "''"));
     let sql = format!(
         "SELECT {select_list} FROM annotate_vep('{vcf_table}', '{}', '{}'{opts_clause})",
         cache_source.replace('\'', "''"),
         backend.replace('\'', "''"),
     );
+
+    // Column set the formatter consumes (same as the serial SELECT list): core
+    // VCF columns + INFO fields + CSQ + per-sample FORMAT columns. Used by the
+    // threads>1 sharded path to project the annotation plan identically.
+    let projection_names: Vec<String> = core_vcf
+        .iter()
+        .map(|name| (*name).to_string())
+        .chain(info_fields.iter().cloned())
+        .chain(std::iter::once("CSQ".to_string()))
+        .chain(format_fields.iter().cloned())
+        .collect();
 
     let mut vcf_info_fields = info_fields;
     vcf_info_fields.push("CSQ".to_string());
@@ -469,28 +1119,134 @@ pub async fn annotate_to_vcf(
         .get("bio.coordinate_system_zero_based")
         .is_some_and(|v| v == "true");
 
-    use futures::StreamExt;
-    let mut stream = df.execute_stream().await?;
     let mut total_rows = 0;
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result?;
-        let lines = batch_to_vcf_lines(
-            &batch,
-            &vcf_info_fields,
-            &unique_format_tags,
-            &sample_names,
+    let mut sink_profile = sink_profile_enabled().then(VcfSinkProfile::default);
+
+    if config.workers > 1 {
+        // Sharded VCF output: bypass the SQL/DataFrame execution and drive the
+        // annotation plan directly with a VcfShardContext, so each fused worker
+        // streams its own VCF body shard. The header was already written above;
+        // here we drive the shards to completion then concat them in order.
+        let tempdir = VcfBodyTempDir::new()?;
+        let shard_ctx = Arc::new(VcfShardContext {
+            vcf_info_fields: Arc::new(vcf_info_fields),
+            unique_format_tags: Arc::new(unique_format_tags),
+            sample_names: Arc::new(sample_names),
             coordinate_zero_based,
-        )?;
-        total_rows += lines.len();
-        writer.write_records(&lines)?;
-        pb.inc(lines.len() as u64);
-        if let Some(ref cb) = config.on_batch_written {
-            cb(lines.len(), total_rows, total_input);
+            tempdir: tempdir.path().to_path_buf(),
+            rows_done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        total_rows = drive_sharded_vcf_annotation(
+            &ctx,
+            vcf_table,
+            cache_source,
+            backend,
+            cache_source_type,
+            options_json.clone(),
+            &vcf_schema,
+            &projection_names,
+            shard_ctx,
+            &mut writer,
+            &pb,
+            config,
+            total_input,
+        )
+        .await?;
+        // tempdir (and any leftover shard files) removed on drop here.
+        drop(tempdir);
+    } else {
+        use futures::StreamExt;
+        let mut stream = df.execute_stream().await?;
+        let mut next_serial_batch_id = 0usize;
+        loop {
+            let stream_started = Instant::now();
+            let next_batch = stream.next().await;
+            let stream_elapsed = stream_started.elapsed();
+            if let Some(profile) = sink_profile.as_mut() {
+                profile.stream_next += stream_elapsed;
+            }
+            let Some(batch_result) = next_batch else {
+                break;
+            };
+            let batch = batch_result?;
+            let input_rows = batch.num_rows();
+            let batch_id = next_serial_batch_id;
+            next_serial_batch_id += 1;
+            pipeline_trace::emit(
+                "vcf_stream",
+                "batch_ready",
+                &[
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(input_rows)),
+                    ("stream_wait", TraceValue::Duration(stream_elapsed)),
+                ],
+            );
+            let lines_started = Instant::now();
+            pipeline_trace::emit(
+                "vcf_format",
+                "start",
+                &[
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(input_rows)),
+                ],
+            );
+            let lines = batch_to_vcf_lines(
+                &batch,
+                &vcf_info_fields,
+                &unique_format_tags,
+                &sample_names,
+                coordinate_zero_based,
+            )?;
+            let format_elapsed = lines_started.elapsed();
+            pipeline_trace::emit(
+                "vcf_format",
+                "done",
+                &[
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(input_rows)),
+                    ("lines", TraceValue::Usize(lines.len())),
+                    ("elapsed", TraceValue::Duration(format_elapsed)),
+                ],
+            );
+            if let Some(profile) = sink_profile.as_mut() {
+                profile.batch_to_lines += format_elapsed;
+                profile.batches += 1;
+                profile.rows += input_rows;
+                profile.lines += lines.len();
+            }
+            total_rows += lines.len();
+            let write_started = Instant::now();
+            writer.write_records(&lines)?;
+            let write_elapsed = write_started.elapsed();
+            pipeline_trace::emit(
+                "vcf_write",
+                "done",
+                &[
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(input_rows)),
+                    ("lines", TraceValue::Usize(lines.len())),
+                    ("elapsed", TraceValue::Duration(write_elapsed)),
+                ],
+            );
+            if let Some(profile) = sink_profile.as_mut() {
+                profile.write_records += write_elapsed;
+            }
+            pb.inc(lines.len() as u64);
+            if let Some(ref cb) = config.on_batch_written {
+                cb(lines.len(), total_rows, total_input);
+            }
         }
     }
 
+    let finish_started = Instant::now();
     writer.finish()?;
+    if let Some(profile) = sink_profile.as_mut() {
+        profile.writer_finish += finish_started.elapsed();
+    }
     pb.finish_and_clear();
+    if let Some(profile) = sink_profile {
+        eprintln!("{}", profile.summary_line());
+    }
 
     Ok(total_rows)
 }
@@ -498,6 +1254,8 @@ pub async fn annotate_to_vcf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     #[test]
     fn test_to_options_json_emits_pick_flags() {
@@ -538,6 +1296,96 @@ mod tests {
     }
 
     #[test]
+    fn test_to_options_json_with_backend_emits_cache_format() {
+        let config = AnnotateVcfConfig::default();
+
+        let json = config.to_options_json_with_backend("lance");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["cache_format"], "lance");
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lance_backend_reads_cache_source_metadata_from_lance_variation() {
+        use datafusion::arrow::array::{StringArray, UInt32Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let variation_dir = tmp.path().join("variation.lance");
+        let dataset_path = variation_dir.join("chr1.lance");
+        let schema = Arc::new(crate::lance_cache::schema::with_cache_source_metadata(
+            &Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+            ]),
+            "merged",
+        ));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"])),
+                Arc::new(UInt32Array::from(vec![10])),
+                Arc::new(UInt32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+
+        crate::lance_cache::write::write_record_batches_to_lance(
+            &dataset_path,
+            vec![batch],
+            crate::lance_cache::write::LanceIndexKind::Start,
+        )
+        .await
+        .unwrap();
+        crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+        ])
+        .write_to_entity_dir(&variation_dir)
+        .unwrap();
+
+        let source_type =
+            cache_source_type_from_cache_source_for_backend(tmp.path().to_str().unwrap(), "lance")
+                .unwrap();
+
+        assert_eq!(source_type, CacheSourceType::Merged);
+    }
+
+    #[test]
+    fn concurrency_plan_serial_uses_single_lookup_partition() {
+        let config = AnnotateVcfConfig::default();
+        let plan = VepConcurrencyPlan::from_config(&config);
+        assert_eq!(plan.lookup_partitions, 1);
+        assert!(!plan.spawn_vcf_provider_open);
+    }
+
+    #[test]
+    fn concurrency_plan_workers_drive_lookup_partitions() {
+        let config = AnnotateVcfConfig {
+            workers: 8,
+            ..AnnotateVcfConfig::default()
+        };
+        let plan = VepConcurrencyPlan::from_config(&config);
+        assert_eq!(plan.lookup_partitions, 8);
+        assert!(plan.spawn_vcf_provider_open);
+    }
+
+    #[test]
+    fn to_options_json_emits_workers_not_threads_or_forks() {
+        let config = AnnotateVcfConfig {
+            workers: 4,
+            ..AnnotateVcfConfig::default()
+        };
+        let json: serde_json::Value = serde_json::from_str(&config.to_options_json()).unwrap();
+        assert_eq!(json["workers"], 4);
+        assert!(json.get("threads").is_none());
+        assert!(json.get("forks").is_none());
+        assert!(json.get("contig_parallelism").is_none());
+        assert!(json.get("inline_lookup").is_none());
+    }
+
+    #[test]
     fn test_to_options_json_does_not_emit_source_selectors() {
         let config = AnnotateVcfConfig {
             refseq: true,
@@ -573,5 +1421,58 @@ mod tests {
 
         let description = csq_header_description(&config, CacheSourceType::Ensembl);
         assert!(!description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
+    }
+
+    #[test]
+    fn test_vcf_sink_profile_summary_formats_stage_timings() {
+        let mut profile = VcfSinkProfile::default();
+        profile.stream_next += std::time::Duration::from_millis(10);
+        profile.batch_to_lines += std::time::Duration::from_millis(20);
+        profile.format_wait += std::time::Duration::from_millis(25);
+        profile.write_records += std::time::Duration::from_millis(30);
+        profile.writer_finish += std::time::Duration::from_millis(40);
+        profile.batches = 2;
+        profile.rows = 3;
+        profile.lines = 4;
+        profile.body_chunk_bytes = 5;
+        profile.format_jobs = 6;
+        profile.format_inflight_max = 7;
+        profile.contig_partitions = 8;
+        profile.contig_inflight_max = 9;
+
+        let line = profile.summary_line();
+
+        assert!(line.contains("[VEP_PROFILE] vcf_sink_profile"));
+        assert!(line.contains("batches=2"));
+        assert!(line.contains("rows=3"));
+        assert!(line.contains("lines=4"));
+        assert!(line.contains("body_chunk_bytes=5"));
+        assert!(line.contains("format_jobs=6"));
+        assert!(line.contains("format_inflight_max=7"));
+        assert!(line.contains("contig_partitions=8"));
+        assert!(line.contains("contig_inflight_max=9"));
+        assert!(line.contains("stream_next=0.010s"));
+        assert!(line.contains("batch_to_lines=0.020s"));
+        assert!(line.contains("format_wait=0.025s"));
+        assert!(line.contains("write_records=0.030s"));
+        assert!(line.contains("writer_finish=0.040s"));
+    }
+
+    #[test]
+    fn test_vcf_lines_to_body_chunk_appends_record_newlines() {
+        let (chunk, lines) = vcf_lines_to_body_chunk(vec![
+            VcfRecordLine {
+                line: "chr1\t1\t.\tA\tC\t.\t.\t.".to_string(),
+            },
+            VcfRecordLine {
+                line: "chr1\t2\t.\tG\tT\t.\t.\t.".to_string(),
+            },
+        ]);
+
+        assert_eq!(lines, 2);
+        assert_eq!(
+            chunk,
+            b"chr1\t1\t.\tA\tC\t.\t.\t.\nchr1\t2\t.\tG\tT\t.\t.\t.\n"
+        );
     }
 }

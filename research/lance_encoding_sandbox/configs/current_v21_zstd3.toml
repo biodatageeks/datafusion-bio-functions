@@ -1,0 +1,42 @@
+[dataset]
+name = "current_v21_zstd3_position_u32"
+cache_root = "/Users/mwiewior/workspace/data_vepyr/115_GRCh38_merged"
+chrom = "chr1"
+output_root = "/Users/mwiewior/workspace/data_vepyr/lance_encoding_sandbox"
+lance_version = "2.1"
+batch_size = 65536
+overwrite = true
+
+[key]
+mode = "position"
+column = "position"
+type = "uint32"
+
+[indexes]
+position_btree = true
+tier_bitmap = true
+
+[benchmark]
+positions_file = "inputs/chr1_e2e_bloom_positions_u32.txt"
+vcf_path = "/Users/mwiewior/research/git/vepyr/e2e-testing/results/fast_chr1/input_chr1.vcf.gz"
+lookup_batch_sizes = [5000]
+sort_position_keys = true
+
+[sidecar]
+payload_backends = ["heed_payload_zstd"]
+heed_map_size_gib = 64
+
+[inspect]
+include_physical_columns = true
+include_index_sizes = true
+
+[defaults.encoding]
+structural = "miniblock"
+compression = "zstd"
+compression_level = 3
+dict_values_compression = "zstd"
+dict_values_compression_level = 3
+rle_threshold = 0.95
+dict_size_ratio = 0.99
+dict_divisor = 1
+minichunk_size = 4096

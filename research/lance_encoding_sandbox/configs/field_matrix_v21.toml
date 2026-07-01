@@ -1,0 +1,66 @@
+# Lance 2.1 field-encoding matrix profile from:
+# docs/superpowers/specs/2026-06-09-lance-variation-cache-layout-design.md
+#
+# This is a single corrected 2.1 dataset profile. It keeps every VEPyr
+# --everything logical field top-level because Lance 2.1 has no variable
+# struct-packing path in this sandbox.
+#
+# The initial matrix forced compression = "none" for compact primitive fields
+# and compression = "fsst" for many strings. chr1 inspect results showed both
+# were regressions for this workload: raw fields inflated dictionary/value ids
+# by up to 98x, and standalone FSST inflated every tested string field versus
+# zstd-3. Lance 7.0.0 exposes one field-level compression selector here, so
+# FSST is not stackable with zstd/lz4 in this TOML profile.
+
+[dataset]
+name = "field_matrix_v21_position_u32"
+cache_root = "/Users/mwiewior/workspace/data_vepyr/115_GRCh38_merged"
+chrom = "chr1"
+output_root = "/Users/mwiewior/workspace/data_vepyr/lance_encoding_sandbox"
+lance_version = "2.1"
+batch_size = 65536
+overwrite = true
+
+[key]
+# Implements the matrix's lookup-key row as chr-local position UInt32; the
+# builder derives this from start and drops global position_key in this mode.
+mode = "position"
+column = "position"
+type = "uint32"
+
+[indexes]
+position_btree = true
+tier_bitmap = true
+
+[benchmark]
+positions_file = "inputs/chr1_cold_sample_10k_positions_u32.txt"
+vcf_path = "/Users/mwiewior/research/git/vepyr/e2e-testing/results/fast_chr1/input_chr1.vcf.gz"
+lookup_batch_sizes = [238, 512, 1024, 2048, 4096, 8192, 16384]
+sort_position_keys = true
+
+[inspect]
+include_physical_columns = true
+include_index_sizes = true
+
+[defaults.encoding]
+structural = "miniblock"
+compression = "zstd"
+compression_level = 3
+dict_values_compression = "zstd"
+dict_values_compression_level = 3
+rle_threshold = 0.95
+dict_size_ratio = 0.99
+dict_divisor = 1
+minichunk_size = 4096
+
+# Field overrides are intentionally empty for this corrected profile.
+#
+# Every field inherits the zstd-3 miniblock defaults above. This preserves the
+# measured 5.3 GiB class dataset size for chr1 instead of the 17 GiB dataset
+# produced by forcing raw primitive pages and standalone FSST pages.
+#
+# All-null logical fields also inherit the default. Lance encodes their data
+# pages as constants with zero compressed payload, so no explicit "none"
+# override is needed.
+#
+# Use a separate experiment config for targeted FSST sweeps.

@@ -1,0 +1,195 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1540" height="1180" viewBox="0 0 1540 1180">
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#bcccdc"/></marker></defs>
+<rect width="100%" height="100%" fill="#fafafa"/>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;fill:#1f2933}.title{font-size:28px;font-weight:700}.sub{font-size:15px;fill:#52606d}.small{font-size:14px}.tiny{font-size:12px;fill:#334e68}.boxTitle{font-size:16px;font-weight:700}.panelTitle{font-size:15px;font-weight:700}.mono{font-family:"SFMono-Regular",Menlo,Consolas,monospace;font-size:12px;fill:#1f2933}</style>
+<text x="36.0" y="46.0" class="title">chr1 e2e annotation flow: indexes, IO, and annotation work</text>
+<text x="36.0" y="74.0" class="sub">Full profiling run. Flow boxes show wall stages; lower panels show lookup/index counters and annotation index pressure.</text>
+<rect x="36.0" y="120.0" width="260.0" height="176.0" rx="8" fill="#ffffff" stroke="#607d8b" stroke-width="2"/>
+<rect x="36.0" y="120.0" width="260.0" height="36" rx="8" fill="#607d8b"/>
+<rect x="36.0" y="144.0" width="260.0" height="12" fill="#607d8b"/>
+<text x="50.0" y="144.0" class="boxTitle" fill="#fff" style="fill:#fff">VCF input</text>
+<text x="50.0" y="178.0" class="small">rows: 323.4k</text>
+<text x="50.0" y="200.0" class="small">lookup batches: 40</text>
+<text x="50.0" y="222.0" class="small">output batches: 104</text>
+<rect x="322.0" y="120.0" width="260.0" height="176.0" rx="8" fill="#ffffff" stroke="#1976d2" stroke-width="2"/>
+<rect x="322.0" y="120.0" width="260.0" height="36" rx="8" fill="#1976d2"/>
+<rect x="322.0" y="144.0" width="260.0" height="12" fill="#1976d2"/>
+<text x="336.0" y="144.0" class="boxTitle" fill="#fff" style="fill:#fff">Variation lookup</text>
+<text x="336.0" y="178.0" class="small">wall: 17.09s</text>
+<text x="336.0" y="200.0" class="small">kv total: 15.10s</text>
+<text x="336.0" y="222.0" class="small">probes: 727.4k</text>
+<text x="336.0" y="244.0" class="small">fjall gets: 0</text>
+<line x1="296.0" y1="208.0" x2="322.0" y2="208.0" stroke="#bcccdc" stroke-width="3" marker-end="url(#arrow)"/>
+<rect x="608.0" y="120.0" width="260.0" height="176.0" rx="8" fill="#ffffff" stroke="#00897b" stroke-width="2"/>
+<rect x="608.0" y="120.0" width="260.0" height="36" rx="8" fill="#00897b"/>
+<rect x="608.0" y="144.0" width="260.0" height="12" fill="#00897b"/>
+<text x="622.0" y="144.0" class="boxTitle" fill="#fff" style="fill:#fff">Context + IO</text>
+<text x="622.0" y="178.0" class="small">context load: 498.3ms</text>
+<text x="622.0" y="200.0" class="small">SIFT load: 6.186s</text>
+<text x="622.0" y="222.0" class="small">hydrate: 593.0ms</text>
+<text x="622.0" y="244.0" class="small">tx ctx: 214.0ms</text>
+<line x1="582.0" y1="208.0" x2="608.0" y2="208.0" stroke="#bcccdc" stroke-width="3" marker-end="url(#arrow)"/>
+<rect x="894.0" y="120.0" width="260.0" height="176.0" rx="8" fill="#ffffff" stroke="#7b1fa2" stroke-width="2"/>
+<rect x="894.0" y="120.0" width="260.0" height="36" rx="8" fill="#7b1fa2"/>
+<rect x="894.0" y="144.0" width="260.0" height="12" fill="#7b1fa2"/>
+<text x="908.0" y="144.0" class="boxTitle" fill="#fff" style="fill:#fff">Annotation engine</text>
+<text x="908.0" y="178.0" class="small">annotate: 30.14s</text>
+<text x="908.0" y="200.0" class="small">engine: 23.12s</text>
+<text x="908.0" y="222.0" class="small">assignments: 4.74M</text>
+<text x="908.0" y="244.0" class="small">CSQ entries: 4.74M</text>
+<line x1="868.0" y1="208.0" x2="894.0" y2="208.0" stroke="#bcccdc" stroke-width="3" marker-end="url(#arrow)"/>
+<rect x="1180.0" y="120.0" width="260.0" height="176.0" rx="8" fill="#ffffff" stroke="#5d4037" stroke-width="2"/>
+<rect x="1180.0" y="120.0" width="260.0" height="36" rx="8" fill="#5d4037"/>
+<rect x="1180.0" y="144.0" width="260.0" height="12" fill="#5d4037"/>
+<text x="1194.0" y="144.0" class="boxTitle" fill="#fff" style="fill:#fff">VCF output</text>
+<text x="1194.0" y="178.0" class="small">sink measured: 52.85s</text>
+<text x="1194.0" y="200.0" class="small">stream wait: 48.68s</text>
+<text x="1194.0" y="222.0" class="small">format: 3.348s</text>
+<text x="1194.0" y="244.0" class="small">write: 827.0ms</text>
+<line x1="1154.0" y1="208.0" x2="1180.0" y2="208.0" stroke="#bcccdc" stroke-width="3" marker-end="url(#arrow)"/>
+<rect x="36.0" y="350.0" width="470.0" height="336.0" rx="8" fill="#ffffff" stroke="#d9e2ec"/>
+<rect x="36.0" y="350.0" width="470.0" height="34" rx="8" fill="#1976d2"/>
+<rect x="36.0" y="372.0" width="470.0" height="12" fill="#1976d2"/>
+<text x="48.0" y="373.0" class="panelTitle" fill="#fff" style="fill:#fff">Variation lookup index and IO path</text>
+<text x="48.0" y="406.0" class="tiny">warm probes</text>
+<text x="356.0" y="406.0" class="mono">727.4k</text>
+<text x="48.0" y="430.0" class="tiny">warm matches</text>
+<text x="356.0" y="430.0" class="mono">307.3k</text>
+<text x="48.0" y="454.0" class="tiny">warm definitive misses</text>
+<text x="356.0" y="454.0" class="mono">369.3k</text>
+<text x="48.0" y="478.0" class="tiny">position-index checks</text>
+<text x="356.0" y="478.0" class="mono">229.3k</text>
+<text x="48.0" y="502.0" class="tiny">position-index negative skips</text>
+<text x="356.0" y="502.0" class="mono">178.5k</text>
+<text x="48.0" y="526.0" class="tiny">position-index positives</text>
+<text x="356.0" y="526.0" class="mono">50.8k</text>
+<text x="48.0" y="550.0" class="tiny">variant-bloom checks</text>
+<text x="356.0" y="550.0" class="mono">50.8k</text>
+<text x="48.0" y="574.0" class="tiny">variant-bloom negative skips</text>
+<text x="356.0" y="574.0" class="mono">41.3k</text>
+<text x="48.0" y="598.0" class="tiny">variant-bloom positives</text>
+<text x="356.0" y="598.0" class="mono">9,561</text>
+<text x="48.0" y="622.0" class="tiny">cold parquet probes</text>
+<text x="356.0" y="622.0" class="mono">9,561</text>
+<text x="48.0" y="646.0" class="tiny">cold matches</text>
+<text x="356.0" y="646.0" class="mono">8,322</text>
+<text x="48.0" y="670.0" class="tiny">Fjall point/raw gets</text>
+<text x="356.0" y="670.0" class="mono">0 / 0</text>
+<rect x="526.0" y="350.0" width="470.0" height="336.0" rx="8" fill="#ffffff" stroke="#d9e2ec"/>
+<rect x="526.0" y="350.0" width="470.0" height="34" rx="8" fill="#ef6c00"/>
+<rect x="526.0" y="372.0" width="470.0" height="12" fill="#ef6c00"/>
+<text x="538.0" y="373.0" class="panelTitle" fill="#fff" style="fill:#fff">Cold parquet row-group/page IO</text>
+<text x="538.0" y="406.0" class="tiny">row groups total</text>
+<text x="846.0" y="406.0" class="mono">10.3k</text>
+<text x="538.0" y="430.0" class="tiny">unique row groups touched</text>
+<text x="846.0" y="430.0" class="mono">4,822</text>
+<text x="538.0" y="454.0" class="tiny">row groups loaded</text>
+<text x="846.0" y="454.0" class="mono">4,825</text>
+<text x="538.0" y="478.0" class="tiny">row-group load batches</text>
+<text x="846.0" y="478.0" class="mono">92</text>
+<text x="538.0" y="502.0" class="tiny">rows loaded/materialized</text>
+<text x="846.0" y="502.0" class="mono">7.25M</text>
+<text x="538.0" y="526.0" class="tiny">rows scanned after load</text>
+<text x="846.0" y="526.0" class="mono">11.7k</text>
+<text x="538.0" y="550.0" class="tiny">position pages total</text>
+<text x="846.0" y="550.0" class="mono">83.0k</text>
+<text x="538.0" y="574.0" class="tiny">candidate pages</text>
+<text x="846.0" y="574.0" class="mono">9,562</text>
+<text x="538.0" y="598.0" class="tiny">unique candidate pages</text>
+<text x="846.0" y="598.0" class="mono">7,083</text>
+<text x="538.0" y="622.0" class="tiny">candidate rows</text>
+<text x="846.0" y="622.0" class="mono">9.79M</text>
+<text x="538.0" y="646.0" class="tiny">unique candidate rows</text>
+<text x="846.0" y="646.0" class="mono">7.25M</text>
+<text x="538.0" y="670.0" class="tiny">cold parquet load</text>
+<text x="846.0" y="670.0" class="mono">8.198s</text>
+<rect x="1016.0" y="350.0" width="470.0" height="336.0" rx="8" fill="#ffffff" stroke="#d9e2ec"/>
+<rect x="1016.0" y="350.0" width="470.0" height="34" rx="8" fill="#7b1fa2"/>
+<rect x="1016.0" y="372.0" width="470.0" height="12" fill="#7b1fa2"/>
+<text x="1028.0" y="373.0" class="panelTitle" fill="#fff" style="fill:#fff">Annotation context and transcript index pressure</text>
+<text x="1028.0" y="406.0" class="tiny">context transcript load</text>
+<text x="1336.0" y="406.0" class="mono">214.0ms</text>
+<text x="1028.0" y="430.0" class="tiny">context exon load</text>
+<text x="1336.0" y="430.0" class="mono">72.0ms</text>
+<text x="1028.0" y="454.0" class="tiny">context translation load</text>
+<text x="1336.0" y="454.0" class="mono">193.0ms</text>
+<text x="1028.0" y="478.0" class="tiny">SIFT parquet/load work</text>
+<text x="1336.0" y="478.0" class="mono">6.186s</text>
+<text x="1028.0" y="502.0" class="tiny">transcript query total</text>
+<text x="1336.0" y="502.0" class="mono">12.85s</text>
+<text x="1028.0" y="526.0" class="tiny">transcript candidates</text>
+<text x="1336.0" y="526.0" class="mono">4.66M</text>
+<text x="1028.0" y="550.0" class="tiny">exon refs consulted</text>
+<text x="1336.0" y="550.0" class="mono">67.15M</text>
+<text x="1028.0" y="574.0" class="tiny">overlap candidates</text>
+<text x="1336.0" y="574.0" class="mono">3.85M</text>
+<text x="1028.0" y="598.0" class="tiny">up/down candidates</text>
+<text x="1336.0" y="598.0" class="mono">812.7k</text>
+<text x="1028.0" y="622.0" class="tiny">exon lookup time</text>
+<text x="1336.0" y="622.0" class="mono">382.5ms</text>
+<text x="1028.0" y="646.0" class="tiny">tx materialization</text>
+<text x="1336.0" y="646.0" class="mono">7.758s</text>
+<text x="1028.0" y="670.0" class="tiny">HGVSc</text>
+<text x="1336.0" y="670.0" class="mono">5.547s</text>
+<rect x="36.0" y="720.0" width="470.0" height="240.0" rx="8" fill="#ffffff" stroke="#d9e2ec"/>
+<rect x="36.0" y="720.0" width="470.0" height="34" rx="8" fill="#7b1fa2"/>
+<rect x="36.0" y="742.0" width="470.0" height="12" fill="#7b1fa2"/>
+<text x="48.0" y="743.0" class="panelTitle" fill="#fff" style="fill:#fff">Engine CPU work</text>
+<text x="48.0" y="776.0" class="tiny">evaluate prepared</text>
+<text x="356.0" y="776.0" class="mono">12.99s</text>
+<text x="48.0" y="800.0" class="tiny">colocated fields</text>
+<text x="356.0" y="800.0" class="mono">4.694s</text>
+<text x="48.0" y="824.0" class="tiny">CSQ format</text>
+<text x="356.0" y="824.0" class="mono">2.639s</text>
+<text x="48.0" y="848.0" class="tiny">HGVS shift</text>
+<text x="356.0" y="848.0" class="mono">808.8ms</text>
+<text x="48.0" y="872.0" class="tiny">append scalars</text>
+<text x="356.0" y="872.0" class="mono">327.1ms</text>
+<text x="48.0" y="896.0" class="tiny">primary allele rows</text>
+<text x="356.0" y="896.0" class="mono">341.2k</text>
+<text x="48.0" y="920.0" class="tiny">colocated allele rows</text>
+<text x="356.0" y="920.0" class="mono">694.2k</text>
+<text x="48.0" y="944.0" class="tiny">colocated entries</text>
+<text x="356.0" y="944.0" class="mono">341.1k</text>
+<rect x="526.0" y="720.0" width="470.0" height="240.0" rx="8" fill="#ffffff" stroke="#d9e2ec"/>
+<rect x="526.0" y="720.0" width="470.0" height="34" rx="8" fill="#607d8b"/>
+<rect x="526.0" y="742.0" width="470.0" height="12" fill="#607d8b"/>
+<text x="538.0" y="743.0" class="panelTitle" fill="#fff" style="fill:#fff">Top-level totals</text>
+<text x="538.0" y="776.0" class="tiny">script annotation wall</text>
+<text x="846.0" y="776.0" class="mono">57.10s</text>
+<text x="538.0" y="800.0" class="tiny">contig pipeline total</text>
+<text x="846.0" y="800.0" class="mono">52.21s</text>
+<text x="538.0" y="824.0" class="tiny">variation lookup wall</text>
+<text x="846.0" y="824.0" class="mono">17.09s</text>
+<text x="538.0" y="848.0" class="tiny">annotation pipeline</text>
+<text x="846.0" y="848.0" class="mono">30.14s</text>
+<text x="538.0" y="872.0" class="tiny">engine pipeline</text>
+<text x="846.0" y="872.0" class="mono">23.12s</text>
+<text x="538.0" y="896.0" class="tiny">output sink measured</text>
+<text x="846.0" y="896.0" class="mono">52.85s</text>
+<text x="538.0" y="920.0" class="tiny">input/output rows</text>
+<text x="846.0" y="920.0" class="mono">323.4k / 323.4k</text>
+<text x="538.0" y="944.0" class="tiny">profile note</text>
+<text x="846.0" y="944.0" class="mono">nested timers are not additive</text>
+<rect x="1016.0" y="720.0" width="470.0" height="240.0" rx="8" fill="#ffffff" stroke="#d9e2ec"/>
+<rect x="1016.0" y="720.0" width="470.0" height="34" rx="8" fill="#3949ab"/>
+<rect x="1016.0" y="742.0" width="470.0" height="12" fill="#3949ab"/>
+<text x="1028.0" y="743.0" class="panelTitle" fill="#fff" style="fill:#fff">What this run says</text>
+<text x="1028.0" y="776.0" class="tiny">Fjall variation calls</text>
+<text x="1336.0" y="776.0" class="mono">zero</text>
+<text x="1028.0" y="800.0" class="tiny">page index active</text>
+<text x="1336.0" y="800.0" class="mono">true</text>
+<text x="1028.0" y="824.0" class="tiny">bloom positives -&gt; cold probes</text>
+<text x="1336.0" y="824.0" class="mono">9,561</text>
+<text x="1028.0" y="848.0" class="tiny">materialized/scanned ratio</text>
+<text x="1336.0" y="848.0" class="mono">621.6x</text>
+<text x="1028.0" y="872.0" class="tiny">cold load dominates lookup</text>
+<text x="1336.0" y="872.0" class="mono">8.198s</text>
+<text x="1028.0" y="896.0" class="tiny">annotation CPU dominates after lookup</text>
+<text x="1336.0" y="896.0" class="mono">23.12s</text>
+<text x="1028.0" y="920.0" class="tiny">SIFT load visible</text>
+<text x="1336.0" y="920.0" class="mono">6.186s</text>
+<text x="1028.0" y="944.0" class="tiny">output work mostly waits upstream</text>
+<text x="1336.0" y="944.0" class="mono">48.68s</text>
+<text x="36.0" y="1090.0" class="sub">Read left-to-right for execution flow; read the panels for index selectivity and IO/materialization pressure.</text>
+</svg>

@@ -1,12 +1,10 @@
 //! VEP cache source-mode metadata helpers.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use datafusion::arrow::datatypes::Schema;
 use datafusion::common::{DataFusionError, Result};
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 
 pub(crate) const CACHE_SOURCE_METADATA_KEY: &str = "bio.vep.cache_source_type";
 
@@ -36,26 +34,16 @@ impl CacheSourceType {
         raw.parse()
     }
 
-    pub(crate) fn from_partitioned_cache_source(cache_source: &str) -> Result<Self> {
-        let parquet = first_variation_parquet(cache_source)?;
-        Self::from_parquet_file(&parquet)
+    #[cfg(feature = "lance-cache")]
+    pub(crate) fn from_partitioned_lance_cache_source(cache_source: &str) -> Result<Self> {
+        let dataset = first_variation_lance_dataset(cache_source)?;
+        Self::from_lance_dataset(&dataset)
     }
 
-    pub(crate) fn from_parquet_file(parquet: &Path) -> Result<Self> {
-        let file = File::open(parquet).map_err(|err| {
-            DataFusionError::Execution(format!(
-                "annotate_vep(): failed to open cache parquet '{}': {err}",
-                parquet.display()
-            ))
-        })?;
-        let metadata =
-            ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).map_err(|err| {
-                DataFusionError::Execution(format!(
-                    "annotate_vep(): failed to read Arrow schema metadata from cache parquet '{}': {err}",
-                    parquet.display()
-                ))
-            })?;
-        Self::from_schema(metadata.schema().as_ref())
+    #[cfg(feature = "lance-cache")]
+    pub(crate) fn from_lance_dataset(dataset_path: &Path) -> Result<Self> {
+        let schema = read_lance_dataset_schema_sync(dataset_path)?;
+        Self::from_schema(&schema)
     }
 }
 
@@ -74,46 +62,64 @@ impl FromStr for CacheSourceType {
     }
 }
 
-fn first_variation_parquet(cache_source: &str) -> Result<PathBuf> {
-    let variation_dir = Path::new(cache_source).join("variation");
-    if !variation_dir.is_dir() {
-        return Err(DataFusionError::Plan(format!(
-            "annotate_vep(): cache source '{}' must contain a variation/ directory with parquet files carrying {CACHE_SOURCE_METADATA_KEY}",
-            cache_source
-        )));
-    }
-
-    let mut dirs = vec![variation_dir];
-    let mut parquet_files = Vec::new();
-    while let Some(dir) = dirs.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|err| {
-            DataFusionError::Execution(format!(
-                "annotate_vep(): failed to read cache variation directory '{}': {err}",
-                dir.display()
-            ))
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|err| {
-                DataFusionError::Execution(format!(
-                    "annotate_vep(): failed to read cache variation directory '{}': {err}",
-                    dir.display()
-                ))
-            })?;
-            let path = entry.path();
-            if path.is_dir() {
-                dirs.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "parquet") {
-                parquet_files.push(path);
-            }
-        }
-    }
-    parquet_files.sort();
-    parquet_files.into_iter().next().ok_or_else(|| {
+#[cfg(feature = "lance-cache")]
+fn first_variation_lance_dataset(cache_source: &str) -> Result<PathBuf> {
+    let variation_dir = Path::new(cache_source).join("variation.lance");
+    let manifest =
+        crate::lance_cache::manifest::ChromManifest::read_from_entity_dir(&variation_dir)?;
+    let first = manifest.entries.first().ok_or_else(|| {
         DataFusionError::Plan(format!(
-            "annotate_vep(): cache source '{}' variation/ directory contains no parquet files carrying {CACHE_SOURCE_METADATA_KEY}",
+            "annotate_vep(): Lance cache source '{}' variation.lance manifest contains no chromosomes",
             cache_source
         ))
-    })
+    })?;
+    Ok(variation_dir.join(&first.dataset))
+}
+
+#[cfg(feature = "lance-cache")]
+fn read_lance_dataset_schema_sync(dataset_path: &Path) -> Result<Schema> {
+    let path = dataset_path.to_path_buf();
+    let open = async move {
+        lance::Dataset::open(path.to_string_lossy().as_ref())
+            .await
+            .map_err(|err| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): failed to open Lance cache dataset '{}': {err}",
+                    path.display()
+                ))
+            })
+            .map(|dataset| dataset.schema().into())
+    };
+
+    match tokio::runtime::Handle::try_current() {
+        // Multi-thread runtime: `block_in_place` is supported and cheapest.
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(open))
+        }
+        // Current-thread runtime (e.g. `#[tokio::test]`, embedded callers):
+        // `block_in_place` would panic and we cannot nest a runtime on this
+        // thread, so resolve on a dedicated OS thread with its own runtime.
+        Ok(_handle) => std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|err| DataFusionError::External(Box::new(err)))?;
+                    rt.block_on(open)
+                })
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(DataFusionError::Execution(
+                        "Lance schema read worker thread panicked".to_string(),
+                    ))
+                })
+        }),
+        // No runtime in scope: create one here.
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|err| DataFusionError::External(Box::new(err)))?;
+            rt.block_on(open)
+        }
+    }
 }
 
 #[cfg(test)]

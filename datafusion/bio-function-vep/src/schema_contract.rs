@@ -29,6 +29,7 @@ fn types_compatible(actual: &DataType, expected: &DataType) -> bool {
         (actual, expected),
         (DataType::Utf8View | DataType::LargeUtf8, DataType::Utf8)
             | (DataType::Utf8, DataType::Utf8View | DataType::LargeUtf8)
+            | (DataType::UInt32, DataType::Int64)
     )
 }
 
@@ -122,6 +123,19 @@ mod tests {
             Field::new("variation_name", DataType::Utf8View, false),
             Field::new("allele_string", DataType::Utf8View, false),
         ]));
+        assert!(validate_variation_schema(&schema).is_ok());
+    }
+
+    #[test]
+    fn validate_uint32_coordinates_accepted() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::UInt32, false),
+            Field::new("end", DataType::UInt32, false),
+            Field::new("variation_name", DataType::Utf8, false),
+            Field::new("allele_string", DataType::Utf8, false),
+        ]));
+
         assert!(validate_variation_schema(&schema).is_ok());
     }
 
