@@ -92,7 +92,28 @@ fn read_lance_dataset_schema_sync(dataset_path: &Path) -> Result<Schema> {
     };
 
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(open)),
+        // Multi-thread runtime: `block_in_place` is supported and cheapest.
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(open))
+        }
+        // Current-thread runtime (e.g. `#[tokio::test]`, embedded callers):
+        // `block_in_place` would panic and we cannot nest a runtime on this
+        // thread, so resolve on a dedicated OS thread with its own runtime.
+        Ok(_handle) => std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|err| DataFusionError::External(Box::new(err)))?;
+                    rt.block_on(open)
+                })
+                .join()
+                .unwrap_or_else(|_| {
+                    Err(DataFusionError::Execution(
+                        "Lance schema read worker thread panicked".to_string(),
+                    ))
+                })
+        }),
+        // No runtime in scope: create one here.
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|err| DataFusionError::External(Box::new(err)))?;

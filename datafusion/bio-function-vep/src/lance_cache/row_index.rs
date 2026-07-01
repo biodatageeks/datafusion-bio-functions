@@ -326,12 +326,36 @@ impl PositionPageDirectory {
         self.num_rows
     }
 
-    /// First page that may contain `position`: the last page whose `min <=
-    /// position` (clamped to page 0 when `position` precedes all page minima).
+    /// First page that may contain `position`: the page *before* the first page
+    /// whose `min >= position` (clamped to page 0).
+    ///
+    /// A run of equal positions can straddle a page boundary — either because it
+    /// exceeds `batch_size` rows (several pages share `min == position`) or
+    /// simply because it crosses a page boundary (`page[N]` has `min < position`
+    /// with `position` in its tail while `page[N+1]` has `min == position`). In
+    /// both cases the earliest page carrying `position` has `min <= position`,
+    /// so we must start one page below the first `min >= position`. This may
+    /// begin reading one page early on an exact boundary hit (the forward scan
+    /// filters those rows out) but never starts *late* — a late start would
+    /// silently drop the earlier row_ids of a high-density position.
     pub(crate) fn first_page_for(&self, position: u32) -> u32 {
-        match self.page_mins.partition_point(|&m| m <= position) {
-            0 => 0,
-            i => (i - 1) as u32,
+        self.page_mins
+            .partition_point(|&m| m < position)
+            .saturating_sub(1) as u32
+    }
+}
+
+#[cfg(test)]
+impl PositionPageDirectory {
+    /// Construct a directory directly from page minima for unit tests that
+    /// exercise `first_page_for` without materializing a Lance dataset.
+    pub(crate) fn from_page_mins_for_test(page_mins: Vec<u32>) -> Self {
+        let num_pages = page_mins.len() as u32;
+        Self {
+            page_mins,
+            num_pages,
+            batch_size: DEFAULT_BTREE_BATCH_SIZE,
+            num_rows: 0,
         }
     }
 }
@@ -705,6 +729,37 @@ mod tests {
         assert_eq!(result.matched_positions, 2);
         assert_eq!(result.row_ids, vec![1, 2, 4, 5]);
         assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn first_page_for_starts_before_straddling_position_runs() {
+        // page_mins ascending: a single position whose rows straddle a page
+        // boundary makes the *next* page's min equal that position, and a run
+        // longer than one page makes several pages share the same min.
+        //   page: 0    1    2    3    4
+        //   min:  10   20   20   20   30
+        let dir = PositionPageDirectory::from_page_mins_for_test(vec![10, 20, 20, 20, 30]);
+
+        // Position 20 first appears (possibly as a straddle tail) at page 0, and
+        // its run continues through pages 1..3. Starting at the last page with
+        // min <= 20 (page 3) would drop the earlier row_ids — we must start at
+        // page 0 so the forward scan sees the whole run.
+        assert_eq!(dir.first_page_for(20), 0);
+        // A position between page minima lands inside the owning page.
+        assert_eq!(dir.first_page_for(25), 3);
+        // Exact hit on the last page's min starts one page early (safe).
+        assert_eq!(dir.first_page_for(30), 3);
+        // Before all minima clamps to page 0.
+        assert_eq!(dir.first_page_for(5), 0);
+        assert_eq!(dir.first_page_for(10), 0);
+
+        // Monotonic non-decreasing across the range.
+        let mut prev = 0;
+        for p in 0..=40 {
+            let page = dir.first_page_for(p);
+            assert!(page >= prev, "first_page_for must be monotonic at {p}");
+            prev = page;
+        }
     }
 
     #[test]
