@@ -5273,17 +5273,13 @@ impl AnnotateProvider {
         // Discover contigs from VCF.
         let t_contigs = profile_start!();
         let vcf_contigs = self.discover_vcf_contigs().await?;
-        // Build expanded cache chrom set with both bare and chr-prefixed forms
-        // so that VCF "chr1" matches cache "1" and vice versa.
+        // Build expanded cache chrom set with all equivalent spellings (bare,
+        // chr-prefixed, and mitochondrial M/MT/chrM/chrMT) so that e.g. VCF
+        // "chr1" matches cache "1" and VCF "M"/"chrM" matches cache "chrMT".
         let mut cache_chroms: HashSet<String> = HashSet::new();
         let available_chroms = cache.available_chroms();
         for c in &available_chroms {
-            cache_chroms.insert(c.clone());
-            if let Some(bare) = c.strip_prefix("chr") {
-                cache_chroms.insert(bare.to_string());
-            } else {
-                cache_chroms.insert(format!("chr{c}"));
-            }
+            cache_chroms.extend(crate::lance_cache::manifest::contig_alias_set(c));
         }
         let contigs: Vec<String> = vcf_contigs
             .iter()

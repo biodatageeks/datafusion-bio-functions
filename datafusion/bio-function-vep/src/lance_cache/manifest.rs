@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -64,27 +64,22 @@ impl ChromManifest {
         })
     }
 
-    /// Resolve the per-chromosome dataset path, tolerating `chr`-prefix spelling
+    /// Resolve the per-chromosome dataset path, tolerating contig-spelling
     /// differences between the query and the manifest (e.g. VCF contig `1` vs a
-    /// manifest canonicalized to `chr1`, or vice versa). Exact match wins; the
-    /// bare/`chr`-prefixed spellings are only tried as fallbacks. Mirrors the
-    /// fallback previously applied only at the variation-lookup call site, so
-    /// context entities (transcript/exon/translation/regulatory/motif/SIFT)
-    /// resolve the same way instead of silently loading empty.
+    /// manifest canonicalized to `chr1`, or mitochondrial `M`/`chrM` vs `chrMT`).
+    /// Exact match wins; the [`contig_alias_set`] spellings are only tried as
+    /// fallbacks. Mirrors the fallback previously applied only at the
+    /// variation-lookup call site, so context entities
+    /// (transcript/exon/translation/regulatory/motif/SIFT) resolve the same way
+    /// instead of silently loading empty.
     pub fn path_for_chrom(&self, chrom: &str) -> Option<&str> {
-        let idx = self.by_chrom.get(chrom).or_else(|| {
-            chrom
-                .strip_prefix("chr")
-                .and_then(|bare| self.by_chrom.get(bare))
-                .or_else(|| {
-                    if chrom.starts_with("chr") {
-                        None
-                    } else {
-                        self.by_chrom.get(&format!("chr{chrom}"))
-                    }
-                })
-        })?;
-        Some(self.entries[*idx].dataset.as_str())
+        if let Some(idx) = self.by_chrom.get(chrom) {
+            return Some(self.entries[*idx].dataset.as_str());
+        }
+        contig_alias_set(chrom)
+            .iter()
+            .find_map(|alias| self.by_chrom.get(alias))
+            .map(|idx| self.entries[*idx].dataset.as_str())
     }
 
     pub fn available_chroms(&self) -> Vec<&str> {
@@ -109,6 +104,29 @@ pub fn dataset_dir_name(chrom: &str) -> String {
     }
     encoded.push_str(".lance");
     encoded
+}
+
+/// All contig spellings equivalent to `chrom` under our canonicalization: the
+/// input itself, its `chr`-prefix add/strip counterpart, and — for the
+/// mitochondrion — the full `M`/`MT`/`chrM`/`chrMT` set. A plain chr-prefix
+/// add/strip cannot bridge `M` <-> `MT`, yet [`canonical_chrom_label`] folds all
+/// four into `chrMT`, so a VCF using `M`/`chrM` must still match a manifest
+/// canonicalized to `chrMT` (and vice versa). Used wherever manifest contigs are
+/// expanded (contig filtering) or resolved (path lookup).
+pub fn contig_alias_set(chrom: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    set.insert(chrom.to_string());
+    if let Some(bare) = chrom.strip_prefix("chr") {
+        set.insert(bare.to_string());
+    } else {
+        set.insert(format!("chr{chrom}"));
+    }
+    if canonical_chrom_label(chrom) == "chrMT" {
+        for alias in ["M", "MT", "chrM", "chrMT"] {
+            set.insert(alias.to_string());
+        }
+    }
+    set
 }
 
 pub fn canonical_chrom_label(chrom: &str) -> String {
@@ -180,5 +198,31 @@ mod tests {
         assert_eq!(bare.path_for_chrom("1").unwrap(), "1.lance");
         assert_eq!(bare.path_for_chrom("chr1").unwrap(), "1.lance");
         assert!(bare.path_for_chrom("chrX").is_none());
+    }
+
+    #[test]
+    fn path_for_chrom_resolves_mitochondrial_aliases() {
+        // Builder canonicalizes the mitochondrion to `chrMT`; every VCF spelling
+        // must still resolve to it.
+        let mito = ChromManifest::new(vec![ChromDatasetEntry::new("chrMT", "chrMT.lance", 1)]);
+        for query in ["chrMT", "MT", "chrM", "M"] {
+            assert_eq!(
+                mito.path_for_chrom(query).unwrap(),
+                "chrMT.lance",
+                "mito query {query} must resolve to chrMT"
+            );
+        }
+        assert!(mito.path_for_chrom("chr1").is_none());
+    }
+
+    #[test]
+    fn contig_alias_set_covers_mito_and_chr_prefix() {
+        assert!(contig_alias_set("M").contains("chrMT"));
+        assert!(contig_alias_set("chrMT").contains("M"));
+        assert!(contig_alias_set("chrM").contains("MT"));
+        assert!(contig_alias_set("1").contains("chr1"));
+        assert!(contig_alias_set("chr1").contains("1"));
+        // Non-mito contigs don't pick up mito aliases.
+        assert!(!contig_alias_set("chr1").contains("chrMT"));
     }
 }
