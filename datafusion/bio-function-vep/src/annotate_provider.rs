@@ -3089,9 +3089,11 @@ impl crate::cache_common::SiftPredictionStore for LanceBinarySiftPredictionStore
             return Ok(out);
         }
 
-        let batch = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.lookup.take_transcript_ids(&uncached))
-        })?;
+        // `block_in_place` panics on a current-thread runtime; `block_on_lance`
+        // falls back to a dedicated thread there (see its doc).
+        let batch = crate::lance_cache::lookup_exec::block_on_lance(
+            self.lookup.take_transcript_ids(&uncached),
+        )?;
         let fetched = sift_predictions_from_binary_batch(&batch)?;
         let mut cache = self.predictions.lock().map_err(|error| {
             DataFusionError::Execution(format!("Lance SIFT prediction cache poisoned: {error}"))
@@ -3163,9 +3165,10 @@ impl crate::cache_common::SiftPredictionStore for PositionSlicedLanceSiftStore {
             return Ok(out);
         }
 
-        let (batch, _present) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.lookup.take_keys(&uncached))
-        })?;
+        // `block_in_place` panics on a current-thread runtime; `block_on_lance`
+        // falls back to a dedicated thread there (see its doc).
+        let (batch, _present) =
+            crate::lance_cache::lookup_exec::block_on_lance(self.lookup.take_keys(&uncached))?;
         let fetched = position_predictions_from_batch(&batch, self.blob_version)?;
         let mut cache = self.cache.lock().map_err(|error| {
             DataFusionError::Execution(format!("Lance SIFT position cache poisoned: {error}"))
@@ -9980,6 +9983,22 @@ fn spawn_lookup_stream_worker(
     })
 }
 
+/// Run a CPU-bound closure, yielding sibling tasks off the worker thread via
+/// `block_in_place` on a multi-thread runtime, but calling it directly on a
+/// current-thread runtime (where `block_in_place` would panic — e.g.
+/// `annotate_to_vcf` with `workers>1` driven from `#[tokio::test]`).
+fn run_maybe_block_in_place<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// Per-partition fused worker (threads>1 path): consume ONE lookup partition's
 /// stream into a LOCAL colocated map (never shared → `Arc::make_mut` never
 /// deep-clones) and annotate windows INLINE (`block_in_place`), streaming
@@ -10066,7 +10085,7 @@ fn spawn_annotation_from_lookup_sharded(
             // state-only so the carried HGNC state is correct before emitting.
             if !warmed_up && batch_end >= emit_start {
                 let wbatches = std::mem::take(&mut warm_up_batches);
-                tokio::task::block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
+                run_maybe_block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
                 warmed_up = true;
             }
             if emit_to > emit_from {
@@ -10084,7 +10103,7 @@ fn spawn_annotation_from_lookup_sharded(
             while window_buffer_input_units(&worker.window_buffer) >= input_buffer_size {
                 let window = drain_window_input_units(&mut worker.window_buffer, input_buffer_size);
                 let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
-                tokio::task::block_in_place(|| -> Result<()> {
+                run_maybe_block_in_place(|| -> Result<()> {
                     hydrate_worker_window(&mut worker, &window, cache_source_type)?;
                     let out = annotate_worker_window(&mut worker, &window, projection.as_deref())?;
                     for b in out {
@@ -10105,13 +10124,13 @@ fn spawn_annotation_from_lookup_sharded(
         // still replay any pending warm-up so state is consistent.
         if !warmed_up {
             let wbatches = std::mem::take(&mut warm_up_batches);
-            tokio::task::block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
+            run_maybe_block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
         }
         // Final flush: annotate the remaining partial emit window.
         worker.lookup_done = true;
         let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
         let window_input_rows: usize = window.iter().map(|b| b.num_rows()).sum();
-        tokio::task::block_in_place(|| -> Result<()> {
+        run_maybe_block_in_place(|| -> Result<()> {
             if !window.is_empty() {
                 hydrate_worker_window(&mut worker, &window, cache_source_type)?;
             }

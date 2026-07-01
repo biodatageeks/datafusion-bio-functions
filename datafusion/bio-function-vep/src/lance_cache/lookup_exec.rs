@@ -52,7 +52,7 @@ use tokio::sync::OnceCell;
 /// so fall back to a dedicated OS thread there; with no runtime in scope, create
 /// one. Keeps the multi-thread fast path (`block_in_place`) for production.
 #[cfg(feature = "lance-cache")]
-fn block_on_lance<T, F>(fut: F) -> Result<T>
+pub(crate) fn block_on_lance<T, F>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>> + Send,
     T: Send,
