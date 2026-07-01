@@ -33,8 +33,7 @@ use crate::allele::{
 use crate::cache_common::AlleleMatcher;
 use crate::colocated::{
     AF_COL_NAMES, AfColumns, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
-    build_shifted_compare_state, compare_existing_variant_alleles,
-    output_allele_from_allele_string, read_reference_sequence,
+    compare_existing_variant_alleles, output_allele_from_allele_string, read_reference_sequence,
 };
 use crate::lance_cache::key_encoding::chrom_to_code;
 use crate::lance_cache::variant_key::{
@@ -1063,25 +1062,14 @@ fn probe_lance_taken_batch_position(
     builders: &mut [Box<dyn datafusion::arrow::array::ArrayBuilder>],
     vcf_indices: &mut Vec<u32>,
     coloc_buf: Option<&mut HashMap<ColocatedKey, ColocatedSinkValue>>,
-    reference_reader: Option<
-        &mut noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>,
-    >,
 ) -> Result<(ColdProbeResult, ColdChunkProbeMetrics)> {
     struct PreparedColoc {
         chrom_norm: String,
         input_start: i64,
         input_allele_string: String,
-        /// ACTIVE compare space: the shifted indel representation when a
-        /// repeat-context genomic shift applies, otherwise the minimized VCF
-        /// allele.
         compare_allele_string: String,
         vep_start: i64,
         vep_end: i64,
-        /// Original (unshifted) minimized allele/coords, retained only when a
-        /// genomic shift applied — fed as the second `compare_existing` pass.
-        unshifted_allele_string: Option<String>,
-        unshifted_start: Option<i64>,
-        unshifted_end: Option<i64>,
         compare_output_allele: Option<String>,
         unshifted_output_allele: Option<String>,
     }
@@ -1092,58 +1080,23 @@ fn probe_lance_taken_batch_position(
     }
     let indices = LanceBatchProbeIndices::new(batch)?;
     let mut coloc_buf = coloc_buf;
-    let mut reference_reader = reference_reader;
     let prepared_coloc = if coloc_buf.is_some() {
         let prepare_started = Instant::now();
         let (input_ref, input_alt, input_start) =
             vcf_to_vep_input_allele(vcf_iv_start, vcf_ref, vcf_alt);
         let input_allele_string = format!("{input_ref}/{input_alt}");
         let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
-        // Minimized (unshifted) VEP compare space derived straight from the VCF.
-        let base_allele_string = format!("{compare_ref}/{compare_alt}");
-        let base_start = vep_norm_start(vcf_iv_start, vcf_ref, vcf_alt);
-        let base_end = vep_norm_end(vcf_iv_start, vcf_ref, vcf_alt);
-
-        // Repeat-context shift: when a reference FASTA is available, VEP moves the
-        // active compare space to the shifted indel representation and keeps the
-        // original as `unshifted_*` for a second matching pass + the
-        // `alt_orig_allele_string` frequency fallback. Without a shift (or FASTA),
-        // the active space stays the minimized VCF allele.
-        let shift = reference_reader.as_deref_mut().and_then(|reader| {
-            build_shifted_compare_state(reader, chrom, &base_allele_string, base_start, base_end)
-                .unwrap_or(None)
-        });
-
-        let prepared = match shift {
-            Some((shifted_allele_string, shifted_start, shifted_end)) => PreparedColoc {
-                chrom_norm: chrom.to_string(),
-                input_start,
-                input_allele_string,
-                compare_output_allele: output_allele_from_allele_string(&shifted_allele_string)
-                    .map(str::to_string),
-                unshifted_output_allele: output_allele_from_allele_string(&base_allele_string)
-                    .map(str::to_string),
-                compare_allele_string: shifted_allele_string,
-                vep_start: shifted_start,
-                vep_end: shifted_end,
-                unshifted_allele_string: Some(base_allele_string),
-                unshifted_start: Some(base_start),
-                unshifted_end: Some(base_end),
-            },
-            None => PreparedColoc {
-                chrom_norm: chrom.to_string(),
-                input_start,
-                input_allele_string,
-                compare_output_allele: output_allele_from_allele_string(&base_allele_string)
-                    .map(str::to_string),
-                unshifted_output_allele: None,
-                compare_allele_string: base_allele_string,
-                vep_start: base_start,
-                vep_end: base_end,
-                unshifted_allele_string: None,
-                unshifted_start: None,
-                unshifted_end: None,
-            },
+        let compare_allele_string = format!("{compare_ref}/{compare_alt}");
+        let prepared = PreparedColoc {
+            chrom_norm: chrom.to_string(),
+            input_start,
+            input_allele_string,
+            compare_output_allele: output_allele_from_allele_string(&compare_allele_string)
+                .map(str::to_string),
+            unshifted_output_allele: None,
+            compare_allele_string,
+            vep_start: vep_norm_start(vcf_iv_start, vcf_ref, vcf_alt),
+            vep_end: vep_norm_end(vcf_iv_start, vcf_ref, vcf_alt),
         };
         metrics.colocated_prepare_elapsed += prepare_started.elapsed();
         Some(prepared)
@@ -1202,9 +1155,9 @@ fn probe_lance_taken_batch_position(
                     &prepared.compare_allele_string,
                     prepared.vep_start,
                     prepared.vep_end,
-                    prepared.unshifted_allele_string.as_deref(),
-                    prepared.unshifted_start,
-                    prepared.unshifted_end,
+                    None,
+                    None,
+                    None,
                     &allele_string,
                     probe_start,
                     existing_end,
@@ -1830,7 +1783,6 @@ impl KvLookupStream {
                             &mut builders,
                             &mut vcf_indices,
                             coloc_buf.as_mut(),
-                            self.reference_reader.as_mut(),
                         )?
                     } else {
                         (
@@ -2859,7 +2811,6 @@ mod tests {
             &mut builders,
             &mut vcf_indices,
             Some(&mut coloc),
-            None,
         )
         .unwrap();
 
