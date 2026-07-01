@@ -64,10 +64,27 @@ impl ChromManifest {
         })
     }
 
+    /// Resolve the per-chromosome dataset path, tolerating `chr`-prefix spelling
+    /// differences between the query and the manifest (e.g. VCF contig `1` vs a
+    /// manifest canonicalized to `chr1`, or vice versa). Exact match wins; the
+    /// bare/`chr`-prefixed spellings are only tried as fallbacks. Mirrors the
+    /// fallback previously applied only at the variation-lookup call site, so
+    /// context entities (transcript/exon/translation/regulatory/motif/SIFT)
+    /// resolve the same way instead of silently loading empty.
     pub fn path_for_chrom(&self, chrom: &str) -> Option<&str> {
-        self.by_chrom
-            .get(chrom)
-            .map(|idx| self.entries[*idx].dataset.as_str())
+        let idx = self.by_chrom.get(chrom).or_else(|| {
+            chrom
+                .strip_prefix("chr")
+                .and_then(|bare| self.by_chrom.get(bare))
+                .or_else(|| {
+                    if chrom.starts_with("chr") {
+                        None
+                    } else {
+                        self.by_chrom.get(&format!("chr{chrom}"))
+                    }
+                })
+        })?;
+        Some(self.entries[*idx].dataset.as_str())
     }
 
     pub fn available_chroms(&self) -> Vec<&str> {
@@ -146,5 +163,22 @@ mod tests {
         );
         assert!(loaded.path_for_chrom("other").is_none());
         assert_eq!(loaded.available_chroms(), ["chr1", "HSCHR6_MHC_COX_CTG1"]);
+    }
+
+    #[test]
+    fn path_for_chrom_tolerates_chr_prefix_spelling() {
+        // Manifest canonicalized to `chr`-prefixed labels.
+        let chr_prefixed =
+            ChromManifest::new(vec![ChromDatasetEntry::new("chr1", "chr1.lance", 1)]);
+        assert_eq!(chr_prefixed.path_for_chrom("chr1").unwrap(), "chr1.lance");
+        // A bare VCF contig spelling still resolves.
+        assert_eq!(chr_prefixed.path_for_chrom("1").unwrap(), "chr1.lance");
+        assert!(chr_prefixed.path_for_chrom("2").is_none());
+
+        // Manifest with bare labels resolves a `chr`-prefixed query too.
+        let bare = ChromManifest::new(vec![ChromDatasetEntry::new("1", "1.lance", 1)]);
+        assert_eq!(bare.path_for_chrom("1").unwrap(), "1.lance");
+        assert_eq!(bare.path_for_chrom("chr1").unwrap(), "1.lance");
+        assert!(bare.path_for_chrom("chrX").is_none());
     }
 }

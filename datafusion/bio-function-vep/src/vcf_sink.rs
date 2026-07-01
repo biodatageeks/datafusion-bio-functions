@@ -773,51 +773,64 @@ async fn drive_sharded_vcf_annotation(
     let mut stream = plan.execute(0, ctx.task_ctx())?;
     let progress_started = Instant::now();
     let progress_trace = std::env::var_os("VEP_PROFILE").is_some();
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    let reported = std::sync::atomic::AtomicUsize::new(0);
-    let drive_result: Result<()> = std::thread::scope(|scope| {
-        scope.spawn(|| {
+    let mut last = 0usize;
+    let mut report = |now: usize| {
+        if now > last {
+            let prev = last;
+            last = now;
+            pb.set_position(now as u64);
+            if progress_trace {
+                eprintln!(
+                    "[VEP_PROGRESS] annotated {now}/{total_input} (+{}) at {:.1}s",
+                    now - prev,
+                    progress_started.elapsed().as_secs_f64(),
+                );
+            }
+            if let Some(ref cb) = config.on_batch_written {
+                cb(now - prev, now, total_input);
+            }
+        }
+    };
+
+    // The sharded stream yields no row batches — workers write shards directly
+    // and bump `shard_ctx.rows_done` as they annotate. A dedicated OS thread
+    // samples that counter every 150ms and forwards snapshots over a channel, so
+    // the progress bar / callback advance DURING annotation. We AWAIT the stream
+    // on the caller's runtime (instead of `block_in_place` + `block_on`, which
+    // panics on a current-thread runtime), keeping the worker tasks driven on
+    // whatever runtime spawned them. The poller uses `std::thread::sleep` (not a
+    // tokio timer) and an unbounded `mpsc`, so it needs no time driver.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tick_tx, mut tick_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let poller = {
+        let stop = Arc::clone(&stop);
+        let shard_ctx = Arc::clone(&shard_ctx);
+        std::thread::spawn(move || {
             while !stop.load(Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(150));
-                let now = shard_ctx.rows_done.load(Relaxed);
-                let last = reported.load(Relaxed);
-                if now > last {
-                    reported.store(now, Relaxed);
-                    pb.set_position(now as u64);
-                    if progress_trace {
-                        eprintln!(
-                            "[VEP_PROGRESS] annotated {now}/{total_input} (+{}) at {:.1}s",
-                            now - last,
-                            progress_started.elapsed().as_secs_f64(),
-                        );
-                    }
-                    if let Some(ref cb) = config.on_batch_written {
-                        cb(now - last, now, total_input);
-                    }
-                }
+                let _ = tick_tx.send(shard_ctx.rows_done.load(Relaxed));
             }
-        });
-        let res = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                while let Some(batch) = stream.next().await {
-                    let _ = batch?;
+        })
+    };
+
+    let drive_result: Result<()> = loop {
+        tokio::select! {
+            item = stream.next() => match item {
+                Some(batch) => {
+                    if let Err(e) = batch {
+                        break Err(e);
+                    }
                 }
-                Ok::<(), DataFusionError>(())
-            })
-        });
-        stop.store(true, Relaxed);
-        res
-    });
+                None => break Ok(()),
+            },
+            Some(now) = tick_rx.recv() => report(now),
+        }
+    };
+    stop.store(true, Relaxed);
+    let _ = poller.join();
     drive_result?;
     // Final flush: report any rows annotated since the poller's last tick.
-    let now = shard_ctx.rows_done.load(Relaxed);
-    let last = reported.load(Relaxed);
-    if now > last {
-        pb.set_position(now as u64);
-        if let Some(ref cb) = config.on_batch_written {
-            cb(now - last, now, total_input);
-        }
-    }
+    report(shard_ctx.rows_done.load(Relaxed));
 
     // Assemble: concat the body shards in ascending (= position) id order.
     let mut shards: Vec<(usize, PathBuf)> = Vec::new();
