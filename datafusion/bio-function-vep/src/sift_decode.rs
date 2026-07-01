@@ -89,7 +89,9 @@ impl ScalarUDFImpl for SiftDecodeUdf {
         let mut list = ListBuilder::new(values_builder);
 
         for row in 0..blobs.len() {
-            if blobs.is_null(row) {
+            // A null blob or a null predictor (nullable column, `CAST(NULL AS
+            // Utf8)`) yields a null list rather than panicking on `value(row)`.
+            if blobs.is_null(row) || predictor.is_null(row) {
                 list.append_null();
                 continue;
             }
@@ -205,6 +207,38 @@ mod tests {
         let score = s.column(2).as_any().downcast_ref::<Float32Array>().unwrap();
         assert_eq!(aa.value(0), 4);
         assert_eq!(score.value(1).to_bits(), 1.0f32.to_bits());
+    }
+
+    #[test]
+    fn null_predictor_yields_null_without_panicking() {
+        use crate::cache_common::{SIFT_CODEC, serialize_position_entries_v2};
+        use crate::transcript_consequence::CompactPrediction;
+        let blob = serialize_position_entries_v2(
+            &[CompactPrediction {
+                position: 0,
+                amino_acid: 4,
+                prediction: 1,
+                score: 0.02,
+            }],
+            SIFT_CODEC,
+        )
+        .unwrap();
+        let udf = vep_decode_sift_predictions_udf();
+        // Row 0: valid blob + valid predictor. Row 1: valid blob + NULL predictor.
+        let out = invoke_for_test(
+            &udf,
+            vec![
+                ColumnarValue::Array(Arc::new(BinaryArray::from(vec![
+                    Some(blob.as_slice()),
+                    Some(blob.as_slice()),
+                ]))),
+                ColumnarValue::Array(Arc::new(StringArray::from(vec![Some("sift"), None]))),
+            ],
+            2,
+        );
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(!list.is_null(0), "valid predictor decodes");
+        assert!(list.is_null(1), "null predictor yields null, not a panic");
     }
 
     #[test]

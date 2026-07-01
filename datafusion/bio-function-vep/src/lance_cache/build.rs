@@ -153,7 +153,7 @@ async fn build_lance_variation(options: &LanceCacheBuildOptions) -> Result<Vec<E
         }
     }
 
-    ChromManifest::new(manifest_entries).write_to_entity_dir(&entity_dir)?;
+    ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
     Ok(vec![EntityStats {
         entity: "variation.lance".to_string(),
         parquet_files: files,
@@ -467,7 +467,7 @@ async fn build_lance_context_entity(
         files.push((dataset_path.to_string_lossy().to_string(), rows));
     }
 
-    ChromManifest::new(manifest_entries).write_to_entity_dir(&entity_dir)?;
+    ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
     Ok(vec![EntityStats {
         entity: lance_entity_dir_name(entity),
         parquet_files: files,
@@ -536,7 +536,7 @@ async fn build_lance_translation_sift(options: &LanceCacheBuildOptions) -> Resul
         files.push((dataset_path.to_string_lossy().to_string(), rows));
     }
 
-    ChromManifest::new(manifest_entries).write_to_entity_dir(&entity_dir)?;
+    ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
     Ok(EntityStats {
         entity: lance_entity_dir_name(entity),
         parquet_files: files,
@@ -594,7 +594,7 @@ async fn build_lance_translation_split(
         files.push((dataset_path.to_string_lossy().to_string(), rows));
     }
 
-    ChromManifest::new(manifest_entries).write_to_entity_dir(&entity_dir)?;
+    ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
     Ok(EntityStats {
         entity: lance_entity_dir_name(entity),
         parquet_files: files,

@@ -51,6 +51,27 @@ impl ChromManifest {
         Ok(Self::new(entries))
     }
 
+    /// Write these entries into `entity_dir`, MERGING with any existing manifest
+    /// rather than replacing it: an entry whose `chrom` matches one already on
+    /// disk overwrites it, other pre-existing entries are preserved. This keeps a
+    /// filtered / single-chromosome rebuild (`--chrom-filter`, `--overwrite`)
+    /// from dropping the other chromosomes' datasets — which remain on disk — out
+    /// of the manifest and thus making their context unresolvable.
+    pub fn merge_write_to_entity_dir(&self, entity_dir: &Path) -> Result<()> {
+        let mut merged = if entity_dir.join(CHROM_MANIFEST_FILE).exists() {
+            Self::read_from_entity_dir(entity_dir)?.entries
+        } else {
+            Vec::new()
+        };
+        for entry in &self.entries {
+            match merged.iter_mut().find(|e| e.chrom == entry.chrom) {
+                Some(slot) => *slot = entry.clone(),
+                None => merged.push(entry.clone()),
+            }
+        }
+        Self::new(merged).write_to_entity_dir(entity_dir)
+    }
+
     pub fn write_to_entity_dir(&self, entity_dir: &Path) -> Result<()> {
         fs::create_dir_all(entity_dir).map_err(|err| {
             DataFusionError::Execution(format!("failed to create {}: {err}", entity_dir.display()))
@@ -198,6 +219,40 @@ mod tests {
         assert_eq!(bare.path_for_chrom("1").unwrap(), "1.lance");
         assert_eq!(bare.path_for_chrom("chr1").unwrap(), "1.lance");
         assert!(bare.path_for_chrom("chrX").is_none());
+    }
+
+    #[test]
+    fn merge_write_preserves_other_chromosomes() {
+        let dir = TempDir::new().unwrap();
+        // Existing multi-chromosome manifest.
+        ChromManifest::new(vec![
+            ChromDatasetEntry::new("chr1", "chr1.lance", 10),
+            ChromDatasetEntry::new("chr2", "chr2.lance", 20),
+        ])
+        .write_to_entity_dir(dir.path())
+        .unwrap();
+
+        // Filtered rebuild of just chr1 (new row count) must keep chr2.
+        ChromManifest::new(vec![ChromDatasetEntry::new("chr1", "chr1.lance", 11)])
+            .merge_write_to_entity_dir(dir.path())
+            .unwrap();
+
+        let merged = ChromManifest::read_from_entity_dir(dir.path()).unwrap();
+        assert_eq!(merged.path_for_chrom("chr1").unwrap(), "chr1.lance");
+        assert_eq!(merged.path_for_chrom("chr2").unwrap(), "chr2.lance");
+        let chr1 = merged.entries.iter().find(|e| e.chrom == "chr1").unwrap();
+        assert_eq!(chr1.rows, 11, "rebuilt chr1 entry overwrites the old one");
+        assert_eq!(merged.entries.len(), 2);
+    }
+
+    #[test]
+    fn merge_write_into_empty_dir_writes_subset() {
+        let dir = TempDir::new().unwrap();
+        ChromManifest::new(vec![ChromDatasetEntry::new("chr1", "chr1.lance", 1)])
+            .merge_write_to_entity_dir(dir.path())
+            .unwrap();
+        let loaded = ChromManifest::read_from_entity_dir(dir.path()).unwrap();
+        assert_eq!(loaded.available_chroms(), ["chr1"]);
     }
 
     #[test]
