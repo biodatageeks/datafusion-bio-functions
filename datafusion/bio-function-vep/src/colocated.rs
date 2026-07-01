@@ -486,6 +486,51 @@ mod tests {
     }
 
     #[test]
+    fn build_shifted_compare_state_shifts_deletion_through_poly_a_run() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let fasta_path = dir.path().join("ref.fa");
+        // chr1: T at 1, a 5-base poly-A run at 2..=6, then G filler so the 3'
+        // flank read (end+1 .. end+1000) stays in bounds.
+        let seq = format!("T{}{}", "A".repeat(5), "G".repeat(1000));
+        let header = ">chr1\n";
+        {
+            let mut f = std::fs::File::create(&fasta_path).unwrap();
+            f.write_all(header.as_bytes()).unwrap();
+            f.write_all(seq.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        // Minimal single-line .fai: name, length, seq-offset, linebases, linewidth.
+        std::fs::write(
+            dir.path().join("ref.fa.fai"),
+            format!(
+                "chr1\t{}\t{}\t{}\t{}\n",
+                seq.len(),
+                header.len(),
+                seq.len(),
+                seq.len() + 1
+            ),
+        )
+        .unwrap();
+
+        let mut reader = fasta::io::indexed_reader::Builder::default()
+            .build_from_path(&fasta_path)
+            .unwrap();
+
+        // A single-base deletion at the start of the run shifts 3' to the last A
+        // of the run (position 6). The shifted allele string stays "A/-".
+        assert_eq!(
+            build_shifted_compare_state(&mut reader, "chr1", "A/-", 2, 2).unwrap(),
+            Some(("A/-".to_string(), 6, 6))
+        );
+        // A non-shiftable SNV yields no shift.
+        assert_eq!(
+            build_shifted_compare_state(&mut reader, "chr1", "A/G", 2, 2).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn compare_existing_variant_alleles_matches_unknown_on_active_coords_only() {
         assert_eq!(
             compare_existing_variant_alleles(
