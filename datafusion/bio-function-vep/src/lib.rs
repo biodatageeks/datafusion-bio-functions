@@ -55,6 +55,8 @@ pub mod lance_cache;
 pub mod lookup_provider;
 pub mod miss_worklist;
 pub(crate) mod ordered_drain;
+#[cfg(feature = "lance-cache")]
+pub mod parquet_cache;
 pub mod partitioned_cache;
 pub(crate) mod pipeline_trace;
 pub mod schema_contract;
