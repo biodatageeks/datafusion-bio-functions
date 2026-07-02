@@ -6,6 +6,7 @@
 pub mod adapter_content;
 pub mod basic_stats;
 pub mod dup_levels;
+pub mod kmer_content;
 pub mod overrepresented;
 pub mod per_base_content;
 pub mod per_base_n;
@@ -78,6 +79,7 @@ use datafusion::common::{DataFusionError, Result};
 use adapter_content::AdapterContent;
 use basic_stats::BasicStats;
 use dup_levels::DuplicationLevels;
+use kmer_content::KmerContent;
 use overrepresented::OverrepresentedSeqs;
 use per_base_content::PerBaseContent;
 use per_base_n::PerBaseN;
@@ -87,7 +89,7 @@ use per_seq_quality::PerSeqQuality;
 use per_tile_quality::PerTileQuality;
 use seq_length::SeqLength;
 
-pub const ALL_MODULES: [&str; 11] = [
+pub const ALL_MODULES: [&str; 12] = [
     "basic_stats",
     "per_base_quality",
     "per_seq_quality",
@@ -99,6 +101,7 @@ pub const ALL_MODULES: [&str; 11] = [
     "adapter_content",
     "dup_levels",
     "per_tile_quality",
+    "kmer_content",
 ];
 
 /// The fixed tidy output schema (independent of module selection).
@@ -126,6 +129,7 @@ fn make_module(name: &str) -> Result<Box<dyn QcModule>> {
         "adapter_content" => Box::new(AdapterContent::new()),
         "dup_levels" => Box::new(DuplicationLevels::new()),
         "per_tile_quality" => Box::new(PerTileQuality::new()),
+        "kmer_content" => Box::new(KmerContent::new()),
         other => {
             return Err(DataFusionError::Plan(format!(
                 "unknown fastqc module '{other}'; valid: {}",
