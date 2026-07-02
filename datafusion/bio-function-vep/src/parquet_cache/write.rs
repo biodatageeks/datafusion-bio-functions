@@ -106,6 +106,11 @@ pub fn variation_output_schema(source_schema: &Schema, source_type: &str) -> Res
         }
         if VARIATION_FLAG_COLUMNS.contains(&name) {
             fields.push(Field::new(name, DataType::Boolean, false));
+        } else if name == "variation_name" {
+            // `dedup_variation_name` nulls entries equal to `dbsnp_ids` (the source
+            // column is non-nullable), so the stored column must be nullable — the
+            // reader coalesces it back via `dbsnp_ids`.
+            fields.push(Field::new(name, DataType::Utf8, true));
         } else {
             fields.push(field.as_ref().clone());
         }
@@ -462,7 +467,11 @@ mod tests {
                     "minor_allele_freq" => DataType::Float64,
                     _ => DataType::Utf8,
                 };
-                Field::new(n, dt, true)
+                // `variation_name` is non-nullable in the real source, yet the
+                // encoder nulls it during dedup — the output schema must re-declare
+                // it nullable. Mirror that here so the round-trip test guards it.
+                let nullable = n != "variation_name";
+                Field::new(n, dt, nullable)
             })
             .collect();
         Schema::new(fields)
@@ -549,7 +558,14 @@ mod tests {
                             "chrom" => Some("chr1".to_string()),
                             "allele_string" => Some("A/G".to_string()),
                             "dbsnp_ids" => Some(format!("rs{i}")),
-                            "variation_name" => (i % 2 != 0).then(|| format!("rs{i}")),
+                            // Non-null in the source (like reality). Even rows equal
+                            // dbsnp_ids → dedup nulls them → coalesce restores `rs{i}`;
+                            // odd rows differ → kept verbatim.
+                            "variation_name" => Some(if i % 2 == 0 {
+                                format!("rs{i}")
+                            } else {
+                                format!("custom{i}")
+                            }),
                             "gnomADg" => Some("A:0.5".to_string()),
                             _ if af_members.contains(name) => Some(String::new()),
                             _ => None,
@@ -605,8 +621,14 @@ mod tests {
                 .iter()
                 .position(|&x| x == out_start.value(r))
                 .unwrap();
-            // Even rows had a null variation_name → coalesced from dbsnp (`rs{orig}`).
-            assert_eq!(out_vn.value(r), format!("rs{orig}"));
+            // Even rows deduped to null → coalesced back from dbsnp (`rs{orig}`);
+            // odd rows kept their distinct `custom{orig}`.
+            let expected = if orig % 2 == 0 {
+                format!("rs{orig}")
+            } else {
+                format!("custom{orig}")
+            };
+            assert_eq!(out_vn.value(r), expected);
         }
     }
 }
