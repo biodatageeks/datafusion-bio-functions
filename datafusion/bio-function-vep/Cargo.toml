@@ -10,8 +10,9 @@ edition.workspace = true
 
 [dependencies]
 datafusion.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
 futures.workspace = true
+bytes = "1"
 log.workspace = true
 async-trait = "0.1.88"
 chrono = "0.4"

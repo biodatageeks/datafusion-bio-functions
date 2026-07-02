@@ -12,4 +12,5 @@
 //!   (positional per population), reconstructed to exact CSQ text via `%.4g`;
 //! - `variation_name` deduped (null where `== dbsnp_ids`, reconstruct via coalesce).
 
+pub mod page_dir;
 pub mod write;

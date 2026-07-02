@@ -1459,6 +1459,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "async-trait",
+ "bytes",
  "chrono",
  "coitrees",
  "datafusion",
