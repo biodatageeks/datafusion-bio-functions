@@ -12,6 +12,7 @@ pub mod per_base_n;
 pub mod per_base_quality;
 pub mod per_seq_gc;
 pub mod per_seq_quality;
+pub mod per_tile_quality;
 pub mod physical_exec;
 pub mod seq_length;
 
@@ -83,9 +84,10 @@ use per_base_n::PerBaseN;
 use per_base_quality::PerBaseQuality;
 use per_seq_gc::PerSeqGc;
 use per_seq_quality::PerSeqQuality;
+use per_tile_quality::PerTileQuality;
 use seq_length::SeqLength;
 
-pub const ALL_MODULES: [&str; 10] = [
+pub const ALL_MODULES: [&str; 11] = [
     "basic_stats",
     "per_base_quality",
     "per_seq_quality",
@@ -96,6 +98,7 @@ pub const ALL_MODULES: [&str; 10] = [
     "overrepresented",
     "adapter_content",
     "dup_levels",
+    "per_tile_quality",
 ];
 
 /// The fixed tidy output schema (independent of module selection).
@@ -122,6 +125,7 @@ fn make_module(name: &str) -> Result<Box<dyn QcModule>> {
         "overrepresented" => Box::new(OverrepresentedSeqs::new()),
         "adapter_content" => Box::new(AdapterContent::new()),
         "dup_levels" => Box::new(DuplicationLevels::new()),
+        "per_tile_quality" => Box::new(PerTileQuality::new()),
         other => {
             return Err(DataFusionError::Plan(format!(
                 "unknown fastqc module '{other}'; valid: {}",
