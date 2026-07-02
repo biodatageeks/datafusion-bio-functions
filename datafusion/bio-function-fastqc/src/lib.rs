@@ -5,6 +5,7 @@
 
 pub mod basic_stats;
 pub mod per_base_quality;
+pub mod per_seq_gc;
 
 use std::any::Any;
 
