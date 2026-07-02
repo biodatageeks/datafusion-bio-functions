@@ -19,6 +19,20 @@ impl PerSeqGc {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// FastQC truncates each read before the GC calculation to bound the number
+    /// of cached length-models: reads >1000 bp are cut to a multiple of 1000,
+    /// reads >100 bp to a multiple of 100 (so a 101 bp read uses its first
+    /// 100 bp). This is specific to Per Sequence GC Content.
+    fn truncated_len(len: usize) -> usize {
+        if len > 1000 {
+            (len / 1000) * 1000
+        } else if len > 100 {
+            (len / 100) * 100
+        } else {
+            len
+        }
+    }
 }
 
 impl QcModule for PerSeqGc {
@@ -27,12 +41,13 @@ impl QcModule for PerSeqGc {
     }
 
     fn update(&mut self, seq: &[u8], _qual: &[u8]) {
-        let len = seq.len();
+        // FastQC truncates the read first, then counts G/C over the truncated
+        // portion and models against the truncated length.
+        let len = Self::truncated_len(seq.len());
         if len == 0 {
             return;
         }
-        // FastQC uses the full read length (incl. N) as the denominator.
-        let gc = seq
+        let gc = seq[..len]
             .iter()
             .filter(|&&b| matches!(b, b'G' | b'g' | b'C' | b'c'))
             .count();
@@ -155,6 +170,22 @@ mod tests {
             .max_by(|a, b| a.value.partial_cmp(&b.value).unwrap())
             .unwrap();
         assert!((40..=60).contains(&peak.position.unwrap()));
+    }
+
+    #[test]
+    fn per_seq_gc_truncates_reads_over_100bp() {
+        // A 101bp read is truncated to its first 100bp: a G/C at position 101
+        // is dropped, so it must match a 100bp read with the same first 100bp.
+        let mut long_seq = vec![b'A'; 100];
+        long_seq.push(b'G'); // 101st base, must be ignored
+        let mut a = PerSeqGc::new();
+        a.update(&long_seq, &[b'I'; 101]);
+        let mut b = PerSeqGc::new();
+        b.update(&[b'A'; 100], &[b'I'; 100]);
+        let (mut ra, mut rb) = (Vec::new(), Vec::new());
+        a.finalize(&mut ra);
+        b.finalize(&mut rb);
+        assert_eq!(ra, rb);
     }
 
     #[test]
