@@ -138,8 +138,16 @@ impl PageDir {
                         hi = m;
                     }
                 }
-                if lo < re && self.min[lo] <= p {
-                    pages.push(lo);
+                // `p` may span several consecutive pages when a run of identical
+                // key values straddles page boundaries (a highly multi-allelic
+                // position). `max` is non-decreasing within a sorted run, so from
+                // `lo` onward `max >= p` holds; include every page while its `min`
+                // is still `<= p`. Pushing only `lo` would drop the rows of `p` that
+                // live in the following page(s).
+                let mut pg = lo;
+                while pg < re && self.min[pg] <= p {
+                    pages.push(pg);
+                    pg += 1;
                 }
             }
         }
@@ -337,6 +345,34 @@ mod tests {
         // 45 is in page 1 (30..50) and page 3 (40..60); those are not adjacent.
         let r = pd.resolve_ranges(&[45]);
         assert_eq!(r, vec![(100, 200), (300, 400)]);
+    }
+
+    #[test]
+    fn page_dir_spans_value_across_page_boundary() {
+        // A run of identical key values (50) straddles the page boundary: page 0
+        // ends with 50s (min=10,max=50), page 1 begins with 50s (min=50,max=90).
+        // Both pages must be returned — else the rows of 50 in page 1 are dropped
+        // (the real chr1 multi-allelic under-count bug).
+        let pd = PageDir::from_parts(vec![10, 50], vec![50, 90], vec![0, 100], vec![100, 200]);
+        assert_eq!(pd.num_runs(), 1);
+        // Adjacent pages → merged into one contiguous range covering both.
+        assert_eq!(pd.resolve_ranges(&[50]), vec![(0, 200)]);
+        // A value only in the first page still returns just that page.
+        assert_eq!(pd.resolve_ranges(&[10]), vec![(0, 100)]);
+        // A value only in the second page returns just that page.
+        assert_eq!(pd.resolve_ranges(&[90]), vec![(100, 200)]);
+    }
+
+    #[test]
+    fn page_dir_spans_value_across_three_pages() {
+        // 50 occupies the tail of page 0, all of page 1, and the head of page 2.
+        let pd = PageDir::from_parts(
+            vec![10, 50, 50],
+            vec![50, 50, 90],
+            vec![0, 100, 200],
+            vec![100, 200, 300],
+        );
+        assert_eq!(pd.resolve_ranges(&[50]), vec![(0, 300)]);
     }
 
     #[test]
