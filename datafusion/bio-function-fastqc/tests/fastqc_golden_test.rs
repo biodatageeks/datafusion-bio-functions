@@ -119,6 +119,11 @@ fn golden(path: &str) -> GoldenData {
     let mut n_seq = f64::NAN;
     let mut gc_pct = f64::NAN;
 
+    let mut per_seq_q: HashMap<i32, f64> = HashMap::new();
+    let mut seq_len: HashMap<i32, f64> = HashMap::new();
+    let mut per_base_n: HashMap<i32, f64> = HashMap::new();
+    let mut per_base_content: HashMap<(i32, String), f64> = HashMap::new();
+
     let mut module = "";
     for line in text.lines() {
         if line.starts_with(">>END_MODULE") {
@@ -129,7 +134,11 @@ fn golden(path: &str) -> GoldenData {
             module = match rest.rsplit_once('\t').map(|(m, _)| m).unwrap_or(rest).trim() {
                 "Basic Statistics" => "basic_stats",
                 "Per base sequence quality" => "per_base_quality",
+                "Per sequence quality scores" => "per_seq_quality",
+                "Per base sequence content" => "per_base_content",
                 "Per sequence GC content" => "per_seq_gc",
+                "Per base N content" => "per_base_n",
+                "Sequence Length Distribution" => "seq_length",
                 "Sequence Duplication Levels" => "dup_levels",
                 _ => "",
             };
@@ -156,6 +165,25 @@ fn golden(path: &str) -> GoldenData {
             "per_seq_gc" if !line.starts_with('#') => {
                 per_seq_gc.insert(cols[0].parse::<f64>().unwrap() as i32, cols[1].parse().unwrap());
             },
+            "per_seq_quality" if !line.starts_with('#') => {
+                per_seq_q.insert(cols[0].parse().unwrap(), cols[1].parse().unwrap());
+            },
+            "seq_length" if !line.starts_with('#') => {
+                // FastQC may print a length range "min-max"; our fixtures are uniform.
+                let pos: i32 = cols[0].split('-').next().unwrap().parse().unwrap();
+                seq_len.insert(pos, cols[1].parse().unwrap());
+            },
+            "per_base_n" if !line.starts_with('#') => {
+                let pos: i32 = cols[0].split('-').next().unwrap().parse().unwrap();
+                per_base_n.insert(pos, cols[1].parse().unwrap());
+            },
+            "per_base_content" if !line.starts_with('#') => {
+                // columns: Base, %G, %A, %T, %C
+                let pos: i32 = cols[0].split('-').next().unwrap().parse().unwrap();
+                for (k, base) in ["G", "A", "T", "C"].iter().enumerate() {
+                    per_base_content.insert((pos, base.to_string()), cols[k + 1].parse().unwrap());
+                }
+            },
             "dup_levels" if line.starts_with("#Total Deduplicated") => {
                 total_dedup = cols[1].parse().unwrap()
             },
@@ -172,6 +200,10 @@ fn golden(path: &str) -> GoldenData {
         total_dedup,
         n_seq,
         gc_pct,
+        per_seq_q,
+        seq_len,
+        per_base_n,
+        per_base_content,
     }
 }
 
@@ -182,6 +214,10 @@ struct GoldenData {
     total_dedup: f64,
     n_seq: f64,
     gc_pct: f64,
+    per_seq_q: HashMap<i32, f64>,
+    seq_len: HashMap<i32, f64>,
+    per_base_n: HashMap<i32, f64>,
+    per_base_content: HashMap<(i32, String), f64>,
 }
 
 #[test]
@@ -240,6 +276,62 @@ fn dup_levels_match_fastqc_exactly() {
         "total_dedup_pct".into(),
     )];
     assert!((got_dedup - g.total_dedup).abs() <= 1e-9);
+}
+
+#[test]
+fn per_seq_quality_matches_fastqc_exactly() {
+    let ours = run_tidy(&data("example.fastq"));
+    let g = golden(&data("example.nogroup.fastqc_data.txt"));
+    assert!(!g.per_seq_q.is_empty());
+    for (phred, expected) in &g.per_seq_q {
+        let got = ours[&("per_seq_quality".into(), String::new(), *phred, "count".into())];
+        assert!(
+            (got - expected).abs() <= 1e-9,
+            "per_seq_quality phred {phred}: {got} vs {expected}"
+        );
+    }
+}
+
+#[test]
+fn seq_length_matches_fastqc_exactly() {
+    let ours = run_tidy(&data("example.fastq"));
+    let g = golden(&data("example.nogroup.fastqc_data.txt"));
+    assert!(!g.seq_len.is_empty());
+    for (len, expected) in &g.seq_len {
+        let got = ours[&("seq_length".into(), String::new(), *len, "count".into())];
+        assert!(
+            (got - expected).abs() <= 1e-9,
+            "seq_length {len}: {got} vs {expected}"
+        );
+    }
+}
+
+#[test]
+fn per_base_n_matches_fastqc_exactly() {
+    let ours = run_tidy(&data("example.fastq"));
+    let g = golden(&data("example.nogroup.fastqc_data.txt"));
+    assert!(!g.per_base_n.is_empty());
+    for (pos, expected) in &g.per_base_n {
+        let got = ours[&("per_base_n".into(), String::new(), *pos, "pct".into())];
+        assert!(
+            (got - expected).abs() <= 1e-6,
+            "per_base_n pos {pos}: {got} vs {expected}"
+        );
+    }
+}
+
+#[test]
+fn per_base_content_matches_fastqc_exactly() {
+    let ours = run_tidy(&data("example.fastq"));
+    let g = golden(&data("example.nogroup.fastqc_data.txt"));
+    assert!(!g.per_base_content.is_empty());
+    for ((pos, base), expected) in &g.per_base_content {
+        let got = ours[&("per_base_content".into(), String::new(), *pos, base.clone())];
+        assert!(
+            (got - expected).abs() <= 1e-6,
+            "per_base_content pos {pos} {base}: {got} vs {expected}"
+        );
+    }
 }
 
 #[test]

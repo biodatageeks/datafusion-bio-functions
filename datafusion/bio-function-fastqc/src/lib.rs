@@ -5,9 +5,13 @@
 
 pub mod basic_stats;
 pub mod dup_levels;
+pub mod per_base_content;
+pub mod per_base_n;
 pub mod per_base_quality;
 pub mod per_seq_gc;
+pub mod per_seq_quality;
 pub mod physical_exec;
+pub mod seq_length;
 
 pub use physical_exec::FastqcExec;
 
@@ -70,13 +74,21 @@ use datafusion::common::{DataFusionError, Result};
 
 use basic_stats::BasicStats;
 use dup_levels::DuplicationLevels;
+use per_base_content::PerBaseContent;
+use per_base_n::PerBaseN;
 use per_base_quality::PerBaseQuality;
 use per_seq_gc::PerSeqGc;
+use per_seq_quality::PerSeqQuality;
+use seq_length::SeqLength;
 
-pub const ALL_MODULES: [&str; 4] = [
+pub const ALL_MODULES: [&str; 8] = [
     "basic_stats",
     "per_base_quality",
+    "per_seq_quality",
+    "per_base_content",
     "per_seq_gc",
+    "per_base_n",
+    "seq_length",
     "dup_levels",
 ];
 
@@ -96,7 +108,11 @@ fn make_module(name: &str) -> Result<Box<dyn QcModule>> {
     Ok(match name {
         "basic_stats" => Box::new(BasicStats::new()),
         "per_base_quality" => Box::new(PerBaseQuality::new()),
+        "per_seq_quality" => Box::new(PerSeqQuality::new()),
+        "per_base_content" => Box::new(PerBaseContent::new()),
         "per_seq_gc" => Box::new(PerSeqGc::new()),
+        "per_base_n" => Box::new(PerBaseN::new()),
+        "seq_length" => Box::new(SeqLength::new()),
         "dup_levels" => Box::new(DuplicationLevels::new()),
         other => {
             return Err(DataFusionError::Plan(format!(
