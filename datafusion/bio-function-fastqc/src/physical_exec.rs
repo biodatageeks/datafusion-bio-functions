@@ -14,6 +14,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use futures::StreamExt;
+use tokio::task::JoinSet;
 
 use crate::{tidy_schema, ModuleSet};
 
@@ -96,12 +97,16 @@ impl ExecutionPlan for FastqcExec {
         let schema = tidy_schema();
 
         let fut = async move {
-            let mut tasks = Vec::with_capacity(n_parts);
+            // Spawn one task per input partition so accumulation runs in
+            // parallel across runtime worker threads (CPU-bound work). A plain
+            // `try_join_all` would only interleave the futures on a single
+            // task, adding overhead without parallelism.
+            let mut join_set: JoinSet<Result<ModuleSet>> = JoinSet::new();
             for p in 0..n_parts {
                 let input = input.clone();
                 let selection = selection.clone();
                 let ctx = context.clone();
-                tasks.push(async move {
+                join_set.spawn(async move {
                     let mut set = ModuleSet::build(selection.as_deref())?;
                     let mut stream = input.execute(p, ctx)?;
                     while let Some(batch) = stream.next().await {
@@ -110,10 +115,11 @@ impl ExecutionPlan for FastqcExec {
                     Ok::<ModuleSet, DataFusionError>(set)
                 });
             }
-            let sets = futures::future::try_join_all(tasks).await?;
             let mut merged = ModuleSet::build(selection.as_deref())?;
-            for s in sets {
-                merged.merge(s);
+            while let Some(joined) = join_set.join_next().await {
+                let set = joined
+                    .map_err(|e| DataFusionError::Execution(format!("fastqc join error: {e}")))??;
+                merged.merge(set);
             }
             let batch = merged.finalize()?;
             Ok::<RecordBatch, DataFusionError>(batch)
