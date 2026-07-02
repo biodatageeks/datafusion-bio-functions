@@ -5,6 +5,7 @@
 
 pub mod basic_stats;
 pub mod dup_levels;
+pub mod overrepresented;
 pub mod per_base_content;
 pub mod per_base_n;
 pub mod per_base_quality;
@@ -74,6 +75,7 @@ use datafusion::common::{DataFusionError, Result};
 
 use basic_stats::BasicStats;
 use dup_levels::DuplicationLevels;
+use overrepresented::OverrepresentedSeqs;
 use per_base_content::PerBaseContent;
 use per_base_n::PerBaseN;
 use per_base_quality::PerBaseQuality;
@@ -81,7 +83,7 @@ use per_seq_gc::PerSeqGc;
 use per_seq_quality::PerSeqQuality;
 use seq_length::SeqLength;
 
-pub const ALL_MODULES: [&str; 8] = [
+pub const ALL_MODULES: [&str; 9] = [
     "basic_stats",
     "per_base_quality",
     "per_seq_quality",
@@ -89,6 +91,7 @@ pub const ALL_MODULES: [&str; 8] = [
     "per_seq_gc",
     "per_base_n",
     "seq_length",
+    "overrepresented",
     "dup_levels",
 ];
 
@@ -113,6 +116,7 @@ fn make_module(name: &str) -> Result<Box<dyn QcModule>> {
         "per_seq_gc" => Box::new(PerSeqGc::new()),
         "per_base_n" => Box::new(PerBaseN::new()),
         "seq_length" => Box::new(SeqLength::new()),
+        "overrepresented" => Box::new(OverrepresentedSeqs::new()),
         "dup_levels" => Box::new(DuplicationLevels::new()),
         other => {
             return Err(DataFusionError::Plan(format!(

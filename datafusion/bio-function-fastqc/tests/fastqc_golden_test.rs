@@ -123,6 +123,7 @@ fn golden(path: &str) -> GoldenData {
     let mut seq_len: HashMap<i32, f64> = HashMap::new();
     let mut per_base_n: HashMap<i32, f64> = HashMap::new();
     let mut per_base_content: HashMap<(i32, String), f64> = HashMap::new();
+    let mut overrep: HashMap<String, (f64, f64)> = HashMap::new(); // seq -> (count, pct)
 
     let mut module = "";
     for line in text.lines() {
@@ -139,6 +140,7 @@ fn golden(path: &str) -> GoldenData {
                 "Per sequence GC content" => "per_seq_gc",
                 "Per base N content" => "per_base_n",
                 "Sequence Length Distribution" => "seq_length",
+                "Overrepresented sequences" => "overrepresented",
                 "Sequence Duplication Levels" => "dup_levels",
                 _ => "",
             };
@@ -184,6 +186,13 @@ fn golden(path: &str) -> GoldenData {
                     per_base_content.insert((pos, base.to_string()), cols[k + 1].parse().unwrap());
                 }
             },
+            "overrepresented" if !line.starts_with('#') => {
+                // columns: Sequence, Count, Percentage, Possible Source
+                overrep.insert(
+                    cols[0].to_string(),
+                    (cols[1].parse().unwrap(), cols[2].parse().unwrap()),
+                );
+            },
             "dup_levels" if line.starts_with("#Total Deduplicated") => {
                 total_dedup = cols[1].parse().unwrap()
             },
@@ -204,6 +213,7 @@ fn golden(path: &str) -> GoldenData {
         seq_len,
         per_base_n,
         per_base_content,
+        overrep,
     }
 }
 
@@ -218,6 +228,7 @@ struct GoldenData {
     seq_len: HashMap<i32, f64>,
     per_base_n: HashMap<i32, f64>,
     per_base_content: HashMap<(i32, String), f64>,
+    overrep: HashMap<String, (f64, f64)>,
 }
 
 #[test]
@@ -332,6 +343,35 @@ fn per_base_content_matches_fastqc_exactly() {
             "per_base_content pos {pos} {base}: {got} vs {expected}"
         );
     }
+}
+
+#[test]
+fn overrepresented_matches_fastqc_exactly() {
+    // dup_mix has genuine overrepresented sequences (up to 4.76%).
+    let ours = run_tidy(&data("dup_mix.fastq"));
+    let g = golden(&data("dup_mix.nogroup.fastqc_data.txt"));
+    assert!(!g.overrep.is_empty());
+    for (seq, (exp_count, exp_pct)) in &g.overrep {
+        let got_count = ours[&(
+            "overrepresented".into(),
+            seq.clone(),
+            i32::MIN,
+            "count".into(),
+        )];
+        let got_pct = ours[&("overrepresented".into(), seq.clone(), i32::MIN, "pct".into())];
+        assert_eq!(got_count, *exp_count, "overrep {seq} count");
+        assert!(
+            (got_pct - exp_pct).abs() <= 1e-9,
+            "overrep {seq} pct: {got_pct} vs {exp_pct}"
+        );
+    }
+    // and no extra sequences beyond what FastQC reported
+    let our_seqs: std::collections::HashSet<String> = ours
+        .keys()
+        .filter(|(m, _, _, metric)| m == "overrepresented" && metric == "count")
+        .map(|(_, label, _, _)| label.clone())
+        .collect();
+    assert_eq!(our_seqs.len(), g.overrep.len(), "overrepresented set size");
 }
 
 #[test]
