@@ -233,7 +233,7 @@ impl KvLookupExec {
     /// [`SinglePathParquetVariationLookup`]. Wired into annotate_provider in a
     /// later task; kept build-visible now.
     #[cfg(feature = "lance-cache")]
-    #[allow(clippy::too_many_arguments, dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new_parquet(
         input: Arc<dyn ExecutionPlan>,
         cache_root: PathBuf,

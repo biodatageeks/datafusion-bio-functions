@@ -83,6 +83,11 @@ pub struct LookupProvider {
     /// `variation.lance/chrN.lance` plus the sidecar position/bloom indexes.
     #[cfg(feature = "lance-cache")]
     lance_cache_root: Option<PathBuf>,
+    /// When true, the variation lookup uses the Parquet backend
+    /// (`parquet.variation/chrN.parquet`) instead of Lance. The cache root is
+    /// still carried in `lance_cache_root` (the shared cache base dir).
+    #[cfg(feature = "lance-cache")]
+    parquet_backend: bool,
     /// Maximum number of independent cold readers used by lookup.
     target_partitions: usize,
     /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
@@ -153,6 +158,8 @@ impl LookupProvider {
             partition_colocated_sinks: None,
             #[cfg(feature = "lance-cache")]
             lance_cache_root: None,
+            #[cfg(feature = "lance-cache")]
+            parquet_backend: false,
             target_partitions: 1,
             vcf_filter: None,
         })
@@ -171,6 +178,13 @@ impl LookupProvider {
     #[cfg(feature = "lance-cache")]
     pub fn set_lance_cache_root(&mut self, root: impl Into<PathBuf>) {
         self.lance_cache_root = Some(root.into());
+    }
+
+    /// Select the Parquet variation backend (default is Lance). The cache root is
+    /// set separately via [`Self::set_lance_cache_root`] (the shared base dir).
+    #[cfg(feature = "lance-cache")]
+    pub fn set_parquet_backend(&mut self, parquet: bool) {
+        self.parquet_backend = parquet;
     }
 
     pub fn set_target_partitions(&mut self, target_partitions: usize) {
@@ -253,7 +267,12 @@ impl TableProvider for LookupProvider {
             };
             let vcf_plan = vcf_df.create_physical_plan().await?;
 
-            let mut exec = KvLookupExec::new_lance(
+            let ctor = if self.parquet_backend {
+                KvLookupExec::new_parquet
+            } else {
+                KvLookupExec::new_lance
+            };
+            let mut exec = ctor(
                 vcf_plan,
                 cache_root.clone(),
                 self.cache_schema.clone(),

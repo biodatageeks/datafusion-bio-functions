@@ -3025,6 +3025,30 @@ async fn read_lance_dataset_schema(path: &std::path::Path) -> Result<Schema> {
     Ok(dataset.schema().into())
 }
 
+/// Read the Arrow schema of a variation `.parquet` shard (the Parquet-backend
+/// analogue of [`read_lance_dataset_schema`]). Used by the Parquet-cache
+/// detection path (wired with the `cache_format="parquet"` selection).
+#[cfg(feature = "lance-cache")]
+#[allow(dead_code)]
+async fn read_parquet_dataset_schema(path: &std::path::Path) -> Result<Schema> {
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+    let file = tokio::fs::File::open(path).await.map_err(|error| {
+        DataFusionError::Execution(format!(
+            "failed to open Parquet schema sample '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let builder = ParquetRecordBatchStreamBuilder::new(file)
+        .await
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to read Parquet schema '{}': {error}",
+                path.display()
+            ))
+        })?;
+    Ok(builder.schema().as_ref().clone())
+}
+
 #[cfg(feature = "lance-cache")]
 #[derive(Clone)]
 struct InMemorySiftPredictionStore {
