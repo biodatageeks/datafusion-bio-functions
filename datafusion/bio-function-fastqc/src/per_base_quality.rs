@@ -61,9 +61,9 @@ impl QcModule for PerBaseQuality {
             .downcast_ref::<PerBaseQuality>()
             .expect("merge type mismatch");
         self.ensure_len(o.hist.len());
-        for (i, oh) in o.hist.iter().enumerate() {
-            for q in 0..QUAL_MAX {
-                self.hist[i][q] += oh[q];
+        for (sh, oh) in self.hist.iter_mut().zip(o.hist.iter()) {
+            for (s, &o) in sh.iter_mut().zip(oh.iter()) {
+                *s += o;
             }
         }
     }

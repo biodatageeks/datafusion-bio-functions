@@ -7,6 +7,9 @@ pub mod basic_stats;
 pub mod dup_levels;
 pub mod per_base_quality;
 pub mod per_seq_gc;
+pub mod physical_exec;
+
+pub use physical_exec::FastqcExec;
 
 use std::any::Any;
 
