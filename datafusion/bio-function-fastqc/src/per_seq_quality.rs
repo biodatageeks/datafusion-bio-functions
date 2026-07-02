@@ -32,7 +32,7 @@ impl QcModule for PerSeqQuality {
         "per_seq_quality"
     }
 
-    fn update(&mut self, _seq: &[u8], qual: &[u8]) {
+    fn update(&mut self, _name: &[u8], _seq: &[u8], qual: &[u8]) {
         if qual.is_empty() {
             return;
         }
@@ -99,8 +99,8 @@ mod tests {
     #[test]
     fn per_seq_quality_bins_mean() {
         let mut m = PerSeqQuality::new();
-        m.update(b"AAAA", b"IIII"); // 'I'=73 -> mean 73 -> phred 40
-        m.update(b"AAAA", b"!!!!"); // '!'=33 -> mean 33 -> phred 0
+        m.update(b"", b"AAAA", b"IIII"); // 'I'=73 -> mean 73 -> phred 40
+        m.update(b"", b"AAAA", b"!!!!"); // '!'=33 -> mean 33 -> phred 0
         let mut rows = Vec::new();
         m.finalize(&mut rows);
         let count_at = |p: i32| {

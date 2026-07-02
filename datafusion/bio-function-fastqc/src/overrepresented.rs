@@ -36,7 +36,7 @@ impl QcModule for OverrepresentedSeqs {
         "overrepresented"
     }
 
-    fn update(&mut self, seq: &[u8], _qual: &[u8]) {
+    fn update(&mut self, _name: &[u8], seq: &[u8], _qual: &[u8]) {
         self.count += 1;
         *self.seqs.entry(Self::key(seq).to_vec()).or_insert(0) += 1;
     }
@@ -121,9 +121,9 @@ mod tests {
     fn overrepresented_lists_frequent_sequences() {
         let mut m = OverrepresentedSeqs::new();
         for _ in 0..10 {
-            m.update(b"AAAACCCC", b"IIIIIIII"); // 10/11 ~= 90.9%
+            m.update(b"", b"AAAACCCC", b"IIIIIIII"); // 10/11 ~= 90.9%
         }
-        m.update(b"GGGGTTTT", b"IIIIIIII"); // 1/11 ~= 9.1%
+        m.update(b"", b"GGGGTTTT", b"IIIIIIII"); // 1/11 ~= 9.1%
         let mut rows = Vec::new();
         m.finalize(&mut rows);
         let count_of = |label: &str| {
@@ -134,8 +134,9 @@ mod tests {
         assert_eq!(count_of("AAAACCCC"), Some(10.0));
         assert_eq!(count_of("GGGGTTTT"), Some(1.0));
         // > 1% -> FAIL
-        assert!(rows
-            .iter()
-            .any(|r| r.metric == "status" && r.value_str.as_deref() == Some("FAIL")));
+        assert!(
+            rows.iter()
+                .any(|r| r.metric == "status" && r.value_str.as_deref() == Some("FAIL"))
+        );
     }
 }

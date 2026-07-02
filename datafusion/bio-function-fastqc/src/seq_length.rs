@@ -20,7 +20,7 @@ impl QcModule for SeqLength {
         "seq_length"
     }
 
-    fn update(&mut self, seq: &[u8], _qual: &[u8]) {
+    fn update(&mut self, _name: &[u8], seq: &[u8], _qual: &[u8]) {
         *self.lengths.entry(seq.len()).or_insert(0) += 1;
     }
 
@@ -72,9 +72,9 @@ mod tests {
     #[test]
     fn seq_length_histogram_and_status() {
         let mut m = SeqLength::new();
-        m.update(b"ACGT", b"IIII");
-        m.update(b"ACGT", b"IIII");
-        m.update(b"ACGTACGT", b"IIIIIIII");
+        m.update(b"", b"ACGT", b"IIII");
+        m.update(b"", b"ACGT", b"IIII");
+        m.update(b"", b"ACGTACGT", b"IIIIIIII");
         let mut rows = Vec::new();
         m.finalize(&mut rows);
         let at = |l: i32| {
@@ -86,8 +86,9 @@ mod tests {
         assert_eq!(at(4), 2.0);
         assert_eq!(at(8), 1.0);
         // multiple lengths -> WARN
-        assert!(rows
-            .iter()
-            .any(|r| r.metric == "status" && r.value_str.as_deref() == Some("WARN")));
+        assert!(
+            rows.iter()
+                .any(|r| r.metric == "status" && r.value_str.as_deref() == Some("WARN"))
+        );
     }
 }

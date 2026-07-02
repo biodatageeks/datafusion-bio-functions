@@ -52,7 +52,7 @@ impl QcModule for AdapterContent {
         "adapter_content"
     }
 
-    fn update(&mut self, seq: &[u8], _qual: &[u8]) {
+    fn update(&mut self, _name: &[u8], seq: &[u8], _qual: &[u8]) {
         self.total += 1;
         self.longest_seq = self.longest_seq.max(seq.len());
         for (a, (_, adapter)) in ADAPTERS.iter().enumerate() {
@@ -138,10 +138,10 @@ mod tests {
         // 2 reads with the Illumina Universal Adapter at index 4, 2 without.
         let with = b"ACGTAGATCGGAAGAGTTTTTTTTTTTTTTTT"; // adapter at index 4, len 32
         let without = b"ACGTACGTACGTACGTACGTACGTACGTACGT";
-        m.update(with, &[b'I'; 32]);
-        m.update(with, &[b'I'; 32]);
-        m.update(without, &[b'I'; 32]);
-        m.update(without, &[b'I'; 32]);
+        m.update(b"", with, &[b'I'; 32]);
+        m.update(b"", with, &[b'I'; 32]);
+        m.update(b"", without, &[b'I'; 32]);
+        m.update(b"", without, &[b'I'; 32]);
         let mut rows = Vec::new();
         m.finalize(&mut rows);
         let at = |pos: i32| {

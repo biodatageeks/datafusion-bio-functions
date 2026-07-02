@@ -89,7 +89,7 @@ impl QcModule for DuplicationLevels {
         "dup_levels"
     }
 
-    fn update(&mut self, seq: &[u8], _qual: &[u8]) {
+    fn update(&mut self, _name: &[u8], seq: &[u8], _qual: &[u8]) {
         self.count += 1;
         *self.seqs.entry(Self::key(seq).to_vec()).or_insert(0) += 1;
     }
@@ -194,11 +194,11 @@ mod tests {
     fn dup_levels_percentages_and_dedup() {
         // AAAA x3, CCCC x1 -> collated {3:1, 1:1}; rawTotal = 3+1 = 4.
         let mut a = DuplicationLevels::new();
-        a.update(b"AAAA", b"IIII");
-        a.update(b"AAAA", b"IIII");
+        a.update(b"", b"AAAA", b"IIII");
+        a.update(b"", b"AAAA", b"IIII");
         let mut b = DuplicationLevels::new();
-        b.update(b"AAAA", b"IIII");
-        b.update(b"CCCC", b"IIII");
+        b.update(b"", b"AAAA", b"IIII");
+        b.update(b"", b"CCCC", b"IIII");
         a.merge(&b);
         let mut rows = Vec::new();
         a.finalize(&mut rows);
@@ -213,7 +213,7 @@ mod tests {
     fn dup_levels_all_unique_is_100pct_dedup() {
         let mut m = DuplicationLevels::new();
         for s in [b"AAAA".as_slice(), b"CCCC".as_slice(), b"GGGG".as_slice()] {
-            m.update(s, b"IIII");
+            m.update(b"", s, b"IIII");
         }
         let mut rows = Vec::new();
         m.finalize(&mut rows);
@@ -229,8 +229,8 @@ mod tests {
         long_b[55] = b'C';
         let qual = [b'I'; 60];
         let mut m = DuplicationLevels::new();
-        m.update(&long_a, &qual);
-        m.update(&long_b, &qual);
+        m.update(b"", &long_a, &qual);
+        m.update(b"", &long_b, &qual);
         let mut rows = Vec::new();
         m.finalize(&mut rows);
         // 1 distinct seen twice -> bin "2" = 100%, 50% remaining after dedup.

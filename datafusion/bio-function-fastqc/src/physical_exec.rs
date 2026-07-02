@@ -16,7 +16,7 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 use tokio::task::JoinSet;
 
-use crate::{tidy_schema, ModuleSet};
+use crate::{ModuleSet, tidy_schema};
 
 /// Physical operator: fold FASTQ (sequence, quality_scores) batches through the
 /// selected QC modules and emit a single tidy RecordBatch.

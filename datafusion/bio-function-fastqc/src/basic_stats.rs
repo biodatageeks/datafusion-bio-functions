@@ -26,7 +26,7 @@ impl QcModule for BasicStats {
         "basic_stats"
     }
 
-    fn update(&mut self, seq: &[u8], _qual: &[u8]) {
+    fn update(&mut self, _name: &[u8], seq: &[u8], _qual: &[u8]) {
         self.n_seq += 1;
         let len = seq.len() as u64;
         self.total_bases += len;
@@ -37,10 +37,10 @@ impl QcModule for BasicStats {
                 b'G' | b'g' | b'C' | b'c' => {
                     self.gc_bases += 1;
                     self.atgc_bases += 1;
-                },
+                }
                 b'A' | b'a' | b'T' | b't' => self.atgc_bases += 1,
                 b'N' | b'n' => self.n_bases += 1,
-                _ => {},
+                _ => {}
             }
         }
     }
@@ -94,8 +94,8 @@ mod tests {
     fn basic_stats_counts_and_gc() {
         let mut m = BasicStats::new();
         // 2 reads: "ACGT" (gc 2/4), "GGGGCA" (gc 5/6)
-        m.update(b"ACGT", b"IIII");
-        m.update(b"GGGGCA", b"IIIIII");
+        m.update(b"", b"ACGT", b"IIII");
+        m.update(b"", b"GGGGCA", b"IIIIII");
         let mut rows = Vec::new();
         m.finalize(&mut rows);
         let get = |metric: &str| {
@@ -109,19 +109,25 @@ mod tests {
         assert_eq!(get("max_len"), 6.0);
         assert_eq!(get("total_bases"), 10.0);
         assert!((get("gc_pct") - 70.0).abs() < 1e-9); // (2+5)/10*100
-        assert!(rows
-            .iter()
-            .any(|r| r.metric == "status" && r.value_str.as_deref() == Some("PASS")));
+        assert!(
+            rows.iter()
+                .any(|r| r.metric == "status" && r.value_str.as_deref() == Some("PASS"))
+        );
     }
 
     #[test]
     fn basic_stats_n_bases_and_length_range() {
         let mut m = BasicStats::new();
-        m.update(b"NNNN", b"IIII"); // 0 GC, len 4, all N
-        m.update(b"GCGCGC", b"IIIIII"); // 6 GC, len 6
+        m.update(b"", b"NNNN", b"IIII"); // 0 GC, len 4, all N
+        m.update(b"", b"GCGCGC", b"IIIIII"); // 6 GC, len 6
         let mut rows = Vec::new();
         m.finalize(&mut rows);
-        let get = |k: &str| rows.iter().find(|r| r.metric == k).and_then(|r| r.value).unwrap();
+        let get = |k: &str| {
+            rows.iter()
+                .find(|r| r.metric == k)
+                .and_then(|r| r.value)
+                .unwrap()
+        };
         assert_eq!(get("min_len"), 4.0);
         assert_eq!(get("max_len"), 6.0);
         assert_eq!(get("total_bases"), 10.0); // full length, incl N

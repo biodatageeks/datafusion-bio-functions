@@ -27,7 +27,7 @@ impl QcModule for PerBaseN {
         "per_base_n"
     }
 
-    fn update(&mut self, seq: &[u8], _qual: &[u8]) {
+    fn update(&mut self, _name: &[u8], seq: &[u8], _qual: &[u8]) {
         self.ensure_len(seq.len());
         for (i, &b) in seq.iter().enumerate() {
             if b == b'N' || b == b'n' {
@@ -92,8 +92,8 @@ mod tests {
     #[test]
     fn per_base_n_percentage_per_position() {
         let mut m = PerBaseN::new();
-        m.update(b"NAA", b"III"); // pos1 N
-        m.update(b"AAA", b"III");
+        m.update(b"", b"NAA", b"III"); // pos1 N
+        m.update(b"", b"AAA", b"III");
         let mut rows = Vec::new();
         m.finalize(&mut rows);
         let at = |p: i32| {

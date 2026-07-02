@@ -46,7 +46,7 @@ impl QcModule for PerBaseQuality {
         "per_base_quality"
     }
 
-    fn update(&mut self, _seq: &[u8], qual: &[u8]) {
+    fn update(&mut self, _name: &[u8], _seq: &[u8], qual: &[u8]) {
         self.ensure_len(qual.len());
         for (i, &q) in qual.iter().enumerate() {
             let phred = (q.saturating_sub(33)) as usize;
@@ -128,8 +128,8 @@ mod tests {
     fn per_base_quality_mean_per_position() {
         let mut m = PerBaseQuality::new();
         // '!' = phred 0, 'I' = phred 40, '5' = phred 20
-        m.update(b"AA", b"!I"); // pos1 -> 0, pos2 -> 40
-        m.update(b"AA", b"I5"); // pos1 -> 40, pos2 -> 20
+        m.update(b"", b"AA", b"!I"); // pos1 -> 0, pos2 -> 40
+        m.update(b"", b"AA", b"I5"); // pos1 -> 40, pos2 -> 20
         let mut rows = Vec::new();
         m.finalize(&mut rows);
         let mean_at = |pos: i32| {
@@ -147,9 +147,9 @@ mod tests {
         // Merging accumulators built from different-length reads must extend
         // the shorter histogram (ensure_len), not panic or drop positions.
         let mut a = PerBaseQuality::new();
-        a.update(b"AAA", b"III"); // 3 positions, phred 40
+        a.update(b"", b"AAA", b"III"); // 3 positions, phred 40
         let mut b = PerBaseQuality::new();
-        b.update(b"AAAAA", b"!!!!!"); // 5 positions, phred 0
+        b.update(b"", b"AAAAA", b"!!!!!"); // 5 positions, phred 0
         a.merge(&b);
         let mut rows = Vec::new();
         a.finalize(&mut rows);

@@ -28,7 +28,7 @@ impl QcModule for PerBaseContent {
         "per_base_content"
     }
 
-    fn update(&mut self, seq: &[u8], _qual: &[u8]) {
+    fn update(&mut self, _name: &[u8], seq: &[u8], _qual: &[u8]) {
         self.ensure_len(seq.len());
         for (i, &b) in seq.iter().enumerate() {
             match b {
@@ -36,7 +36,7 @@ impl QcModule for PerBaseContent {
                 b'A' | b'a' => self.counts[i][1] += 1,
                 b'T' | b't' => self.counts[i][2] += 1,
                 b'C' | b'c' => self.counts[i][3] += 1,
-                _ => {},
+                _ => {}
             }
         }
     }
@@ -76,7 +76,9 @@ impl QcModule for PerBaseContent {
                 });
             }
             // FastQC flags |%A-%T| or |%G-%C| deviations.
-            worst_diff = worst_diff.max((pct[1] - pct[2]).abs()).max((pct[0] - pct[3]).abs());
+            worst_diff = worst_diff
+                .max((pct[1] - pct[2]).abs())
+                .max((pct[0] - pct[3]).abs());
         }
         let status = if worst_diff > 20.0 {
             "FAIL"
@@ -100,8 +102,8 @@ mod tests {
     #[test]
     fn per_base_content_percentages() {
         let mut m = PerBaseContent::new();
-        m.update(b"GA", b"II");
-        m.update(b"GT", b"II");
+        m.update(b"", b"GA", b"II");
+        m.update(b"", b"GT", b"II");
         let mut rows = Vec::new();
         m.finalize(&mut rows);
         let at = |p: i32, metric: &str| {

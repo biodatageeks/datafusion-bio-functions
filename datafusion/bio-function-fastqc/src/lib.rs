@@ -57,8 +57,8 @@ impl TidyRow {
 pub trait QcModule: Send {
     /// Stable identifier, e.g. "basic_stats".
     fn name(&self) -> &'static str;
-    /// Fold one read (raw sequence bytes and raw phred+33 quality bytes).
-    fn update(&mut self, seq: &[u8], qual: &[u8]);
+    /// Fold one read (raw header/name bytes, raw sequence bytes, raw phred+33 quality bytes).
+    fn update(&mut self, name: &[u8], seq: &[u8], qual: &[u8]);
     /// Merge another accumulator of the SAME concrete type into self.
     fn merge(&mut self, other: &dyn QcModule);
     /// Emit tidy rows for this module's result.
@@ -126,8 +126,8 @@ fn make_module(name: &str) -> Result<Box<dyn QcModule>> {
             return Err(DataFusionError::Plan(format!(
                 "unknown fastqc module '{other}'; valid: {}",
                 ALL_MODULES.join(", ")
-            )))
-        },
+            )));
+        }
     })
 }
 
@@ -154,7 +154,7 @@ impl ModuleSet {
                     .copied()
                     .filter(|m| sel.iter().any(|s| s == m))
                     .collect()
-            },
+            }
         };
         let modules = names
             .iter()
@@ -174,6 +174,11 @@ impl ModuleSet {
                 DataFusionError::Execution("fastqc input missing 'quality_scores'".into())
             })?
             .as_string::<i32>();
+        let name = batch.column_by_name("name").map(|c| c.as_string::<i32>());
+        let desc = batch
+            .column_by_name("description")
+            .map(|c| c.as_string::<i32>());
+        let mut hdr: Vec<u8> = Vec::new();
         for i in 0..batch.num_rows() {
             if seq.is_null(i) {
                 continue;
@@ -184,8 +189,25 @@ impl ModuleSet {
             } else {
                 qual.value(i).as_bytes()
             };
+            // Reconstruct the full FastQC header (name + " " + description) so
+            // header-aware modules (per_tile_quality) parse tiles as FastQC does.
+            hdr.clear();
+            if let Some(n) = &name
+                && !n.is_null(i)
+            {
+                hdr.extend_from_slice(n.value(i).as_bytes());
+            }
+            if let Some(d) = &desc
+                && !d.is_null(i)
+                && !d.value(i).is_empty()
+            {
+                if !hdr.is_empty() {
+                    hdr.push(b' ');
+                }
+                hdr.extend_from_slice(d.value(i).as_bytes());
+            }
             for m in self.modules.iter_mut() {
-                m.update(s, q);
+                m.update(&hdr, s, q);
             }
         }
         Ok(())

@@ -40,7 +40,7 @@ impl QcModule for PerSeqGc {
         "per_seq_gc"
     }
 
-    fn update(&mut self, seq: &[u8], _qual: &[u8]) {
+    fn update(&mut self, _name: &[u8], seq: &[u8], _qual: &[u8]) {
         // FastQC truncates the read first, then counts G/C over the truncated
         // portion and models against the truncated length.
         let len = Self::truncated_len(seq.len());
@@ -51,7 +51,10 @@ impl QcModule for PerSeqGc {
             .iter()
             .filter(|&&b| matches!(b, b'G' | b'g' | b'C' | b'c'))
             .count();
-        let counts = self.by_len.entry(len).or_insert_with(|| vec![0u64; len + 1]);
+        let counts = self
+            .by_len
+            .entry(len)
+            .or_insert_with(|| vec![0u64; len + 1]);
         counts[gc] += 1;
     }
 
@@ -61,7 +64,10 @@ impl QcModule for PerSeqGc {
             .downcast_ref::<PerSeqGc>()
             .expect("merge type mismatch");
         for (len, counts) in &o.by_len {
-            let e = self.by_len.entry(*len).or_insert_with(|| vec![0u64; len + 1]);
+            let e = self
+                .by_len
+                .entry(*len)
+                .or_insert_with(|| vec![0u64; len + 1]);
             for (i, &c) in counts.iter().enumerate() {
                 e[i] += c;
             }
@@ -158,7 +164,7 @@ mod tests {
         // 50%-GC reads (len 8) -> mass concentrates near bin 50.
         let mut m = PerSeqGc::new();
         for _ in 0..10 {
-            m.update(b"ATGCATGC", b"IIIIIIII");
+            m.update(b"", b"ATGCATGC", b"IIIIIIII");
         }
         let mut rows = Vec::new();
         m.finalize(&mut rows);
@@ -179,9 +185,9 @@ mod tests {
         let mut long_seq = vec![b'A'; 100];
         long_seq.push(b'G'); // 101st base, must be ignored
         let mut a = PerSeqGc::new();
-        a.update(&long_seq, &[b'I'; 101]);
+        a.update(b"", &long_seq, &[b'I'; 101]);
         let mut b = PerSeqGc::new();
-        b.update(&[b'A'; 100], &[b'I'; 100]);
+        b.update(b"", &[b'A'; 100], &[b'I'; 100]);
         let (mut ra, mut rb) = (Vec::new(), Vec::new());
         a.finalize(&mut ra);
         b.finalize(&mut rb);
@@ -196,12 +202,12 @@ mod tests {
         let g2: &[&[u8]] = &[b"ATATATAT", b"ATGCGCAT"];
         let (mut a, mut b, mut ab) = (PerSeqGc::new(), PerSeqGc::new(), PerSeqGc::new());
         for s in g1 {
-            a.update(s, b"IIIIIIII");
-            ab.update(s, b"IIIIIIII");
+            a.update(b"", s, b"IIIIIIII");
+            ab.update(b"", s, b"IIIIIIII");
         }
         for s in g2 {
-            b.update(s, b"IIIIIIII");
-            ab.update(s, b"IIIIIIII");
+            b.update(b"", s, b"IIIIIIII");
+            ab.update(b"", s, b"IIIIIIII");
         }
         a.merge(&b);
         let (mut r_merged, mut r_combined) = (Vec::new(), Vec::new());
