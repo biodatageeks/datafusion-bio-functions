@@ -3,6 +3,7 @@
 //! Each module implements `QcModule` (update/merge/finalize), mirroring
 //! RastQC's process_sequence/merge_from/calculate_results.
 
+pub mod adapter_content;
 pub mod basic_stats;
 pub mod dup_levels;
 pub mod overrepresented;
@@ -73,6 +74,7 @@ use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 
+use adapter_content::AdapterContent;
 use basic_stats::BasicStats;
 use dup_levels::DuplicationLevels;
 use overrepresented::OverrepresentedSeqs;
@@ -83,7 +85,7 @@ use per_seq_gc::PerSeqGc;
 use per_seq_quality::PerSeqQuality;
 use seq_length::SeqLength;
 
-pub const ALL_MODULES: [&str; 9] = [
+pub const ALL_MODULES: [&str; 10] = [
     "basic_stats",
     "per_base_quality",
     "per_seq_quality",
@@ -92,6 +94,7 @@ pub const ALL_MODULES: [&str; 9] = [
     "per_base_n",
     "seq_length",
     "overrepresented",
+    "adapter_content",
     "dup_levels",
 ];
 
@@ -117,6 +120,7 @@ fn make_module(name: &str) -> Result<Box<dyn QcModule>> {
         "per_base_n" => Box::new(PerBaseN::new()),
         "seq_length" => Box::new(SeqLength::new()),
         "overrepresented" => Box::new(OverrepresentedSeqs::new()),
+        "adapter_content" => Box::new(AdapterContent::new()),
         "dup_levels" => Box::new(DuplicationLevels::new()),
         other => {
             return Err(DataFusionError::Plan(format!(

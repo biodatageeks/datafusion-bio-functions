@@ -124,6 +124,10 @@ fn golden(path: &str) -> GoldenData {
     let mut per_base_n: HashMap<i32, f64> = HashMap::new();
     let mut per_base_content: HashMap<(i32, String), f64> = HashMap::new();
     let mut overrep: HashMap<String, (f64, f64)> = HashMap::new(); // seq -> (count, pct)
+    let mut adapter: HashMap<(i32, String), f64> = HashMap::new(); // (pos, adapter) -> pct
+
+    // Column order of the Adapter Content table (filled from its header line).
+    let mut adapter_names: Vec<String> = Vec::new();
 
     let mut module = "";
     for line in text.lines() {
@@ -141,12 +145,18 @@ fn golden(path: &str) -> GoldenData {
                 "Per base N content" => "per_base_n",
                 "Sequence Length Distribution" => "seq_length",
                 "Overrepresented sequences" => "overrepresented",
+                "Adapter Content" => "adapter_content",
                 "Sequence Duplication Levels" => "dup_levels",
                 _ => "",
             };
             continue;
         }
         if module.is_empty() {
+            continue;
+        }
+        // The Adapter Content header names the adapter columns.
+        if module == "adapter_content" && line.starts_with("#Position") {
+            adapter_names = line.split('\t').skip(1).map(|s| s.to_string()).collect();
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
@@ -193,6 +203,12 @@ fn golden(path: &str) -> GoldenData {
                     (cols[1].parse().unwrap(), cols[2].parse().unwrap()),
                 );
             },
+            "adapter_content" if !line.starts_with('#') => {
+                let pos: i32 = cols[0].split('-').next().unwrap().parse().unwrap();
+                for (k, name) in adapter_names.iter().enumerate() {
+                    adapter.insert((pos, name.clone()), cols[k + 1].parse().unwrap());
+                }
+            },
             "dup_levels" if line.starts_with("#Total Deduplicated") => {
                 total_dedup = cols[1].parse().unwrap()
             },
@@ -214,6 +230,7 @@ fn golden(path: &str) -> GoldenData {
         per_base_n,
         per_base_content,
         overrep,
+        adapter,
     }
 }
 
@@ -229,6 +246,7 @@ struct GoldenData {
     per_base_n: HashMap<i32, f64>,
     per_base_content: HashMap<(i32, String), f64>,
     overrep: HashMap<String, (f64, f64)>,
+    adapter: HashMap<(i32, String), f64>,
 }
 
 #[test]
@@ -372,6 +390,26 @@ fn overrepresented_matches_fastqc_exactly() {
         .map(|(_, label, _, _)| label.clone())
         .collect();
     assert_eq!(our_seqs.len(), g.overrep.len(), "overrepresented set size");
+}
+
+#[test]
+fn adapter_content_matches_fastqc_exactly() {
+    // adapter_mix has 20/50 reads carrying the Illumina Universal Adapter.
+    let ours = run_tidy(&data("adapter_mix.fastq"));
+    let g = golden(&data("adapter_mix.nogroup.fastqc_data.txt"));
+    assert!(!g.adapter.is_empty());
+    let mut checked_nonzero = false;
+    for ((pos, name), expected) in &g.adapter {
+        let got = ours[&("adapter_content".into(), name.clone(), *pos, "pct".into())];
+        assert!(
+            (got - expected).abs() <= 1e-9,
+            "adapter {name} pos {pos}: {got} vs {expected}"
+        );
+        if *expected > 0.0 {
+            checked_nonzero = true;
+        }
+    }
+    assert!(checked_nonzero, "fixture should exercise a non-zero adapter curve");
 }
 
 #[test]
