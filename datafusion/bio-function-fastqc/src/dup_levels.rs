@@ -156,4 +156,25 @@ mod tests {
             .unwrap();
         assert!((pct_dup - 50.0).abs() < 1e-9); // (4-2)/4*100
     }
+
+    #[test]
+    fn dup_levels_keys_on_50bp_prefix() {
+        // Two 60bp reads share the first 50bp but differ after -> same key,
+        // counted as duplicates (KEY_PREFIX = 50).
+        let a = [b'A'; 60];
+        let mut b = [b'A'; 60];
+        b[55] = b'C'; // differs only beyond the 50bp prefix
+        let qual = [b'I'; 60];
+        let mut m = DuplicationLevels::new();
+        m.update(&a, &qual);
+        m.update(&b, &qual);
+        let mut rows = Vec::new();
+        m.finalize(&mut rows);
+        let pct_dup = rows
+            .iter()
+            .find(|r| r.metric == "pct_dup")
+            .and_then(|r| r.value)
+            .unwrap();
+        assert!((pct_dup - 50.0).abs() < 1e-9); // 1 distinct, 2 obs
+    }
 }

@@ -141,4 +141,25 @@ mod tests {
         assert!((mean_at(1) - 20.0).abs() < 1e-9);
         assert!((mean_at(2) - 30.0).abs() < 1e-9);
     }
+
+    #[test]
+    fn per_base_quality_merge_variable_lengths() {
+        // Merging accumulators built from different-length reads must extend
+        // the shorter histogram (ensure_len), not panic or drop positions.
+        let mut a = PerBaseQuality::new();
+        a.update(b"AAA", b"III"); // 3 positions, phred 40
+        let mut b = PerBaseQuality::new();
+        b.update(b"AAAAA", b"!!!!!"); // 5 positions, phred 0
+        a.merge(&b);
+        let mut rows = Vec::new();
+        a.finalize(&mut rows);
+        let mean_at = |pos: i32| {
+            rows.iter()
+                .find(|r| r.position == Some(pos) && r.metric == "mean")
+                .and_then(|r| r.value)
+        };
+        // pos1: (40 + 0) / 2 = 20; pos5 only from the longer read = 0
+        assert!((mean_at(1).unwrap() - 20.0).abs() < 1e-9);
+        assert!((mean_at(5).unwrap() - 0.0).abs() < 1e-9);
+    }
 }

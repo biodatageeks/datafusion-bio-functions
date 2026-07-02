@@ -1,22 +1,23 @@
 use std::any::Any;
+use std::collections::HashMap;
 
 use crate::{QcModule, TidyRow};
 
-/// FastQC "Per Sequence GC Content": distribution of per-read GC% over 0..=100.
-#[derive(Debug)]
+/// FastQC "Per Sequence GC Content".
+///
+/// Matches FastQC exactly: raw counts are accumulated per `(read_length,
+/// gc_count)` (integer, so the cross-partition merge stays associative), then
+/// `finalize` interpolates each read's real GC% linearly across the two nearest
+/// integer 0..=100 bins — FastQC's smoothing that yields fractional counts.
+#[derive(Debug, Default)]
 pub struct PerSeqGc {
-    bins: [u64; 101],
+    /// read length -> counts indexed by gc_count (0..=length)
+    by_len: HashMap<usize, Vec<u64>>,
 }
 
 impl PerSeqGc {
     pub fn new() -> Self {
-        Self { bins: [0u64; 101] }
-    }
-}
-
-impl Default for PerSeqGc {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 
@@ -26,27 +27,17 @@ impl QcModule for PerSeqGc {
     }
 
     fn update(&mut self, seq: &[u8], _qual: &[u8]) {
-        if seq.is_empty() {
+        let len = seq.len();
+        if len == 0 {
             return;
         }
-        let mut gc = 0u64;
-        let mut counted = 0u64;
-        for &b in seq {
-            match b {
-                b'G' | b'g' | b'C' | b'c' => {
-                    gc += 1;
-                    counted += 1;
-                },
-                b'A' | b'a' | b'T' | b't' | b'U' | b'u' => counted += 1,
-                _ => {}, // N excluded from denominator, matching FastQC
-            }
-        }
-        if counted == 0 {
-            return;
-        }
-        let pct = (gc as f64 / counted as f64) * 100.0;
-        let bin = pct.round() as usize;
-        self.bins[bin.min(100)] += 1;
+        // FastQC uses the full read length (incl. N) as the denominator.
+        let gc = seq
+            .iter()
+            .filter(|&&b| matches!(b, b'G' | b'g' | b'C' | b'c'))
+            .count();
+        let counts = self.by_len.entry(len).or_insert_with(|| vec![0u64; len + 1]);
+        counts[gc] += 1;
     }
 
     fn merge(&mut self, other: &dyn QcModule) {
@@ -54,26 +45,83 @@ impl QcModule for PerSeqGc {
             .as_any()
             .downcast_ref::<PerSeqGc>()
             .expect("merge type mismatch");
-        for i in 0..101 {
-            self.bins[i] += o.bins[i];
+        for (len, counts) in &o.by_len {
+            let e = self.by_len.entry(*len).or_insert_with(|| vec![0u64; len + 1]);
+            for (i, &c) in counts.iter().enumerate() {
+                e[i] += c;
+            }
         }
     }
 
     fn finalize(&self, out: &mut Vec<TidyRow>) {
         let m = "per_seq_gc";
-        for (g, &c) in self.bins.iter().enumerate() {
+        // Replicate FastQC's GCModel exactly: for a read of length L, a GC count
+        // `pos` claims the percentage bins round((pos-0.5)*100/L)..=round((pos+
+        // 0.5)*100/L), each weighted 1/claimingCounts[p], where claimingCounts[p]
+        // is how many gc-counts (0..=L) map onto bin p. Lengths are processed in
+        // sorted order so the float accumulation is deterministic regardless of
+        // how partitions merged.
+        let mut bins = [0f64; 101];
+        let mut lens: Vec<usize> = self.by_len.keys().copied().collect();
+        lens.sort_unstable();
+        for len in lens {
+            if len == 0 {
+                continue;
+            }
+            let lenf = len as f64;
+            // Java Math.round == round-half-up; percentages are non-negative so
+            // f64::round (half away from zero) is equivalent here.
+            let bounds = |pos: usize| -> (usize, usize) {
+                let mut low = pos as f64 - 0.5;
+                let mut high = pos as f64 + 0.5;
+                if low < 0.0 {
+                    low = 0.0;
+                }
+                if high < 0.0 {
+                    high = 0.0;
+                }
+                if high > lenf {
+                    high = lenf;
+                }
+                if low > lenf {
+                    low = lenf;
+                }
+                let lp = (low * 100.0 / lenf).round() as usize;
+                let hp = (high * 100.0 / lenf).round() as usize;
+                (lp, hp)
+            };
+            // Pass 1: claiming counts.
+            let mut claiming = [0i64; 101];
+            for pos in 0..=len {
+                let (lp, hp) = bounds(pos);
+                for c in claiming.iter_mut().take(hp + 1).skip(lp) {
+                    *c += 1;
+                }
+            }
+            // Pass 2: distribute each read's weight over its claimed bins.
+            let counts = &self.by_len[&len];
+            for (gc, &c) in counts.iter().enumerate() {
+                if c == 0 {
+                    continue;
+                }
+                let (lp, hp) = bounds(gc);
+                for p in lp..=hp {
+                    bins[p] += c as f64 / claiming[p] as f64;
+                }
+            }
+        }
+        for (g, &c) in bins.iter().enumerate() {
             out.push(TidyRow {
                 module: m,
                 label: None,
                 position: Some(g as i32),
                 metric: "count".to_string(),
-                value: Some(c as f64),
+                value: Some(c),
                 value_str: None,
             });
         }
         // Phase-1 status: PASS. Exact FastQC theoretical-distribution status
-        // is a follow-up; the parity harness checks the count distribution,
-        // which is exact here.
+        // (warn/fail on deviation from the modelled normal) is a follow-up.
         out.push(TidyRow::status(m, "PASS"));
     }
 
@@ -86,22 +134,48 @@ impl QcModule for PerSeqGc {
 mod tests {
     use super::*;
 
+    fn counts(rows: &[TidyRow]) -> Vec<&TidyRow> {
+        rows.iter().filter(|r| r.metric == "count").collect()
+    }
+
     #[test]
-    fn per_seq_gc_bins_reads() {
+    fn per_seq_gc_emits_full_axis_with_peak_near_true_gc() {
+        // 50%-GC reads (len 8) -> mass concentrates near bin 50.
         let mut m = PerSeqGc::new();
-        m.update(b"GGCC", b"IIII"); // 100% -> bin 100
-        m.update(b"ATAT", b"IIII"); // 0%   -> bin 0
-        m.update(b"ATGC", b"IIII"); // 50%  -> bin 50
+        for _ in 0..10 {
+            m.update(b"ATGCATGC", b"IIIIIIII");
+        }
         let mut rows = Vec::new();
         m.finalize(&mut rows);
-        let count_at = |bin: i32| {
-            rows.iter()
-                .find(|r| r.position == Some(bin) && r.metric == "count")
-                .and_then(|r| r.value)
-                .unwrap_or(0.0)
-        };
-        assert_eq!(count_at(0), 1.0);
-        assert_eq!(count_at(50), 1.0);
-        assert_eq!(count_at(100), 1.0);
+        let c = counts(&rows);
+        assert_eq!(c.len(), 101); // bins 0..=100
+        assert!(rows.iter().any(|r| r.metric == "status"));
+        let peak = c
+            .iter()
+            .max_by(|a, b| a.value.partial_cmp(&b.value).unwrap())
+            .unwrap();
+        assert!((40..=60).contains(&peak.position.unwrap()));
+    }
+
+    #[test]
+    fn per_seq_gc_merge_equals_combined() {
+        // merge(a, b) must equal accumulating everything into one set, and
+        // finalize must be deterministic -> underpins partition invariance.
+        let g1: &[&[u8]] = &[b"ATGCATGC", b"GGGGCCCC"];
+        let g2: &[&[u8]] = &[b"ATATATAT", b"ATGCGCAT"];
+        let (mut a, mut b, mut ab) = (PerSeqGc::new(), PerSeqGc::new(), PerSeqGc::new());
+        for s in g1 {
+            a.update(s, b"IIIIIIII");
+            ab.update(s, b"IIIIIIII");
+        }
+        for s in g2 {
+            b.update(s, b"IIIIIIII");
+            ab.update(s, b"IIIIIIII");
+        }
+        a.merge(&b);
+        let (mut r_merged, mut r_combined) = (Vec::new(), Vec::new());
+        a.finalize(&mut r_merged);
+        ab.finalize(&mut r_combined);
+        assert_eq!(r_merged, r_combined);
     }
 }

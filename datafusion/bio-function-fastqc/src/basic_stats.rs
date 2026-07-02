@@ -103,4 +103,19 @@ mod tests {
             .iter()
             .any(|r| r.metric == "status" && r.value_str.as_deref() == Some("PASS")));
     }
+
+    #[test]
+    fn basic_stats_n_bases_and_length_range() {
+        let mut m = BasicStats::new();
+        m.update(b"NNNN", b"IIII"); // 0 GC, len 4, all N
+        m.update(b"GCGCGC", b"IIIIII"); // 6 GC, len 6
+        let mut rows = Vec::new();
+        m.finalize(&mut rows);
+        let get = |k: &str| rows.iter().find(|r| r.metric == k).and_then(|r| r.value).unwrap();
+        assert_eq!(get("min_len"), 4.0);
+        assert_eq!(get("max_len"), 6.0);
+        assert_eq!(get("total_bases"), 10.0);
+        // N counts toward total bases but not GC: 6 / 10 * 100 = 60%.
+        assert!((get("gc_pct") - 60.0).abs() < 1e-9);
+    }
 }
