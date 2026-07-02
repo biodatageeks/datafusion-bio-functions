@@ -4,6 +4,7 @@
 //! RastQC's process_sequence/merge_from/calculate_results.
 
 pub mod basic_stats;
+pub mod dup_levels;
 pub mod per_base_quality;
 pub mod per_seq_gc;
 
