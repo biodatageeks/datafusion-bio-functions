@@ -30,7 +30,7 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 noodles-core = "0.16"
 noodles-fasta = "0.49"
-parquet = { version = "=58.0.0", features = ["arrow"] }
+parquet = { version = "=58.0.0", features = ["arrow", "async"] }
 # Stock lance 7.0.0. The fork's miniblock large-chunk fix is NOT needed once the AF List
 # columns are forced to TRUE fullzip by disabling dictionary encoding on them (see
 # af_bundle::bundled_list_field). With no miniblock AF pages, take_rows never hits the
