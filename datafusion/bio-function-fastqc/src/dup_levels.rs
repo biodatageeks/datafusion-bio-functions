@@ -3,16 +3,75 @@ use std::collections::HashMap;
 
 use crate::{QcModule, TidyRow};
 
-/// FastQC caps distinct-sequence tracking to bound memory.
-const MAX_TRACKED: usize = 100_000;
-/// Only the first N bases are used as the dedup key (FastQC uses 50).
+/// FastQC truncates a read to its first 50bp before using it as a duplication
+/// key (so downstream miscalls don't split otherwise-identical reads).
 const KEY_PREFIX: usize = 50;
 
-/// FastQC "Sequence Duplication Levels".
+/// FastQC "Sequence Duplication Levels" (matches FastQC 0.12.1 exactly for
+/// libraries with <= 100k distinct sequences, i.e. the range where FastQC does
+/// not freeze its observation table and applies no count correction).
+///
+/// We do NOT freeze at FastQC's 100k-unique cap: keeping every key makes the
+/// parallel merge exact and deterministic. `getCorrectedCount` is implemented
+/// faithfully but is the identity while `count_at_unique_limit == count`, which
+/// always holds here — so beyond 100k distinct sequences we are more accurate
+/// than (and diverge from) FastQC's sampled estimate.
 #[derive(Debug, Default)]
 pub struct DuplicationLevels {
-    counts: HashMap<Vec<u8>, u64>,
-    overflow_obs: u64,
+    /// truncated sequence -> number of observations
+    seqs: HashMap<Vec<u8>, u64>,
+    /// total sequences seen
+    count: u64,
+}
+
+/// FastQC's 16 duplication-level bins.
+const LABELS: [&str; 16] = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", ">10", ">50", ">100", ">500", ">1k", ">5k",
+    ">10k+",
+];
+
+/// FastQC's dupSlot mapping: slot = f(dupLevel-1).
+fn dup_slot(dup_level: u64) -> usize {
+    let s = dup_level as i64 - 1;
+    if !(0..=9999).contains(&s) {
+        15
+    } else if s > 4999 {
+        14
+    } else if s > 999 {
+        13
+    } else if s > 499 {
+        12
+    } else if s > 99 {
+        11
+    } else if s > 49 {
+        10
+    } else if s > 9 {
+        9
+    } else {
+        s as usize
+    }
+}
+
+/// FastQC's corrected-count estimator. Returns the observed count unchanged
+/// whenever the full library was tracked (`count_at_unique_limit == total`).
+fn corrected_count(count_at_limit: u64, total: u64, dup_level: u64, num_obs: u64) -> f64 {
+    if count_at_limit == total {
+        return num_obs as f64;
+    }
+    if total - num_obs < count_at_limit {
+        return num_obs as f64;
+    }
+    let mut p_not_seeing = 1.0f64;
+    let limit_of_caring = 1.0 - (num_obs as f64 / (num_obs as f64 + 0.01));
+    for i in 0..count_at_limit {
+        p_not_seeing *= ((total - i) as f64 - dup_level as f64) / (total - i) as f64;
+        if p_not_seeing < limit_of_caring {
+            p_not_seeing = 0.0;
+            break;
+        }
+    }
+    let p_seeing = 1.0 - p_not_seeing;
+    num_obs as f64 / p_seeing
 }
 
 impl DuplicationLevels {
@@ -20,48 +79,10 @@ impl DuplicationLevels {
         Self::default()
     }
 
-    fn key(seq: &[u8]) -> Vec<u8> {
-        let n = seq.len().min(KEY_PREFIX);
-        seq[..n].to_ascii_uppercase()
-    }
-
-    fn add_count(&mut self, key: Vec<u8>, n: u64) {
-        if let Some(c) = self.counts.get_mut(&key) {
-            *c += n;
-        } else if self.counts.len() < MAX_TRACKED {
-            self.counts.insert(key, n);
-        } else {
-            self.overflow_obs += n;
-        }
-    }
-
-    fn level_bin(count: u64) -> &'static str {
-        match count {
-            0 => unreachable!(),
-            1 => "1",
-            2 => "2",
-            3 => "3",
-            4 => "4",
-            5 => "5",
-            6 => "6",
-            7 => "7",
-            8 => "8",
-            9 => "9",
-            10..=49 => ">10",
-            50..=99 => ">50",
-            100..=499 => ">100",
-            500..=999 => ">500",
-            1000..=4999 => ">1k",
-            5000..=9999 => ">5k",
-            _ => ">10k+",
-        }
+    fn key(seq: &[u8]) -> &[u8] {
+        &seq[..seq.len().min(KEY_PREFIX)]
     }
 }
-
-const BINS: [&str; 16] = [
-    "1", "2", "3", "4", "5", "6", "7", "8", "9", ">10", ">50", ">100", ">500", ">1k", ">5k",
-    ">10k+",
-];
 
 impl QcModule for DuplicationLevels {
     fn name(&self) -> &'static str {
@@ -69,8 +90,8 @@ impl QcModule for DuplicationLevels {
     }
 
     fn update(&mut self, seq: &[u8], _qual: &[u8]) {
-        let key = Self::key(seq);
-        self.add_count(key, 1);
+        self.count += 1;
+        *self.seqs.entry(Self::key(seq).to_vec()).or_insert(0) += 1;
     }
 
     fn merge(&mut self, other: &dyn QcModule) {
@@ -78,32 +99,47 @@ impl QcModule for DuplicationLevels {
             .as_any()
             .downcast_ref::<DuplicationLevels>()
             .expect("merge type mismatch");
-        for (k, &c) in &o.counts {
-            self.add_count(k.clone(), c);
+        self.count += o.count;
+        for (k, &c) in &o.seqs {
+            *self.seqs.entry(k.clone()).or_insert(0) += c;
         }
-        self.overflow_obs += o.overflow_obs;
     }
 
     fn finalize(&self, out: &mut Vec<TidyRow>) {
         let m = "dup_levels";
-        let distinct = self.counts.len() as u64;
-        let tracked_obs: u64 = self.counts.values().sum();
-        let total_obs = tracked_obs + self.overflow_obs;
+        // We tracked every sequence, so the observation limit equals the total.
+        let count_at_limit = self.count;
 
-        let mut level_counts: HashMap<&'static str, u64> = HashMap::new();
-        for &c in self.counts.values() {
-            *level_counts.entry(Self::level_bin(c)).or_insert(0) += 1;
+        // Collate: duplication level -> number of distinct sequences at it.
+        let mut collated: HashMap<u64, u64> = HashMap::new();
+        for &c in self.seqs.values() {
+            *collated.entry(c).or_insert(0) += 1;
         }
-        for bin in BINS {
-            let n = *level_counts.get(bin).unwrap_or(&0);
-            let pct = if distinct > 0 {
-                n as f64 / distinct as f64 * 100.0
+
+        // Correct + accumulate into raw / dedup totals and the 16 bins,
+        // iterating dup levels in sorted order for deterministic float sums.
+        let mut levels: Vec<u64> = collated.keys().copied().collect();
+        levels.sort_unstable();
+        let mut total_percentages = [0f64; 16];
+        let mut dedup_total = 0f64;
+        let mut raw_total = 0f64;
+        for dup_level in levels {
+            let num_obs = collated[&dup_level];
+            let corrected = corrected_count(count_at_limit, self.count, dup_level, num_obs);
+            dedup_total += corrected;
+            raw_total += corrected * dup_level as f64;
+            total_percentages[dup_slot(dup_level)] += corrected * dup_level as f64;
+        }
+
+        for (i, label) in LABELS.iter().enumerate() {
+            let pct = if raw_total > 0.0 {
+                total_percentages[i] / raw_total * 100.0
             } else {
                 0.0
             };
             out.push(TidyRow {
                 module: m,
-                label: Some(bin.to_string()),
+                label: Some(label.to_string()),
                 position: None,
                 metric: "pct".to_string(),
                 value: Some(pct),
@@ -111,16 +147,19 @@ impl QcModule for DuplicationLevels {
             });
         }
 
-        let pct_dup = if total_obs > 0 {
-            (total_obs - distinct.min(total_obs)) as f64 / total_obs as f64 * 100.0
+        // FastQC's headline number: % of sequences remaining after dedup.
+        let percent_different = if raw_total == 0.0 {
+            100.0
         } else {
-            0.0
+            dedup_total / raw_total * 100.0
         };
-        out.push(TidyRow::num(m, "pct_dup", pct_dup));
+        out.push(TidyRow::num(m, "total_dedup_pct", percent_different));
 
-        let status = if pct_dup > 50.0 {
+        // FastQC status thresholds (Configuration/limits.txt): warn < 70,
+        // error < 50, on the % remaining after deduplication.
+        let status = if percent_different < 50.0 {
             "FAIL"
-        } else if pct_dup > 20.0 {
+        } else if percent_different < 70.0 {
             "WARN"
         } else {
             "PASS"
@@ -137,8 +176,23 @@ impl QcModule for DuplicationLevels {
 mod tests {
     use super::*;
 
+    fn pct_at(rows: &[TidyRow], label: &str) -> f64 {
+        rows.iter()
+            .find(|r| r.label.as_deref() == Some(label) && r.metric == "pct")
+            .and_then(|r| r.value)
+            .unwrap()
+    }
+
+    fn scalar(rows: &[TidyRow], metric: &str) -> f64 {
+        rows.iter()
+            .find(|r| r.metric == metric)
+            .and_then(|r| r.value)
+            .unwrap()
+    }
+
     #[test]
-    fn dup_levels_and_merge() {
+    fn dup_levels_percentages_and_dedup() {
+        // AAAA x3, CCCC x1 -> collated {3:1, 1:1}; rawTotal = 3+1 = 4.
         let mut a = DuplicationLevels::new();
         a.update(b"AAAA", b"IIII");
         a.update(b"AAAA", b"IIII");
@@ -146,35 +200,41 @@ mod tests {
         b.update(b"AAAA", b"IIII");
         b.update(b"CCCC", b"IIII");
         a.merge(&b);
-        // AAAA x3, CCCC x1 -> 2 distinct, 4 observations.
         let mut rows = Vec::new();
         a.finalize(&mut rows);
-        let pct_dup = rows
-            .iter()
-            .find(|r| r.metric == "pct_dup")
-            .and_then(|r| r.value)
-            .unwrap();
-        assert!((pct_dup - 50.0).abs() < 1e-9); // (4-2)/4*100
+        // bin "3" gets the AAAA reads: 3/4*100 = 75; bin "1" gets CCCC: 1/4*100 = 25.
+        assert!((pct_at(&rows, "3") - 75.0).abs() < 1e-9);
+        assert!((pct_at(&rows, "1") - 25.0).abs() < 1e-9);
+        // 2 distinct / 4 total -> 50% remaining after dedup.
+        assert!((scalar(&rows, "total_dedup_pct") - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dup_levels_all_unique_is_100pct_dedup() {
+        let mut m = DuplicationLevels::new();
+        for s in [b"AAAA".as_slice(), b"CCCC".as_slice(), b"GGGG".as_slice()] {
+            m.update(s, b"IIII");
+        }
+        let mut rows = Vec::new();
+        m.finalize(&mut rows);
+        assert!((pct_at(&rows, "1") - 100.0).abs() < 1e-9);
+        assert!((scalar(&rows, "total_dedup_pct") - 100.0).abs() < 1e-9);
     }
 
     #[test]
     fn dup_levels_keys_on_50bp_prefix() {
-        // Two 60bp reads share the first 50bp but differ after -> same key,
-        // counted as duplicates (KEY_PREFIX = 50).
-        let a = [b'A'; 60];
-        let mut b = [b'A'; 60];
-        b[55] = b'C'; // differs only beyond the 50bp prefix
+        // Two 60bp reads share the first 50bp but differ after -> same key.
+        let long_a = vec![b'A'; 60];
+        let mut long_b = vec![b'A'; 60];
+        long_b[55] = b'C';
         let qual = [b'I'; 60];
         let mut m = DuplicationLevels::new();
-        m.update(&a, &qual);
-        m.update(&b, &qual);
+        m.update(&long_a, &qual);
+        m.update(&long_b, &qual);
         let mut rows = Vec::new();
         m.finalize(&mut rows);
-        let pct_dup = rows
-            .iter()
-            .find(|r| r.metric == "pct_dup")
-            .and_then(|r| r.value)
-            .unwrap();
-        assert!((pct_dup - 50.0).abs() < 1e-9); // 1 distinct, 2 obs
+        // 1 distinct seen twice -> bin "2" = 100%, 50% remaining after dedup.
+        assert!((pct_at(&rows, "2") - 100.0).abs() < 1e-9);
+        assert!((scalar(&rows, "total_dedup_pct") - 50.0).abs() < 1e-9);
     }
 }

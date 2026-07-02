@@ -8,6 +8,8 @@ pub struct BasicStats {
     n_seq: u64,
     total_bases: u64,
     gc_bases: u64,
+    /// A+T+G+C only — FastQC's %GC denominator excludes N (and any other base).
+    atgc_bases: u64,
     n_bases: u64,
     min_len: Option<u64>,
     max_len: u64,
@@ -32,7 +34,11 @@ impl QcModule for BasicStats {
         self.min_len = Some(self.min_len.map_or(len, |m| m.min(len)));
         for &b in seq {
             match b {
-                b'G' | b'g' | b'C' | b'c' => self.gc_bases += 1,
+                b'G' | b'g' | b'C' | b'c' => {
+                    self.gc_bases += 1;
+                    self.atgc_bases += 1;
+                },
+                b'A' | b'a' | b'T' | b't' => self.atgc_bases += 1,
                 b'N' | b'n' => self.n_bases += 1,
                 _ => {},
             }
@@ -47,6 +53,7 @@ impl QcModule for BasicStats {
         self.n_seq += o.n_seq;
         self.total_bases += o.total_bases;
         self.gc_bases += o.gc_bases;
+        self.atgc_bases += o.atgc_bases;
         self.n_bases += o.n_bases;
         self.max_len = self.max_len.max(o.max_len);
         self.min_len = match (self.min_len, o.min_len) {
@@ -61,8 +68,11 @@ impl QcModule for BasicStats {
         out.push(TidyRow::num(m, "total_bases", self.total_bases as f64));
         out.push(TidyRow::num(m, "min_len", self.min_len.unwrap_or(0) as f64));
         out.push(TidyRow::num(m, "max_len", self.max_len as f64));
-        let gc_pct = if self.total_bases > 0 {
-            self.gc_bases as f64 / self.total_bases as f64 * 100.0
+        // FastQC computes %GC as (G+C)*100/(A+T+G+C) with integer division and
+        // N excluded. We emit the full-precision value over A/T/G/C (FastQC
+        // displays its floor, e.g. 47.23 -> "47").
+        let gc_pct = if self.atgc_bases > 0 {
+            self.gc_bases as f64 / self.atgc_bases as f64 * 100.0
         } else {
             0.0
         };
@@ -114,8 +124,8 @@ mod tests {
         let get = |k: &str| rows.iter().find(|r| r.metric == k).and_then(|r| r.value).unwrap();
         assert_eq!(get("min_len"), 4.0);
         assert_eq!(get("max_len"), 6.0);
-        assert_eq!(get("total_bases"), 10.0);
-        // N counts toward total bases but not GC: 6 / 10 * 100 = 60%.
-        assert!((get("gc_pct") - 60.0).abs() < 1e-9);
+        assert_eq!(get("total_bases"), 10.0); // full length, incl N
+        // FastQC excludes N from %GC: (6 G/C) / (6 A+T+G+C) * 100 = 100%.
+        assert!((get("gc_pct") - 100.0).abs() < 1e-9);
     }
 }
