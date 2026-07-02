@@ -16,12 +16,20 @@ const KEY_PREFIX: usize = 50;
 /// faithfully but is the identity while `count_at_unique_limit == count`, which
 /// always holds here — so beyond 100k distinct sequences we are more accurate
 /// than (and diverge from) FastQC's sampled estimate.
+/// FastQC stops tracking NEW distinct sequences after this many uniques, to
+/// bound memory (`OverRepresentedSeqs.OBSERVATION_CUTOFF`).
+const OBSERVATION_CUTOFF: usize = 100_000;
+
 #[derive(Debug, Default)]
 pub struct DuplicationLevels {
     /// truncated sequence -> number of observations
     seqs: HashMap<Vec<u8>, u64>,
     /// total sequences seen
     count: u64,
+    /// once `seqs` reaches OBSERVATION_CUTOFF we stop adding new keys
+    frozen: bool,
+    /// total observations at the moment we froze (feeds `corrected_count`)
+    count_at_unique_limit: u64,
 }
 
 /// FastQC's 16 duplication-level bins.
@@ -90,8 +98,22 @@ impl QcModule for DuplicationLevels {
     }
 
     fn update(&mut self, _name: &[u8], seq: &[u8], _qual: &[u8]) {
+        // Mirrors FastQC OverRepresentedSeqs.processSequence: count every read,
+        // but stop adding NEW distinct sequences once frozen.
         self.count += 1;
-        *self.seqs.entry(Self::key(seq).to_vec()).or_insert(0) += 1;
+        let key = Self::key(seq);
+        if let Some(c) = self.seqs.get_mut(key) {
+            *c += 1;
+            if !self.frozen {
+                self.count_at_unique_limit = self.count;
+            }
+        } else if !self.frozen {
+            self.seqs.insert(key.to_vec(), 1);
+            self.count_at_unique_limit = self.count;
+            if self.seqs.len() == OBSERVATION_CUTOFF {
+                self.frozen = true;
+            }
+        }
     }
 
     fn merge(&mut self, other: &dyn QcModule) {
@@ -99,7 +121,13 @@ impl QcModule for DuplicationLevels {
             .as_any()
             .downcast_ref::<DuplicationLevels>()
             .expect("merge type mismatch");
+        // Union the per-partition tables (each already bounded to
+        // OBSERVATION_CUTOFF keys, so the merged table is bounded to
+        // CUTOFF * n_partitions). A single-partition scan reproduces FastQC's
+        // in-order freeze exactly; multi-partition is a bounded approximation.
         self.count += o.count;
+        self.count_at_unique_limit += o.count_at_unique_limit;
+        self.frozen |= o.frozen;
         for (k, &c) in &o.seqs {
             *self.seqs.entry(k.clone()).or_insert(0) += c;
         }
@@ -107,8 +135,11 @@ impl QcModule for DuplicationLevels {
 
     fn finalize(&self, out: &mut Vec<TidyRow>) {
         let m = "dup_levels";
-        // We tracked every sequence, so the observation limit equals the total.
-        let count_at_limit = self.count;
+        // Observations counted while the table was still growing. Equals the
+        // total whenever we never froze (< 100k distinct), so small libraries
+        // are unchanged and exact; past the freeze this drives FastQC's
+        // corrected-count estimator.
+        let count_at_limit = self.count_at_unique_limit;
 
         // Collate: duplication level -> number of distinct sequences at it.
         let mut collated: HashMap<u64, u64> = HashMap::new();
@@ -188,6 +219,40 @@ mod tests {
             .find(|r| r.metric == metric)
             .and_then(|r| r.value)
             .unwrap()
+    }
+
+    #[test]
+    fn freezes_at_100k_unique_but_keeps_counting() {
+        // FastQC stops tracking NEW sequences after 100k unique, but keeps
+        // counting total observations. This bounds memory on diverse libraries.
+        let mut m = DuplicationLevels::new();
+        for i in 0..120_000u32 {
+            m.update(b"", format!("{i:0>50}").as_bytes(), b"");
+        }
+        assert_eq!(m.seqs.len(), 100_000); // frozen at the observation cutoff
+        assert_eq!(m.count, 120_000); // total keeps growing past the freeze
+        assert_eq!(m.count_at_unique_limit, 100_000); // count when we froze
+    }
+
+    #[test]
+    fn freeze_correction_matches_fastqc() {
+        // 100k unique singletons then 50k copies of one already-tracked seq.
+        // FastQC 0.12.1 reports exactly 66.667% remaining after dedup and puts
+        // the duplicated sequence in the ">10k+" bin — we must reproduce that
+        // via the frozen-table correction (verified against a real golden run).
+        let mut m = DuplicationLevels::new();
+        for i in 0..100_000u32 {
+            m.update(b"", format!("{i:0>50}").as_bytes(), b"");
+        }
+        let dup = format!("{:0>50}", 0u32);
+        for _ in 0..50_000 {
+            m.update(b"", dup.as_bytes(), b"");
+        }
+        let mut rows = Vec::new();
+        m.finalize(&mut rows);
+        assert!((scalar(&rows, "total_dedup_pct") - 66.6667).abs() < 1e-3);
+        assert!((pct_at(&rows, "1") - 66.666).abs() < 1e-2);
+        assert!((pct_at(&rows, ">10k+") - 33.334).abs() < 1e-2);
     }
 
     #[test]

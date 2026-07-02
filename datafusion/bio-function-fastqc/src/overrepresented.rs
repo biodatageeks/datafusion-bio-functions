@@ -10,6 +10,11 @@ const KEY_PREFIX: usize = 50;
 const WARN_PCT: f64 = 0.1;
 /// error threshold (limits.txt: overrepresented error 1).
 const FAIL_PCT: f64 = 1.0;
+/// FastQC stops tracking new distinct sequences after this many uniques
+/// (`OverRepresentedSeqs.OBSERVATION_CUTOFF`) to bound memory. Any sequence
+/// above the 0.1% overrepresentation threshold is frequent enough to be seen
+/// well before the freeze, so the reported set is unaffected.
+const OBSERVATION_CUTOFF: usize = 100_000;
 
 /// FastQC "Overrepresented sequences": lists 50bp-truncated sequences making up
 /// more than 0.1% of the library, with count, percentage and a "Possible
@@ -19,6 +24,8 @@ const FAIL_PCT: f64 = 1.0;
 pub struct OverrepresentedSeqs {
     seqs: HashMap<Vec<u8>, u64>,
     count: u64,
+    /// once `seqs` reaches OBSERVATION_CUTOFF we stop adding new keys
+    frozen: bool,
 }
 
 impl OverrepresentedSeqs {
@@ -37,8 +44,18 @@ impl QcModule for OverrepresentedSeqs {
     }
 
     fn update(&mut self, _name: &[u8], seq: &[u8], _qual: &[u8]) {
+        // Mirrors FastQC OverRepresentedSeqs.processSequence: count every read,
+        // but stop adding NEW distinct sequences once frozen.
         self.count += 1;
-        *self.seqs.entry(Self::key(seq).to_vec()).or_insert(0) += 1;
+        let key = Self::key(seq);
+        if let Some(c) = self.seqs.get_mut(key) {
+            *c += 1;
+        } else if !self.frozen {
+            self.seqs.insert(key.to_vec(), 1);
+            if self.seqs.len() == OBSERVATION_CUTOFF {
+                self.frozen = true;
+            }
+        }
     }
 
     fn merge(&mut self, other: &dyn QcModule) {
@@ -46,7 +63,10 @@ impl QcModule for OverrepresentedSeqs {
             .as_any()
             .downcast_ref::<OverrepresentedSeqs>()
             .expect("merge type mismatch");
+        // Each partition table is bounded to OBSERVATION_CUTOFF keys, so the
+        // union is bounded to CUTOFF * n_partitions.
         self.count += o.count;
+        self.frozen |= o.frozen;
         for (k, &c) in &o.seqs {
             *self.seqs.entry(k.clone()).or_insert(0) += c;
         }
@@ -116,6 +136,21 @@ impl QcModule for OverrepresentedSeqs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freezes_at_100k_unique_but_counts_existing() {
+        let mut m = OverrepresentedSeqs::new();
+        for i in 0..120_000u32 {
+            m.update(b"", format!("{i:0>50}").as_bytes(), b"");
+        }
+        assert_eq!(m.seqs.len(), 100_000); // frozen at the cutoff
+        assert_eq!(m.count, 120_000); // total still counted
+        // A sequence already in the table keeps accumulating after the freeze.
+        let existing = format!("{:0>50}", 0u32);
+        m.update(b"", existing.as_bytes(), b"");
+        assert_eq!(m.seqs.len(), 100_000);
+        assert_eq!(*m.seqs.get(existing.as_bytes()).unwrap(), 2);
+    }
 
     #[test]
     fn overrepresented_lists_frequent_sequences() {
