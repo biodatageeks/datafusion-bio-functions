@@ -4,6 +4,7 @@
 //! RastQC's process_sequence/merge_from/calculate_results.
 
 pub mod basic_stats;
+pub mod per_base_quality;
 
 use std::any::Any;
 
