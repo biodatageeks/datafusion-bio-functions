@@ -205,6 +205,98 @@ pub async fn build_lance_variation_chrom(
     Ok(ChromDatasetEntry::new(manifest_chrom, dataset_name, rows))
 }
 
+/// Parquet analogue of [`build_lance_variation_chrom`]: build one chromosome's
+/// variation shard as a single no-dictionary, page-indexed `.parquet` file under
+/// `parquet.variation/<chrom>.parquet`.
+///
+/// Reuses the exact tiering pipeline — the warm-start pre-pass
+/// ([`collect_warm_starts`]) and [`transform_variation_tier_batch`] — then applies
+/// the Parquet encoding (Boolean flags, 2-array AF, `variation_name` dedup, via
+/// [`crate::parquet_cache::write::encode_variation_batch`]) and streams the result
+/// to the shard. Rows are written warm tier (0) first then cold (1), each
+/// `start`-ordered by the source `ORDER BY start` plan — the two sorted runs the
+/// read-side `PageDir` binary search relies on.
+pub async fn build_parquet_variation_chrom(
+    options: &LanceCacheBuildOptions,
+    chrom: &str,
+) -> Result<ChromDatasetEntry> {
+    use crate::parquet_cache::write::{
+        VariationParquetShardWriter, encode_variation_batch, variation_output_schema,
+    };
+
+    let entity_dir = PathBuf::from(&options.output_dir).join("parquet.variation");
+    std::fs::create_dir_all(&entity_dir).map_err(|err| {
+        DataFusionError::Execution(format!(
+            "failed to create '{}': {err}",
+            entity_dir.display()
+        ))
+    })?;
+
+    let source_chrom = chrom.strip_prefix("chr").unwrap_or(chrom);
+    let query = build_export_query(
+        EnsemblEntityKind::Variation,
+        "var",
+        Some(source_chrom),
+        None,
+    );
+    let manifest_chrom = canonical_chrom_label(chrom);
+    let file_name = format!("{manifest_chrom}.parquet");
+    let shard_path = entity_dir.join(&file_name);
+    if shard_path.exists() {
+        if !options.overwrite {
+            return Err(DataFusionError::Execution(format!(
+                "parquet variation shard '{}' already exists and overwrite=false",
+                shard_path.display()
+            )));
+        }
+        std::fs::remove_file(&shard_path).map_err(|err| {
+            DataFusionError::Execution(format!(
+                "failed to remove existing parquet shard '{}': {err}",
+                shard_path.display()
+            ))
+        })?;
+    }
+
+    let source_type = options.cache_source_type.as_str().to_string();
+    let warm_starts = Arc::new(collect_warm_starts(options, source_chrom).await?);
+    info!(
+        "Parquet variation {} warm positions={} (af>={WARM_AF_THRESHOLD}, +/-{WARM_POSITION_RADIUS})",
+        shard_path.display(),
+        warm_starts.len(),
+    );
+
+    // Warm tier (0) first, then cold (1); a chromosome with no warm positions
+    // writes a single cold tier. Mirrors the Lance tiered writer's passes.
+    let passes: &[i8] = if warm_starts.is_empty() {
+        &[1]
+    } else {
+        &[0, 1]
+    };
+    let ctx = make_ctx_and_register(options, EnsemblEntityKind::Variation, "var")?;
+
+    // Derive the output schema once from the source plan schema and reuse it for
+    // every written batch so the shard carries one stable Arrow schema.
+    let schema_plan = ctx.sql(&query).await?.create_physical_plan().await?;
+    let out_schema = variation_output_schema(schema_plan.schema().as_ref(), &source_type)?;
+
+    let mut writer = VariationParquetShardWriter::create(&shard_path, Arc::clone(&out_schema))?;
+    for &keep_tier in passes {
+        let plan = ctx.sql(&query).await?.create_physical_plan().await?;
+        let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+        while let Some(batch) = stream.next().await {
+            let tiered =
+                transform_variation_tier_batch(batch?, &source_type, &warm_starts, keep_tier)?;
+            if tiered.num_rows() == 0 {
+                continue;
+            }
+            let encoded = encode_variation_batch(&tiered, &out_schema)?;
+            writer.write(&encoded)?;
+        }
+    }
+    let rows = writer.finish()?;
+    Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
+}
+
 /// Run a cheap pre-pass over the source variation table for one chromosome to
 /// classify each genomic `start` as warm (common) or cold (rare) using the same
 /// allele-frequency selector as the Parquet warm tier.
@@ -1218,7 +1310,10 @@ fn streaming_lance_output_schema(
     }
 }
 
-fn variation_projected_schema(source_schema: &Schema, source_type: &str) -> Result<Schema> {
+pub(crate) fn variation_projected_schema(
+    source_schema: &Schema,
+    source_type: &str,
+) -> Result<Schema> {
     let mut fields = Vec::new();
     let forbidden = VARIATION_FORBIDDEN_COLUMNS
         .iter()
