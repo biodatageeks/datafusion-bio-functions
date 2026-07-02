@@ -11,8 +11,8 @@
 //!   significant figures and the reader reproduces the exact CSQ text with this.
 
 use datafusion::arrow::array::{
-    Array, BooleanArray, Float32Builder, Int8Array, ListArray, ListBuilder, StringArray,
-    StringBuilder,
+    Array, BooleanArray, Float32Array, Float32Builder, Int8Array, ListArray, ListBuilder,
+    StringArray, StringBuilder,
 };
 use datafusion::common::{DataFusionError, Result};
 
@@ -199,6 +199,54 @@ pub fn dedup_variation_name(vn: &StringArray, dbsnp: &StringArray) -> StringArra
     StringArray::from(out)
 }
 
+/// Inverse of [`encode_af_2array`]: rebuild the pipe-joined AF group string
+/// (`pop0|pop1|...`, each population `allele:freq[,allele:freq]`) from the
+/// struct-of-arrays. `n_pops` is the group's population count (6/10/11). The
+/// result is the scalar `Utf8` group column that `af_bundle::unbundle_af_columns`
+/// then splits into the per-population logical AF columns — i.e. the exact
+/// physical shape the Lance path yields, so downstream is unchanged.
+///
+/// Frequencies are formatted with [`format_g4`] (the source is 4 significant
+/// figures), which reproduces the original CSQ text byte-for-byte.
+pub fn reconstruct_af_group_string(
+    alleles: &ListArray,
+    freqs: &ListArray,
+    n_pops: usize,
+) -> Result<StringArray> {
+    let n = alleles.len();
+    let mut b = StringBuilder::new();
+    for r in 0..n {
+        // A null list element means the whole group is absent for this row
+        // (matches `concat_group`'s null-when-all-absent).
+        if alleles.is_null(r) || freqs.is_null(r) {
+            b.append_null();
+            continue;
+        }
+        let al = alleles.value(r);
+        let al = al.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            DataFusionError::Execution("AF alleles list element must be Utf8".to_string())
+        })?;
+        let fr = freqs.value(r);
+        let fr = fr.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
+            DataFusionError::Execution("AF freqs list element must be Float32".to_string())
+        })?;
+        let n_alleles = al.len();
+        let mut segments: Vec<String> = Vec::with_capacity(n_pops);
+        for p in 0..n_pops {
+            let mut parts: Vec<String> = Vec::new();
+            for a in 0..n_alleles {
+                let idx = a * n_pops + p;
+                if idx < fr.len() && !fr.is_null(idx) {
+                    parts.push(format!("{}:{}", al.value(a), format_g4(fr.value(idx))));
+                }
+            }
+            segments.push(parts.join(","));
+        }
+        b.append_value(segments.join("|"));
+    }
+    Ok(b.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +347,27 @@ mod tests {
         assert!(out.is_null(0));
         assert_eq!(out.value(1), "rs2");
         assert!(out.is_null(2));
+    }
+
+    #[test]
+    fn af_2array_reconstruct_round_trips() {
+        // Single-allele, multi-allelic, a missing population, and a null row —
+        // encode then reconstruct must reproduce the original group string.
+        let inputs = vec![
+            Some("A:0.08806|A:0.0367|A:2.682e-05"), // 3 pops, single allele
+            Some("A:0.1,G:0.2|A:0.3,G:0.4|A:0.5,G:0.6"), // multi-allelic
+            Some("A:0.1||A:0.3"),                   // middle pop missing
+            None,                                   // null row
+        ];
+        let col = StringArray::from(inputs.clone());
+        let af = encode_af_2array(&col, 3).unwrap();
+        let back = reconstruct_af_group_string(&af.alleles, &af.freqs, 3).unwrap();
+        assert_eq!(back.len(), inputs.len());
+        for (i, want) in inputs.iter().enumerate() {
+            match want {
+                Some(s) => assert_eq!(back.value(i), *s, "row {i}"),
+                None => assert!(back.is_null(i), "row {i} should be null"),
+            }
+        }
     }
 }

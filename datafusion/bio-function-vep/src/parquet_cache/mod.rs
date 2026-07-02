@@ -14,4 +14,5 @@
 
 pub mod encode;
 pub mod page_dir;
+pub mod variation_lookup;
 pub mod write;
