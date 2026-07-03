@@ -127,8 +127,10 @@ impl SinglePathParquetVariationLookup {
         let probe_set: HashSet<u32> = sorted_unique_starts.iter().copied().collect();
         let counters = IoCounters::new();
 
-        // Phase 1: candidate page row-ranges from the footer PageDir.
-        let ranges = self.page_dir.resolve_ranges(sorted_unique_starts);
+        // Phase 1: candidate page row-ranges from the footer PageDir. The PageDir
+        // holds keys as u64; variation's `start` probes widen losslessly.
+        let probes64: Vec<u64> = sorted_unique_starts.iter().map(|&s| s as u64).collect();
+        let ranges = self.page_dir.resolve_ranges(&probes64);
 
         // Phase 2: start-only read of the candidate pages -> exact row offsets.
         let offsets = self.exact_offsets(&ranges, &probe_set, &counters).await?;

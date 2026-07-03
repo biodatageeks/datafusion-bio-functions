@@ -364,7 +364,7 @@ mod tests {
 
         // Probe a few known positions.
         let probes: Vec<u32> = vec![starts[3], starts[100], starts[1999]];
-        let ranges = pd.resolve_ranges(&probes);
+        let ranges = pd.resolve_ranges(&probes.iter().map(|&p| p as u64).collect::<Vec<_>>());
         assert!(!ranges.is_empty());
 
         // Phase 2: start-only read of candidate pages -> exact offsets.

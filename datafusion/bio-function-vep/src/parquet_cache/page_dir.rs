@@ -45,9 +45,14 @@ impl IoCounters {
 }
 
 /// A sparse position → page directory built from the footer page index.
+///
+/// Keys are held as `u64` regardless of the physical key column width so a single
+/// implementation serves both the `INT32` `start` key (variation) and the `INT64`
+/// `key` (translation_sift). `u32` keys are widened losslessly at build time and
+/// callers cast their probes up to `u64`.
 pub struct PageDir {
-    min: Vec<u32>,
-    max: Vec<u32>,
+    min: Vec<u64>,
+    max: Vec<u64>,
     first_row: Vec<u64>,
     end_row: Vec<u64>,
     /// Contiguous sorted runs `[start, end)` in page order, split where the key
@@ -58,7 +63,9 @@ pub struct PageDir {
 impl PageDir {
     /// Build from preloaded reader metadata (must have been loaded with the page
     /// index enabled). `key_leaf` is the leaf column index of the sort key
-    /// (`start` for variation), which must be an `INT32` physical column.
+    /// (`start` for variation, `key` for translation_sift), which must be an
+    /// `INT32` or `INT64` physical column. `INT32`/`UInt32` values are widened to
+    /// `u64` losslessly (the `as u32` step recovers the unsigned value first).
     pub fn build(meta: &ArrowReaderMetadata, key_leaf: usize) -> Result<Self> {
         use parquet::file::page_index::column_index::ColumnIndexMetaData;
         let md = meta.metadata();
@@ -73,11 +80,18 @@ impl PageDir {
         for rg in 0..md.num_row_groups() {
             let rg_rows = md.row_group(rg).num_rows() as u64;
             let col = &ci[rg][key_leaf];
-            let (mins, maxs): (&[i32], &[i32]) = match col {
-                ColumnIndexMetaData::INT32(p) => (p.min_values(), p.max_values()),
+            let (mins, maxs): (Vec<u64>, Vec<u64>) = match col {
+                ColumnIndexMetaData::INT32(p) => (
+                    p.min_values().iter().map(|&v| v as u32 as u64).collect(),
+                    p.max_values().iter().map(|&v| v as u32 as u64).collect(),
+                ),
+                ColumnIndexMetaData::INT64(p) => (
+                    p.min_values().iter().map(|&v| v as u64).collect(),
+                    p.max_values().iter().map(|&v| v as u64).collect(),
+                ),
                 _ => {
                     return Err(DataFusionError::Execution(
-                        "parquet key column index is not INT32".into(),
+                        "parquet key column index is not INT32 or INT64".into(),
                     ));
                 }
             };
@@ -89,8 +103,8 @@ impl PageDir {
                 } else {
                     rg_start + rg_rows
                 };
-                min.push(mins[p] as u32);
-                max.push(maxs[p] as u32);
+                min.push(mins[p]);
+                max.push(maxs[p]);
                 first_row.push(fr);
                 end_row.push(er);
             }
@@ -101,7 +115,7 @@ impl PageDir {
 
     /// Construct from raw per-page arrays, detecting the sorted runs. Exposed for
     /// unit tests (and reused by [`build`]).
-    fn from_parts(min: Vec<u32>, max: Vec<u32>, first_row: Vec<u64>, end_row: Vec<u64>) -> Self {
+    fn from_parts(min: Vec<u64>, max: Vec<u64>, first_row: Vec<u64>, end_row: Vec<u64>) -> Self {
         let mut runs = vec![];
         let mut s = 0usize;
         for i in 1..min.len() {
@@ -123,7 +137,7 @@ impl PageDir {
     }
 
     /// Merged candidate page row-ranges covering any of `positions`.
-    pub fn resolve_ranges(&self, positions: &[u32]) -> Vec<(u64, u64)> {
+    pub fn resolve_ranges(&self, positions: &[u64]) -> Vec<(u64, u64)> {
         let mut pages: Vec<usize> = Vec::new();
         for &p in positions {
             for &(rs, re) in &self.runs {
