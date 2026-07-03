@@ -76,10 +76,11 @@ impl QcModule for PerSeqQuality {
                 value_str: None,
             });
         }
-        // FastQC: warn if the most frequent mean quality < 27, error if < 20.
-        let status = if mode_phred < 20 {
+        // FastQC PerSequenceQualityScores: error if the most frequent mean
+        // quality <= 20, warn if <= 27 (note: inclusive `<=`, per the Java).
+        let status = if mode_phred <= 20 {
             "FAIL"
-        } else if mode_phred < 27 {
+        } else if mode_phred <= 27 {
             "WARN"
         } else {
             "PASS"
@@ -113,5 +114,29 @@ mod tests {
         assert_eq!(count_at(0), 1.0);
         // contiguous range 0..=40 emitted
         assert_eq!(count_at(20), 0.0);
+    }
+
+    fn status_for_mode(mode_phred: usize) -> String {
+        // Build a histogram whose mode sits at `mode_phred`.
+        let mut m = PerSeqQuality::new();
+        m.hist[mode_phred] = 10;
+        if mode_phred > 0 {
+            m.hist[mode_phred - 1] = 1;
+        }
+        let mut rows = Vec::new();
+        m.finalize(&mut rows);
+        rows.iter()
+            .find(|r| r.metric == "status")
+            .and_then(|r| r.value_str.clone())
+            .unwrap()
+    }
+
+    #[test]
+    fn status_thresholds_are_inclusive_like_fastqc() {
+        // FastQC uses `<=`: mode 20 -> FAIL, 27 -> WARN, 28 -> PASS.
+        assert_eq!(status_for_mode(20), "FAIL");
+        assert_eq!(status_for_mode(21), "WARN");
+        assert_eq!(status_for_mode(27), "WARN");
+        assert_eq!(status_for_mode(28), "PASS");
     }
 }

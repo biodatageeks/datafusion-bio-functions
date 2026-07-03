@@ -96,11 +96,34 @@ impl ExecutionPlan for FastqcExec {
         let n_parts = input.properties().partitioning.partition_count();
         let schema = tidy_schema();
 
+        // kmer_content samples every 50th read in file order, so it is only
+        // exact vs FastQC when reads are seen in order. Accumulating one
+        // ModuleSet per partition and merging would sample each partition
+        // independently (partition-dependent, non-FastQC). When kmer is
+        // selected we therefore read partitions sequentially in index order
+        // (= file order for range-based scans) into a single ModuleSet.
+        let kmer_ordered = match &selection {
+            None => true, // None resolves to all modules, which includes kmer
+            Some(sel) => sel.iter().any(|m| m == "kmer_content"),
+        };
+
         let fut = async move {
-            // Spawn one task per input partition so accumulation runs in
-            // parallel across runtime worker threads (CPU-bound work). A plain
-            // `try_join_all` would only interleave the futures on a single
-            // task, adding overhead without parallelism.
+            if kmer_ordered {
+                let mut set = ModuleSet::build(selection.as_deref())?;
+                for p in 0..n_parts {
+                    let mut stream = input.execute(p, context.clone())?;
+                    while let Some(batch) = stream.next().await {
+                        set.update_batch(&batch?)?;
+                    }
+                }
+                let batch = set.finalize()?;
+                return Ok::<RecordBatch, DataFusionError>(batch);
+            }
+
+            // No order-dependent module: spawn one task per input partition so
+            // accumulation runs in parallel across runtime worker threads
+            // (CPU-bound work). A plain `try_join_all` would only interleave the
+            // futures on a single task, adding overhead without parallelism.
             let mut join_set: JoinSet<Result<ModuleSet>> = JoinSet::new();
             for p in 0..n_parts {
                 let input = input.clone();
@@ -132,7 +155,7 @@ impl ExecutionPlan for FastqcExec {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::{Float64Array, StringArray};
+    use datafusion::arrow::array::{Array, Float64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use datafusion::prelude::*;
@@ -192,5 +215,87 @@ mod tests {
         // 2 reads per partition; merged n_seq must scale with partition count.
         assert_eq!(run_n_seq(1).await, 2.0);
         assert_eq!(run_n_seq(4).await, 8.0);
+    }
+
+    /// Collect kmer_content (label -> count) running `total` motif-bearing reads
+    /// through FastqcExec split across `n_parts` file-ordered partitions.
+    async fn run_kmer(total: usize, n_parts: usize) -> Vec<(String, i64)> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sequence", DataType::Utf8, true),
+            Field::new("quality_scores", DataType::Utf8, true),
+        ]));
+        // A fixed motif at a fixed position in every read -> strong kmer
+        // enrichment; the 2% (every-50th) sample must be identical whether read
+        // as one partition or several contiguous ones.
+        let seqs: Vec<String> = (0..total)
+            .map(|i| format!("ACGTACGTACGATTACGTTTT{:09}", i % 10))
+            .collect();
+        let per = total.div_ceil(n_parts);
+        let partitions: Vec<Vec<RecordBatch>> = (0..n_parts)
+            .map(|p| {
+                let lo = p * per;
+                let hi = ((p + 1) * per).min(total);
+                let s: Vec<&str> = seqs[lo..hi].iter().map(|s| s.as_str()).collect();
+                let q: Vec<&str> = s.iter().map(|_| "IIIIIIIIIIIIIIIIIIIIIIIIIIIIII").collect();
+                vec![
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(StringArray::from(s)),
+                            Arc::new(StringArray::from(q)),
+                        ],
+                    )
+                    .unwrap(),
+                ]
+            })
+            .collect();
+
+        let mem = MemTable::try_new(schema, partitions).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("reads", Arc::new(mem)).unwrap();
+        let plan = ctx
+            .table("reads")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let exec = FastqcExec::new(plan, Some(vec!["kmer_content".into()]));
+        let mut stream = exec.execute(0, ctx.task_ctx()).unwrap();
+        let b = stream.next().await.unwrap().unwrap();
+        let label = b
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let metric = b
+            .column_by_name("metric")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let value = b
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let mut out: Vec<(String, i64)> = (0..b.num_rows())
+            .filter(|&i| metric.value(i) == "count" && !label.is_null(i))
+            .map(|i| (label.value(i).to_string(), value.value(i) as i64))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kmer_content_is_partition_invariant_when_ordered() {
+        // kmer must sample in file order: splitting the same reads across
+        // contiguous partitions must not change the reported kmers/counts.
+        let one = run_kmer(300, 1).await;
+        assert!(!one.is_empty(), "fixture should enrich some kmers");
+        assert_eq!(one, run_kmer(300, 3).await);
+        assert_eq!(one, run_kmer(300, 7).await);
     }
 }

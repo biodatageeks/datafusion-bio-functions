@@ -131,13 +131,6 @@ impl QcModule for KmerContent {
         let total_kmer_count: u64 = self.total_at_position.iter().sum();
         let bonferroni = 4f64.powi(KMER_SIZE as i32);
 
-        struct Enriched {
-            seq: [u8; KMER_SIZE],
-            count: u64,
-            lowest_p: f64,
-            max_obs_exp: f64,
-            max_pos: usize, // 1-based
-        }
         let mut enriched: Vec<Enriched> = Vec::new();
 
         for (key, k) in &self.kmers {
@@ -159,8 +152,9 @@ impl QcModule for KmerContent {
                     max_pos = g + 1;
                 }
                 if total_group_hits as f64 > predicted {
-                    let p = (1.0
-                        - binom_cdf(total_group_count, expected_proportion, total_group_hits))
+                    // FastQC: (1 - binomialCDF(hits)) * 4^k, computed via the
+                    // upper tail to preserve precision on tiny p-values.
+                    let p = binom_sf(total_group_count, expected_proportion, total_group_hits)
                         * bonferroni;
                     if p < 0.01 && obs_exp > 5.0 && p < lowest_p {
                         lowest_p = p;
@@ -179,8 +173,7 @@ impl QcModule for KmerContent {
         }
 
         // Sort descending by max obs/exp (FastQC Kmer.compareTo), keep top 20.
-        enriched.sort_by(|a, b| b.max_obs_exp.partial_cmp(&a.max_obs_exp).unwrap());
-        enriched.truncate(20);
+        let enriched = rank_enriched(enriched);
 
         // Status from the top k-mer's p-value: -log10(p) vs kmer warn=2 / error=5.
         let status = match enriched.first() {
@@ -221,9 +214,35 @@ impl QcModule for KmerContent {
     }
 }
 
+struct Enriched {
+    seq: [u8; KMER_SIZE],
+    count: u64,
+    lowest_p: f64,
+    max_obs_exp: f64,
+    max_pos: usize, // 1-based
+}
+
+/// Rank enriched k-mers descending by max obs/exp (FastQC `Kmer.compareTo`) and
+/// keep the top 20.
+fn rank_enriched(mut enriched: Vec<Enriched>) -> Vec<Enriched> {
+    // Break obs/exp ties by sequence ascending so the reported top-20 is
+    // deterministic run-to-run (on real data many k-mers tie at the max obs/exp
+    // and HashMap iteration order would otherwise decide which 20 are kept).
+    enriched.sort_by(|a, b| {
+        b.max_obs_exp
+            .partial_cmp(&a.max_obs_exp)
+            .unwrap()
+            .then_with(|| a.seq.cmp(&b.seq))
+    });
+    enriched.truncate(20);
+    enriched
+}
+
 /// P(X <= k) for X ~ Binomial(n, p), summing exact PMF terms in log space.
-/// Mirrors Apache-commons `BinomialDistribution.cumulativeProbability` used by
-/// FastQC.
+/// Mirrors Apache-commons `BinomialDistribution.cumulativeProbability`. Retained
+/// as the lower-tail reference; the enrichment p-value uses [`binom_sf`] instead
+/// (see its doc for why the upper tail is computed directly).
+#[cfg(test)]
 fn binom_cdf(n: u64, p: f64, k: u64) -> f64 {
     if k >= n {
         return 1.0;
@@ -240,6 +259,36 @@ fn binom_cdf(n: u64, p: f64, k: u64) -> f64 {
         cum += (ln_choose + (i as f64) * ln_p + ((n - i) as f64) * ln_q).exp();
     }
     cum.min(1.0)
+}
+
+/// P(X > k) = P(X >= k+1) for X ~ Binomial(n, p), summed directly from the
+/// upper tail. FastQC computes `1 - BinomialDistribution.cumulativeProbability`,
+/// but forming `1 - CDF` loses all precision when the tail is tiny (the CDF is
+/// stored as ~1 and the subtraction keeps only absolute precision). Summing the
+/// upper-tail PMF terms keeps full relative precision, matching FastQC's value.
+fn binom_sf(n: u64, p: f64, k: u64) -> f64 {
+    if k >= n {
+        return 0.0;
+    }
+    if p <= 0.0 {
+        return 0.0;
+    }
+    let ln_p = p.ln();
+    let ln_q = (1.0 - p).ln();
+    let mean = n as f64 * p;
+    let mut sum = 0.0f64;
+    for i in (k + 1)..=n {
+        let ln_choose =
+            ln_gamma((n + 1) as f64) - ln_gamma((i + 1) as f64) - ln_gamma((n - i + 1) as f64);
+        let term = (ln_choose + (i as f64) * ln_p + ((n - i) as f64) * ln_q).exp();
+        sum += term;
+        // Past the mode the PMF decays monotonically; stop once terms no longer
+        // affect the sum (bounds cost for large n while staying exact).
+        if i as f64 > mean && term < sum * 1e-17 {
+            break;
+        }
+    }
+    sum.min(1.0)
 }
 
 /// Lanczos approximation for ln Gamma.
@@ -294,10 +343,43 @@ mod tests {
     }
 
     #[test]
+    fn rank_enriched_breaks_obs_exp_ties_by_sequence_ascending() {
+        // Two k-mers with identical max obs/exp must come out in a stable,
+        // sequence-ascending order regardless of HashMap iteration order, so
+        // the reported top-20 is reproducible run-to-run.
+        let mk = |seq: [u8; KMER_SIZE]| Enriched {
+            seq,
+            count: 1,
+            lowest_p: 0.0,
+            max_obs_exp: 100.0,
+            max_pos: 1,
+        };
+        // Provided in DESCENDING sequence order; expect ASCENDING out.
+        let ranked = rank_enriched(vec![mk(*b"CCCCCCC"), mk(*b"AAAAAAA")]);
+        let order: Vec<[u8; KMER_SIZE]> = ranked.iter().map(|e| e.seq).collect();
+        assert_eq!(order, vec![*b"AAAAAAA", *b"CCCCCCC"]);
+    }
+
+    #[test]
     fn binom_cdf_matches_known_values() {
         // Binomial(10, 0.5): P(X<=5) = 0.623046875 exactly.
         assert!((binom_cdf(10, 0.5, 5) - 0.623_046_875).abs() < 1e-9);
         // P(X<=10) = 1.0
         assert!((binom_cdf(10, 0.5, 10) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn binom_sf_matches_known_values_and_is_precise_in_the_tail() {
+        // P(X>5) for Binom(10,0.5) = 1 - 0.623046875 = 0.376953125 exactly.
+        assert!((binom_sf(10, 0.5, 5) - 0.376_953_125).abs() < 1e-12);
+        // P(X>10) = 0.
+        assert_eq!(binom_sf(10, 0.5, 10), 0.0);
+        // Extreme tail: the direct sum keeps full relative precision where
+        // 1 - binom_cdf loses it. P(X>10) for Binom(40, 1e-3) computed exactly.
+        let sf = binom_sf(40, 1e-3, 10);
+        assert!(
+            sf > 1e-30 && sf < 1e-20,
+            "tail should be tiny and positive: {sf}"
+        );
     }
 }

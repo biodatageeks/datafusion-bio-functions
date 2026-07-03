@@ -141,13 +141,94 @@ impl QcModule for PerSeqGc {
                 value_str: None,
             });
         }
-        // Phase-1 status: PASS. Exact FastQC theoretical-distribution status
-        // (warn/fail on deviation from the modelled normal) is a follow-up.
-        out.push(TidyRow::status(m, "PASS"));
+        // Status: FastQC's deviation of the observed GC distribution from a
+        // mode-centred normal (gc_sequence warn=15%, error=30%).
+        out.push(TidyRow::status(m, gc_status(&bins)));
     }
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+/// FastQC `PerSequenceGCContent.calculateDistribution`: fit a normal to the
+/// observed GC distribution centred on its (adjacent-averaged) mode, then take
+/// the summed absolute deviation as a percentage of all reads (warn at 15%,
+/// fail at 30%). `gc` is the 101-bin distribution (index = GC%), identical to
+/// FastQC's `gcDistribution`.
+fn gc_status(gc: &[f64; 101]) -> &'static str {
+    let total_count: f64 = gc.iter().sum();
+    if total_count <= 1.0 {
+        return "PASS";
+    }
+
+    // First mode = argmax of the distribution.
+    let mut first_mode = 0usize;
+    let mut mode_count = 0.0f64;
+    for (i, &v) in gc.iter().enumerate() {
+        if v > mode_count {
+            mode_count = v;
+            first_mode = i;
+        }
+    }
+
+    // Average the mode over adjacent bins that stay above 90% of the modal
+    // value (FastQC's `modeValue - modeValue/10`), walking up then down.
+    let threshold = gc[first_mode] - gc[first_mode] / 10.0;
+    let mut mode = 0.0f64;
+    let mut mode_dups = 0i32;
+    let mut fell_off_top = true;
+    for (i, &v) in gc.iter().enumerate().skip(first_mode) {
+        if v > threshold {
+            mode += i as f64;
+            mode_dups += 1;
+        } else {
+            fell_off_top = false;
+            break;
+        }
+    }
+    let mut fell_off_bottom = true;
+    for i in (0..first_mode).rev() {
+        if gc[i] > threshold {
+            mode += i as f64;
+            mode_dups += 1;
+        } else {
+            fell_off_bottom = false;
+            break;
+        }
+    }
+    let mode = if fell_off_top || fell_off_bottom {
+        first_mode as f64
+    } else {
+        mode / mode_dups as f64
+    };
+
+    // Standard deviation about the mode, then the normal PDF scaled by the
+    // read count gives the theoretical curve; deviation is |theoretical-obs|.
+    let mut stdev = 0.0f64;
+    for (i, &v) in gc.iter().enumerate() {
+        stdev += (i as f64 - mode).powi(2) * v;
+    }
+    stdev = (stdev / (total_count - 1.0)).sqrt();
+    if stdev <= 0.0 {
+        return "PASS";
+    }
+
+    let mut deviation = 0.0f64;
+    let denom = 2.0 * stdev * stdev;
+    let lhs = 1.0 / (std::f64::consts::PI * denom).sqrt();
+    for (i, &v) in gc.iter().enumerate() {
+        let theoretical = lhs * (-((i as f64 - mode).powi(2)) / denom).exp() * total_count;
+        deviation += (theoretical - v).abs();
+    }
+    deviation = deviation / total_count * 100.0;
+
+    if deviation > 30.0 {
+        "FAIL"
+    } else if deviation > 15.0 {
+        "WARN"
+    } else {
+        "PASS"
     }
 }
 
