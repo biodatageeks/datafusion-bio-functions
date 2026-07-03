@@ -136,7 +136,12 @@ fn golden(path: &str) -> GoldenData {
             continue;
         }
         if let Some(rest) = line.strip_prefix(">>") {
-            module = match rest.rsplit_once('\t').map(|(m, _)| m).unwrap_or(rest).trim() {
+            module = match rest
+                .rsplit_once('\t')
+                .map(|(m, _)| m)
+                .unwrap_or(rest)
+                .trim()
+            {
                 "Basic Statistics" => "basic_stats",
                 "Per base sequence quality" => "per_base_quality",
                 "Per sequence quality scores" => "per_seq_quality",
@@ -163,7 +168,7 @@ fn golden(path: &str) -> GoldenData {
         match module {
             "basic_stats" if line.starts_with("Total Sequences") => {
                 n_seq = cols[1].parse().unwrap()
-            },
+            }
             "basic_stats" if line.starts_with("%GC") => gc_pct = cols[1].parse().unwrap(),
             "per_base_quality" if !line.starts_with('#') => {
                 let pos: usize = cols[0].split('-').next().unwrap().parse().unwrap();
@@ -173,49 +178,52 @@ fn golden(path: &str) -> GoldenData {
                 for j in 0..6 {
                     per_base[pos - 1][j] = cols[j + 1].parse().unwrap();
                 }
-            },
+            }
             "per_seq_gc" if !line.starts_with('#') => {
-                per_seq_gc.insert(cols[0].parse::<f64>().unwrap() as i32, cols[1].parse().unwrap());
-            },
+                per_seq_gc.insert(
+                    cols[0].parse::<f64>().unwrap() as i32,
+                    cols[1].parse().unwrap(),
+                );
+            }
             "per_seq_quality" if !line.starts_with('#') => {
                 per_seq_q.insert(cols[0].parse().unwrap(), cols[1].parse().unwrap());
-            },
+            }
             "seq_length" if !line.starts_with('#') => {
                 // FastQC may print a length range "min-max"; our fixtures are uniform.
                 let pos: i32 = cols[0].split('-').next().unwrap().parse().unwrap();
                 seq_len.insert(pos, cols[1].parse().unwrap());
-            },
+            }
             "per_base_n" if !line.starts_with('#') => {
                 let pos: i32 = cols[0].split('-').next().unwrap().parse().unwrap();
                 per_base_n.insert(pos, cols[1].parse().unwrap());
-            },
+            }
             "per_base_content" if !line.starts_with('#') => {
                 // columns: Base, %G, %A, %T, %C
                 let pos: i32 = cols[0].split('-').next().unwrap().parse().unwrap();
                 for (k, base) in ["G", "A", "T", "C"].iter().enumerate() {
                     per_base_content.insert((pos, base.to_string()), cols[k + 1].parse().unwrap());
                 }
-            },
+            }
             "overrepresented" if !line.starts_with('#') => {
                 // columns: Sequence, Count, Percentage, Possible Source
                 overrep.insert(
                     cols[0].to_string(),
                     (cols[1].parse().unwrap(), cols[2].parse().unwrap()),
                 );
-            },
+            }
             "adapter_content" if !line.starts_with('#') => {
                 let pos: i32 = cols[0].split('-').next().unwrap().parse().unwrap();
                 for (k, name) in adapter_names.iter().enumerate() {
                     adapter.insert((pos, name.clone()), cols[k + 1].parse().unwrap());
                 }
-            },
+            }
             "dup_levels" if line.starts_with("#Total Deduplicated") => {
                 total_dedup = cols[1].parse().unwrap()
-            },
+            }
             "dup_levels" if !line.starts_with('#') => {
                 dup_pct.insert(cols[0].to_string(), cols[1].parse().unwrap());
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
     GoldenData {
@@ -313,7 +321,12 @@ fn per_seq_quality_matches_fastqc_exactly() {
     let g = golden(&data("example.nogroup.fastqc_data.txt"));
     assert!(!g.per_seq_q.is_empty());
     for (phred, expected) in &g.per_seq_q {
-        let got = ours[&("per_seq_quality".into(), String::new(), *phred, "count".into())];
+        let got = ours[&(
+            "per_seq_quality".into(),
+            String::new(),
+            *phred,
+            "count".into(),
+        )];
         assert!(
             (got - expected).abs() <= 1e-9,
             "per_seq_quality phred {phred}: {got} vs {expected}"
@@ -376,7 +389,12 @@ fn overrepresented_matches_fastqc_exactly() {
             i32::MIN,
             "count".into(),
         )];
-        let got_pct = ours[&("overrepresented".into(), seq.clone(), i32::MIN, "pct".into())];
+        let got_pct = ours[&(
+            "overrepresented".into(),
+            seq.clone(),
+            i32::MIN,
+            "pct".into(),
+        )];
         assert_eq!(got_count, *exp_count, "overrep {seq} count");
         assert!(
             (got_pct - exp_pct).abs() <= 1e-9,
@@ -409,16 +427,29 @@ fn adapter_content_matches_fastqc_exactly() {
             checked_nonzero = true;
         }
     }
-    assert!(checked_nonzero, "fixture should exercise a non-zero adapter curve");
+    assert!(
+        checked_nonzero,
+        "fixture should exercise a non-zero adapter curve"
+    );
 }
 
 #[test]
 fn basic_stats_match_fastqc() {
     let ours = run_tidy(&data("example.fastq"));
     let g = golden(&data("example.nogroup.fastqc_data.txt"));
-    let n = ours[&("basic_stats".into(), String::new(), i32::MIN, "n_seq".into())];
+    let n = ours[&(
+        "basic_stats".into(),
+        String::new(),
+        i32::MIN,
+        "n_seq".into(),
+    )];
     assert_eq!(n, g.n_seq);
-    let gc = ours[&("basic_stats".into(), String::new(), i32::MIN, "gc_pct".into())];
+    let gc = ours[&(
+        "basic_stats".into(),
+        String::new(),
+        i32::MIN,
+        "gc_pct".into(),
+    )];
     // FastQC prints floor((G+C)*100/(A+T+G+C)); our precise value must floor to it.
     assert_eq!(gc.floor(), g.gc_pct);
 }
