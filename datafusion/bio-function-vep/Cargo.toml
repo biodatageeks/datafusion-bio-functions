@@ -10,15 +10,13 @@ edition.workspace = true
 
 [dependencies]
 datafusion.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
 futures.workspace = true
+bytes = "1"
 log.workspace = true
 async-trait = "0.1.88"
 chrono = "0.4"
 libc = "0.2"
-arrow-ipc = { version = "=58.0.0", features = ["lz4", "zstd"], optional = true }
-lz4_flex = { version = "0.12.1", optional = true }
-zstd = { version = "0.13.3", optional = true }
 ahash = { version = "0.8.6", optional = true }
 hashbrown = { version = "0.16.1", optional = true }
 nohash-hasher = { version = "0.2.0", optional = true }
@@ -30,15 +28,8 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 noodles-core = "0.16"
 noodles-fasta = "0.49"
-parquet = { version = "=58.0.0", features = ["arrow"] }
-# Stock lance 7.0.0. The fork's miniblock large-chunk fix is NOT needed once the AF List
-# columns are forced to TRUE fullzip by disabling dictionary encoding on them (see
-# af_bundle::bundled_list_field). With no miniblock AF pages, take_rows never hits the
-# large-chunk path, and the existing miniblock context datasets read as-is — no rebuilds.
-lance = { version = "7.0.0", default-features = false, optional = true }
-lance-file = { version = "7.0.0", optional = true }
-lance-index = { version = "7.0.0", optional = true }
-datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.8.0" }
+parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
+datafusion-bio-format-vcf ={ git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.8.0" }
 datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.8.0", optional = true }
 indicatif = "0.18.4"
 
@@ -57,33 +48,28 @@ name = "vcf_batch_stats"
 required-features = []
 
 [[example]]
-name = "build_lance_variation_chrom"
-required-features = ["lance-cache", "cache-builder"]
+name = "build_parquet_variation_chrom"
+required-features = ["parquet-cache", "cache-builder"]
 
 [[example]]
-name = "build_lance_chrom_context"
-required-features = ["lance-cache", "cache-builder"]
+name = "build_parquet_translation_sift_chrom"
+required-features = ["parquet-cache", "cache-builder"]
 
 [[example]]
-name = "build_lance_full_cache"
-required-features = ["lance-cache", "cache-builder"]
+name = "build_parquet_context_chrom"
+required-features = ["parquet-cache", "cache-builder"]
 
 [features]
-default = ["lance-cache"]
-lance-cache = [
-    "dep:lance",
-    "dep:lance-file",
-    "dep:lance-index",
-    "dep:arrow-ipc",
-    "dep:lz4_flex",
-    "dep:zstd",
+default = ["parquet-cache"]
+# Parquet cache read runtime (variation/SIFT point-lookups + context scans).
+parquet-cache = [
     "dep:ahash",
     "dep:hashbrown",
     "dep:nohash-hasher",
     "dep:rapidhash",
     "dep:smallvec",
 ]
-cache-builder = ["lance-cache", "dep:datafusion-bio-format-ensembl-cache"]
+cache-builder = ["parquet-cache", "dep:datafusion-bio-format-ensembl-cache"]
 
 # Regression tests that bake per-transcript sequence fixtures via
 # `include_str!(".tmp_*.txt")` are gated behind the raw `cfg(dev_fixtures)`

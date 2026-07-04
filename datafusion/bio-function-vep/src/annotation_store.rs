@@ -1,6 +1,6 @@
 //! Backend abstraction for VEP consequence annotation stores.
 //!
-//! Lance is the only supported backend.
+//! Parquet is the only supported backend.
 
 use datafusion::common::{DataFusionError, Result};
 
@@ -11,7 +11,7 @@ pub enum AnnotationBackend {
 }
 
 impl AnnotationBackend {
-    /// Parse backend from UDTF argument. Only `"lance"` is accepted.
+    /// Parse backend from UDTF argument. Only `"cache"` is accepted.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "lance" => Ok(Self::Lance),

@@ -1,7 +1,7 @@
 //! VEP (Variant Effect Predictor) annotation functions for Apache DataFusion.
 //!
 //! Provides:
-//! - `annotate_vep()` table function for consequence annotation over a Lance cache
+//! - `annotate_vep()` table function for consequence annotation over a Parquet cache
 //! - `match_allele()` scalar UDF for allele matching
 //! - `vep_allele()` scalar UDF for VCF→VEP allele conversion
 #![allow(
@@ -42,6 +42,8 @@ pub mod allele;
 pub mod annotate_provider;
 pub mod annotate_table_function;
 pub mod annotation_store;
+#[cfg(feature = "parquet-cache")]
+pub mod cache;
 #[cfg(feature = "cache-builder")]
 pub mod cache_builder;
 pub(crate) mod cache_common;
@@ -50,11 +52,11 @@ pub(crate) mod colocated;
 pub mod coordinate;
 pub mod golden_benchmark;
 pub mod hgvs;
-#[cfg(feature = "lance-cache")]
-pub mod lance_cache;
 pub mod lookup_provider;
 pub mod miss_worklist;
 pub(crate) mod ordered_drain;
+#[cfg(feature = "parquet-cache")]
+pub mod parquet_cache;
 pub mod partitioned_cache;
 pub(crate) mod pipeline_trace;
 pub mod schema_contract;

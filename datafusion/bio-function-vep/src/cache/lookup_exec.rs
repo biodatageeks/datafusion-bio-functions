@@ -1,5 +1,5 @@
 //! KvLookupExec: ExecutionPlan that streams VCF batches and probes
-//! the Lance columnar variation dataset per-position for annotation.
+//! the Parquet columnar variation dataset per-position for annotation.
 
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -30,29 +30,27 @@ use crate::allele::{
     VariantAlleleInput, allele_matches, get_matched_variant_alleles, vcf_to_vep_allele,
     vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
+use crate::cache::key_encoding::chrom_to_code;
+use crate::cache::variant_key::{
+    position_key_from_code as warm_position_key_from_code,
+    variant_key_from_position as warm_variant_key_from_position,
+};
 use crate::cache_common::AlleleMatcher;
 use crate::colocated::{
     AF_COL_NAMES, AfColumns, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
     compare_existing_variant_alleles, output_allele_from_allele_string, read_reference_sequence,
 };
-use crate::lance_cache::key_encoding::chrom_to_code;
-use crate::lance_cache::variant_key::{
-    position_key_from_code as warm_position_key_from_code,
-    variant_key_from_position as warm_variant_key_from_position,
-};
-use crate::lance_cache::variation_runtime::{
-    SinglePathLanceVariationLookup, StreamingPositionCursor,
-};
-use crate::partitioned_cache::PartitionedLanceCache;
+use crate::parquet_cache::variation_lookup::SinglePathParquetVariationLookup;
+use datafusion::arrow::array::BooleanArray;
 use tokio::sync::OnceCell;
 
-/// Drive a Lance future to completion from a synchronous context regardless of
+/// Drive a Parquet future to completion from a synchronous context regardless of
 /// the ambient Tokio runtime flavor. `block_in_place` panics on a current-thread
 /// runtime (`#[tokio::test]`'s default flavor, embedded single-thread callers),
 /// so fall back to a dedicated OS thread there; with no runtime in scope, create
 /// one. Keeps the multi-thread fast path (`block_in_place`) for production.
-#[cfg(feature = "lance-cache")]
-pub(crate) fn block_on_lance<T, F>(fut: F) -> Result<T>
+#[cfg(feature = "parquet-cache")]
+pub(crate) fn block_on<T, F>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>> + Send,
     T: Send,
@@ -71,7 +69,7 @@ where
                 .join()
                 .unwrap_or_else(|_| {
                     Err(DataFusionError::Execution(
-                        "lance lookup worker thread panicked".to_string(),
+                        "cache lookup worker thread panicked".to_string(),
                     ))
                 })
         }),
@@ -94,7 +92,7 @@ pub enum KvMatchMode {
 
 /// Physical execution plan for KV-backed variant lookup.
 ///
-/// Takes a VCF input plan, probes the Lance variation dataset per-position,
+/// Takes a VCF input plan, probes the Parquet variation dataset per-position,
 /// and emits LEFT JOIN output (unmatched VCF rows get NULL cache columns).
 pub struct KvLookupExec {
     input: Arc<dyn ExecutionPlan>,
@@ -121,24 +119,21 @@ pub struct KvLookupExec {
     /// Optional partition-local sinks for co-located data collected during probe phase.
     colocated_partition_sinks: Option<Vec<ColocatedSink>>,
     target_partitions: usize,
-    /// Per-contig lance variation lookup (dataset + page directory + streaming
-    /// reader), built once and shared across all per-partition streams via the
-    /// Arc. Single-flight via OnceCell so simultaneous fan-out probes build it
-    /// exactly once. Each partition derives its own streaming cursor.
-    #[cfg(feature = "lance-cache")]
-    lance_lookup_cell: Arc<OnceCell<Arc<SinglePathLanceVariationLookup>>>,
+    /// Per-contig Parquet variation lookup (shard + footer page directory), built
+    /// once and shared across all per-partition streams via the Arc. Single-flight
+    /// via OnceCell so simultaneous fan-out probes build it exactly once.
+    #[cfg(feature = "parquet-cache")]
+    parquet_lookup_cell: Arc<OnceCell<Arc<SinglePathParquetVariationLookup>>>,
 }
 
 #[derive(Debug, Clone)]
-enum VariationLookupStorage {
-    Lance { cache_root: PathBuf },
+struct VariationLookupStorage {
+    cache_root: PathBuf,
 }
 
 impl VariationLookupStorage {
     fn as_str(&self) -> &'static str {
-        match self {
-            Self::Lance { .. } => "lance",
-        }
+        "parquet"
     }
 }
 
@@ -168,9 +163,11 @@ fn build_lookup_output_schema(
 }
 
 impl KvLookupExec {
-    #[cfg(feature = "lance-cache")]
+    /// Construct a variation lookup exec backed by the Parquet cache. The read
+    /// seam resolves through [`SinglePathParquetVariationLookup`].
+    #[cfg(feature = "parquet-cache")]
     #[allow(clippy::too_many_arguments)]
-    pub fn new_lance(
+    pub fn new_parquet(
         input: Arc<dyn ExecutionPlan>,
         cache_root: PathBuf,
         cache_schema: SchemaRef,
@@ -196,7 +193,7 @@ impl KvLookupExec {
 
         Ok(Self {
             input,
-            variation_storage: VariationLookupStorage::Lance { cache_root },
+            variation_storage: VariationLookupStorage { cache_root },
             cache_schema,
             cache_columns,
             match_mode,
@@ -212,8 +209,8 @@ impl KvLookupExec {
             colocated_sink: None,
             colocated_partition_sinks: None,
             target_partitions: 1,
-            #[cfg(feature = "lance-cache")]
-            lance_lookup_cell: Arc::new(OnceCell::new()),
+            #[cfg(feature = "parquet-cache")]
+            parquet_lookup_cell: Arc::new(OnceCell::new()),
         })
     }
 
@@ -281,10 +278,10 @@ impl ExecutionPlan for KvLookupExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1);
-        let VariationLookupStorage::Lance { cache_root } = &self.variation_storage;
-        let mut exec = KvLookupExec::new_lance(
+        let cache_root = self.variation_storage.cache_root.clone();
+        let mut exec = KvLookupExec::new_parquet(
             children[0].clone(),
-            cache_root.clone(),
+            cache_root,
             self.cache_schema.clone(),
             self.cache_columns.clone(),
             self.match_mode,
@@ -302,11 +299,11 @@ impl ExecutionPlan for KvLookupExec {
             exec = exec.with_colocated_partition_sinks(sinks.clone());
         }
         exec = exec.with_target_partitions(self.target_partitions);
-        // Carry the shared per-contig lance lookup (and any already-built index)
-        // forward across re-planning instead of letting new_lance reset it.
-        #[cfg(feature = "lance-cache")]
+        // Carry the shared per-contig variation lookup forward across re-planning
+        // instead of letting new_parquet reset it.
+        #[cfg(feature = "parquet-cache")]
         {
-            exec.lance_lookup_cell = Arc::clone(&self.lance_lookup_cell);
+            exec.parquet_lookup_cell = Arc::clone(&self.parquet_lookup_cell);
         }
         Ok(Arc::new(exec))
     }
@@ -323,7 +320,7 @@ impl ExecutionPlan for KvLookupExec {
             .and_then(|sinks| sinks.get(partition).cloned())
             .or_else(|| self.colocated_sink.clone());
 
-        #[cfg_attr(not(feature = "lance-cache"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "parquet-cache"), allow(unused_mut))]
         let mut stream = KvLookupStream::new(
             input_stream,
             self.variation_storage.clone(),
@@ -344,9 +341,9 @@ impl ExecutionPlan for KvLookupExec {
 
         // Share the exec's single per-contig variation lookup with this stream;
         // new() seeded a placeholder empty cell.
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         {
-            stream.lance_lookup_cell = Arc::clone(&self.lance_lookup_cell);
+            stream.parquet_lookup_cell = Arc::clone(&self.parquet_lookup_cell);
         }
 
         Ok(Box::pin(stream))
@@ -375,13 +372,10 @@ struct KvLookupStream {
     output_col_positions: Vec<usize>,
     colocated_sink: Option<ColocatedSink>,
     target_partitions: usize,
-    /// Shared (Arc-cloned from the exec) per-contig variation lookup, built once.
-    #[cfg(feature = "lance-cache")]
-    lance_lookup_cell: Arc<OnceCell<Arc<SinglePathLanceVariationLookup>>>,
-    /// Per-partition resolution cursor (eager offset or streaming page cursor),
-    /// keyed by chrom. Created lazily from the shared lookup's backend.
-    #[cfg(feature = "lance-cache")]
-    lance_cursors: HashMap<String, StreamingPositionCursor>,
+    /// Shared (Arc-cloned from the exec) per-contig Parquet variation lookup,
+    /// built once.
+    #[cfg(feature = "parquet-cache")]
+    parquet_lookup_cell: Arc<OnceCell<Arc<SinglePathParquetVariationLookup>>>,
     warm_cold_backend: WarmColdVariationBackend,
     warm_cold_index_mode: WarmColdVariationIndexMode,
     profile_enabled: bool,
@@ -389,7 +383,7 @@ struct KvLookupStream {
     profile_emitted: bool,
     profile: LookupProfile,
     /// Input slices waiting to be processed after a large upstream batch was
-    /// split to bound Lance `take_rows` work.
+    /// split to bound Parquet `take_rows` work.
     pending_input_slices: VecDeque<RecordBatch>,
     /// Buffered matched batches (used when colocated sink is present).
     /// Batches are collected during probe and emitted after input exhaustion.
@@ -474,7 +468,7 @@ fn push_unique_column(columns: &mut Vec<String>, name: &str) {
     }
 }
 
-/// Columns to project from the Lance variation dataset for a cold-tier probe.
+/// Columns to project from the Parquet variation dataset for a cold-tier probe.
 fn cold_parquet_projection_columns(
     cache_columns: &[String],
     include_colocated: bool,
@@ -519,23 +513,23 @@ struct ColdChunkProbeMetrics {
     emitted: bool,
 }
 
-/// Variation cold-tier backend. The single-path cache is Lance-only; the enum
+/// Variation cold-tier backend. The single-path cache is Parquet-only; the enum
 /// is retained so the profiling/diagnostic plumbing keeps its `backend` label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WarmColdVariationBackend {
-    Lance,
+    Parquet,
 }
 
 impl WarmColdVariationBackend {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Lance => "lance",
+            Self::Parquet => "parquet",
         }
     }
 
-    #[cfg(feature = "lance-cache")]
-    fn is_lance(self) -> bool {
-        matches!(self, Self::Lance)
+    #[cfg(feature = "parquet-cache")]
+    fn is_parquet(self) -> bool {
+        matches!(self, Self::Parquet)
     }
 }
 
@@ -579,13 +573,16 @@ fn format_variation_lookup_profile_line(
 
 fn warm_source_label(backend: WarmColdVariationBackend) -> &'static str {
     match backend {
-        #[cfg(feature = "lance-cache")]
-        WarmColdVariationBackend::Lance => "lance",
+        #[cfg(feature = "parquet-cache")]
+        WarmColdVariationBackend::Parquet => "parquet",
     }
 }
 
-#[cfg(feature = "lance-cache")]
-fn lance_variation_path_for_chrom(cache: &PartitionedLanceCache, chrom: &str) -> Option<PathBuf> {
+#[cfg(feature = "parquet-cache")]
+fn parquet_variation_path_for_chrom(
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
+    chrom: &str,
+) -> Option<PathBuf> {
     cache.variation_path(chrom).or_else(|| {
         chrom
             .strip_prefix("chr")
@@ -709,10 +706,10 @@ struct LookupProfile {
     cold_parquet_page_index_unique_candidate_pages: u64,
     cold_parquet_page_index_unique_candidate_rows: u64,
     /// Cold-tier read time. Emitted as `cold_tier_load` (and the read-stats line
-    /// as `cold_tier`) — the cold tier is backend-agnostic and is Lance in the
+    /// as `cold_tier`) — the cold tier is backend-agnostic and is Parquet in the
     /// single-path cache; the `cold_parquet*` field names are retained from the
     /// former parquet cold tier and only matter for the parquet-format diagnostics
-    /// (row_groups/pages) below, which stay zero under the Lance backend.
+    /// (row_groups/pages) below, which stay zero under the Parquet backend.
     cold_parquet_load: Duration,
 }
 
@@ -953,7 +950,7 @@ fn kv_profile_detailed_enabled() -> bool {
     std::env::var_os("VEP_KV_PROFILE_DETAILED").is_some()
 }
 
-fn lance_lookup_process_batch_rows() -> usize {
+fn lookup_process_batch_rows() -> usize {
     std::env::var("VEP_LANCE_LOOKUP_PROCESS_BATCH_ROWS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -1015,7 +1012,7 @@ impl<'a> StringColumnView<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn probe_lance_taken_batch_position(
+fn probe_taken_batch_position(
     batch: &RecordBatch,
     rows: &[u32],
     exact_matcher: AlleleMatcher,
@@ -1050,7 +1047,7 @@ fn probe_lance_taken_batch_position(
     if rows.is_empty() {
         return Ok((ColdProbeResult::NotCovered, metrics));
     }
-    let indices = LanceBatchProbeIndices::new(batch)?;
+    let indices = BatchProbeIndices::new(batch)?;
     let mut coloc_buf = coloc_buf;
     let prepared_coloc = if coloc_buf.is_some() {
         let prepare_started = Instant::now();
@@ -1206,15 +1203,15 @@ fn probe_lance_taken_batch_position(
     }
 }
 
-#[cfg(feature = "lance-cache")]
-struct LanceBatchProbeIndices {
+#[cfg(feature = "parquet-cache")]
+struct BatchProbeIndices {
     allele_string: usize,
     end: Option<usize>,
     failed: Option<usize>,
 }
 
-#[cfg(feature = "lance-cache")]
-impl LanceBatchProbeIndices {
+#[cfg(feature = "parquet-cache")]
+impl BatchProbeIndices {
     fn new(batch: &RecordBatch) -> Result<Self> {
         let schema = batch.schema();
         Ok(Self {
@@ -1227,8 +1224,8 @@ impl LanceBatchProbeIndices {
     }
 }
 
-#[cfg(feature = "lance-cache")]
-fn lance_start_row_map(batch: &RecordBatch) -> Result<HashMap<u32, Vec<u32>>> {
+#[cfg(feature = "parquet-cache")]
+fn start_row_map(batch: &RecordBatch) -> Result<HashMap<u32, Vec<u32>>> {
     let schema = batch.schema();
     let start_idx = schema
         .index_of("start")
@@ -1266,8 +1263,8 @@ impl KvLookupStream {
         colocated_sink: Option<ColocatedSink>,
         target_partitions: usize,
     ) -> Self {
-        let VariationLookupStorage::Lance { cache_root } = &variation_storage;
-        let warm_cold_backend = WarmColdVariationBackend::Lance;
+        let cache_root = &variation_storage.cache_root;
+        let warm_cold_backend = WarmColdVariationBackend::Parquet;
         let warm_cold_index_mode = WarmColdVariationIndexMode::PositionThenVariantBloom;
         let profile_enabled = kv_profile_enabled();
         let profile_detailed = kv_profile_detailed_enabled();
@@ -1306,10 +1303,8 @@ impl KvLookupStream {
             colocated_sink,
             target_partitions: target_partitions.max(1),
             // Placeholder; execute() overwrites with the exec's shared cell.
-            #[cfg(feature = "lance-cache")]
-            lance_lookup_cell: Arc::new(OnceCell::new()),
-            #[cfg(feature = "lance-cache")]
-            lance_cursors: HashMap::new(),
+            #[cfg(feature = "parquet-cache")]
+            parquet_lookup_cell: Arc::new(OnceCell::new()),
             warm_cold_backend,
             warm_cold_index_mode,
             profile_enabled,
@@ -1324,10 +1319,10 @@ impl KvLookupStream {
 
     /// Single-pass position-keyed lookup.
     ///
-    /// For each VCF row, fetch the per-position entry from Lance, match alleles,
+    /// For each VCF row, fetch the per-position entry from Parquet, match alleles,
     /// and append matched column values directly into ArrayBuilders.
     #[allow(clippy::too_many_arguments)]
-    fn probe_lance_warm_position(
+    fn probe_warm_position(
         &mut self,
         chrom: &str,
         _chrom_code: u16,
@@ -1345,7 +1340,7 @@ impl KvLookupStream {
         coloc_buf: Option<&mut HashMap<ColocatedKey, ColocatedSinkValue>>,
     ) -> Result<Option<LookupDecision>> {
         let collect_colocated = coloc_buf.is_some();
-        self.ensure_lance_lookup(chrom, cache_columns, collect_colocated)?;
+        self.ensure_parquet_lookup(chrom, cache_columns, collect_colocated)?;
         if self.profile_enabled {
             self.profile.warm_probes += 1;
             self.profile.warm_not_covered += 1;
@@ -1355,71 +1350,49 @@ impl KvLookupStream {
         Ok(Some(LookupDecision::UseFjall))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(feature = "lance-cache")]
-    fn ensure_lance_lookup(
+    /// Single-flight build of the shared per-contig Parquet variation lookup.
+    #[cfg(feature = "parquet-cache")]
+    fn ensure_parquet_lookup(
         &mut self,
         chrom: &str,
         cache_columns: &[String],
         collect_colocated: bool,
     ) -> Result<()> {
-        let VariationLookupStorage::Lance { cache_root } = &self.variation_storage;
-        let cache_root = cache_root.clone();
-
-        // Build the shared per-contig lookup exactly once (single-flight across
-        // all partition streams via the shared OnceCell). Concurrent fan-out
-        // probes await the one build instead of each materializing the index.
-        if self.lance_lookup_cell.get().is_none() {
-            let cache = PartitionedLanceCache::detect(cache_root.to_string_lossy().as_ref())
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "lance variation lookup but no variation.lance manifest under {}",
-                        cache_root.display()
-                    ))
-                })?;
-            let path = lance_variation_path_for_chrom(&cache, chrom).ok_or_else(|| {
+        let cache_root = self.variation_storage.cache_root.clone();
+        if self.parquet_lookup_cell.get().is_none() {
+            let cache = crate::parquet_cache::detect::PartitionedParquetCache::detect(
+                cache_root.to_string_lossy().as_ref(),
+            )
+            .ok_or_else(|| {
                 DataFusionError::Execution(format!(
-                    "lance variation lookup but no Lance dataset for {chrom} in {}",
+                    "parquet variation lookup but no variation manifest under {}",
+                    cache_root.display()
+                ))
+            })?;
+            let path = parquet_variation_path_for_chrom(&cache, chrom).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "parquet variation lookup but no shard for {chrom} in {}",
                     cache_root.display()
                 ))
             })?;
             let projection = cold_parquet_projection_columns(cache_columns, collect_colocated);
-            let projected_cols = projection.len();
-            let path_disp = path.display().to_string();
-            let cell = Arc::clone(&self.lance_lookup_cell);
+            let cell = Arc::clone(&self.parquet_lookup_cell);
             let open_started = Instant::now();
             let open_fut = async {
                 cell.get_or_try_init(|| async {
-                    SinglePathLanceVariationLookup::open(&path, projection)
+                    SinglePathParquetVariationLookup::open(&path, projection)
                         .await
                         .map(Arc::new)
                 })
                 .await
                 .cloned()
             };
-            let lookup = block_on_lance(open_fut)?;
-            let open_elapsed = open_started.elapsed();
+            let _lookup = block_on(open_fut)?;
             if self.profile_enabled {
-                self.profile.position_index_load += open_elapsed;
+                self.profile.position_index_load += open_started.elapsed();
                 self.profile.position_index_loaded += 1;
-                self.profile.position_index_rows += lookup.row_ids_len() as u64;
-            }
-            if self.profile_detailed || std::env::var_os("VEP_LANCE_PROFILE").is_some() {
-                eprintln!(
-                    "[vep-lance-profile] open chrom={} path={} projected_cols={} collect_colocated={} row_ids={} unique_positions={} open_s={:.3}",
-                    chrom,
-                    path_disp,
-                    projected_cols,
-                    collect_colocated,
-                    lookup.row_ids_len(),
-                    lookup.unique_positions(),
-                    open_elapsed.as_secs_f64(),
-                );
             }
         }
-        // The per-partition cursor is created lazily on first probe (it depends
-        // on the lookup backend chosen during open()).
-
         Ok(())
     }
 
@@ -1458,9 +1431,9 @@ impl KvLookupStream {
     }
 
     fn input_slice_rows(&self) -> usize {
-        #[cfg(feature = "lance-cache")]
-        if self.warm_cold_backend.is_lance() {
-            return lance_lookup_process_batch_rows();
+        #[cfg(feature = "parquet-cache")]
+        if self.warm_cold_backend.is_parquet() {
+            return lookup_process_batch_rows();
         }
         usize::MAX
     }
@@ -1612,7 +1585,7 @@ impl KvLookupStream {
                 if self.profile_enabled {
                     self.profile.probes += 1;
                 }
-                if let Some(warm_decision) = self.probe_lance_warm_position(
+                if let Some(warm_decision) = self.probe_warm_position(
                     chrom,
                     chrom_code,
                     *probe_start,
@@ -1639,7 +1612,7 @@ impl KvLookupStream {
                         }
                         LookupDecision::UseFjall => {
                             let collect_colocated = coloc_buf.is_some();
-                            self.ensure_lance_lookup(chrom, &cache_columns, collect_colocated)?;
+                            self.ensure_parquet_lookup(chrom, &cache_columns, collect_colocated)?;
                             let pending_idx = pending_cold_probes.len();
                             pending_cold_probes.push(PendingColdProbe {
                                 chrom: chrom.to_string(),
@@ -1674,7 +1647,7 @@ impl KvLookupStream {
         }
 
         if !pending_cold_probes.is_empty() {
-            let mut lance_taken_by_chrom =
+            let mut taken_by_chrom =
                 HashMap::<String, (RecordBatch, HashMap<u32, Vec<u32>>)>::new();
 
             let mut pending_starts_by_chrom: HashMap<String, Vec<u32>> = HashMap::new();
@@ -1690,35 +1663,36 @@ impl KvLookupStream {
             for (chrom, mut starts) in pending_starts_by_chrom {
                 starts.sort_unstable();
                 starts.dedup();
-                let lookup = self.lance_lookup_cell.get().ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "lance variation lookup not built for {chrom}"
-                    ))
-                })?;
-                let cursor = self
-                    .lance_cursors
-                    .entry(chrom.clone())
-                    .or_insert_with(|| lookup.new_cursor());
                 let take_started = self.profile_enabled.then(Instant::now);
-                let taken = block_on_lance(lookup.resolve_and_take(&starts, cursor))?;
+                let taken = {
+                    let lookup = self.parquet_lookup_cell.get().ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "parquet variation lookup not built for {chrom}"
+                        ))
+                    })?;
+                    // Parquet resolution is stateless (footer PageDir), so a
+                    // fresh per-call cursor is sufficient.
+                    let mut cursor = lookup.new_cursor();
+                    block_on(lookup.resolve_and_take(&starts, &mut cursor))?
+                };
                 if let Some(t0) = take_started {
                     self.profile.cold_parquet_load += t0.elapsed();
                 }
-                let row_map = lance_start_row_map(&taken.batch)?;
-                lance_taken_by_chrom.insert(chrom, (taken.batch, row_map));
+                let row_map = start_row_map(&taken.batch)?;
+                taken_by_chrom.insert(chrom, (taken.batch, row_map));
             }
 
             for pending in &pending_cold_probes {
                 let row = pending.vcf_row as usize;
                 let emit_output = !row_output_emitted[row];
                 let (result, metrics) =
-                    if let Some((batch, row_map)) = lance_taken_by_chrom.get(&pending.chrom) {
+                    if let Some((batch, row_map)) = taken_by_chrom.get(&pending.chrom) {
                         let rows = u32::try_from(pending.probe_start)
                             .ok()
                             .and_then(|start| row_map.get(&start))
                             .map(Vec::as_slice)
                             .unwrap_or(&[]);
-                        probe_lance_taken_batch_position(
+                        probe_taken_batch_position(
                             batch,
                             rows,
                             self.exact_matcher,
@@ -1874,7 +1848,7 @@ fn output_order_for_vcf_indices(vcf_indices: &[u32]) -> Option<Vec<u32>> {
     Some(output_order)
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn batch_output_indices(
     batch: &RecordBatch,
     cache_columns: &[String],
@@ -1893,7 +1867,7 @@ fn batch_output_indices(
         .collect()
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn append_batch_row_values(
     batch: &RecordBatch,
     row: usize,
@@ -1910,7 +1884,7 @@ fn append_batch_row_values(
     Ok(())
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn batch_string_value(
     batch: &RecordBatch,
     column_idx: Option<usize>,
@@ -1938,7 +1912,7 @@ fn batch_string_value(
     }
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn batch_i64_value(batch: &RecordBatch, column_idx: Option<usize>, row: usize) -> Option<i64> {
     let array = batch.column(column_idx?);
     if row >= array.len() || array.is_null(row) {
@@ -1959,6 +1933,11 @@ fn batch_i64_value(batch: &RecordBatch, column_idx: Option<usize>, row: usize) -
         Some(array.value(row) as i64)
     } else if let Some(array) = array.as_any().downcast_ref::<UInt32Array>() {
         Some(array.value(row) as i64)
+    } else if let Some(array) = array.as_any().downcast_ref::<BooleanArray>() {
+        // Parquet variation cache stores the binary flags (failed/somatic/
+        // phenotype_or_disease) as presence Boolean; read true->1, false->0 so
+        // they compare identically to the Int8-encoded Parquet cache.
+        Some(array.value(row) as i64)
     } else {
         array
             .as_any()
@@ -1967,7 +1946,28 @@ fn batch_i64_value(batch: &RecordBatch, column_idx: Option<usize>, row: usize) -
     }
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(all(test, feature = "parquet-cache"))]
+mod batch_i64_boolean_tests {
+    use super::*;
+    use datafusion::arrow::array::BooleanArray;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn batch_i64_value_reads_boolean_presence_flags() {
+        let arr = BooleanArray::from(vec![Some(true), Some(false), None]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "failed",
+            DataType::Boolean,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        assert_eq!(batch_i64_value(&batch, Some(0), 0), Some(1)); // true  -> 1
+        assert_eq!(batch_i64_value(&batch, Some(0), 1), Some(0)); // false -> 0
+        assert_eq!(batch_i64_value(&batch, Some(0), 2), None); //    null  -> None
+    }
+}
+
+#[cfg(feature = "parquet-cache")]
 fn resolve_batch_coloc_indices(batch: &RecordBatch) -> Option<WarmColocIndices> {
     let schema = batch.schema();
     let find = |name: &str| schema.index_of(name).ok();
@@ -2663,38 +2663,41 @@ mod tests {
         assert!(lines[8].contains("unique_candidate_rows=61"));
     }
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     #[test]
-    fn variation_lookup_profile_line_identifies_lance_backend() {
+    fn variation_lookup_profile_line_identifies_parquet_backend() {
         let line = format_variation_lookup_profile_line(
-            "lance",
-            "lance",
-            WarmColdVariationBackend::Lance,
+            "parquet",
+            "parquet",
+            WarmColdVariationBackend::Parquet,
             WarmColdVariationIndexMode::PositionThenVariantBloom,
-            "/cache/variation.lance",
+            "/cache/variation",
             None,
             None,
             Some("/cache/variation.position_index"),
             Some("/cache/variation.variant_bloom_index"),
         );
 
-        assert!(line.contains("storage=lance"));
-        assert!(line.contains("warm_source=lance"));
-        assert!(line.contains("warm_cold_backend=lance"));
+        assert!(line.contains("storage=parquet"));
+        assert!(line.contains("warm_source=parquet"));
+        assert!(line.contains("warm_cold_backend=parquet"));
         assert!(line.contains("index_mode=posidx_bloom"));
         assert!(line.contains("warm_dir=-"));
         assert!(line.contains("cold_dir=-"));
         assert!(line.contains("variant_bloom_index_dir=/cache/variation.variant_bloom_index"));
     }
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     #[test]
-    fn warm_source_label_uses_lance_for_lance_backend() {
-        assert_eq!(warm_source_label(WarmColdVariationBackend::Lance), "lance");
+    fn warm_source_label_is_parquet() {
+        assert_eq!(
+            warm_source_label(WarmColdVariationBackend::Parquet),
+            "parquet"
+        );
     }
 
     #[test]
-    fn record_batch_slicer_bounds_large_lance_lookup_batches() {
+    fn record_batch_slicer_bounds_large_lookup_batches() {
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
             datafusion::arrow::datatypes::Field::new("start", DataType::Int32, false),
         ]));
@@ -2710,9 +2713,9 @@ mod tests {
         let lengths = queue.iter().map(RecordBatch::num_rows).collect::<Vec<_>>();
         assert_eq!(lengths, vec![5_000, 5_000, 2_001]);
     }
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     #[test]
-    fn lance_colocated_probe_matches_chr1_homopolymer_deletion() {
+    fn colocated_probe_matches_chr1_homopolymer_deletion() {
         use datafusion::arrow::datatypes::{Field, Schema};
         use std::collections::HashMap as StdHashMap;
         let cache_schema = Arc::new(Schema::new(vec![
@@ -2743,10 +2746,10 @@ mod tests {
         let mut coloc = StdHashMap::new();
         let mut builders = Vec::new();
         let mut vcf_indices = Vec::new();
-        let row_map = lance_start_row_map(&batch).unwrap();
+        let row_map = start_row_map(&batch).unwrap();
         let rows = row_map.get(&244_978_492).unwrap();
 
-        let (result, metrics) = probe_lance_taken_batch_position(
+        let (result, metrics) = probe_taken_batch_position(
             &batch,
             rows,
             allele_matches as fn(&str, &str, &str) -> bool,

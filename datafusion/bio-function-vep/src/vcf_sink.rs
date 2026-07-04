@@ -620,23 +620,23 @@ impl AnnotateVcfConfig {
 }
 
 fn cache_format_for_backend(_backend: &str) -> &str {
-    // Lance is the only supported backend.
-    "lance"
+    // Parquet is the only supported cache format.
+    "parquet"
 }
 
 fn cache_source_type_from_cache_source_for_backend(
     cache_source: &str,
     _backend: &str,
 ) -> Result<CacheSourceType> {
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     {
-        CacheSourceType::from_partitioned_lance_cache_source(cache_source)
+        CacheSourceType::from_partitioned_parquet_cache_source(cache_source)
     }
-    #[cfg(not(feature = "lance-cache"))]
+    #[cfg(not(feature = "parquet-cache"))]
     {
         let _ = cache_source;
         Err(DataFusionError::Plan(
-            "annotate_to_vcf(): Lance cache source metadata requires the lance-cache feature"
+            "annotate_to_vcf(): Parquet cache source metadata requires the parquet-cache feature"
                 .to_string(),
         ))
     }
@@ -1302,54 +1302,7 @@ mod tests {
         let json = config.to_options_json_with_backend("lance");
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(value["cache_format"], "lance");
-    }
-
-    #[cfg(feature = "lance-cache")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn lance_backend_reads_cache_source_metadata_from_lance_variation() {
-        use datafusion::arrow::array::{StringArray, UInt32Array};
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-
-        let tmp = tempfile::tempdir().unwrap();
-        let variation_dir = tmp.path().join("variation.lance");
-        let dataset_path = variation_dir.join("chr1.lance");
-        let schema = Arc::new(crate::lance_cache::schema::with_cache_source_metadata(
-            &Schema::new(vec![
-                Field::new("chrom", DataType::Utf8, false),
-                Field::new("start", DataType::UInt32, false),
-                Field::new("end", DataType::UInt32, false),
-            ]),
-            "merged",
-        ));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["chr1"])),
-                Arc::new(UInt32Array::from(vec![10])),
-                Arc::new(UInt32Array::from(vec![10])),
-            ],
-        )
-        .unwrap();
-
-        crate::lance_cache::write::write_record_batches_to_lance(
-            &dataset_path,
-            vec![batch],
-            crate::lance_cache::write::LanceIndexKind::Start,
-        )
-        .await
-        .unwrap();
-        crate::lance_cache::manifest::ChromManifest::new(vec![
-            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
-        ])
-        .write_to_entity_dir(&variation_dir)
-        .unwrap();
-
-        let source_type =
-            cache_source_type_from_cache_source_for_backend(tmp.path().to_str().unwrap(), "lance")
-                .unwrap();
-
-        assert_eq!(source_type, CacheSourceType::Merged);
+        assert_eq!(value["cache_format"], "parquet");
     }
 
     #[test]

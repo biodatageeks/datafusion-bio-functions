@@ -9,7 +9,7 @@ pub struct MissWorklist {
 impl MissWorklist {
     /// Build a single-chrom worklist.
     ///
-    /// Used by the partitioned path where the per-chrom Lance dataset IS the
+    /// Used by the partitioned path where the per-chrom Parquet dataset IS the
     /// filter, so no variant scanning is needed. The `expanded_chroms()` set
     /// will cover both bare and "chr"-prefixed forms.
     pub fn for_chrom(chrom: &str) -> Self {
@@ -49,7 +49,7 @@ impl MissWorklist {
         format!(" WHERE chrom IN ({})", literals.join(", "))
     }
 
-    /// SQL filter for the per-chrom Lance scan. The partitioned path filters by
+    /// SQL filter for the per-chrom Parquet scan. The partitioned path filters by
     /// chromosome only (the per-chrom dataset is itself the position filter).
     pub fn interval_filter_sql(&self) -> String {
         self.chrom_filter_clause()

@@ -1,7 +1,7 @@
-//! Cache builder: converts a raw Ensembl VEP cache to the partitioned Lance
-//! cache. The actual build work is delegated to [`crate::lance_cache::build`];
+//! Cache builder: converts a raw Ensembl VEP cache to the partitioned Parquet
+//! cache. The actual build work is delegated to [`crate::cache::build`];
 //! this module provides the public [`CacheBuilder`] entry point and entity
-//! dispatch. Lance is the only supported output format.
+//! dispatch. Parquet is the only supported output format.
 
 use datafusion::common::{DataFusionError, Result};
 use log::info;
@@ -13,22 +13,24 @@ use datafusion_bio_format_ensembl_cache::{
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheFormat {
     #[default]
-    Lance,
+    Parquet,
 }
 
 impl CacheFormat {
     pub fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
-            "lance" => Ok(Self::Lance),
+            // "cache" is accepted as a historical alias but always resolves to
+            // the Parquet cache — the only supported output format.
+            "lance" | "parquet" => Ok(Self::Parquet),
             other => Err(DataFusionError::Execution(format!(
-                "cache_format must be 'lance', got '{other}'"
+                "cache_format must be 'parquet', got '{other}'"
             ))),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Lance => "lance",
+            Self::Parquet => "parquet",
         }
     }
 }
@@ -39,11 +41,11 @@ pub struct EntityStats {
     pub entity: String,
     /// Files written for this entity, as `(path, row_count)`. Named
     /// `parquet_files` for backward compatibility with the Python wrapper;
-    /// now holds the entity's Lance dataset files.
+    /// holds the entity's Parquet shard files.
     pub parquet_files: Vec<(String, usize)>,
 }
 
-/// Builder for converting a raw Ensembl VEP cache to the partitioned Lance cache.
+/// Builder for converting a raw Ensembl VEP cache to the partitioned Parquet cache.
 pub struct CacheBuilder {
     cache_root: String,
     output_dir: String,
@@ -100,7 +102,7 @@ impl CacheBuilder {
         self
     }
 
-    /// Build all entities into the Lance cache.
+    /// Build all entities into the Parquet cache.
     pub async fn build_all(&self) -> Result<Vec<EntityStats>> {
         let entities = [
             "variation",
@@ -129,18 +131,18 @@ impl CacheBuilder {
 
     /// Build a single entity. Returns one or more EntityStats (translation splits into two).
     ///
-    /// When `overwrite` is false (default), skips entities whose Lance output
+    /// When `overwrite` is false (default), skips entities whose Parquet output
     /// already exists.
     pub async fn build_entity(&self, entity: &str) -> Result<Vec<EntityStats>> {
         let kind = parse_entity(entity)
             .ok_or_else(|| DataFusionError::Execution(format!("Unknown entity: {entity}")))?;
 
-        // Lance is the only supported cache format.
-        let CacheFormat::Lance = self.cache_format;
+        // Parquet is the only supported cache format.
+        let CacheFormat::Parquet = self.cache_format;
 
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         {
-            let options = crate::lance_cache::build::LanceCacheBuildOptions {
+            let options = crate::cache::build::CacheBuildOptions {
                 cache_root: self.cache_root.clone(),
                 output_dir: self.output_dir.clone(),
                 partitions: self.partitions,
@@ -148,14 +150,14 @@ impl CacheBuilder {
                 overwrite: self.overwrite,
                 chrom_filter: self.chrom_filter.clone(),
             };
-            crate::lance_cache::build::build_lance_entity(&options, kind).await
+            crate::cache::build::build_parquet_entity(&options, kind).await
         }
 
-        #[cfg(not(feature = "lance-cache"))]
+        #[cfg(not(feature = "parquet-cache"))]
         {
             let _ = kind;
             Err(DataFusionError::Execution(
-                "cache builder requires the lance-cache feature".to_string(),
+                "cache builder requires the parquet-cache feature".to_string(),
             ))
         }
     }
@@ -209,23 +211,24 @@ mod tests {
     }
 
     #[test]
-    fn cache_format_parser_accepts_lance_only() {
-        assert_eq!(CacheFormat::parse("lance").unwrap(), CacheFormat::Lance);
-        assert_eq!(CacheFormat::parse("LANCE").unwrap(), CacheFormat::Lance);
+    fn cache_format_parser_accepts_parquet_and_lance_alias() {
+        assert_eq!(CacheFormat::parse("parquet").unwrap(), CacheFormat::Parquet);
+        assert_eq!(CacheFormat::parse("lance").unwrap(), CacheFormat::Parquet);
+        assert_eq!(CacheFormat::parse("LANCE").unwrap(), CacheFormat::Parquet);
         assert!(CacheFormat::parse("indexed_parquet").is_err());
         assert!(CacheFormat::parse("legacy_fjall").is_err());
     }
 
     #[test]
-    fn cache_format_default_is_lance() {
-        assert_eq!(CacheFormat::default(), CacheFormat::Lance);
-        assert_eq!(CacheFormat::Lance.as_str(), "lance");
+    fn cache_format_default_is_parquet() {
+        assert_eq!(CacheFormat::default(), CacheFormat::Parquet);
+        assert_eq!(CacheFormat::Parquet.as_str(), "parquet");
     }
 
     #[test]
-    fn cache_builder_defaults_to_lance() {
+    fn cache_builder_defaults_to_parquet() {
         let builder = CacheBuilder::new("/cache", "/output");
-        assert_eq!(builder.cache_format, CacheFormat::Lance);
+        assert_eq!(builder.cache_format, CacheFormat::Parquet);
         assert_eq!(builder.partitions, 8);
         assert!(!builder.overwrite);
         assert!(builder.chrom_filter.is_none());
@@ -235,11 +238,11 @@ mod tests {
     fn cache_builder_with_overrides() {
         let builder = CacheBuilder::new("/cache", "/output")
             .with_partitions(4)
-            .with_cache_format(CacheFormat::Lance)
+            .with_cache_format(CacheFormat::Parquet)
             .with_overwrite(true)
             .with_chrom_filter(["chr1", "chr2"]);
         assert_eq!(builder.partitions, 4);
-        assert_eq!(builder.cache_format, CacheFormat::Lance);
+        assert_eq!(builder.cache_format, CacheFormat::Parquet);
         assert!(builder.overwrite);
         assert_eq!(
             builder.chrom_filter.as_deref(),

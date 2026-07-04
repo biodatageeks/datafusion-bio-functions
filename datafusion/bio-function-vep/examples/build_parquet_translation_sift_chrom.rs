@@ -1,10 +1,12 @@
-//! Rebuild one chromosome of the partitioned Lance variation cache from the
-//! Ensembl-cache table provider.
+//! Rebuild one chromosome of the partitioned **Parquet** variation cache from the
+//! Ensembl-cache table provider (Phase 2 backend).
+//!
+//! Writes `translation_sift/<chrom>.parquet` + upserts `chrom_manifest.json`.
 //!
 //! Usage:
 //!   cargo run --release -p datafusion-bio-function-vep \
 //!     --features lance-cache,cache-builder \
-//!     --example build_lance_variation_chrom -- \
+//!     --example build_parquet_translation_sift_chrom -- \
 //!     --cache-root /path/to/homo_sapiens_merged/115_GRCh38 \
 //!     --output-dir /path/to/115_GRCh38_merged \
 //!     --chrom chr1 --cache-source-type merged --partitions 8 --overwrite
@@ -15,12 +17,15 @@ use std::time::Instant;
 
 use datafusion::common::{DataFusionError, Result};
 use datafusion_bio_format_ensembl_cache::CacheSourceType;
-use datafusion_bio_function_vep::lance_cache::build::{
-    LanceCacheBuildOptions, build_lance_variation_chrom, lance_entity_dir_name,
+use datafusion_bio_function_vep::cache::build::{
+    CacheBuildOptions, build_parquet_translation_sift_chrom,
 };
-use datafusion_bio_function_vep::lance_cache::manifest::{
+use datafusion_bio_function_vep::cache::manifest::{
     CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest,
 };
+
+/// Parquet entity directory name (mirrors `parquet_cache::detect`).
+const PARQUET_SIFT_DIR: &str = "translation_sift";
 
 #[derive(Debug)]
 struct Args {
@@ -37,7 +42,7 @@ async fn main() -> Result<()> {
     let _ = env_logger::try_init();
     let args = parse_args()?;
     let started = Instant::now();
-    let options = LanceCacheBuildOptions {
+    let options = CacheBuildOptions {
         cache_root: args.cache_root.to_string_lossy().to_string(),
         output_dir: args.output_dir.to_string_lossy().to_string(),
         partitions: args.partitions,
@@ -53,19 +58,19 @@ async fn main() -> Result<()> {
     eprintln!("partitions={}", args.partitions);
     eprintln!("overwrite={}", args.overwrite);
 
-    let entry = build_lance_variation_chrom(&options, &args.chrom).await?;
+    let entry = build_parquet_translation_sift_chrom(&options, &args.chrom).await?;
     if entry.rows == 0 {
         return Err(DataFusionError::Execution(format!(
-            "variation Lance build for {} wrote 0 rows",
+            "translation_sift Parquet build for {} wrote 0 rows",
             args.chrom
         )));
     }
 
-    let entity_dir = args.output_dir.join(lance_entity_dir_name("variation"));
+    let entity_dir = args.output_dir.join(PARQUET_SIFT_DIR);
     upsert_manifest_entry(&entity_dir, entry.clone())?;
 
     eprintln!(
-        "wrote chrom={} dataset={} rows={} elapsed={:.2}s",
+        "wrote chrom={} shard={} rows={} elapsed={:.2}s",
         entry.chrom,
         entity_dir.join(&entry.dataset).display(),
         entry.rows,
@@ -153,7 +158,7 @@ fn parse_usize(value: String) -> Result<usize> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: build_lance_variation_chrom --cache-root /path/to/homo_sapiens_merged/115_GRCh38 \
+        "Usage: build_parquet_translation_sift_chrom --cache-root /path/to/homo_sapiens_merged/115_GRCh38 \
          --output-dir /path/to/115_GRCh38_merged --chrom chr1 \
          [--cache-source-type merged] [--partitions 8] [--overwrite]"
     );

@@ -1,7 +1,7 @@
 //! Provider for `annotate_vep()` table function.
 //!
 //! Runtime behavior:
-//! - starts from the Lance variation cache lookup for known-variant metadata,
+//! - starts from the Parquet variation cache lookup for known-variant metadata,
 //! - when transcript/exon context is available, computes transcript-driven
 //!   consequence terms and most-severe ranking,
 //! - otherwise falls back to known-variant CSQ placeholders.
@@ -185,8 +185,6 @@ use crate::colocated::{
 };
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::MissWorklist;
-#[cfg(feature = "lance-cache")]
-use crate::partitioned_cache::PartitionedLanceCache;
 use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
@@ -198,7 +196,7 @@ use crate::transcript_consequence::{
     refseq_edit_offset_delta,
 };
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 use crate::cache_common::SiftPredictionStoreRef;
 
 /// Column categories for typed non-meta annotation columns.
@@ -2123,7 +2121,7 @@ impl ColocatedData {
 
 /// Build co-located variant aggregation from the piggybacked collection sink.
 ///
-/// Converts `ColocatedCacheEntry` entries (collected during Lance variation
+/// Converts `ColocatedCacheEntry` entries (collected during Parquet variation
 /// lookup) into the same `ColocatedData` format used by the CSQ assembler,
 /// preserving the per-input-allele separation VEP keeps between different
 /// parser/decomposed alleles at the same locus.
@@ -2924,8 +2922,8 @@ fn lookup_sift_polyphen(
     protein_position: Option<&str>,
     amino_acids: Option<&str>,
     cache: &mut SiftPolyphenCache,
-    #[cfg(feature = "lance-cache")] sift_store: &Option<SiftPredictionStoreRef>,
-    #[cfg(not(feature = "lance-cache"))] _sift_kv: &Option<()>,
+    #[cfg(feature = "parquet-cache")] sift_store: &Option<SiftPredictionStoreRef>,
+    #[cfg(not(feature = "parquet-cache"))] _sift_kv: &Option<()>,
 ) -> (String, String) {
     let empty = || (String::new(), String::new());
 
@@ -2954,7 +2952,7 @@ fn lookup_sift_polyphen(
     // reading only this amino-acid position's payload. `transcript_id` is not
     // used on this path; without a `transcript_uid` we cannot build the key, so
     // skip SIFT rather than guess.
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     if let Some(store) = sift_store {
         if store.is_position_sliced() {
             let Some(uid) = transcript_uid else {
@@ -2985,7 +2983,7 @@ fn lookup_sift_polyphen(
 
     // Lazy load from the configured transcript-id prediction store on cache miss.
     if cache.get(tx_id).is_none() {
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         if let Some(store) = sift_store {
             let ids = [tx_id.to_string()];
             if let Ok(mut found) = store.get_many(&ids) {
@@ -3012,183 +3010,32 @@ fn lookup_sift_polyphen(
     (sift, polyphen)
 }
 
-#[cfg(feature = "lance-cache")]
-async fn read_lance_dataset_schema(path: &std::path::Path) -> Result<Schema> {
-    let dataset = lance::Dataset::open(path.to_string_lossy().as_ref())
+/// Read the Arrow schema of a variation `.parquet` shard. Used by the
+/// Parquet-cache detection path.
+#[cfg(feature = "parquet-cache")]
+async fn read_parquet_dataset_schema(path: &std::path::Path) -> Result<Schema> {
+    use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+    let file = tokio::fs::File::open(path).await.map_err(|error| {
+        DataFusionError::Execution(format!(
+            "failed to open Parquet schema sample '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let builder = ParquetRecordBatchStreamBuilder::new(file)
         .await
         .map_err(|error| {
             DataFusionError::Execution(format!(
-                "failed to open Lance schema sample '{}': {error}",
+                "failed to read Parquet schema '{}': {error}",
                 path.display()
             ))
         })?;
-    Ok(dataset.schema().into())
-}
-
-#[cfg(feature = "lance-cache")]
-#[derive(Clone)]
-struct InMemorySiftPredictionStore {
-    predictions: Arc<HashMap<String, CachedPredictions>>,
-}
-
-#[cfg(feature = "lance-cache")]
-impl crate::cache_common::SiftPredictionStore for InMemorySiftPredictionStore {
-    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
-        if transcript_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut out = HashMap::with_capacity(transcript_ids.len());
-        for transcript_id in transcript_ids {
-            if out.contains_key(transcript_id) {
-                continue;
-            }
-            if let Some(predictions) = self.predictions.get(transcript_id) {
-                out.insert(transcript_id.clone(), predictions.clone());
-            }
-        }
-        Ok(out)
-    }
-}
-
-#[cfg(feature = "lance-cache")]
-#[derive(Clone)]
-struct LanceBinarySiftPredictionStore {
-    lookup: Arc<crate::lance_cache::context_runtime::TranscriptIdLanceLookup>,
-    predictions: Arc<Mutex<HashMap<String, Option<CachedPredictions>>>>,
-}
-
-#[cfg(feature = "lance-cache")]
-impl crate::cache_common::SiftPredictionStore for LanceBinarySiftPredictionStore {
-    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
-        if transcript_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut out = HashMap::with_capacity(transcript_ids.len());
-        let mut uncached = Vec::new();
-        let mut seen_uncached = HashSet::new();
-        {
-            let cache = self.predictions.lock().map_err(|error| {
-                DataFusionError::Execution(format!("Lance SIFT prediction cache poisoned: {error}"))
-            })?;
-            for transcript_id in transcript_ids {
-                if out.contains_key(transcript_id) {
-                    continue;
-                }
-                if let Some(cached) = cache.get(transcript_id) {
-                    if let Some(predictions) = cached {
-                        out.insert(transcript_id.clone(), predictions.clone());
-                    }
-                    continue;
-                }
-                if seen_uncached.insert(transcript_id.clone()) {
-                    uncached.push(transcript_id.clone());
-                }
-            }
-        }
-        if uncached.is_empty() {
-            return Ok(out);
-        }
-
-        // `block_in_place` panics on a current-thread runtime; `block_on_lance`
-        // falls back to a dedicated thread there (see its doc).
-        let batch = crate::lance_cache::lookup_exec::block_on_lance(
-            self.lookup.take_transcript_ids(&uncached),
-        )?;
-        let fetched = sift_predictions_from_binary_batch(&batch)?;
-        let mut cache = self.predictions.lock().map_err(|error| {
-            DataFusionError::Execution(format!("Lance SIFT prediction cache poisoned: {error}"))
-        })?;
-        for transcript_id in uncached {
-            if let Some(predictions) = fetched.get(&transcript_id) {
-                cache.insert(transcript_id.clone(), Some(predictions.clone()));
-                out.insert(transcript_id, predictions.clone());
-            } else {
-                cache.insert(transcript_id, None);
-            }
-        }
-        Ok(out)
-    }
-}
-
-/// Position-sliced SIFT store: resolves predictions by the packed key
-/// `(transcript_uid << 32) | protein_position` via [`KeyU64LanceLookup`], so a
-/// missense lookup reads only the needed amino-acid position's payload instead
-/// of the transcript's whole substitution matrix. Memoizes resolved keys
-/// (including misses) to avoid repeated `take_rows`.
-#[cfg(feature = "lance-cache")]
-#[derive(Clone)]
-struct PositionSlicedLanceSiftStore {
-    lookup: Arc<crate::lance_cache::context_runtime::KeyU64LanceLookup>,
-    cache: Arc<Mutex<HashMap<u64, Option<CachedPredictions>>>>,
-    blob_version: crate::cache_common::SiftBlobVersion,
-}
-
-#[cfg(feature = "lance-cache")]
-impl crate::cache_common::SiftPredictionStore for PositionSlicedLanceSiftStore {
-    fn get_many(&self, _transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
-        // Position-sliced stores are keyed by `(uid, position)`; the engine
-        // resolves them via `get_position_predictions`, never by transcript id.
-        Ok(HashMap::new())
-    }
-
-    fn is_position_sliced(&self) -> bool {
-        true
-    }
-
-    fn get_position_predictions(&self, keys: &[u64]) -> Result<HashMap<u64, CachedPredictions>> {
-        if keys.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut out = HashMap::with_capacity(keys.len());
-        let mut uncached = Vec::new();
-        let mut seen_uncached = HashSet::new();
-        {
-            let cache = self.cache.lock().map_err(|error| {
-                DataFusionError::Execution(format!("Lance SIFT position cache poisoned: {error}"))
-            })?;
-            for &key in keys {
-                if out.contains_key(&key) {
-                    continue;
-                }
-                if let Some(cached) = cache.get(&key) {
-                    if let Some(predictions) = cached {
-                        out.insert(key, predictions.clone());
-                    }
-                    continue;
-                }
-                if seen_uncached.insert(key) {
-                    uncached.push(key);
-                }
-            }
-        }
-        if uncached.is_empty() {
-            return Ok(out);
-        }
-
-        // `block_in_place` panics on a current-thread runtime; `block_on_lance`
-        // falls back to a dedicated thread there (see its doc).
-        let (batch, _present) =
-            crate::lance_cache::lookup_exec::block_on_lance(self.lookup.take_keys(&uncached))?;
-        let fetched = position_predictions_from_batch(&batch, self.blob_version)?;
-        let mut cache = self.cache.lock().map_err(|error| {
-            DataFusionError::Execution(format!("Lance SIFT position cache poisoned: {error}"))
-        })?;
-        for key in uncached {
-            if let Some(predictions) = fetched.get(&key) {
-                cache.insert(key, Some(predictions.clone()));
-                out.insert(key, predictions.clone());
-            } else {
-                cache.insert(key, None);
-            }
-        }
-        Ok(out)
-    }
+    Ok(builder.schema().as_ref().clone())
 }
 
 /// Decode a position-sliced SIFT take batch (`key: UInt64`, `sift: Binary`,
 /// `poly: Binary`) into per-key [`CachedPredictions`]. The protein position is
 /// recovered from the low 32 bits of `key`.
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn position_predictions_from_batch(
     batch: &RecordBatch,
     version: crate::cache_common::SiftBlobVersion,
@@ -3228,81 +3075,109 @@ fn position_predictions_from_batch(
     Ok(predictions)
 }
 
-#[cfg(feature = "lance-cache")]
-async fn load_lance_sift_prediction_store_for_chrom(
-    cache: &PartitionedLanceCache,
+/// Position-sliced SIFT store over the no-dictionary Parquet sift shard:
+/// resolves `(uid, position)` keys, memoizing hits and misses. Decodes with the
+/// shared [`position_predictions_from_batch`].
+#[cfg(feature = "parquet-cache")]
+#[derive(Clone)]
+struct PositionSlicedParquetSiftStore {
+    lookup: Arc<crate::parquet_cache::sift::SinglePathParquetSiftLookup>,
+    cache: Arc<Mutex<HashMap<u64, Option<CachedPredictions>>>>,
+    blob_version: crate::cache_common::SiftBlobVersion,
+}
+
+#[cfg(feature = "parquet-cache")]
+impl crate::cache_common::SiftPredictionStore for PositionSlicedParquetSiftStore {
+    fn get_many(&self, _transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+        Ok(HashMap::new())
+    }
+
+    fn is_position_sliced(&self) -> bool {
+        true
+    }
+
+    fn get_position_predictions(&self, keys: &[u64]) -> Result<HashMap<u64, CachedPredictions>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut out = HashMap::with_capacity(keys.len());
+        let mut uncached = Vec::new();
+        let mut seen_uncached = HashSet::new();
+        {
+            let cache = self.cache.lock().map_err(|error| {
+                DataFusionError::Execution(format!("Parquet SIFT position cache poisoned: {error}"))
+            })?;
+            for &key in keys {
+                if out.contains_key(&key) {
+                    continue;
+                }
+                if let Some(cached) = cache.get(&key) {
+                    if let Some(predictions) = cached {
+                        out.insert(key, predictions.clone());
+                    }
+                    continue;
+                }
+                if seen_uncached.insert(key) {
+                    uncached.push(key);
+                }
+            }
+        }
+        if uncached.is_empty() {
+            return Ok(out);
+        }
+
+        let (batch, _present) =
+            crate::cache::lookup_exec::block_on(self.lookup.take_keys(&uncached))?;
+        let fetched = position_predictions_from_batch(&batch, self.blob_version)?;
+        let mut cache = self.cache.lock().map_err(|error| {
+            DataFusionError::Execution(format!("Parquet SIFT position cache poisoned: {error}"))
+        })?;
+        for key in uncached {
+            if let Some(predictions) = fetched.get(&key) {
+                cache.insert(key, Some(predictions.clone()));
+                out.insert(key, predictions.clone());
+            } else {
+                cache.insert(key, None);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Open the position-sliced SIFT store from the Parquet cache for `chrom`, or
+/// `None` when no Parquet `translation_sift` shard is present (partial migration
+/// falls back to Parquet).
+#[cfg(feature = "parquet-cache")]
+async fn load_parquet_sift_prediction_store_for_chrom(
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     chrom: &str,
 ) -> Result<Option<SiftPredictionStoreRef>> {
     let Some(path) = cache.context_path("translation_sift", chrom) else {
         return Ok(None);
     };
-    let schema = read_lance_dataset_schema(&path).await?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let schema = read_parquet_dataset_schema(&path).await?;
     if schema.index_of("key").is_ok()
         && (schema.index_of("sift").is_ok() || schema.index_of("poly").is_ok())
     {
-        let lookup = crate::lance_cache::context_runtime::KeyU64LanceLookup::open(
+        let lookup = crate::parquet_cache::sift::SinglePathParquetSiftLookup::open(
             &path,
             vec!["key".to_string(), "sift".to_string(), "poly".to_string()],
         )
         .await?;
-        if lookup.keys_len() == 0 {
-            return Ok(None);
-        }
         let blob_version = crate::cache_common::sift_blob_version_from_metadata(schema.metadata());
-        return Ok(Some(Arc::new(PositionSlicedLanceSiftStore {
+        return Ok(Some(Arc::new(PositionSlicedParquetSiftStore {
             lookup: Arc::new(lookup),
             cache: Arc::new(Mutex::new(HashMap::new())),
             blob_version,
         }) as SiftPredictionStoreRef));
     }
-    if schema.index_of("predictions").is_ok() {
-        let lookup = crate::lance_cache::context_runtime::TranscriptIdLanceLookup::open(
-            &path,
-            vec!["transcript_id".to_string(), "predictions".to_string()],
-        )
-        .await?;
-        if lookup.row_ids_len() == 0 {
-            return Ok(None);
-        }
-        return Ok(Some(Arc::new(LanceBinarySiftPredictionStore {
-            lookup: Arc::new(lookup),
-            predictions: Arc::new(Mutex::new(HashMap::new())),
-        }) as SiftPredictionStoreRef));
-    }
-
-    let profile_enabled = std::env::var_os("VEP_LANCE_PROFILE").is_some();
-    let scan_started = profile_enabled.then(std::time::Instant::now);
-    let batches = crate::lance_cache::context_runtime::scan_projected_existing_columns(
-        &path,
-        &[
-            "transcript_id",
-            "stable_id",
-            "sift_predictions",
-            "polyphen_predictions",
-        ],
-    )
-    .await?;
-    let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-    let predictions = sift_predictions_from_batches(&batches)?;
-    if let Some(started) = scan_started {
-        eprintln!(
-            "[vep-lance-profile] sift_scan_load path={} batches={} rows={} transcripts={} seconds={:.3}",
-            path.display(),
-            batches.len(),
-            rows,
-            predictions.len(),
-            started.elapsed().as_secs_f64(),
-        );
-    }
-    if predictions.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(Arc::new(InMemorySiftPredictionStore {
-        predictions: Arc::new(predictions),
-    }) as SiftPredictionStoreRef))
+    Ok(None)
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn sift_predictions_from_binary_batch(
     batch: &RecordBatch,
 ) -> Result<HashMap<String, CachedPredictions>> {
@@ -3326,7 +3201,7 @@ fn sift_predictions_from_binary_batch(
     Ok(predictions)
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn binary_at(array: &dyn Array, row: usize) -> Result<Option<&[u8]>> {
     if row >= array.len() || array.is_null(row) {
         return Ok(None);
@@ -3343,7 +3218,7 @@ fn binary_at(array: &dyn Array, row: usize) -> Result<Option<&[u8]>> {
     )))
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn sift_predictions_from_batches(
     batches: &[RecordBatch],
 ) -> Result<HashMap<String, CachedPredictions>> {
@@ -3354,7 +3229,7 @@ fn sift_predictions_from_batches(
     Ok(predictions)
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn sift_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<String, CachedPredictions>> {
     let schema = batch.schema();
     let tx_idx = schema
@@ -3387,7 +3262,7 @@ fn sift_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<String, Ca
     Ok(predictions)
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 /// Format a SIFT/PolyPhen prediction as `prediction(score)` with spaces→underscores.
 ///
 /// VEP uses `--sift b` / `--polyphen b` format (both prediction and score).
@@ -4493,7 +4368,7 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    fn parse_lance_transcript_batches(
+    fn parse_transcript_batches(
         table: &str,
         batches: &[RecordBatch],
     ) -> Result<(Vec<TranscriptFeature>, HashMap<String, String>)> {
@@ -4766,7 +4641,7 @@ impl AnnotateProvider {
         Ok((out, translateable_seq_by_tx))
     }
 
-    fn parse_lance_exon_batches(table: &str, batches: &[RecordBatch]) -> Result<Vec<ExonFeature>> {
+    fn parse_exon_batches(table: &str, batches: &[RecordBatch]) -> Result<Vec<ExonFeature>> {
         let mut out = Vec::new();
         for batch in batches {
             let schema = batch.schema();
@@ -4817,7 +4692,7 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    fn parse_lance_translation_batches(
+    fn parse_translation_batches(
         table: &str,
         batches: &[RecordBatch],
     ) -> Result<Vec<TranslationFeature>> {
@@ -4882,7 +4757,7 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    fn parse_lance_regulatory_batches(
+    fn parse_regulatory_batches(
         table: &str,
         batches: &[RecordBatch],
     ) -> Result<Vec<RegulatoryFeature>> {
@@ -4933,10 +4808,7 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    fn parse_lance_motif_batches(
-        table: &str,
-        batches: &[RecordBatch],
-    ) -> Result<Vec<MotifFeature>> {
+    fn parse_motif_batches(table: &str, batches: &[RecordBatch]) -> Result<Vec<MotifFeature>> {
         let mut out = Vec::new();
         for batch in batches {
             let schema = batch.schema();
@@ -5212,7 +5084,6 @@ impl AnnotateProvider {
         extended_probes: bool,
         cache: PartitionedAnnotationCache,
         translations_sift_table: Option<&str>,
-        #[cfg(feature = "lance-cache")] use_lance: bool,
         fetch_limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if profiling_enabled() {
@@ -5280,7 +5151,7 @@ impl AnnotateProvider {
         let mut cache_chroms: HashSet<String> = HashSet::new();
         let available_chroms = cache.available_chroms();
         for c in &available_chroms {
-            cache_chroms.extend(crate::lance_cache::manifest::contig_alias_set(c));
+            cache_chroms.extend(crate::cache::manifest::contig_alias_set(c));
         }
         let contigs: Vec<String> = vcf_contigs
             .iter()
@@ -5304,8 +5175,12 @@ impl AnnotateProvider {
         } else {
             self.schema.clone()
         };
-        #[cfg(feature = "lance-cache")]
-        let lance_cache_root = use_lance.then(|| cache.base_dir().to_path_buf());
+        // The base dir holds the parquet.* shards; the variation exec is always
+        // built via `new_parquet`.
+        #[cfg(feature = "parquet-cache")]
+        let parquet_backend = true;
+        #[cfg(feature = "parquet-cache")]
+        let cache_root = Some(cache.base_dir().to_path_buf());
 
         let config = ContigAnnotationConfig {
             vcf_table: self.vcf_table.clone(),
@@ -5328,9 +5203,11 @@ impl AnnotateProvider {
             annotation_column_count: self.annotation_column_count(),
             fetch_limit,
             annotation_workers,
-            #[cfg(feature = "lance-cache")]
-            lance_cache_root,
-            #[cfg(feature = "lance-cache")]
+            #[cfg(feature = "parquet-cache")]
+            cache_root,
+            #[cfg(feature = "parquet-cache")]
+            parquet_backend,
+            #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: self.vcf_shard_ctx.clone(),
         };
@@ -5361,8 +5238,8 @@ impl AnnotateProvider {
         ctx: &PreparedContext<'_>,
         colocated_map: &HashMap<ColocatedKey, ColocatedData>,
         sift_cache: &mut SiftPolyphenCache,
-        #[cfg(feature = "lance-cache")] sift_store: &Option<SiftPredictionStoreRef>,
-        #[cfg(not(feature = "lance-cache"))] _sift_kv: &Option<()>,
+        #[cfg(feature = "parquet-cache")] sift_store: &Option<SiftPredictionStoreRef>,
+        #[cfg(not(feature = "parquet-cache"))] _sift_kv: &Option<()>,
         skip_csq: bool,
         skip_typed_cols: bool,
         flags: &VepFlags,
@@ -5897,7 +5774,7 @@ impl AnnotateProvider {
                 // consequence. Only the position-sliced store benefits; the
                 // legacy transcript-id store ignores this. SIFT is emitted only
                 // under `--everything`.
-                #[cfg(feature = "lance-cache")]
+                #[cfg(feature = "parquet-cache")]
                 if flags.everything {
                     if let Some(store) = sift_store {
                         if store.is_position_sliced() {
@@ -6138,9 +6015,9 @@ impl AnnotateProvider {
                                         tc.protein_position.as_deref(),
                                         tc.amino_acids.as_deref(),
                                         sift_cache,
-                                        #[cfg(feature = "lance-cache")]
+                                        #[cfg(feature = "parquet-cache")]
                                         sift_store,
-                                        #[cfg(not(feature = "lance-cache"))]
+                                        #[cfg(not(feature = "parquet-cache"))]
                                         _sift_kv,
                                     )
                                 }
@@ -6597,9 +6474,9 @@ impl AnnotateProvider {
                                 tc.protein_position.as_deref(),
                                 tc.amino_acids.as_deref(),
                                 sift_cache,
-                                #[cfg(feature = "lance-cache")]
+                                #[cfg(feature = "parquet-cache")]
                                 sift_store,
-                                #[cfg(not(feature = "lance-cache"))]
+                                #[cfg(not(feature = "parquet-cache"))]
                                 _sift_kv,
                             );
                             append_opt_str(
@@ -8400,10 +8277,14 @@ struct ContigAnnotationConfig {
     /// contig. `<= 1` is serial (one spawned lookup partition).
     annotation_workers: usize,
     pick_flags: PickFlags,
-    #[cfg(feature = "lance-cache")]
-    lance_cache_root: Option<std::path::PathBuf>,
+    #[cfg(feature = "parquet-cache")]
+    cache_root: Option<std::path::PathBuf>,
+    /// When true, the variation lookup uses the Parquet backend (`new_parquet`)
+    /// while context entities + SIFT still load from the co-located Parquet cache.
+    #[cfg(feature = "parquet-cache")]
+    parquet_backend: bool,
     /// Shared transcript-id SIFT store (opened once, reused across contigs).
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     sift_prediction_store: Option<SiftPredictionStoreRef>,
     /// When `Some`, the `threads>1` path is sharded-VCF-output mode: each fused
     /// worker serializes its annotated batches directly into its own VCF body
@@ -8414,15 +8295,19 @@ struct ContigAnnotationConfig {
 
 #[derive(Clone)]
 enum PartitionedAnnotationCache {
-    #[cfg(feature = "lance-cache")]
-    Lance(PartitionedLanceCache),
+    // Parquet is the only cache backend. Variation point-lookups, context
+    // entity scans, and SIFT are all served from the Parquet shards under this
+    // handle's base dir. (A single variant keeps the type uninhabited — and all
+    // methods trivially valid — when the cache feature is disabled.)
+    #[cfg(feature = "parquet-cache")]
+    Parquet(crate::parquet_cache::detect::PartitionedParquetCache),
 }
 
 impl PartitionedAnnotationCache {
     fn available_chroms(&self) -> Vec<String> {
         match self {
-            #[cfg(feature = "lance-cache")]
-            Self::Lance(cache) => cache
+            #[cfg(feature = "parquet-cache")]
+            Self::Parquet(variation) => variation
                 .available_chroms()
                 .into_iter()
                 .map(ToString::to_string)
@@ -8432,15 +8317,16 @@ impl PartitionedAnnotationCache {
 
     fn base_dir(&self) -> &std::path::Path {
         match self {
-            #[cfg(feature = "lance-cache")]
-            Self::Lance(cache) => cache.base_dir(),
+            #[cfg(feature = "parquet-cache")]
+            Self::Parquet(variation) => variation.base_dir(),
         }
     }
 
-    #[cfg(feature = "lance-cache")]
-    fn as_lance(&self) -> Option<&PartitionedLanceCache> {
+    /// The Parquet cache handle backing variation, context, and SIFT lookups.
+    #[cfg(feature = "parquet-cache")]
+    fn as_parquet(&self) -> &crate::parquet_cache::detect::PartitionedParquetCache {
         match self {
-            Self::Lance(cache) => Some(cache),
+            Self::Parquet(variation) => variation,
         }
     }
 }
@@ -8663,7 +8549,7 @@ struct ContigPipelineProfile {
     prepare_setup: Duration,
     /// Building the shared annotation context (indexes, cache regions) after loads.
     prepare_shared_ctx: Duration,
-    /// Per-entity Lance scan IO (separate from the parse timers below).
+    /// Per-entity Parquet scan IO (separate from the parse timers below).
     context_transcripts_scan: Duration,
     context_exons_scan: Duration,
     context_translations_scan: Duration,
@@ -8795,15 +8681,15 @@ fn emit_contig_pipeline_profile(profile: &Option<SharedContigPipelineProfile>, c
     }
 }
 
-#[cfg(feature = "lance-cache")]
-async fn load_lance_contig_context(
-    cache: &PartitionedLanceCache,
+#[cfg(feature = "parquet-cache")]
+async fn load_contig_context(
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     chrom: &str,
     config: &ContigAnnotationConfig,
     profile: &Option<SharedContigPipelineProfile>,
 ) -> Result<LoadedContigContext> {
     let scan_started = Instant::now();
-    let tx_batches = scan_lance_context_entity(
+    let tx_batches = scan_context_entity(
         cache,
         "transcript",
         chrom,
@@ -8866,7 +8752,7 @@ async fn load_lance_contig_context(
     });
     let started = Instant::now();
     let (tx, translateable_seq) =
-        AnnotateProvider::parse_lance_transcript_batches("transcript.lance", &tx_batches)?;
+        AnnotateProvider::parse_transcript_batches("transcript", &tx_batches)?;
     let tx_vec: Vec<_> = tx
         .into_iter()
         .filter(|t| passes_transcript_selection(t, config.transcript_selection))
@@ -8877,7 +8763,7 @@ async fn load_lance_contig_context(
     let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
 
     let scan_started = Instant::now();
-    let ex_batches = scan_lance_context_entity(
+    let ex_batches = scan_context_entity(
         cache,
         "exon",
         chrom,
@@ -8895,7 +8781,7 @@ async fn load_lance_contig_context(
         profile.context_exons_scan += scan_started.elapsed();
     });
     let started = Instant::now();
-    let ex: Vec<_> = AnnotateProvider::parse_lance_exon_batches("exon.lance", &ex_batches)?
+    let ex: Vec<_> = AnnotateProvider::parse_exon_batches("exon", &ex_batches)?
         .into_iter()
         .filter(|exon| tx_ids.contains(&exon.transcript_id))
         .collect();
@@ -8904,7 +8790,7 @@ async fn load_lance_contig_context(
     });
 
     let scan_started = Instant::now();
-    let tl_batches = scan_lance_context_entity(
+    let tl_batches = scan_context_entity(
         cache,
         "translation_core",
         chrom,
@@ -8932,17 +8818,16 @@ async fn load_lance_contig_context(
         profile.context_translations_scan += scan_started.elapsed();
     });
     let started = Instant::now();
-    let tl: Vec<_> =
-        AnnotateProvider::parse_lance_translation_batches("translation_core.lance", &tl_batches)?
-            .into_iter()
-            .filter(|translation| tx_ids.contains(&translation.transcript_id))
-            .collect();
+    let tl: Vec<_> = AnnotateProvider::parse_translation_batches("translation_core", &tl_batches)?
+        .into_iter()
+        .filter(|translation| tx_ids.contains(&translation.transcript_id))
+        .collect();
     record_contig_profile(profile, |profile| {
         profile.context_translations += started.elapsed();
     });
 
     let scan_started = Instant::now();
-    let rg_batches = scan_lance_context_entity(
+    let rg_batches = scan_context_entity(
         cache,
         "regulatory",
         chrom,
@@ -8960,13 +8845,13 @@ async fn load_lance_contig_context(
         profile.context_regulatory_scan += scan_started.elapsed();
     });
     let started = Instant::now();
-    let rg = AnnotateProvider::parse_lance_regulatory_batches("regulatory.lance", &rg_batches)?;
+    let rg = AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)?;
     record_contig_profile(profile, |profile| {
         profile.context_regulatory += started.elapsed();
     });
 
     let scan_started = Instant::now();
-    let mt_batches = scan_lance_context_entity(
+    let mt_batches = scan_context_entity(
         cache,
         "motif",
         chrom,
@@ -8977,7 +8862,7 @@ async fn load_lance_contig_context(
         profile.context_motifs_scan += scan_started.elapsed();
     });
     let started = Instant::now();
-    let mt = AnnotateProvider::parse_lance_motif_batches("motif.lance", &mt_batches)?;
+    let mt = AnnotateProvider::parse_motif_batches("motif", &mt_batches)?;
     record_contig_profile(profile, |profile| {
         profile.context_motifs += started.elapsed();
     });
@@ -8985,17 +8870,22 @@ async fn load_lance_contig_context(
     Ok((tx_vec, translateable_seq, ex, tl, rg, mt))
 }
 
-#[cfg(feature = "lance-cache")]
-async fn scan_lance_context_entity(
-    cache: &PartitionedLanceCache,
+#[cfg(feature = "parquet-cache")]
+async fn scan_context_entity(
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     entity: &str,
     chrom: &str,
     columns: &[&str],
 ) -> Result<Vec<RecordBatch>> {
+    // Read the dict-enabled Parquet context shard. A missing shard (e.g. `motif`,
+    // which has no dataset in any chrom) yields an empty context.
     let Some(path) = cache.context_path(entity, chrom) else {
         return Ok(Vec::new());
     };
-    crate::lance_cache::context_runtime::scan_projected_existing_columns(&path, columns).await
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    crate::parquet_cache::scan::read_context_parquet(&path, columns).await
 }
 
 struct SharedContigAnnotationContext {
@@ -9016,7 +8906,7 @@ struct SharedContigAnnotationContext {
     transcript_cache_regions: Arc<HashMap<String, Vec<TranscriptCacheRegion>>>,
     tmp_provider: Arc<AnnotateProvider>,
     engine: Arc<TranscriptConsequenceEngine>,
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     sift_prediction_store: Option<SiftPredictionStoreRef>,
 }
 
@@ -11294,9 +11184,9 @@ fn annotate_worker_window(
             // was a large over-fetch (SIFT applies to <1% of overlaps); the demand
             // path reads only the transcripts that actually need predictions.
 
-            #[cfg(not(feature = "lance-cache"))]
+            #[cfg(not(feature = "parquet-cache"))]
             let sift_kv: Option<()> = None;
-            #[cfg(feature = "lance-cache")]
+            #[cfg(feature = "parquet-cache")]
             let sift_store = &shared.sift_prediction_store;
 
             let engine_started = Instant::now();
@@ -11306,9 +11196,9 @@ fn annotate_worker_window(
                 &ctx,
                 &worker.colocated_map,
                 &mut worker.sift_cache,
-                #[cfg(feature = "lance-cache")]
+                #[cfg(feature = "parquet-cache")]
                 sift_store,
-                #[cfg(not(feature = "lance-cache"))]
+                #[cfg(not(feature = "parquet-cache"))]
                 &sift_kv,
                 skip_csq,
                 skip_typed_cols,
@@ -12121,7 +12011,7 @@ impl Stream for ContigAnnotationStream {
 /// chrom region restriction via its tabix index), projecting only `start`(+`alt`),
 /// and replay the serial buffer-cut logic to discover the global input-buffer
 /// boundaries. Partitions are executed in id order (= position order) and
-/// concatenated, matching the annotation scan order; no Lance lookup, no
+/// concatenated, matching the annotation scan order; no Parquet lookup, no
 /// annotation. Returns the boundaries (length `B+1`) and total input-row count.
 async fn count_contig_buffer_boundaries(
     session: &Arc<SessionContext>,
@@ -12182,23 +12072,23 @@ async fn prepare_contig_context(
         .saturating_sub(config.annotation_column_count);
     let vcf_only_schema = Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
 
-    // Lance loads variation + context directly; no ephemeral tables are
+    // Parquet loads variation + context directly; no ephemeral tables are
     // registered, but the field is retained for the cleanup state machine.
     let ephemeral_tables: Vec<String> = Vec::new();
 
-    // Variation table: Lance variation cache (per-chrom dataset under
-    // `variation.lance/`). The KvLookupExec resolves the dataset itself via
+    // Variation table: Parquet variation cache (per-chrom dataset under
+    // `variation.cache/`). The KvLookupExec resolves the dataset itself via
     // the cache root, so a placeholder table name is sufficient.
-    #[cfg(feature = "lance-cache")]
-    let use_lance = config.lance_cache_root.is_some();
-    #[cfg(not(feature = "lance-cache"))]
-    let use_lance = false;
+    #[cfg(feature = "parquet-cache")]
+    let cache_enabled = config.cache_root.is_some();
+    #[cfg(not(feature = "parquet-cache"))]
+    let cache_enabled = false;
 
     let var_table = "__vep_indexed_variation".to_string();
 
-    // 2. Create lookup stream + load context data. Lance loads
+    // 2. Create lookup stream + load context data. Parquet loads
     // transcript/exon/translation/regulatory/motif context via
-    // `load_lance_contig_context`; no per-chrom parquet tables are registered.
+    // `load_contig_context`; no per-chrom parquet tables are registered.
 
     // Lookup arm: build LookupProvider, create stream (cheap — build+probe
     // happens on first poll, NOT here).
@@ -12209,28 +12099,24 @@ async fn prepare_contig_context(
         .schema()
         .as_arrow()
         .clone();
-    // Lance variation lookup reads the cache schema directly from the per-chrom
-    // Lance dataset; the KvLookupExec resolves the dataset path via the root.
-    #[cfg(feature = "lance-cache")]
+    // The Parquet variation lookup reads the cache schema directly from the
+    // per-chrom Parquet shard; the KvLookupExec resolves the shard path via the
+    // cache root.
+    #[cfg(feature = "parquet-cache")]
     let cache_schema = {
-        let lance_cache = cache.as_lance().ok_or_else(|| {
-            DataFusionError::Execution(
-                "Lance variation lookup requires a Lance cache layout".to_string(),
-            )
-        })?;
-        let variation_path = lance_cache.variation_path(&chrom).ok_or_else(|| {
+        let variation_path = cache.as_parquet().variation_path(&chrom).ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "Lance cache has no variation dataset for chrom {chrom}"
+                "Parquet cache has no variation shard for chrom {chrom}"
             ))
         })?;
-        read_lance_dataset_schema(&variation_path).await?
+        read_parquet_dataset_schema(&variation_path).await?
     };
-    #[cfg(not(feature = "lance-cache"))]
-    let cache_schema: Schema = unreachable!("lance-cache feature is required");
+    #[cfg(not(feature = "parquet-cache"))]
+    let cache_schema: Schema = unreachable!("parquet-cache feature is required");
     // Stateful Merged/RefSeq at workers>1 runs N grid-aligned per-worker lookup
     // scans (built after the context load below, once overlap_width is known),
     // not the byte-budget partitioning. Keep schema clones for those providers.
-    let stateful_parallel = use_lance
+    let stateful_parallel = cache_enabled
         && config.annotation_workers > 1
         && matches!(
             config.cache_source_type,
@@ -12251,11 +12137,14 @@ async fn prepare_contig_context(
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
     provider.set_target_partitions(config.target_partitions);
-    #[cfg(feature = "lance-cache")]
-    if let Some(root) = &config.lance_cache_root {
-        provider.set_lance_cache_root(root.clone());
+    #[cfg(feature = "parquet-cache")]
+    if let Some(root) = &config.cache_root {
+        provider.set_cache_root(root.clone());
+        if config.parquet_backend {
+            provider.set_parquet_backend(true);
+        }
     }
-    let parallel_lookup = use_lance;
+    let parallel_lookup = cache_enabled;
     let mut lookup_partitions = if stateful_parallel {
         // Deferred: grid-aligned per-worker lookup scans are spawned after the
         // context load below (once overlap_width_bp is known). The `provider`
@@ -12322,7 +12211,7 @@ async fn prepare_contig_context(
         profile.lookup_partitions = lookup_partitions.len();
     });
 
-    // Context arm: load transcripts, exons, translations, etc. (Lance only).
+    // Context arm: load transcripts, exons, translations, etc. (Parquet only).
     // Everything up to here (schema reads, lookup plan build, worker spawn) is
     // setup that runs before any context data is loaded.
     record_contig_profile(&pipeline_profile, |profile| {
@@ -12332,16 +12221,11 @@ async fn prepare_contig_context(
     let context_fut = async {
         let t_ctx = profile_start!();
         pipeline_trace::emit("context", "start", &[("chrom", TraceValue::Str(&chrom))]);
-        let _ = use_lance;
-        #[cfg(feature = "lance-cache")]
+        let _ = cache_enabled;
+        #[cfg(feature = "parquet-cache")]
         {
-            let lance_cache = cache.as_lance().ok_or_else(|| {
-                DataFusionError::Execution(
-                    "Lance context loading requires a Lance cache layout".to_string(),
-                )
-            })?;
             let loaded =
-                load_lance_contig_context(lance_cache, &chrom, &config, &pipeline_profile).await?;
+                load_contig_context(cache.as_parquet(), &chrom, &config, &pipeline_profile).await?;
             let context_elapsed = t_ctx.elapsed();
             pipeline_trace::emit(
                 "context",
@@ -12368,13 +12252,13 @@ async fn prepare_contig_context(
             }
             Ok(loaded)
         }
-        #[cfg(not(feature = "lance-cache"))]
+        #[cfg(not(feature = "parquet-cache"))]
         {
-            unreachable!("lance-cache feature is required")
+            unreachable!("parquet-cache feature is required")
         }
     };
     // Run the grid count pass (VCF positions only) CONCURRENTLY with the context
-    // load (Lance transcripts/exons) — independent IO, so the count is hidden
+    // load (Parquet transcripts/exons) — independent IO, so the count is hidden
     // behind context load instead of running as a serial prelude before workers.
     let count_fut = async {
         if stateful_parallel {
@@ -12418,20 +12302,18 @@ async fn prepare_contig_context(
         config.hgvs_flags.shift_hgvs,
     );
 
-    // SIFT source: the Lance backend uses a shared transcript-id prediction
-    // store loaded per-contig.
-    #[cfg(feature = "lance-cache")]
-    let use_lookup_sift = config.lance_cache_root.is_some();
-    #[cfg(not(feature = "lance-cache"))]
+    // SIFT source: a shared per-contig prediction store loaded from the Parquet
+    // translation_sift shard.
+    #[cfg(feature = "parquet-cache")]
+    let use_lookup_sift = config.cache_root.is_some();
+    #[cfg(not(feature = "parquet-cache"))]
     let use_lookup_sift = false;
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     let sift_prediction_store = if use_lookup_sift && config.flags.everything {
-        let lance_cache = cache.as_lance().ok_or_else(|| {
-            DataFusionError::Execution("Lance SIFT store requires a Lance cache layout".to_string())
-        })?;
         let sift_started = Instant::now();
-        let store = load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?;
+        let store =
+            load_parquet_sift_prediction_store_for_chrom(cache.as_parquet(), &chrom).await?;
         record_contig_profile(&pipeline_profile, |profile| {
             profile.sift_load += sift_started.elapsed();
         });
@@ -12486,9 +12368,12 @@ async fn prepare_contig_context(
             }
             wprovider.set_vcf_filter(Some(filter));
             wprovider.set_target_partitions(config.target_partitions);
-            #[cfg(feature = "lance-cache")]
-            if let Some(root) = &config.lance_cache_root {
-                wprovider.set_lance_cache_root(root.clone());
+            #[cfg(feature = "parquet-cache")]
+            if let Some(root) = &config.cache_root {
+                wprovider.set_cache_root(root.clone());
+                if config.parquet_backend {
+                    wprovider.set_parquet_backend(true);
+                }
             }
             let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
             if config.flags.check_existing {
@@ -12530,7 +12415,7 @@ async fn prepare_contig_context(
         transcript_cache_regions,
         tmp_provider: Arc::new(tmp_provider),
         engine: Arc::new(engine),
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         sift_prediction_store,
     });
 
@@ -12573,34 +12458,46 @@ impl TableProvider for AnnotateProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Lance is the only supported backend. `backend` is validated at
-        // construction; here we additionally reject a non-`lance` `cache_format`.
+        // Parquet is the only cache backend. `cache_format` is still accepted for
+        // backward compatibility ("cache" is a historical alias) but always
+        // resolves to the Parquet shards.
         let cache_format = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "cache_format"))
-            .unwrap_or_else(|| "lance".to_string());
-        if cache_format != "lance" {
-            return Err(DataFusionError::Plan(format!(
-                "annotate_vep(): cache_format must be 'lance', got '{cache_format}'"
-            )));
+            .unwrap_or_else(|| "parquet".to_string());
+        match cache_format.as_str() {
+            "lance" | "parquet" => {}
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "annotate_vep(): cache_format must be 'lance' or 'parquet', got '{other}'"
+                )));
+            }
         }
 
-        // Detect the partitioned per-chromosome Lance cache layout.
+        // Detect the partitioned per-chromosome cache layout (Parquet or Parquet).
         // Opt-out via "partitioned": false in options_json.
         let partitioned_opt = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "partitioned"));
 
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         let partitioned_annotation_cache = if partitioned_opt != Some(false) {
-            crate::partitioned_cache::PartitionedLanceCache::detect(&self.cache_source)
-                .map(PartitionedAnnotationCache::Lance)
+            match crate::parquet_cache::detect::PartitionedParquetCache::detect(&self.cache_source)
+            {
+                Some(variation) => Some(PartitionedAnnotationCache::Parquet(variation)),
+                None => {
+                    return Err(DataFusionError::Plan(format!(
+                        "annotate_vep(): a 'variation/' cache layout is required at '{}'",
+                        self.cache_source
+                    )));
+                }
+            }
         } else {
             None
         };
-        #[cfg(not(feature = "lance-cache"))]
+        #[cfg(not(feature = "parquet-cache"))]
         let partitioned_annotation_cache: Option<PartitionedAnnotationCache> = {
             let _ = partitioned_opt;
             None
@@ -12610,34 +12507,31 @@ impl TableProvider for AnnotateProvider {
             let available_chroms = cache.available_chroms();
             if profiling_enabled() {
                 eprintln!(
-                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {} [lance]",
+                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {} [parquet]",
                     available_chroms.len(),
                     self.cache_source,
                 );
             }
 
-            // Read available variation columns from a sample Lance dataset.
-            #[cfg(feature = "lance-cache")]
+            // Read available variation columns from a sample Parquet shard.
+            #[cfg(feature = "parquet-cache")]
             let available_cache_columns: HashSet<String> = {
-                let lance_cache = cache.as_lance().ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "lance cache format requires a Lance cache layout".to_string(),
-                    )
-                })?;
                 let sample_chrom = &available_chroms[0];
-                let sample_path = lance_cache.variation_path(sample_chrom).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Lance cache has no variation dataset for sample chrom {sample_chrom}"
-                    ))
-                })?;
-                let cache_schema = read_lance_dataset_schema(&sample_path).await?;
+                let sample_path = cache.as_parquet().variation_path(sample_chrom).ok_or_else(
+                    || {
+                        DataFusionError::Execution(format!(
+                            "Parquet cache has no variation shard for sample chrom {sample_chrom}"
+                        ))
+                    },
+                )?;
+                let cache_schema = read_parquet_dataset_schema(&sample_path).await?;
                 cache_schema
                     .fields()
                     .iter()
                     .map(|f| f.name().clone())
                     .collect()
             };
-            #[cfg(not(feature = "lance-cache"))]
+            #[cfg(not(feature = "parquet-cache"))]
             let available_cache_columns: HashSet<String> = HashSet::new();
 
             let mut preferred_columns = vec!["consequence_types", "most_severe_consequence"];
@@ -12691,15 +12585,13 @@ impl TableProvider for AnnotateProvider {
                     extended_probes,
                     cache,
                     translations_sift_table.as_deref(),
-                    #[cfg(feature = "lance-cache")]
-                    true,
                     limit,
                 )
                 .await;
         }
 
         Err(DataFusionError::Execution(format!(
-            "annotate_vep(): no partitioned Lance cache detected at '{}'. Expected a directory with variation.lance/chrom_manifest.json.",
+            "annotate_vep(): no partitioned Parquet cache detected at '{}'. Expected a directory with variation/chrom_manifest.json.",
             self.cache_source
         )))
     }
@@ -12889,9 +12781,9 @@ mod tests {
         assert!(frequency_fields.max_af_pops.is_empty());
     }
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     #[tokio::test]
-    async fn lance_cache_format_is_accepted() {
+    async fn cache_format_is_accepted() {
         let session = Arc::new(SessionContext::new());
         let vcf_schema = Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -12920,27 +12812,11 @@ mod tests {
         let message = err.to_string();
         assert!(
             !message.contains("cache_format must"),
-            "lance cache_format was rejected: {message}"
+            "the 'lance' cache_format alias was rejected: {message}"
         );
-        assert!(message.contains("no partitioned Lance cache detected"));
-    }
-
-    #[cfg(feature = "lance-cache")]
-    #[tokio::test]
-    async fn lance_backend_detects_lance_manifest_without_parquet_variation_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let variation = tmp.path().join("variation.lance");
-        std::fs::create_dir_all(variation.join("chr1.lance")).unwrap();
-        crate::lance_cache::manifest::ChromManifest::new(vec![
-            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
-        ])
-        .write_to_entity_dir(&variation)
-        .unwrap();
-
-        assert!(
-            crate::partitioned_cache::PartitionedLanceCache::detect(tmp.path().to_str().unwrap())
-                .is_some()
-        );
+        // "cache" is accepted as a historical alias and resolves to Parquet, so
+        // the empty cache dir fails on the missing Parquet variation layout.
+        assert!(message.contains("variation"), "unexpected error: {message}");
     }
 
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
@@ -12965,9 +12841,11 @@ mod tests {
             fetch_limit: None,
             annotation_workers: 1,
             pick_flags: PickFlags::default(),
-            #[cfg(feature = "lance-cache")]
-            lance_cache_root: None,
-            #[cfg(feature = "lance-cache")]
+            #[cfg(feature = "parquet-cache")]
+            cache_root: None,
+            #[cfg(feature = "parquet-cache")]
+            parquet_backend: false,
+            #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: None,
         }
@@ -13030,7 +12908,7 @@ mod tests {
             engine: Arc::new(TranscriptConsequenceEngine::new_with_hgvs_shift(
                 5000, 5000, false,
             )),
-            #[cfg(feature = "lance-cache")]
+            #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
         })
     }
@@ -13304,10 +13182,10 @@ mod tests {
         Arc::new(list_builder.finish())
     }
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     type TestCompactPrediction = (i32, &'static str, &'static str, f32);
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     fn compact_prediction_array(rows: Vec<Option<Vec<TestCompactPrediction>>>) -> Arc<dyn Array> {
         use datafusion::arrow::array::{ArrayBuilder, Float32Builder, Int32Builder, StructBuilder};
 
@@ -13358,88 +13236,6 @@ mod tests {
         }
 
         Arc::new(list_builder.finish())
-    }
-
-    #[cfg(feature = "lance-cache")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn lance_sift_prediction_store_reads_binary_predictions_by_transcript_id() {
-        use crate::cache_common::serialize_predictions;
-        use datafusion::arrow::array::BinaryArray;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let entity_dir = tmp.path().join("translation_sift.lance");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("transcript_id", DataType::Utf8, false),
-            Field::new("predictions", DataType::Binary, false),
-        ]));
-
-        for (chrom, tx) in [("chr1", "tx1"), ("chr2", "tx2")] {
-            let mut predictions = CachedPredictions::default();
-            predictions.sift = vec![CompactPrediction {
-                position: 1,
-                amino_acid: CompactPrediction::encode_amino_acid("A").unwrap(),
-                prediction: CompactPrediction::encode_prediction("tolerated"),
-                score: 0.1,
-            }];
-            predictions.polyphen = vec![CompactPrediction {
-                position: 1,
-                amino_acid: CompactPrediction::encode_amino_acid("A").unwrap(),
-                prediction: CompactPrediction::encode_prediction("benign"),
-                score: 0.2,
-            }];
-            predictions.sort();
-            let blob = serialize_predictions(&predictions);
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(vec![tx])),
-                    Arc::new(BinaryArray::from_iter_values(vec![blob])),
-                ],
-            )
-            .unwrap();
-            let dataset = entity_dir.join(format!("{chrom}.lance"));
-            crate::lance_cache::write::write_record_batches_to_lance(
-                &dataset,
-                vec![batch],
-                crate::lance_cache::write::LanceIndexKind::TranscriptId,
-            )
-            .await
-            .unwrap();
-        }
-        crate::lance_cache::manifest::ChromManifest::new(vec![
-            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
-            crate::lance_cache::manifest::ChromDatasetEntry::new("chr2", "chr2.lance", 1),
-        ])
-        .write_to_entity_dir(&entity_dir)
-        .unwrap();
-        let variation = tmp.path().join("variation.lance");
-        std::fs::create_dir_all(variation.join("chr1.lance")).unwrap();
-        crate::lance_cache::manifest::ChromManifest::new(vec![
-            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
-        ])
-        .write_to_entity_dir(&variation)
-        .unwrap();
-        let cache =
-            crate::partitioned_cache::PartitionedLanceCache::detect(tmp.path().to_str().unwrap())
-                .unwrap();
-
-        let store = load_lance_sift_prediction_store_for_chrom(&cache, "chr1")
-            .await
-            .unwrap()
-            .unwrap();
-        let loaded = store
-            .get_many(&["tx1".to_string(), "tx2".to_string()])
-            .unwrap();
-
-        let tx1 = loaded.get("tx1").expect("tx1 predictions from chr1");
-        assert_eq!(tx1.lookup_sift(1, "A"), Some(("tolerated", 0.1)));
-        assert_eq!(tx1.lookup_polyphen(1, "A"), Some(("benign", 0.2)));
-        assert!(!loaded.contains_key("tx2"));
-
-        std::fs::remove_dir_all(entity_dir.join("chr1.lance")).unwrap();
-        let cached = store.get_many(&["tx1".to_string()]).unwrap();
-        let tx1 = cached.get("tx1").expect("tx1 predictions from cache");
-        assert_eq!(tx1.lookup_sift(1, "A"), Some(("tolerated", 0.1)));
     }
 
     #[tokio::test]
@@ -14205,7 +14001,7 @@ mod tests {
         assert_eq!(sift_position_key(Some(7), None, Some("V/I")), None);
     }
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     #[test]
     fn position_predictions_from_batch_decodes_key_and_payloads() {
         use crate::cache_common::serialize_position_entries;
@@ -14259,7 +14055,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     #[test]
     fn position_predictions_from_batch_decodes_v2() {
         use crate::cache_common::{
@@ -14307,162 +14103,6 @@ mod tests {
         assert_eq!(cached.sift[0].score.to_bits(), 0.07f32.to_bits());
         assert_eq!(cached.polyphen[0].score.to_bits(), 0.951f32.to_bits());
         assert_eq!(cached.sift[0].position, 11);
-    }
-
-    /// Opt-in data-parity gate for the position-sliced SIFT layout. Decodes the
-    /// legacy per-transcript `predictions` blob and, for every
-    /// `(transcript, position)`, compares it against the new position-sliced
-    /// store (resolved by `key = (transcript_uid << 32) | position`) — asserting
-    /// byte-identical `(amino_acid, prediction, score)` entries for both SIFT and
-    /// PolyPhen, and a bijection between legacy positions and new rows.
-    ///
-    /// Skipped unless all three dataset dirs are provided:
-    ///   VEP_PARITY_LEGACY_SIFT  = .../translation_sift.lance/<chrom>.lance  (legacy blob)
-    ///   VEP_PARITY_NEW_SIFT     = .../translation_sift.lance/<chrom>.lance  (position-sliced)
-    ///   VEP_PARITY_NEW_TX       = .../transcript.lance/<chrom>.lance        (carries transcript_uid)
-    #[cfg(feature = "lance-cache")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn position_sliced_sift_matches_legacy_blob_parity() {
-        use crate::cache_common::SiftPredictionStore;
-        use std::path::PathBuf;
-
-        let (Some(legacy_sift), Some(new_sift), Some(new_tx)) = (
-            std::env::var_os("VEP_PARITY_LEGACY_SIFT"),
-            std::env::var_os("VEP_PARITY_NEW_SIFT"),
-            std::env::var_os("VEP_PARITY_NEW_TX"),
-        ) else {
-            eprintln!(
-                "skipping position_sliced_sift_matches_legacy_blob_parity \
-                 (set VEP_PARITY_LEGACY_SIFT / VEP_PARITY_NEW_SIFT / VEP_PARITY_NEW_TX)"
-            );
-            return;
-        };
-        let legacy_sift = PathBuf::from(legacy_sift);
-        let new_sift = PathBuf::from(new_sift);
-        let new_tx = PathBuf::from(new_tx);
-
-        // stable_id -> transcript_uid (authoritative map written into transcript.lance).
-        let tx_batches = crate::lance_cache::context_runtime::scan_projected_existing_columns(
-            &new_tx,
-            &["stable_id", "transcript_uid"],
-        )
-        .await
-        .unwrap();
-        let mut uid_map: HashMap<String, u32> = HashMap::new();
-        for batch in &tx_batches {
-            let schema = batch.schema();
-            let id_idx = schema.index_of("stable_id").unwrap();
-            let uid_idx = schema.index_of("transcript_uid").unwrap();
-            for row in 0..batch.num_rows() {
-                if let (Some(id), Some(uid)) = (
-                    string_at(batch.column(id_idx).as_ref(), row),
-                    uint32_at(batch.column(uid_idx).as_ref(), row),
-                ) {
-                    uid_map.insert(id, uid);
-                }
-            }
-        }
-        assert!(!uid_map.is_empty(), "transcript_uid map is empty");
-
-        // Legacy per-transcript predictions blob.
-        let legacy_batches = crate::lance_cache::context_runtime::scan_projected_existing_columns(
-            &legacy_sift,
-            &["transcript_id", "predictions"],
-        )
-        .await
-        .unwrap();
-        let mut legacy: HashMap<String, CachedPredictions> = HashMap::new();
-        for batch in &legacy_batches {
-            legacy.extend(sift_predictions_from_binary_batch(batch).unwrap());
-        }
-        assert!(!legacy.is_empty(), "legacy predictions are empty");
-
-        // New position-sliced store.
-        let lookup = crate::lance_cache::context_runtime::KeyU64LanceLookup::open(
-            &new_sift,
-            vec!["key".to_string(), "sift".to_string(), "poly".to_string()],
-        )
-        .await
-        .unwrap();
-        let new_rows = lookup.keys_len();
-        let new_schema = read_lance_dataset_schema(&new_sift).await.unwrap();
-        let store = PositionSlicedLanceSiftStore {
-            lookup: Arc::new(lookup),
-            cache: Arc::new(Mutex::new(HashMap::new())),
-            blob_version: crate::cache_common::sift_blob_version_from_metadata(
-                new_schema.metadata(),
-            ),
-        };
-
-        let entries_at = |preds: &[CompactPrediction], pos: i32| -> Vec<(u8, u8, u32)> {
-            let mut v: Vec<(u8, u8, u32)> = preds
-                .iter()
-                .filter(|p| p.position == pos)
-                .map(|p| (p.amino_acid, p.prediction, p.score.to_bits()))
-                .collect();
-            v.sort_unstable();
-            v
-        };
-
-        let mut compared_transcripts = 0usize;
-        let mut matched_positions = 0usize;
-        let mut mismatches = 0usize;
-        for (tx_id, lp) in &legacy {
-            // Distinct positions present in the legacy blob for this transcript.
-            let mut positions: Vec<i32> = lp
-                .sift
-                .iter()
-                .chain(lp.polyphen.iter())
-                .map(|p| p.position)
-                .collect();
-            positions.sort_unstable();
-            positions.dedup();
-            if positions.is_empty() {
-                continue; // non-coding transcript: no rows expected
-            }
-            let Some(&uid) = uid_map.get(tx_id) else {
-                mismatches += 1;
-                eprintln!(
-                    "PARITY: legacy transcript {tx_id} has predictions but no transcript_uid"
-                );
-                continue;
-            };
-            compared_transcripts += 1;
-
-            let keys: Vec<u64> = positions
-                .iter()
-                .map(|&pos| ((uid as u64) << 32) | (pos as u64))
-                .collect();
-            let new = store.get_position_predictions(&keys).unwrap();
-
-            for &pos in &positions {
-                let key = ((uid as u64) << 32) | (pos as u64);
-                let Some(np) = new.get(&key) else {
-                    mismatches += 1;
-                    eprintln!("PARITY: missing new row for {tx_id} pos {pos} (key {key})");
-                    continue;
-                };
-                matched_positions += 1;
-                if entries_at(&lp.sift, pos) != entries_at(&np.sift, pos) {
-                    mismatches += 1;
-                    eprintln!("PARITY: SIFT mismatch {tx_id} pos {pos}");
-                }
-                if entries_at(&lp.polyphen, pos) != entries_at(&np.polyphen, pos) {
-                    mismatches += 1;
-                    eprintln!("PARITY: PolyPhen mismatch {tx_id} pos {pos}");
-                }
-            }
-        }
-
-        eprintln!(
-            "parity: transcripts={compared_transcripts} matched_positions={matched_positions} \
-             new_rows={new_rows} mismatches={mismatches}"
-        );
-        assert_eq!(mismatches, 0, "SIFT/PolyPhen parity mismatches found");
-        assert_eq!(
-            matched_positions, new_rows,
-            "legacy positions and new rows are not a bijection (extra/missing rows)"
-        );
     }
 
     // ── lookup_domains ─────────────────────────────────────────────────

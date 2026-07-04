@@ -1,76 +1,77 @@
-//! Rebuild a single chromosome's context entities (transcript, translation_core,
-//! translation_sift) of the single-path Lance cache from the Ensembl-cache table
-//! provider. Scoped to one chromosome via the build's `chrom_filter`, so it is
-//! cheap enough for profiling / parity iteration on the position-sliced SIFT
-//! layout without rebuilding the whole genome.
+//! Rebuild one chromosome of the partitioned **Parquet** variation cache from the
+//! Ensembl-cache table provider (Phase 2 backend).
+//!
+//! Writes `variation/<chrom>.parquet` + upserts `chrom_manifest.json`.
 //!
 //! Usage:
 //!   cargo run --release -p datafusion-bio-function-vep \
 //!     --features lance-cache,cache-builder \
-//!     --example build_lance_chrom_context -- \
+//!     --example build_parquet_variation_chrom -- \
 //!     --cache-root /path/to/homo_sapiens_merged/115_GRCh38 \
-//!     --output-dir /path/to/scratch_chr1_cache \
-//!     --chrom chr1 --cache-source-type merged --partitions 8 --overwrite \
-//!     [--entities transcript,translation]
+//!     --output-dir /path/to/115_GRCh38_merged \
+//!     --chrom chr1 --cache-source-type merged --partitions 8 --overwrite
 
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
 
 use datafusion::common::{DataFusionError, Result};
 use datafusion_bio_format_ensembl_cache::CacheSourceType;
-use datafusion_bio_function_vep::cache_builder::{CacheBuilder, CacheFormat};
+use datafusion_bio_function_vep::cache::build::{CacheBuildOptions, build_parquet_variation_chrom};
+use datafusion_bio_function_vep::cache::manifest::{
+    CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest,
+};
+
+/// Parquet entity directory name (mirrors `parquet_cache::detect`).
+const PARQUET_VARIATION_DIR: &str = "variation";
 
 #[derive(Debug)]
 struct Args {
-    cache_root: String,
-    output_dir: String,
+    cache_root: PathBuf,
+    output_dir: PathBuf,
     chrom: String,
     cache_source_type: CacheSourceType,
     partitions: usize,
     overwrite: bool,
-    entities: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = env_logger::try_init();
     let args = parse_args()?;
     let started = Instant::now();
+    let options = CacheBuildOptions {
+        cache_root: args.cache_root.to_string_lossy().to_string(),
+        output_dir: args.output_dir.to_string_lossy().to_string(),
+        partitions: args.partitions,
+        cache_source_type: args.cache_source_type,
+        overwrite: args.overwrite,
+        chrom_filter: None,
+    };
 
-    eprintln!("cache_root={}", args.cache_root);
-    eprintln!("output_dir={}", args.output_dir);
+    eprintln!("cache_root={}", args.cache_root.display());
+    eprintln!("output_dir={}", args.output_dir.display());
     eprintln!("chrom={}", args.chrom);
     eprintln!("cache_source_type={}", args.cache_source_type);
     eprintln!("partitions={}", args.partitions);
     eprintln!("overwrite={}", args.overwrite);
-    eprintln!("entities={}", args.entities.join(","));
 
-    let builder = CacheBuilder::new(args.cache_root.clone(), args.output_dir.clone())
-        .with_cache_format(CacheFormat::Lance)
-        .with_cache_source_type(args.cache_source_type)
-        .with_partitions(args.partitions)
-        .with_overwrite(args.overwrite)
-        .with_chrom_filter([args.chrom.clone()]);
-
-    for entity in &args.entities {
-        let entity_started = Instant::now();
-        let stats = builder.build_entity(entity).await?;
-        for stat in &stats {
-            let rows: usize = stat.parquet_files.iter().map(|(_, rows)| *rows).sum();
-            eprintln!(
-                "built entity={} dataset={} files={} rows={} elapsed={:.2}s",
-                entity,
-                stat.entity,
-                stat.parquet_files.len(),
-                rows,
-                entity_started.elapsed().as_secs_f64()
-            );
-        }
+    let entry = build_parquet_variation_chrom(&options, &args.chrom).await?;
+    if entry.rows == 0 {
+        return Err(DataFusionError::Execution(format!(
+            "variation Parquet build for {} wrote 0 rows",
+            args.chrom
+        )));
     }
 
+    let entity_dir = args.output_dir.join(PARQUET_VARIATION_DIR);
+    upsert_manifest_entry(&entity_dir, entry.clone())?;
+
     eprintln!(
-        "done chrom={} entities={} elapsed={:.2}s",
-        args.chrom,
-        args.entities.join(","),
+        "wrote chrom={} shard={} rows={} elapsed={:.2}s",
+        entry.chrom,
+        entity_dir.join(&entry.dataset).display(),
+        entry.rows,
         started.elapsed().as_secs_f64()
     );
     Ok(())
@@ -83,13 +84,12 @@ fn parse_args() -> Result<Args> {
     let mut cache_source_type = CacheSourceType::Ensembl;
     let mut partitions = 8usize;
     let mut overwrite = false;
-    let mut entities: Vec<String> = vec!["transcript".to_string(), "translation".to_string()];
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--cache-root" => cache_root = Some(require_value(&mut args, &arg)?),
-            "--output-dir" => output_dir = Some(require_value(&mut args, &arg)?),
+            "--cache-root" => cache_root = Some(PathBuf::from(require_value(&mut args, &arg)?)),
+            "--output-dir" => output_dir = Some(PathBuf::from(require_value(&mut args, &arg)?)),
             "--chrom" => chrom = Some(require_value(&mut args, &arg)?),
             "--cache-source-type" => {
                 let value = require_value(&mut args, &arg)?;
@@ -101,14 +101,6 @@ fn parse_args() -> Result<Args> {
             }
             "--partitions" => partitions = parse_usize(require_value(&mut args, &arg)?)?,
             "--overwrite" => overwrite = true,
-            "--entities" => {
-                let value = require_value(&mut args, &arg)?;
-                entities = value
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -130,8 +122,25 @@ fn parse_args() -> Result<Args> {
         cache_source_type,
         partitions: partitions.max(1),
         overwrite,
-        entities,
     })
+}
+
+fn upsert_manifest_entry(entity_dir: &Path, entry: ChromDatasetEntry) -> Result<()> {
+    let manifest_path = entity_dir.join(CHROM_MANIFEST_FILE);
+    let mut entries = if manifest_path.exists() {
+        ChromManifest::read_from_entity_dir(entity_dir)?.entries
+    } else {
+        Vec::new()
+    };
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|existing| existing.chrom == entry.chrom)
+    {
+        *existing = entry;
+    } else {
+        entries.push(entry);
+    }
+    ChromManifest::new(entries).write_to_entity_dir(entity_dir)
 }
 
 fn require_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
@@ -142,13 +151,13 @@ fn require_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<
 fn parse_usize(value: String) -> Result<usize> {
     value
         .parse::<usize>()
-        .map_err(|_| DataFusionError::Execution(format!("invalid integer: {value}")))
+        .map_err(|error| DataFusionError::Execution(format!("invalid integer '{value}': {error}")))
 }
 
 fn print_usage() {
     eprintln!(
-        "build_lance_chrom_context --cache-root <dir> --output-dir <dir> --chrom <chrom> \
-         [--cache-source-type ensembl|merged|refseq] [--partitions N] [--overwrite] \
-         [--entities transcript,translation]"
+        "Usage: build_parquet_variation_chrom --cache-root /path/to/homo_sapiens_merged/115_GRCh38 \
+         --output-dir /path/to/115_GRCh38_merged --chrom chr1 \
+         [--cache-source-type merged] [--partitions 8] [--overwrite]"
     );
 }
