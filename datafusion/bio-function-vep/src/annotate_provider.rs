@@ -3325,6 +3325,108 @@ async fn load_lance_sift_prediction_store_for_chrom(
     }) as SiftPredictionStoreRef))
 }
 
+/// Parquet analogue of [`PositionSlicedLanceSiftStore`]: resolves `(uid, position)`
+/// keys through the no-dictionary Parquet sift shard, memoizing hits and misses.
+/// Decodes with the shared [`position_predictions_from_batch`].
+#[cfg(feature = "lance-cache")]
+#[derive(Clone)]
+struct PositionSlicedParquetSiftStore {
+    lookup: Arc<crate::parquet_cache::sift::SinglePathParquetSiftLookup>,
+    cache: Arc<Mutex<HashMap<u64, Option<CachedPredictions>>>>,
+    blob_version: crate::cache_common::SiftBlobVersion,
+}
+
+#[cfg(feature = "lance-cache")]
+impl crate::cache_common::SiftPredictionStore for PositionSlicedParquetSiftStore {
+    fn get_many(&self, _transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+        Ok(HashMap::new())
+    }
+
+    fn is_position_sliced(&self) -> bool {
+        true
+    }
+
+    fn get_position_predictions(&self, keys: &[u64]) -> Result<HashMap<u64, CachedPredictions>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut out = HashMap::with_capacity(keys.len());
+        let mut uncached = Vec::new();
+        let mut seen_uncached = HashSet::new();
+        {
+            let cache = self.cache.lock().map_err(|error| {
+                DataFusionError::Execution(format!("Parquet SIFT position cache poisoned: {error}"))
+            })?;
+            for &key in keys {
+                if out.contains_key(&key) {
+                    continue;
+                }
+                if let Some(cached) = cache.get(&key) {
+                    if let Some(predictions) = cached {
+                        out.insert(key, predictions.clone());
+                    }
+                    continue;
+                }
+                if seen_uncached.insert(key) {
+                    uncached.push(key);
+                }
+            }
+        }
+        if uncached.is_empty() {
+            return Ok(out);
+        }
+
+        let (batch, _present) =
+            crate::lance_cache::lookup_exec::block_on_lance(self.lookup.take_keys(&uncached))?;
+        let fetched = position_predictions_from_batch(&batch, self.blob_version)?;
+        let mut cache = self.cache.lock().map_err(|error| {
+            DataFusionError::Execution(format!("Parquet SIFT position cache poisoned: {error}"))
+        })?;
+        for key in uncached {
+            if let Some(predictions) = fetched.get(&key) {
+                cache.insert(key, Some(predictions.clone()));
+                out.insert(key, predictions.clone());
+            } else {
+                cache.insert(key, None);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Open the position-sliced SIFT store from the Parquet cache for `chrom`, or
+/// `None` when no Parquet `translation_sift` shard is present (partial migration
+/// falls back to Lance).
+#[cfg(feature = "lance-cache")]
+async fn load_parquet_sift_prediction_store_for_chrom(
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
+    chrom: &str,
+) -> Result<Option<SiftPredictionStoreRef>> {
+    let Some(path) = cache.context_path("translation_sift", chrom) else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let schema = read_parquet_dataset_schema(&path).await?;
+    if schema.index_of("key").is_ok()
+        && (schema.index_of("sift").is_ok() || schema.index_of("poly").is_ok())
+    {
+        let lookup = crate::parquet_cache::sift::SinglePathParquetSiftLookup::open(
+            &path,
+            vec!["key".to_string(), "sift".to_string(), "poly".to_string()],
+        )
+        .await?;
+        let blob_version = crate::cache_common::sift_blob_version_from_metadata(schema.metadata());
+        return Ok(Some(Arc::new(PositionSlicedParquetSiftStore {
+            lookup: Arc::new(lookup),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            blob_version,
+        }) as SiftPredictionStoreRef));
+    }
+    Ok(None)
+}
+
 #[cfg(feature = "lance-cache")]
 fn sift_predictions_from_binary_batch(
     batch: &RecordBatch,
@@ -12493,11 +12595,33 @@ async fn prepare_contig_context(
 
     #[cfg(feature = "lance-cache")]
     let sift_prediction_store = if use_lookup_sift && config.flags.everything {
-        let lance_cache = cache.as_lance().ok_or_else(|| {
-            DataFusionError::Execution("Lance SIFT store requires a Lance cache layout".to_string())
-        })?;
         let sift_started = Instant::now();
-        let store = load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?;
+        // Prefer the Parquet sift shard when the Parquet backend is active and it
+        // exists; otherwise (or during partial migration) fall back to the Lance
+        // context store.
+        let store = match cache.as_parquet() {
+            Some(parquet_cache) => {
+                match load_parquet_sift_prediction_store_for_chrom(parquet_cache, &chrom).await? {
+                    Some(store) => Some(store),
+                    None => {
+                        let lance_cache = cache.as_lance().ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "SIFT store requires a Parquet or Lance cache layout".to_string(),
+                            )
+                        })?;
+                        load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?
+                    }
+                }
+            }
+            None => {
+                let lance_cache = cache.as_lance().ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "Lance SIFT store requires a Lance cache layout".to_string(),
+                    )
+                })?;
+                load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?
+            }
+        };
         record_contig_profile(&pipeline_profile, |profile| {
             profile.sift_load += sift_started.elapsed();
         });
