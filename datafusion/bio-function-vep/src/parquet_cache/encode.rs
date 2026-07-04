@@ -143,30 +143,59 @@ pub fn encode_af_2array(col: &StringArray, n_pops: usize) -> Result<AfArrays> {
             pops.push(Some(pairs));
         }
 
-        // Ordered allele set (first-seen order across populations).
-        let mut order: Vec<String> = Vec::new();
-        for pop in pops.iter().flatten() {
-            for (allele, _) in pop {
-                if !order.iter().any(|a| a == allele) {
-                    order.push(allele.clone());
-                }
-            }
-        }
+        // Master allele order: the population with the most (allele:freq) pairs,
+        // PRESERVING duplicate allele strings and order. The read side
+        // (`reconstruct_af_group_string`) is positional (allele-major, `idx =
+        // a*n_pops + p`), so a single master order carries every population; each
+        // population's own alleles are an in-order subsequence of it (VEP lists a
+        // canonical allele order per variant and populations omit alleles they
+        // lack data for). A first-seen DEDUP here (the old behavior) silently
+        // dropped the 2nd+ freq of a repeated allele string (e.g. microsatellites
+        // where distinct true alleles trim to an identical repeat string).
+        let master: Vec<String> = pops
+            .iter()
+            .flatten()
+            .max_by_key(|pairs| pairs.len())
+            .map(|pairs| pairs.iter().map(|(a, _)| a.clone()).collect())
+            .unwrap_or_default();
 
-        for allele in &order {
+        for allele in &master {
             alleles.values().append_value(allele);
         }
         alleles.append(true);
 
-        // Allele-major: for each allele, `n_pops` positional freq slots.
-        for allele in &order {
-            for pop_idx in 0..n_pops {
-                match pops.get(pop_idx) {
-                    Some(Some(pairs)) => match pairs.iter().find(|(a, _)| a == allele) {
-                        Some((_, f)) => freqs.values().append_value(*f),
-                        None => freqs.values().append_null(),
-                    },
-                    _ => freqs.values().append_null(),
+        // Align each population's pairs to `master` as an in-order subsequence,
+        // recording the freq at each master position (`None` where the population
+        // has no entry there).
+        let mut pop_rows: Vec<Vec<Option<f32>>> = Vec::with_capacity(n_pops);
+        for pop_idx in 0..n_pops {
+            let mut row = vec![None; master.len()];
+            if let Some(Some(pairs)) = pops.get(pop_idx) {
+                let mut j = 0usize;
+                for (i, mname) in master.iter().enumerate() {
+                    if j < pairs.len() && &pairs[j].0 == mname {
+                        row[i] = Some(pairs[j].1);
+                        j += 1;
+                    }
+                }
+                if j != pairs.len() {
+                    return Err(DataFusionError::Execution(format!(
+                        "AF group population alleles are not an in-order subsequence \
+                         of the master allele order (positional 2-array encoding \
+                         cannot represent this row): '{s}'"
+                    )));
+                }
+            }
+            pop_rows.push(row);
+        }
+
+        // Allele-major emission: for each master allele position, one freq slot per
+        // population.
+        for pos in 0..master.len() {
+            for row in &pop_rows {
+                match row[pos] {
+                    Some(f) => freqs.values().append_value(f),
+                    None => freqs.values().append_null(),
                 }
             }
         }
@@ -321,6 +350,46 @@ mod tests {
             list_row_f32(&af.freqs, 0),
             vec![Some(0.1), Some(0.3), Some(0.2), Some(0.4)]
         );
+    }
+
+    #[test]
+    fn encode_af_preserves_duplicate_allele_strings() {
+        // Microsatellite case: the same trimmed allele string ("X") appears twice
+        // with different freqs. The old first-seen dedup dropped the 2nd, losing
+        // the 0.2712 freq (see the parquet-af-duplicate-allele-encoder-bug). Both
+        // populations share the same allele sequence [X, Y, X].
+        let col = StringArray::from(vec![Some(
+            "X:0.004792,Y:0.02556,X:0.2712|X:0,Y:0.0106,X:0.4319",
+        )]);
+        let af = encode_af_2array(&col, 2).unwrap();
+        assert_eq!(list_row_str(&af.alleles, 0), vec!["X", "Y", "X"]);
+        // allele-major over 2 pops: X, X, Y, Y, X', X'.
+        assert_eq!(
+            list_row_f32(&af.freqs, 0),
+            vec![
+                Some(0.004792),
+                Some(0.0),
+                Some(0.02556),
+                Some(0.0106),
+                Some(0.2712),
+                Some(0.4319),
+            ]
+        );
+        // Round-trips back to the exact source string (the losslessness the
+        // downstream CSQ text relies on).
+        let s = reconstruct_af_group_string(&af.alleles, &af.freqs, 2).unwrap();
+        assert_eq!(
+            s.value(0),
+            "X:0.004792,Y:0.02556,X:0.2712|X:0,Y:0.0106,X:0.4319"
+        );
+    }
+
+    #[test]
+    fn encode_af_rejects_divergent_population_allele_order() {
+        // The positional 2-array encoding requires a shared allele sequence across
+        // populations; a divergent order must fail loud rather than corrupt.
+        let col = StringArray::from(vec![Some("A:0.1,G:0.2|G:0.3,A:0.4")]);
+        assert!(encode_af_2array(&col, 2).is_err());
     }
 
     #[test]
