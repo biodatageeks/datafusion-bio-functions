@@ -66,7 +66,15 @@ name = "build_parquet_variation_chrom"
 required-features = ["lance-cache", "cache-builder"]
 
 [[example]]
+name = "build_parquet_translation_sift_chrom"
+required-features = ["lance-cache", "cache-builder"]
+
+[[example]]
 name = "variation_backend_diff"
+required-features = ["lance-cache", "cache-builder"]
+
+[[example]]
+name = "sift_backend_diff"
 required-features = ["lance-cache", "cache-builder"]
 
 [[example]]

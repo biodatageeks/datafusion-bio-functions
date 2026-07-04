@@ -7,7 +7,9 @@ use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int8Array, Int64Array, StringArray,
     UInt32Array, UInt64Array,
 };
-use datafusion::arrow::compute::{cast, concat_batches, filter_record_batch};
+use datafusion::arrow::compute::{
+    cast, concat_batches, filter_record_batch, sort_to_indices, take,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
@@ -632,6 +634,99 @@ async fn build_lance_translation_sift(options: &LanceCacheBuildOptions) -> Resul
     Ok(EntityStats {
         entity: lance_entity_dir_name(entity),
         parquet_files: files,
+    })
+}
+
+/// Parquet analogue of [`build_lance_translation_sift`] for one chromosome: build
+/// the position-sliced SIFT/PolyPhen shard as a single no-dictionary,
+/// page-indexed `.parquet` file under `parquet.translation_sift/<chrom>.parquet`,
+/// physically sorted by the u64 `key` so the read-side `PageDir` sees one monotone
+/// run.
+///
+/// Reuses the exact row pipeline — the shared `transcript_uid` map and
+/// [`transform_translation_sift_position_batch`] — then globally sorts the
+/// accumulated `(key, sift, poly)` rows by `key` (the source dedup plan groups by
+/// transcript, not by the derived key) and writes via
+/// [`crate::parquet_cache::sift::write_sift_parquet`]. The schema metadata
+/// (`SIFT_BLOB_VERSION`) is preserved so the reader decodes blobs unchanged.
+pub async fn build_parquet_translation_sift_chrom(
+    options: &LanceCacheBuildOptions,
+    chrom: &str,
+) -> Result<ChromDatasetEntry> {
+    let entity_dir = PathBuf::from(&options.output_dir).join("parquet.translation_sift");
+    std::fs::create_dir_all(&entity_dir).map_err(|err| {
+        DataFusionError::Execution(format!(
+            "failed to create '{}': {err}",
+            entity_dir.display()
+        ))
+    })?;
+
+    let source_chrom = chrom.strip_prefix("chr").unwrap_or(chrom);
+    let query = build_translation_dedup_query_with_where_clause(
+        "tl",
+        &format!(" WHERE chrom = '{}'", sql_escape_literal(source_chrom)),
+    );
+    let manifest_chrom = canonical_chrom_label(chrom);
+    let file_name = format!("{manifest_chrom}.parquet");
+    let shard_path = entity_dir.join(&file_name);
+    if shard_path.exists() {
+        if !options.overwrite {
+            return Err(DataFusionError::Execution(format!(
+                "parquet translation_sift shard '{}' already exists and overwrite=false",
+                shard_path.display()
+            )));
+        }
+        std::fs::remove_file(&shard_path).map_err(|err| {
+            DataFusionError::Execution(format!(
+                "failed to remove existing parquet shard '{}': {err}",
+                shard_path.display()
+            ))
+        })?;
+    }
+
+    let source_type = options.cache_source_type.as_str().to_string();
+    // Same shared uid map the transcript build uses, so keys agree.
+    let uid_map = Arc::new(load_transcript_uid_map(options, source_chrom).await?);
+    let ctx = make_ctx_and_register(options, EnsemblEntityKind::Translation, "tl")?;
+    let plan = ctx.sql(&query).await?.create_physical_plan().await?;
+    let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = drop_row_number_batch(batch?)?;
+        let out = transform_translation_sift_position_batch(batch, &source_type, &uid_map)?;
+        if out.num_rows() > 0 {
+            batches.push(out);
+        }
+    }
+    if batches.is_empty() {
+        return Ok(ChromDatasetEntry::new(manifest_chrom, file_name, 0));
+    }
+
+    // Global sort by the derived u64 `key` (unique by construction) → one monotone
+    // PageDir run, matching the Lance BTree key order.
+    let schema = batches[0].schema();
+    let combined = concat_batches(&schema, &batches).map_err(|err| {
+        DataFusionError::Execution(format!("failed to concat sift batches: {err}"))
+    })?;
+    let sorted = sort_record_batch_by_key(&combined)?;
+    let rows = crate::parquet_cache::sift::write_sift_parquet(&shard_path, &[sorted])?;
+    Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
+}
+
+/// Sort a translation_sift batch ascending by its `key` column.
+fn sort_record_batch_by_key(batch: &RecordBatch) -> Result<RecordBatch> {
+    let key_idx = batch.schema().index_of("key")?;
+    let indices = sort_to_indices(batch.column(key_idx), None, None)
+        .map_err(|err| DataFusionError::Execution(format!("failed to sort sift key: {err}")))?;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|c| take(c, &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| DataFusionError::Execution(format!("failed to take sorted sift: {err}")))?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(|err| {
+        DataFusionError::Execution(format!("failed to rebuild sorted sift batch: {err}"))
     })
 }
 
