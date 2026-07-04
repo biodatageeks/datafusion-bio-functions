@@ -78,6 +78,14 @@ name = "sift_backend_diff"
 required-features = ["lance-cache", "cache-builder"]
 
 [[example]]
+name = "build_parquet_context_chrom"
+required-features = ["lance-cache", "cache-builder"]
+
+[[example]]
+name = "context_backend_diff"
+required-features = ["lance-cache", "cache-builder"]
+
+[[example]]
 name = "build_lance_chrom_context"
 required-features = ["lance-cache", "cache-builder"]
 

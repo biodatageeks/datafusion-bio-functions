@@ -15,6 +15,7 @@
 pub mod detect;
 pub mod encode;
 pub mod page_dir;
+pub mod scan;
 pub mod sift;
 pub mod variation_lookup;
 pub mod write;

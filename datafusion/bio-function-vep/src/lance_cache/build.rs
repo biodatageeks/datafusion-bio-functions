@@ -714,6 +714,168 @@ pub async fn build_parquet_translation_sift_chrom(
     Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
 }
 
+/// Remove an existing Parquet shard file, honoring `overwrite`. Shared by the
+/// Parquet build drivers.
+fn remove_existing_parquet_shard(path: &Path, overwrite: bool) -> Result<()> {
+    if path.exists() {
+        if !overwrite {
+            return Err(DataFusionError::Execution(format!(
+                "parquet shard '{}' already exists and overwrite=false",
+                path.display()
+            )));
+        }
+        std::fs::remove_file(path).map_err(|err| {
+            DataFusionError::Execution(format!(
+                "failed to remove existing parquet shard '{}': {err}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// The provider output schema for an entity (used to build the transcript export
+/// query, which selects an explicit field list keyed on the provider schema).
+fn provider_output_schema(
+    options: &LanceCacheBuildOptions,
+    kind: EnsemblEntityKind,
+) -> Result<SchemaRef> {
+    use datafusion::catalog::TableProvider;
+    let mut provider_options = EnsemblCacheOptions::new(&options.cache_root)
+        .with_cache_source_type(options.cache_source_type);
+    provider_options.target_partitions = Some(options.partitions);
+    Ok(EnsemblCacheTableProvider::for_entity(kind, provider_options)?.schema())
+}
+
+/// Stream a source query to a dictionary-enabled context Parquet shard, applying
+/// `transform` to each batch. Preserves source (query) order — no explicit sort —
+/// so the shard matches the Lance dataset row order. Returns the row count
+/// (0 → no file written).
+async fn write_query_stream_to_parquet<F>(
+    ctx: &SessionContext,
+    query: &str,
+    path: &Path,
+    transform: F,
+) -> Result<usize>
+where
+    F: Fn(RecordBatch) -> Result<RecordBatch>,
+{
+    use crate::parquet_cache::scan::ContextParquetShardWriter;
+    let plan = ctx.sql(query).await?.create_physical_plan().await?;
+    let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+    let mut writer: Option<ContextParquetShardWriter> = None;
+    let mut rows = 0usize;
+    while let Some(batch) = stream.next().await {
+        let out = transform(batch?)?;
+        if out.num_rows() == 0 {
+            continue;
+        }
+        if writer.is_none() {
+            writer = Some(ContextParquetShardWriter::create(path, out.schema())?);
+        }
+        writer.as_mut().unwrap().write(&out)?;
+        rows += out.num_rows();
+    }
+    if let Some(writer) = writer {
+        writer.finish()?;
+    }
+    Ok(rows)
+}
+
+/// Parquet analogue of [`build_lance_context_entity`] for one chromosome and one
+/// scan entity (`transcript`/`exon`/`regulatory`/`motif`): dictionary-enabled
+/// `parquet.<entity>/<chrom>.parquet`, written verbatim from the same export
+/// query + per-batch transform the Lance path uses (transcript also attaches the
+/// shared `transcript_uid`). Read back by a full projected scan.
+pub async fn build_parquet_context_entity_chrom(
+    options: &LanceCacheBuildOptions,
+    kind: EnsemblEntityKind,
+    chrom: &str,
+) -> Result<ChromDatasetEntry> {
+    let entity = entity_output_name(kind);
+    let entity_dir = PathBuf::from(&options.output_dir).join(format!("parquet.{entity}"));
+    std::fs::create_dir_all(&entity_dir).map_err(|err| {
+        DataFusionError::Execution(format!(
+            "failed to create '{}': {err}",
+            entity_dir.display()
+        ))
+    })?;
+
+    let source_chrom = chrom.strip_prefix("chr").unwrap_or(chrom);
+    let table_name = entity_table_name(kind);
+    let manifest_chrom = canonical_chrom_label(chrom);
+    let file_name = format!("{manifest_chrom}.parquet");
+    let shard_path = entity_dir.join(&file_name);
+    remove_existing_parquet_shard(&shard_path, options.overwrite)?;
+
+    // Only transcript's export query needs the provider schema (explicit select list).
+    let provider_schema = if kind == EnsemblEntityKind::Transcript {
+        Some(provider_output_schema(options, kind)?)
+    } else {
+        None
+    };
+    let query = build_export_query(
+        kind,
+        table_name,
+        Some(source_chrom),
+        provider_schema.as_deref(),
+    );
+    let source_type = options.cache_source_type.as_str().to_string();
+    let ctx = make_ctx_and_register(options, kind, table_name)?;
+
+    let rows = if kind == EnsemblEntityKind::Transcript {
+        let uid_map = Arc::new(load_transcript_uid_map(options, source_chrom).await?);
+        write_query_stream_to_parquet(&ctx, &query, &shard_path, move |batch| {
+            attach_transcript_uid_batch(batch, &source_type, &uid_map)
+        })
+        .await?
+    } else {
+        write_query_stream_to_parquet(&ctx, &query, &shard_path, move |batch| {
+            attach_schema_metadata_to_batch(batch, &source_type)
+        })
+        .await?
+    };
+    Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
+}
+
+/// Parquet analogue of [`build_lance_translation_split`] for `translation_core`,
+/// one chromosome: dictionary-enabled `parquet.translation_core/<chrom>.parquet`,
+/// projected to `translation_core_schema` (big sequences + `list<struct>`
+/// `protein_features`). Read back by a full projected scan.
+pub async fn build_parquet_translation_core_chrom(
+    options: &LanceCacheBuildOptions,
+    chrom: &str,
+) -> Result<ChromDatasetEntry> {
+    let entity_dir = PathBuf::from(&options.output_dir).join("parquet.translation_core");
+    std::fs::create_dir_all(&entity_dir).map_err(|err| {
+        DataFusionError::Execution(format!(
+            "failed to create '{}': {err}",
+            entity_dir.display()
+        ))
+    })?;
+
+    let source_chrom = chrom.strip_prefix("chr").unwrap_or(chrom);
+    let query = build_translation_dedup_query_with_where_clause(
+        "tl",
+        &format!(" WHERE chrom = '{}'", sql_escape_literal(source_chrom)),
+    );
+    let manifest_chrom = canonical_chrom_label(chrom);
+    let file_name = format!("{manifest_chrom}.parquet");
+    let shard_path = entity_dir.join(&file_name);
+    remove_existing_parquet_shard(&shard_path, options.overwrite)?;
+
+    let target_schema = translation_core_schema(false, options.cache_source_type);
+    let source_type = options.cache_source_type.as_str().to_string();
+    let ctx = make_ctx_and_register(options, EnsemblEntityKind::Translation, "tl")?;
+    let rows = write_query_stream_to_parquet(&ctx, &query, &shard_path, move |batch| {
+        let batch = drop_row_number_batch(batch)?;
+        let batch = project_batch_to_schema(batch, Arc::clone(&target_schema))?;
+        attach_schema_metadata_to_batch(batch, &source_type)
+    })
+    .await?;
+    Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
+}
+
 /// Sort a translation_sift batch ascending by its `key` column.
 fn sort_record_batch_by_key(batch: &RecordBatch) -> Result<RecordBatch> {
     let key_idx = batch.schema().index_of("key")?;

@@ -8963,6 +8963,7 @@ fn emit_contig_pipeline_profile(profile: &Option<SharedContigPipelineProfile>, c
 #[cfg(feature = "lance-cache")]
 async fn load_lance_contig_context(
     cache: &PartitionedLanceCache,
+    parquet_cache: Option<&crate::parquet_cache::detect::PartitionedParquetCache>,
     chrom: &str,
     config: &ContigAnnotationConfig,
     profile: &Option<SharedContigPipelineProfile>,
@@ -8970,6 +8971,7 @@ async fn load_lance_contig_context(
     let scan_started = Instant::now();
     let tx_batches = scan_lance_context_entity(
         cache,
+        parquet_cache,
         "transcript",
         chrom,
         &[
@@ -9044,6 +9046,7 @@ async fn load_lance_contig_context(
     let scan_started = Instant::now();
     let ex_batches = scan_lance_context_entity(
         cache,
+        parquet_cache,
         "exon",
         chrom,
         &[
@@ -9071,6 +9074,7 @@ async fn load_lance_contig_context(
     let scan_started = Instant::now();
     let tl_batches = scan_lance_context_entity(
         cache,
+        parquet_cache,
         "translation_core",
         chrom,
         &[
@@ -9109,6 +9113,7 @@ async fn load_lance_contig_context(
     let scan_started = Instant::now();
     let rg_batches = scan_lance_context_entity(
         cache,
+        parquet_cache,
         "regulatory",
         chrom,
         &[
@@ -9133,6 +9138,7 @@ async fn load_lance_contig_context(
     let scan_started = Instant::now();
     let mt_batches = scan_lance_context_entity(
         cache,
+        parquet_cache,
         "motif",
         chrom,
         &["motif_id", "feature_id", "chrom", "start", "\"end\""],
@@ -9153,10 +9159,20 @@ async fn load_lance_contig_context(
 #[cfg(feature = "lance-cache")]
 async fn scan_lance_context_entity(
     cache: &PartitionedLanceCache,
+    parquet_cache: Option<&crate::parquet_cache::detect::PartitionedParquetCache>,
     entity: &str,
     chrom: &str,
     columns: &[&str],
 ) -> Result<Vec<RecordBatch>> {
+    // Prefer the dict-enabled Parquet context shard when the Parquet backend is
+    // active and the shard exists; otherwise fall back to the Lance dataset
+    // (graceful partial migration).
+    if let Some(parquet_cache) = parquet_cache
+        && let Some(path) = parquet_cache.context_path(entity, chrom)
+        && path.exists()
+    {
+        return crate::parquet_cache::scan::read_context_parquet(&path, columns).await;
+    }
     let Some(path) = cache.context_path(entity, chrom) else {
         return Ok(Vec::new());
     };
@@ -12508,8 +12524,14 @@ async fn prepare_contig_context(
                     "Lance context loading requires a Lance cache layout".to_string(),
                 )
             })?;
-            let loaded =
-                load_lance_contig_context(lance_cache, &chrom, &config, &pipeline_profile).await?;
+            let loaded = load_lance_contig_context(
+                lance_cache,
+                cache.as_parquet(),
+                &chrom,
+                &config,
+                &pipeline_profile,
+            )
+            .await?;
             let context_elapsed = t_ctx.elapsed();
             pipeline_trace::emit(
                 "context",
