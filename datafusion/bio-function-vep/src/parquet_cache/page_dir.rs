@@ -163,6 +163,19 @@ impl PageDir {
                     pages.push(pg);
                     pg += 1;
                 }
+                // A run's FIRST page can STRADDLE the tier seam: the shard streams
+                // the warm tier then the cold tier without forcing a page break at
+                // the boundary, so one page holds the warm tail (high keys)
+                // followed by the cold head (low keys). Its key `min` resets
+                // downward (which is exactly what starts this run) while its `max`
+                // stays high (a warm value), so its `[min,max]` spans both tiers.
+                // That out-of-order `max` breaks the monotonic-max binary search
+                // above (which skips it), dropping the warm rows living in that
+                // page. Bracket-test the run's first page directly to recover them.
+                // Deduped below, so at most one extra page per batch.
+                if self.min[rs] <= p && p <= self.max[rs] {
+                    pages.push(rs);
+                }
             }
         }
         pages.sort_unstable();
@@ -387,6 +400,28 @@ mod tests {
             vec![100, 200, 300],
         );
         assert_eq!(pd.resolve_ranges(&[50]), vec![(0, 300)]);
+    }
+
+    #[test]
+    fn page_dir_finds_warm_rows_in_a_tier_straddling_page() {
+        // Reproduces the chr16:90202097 miss: the warm tier (pages 0,1 ascending)
+        // is followed by the cold tier, but the boundary lands INSIDE a page, so
+        // page 2 holds the warm tail (keys up to 300) AND the cold head (min 1).
+        // Its min resets to 1 (→ run boundary) while its max stays high (300),
+        // which is out of order vs the following pure-cold page 3 (max 50).
+        let pd = PageDir::from_parts(
+            vec![10, 91, 1, 2],     // min  (reset at page 2 → run split)
+            vec![90, 150, 300, 50], // max  (page 2 max=300 is out of order vs page 3=50)
+            vec![0, 100, 200, 300],
+            vec![100, 200, 300, 400],
+        );
+        assert_eq!(pd.num_runs(), 2);
+        // 200 is a warm key that lives ONLY in the straddling page 2 (its warm
+        // tail): > page 1's max (150) and > pure-cold page 3's max (50). The
+        // monotonic binary search skips page 2; the run-first-page bracket test
+        // must recover it.
+        // Without the run-first-page bracket test this returns [] (the bug).
+        assert_eq!(pd.resolve_ranges(&[200]), vec![(200, 300)]);
     }
 
     #[test]
