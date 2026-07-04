@@ -5337,7 +5337,6 @@ impl AnnotateProvider {
         extended_probes: bool,
         cache: PartitionedAnnotationCache,
         translations_sift_table: Option<&str>,
-        #[cfg(feature = "lance-cache")] use_lance: bool,
         fetch_limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if profiling_enabled() {
@@ -5429,14 +5428,12 @@ impl AnnotateProvider {
         } else {
             self.schema.clone()
         };
-        // The Parquet variation backend reuses the same cache-root plumbing (the
-        // base dir holds both parquet.variation/ and the Lance context entities);
-        // `parquet_backend` additionally flips the variation exec to `new_parquet`.
+        // The base dir holds the parquet.* shards; the variation exec is always
+        // built via `new_parquet`.
         #[cfg(feature = "lance-cache")]
-        let parquet_backend = cache.as_parquet().is_some();
+        let parquet_backend = true;
         #[cfg(feature = "lance-cache")]
-        let lance_cache_root =
-            (use_lance || parquet_backend).then(|| cache.base_dir().to_path_buf());
+        let lance_cache_root = Some(cache.base_dir().to_path_buf());
 
         let config = ContigAnnotationConfig {
             vcf_table: self.vcf_table.clone(),
@@ -8551,28 +8548,19 @@ struct ContigAnnotationConfig {
 
 #[derive(Clone)]
 enum PartitionedAnnotationCache {
+    // Parquet is the only cache backend. Variation point-lookups, context
+    // entity scans, and SIFT are all served from the Parquet shards under this
+    // handle's base dir. (A single variant keeps the type uninhabited — and all
+    // methods trivially valid — when the cache feature is disabled.)
     #[cfg(feature = "lance-cache")]
-    Lance(PartitionedLanceCache),
-    // Variation-first hybrid: variation is served from Parquet while context
-    // entities + SIFT are still served from the Lance cache in the same base dir.
-    #[cfg(feature = "lance-cache")]
-    Parquet {
-        variation: crate::parquet_cache::detect::PartitionedParquetCache,
-        lance_context: PartitionedLanceCache,
-    },
+    Parquet(crate::parquet_cache::detect::PartitionedParquetCache),
 }
 
 impl PartitionedAnnotationCache {
     fn available_chroms(&self) -> Vec<String> {
         match self {
             #[cfg(feature = "lance-cache")]
-            Self::Lance(cache) => cache
-                .available_chroms()
-                .into_iter()
-                .map(ToString::to_string)
-                .collect(),
-            #[cfg(feature = "lance-cache")]
-            Self::Parquet { variation, .. } => variation
+            Self::Parquet(variation) => variation
                 .available_chroms()
                 .into_iter()
                 .map(ToString::to_string)
@@ -8583,29 +8571,15 @@ impl PartitionedAnnotationCache {
     fn base_dir(&self) -> &std::path::Path {
         match self {
             #[cfg(feature = "lance-cache")]
-            Self::Lance(cache) => cache.base_dir(),
-            #[cfg(feature = "lance-cache")]
-            Self::Parquet { variation, .. } => variation.base_dir(),
+            Self::Parquet(variation) => variation.base_dir(),
         }
     }
 
-    /// The Lance cache used for context entities + SIFT. For the hybrid Parquet
-    /// backend this is the co-located Lance context cache (variation itself is
-    /// served via the Parquet `KvLookupExec`, not through this handle).
+    /// The Parquet cache handle backing variation, context, and SIFT lookups.
     #[cfg(feature = "lance-cache")]
-    fn as_lance(&self) -> Option<&PartitionedLanceCache> {
+    fn as_parquet(&self) -> &crate::parquet_cache::detect::PartitionedParquetCache {
         match self {
-            Self::Lance(cache) => Some(cache),
-            Self::Parquet { lance_context, .. } => Some(lance_context),
-        }
-    }
-
-    /// The Parquet variation handle, when the Parquet backend is active.
-    #[cfg(feature = "lance-cache")]
-    fn as_parquet(&self) -> Option<&crate::parquet_cache::detect::PartitionedParquetCache> {
-        match self {
-            Self::Parquet { variation, .. } => Some(variation),
-            Self::Lance(_) => None,
+            Self::Parquet(variation) => variation,
         }
     }
 }
@@ -8962,8 +8936,7 @@ fn emit_contig_pipeline_profile(profile: &Option<SharedContigPipelineProfile>, c
 
 #[cfg(feature = "lance-cache")]
 async fn load_lance_contig_context(
-    cache: &PartitionedLanceCache,
-    parquet_cache: Option<&crate::parquet_cache::detect::PartitionedParquetCache>,
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     chrom: &str,
     config: &ContigAnnotationConfig,
     profile: &Option<SharedContigPipelineProfile>,
@@ -8971,7 +8944,6 @@ async fn load_lance_contig_context(
     let scan_started = Instant::now();
     let tx_batches = scan_lance_context_entity(
         cache,
-        parquet_cache,
         "transcript",
         chrom,
         &[
@@ -9046,7 +9018,6 @@ async fn load_lance_contig_context(
     let scan_started = Instant::now();
     let ex_batches = scan_lance_context_entity(
         cache,
-        parquet_cache,
         "exon",
         chrom,
         &[
@@ -9074,7 +9045,6 @@ async fn load_lance_contig_context(
     let scan_started = Instant::now();
     let tl_batches = scan_lance_context_entity(
         cache,
-        parquet_cache,
         "translation_core",
         chrom,
         &[
@@ -9113,7 +9083,6 @@ async fn load_lance_contig_context(
     let scan_started = Instant::now();
     let rg_batches = scan_lance_context_entity(
         cache,
-        parquet_cache,
         "regulatory",
         chrom,
         &[
@@ -9138,7 +9107,6 @@ async fn load_lance_contig_context(
     let scan_started = Instant::now();
     let mt_batches = scan_lance_context_entity(
         cache,
-        parquet_cache,
         "motif",
         chrom,
         &["motif_id", "feature_id", "chrom", "start", "\"end\""],
@@ -9158,25 +9126,20 @@ async fn load_lance_contig_context(
 
 #[cfg(feature = "lance-cache")]
 async fn scan_lance_context_entity(
-    cache: &PartitionedLanceCache,
-    parquet_cache: Option<&crate::parquet_cache::detect::PartitionedParquetCache>,
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     entity: &str,
     chrom: &str,
     columns: &[&str],
 ) -> Result<Vec<RecordBatch>> {
-    // Prefer the dict-enabled Parquet context shard when the Parquet backend is
-    // active and the shard exists; otherwise fall back to the Lance dataset
-    // (graceful partial migration).
-    if let Some(parquet_cache) = parquet_cache
-        && let Some(path) = parquet_cache.context_path(entity, chrom)
-        && path.exists()
-    {
-        return crate::parquet_cache::scan::read_context_parquet(&path, columns).await;
-    }
+    // Read the dict-enabled Parquet context shard. A missing shard (e.g. `motif`,
+    // which has no dataset in any chrom) yields an empty context.
     let Some(path) = cache.context_path(entity, chrom) else {
         return Ok(Vec::new());
     };
-    crate::lance_cache::context_runtime::scan_projected_existing_columns(&path, columns).await
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    crate::parquet_cache::scan::read_context_parquet(&path, columns).await
 }
 
 struct SharedContigAnnotationContext {
@@ -12390,21 +12353,17 @@ async fn prepare_contig_context(
         .schema()
         .as_arrow()
         .clone();
-    // Lance variation lookup reads the cache schema directly from the per-chrom
-    // Lance dataset; the KvLookupExec resolves the dataset path via the root.
+    // The Parquet variation lookup reads the cache schema directly from the
+    // per-chrom Parquet shard; the KvLookupExec resolves the shard path via the
+    // cache root.
     #[cfg(feature = "lance-cache")]
     let cache_schema = {
-        let lance_cache = cache.as_lance().ok_or_else(|| {
-            DataFusionError::Execution(
-                "Lance variation lookup requires a Lance cache layout".to_string(),
-            )
-        })?;
-        let variation_path = lance_cache.variation_path(&chrom).ok_or_else(|| {
+        let variation_path = cache.as_parquet().variation_path(&chrom).ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "Lance cache has no variation dataset for chrom {chrom}"
+                "Parquet cache has no variation shard for chrom {chrom}"
             ))
         })?;
-        read_lance_dataset_schema(&variation_path).await?
+        read_parquet_dataset_schema(&variation_path).await?
     };
     #[cfg(not(feature = "lance-cache"))]
     let cache_schema: Schema = unreachable!("lance-cache feature is required");
@@ -12519,19 +12478,9 @@ async fn prepare_contig_context(
         let _ = use_lance;
         #[cfg(feature = "lance-cache")]
         {
-            let lance_cache = cache.as_lance().ok_or_else(|| {
-                DataFusionError::Execution(
-                    "Lance context loading requires a Lance cache layout".to_string(),
-                )
-            })?;
-            let loaded = load_lance_contig_context(
-                lance_cache,
-                cache.as_parquet(),
-                &chrom,
-                &config,
-                &pipeline_profile,
-            )
-            .await?;
+            let loaded =
+                load_lance_contig_context(cache.as_parquet(), &chrom, &config, &pipeline_profile)
+                    .await?;
             let context_elapsed = t_ctx.elapsed();
             pipeline_trace::emit(
                 "context",
@@ -12608,8 +12557,8 @@ async fn prepare_contig_context(
         config.hgvs_flags.shift_hgvs,
     );
 
-    // SIFT source: the Lance backend uses a shared transcript-id prediction
-    // store loaded per-contig.
+    // SIFT source: a shared per-contig prediction store loaded from the Parquet
+    // translation_sift shard.
     #[cfg(feature = "lance-cache")]
     let use_lookup_sift = config.lance_cache_root.is_some();
     #[cfg(not(feature = "lance-cache"))]
@@ -12618,32 +12567,8 @@ async fn prepare_contig_context(
     #[cfg(feature = "lance-cache")]
     let sift_prediction_store = if use_lookup_sift && config.flags.everything {
         let sift_started = Instant::now();
-        // Prefer the Parquet sift shard when the Parquet backend is active and it
-        // exists; otherwise (or during partial migration) fall back to the Lance
-        // context store.
-        let store = match cache.as_parquet() {
-            Some(parquet_cache) => {
-                match load_parquet_sift_prediction_store_for_chrom(parquet_cache, &chrom).await? {
-                    Some(store) => Some(store),
-                    None => {
-                        let lance_cache = cache.as_lance().ok_or_else(|| {
-                            DataFusionError::Execution(
-                                "SIFT store requires a Parquet or Lance cache layout".to_string(),
-                            )
-                        })?;
-                        load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?
-                    }
-                }
-            }
-            None => {
-                let lance_cache = cache.as_lance().ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "Lance SIFT store requires a Lance cache layout".to_string(),
-                    )
-                })?;
-                load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?
-            }
-        };
+        let store =
+            load_parquet_sift_prediction_store_for_chrom(cache.as_parquet(), &chrom).await?;
         record_contig_profile(&pipeline_profile, |profile| {
             profile.sift_load += sift_started.elapsed();
         });
@@ -12788,22 +12713,22 @@ impl TableProvider for AnnotateProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Lance is the only supported backend. `backend` is validated at
-        // construction; here we additionally reject a non-`lance` `cache_format`.
+        // Parquet is the only cache backend. `cache_format` is still accepted for
+        // backward compatibility ("lance" is a historical alias) but always
+        // resolves to the Parquet shards.
         let cache_format = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "cache_format"))
-            .unwrap_or_else(|| "lance".to_string());
-        let use_parquet_backend = match cache_format.as_str() {
-            "lance" => false,
-            "parquet" => true,
+            .unwrap_or_else(|| "parquet".to_string());
+        match cache_format.as_str() {
+            "lance" | "parquet" => {}
             other => {
                 return Err(DataFusionError::Plan(format!(
                     "annotate_vep(): cache_format must be 'lance' or 'parquet', got '{other}'"
                 )));
             }
-        };
+        }
 
         // Detect the partitioned per-chromosome cache layout (Lance or Parquet).
         // Opt-out via "partitioned": false in options_json.
@@ -12814,39 +12739,15 @@ impl TableProvider for AnnotateProvider {
 
         #[cfg(feature = "lance-cache")]
         let partitioned_annotation_cache = if partitioned_opt != Some(false) {
-            if use_parquet_backend {
-                // Variation-first hybrid: require BOTH parquet.variation/ and the
-                // co-located Lance context entities.
-                match (
-                    crate::parquet_cache::detect::PartitionedParquetCache::detect(
-                        &self.cache_source,
-                    ),
-                    crate::partitioned_cache::PartitionedLanceCache::detect(&self.cache_source),
-                ) {
-                    (Some(variation), Some(lance_context)) => {
-                        Some(PartitionedAnnotationCache::Parquet {
-                            variation,
-                            lance_context,
-                        })
-                    }
-                    (None, _) => {
-                        return Err(DataFusionError::Plan(format!(
-                            "annotate_vep(): cache_format='parquet' requires a 'parquet.variation/' \
-                             layout at '{}'",
-                            self.cache_source
-                        )));
-                    }
-                    (Some(_), None) => {
-                        return Err(DataFusionError::Plan(format!(
-                            "annotate_vep(): cache_format='parquet' is variation-first and still \
-                             requires the Lance context entities (transcript.lance/, etc.) at '{}'",
-                            self.cache_source
-                        )));
-                    }
+            match crate::parquet_cache::detect::PartitionedParquetCache::detect(&self.cache_source)
+            {
+                Some(variation) => Some(PartitionedAnnotationCache::Parquet(variation)),
+                None => {
+                    return Err(DataFusionError::Plan(format!(
+                        "annotate_vep(): a 'parquet.variation/' cache layout is required at '{}'",
+                        self.cache_source
+                    )));
                 }
-            } else {
-                crate::partitioned_cache::PartitionedLanceCache::detect(&self.cache_source)
-                    .map(PartitionedAnnotationCache::Lance)
             }
         } else {
             None
@@ -12854,7 +12755,6 @@ impl TableProvider for AnnotateProvider {
         #[cfg(not(feature = "lance-cache"))]
         let partitioned_annotation_cache: Option<PartitionedAnnotationCache> = {
             let _ = partitioned_opt;
-            let _ = use_parquet_backend;
             None
         };
 
@@ -12868,31 +12768,18 @@ impl TableProvider for AnnotateProvider {
                 );
             }
 
-            // Read available variation columns from a sample shard (Lance or Parquet).
+            // Read available variation columns from a sample Parquet shard.
             #[cfg(feature = "lance-cache")]
             let available_cache_columns: HashSet<String> = {
                 let sample_chrom = &available_chroms[0];
-                let cache_schema = if let Some(parquet_cache) = cache.as_parquet() {
-                    let sample_path =
-                        parquet_cache.variation_path(sample_chrom).ok_or_else(|| {
-                            DataFusionError::Execution(format!(
-                                "Parquet cache has no variation shard for sample chrom {sample_chrom}"
-                            ))
-                        })?;
-                    read_parquet_dataset_schema(&sample_path).await?
-                } else {
-                    let lance_cache = cache.as_lance().ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "cache layout is neither Lance nor Parquet".to_string(),
-                        )
-                    })?;
-                    let sample_path = lance_cache.variation_path(sample_chrom).ok_or_else(|| {
+                let sample_path = cache.as_parquet().variation_path(sample_chrom).ok_or_else(
+                    || {
                         DataFusionError::Execution(format!(
-                            "Lance cache has no variation dataset for sample chrom {sample_chrom}"
+                            "Parquet cache has no variation shard for sample chrom {sample_chrom}"
                         ))
-                    })?;
-                    read_lance_dataset_schema(&sample_path).await?
-                };
+                    },
+                )?;
+                let cache_schema = read_parquet_dataset_schema(&sample_path).await?;
                 cache_schema
                     .fields()
                     .iter()
@@ -12953,8 +12840,6 @@ impl TableProvider for AnnotateProvider {
                     extended_probes,
                     cache,
                     translations_sift_table.as_deref(),
-                    #[cfg(feature = "lance-cache")]
-                    true,
                     limit,
                 )
                 .await;
