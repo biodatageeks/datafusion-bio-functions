@@ -118,6 +118,63 @@ fn run_tidy(path: &str) -> HashMap<(String, String, i32, String), f64> {
     map
 }
 
+/// Run all modules over a fixture and return the tidy result's STRING payload
+/// keyed by (module, label, metric) -> value_str. This surfaces rows the numeric
+/// `run_tidy` drops (their `value` is null), e.g. the overrepresented `source`
+/// row that carries the contaminant "Possible Source" in `value_str`. Source
+/// rows have a null position, so the key omits position (module+label+metric is
+/// unique for them). Column name `value_str` is the finalize schema field
+/// (lib.rs `tidy_schema()` -> `Field::new("value_str", Utf8, true)`).
+fn run_tidy_str(path: &str) -> HashMap<(String, String, String), String> {
+    let batch = fastq_batch(path);
+    let mut set = ModuleSet::build(None).unwrap();
+    set.update_batch(&batch).unwrap();
+    let out = set.finalize().unwrap();
+
+    let module = out
+        .column_by_name("module")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let label = out
+        .column_by_name("label")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let metric = out
+        .column_by_name("metric")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let value_str = out
+        .column_by_name("value_str")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let mut map = HashMap::new();
+    for i in 0..out.num_rows() {
+        if value_str.is_null(i) {
+            continue;
+        }
+        let key = (
+            module.value(i).to_string(),
+            if label.is_null(i) {
+                String::new()
+            } else {
+                label.value(i).to_string()
+            },
+            metric.value(i).to_string(),
+        );
+        map.insert(key, value_str.value(i).to_string());
+    }
+    map
+}
+
 /// A tolerant lookup of a golden fastqc_data.txt for one module. Returns rows
 /// as (label, position, metric) -> value using the same conventions as `run_tidy`.
 fn golden(path: &str) -> GoldenData {
@@ -134,6 +191,7 @@ fn golden(path: &str) -> GoldenData {
     let mut per_base_n: HashMap<i32, f64> = HashMap::new();
     let mut per_base_content: HashMap<(i32, String), f64> = HashMap::new();
     let mut overrep: HashMap<String, (f64, f64)> = HashMap::new(); // seq -> (count, pct)
+    let mut overrep_source: HashMap<String, String> = HashMap::new(); // seq -> Possible Source
     let mut adapter: HashMap<(i32, String), f64> = HashMap::new(); // (pos, adapter) -> pct
     let mut per_tile: HashMap<(u32, i32), f64> = HashMap::new(); // (tile, base) -> mean dev
     let mut kmer: HashMap<String, KmerGolden> = HashMap::new(); // seq -> stats
@@ -225,6 +283,9 @@ fn golden(path: &str) -> GoldenData {
                     cols[0].to_string(),
                     (cols[1].parse().unwrap(), cols[2].parse().unwrap()),
                 );
+                // The 4th tab field is the "Possible Source" (a contaminant name
+                // like "Illumina Single End Adapter 1 (100% over 33bp)" or "No Hit").
+                overrep_source.insert(cols[0].to_string(), cols[3].to_string());
             }
             "adapter_content" if !line.starts_with('#') => {
                 let pos: i32 = cols[0].split('-').next().unwrap().parse().unwrap();
@@ -271,6 +332,7 @@ fn golden(path: &str) -> GoldenData {
         per_base_n,
         per_base_content,
         overrep,
+        overrep_source,
         adapter,
         per_tile,
         kmer,
@@ -297,6 +359,7 @@ struct GoldenData {
     per_base_n: HashMap<i32, f64>,
     per_base_content: HashMap<(i32, String), f64>,
     overrep: HashMap<String, (f64, f64)>,
+    overrep_source: HashMap<String, String>,
     adapter: HashMap<(i32, String), f64>,
     per_tile: HashMap<(u32, i32), f64>,
     kmer: HashMap<String, KmerGolden>,
@@ -534,6 +597,41 @@ fn overrepresented_matches_fastqc_exactly() {
 }
 
 #[test]
+fn overrepresented_source_matches_fastqc_exactly() {
+    // contaminant_mix implants 60/100 reads of the "Illumina Single End Adapter 1"
+    // (an exact 33bp contaminant hit) alongside 40/100 of a No-Hit sequence, so
+    // FastQC's "Possible Source" column exercises BOTH the positive contaminant
+    // path and "No Hit". The `source` row carries its payload in `value_str`
+    // (value is null), so it only surfaces through `run_tidy_str`.
+    let ours = run_tidy_str(&data("contaminant_mix.fastq"));
+    let g = golden(&data("contaminant_mix.nogroup.fastqc_data.txt"));
+    assert!(
+        !g.overrep_source.is_empty(),
+        "golden should report overrepresented sequences with a Possible Source"
+    );
+    // Fail loudly unless the golden genuinely exercises the positive path — at
+    // least one non-"No Hit" contaminant source must be present.
+    assert!(
+        g.overrep_source.values().any(|s| s != "No Hit"),
+        "golden must contain at least one non-'No Hit' Possible Source so the \
+         positive contaminant path is actually tested"
+    );
+    for (seq, expected_source) in &g.overrep_source {
+        let got = ours
+            .get(&(
+                "overrepresented".to_string(),
+                seq.clone(),
+                "source".to_string(),
+            ))
+            .unwrap_or_else(|| panic!("our output has no overrepresented source row for {seq}"));
+        assert_eq!(
+            got, expected_source,
+            "overrepresented source for {seq}: got {got:?}, FastQC says {expected_source:?}"
+        );
+    }
+}
+
+#[test]
 fn adapter_content_matches_fastqc_exactly() {
     // adapter_mix has 20/50 reads carrying the Illumina Universal Adapter.
     let ours = run_tidy(&data("adapter_mix.fastq"));
@@ -566,6 +664,18 @@ fn all_module_statuses_match_fastqc() {
         ("adapter_mix.fastq", "adapter_mix.nogroup.fastqc_data.txt"),
         ("per_tile_mix.fastq", "per_tile_mix.nogroup.fastqc_data.txt"),
         ("kmer_mix.fastq", "kmer_mix.nogroup.fastqc_data.txt"),
+        // contaminant_mix: overrepresented FAIL + a real contaminant source.
+        (
+            "contaminant_mix.fastq",
+            "contaminant_mix.nogroup.fastqc_data.txt",
+        ),
+        // psq_warn / dup_warn: engineered to sit in the WARN band for
+        // per_sequence_quality (mode mean-Q 25, in [20,27)) and duplication
+        // (60% unique remaining, in [50,70)) respectively — the boundary logic
+        // RastQC gets wrong. Quality ':' (Q25, ASCII 58<59) forces Phred+33 so
+        // FastQC does not misdetect the encoding.
+        ("psq_warn.fastq", "psq_warn.nogroup.fastqc_data.txt"),
+        ("dup_warn.fastq", "dup_warn.nogroup.fastqc_data.txt"),
     ];
     let mut checked = 0;
     for (fixture, gf) in cases {

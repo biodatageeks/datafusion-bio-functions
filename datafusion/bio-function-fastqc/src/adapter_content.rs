@@ -89,8 +89,19 @@ impl QcModule for AdapterContent {
 
     fn finalize(&self, out: &mut Vec<TidyRow>) {
         let m = "adapter_content";
-        if self.longest_seq < LONGEST_ADAPTER || self.total == 0 {
+        if self.total == 0 {
+            // No reads at all: nothing to assess.
             out.push(TidyRow::status(m, "PASS"));
+            return;
+        }
+        if self.longest_seq <= LONGEST_ADAPTER {
+            // FastQC AdapterContent.raiseWarning(): "We warn if we just couldn't
+            // run the analysis" -> `longestAdapter > longestSequence` returns
+            // true (WARN), not PASS. FastQC only grows longestSequence for reads
+            // with `length - longestAdapter > 0` (length > 12), so a read must
+            // exceed LONGEST_ADAPTER (12bp) to be assessable; `<=` here matches
+            // that boundary (a 12bp read is NOT assessable).
+            out.push(TidyRow::status(m, "WARN"));
             return;
         }
         let max_pos0 = self.longest_seq - LONGEST_ADAPTER; // 0-based, inclusive
@@ -158,5 +169,52 @@ mod tests {
         assert!((at(4) - 0.0).abs() < 1e-9);
         assert!((at(5) - 50.0).abs() < 1e-9);
         assert!((at(21) - 50.0).abs() < 1e-9);
+    }
+
+    fn status_of(m: &AdapterContent) -> String {
+        let mut rows = Vec::new();
+        m.finalize(&mut rows);
+        rows.iter()
+            .find(|r| r.metric == "status")
+            .and_then(|r| r.value_str.clone())
+            .expect("status row")
+    }
+
+    #[test]
+    fn short_reads_len10_warn() {
+        // Reads too short to assess adapters -> WARN (FastQC raiseWarning).
+        let mut m = AdapterContent::new();
+        for _ in 0..5 {
+            m.update(b"", b"ACGTACGTAC", &[b'I'; 10]); // 10bp
+        }
+        assert_eq!(status_of(&m), "WARN");
+    }
+
+    #[test]
+    fn reads_len12_warn() {
+        // Exactly LONGEST_ADAPTER (12bp) is NOT assessable -> WARN.
+        let mut m = AdapterContent::new();
+        for _ in 0..5 {
+            m.update(b"", b"ACGTACGTACGT", &[b'I'; 12]); // 12bp
+        }
+        assert_eq!(status_of(&m), "WARN");
+    }
+
+    #[test]
+    fn long_reads_no_adapter_pass() {
+        // Reads long enough to assess, with no adapter content -> PASS.
+        let mut m = AdapterContent::new();
+        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"; // 40bp, no adapter
+        for _ in 0..5 {
+            m.update(b"", seq, &[b'I'; 40]);
+        }
+        assert_eq!(status_of(&m), "PASS");
+    }
+
+    #[test]
+    fn empty_input_pass() {
+        // No reads at all -> PASS (nothing to assess).
+        let m = AdapterContent::new();
+        assert_eq!(status_of(&m), "PASS");
     }
 }
