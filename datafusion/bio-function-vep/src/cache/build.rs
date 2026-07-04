@@ -156,6 +156,14 @@ pub async fn build_parquet_variation_chrom(
         }
     }
     let rows = writer.finish()?;
+    if rows == 0 {
+        // The writer is created eagerly (before the stream), so a contig with no
+        // variants — e.g. a GL*/KI* scaffold present in the source schema but
+        // carrying no variant rows — leaves a schema-only shard. Drop it so the
+        // on-disk layout matches the manifest (which omits empty contigs), like
+        // the lazily-written context/translation shards.
+        let _ = std::fs::remove_file(&shard_path);
+    }
     Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
 }
 
