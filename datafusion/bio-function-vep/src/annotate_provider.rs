@@ -185,8 +185,6 @@ use crate::colocated::{
 };
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::MissWorklist;
-#[cfg(feature = "lance-cache")]
-use crate::partitioned_cache::PartitionedLanceCache;
 use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
@@ -3012,22 +3010,8 @@ fn lookup_sift_polyphen(
     (sift, polyphen)
 }
 
-#[cfg(feature = "lance-cache")]
-async fn read_lance_dataset_schema(path: &std::path::Path) -> Result<Schema> {
-    let dataset = lance::Dataset::open(path.to_string_lossy().as_ref())
-        .await
-        .map_err(|error| {
-            DataFusionError::Execution(format!(
-                "failed to open Lance schema sample '{}': {error}",
-                path.display()
-            ))
-        })?;
-    Ok(dataset.schema().into())
-}
-
-/// Read the Arrow schema of a variation `.parquet` shard (the Parquet-backend
-/// analogue of [`read_lance_dataset_schema`]). Used by the Parquet-cache
-/// detection path (wired with the `cache_format="parquet"` selection).
+/// Read the Arrow schema of a variation `.parquet` shard. Used by the
+/// Parquet-cache detection path.
 #[cfg(feature = "lance-cache")]
 async fn read_parquet_dataset_schema(path: &std::path::Path) -> Result<Schema> {
     use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -3046,166 +3030,6 @@ async fn read_parquet_dataset_schema(path: &std::path::Path) -> Result<Schema> {
             ))
         })?;
     Ok(builder.schema().as_ref().clone())
-}
-
-#[cfg(feature = "lance-cache")]
-#[derive(Clone)]
-struct InMemorySiftPredictionStore {
-    predictions: Arc<HashMap<String, CachedPredictions>>,
-}
-
-#[cfg(feature = "lance-cache")]
-impl crate::cache_common::SiftPredictionStore for InMemorySiftPredictionStore {
-    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
-        if transcript_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut out = HashMap::with_capacity(transcript_ids.len());
-        for transcript_id in transcript_ids {
-            if out.contains_key(transcript_id) {
-                continue;
-            }
-            if let Some(predictions) = self.predictions.get(transcript_id) {
-                out.insert(transcript_id.clone(), predictions.clone());
-            }
-        }
-        Ok(out)
-    }
-}
-
-#[cfg(feature = "lance-cache")]
-#[derive(Clone)]
-struct LanceBinarySiftPredictionStore {
-    lookup: Arc<crate::lance_cache::context_runtime::TranscriptIdLanceLookup>,
-    predictions: Arc<Mutex<HashMap<String, Option<CachedPredictions>>>>,
-}
-
-#[cfg(feature = "lance-cache")]
-impl crate::cache_common::SiftPredictionStore for LanceBinarySiftPredictionStore {
-    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
-        if transcript_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut out = HashMap::with_capacity(transcript_ids.len());
-        let mut uncached = Vec::new();
-        let mut seen_uncached = HashSet::new();
-        {
-            let cache = self.predictions.lock().map_err(|error| {
-                DataFusionError::Execution(format!("Lance SIFT prediction cache poisoned: {error}"))
-            })?;
-            for transcript_id in transcript_ids {
-                if out.contains_key(transcript_id) {
-                    continue;
-                }
-                if let Some(cached) = cache.get(transcript_id) {
-                    if let Some(predictions) = cached {
-                        out.insert(transcript_id.clone(), predictions.clone());
-                    }
-                    continue;
-                }
-                if seen_uncached.insert(transcript_id.clone()) {
-                    uncached.push(transcript_id.clone());
-                }
-            }
-        }
-        if uncached.is_empty() {
-            return Ok(out);
-        }
-
-        // `block_in_place` panics on a current-thread runtime; `block_on_lance`
-        // falls back to a dedicated thread there (see its doc).
-        let batch = crate::lance_cache::lookup_exec::block_on_lance(
-            self.lookup.take_transcript_ids(&uncached),
-        )?;
-        let fetched = sift_predictions_from_binary_batch(&batch)?;
-        let mut cache = self.predictions.lock().map_err(|error| {
-            DataFusionError::Execution(format!("Lance SIFT prediction cache poisoned: {error}"))
-        })?;
-        for transcript_id in uncached {
-            if let Some(predictions) = fetched.get(&transcript_id) {
-                cache.insert(transcript_id.clone(), Some(predictions.clone()));
-                out.insert(transcript_id, predictions.clone());
-            } else {
-                cache.insert(transcript_id, None);
-            }
-        }
-        Ok(out)
-    }
-}
-
-/// Position-sliced SIFT store: resolves predictions by the packed key
-/// `(transcript_uid << 32) | protein_position` via [`KeyU64LanceLookup`], so a
-/// missense lookup reads only the needed amino-acid position's payload instead
-/// of the transcript's whole substitution matrix. Memoizes resolved keys
-/// (including misses) to avoid repeated `take_rows`.
-#[cfg(feature = "lance-cache")]
-#[derive(Clone)]
-struct PositionSlicedLanceSiftStore {
-    lookup: Arc<crate::lance_cache::context_runtime::KeyU64LanceLookup>,
-    cache: Arc<Mutex<HashMap<u64, Option<CachedPredictions>>>>,
-    blob_version: crate::cache_common::SiftBlobVersion,
-}
-
-#[cfg(feature = "lance-cache")]
-impl crate::cache_common::SiftPredictionStore for PositionSlicedLanceSiftStore {
-    fn get_many(&self, _transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
-        // Position-sliced stores are keyed by `(uid, position)`; the engine
-        // resolves them via `get_position_predictions`, never by transcript id.
-        Ok(HashMap::new())
-    }
-
-    fn is_position_sliced(&self) -> bool {
-        true
-    }
-
-    fn get_position_predictions(&self, keys: &[u64]) -> Result<HashMap<u64, CachedPredictions>> {
-        if keys.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut out = HashMap::with_capacity(keys.len());
-        let mut uncached = Vec::new();
-        let mut seen_uncached = HashSet::new();
-        {
-            let cache = self.cache.lock().map_err(|error| {
-                DataFusionError::Execution(format!("Lance SIFT position cache poisoned: {error}"))
-            })?;
-            for &key in keys {
-                if out.contains_key(&key) {
-                    continue;
-                }
-                if let Some(cached) = cache.get(&key) {
-                    if let Some(predictions) = cached {
-                        out.insert(key, predictions.clone());
-                    }
-                    continue;
-                }
-                if seen_uncached.insert(key) {
-                    uncached.push(key);
-                }
-            }
-        }
-        if uncached.is_empty() {
-            return Ok(out);
-        }
-
-        // `block_in_place` panics on a current-thread runtime; `block_on_lance`
-        // falls back to a dedicated thread there (see its doc).
-        let (batch, _present) =
-            crate::lance_cache::lookup_exec::block_on_lance(self.lookup.take_keys(&uncached))?;
-        let fetched = position_predictions_from_batch(&batch, self.blob_version)?;
-        let mut cache = self.cache.lock().map_err(|error| {
-            DataFusionError::Execution(format!("Lance SIFT position cache poisoned: {error}"))
-        })?;
-        for key in uncached {
-            if let Some(predictions) = fetched.get(&key) {
-                cache.insert(key, Some(predictions.clone()));
-                out.insert(key, predictions.clone());
-            } else {
-                cache.insert(key, None);
-            }
-        }
-        Ok(out)
-    }
 }
 
 /// Decode a position-sliced SIFT take batch (`key: UInt64`, `sift: Binary`,
@@ -3251,83 +3075,9 @@ fn position_predictions_from_batch(
     Ok(predictions)
 }
 
-#[cfg(feature = "lance-cache")]
-async fn load_lance_sift_prediction_store_for_chrom(
-    cache: &PartitionedLanceCache,
-    chrom: &str,
-) -> Result<Option<SiftPredictionStoreRef>> {
-    let Some(path) = cache.context_path("translation_sift", chrom) else {
-        return Ok(None);
-    };
-    let schema = read_lance_dataset_schema(&path).await?;
-    if schema.index_of("key").is_ok()
-        && (schema.index_of("sift").is_ok() || schema.index_of("poly").is_ok())
-    {
-        let lookup = crate::lance_cache::context_runtime::KeyU64LanceLookup::open(
-            &path,
-            vec!["key".to_string(), "sift".to_string(), "poly".to_string()],
-        )
-        .await?;
-        if lookup.keys_len() == 0 {
-            return Ok(None);
-        }
-        let blob_version = crate::cache_common::sift_blob_version_from_metadata(schema.metadata());
-        return Ok(Some(Arc::new(PositionSlicedLanceSiftStore {
-            lookup: Arc::new(lookup),
-            cache: Arc::new(Mutex::new(HashMap::new())),
-            blob_version,
-        }) as SiftPredictionStoreRef));
-    }
-    if schema.index_of("predictions").is_ok() {
-        let lookup = crate::lance_cache::context_runtime::TranscriptIdLanceLookup::open(
-            &path,
-            vec!["transcript_id".to_string(), "predictions".to_string()],
-        )
-        .await?;
-        if lookup.row_ids_len() == 0 {
-            return Ok(None);
-        }
-        return Ok(Some(Arc::new(LanceBinarySiftPredictionStore {
-            lookup: Arc::new(lookup),
-            predictions: Arc::new(Mutex::new(HashMap::new())),
-        }) as SiftPredictionStoreRef));
-    }
-
-    let profile_enabled = std::env::var_os("VEP_LANCE_PROFILE").is_some();
-    let scan_started = profile_enabled.then(std::time::Instant::now);
-    let batches = crate::lance_cache::context_runtime::scan_projected_existing_columns(
-        &path,
-        &[
-            "transcript_id",
-            "stable_id",
-            "sift_predictions",
-            "polyphen_predictions",
-        ],
-    )
-    .await?;
-    let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-    let predictions = sift_predictions_from_batches(&batches)?;
-    if let Some(started) = scan_started {
-        eprintln!(
-            "[vep-lance-profile] sift_scan_load path={} batches={} rows={} transcripts={} seconds={:.3}",
-            path.display(),
-            batches.len(),
-            rows,
-            predictions.len(),
-            started.elapsed().as_secs_f64(),
-        );
-    }
-    if predictions.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(Arc::new(InMemorySiftPredictionStore {
-        predictions: Arc::new(predictions),
-    }) as SiftPredictionStoreRef))
-}
-
-/// Parquet analogue of [`PositionSlicedLanceSiftStore`]: resolves `(uid, position)`
-/// keys through the no-dictionary Parquet sift shard, memoizing hits and misses.
-/// Decodes with the shared [`position_predictions_from_batch`].
+/// Position-sliced SIFT store over the no-dictionary Parquet sift shard:
+/// resolves `(uid, position)` keys, memoizing hits and misses. Decodes with the
+/// shared [`position_predictions_from_batch`].
 #[cfg(feature = "lance-cache")]
 #[derive(Clone)]
 struct PositionSlicedParquetSiftStore {
@@ -12846,7 +12596,7 @@ impl TableProvider for AnnotateProvider {
         }
 
         Err(DataFusionError::Execution(format!(
-            "annotate_vep(): no partitioned Lance cache detected at '{}'. Expected a directory with variation.lance/chrom_manifest.json.",
+            "annotate_vep(): no partitioned Parquet cache detected at '{}'. Expected a directory with parquet.variation/chrom_manifest.json.",
             self.cache_source
         )))
     }
@@ -13069,24 +12819,11 @@ mod tests {
             !message.contains("cache_format must"),
             "lance cache_format was rejected: {message}"
         );
-        assert!(message.contains("no partitioned Lance cache detected"));
-    }
-
-    #[cfg(feature = "lance-cache")]
-    #[tokio::test]
-    async fn lance_backend_detects_lance_manifest_without_parquet_variation_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let variation = tmp.path().join("variation.lance");
-        std::fs::create_dir_all(variation.join("chr1.lance")).unwrap();
-        crate::lance_cache::manifest::ChromManifest::new(vec![
-            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
-        ])
-        .write_to_entity_dir(&variation)
-        .unwrap();
-
+        // "lance" is accepted as a historical alias and resolves to Parquet, so
+        // the empty cache dir fails on the missing Parquet variation layout.
         assert!(
-            crate::partitioned_cache::PartitionedLanceCache::detect(tmp.path().to_str().unwrap())
-                .is_some()
+            message.contains("parquet.variation"),
+            "unexpected error: {message}"
         );
     }
 
@@ -13507,88 +13244,6 @@ mod tests {
         }
 
         Arc::new(list_builder.finish())
-    }
-
-    #[cfg(feature = "lance-cache")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn lance_sift_prediction_store_reads_binary_predictions_by_transcript_id() {
-        use crate::cache_common::serialize_predictions;
-        use datafusion::arrow::array::BinaryArray;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let entity_dir = tmp.path().join("translation_sift.lance");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("transcript_id", DataType::Utf8, false),
-            Field::new("predictions", DataType::Binary, false),
-        ]));
-
-        for (chrom, tx) in [("chr1", "tx1"), ("chr2", "tx2")] {
-            let mut predictions = CachedPredictions::default();
-            predictions.sift = vec![CompactPrediction {
-                position: 1,
-                amino_acid: CompactPrediction::encode_amino_acid("A").unwrap(),
-                prediction: CompactPrediction::encode_prediction("tolerated"),
-                score: 0.1,
-            }];
-            predictions.polyphen = vec![CompactPrediction {
-                position: 1,
-                amino_acid: CompactPrediction::encode_amino_acid("A").unwrap(),
-                prediction: CompactPrediction::encode_prediction("benign"),
-                score: 0.2,
-            }];
-            predictions.sort();
-            let blob = serialize_predictions(&predictions);
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(vec![tx])),
-                    Arc::new(BinaryArray::from_iter_values(vec![blob])),
-                ],
-            )
-            .unwrap();
-            let dataset = entity_dir.join(format!("{chrom}.lance"));
-            crate::lance_cache::write::write_record_batches_to_lance(
-                &dataset,
-                vec![batch],
-                crate::lance_cache::write::LanceIndexKind::TranscriptId,
-            )
-            .await
-            .unwrap();
-        }
-        crate::lance_cache::manifest::ChromManifest::new(vec![
-            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
-            crate::lance_cache::manifest::ChromDatasetEntry::new("chr2", "chr2.lance", 1),
-        ])
-        .write_to_entity_dir(&entity_dir)
-        .unwrap();
-        let variation = tmp.path().join("variation.lance");
-        std::fs::create_dir_all(variation.join("chr1.lance")).unwrap();
-        crate::lance_cache::manifest::ChromManifest::new(vec![
-            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
-        ])
-        .write_to_entity_dir(&variation)
-        .unwrap();
-        let cache =
-            crate::partitioned_cache::PartitionedLanceCache::detect(tmp.path().to_str().unwrap())
-                .unwrap();
-
-        let store = load_lance_sift_prediction_store_for_chrom(&cache, "chr1")
-            .await
-            .unwrap()
-            .unwrap();
-        let loaded = store
-            .get_many(&["tx1".to_string(), "tx2".to_string()])
-            .unwrap();
-
-        let tx1 = loaded.get("tx1").expect("tx1 predictions from chr1");
-        assert_eq!(tx1.lookup_sift(1, "A"), Some(("tolerated", 0.1)));
-        assert_eq!(tx1.lookup_polyphen(1, "A"), Some(("benign", 0.2)));
-        assert!(!loaded.contains_key("tx2"));
-
-        std::fs::remove_dir_all(entity_dir.join("chr1.lance")).unwrap();
-        let cached = store.get_many(&["tx1".to_string()]).unwrap();
-        let tx1 = cached.get("tx1").expect("tx1 predictions from cache");
-        assert_eq!(tx1.lookup_sift(1, "A"), Some(("tolerated", 0.1)));
     }
 
     #[tokio::test]
@@ -14456,162 +14111,6 @@ mod tests {
         assert_eq!(cached.sift[0].score.to_bits(), 0.07f32.to_bits());
         assert_eq!(cached.polyphen[0].score.to_bits(), 0.951f32.to_bits());
         assert_eq!(cached.sift[0].position, 11);
-    }
-
-    /// Opt-in data-parity gate for the position-sliced SIFT layout. Decodes the
-    /// legacy per-transcript `predictions` blob and, for every
-    /// `(transcript, position)`, compares it against the new position-sliced
-    /// store (resolved by `key = (transcript_uid << 32) | position`) — asserting
-    /// byte-identical `(amino_acid, prediction, score)` entries for both SIFT and
-    /// PolyPhen, and a bijection between legacy positions and new rows.
-    ///
-    /// Skipped unless all three dataset dirs are provided:
-    ///   VEP_PARITY_LEGACY_SIFT  = .../translation_sift.lance/<chrom>.lance  (legacy blob)
-    ///   VEP_PARITY_NEW_SIFT     = .../translation_sift.lance/<chrom>.lance  (position-sliced)
-    ///   VEP_PARITY_NEW_TX       = .../transcript.lance/<chrom>.lance        (carries transcript_uid)
-    #[cfg(feature = "lance-cache")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn position_sliced_sift_matches_legacy_blob_parity() {
-        use crate::cache_common::SiftPredictionStore;
-        use std::path::PathBuf;
-
-        let (Some(legacy_sift), Some(new_sift), Some(new_tx)) = (
-            std::env::var_os("VEP_PARITY_LEGACY_SIFT"),
-            std::env::var_os("VEP_PARITY_NEW_SIFT"),
-            std::env::var_os("VEP_PARITY_NEW_TX"),
-        ) else {
-            eprintln!(
-                "skipping position_sliced_sift_matches_legacy_blob_parity \
-                 (set VEP_PARITY_LEGACY_SIFT / VEP_PARITY_NEW_SIFT / VEP_PARITY_NEW_TX)"
-            );
-            return;
-        };
-        let legacy_sift = PathBuf::from(legacy_sift);
-        let new_sift = PathBuf::from(new_sift);
-        let new_tx = PathBuf::from(new_tx);
-
-        // stable_id -> transcript_uid (authoritative map written into transcript.lance).
-        let tx_batches = crate::lance_cache::context_runtime::scan_projected_existing_columns(
-            &new_tx,
-            &["stable_id", "transcript_uid"],
-        )
-        .await
-        .unwrap();
-        let mut uid_map: HashMap<String, u32> = HashMap::new();
-        for batch in &tx_batches {
-            let schema = batch.schema();
-            let id_idx = schema.index_of("stable_id").unwrap();
-            let uid_idx = schema.index_of("transcript_uid").unwrap();
-            for row in 0..batch.num_rows() {
-                if let (Some(id), Some(uid)) = (
-                    string_at(batch.column(id_idx).as_ref(), row),
-                    uint32_at(batch.column(uid_idx).as_ref(), row),
-                ) {
-                    uid_map.insert(id, uid);
-                }
-            }
-        }
-        assert!(!uid_map.is_empty(), "transcript_uid map is empty");
-
-        // Legacy per-transcript predictions blob.
-        let legacy_batches = crate::lance_cache::context_runtime::scan_projected_existing_columns(
-            &legacy_sift,
-            &["transcript_id", "predictions"],
-        )
-        .await
-        .unwrap();
-        let mut legacy: HashMap<String, CachedPredictions> = HashMap::new();
-        for batch in &legacy_batches {
-            legacy.extend(sift_predictions_from_binary_batch(batch).unwrap());
-        }
-        assert!(!legacy.is_empty(), "legacy predictions are empty");
-
-        // New position-sliced store.
-        let lookup = crate::lance_cache::context_runtime::KeyU64LanceLookup::open(
-            &new_sift,
-            vec!["key".to_string(), "sift".to_string(), "poly".to_string()],
-        )
-        .await
-        .unwrap();
-        let new_rows = lookup.keys_len();
-        let new_schema = read_lance_dataset_schema(&new_sift).await.unwrap();
-        let store = PositionSlicedLanceSiftStore {
-            lookup: Arc::new(lookup),
-            cache: Arc::new(Mutex::new(HashMap::new())),
-            blob_version: crate::cache_common::sift_blob_version_from_metadata(
-                new_schema.metadata(),
-            ),
-        };
-
-        let entries_at = |preds: &[CompactPrediction], pos: i32| -> Vec<(u8, u8, u32)> {
-            let mut v: Vec<(u8, u8, u32)> = preds
-                .iter()
-                .filter(|p| p.position == pos)
-                .map(|p| (p.amino_acid, p.prediction, p.score.to_bits()))
-                .collect();
-            v.sort_unstable();
-            v
-        };
-
-        let mut compared_transcripts = 0usize;
-        let mut matched_positions = 0usize;
-        let mut mismatches = 0usize;
-        for (tx_id, lp) in &legacy {
-            // Distinct positions present in the legacy blob for this transcript.
-            let mut positions: Vec<i32> = lp
-                .sift
-                .iter()
-                .chain(lp.polyphen.iter())
-                .map(|p| p.position)
-                .collect();
-            positions.sort_unstable();
-            positions.dedup();
-            if positions.is_empty() {
-                continue; // non-coding transcript: no rows expected
-            }
-            let Some(&uid) = uid_map.get(tx_id) else {
-                mismatches += 1;
-                eprintln!(
-                    "PARITY: legacy transcript {tx_id} has predictions but no transcript_uid"
-                );
-                continue;
-            };
-            compared_transcripts += 1;
-
-            let keys: Vec<u64> = positions
-                .iter()
-                .map(|&pos| ((uid as u64) << 32) | (pos as u64))
-                .collect();
-            let new = store.get_position_predictions(&keys).unwrap();
-
-            for &pos in &positions {
-                let key = ((uid as u64) << 32) | (pos as u64);
-                let Some(np) = new.get(&key) else {
-                    mismatches += 1;
-                    eprintln!("PARITY: missing new row for {tx_id} pos {pos} (key {key})");
-                    continue;
-                };
-                matched_positions += 1;
-                if entries_at(&lp.sift, pos) != entries_at(&np.sift, pos) {
-                    mismatches += 1;
-                    eprintln!("PARITY: SIFT mismatch {tx_id} pos {pos}");
-                }
-                if entries_at(&lp.polyphen, pos) != entries_at(&np.polyphen, pos) {
-                    mismatches += 1;
-                    eprintln!("PARITY: PolyPhen mismatch {tx_id} pos {pos}");
-                }
-            }
-        }
-
-        eprintln!(
-            "parity: transcripts={compared_transcripts} matched_positions={matched_positions} \
-             new_rows={new_rows} mismatches={mismatches}"
-        );
-        assert_eq!(mismatches, 0, "SIFT/PolyPhen parity mismatches found");
-        assert_eq!(
-            matched_positions, new_rows,
-            "legacy positions and new rows are not a bijection (extra/missing rows)"
-        );
     }
 
     // ── lookup_domains ─────────────────────────────────────────────────

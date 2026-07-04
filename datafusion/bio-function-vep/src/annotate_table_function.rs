@@ -80,15 +80,15 @@ impl TableFunctionImpl for AnnotateFunction {
             None
         };
         reject_options_json_source_selectors(options_json.as_deref())?;
-        // Backend is always Lance (`AnnotationBackend::parse` rejects everything
-        // else), so the cache source is always the partitioned Lance cache.
+        // The cache is always the partitioned Parquet cache; read its source-type
+        // metadata off the first variation shard.
         #[cfg(feature = "lance-cache")]
         let cache_source_type =
-            CacheSourceType::from_partitioned_lance_cache_source(&cache_source)?;
+            CacheSourceType::from_partitioned_parquet_cache_source(&cache_source)?;
         #[cfg(not(feature = "lance-cache"))]
         let cache_source_type: CacheSourceType = {
             return Err(DataFusionError::Plan(
-                "annotate_vep(): Lance cache source metadata requires the lance-cache feature"
+                "annotate_vep(): Parquet cache source metadata requires the lance-cache feature"
                     .to_string(),
             ));
         };

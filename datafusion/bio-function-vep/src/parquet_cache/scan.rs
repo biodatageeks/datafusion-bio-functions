@@ -9,8 +9,8 @@
 //! path) and read back unchanged, so the format-agnostic per-entity parsers are
 //! untouched.
 //!
-//! [`read_context_parquet`] mirrors `scan_projected_existing_columns`: a full
-//! read, projected to the requested columns that exist (missing columns tolerated,
+//! [`read_context_parquet`] performs a full read, projected to the requested
+//! columns that exist (missing columns tolerated,
 //! quotes stripped), returning `Vec<RecordBatch>` in file (write) order.
 
 use std::collections::HashSet;
@@ -77,9 +77,9 @@ impl ContextParquetShardWriter {
 }
 
 /// Read a context shard, projected to the requested columns that exist in the
-/// schema. Mirrors `scan_projected_existing_columns`: full scan (all rows),
-/// missing columns silently dropped, surrounding quotes on a requested name
-/// stripped so `"\"end\""` matches `end`. Returns batches in file order.
+/// schema: full scan (all rows), missing columns silently dropped, surrounding
+/// quotes on a requested name stripped so `"\"end\""` matches `end`. Returns
+/// batches in file order.
 pub async fn read_context_parquet(
     path: &Path,
     requested_columns: &[&str],

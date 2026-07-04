@@ -1,8 +1,7 @@
-//! Partitioned per-chromosome Parquet cache detection (Phase 2 backend).
+//! Partitioned per-chromosome Parquet cache detection.
 //!
-//! Mirrors [`crate::partitioned_cache::PartitionedLanceCache`] for the Parquet
-//! layout. Each entity is a `parquet.<entity>/` directory with a
-//! `chrom_manifest.json` mapping chromosomes to per-chromosome `.parquet` files:
+//! Each entity is a `parquet.<entity>/` directory with a `chrom_manifest.json`
+//! mapping chromosomes to per-chromosome `.parquet` files:
 //!
 //! ```text
 //! 115_GRCh38_vep/

@@ -251,13 +251,14 @@ impl TableProvider for LookupProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Lance cache dispatch: when a Lance variation cache root is set,
-        // use the KvLookupExec (Lance backend) instead of the interval join.
+        // Parquet cache dispatch: when a variation cache root is set, use the
+        // KvLookupExec (Parquet backend) instead of the interval join.
         #[cfg(feature = "lance-cache")]
         if let Some(cache_root) = &self.lance_cache_root {
             use crate::allele::allele_matches;
             use crate::lance_cache::lookup_exec::{KvLookupExec, KvMatchMode};
 
+            let _ = self.parquet_backend;
             let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
             let vcf_df = self.session.table(&self.vcf_table).await?;
             let vcf_df = if let Some(ref filter) = self.vcf_filter {
@@ -267,12 +268,7 @@ impl TableProvider for LookupProvider {
             };
             let vcf_plan = vcf_df.create_physical_plan().await?;
 
-            let ctor = if self.parquet_backend {
-                KvLookupExec::new_parquet
-            } else {
-                KvLookupExec::new_lance
-            };
-            let mut exec = ctor(
+            let mut exec = KvLookupExec::new_parquet(
                 vcf_plan,
                 cache_root.clone(),
                 self.cache_schema.clone(),
