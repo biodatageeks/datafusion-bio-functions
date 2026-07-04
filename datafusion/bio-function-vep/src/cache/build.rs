@@ -72,7 +72,7 @@ pub struct CacheBuildOptions {
 /// `variation/<chrom>.parquet`.
 ///
 /// Reuses the exact tiering pipeline — the warm-start pre-pass
-/// ([`collect_warm_starts`]) and [`transform_variation_tier_batch`] — then applies
+/// (`collect_warm_starts`) and `transform_variation_tier_batch` — then applies
 /// the Parquet encoding (Boolean flags, 2-array AF, `variation_name` dedup, via
 /// [`crate::parquet_cache::write::encode_variation_batch`]) and streams the result
 /// to the shard. Rows are written warm tier (0) first then cold (1), each
@@ -273,7 +273,7 @@ fn column_as_str(batch: &RecordBatch, name: &str) -> Option<ArrayRef> {
 /// run.
 ///
 /// Reuses the exact row pipeline — the shared `transcript_uid` map and
-/// [`transform_translation_sift_position_batch`] — then globally sorts the
+/// `transform_translation_sift_position_batch` — then globally sorts the
 /// accumulated `(key, sift, poly)` rows by `key` (the source dedup plan groups by
 /// transcript, not by the derived key) and writes via
 /// [`crate::parquet_cache::sift::write_sift_parquet`]. The schema metadata
