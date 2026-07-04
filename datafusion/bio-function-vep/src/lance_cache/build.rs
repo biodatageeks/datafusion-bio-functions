@@ -876,6 +876,173 @@ pub async fn build_parquet_translation_core_chrom(
     Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
 }
 
+/// Output directory for a Parquet entity's shard set: `parquet.<entity>/`.
+fn parquet_entity_dir(options: &LanceCacheBuildOptions, entity: &str) -> Result<PathBuf> {
+    let path = Path::new(&options.output_dir).join(format!("parquet.{entity}"));
+    std::fs::create_dir_all(&path).map_err(|err| {
+        DataFusionError::Execution(format!("failed to create {}: {err}", path.display()))
+    })?;
+    Ok(path)
+}
+
+/// Skip a Parquet entity build when a manifest and at least one `.parquet` shard
+/// already exist and `overwrite` is false. Parquet analogue of
+/// [`should_skip_lance_entity`].
+fn should_skip_parquet_entity(entity_dir: &Path, overwrite: bool) -> bool {
+    !overwrite
+        && entity_dir.join(CHROM_MANIFEST_FILE).exists()
+        && std::fs::read_dir(entity_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.flatten())
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".parquet"))
+}
+
+/// Build one entity as Parquet shards under `parquet.<entity>/`, writing the
+/// per-chrom `chrom_manifest.json`. Parquet analogue of [`build_lance_entity`];
+/// this is the entry point the [`crate::cache_builder::CacheBuilder`] dispatches
+/// to.
+pub async fn build_parquet_entity(
+    options: &LanceCacheBuildOptions,
+    kind: EnsemblEntityKind,
+) -> Result<Vec<EntityStats>> {
+    match kind {
+        EnsemblEntityKind::Variation => build_parquet_variation(options).await,
+        EnsemblEntityKind::Translation => build_parquet_translation(options).await,
+        EnsemblEntityKind::Transcript
+        | EnsemblEntityKind::Exon
+        | EnsemblEntityKind::RegulatoryFeature
+        | EnsemblEntityKind::MotifFeature => build_parquet_context(options, kind).await,
+    }
+}
+
+async fn build_parquet_variation(options: &LanceCacheBuildOptions) -> Result<Vec<EntityStats>> {
+    let entity_dir = parquet_entity_dir(options, "variation")?;
+    if should_skip_parquet_entity(&entity_dir, options.overwrite) {
+        info!("parquet.variation already exists, skipping (use overwrite to rebuild)");
+        return Ok(vec![EntityStats {
+            entity: "parquet.variation".to_string(),
+            parquet_files: vec![],
+        }]);
+    }
+
+    let chroms = discover_chroms(options, EnsemblEntityKind::Variation, "var").await?;
+    let mut manifest_entries = Vec::new();
+    let mut files = Vec::new();
+    for chrom in chroms {
+        let entry = build_parquet_variation_chrom(options, &chrom).await?;
+        if entry.rows > 0 {
+            let shard_path = entity_dir.join(&entry.dataset);
+            files.push((shard_path.to_string_lossy().to_string(), entry.rows));
+            manifest_entries.push(entry);
+        }
+    }
+
+    ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
+    Ok(vec![EntityStats {
+        entity: "parquet.variation".to_string(),
+        parquet_files: files,
+    }])
+}
+
+async fn build_parquet_context(
+    options: &LanceCacheBuildOptions,
+    kind: EnsemblEntityKind,
+) -> Result<Vec<EntityStats>> {
+    let entity = entity_output_name(kind);
+    let entity_dir = parquet_entity_dir(options, entity)?;
+    if should_skip_parquet_entity(&entity_dir, options.overwrite) {
+        info!("parquet.{entity} already exists, skipping (use overwrite to rebuild)");
+        return Ok(vec![EntityStats {
+            entity: format!("parquet.{entity}"),
+            parquet_files: vec![],
+        }]);
+    }
+
+    let table_name = entity_table_name(kind);
+    let chroms = discover_chroms(options, kind, table_name).await?;
+    let mut manifest_entries = Vec::new();
+    let mut files = Vec::new();
+    for chrom in chroms {
+        let entry = build_parquet_context_entity_chrom(options, kind, &chrom).await?;
+        if entry.rows > 0 {
+            let shard_path = entity_dir.join(&entry.dataset);
+            files.push((shard_path.to_string_lossy().to_string(), entry.rows));
+            manifest_entries.push(entry);
+        }
+    }
+
+    ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
+    Ok(vec![EntityStats {
+        entity: format!("parquet.{entity}"),
+        parquet_files: files,
+    }])
+}
+
+async fn build_parquet_translation(options: &LanceCacheBuildOptions) -> Result<Vec<EntityStats>> {
+    let core = build_parquet_translation_core(options).await?;
+    let sift = build_parquet_translation_sift(options).await?;
+    Ok(vec![core, sift])
+}
+
+async fn build_parquet_translation_core(options: &LanceCacheBuildOptions) -> Result<EntityStats> {
+    let entity_dir = parquet_entity_dir(options, "translation_core")?;
+    if should_skip_parquet_entity(&entity_dir, options.overwrite) {
+        info!("parquet.translation_core already exists, skipping (use overwrite to rebuild)");
+        return Ok(EntityStats {
+            entity: "parquet.translation_core".to_string(),
+            parquet_files: vec![],
+        });
+    }
+
+    let chroms = discover_chroms(options, EnsemblEntityKind::Translation, "tl").await?;
+    let mut manifest_entries = Vec::new();
+    let mut files = Vec::new();
+    for chrom in chroms {
+        let entry = build_parquet_translation_core_chrom(options, &chrom).await?;
+        if entry.rows > 0 {
+            let shard_path = entity_dir.join(&entry.dataset);
+            files.push((shard_path.to_string_lossy().to_string(), entry.rows));
+            manifest_entries.push(entry);
+        }
+    }
+
+    ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
+    Ok(EntityStats {
+        entity: "parquet.translation_core".to_string(),
+        parquet_files: files,
+    })
+}
+
+async fn build_parquet_translation_sift(options: &LanceCacheBuildOptions) -> Result<EntityStats> {
+    let entity_dir = parquet_entity_dir(options, "translation_sift")?;
+    if should_skip_parquet_entity(&entity_dir, options.overwrite) {
+        info!("parquet.translation_sift already exists, skipping (use overwrite to rebuild)");
+        return Ok(EntityStats {
+            entity: "parquet.translation_sift".to_string(),
+            parquet_files: vec![],
+        });
+    }
+
+    let chroms = discover_chroms(options, EnsemblEntityKind::Translation, "tl").await?;
+    let mut manifest_entries = Vec::new();
+    let mut files = Vec::new();
+    for chrom in chroms {
+        let entry = build_parquet_translation_sift_chrom(options, &chrom).await?;
+        if entry.rows > 0 {
+            let shard_path = entity_dir.join(&entry.dataset);
+            files.push((shard_path.to_string_lossy().to_string(), entry.rows));
+            manifest_entries.push(entry);
+        }
+    }
+
+    ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
+    Ok(EntityStats {
+        entity: "parquet.translation_sift".to_string(),
+        parquet_files: files,
+    })
+}
+
 /// Sort a translation_sift batch ascending by its `key` column.
 fn sort_record_batch_by_key(batch: &RecordBatch) -> Result<RecordBatch> {
     let key_idx = batch.schema().index_of("key")?;
