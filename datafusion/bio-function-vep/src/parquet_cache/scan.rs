@@ -4,8 +4,8 @@
 //! Unlike the point-lookup entities (variation, translation_sift), these are read
 //! by a **full projected scan** — every row, a subset of columns — so they use the
 //! opposite writer profile: **dictionary enabled** (free for scans, and needed for
-//! `translation_core`'s big sequences + `list<struct>` to match Lance). No encode
-//! / decode step: the rows are written verbatim (same Arrow schema as the Lance
+//! `translation_core`'s big sequences + `list<struct>` to match Parquet). No encode
+//! / decode step: the rows are written verbatim (same Arrow schema as the Parquet
 //! path) and read back unchanged, so the format-agnostic per-entity parsers are
 //! untouched.
 //!
@@ -33,7 +33,7 @@ const CONTEXT_ROW_GROUP_ROWS: usize = 50_000;
 
 /// Dictionary-enabled `WriterProperties` for a context (scan) shard: zstd(3),
 /// dictionaries on (free for full scans; closes the `translation_core` gap vs
-/// Lance), bounded row groups. No declared sort order — the read path is a full
+/// Parquet), bounded row groups. No declared sort order — the read path is a full
 /// scan, and the physical order already follows the source query.
 pub fn context_writer_properties() -> WriterProperties {
     WriterProperties::builder()

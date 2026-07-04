@@ -1,6 +1,6 @@
-//! Lookup provider for the Lance variation cache.
+//! Lookup provider for the Parquet variation cache.
 //!
-//! Builds a `KvLookupExec` (Lance backend) over the per-chrom variation cache;
+//! Builds a `KvLookupExec` (Parquet backend) over the per-chrom variation cache;
 //! consumed by the `annotate_vep` annotation path.
 
 use std::any::Any;
@@ -51,10 +51,10 @@ fn wrap_with_projection(
     }
 }
 
-/// Table provider that implements variant lookup against the Lance variation
+/// Table provider that implements variant lookup against the Parquet variation
 /// cache via `KvLookupExec`.
 ///
-/// VCF variants are streamed and probed against the per-chrom Lance variation
+/// VCF variants are streamed and probed against the per-chrom Parquet variation
 /// dataset; `match_allele()` is applied as a post-filter and unmatched VCF rows
 /// appear with NULL cache columns. `extended_probes = true` uses interval-overlap
 /// matching for VEP-style coordinate encodings (insertion-style start > end,
@@ -79,13 +79,13 @@ pub struct LookupProvider {
     colocated_sink: Option<ColocatedSink>,
     /// Optional partition-local sinks for co-located data collection.
     partition_colocated_sinks: Option<Vec<ColocatedSink>>,
-    /// Root of a Lance variation cache. When set, variation lookup uses
-    /// `variation.lance/chrN.lance` plus the sidecar position/bloom indexes.
+    /// Root of a Parquet variation cache. When set, variation lookup uses
+    /// `variation.cache/chrN.cache` plus the sidecar position/bloom indexes.
     #[cfg(feature = "parquet-cache")]
-    lance_cache_root: Option<PathBuf>,
+    cache_root: Option<PathBuf>,
     /// When true, the variation lookup uses the Parquet backend
-    /// (`parquet.variation/chrN.parquet`) instead of Lance. The cache root is
-    /// still carried in `lance_cache_root` (the shared cache base dir).
+    /// (`variation/chrN.parquet`) instead of Parquet. The cache root is
+    /// still carried in `cache_root` (the shared cache base dir).
     #[cfg(feature = "parquet-cache")]
     parquet_backend: bool,
     /// Maximum number of independent cold readers used by lookup.
@@ -157,7 +157,7 @@ impl LookupProvider {
             colocated_sink: None,
             partition_colocated_sinks: None,
             #[cfg(feature = "parquet-cache")]
-            lance_cache_root: None,
+            cache_root: None,
             #[cfg(feature = "parquet-cache")]
             parquet_backend: false,
             target_partitions: 1,
@@ -170,18 +170,18 @@ impl LookupProvider {
         self.colocated_sink = Some(sink);
     }
 
-    /// Set partition-local co-located data sinks for lance lookup execution.
+    /// Set partition-local co-located data sinks for cache lookup execution.
     pub fn set_partition_colocated_sinks(&mut self, sinks: Vec<ColocatedSink>) {
         self.partition_colocated_sinks = Some(sinks);
     }
 
     #[cfg(feature = "parquet-cache")]
-    pub fn set_lance_cache_root(&mut self, root: impl Into<PathBuf>) {
-        self.lance_cache_root = Some(root.into());
+    pub fn set_cache_root(&mut self, root: impl Into<PathBuf>) {
+        self.cache_root = Some(root.into());
     }
 
-    /// Select the Parquet variation backend (default is Lance). The cache root is
-    /// set separately via [`Self::set_lance_cache_root`] (the shared base dir).
+    /// Select the Parquet variation backend (default is Parquet). The cache root is
+    /// set separately via [`Self::set_cache_root`] (the shared base dir).
     #[cfg(feature = "parquet-cache")]
     pub fn set_parquet_backend(&mut self, parquet: bool) {
         self.parquet_backend = parquet;
@@ -254,9 +254,9 @@ impl TableProvider for LookupProvider {
         // Parquet cache dispatch: when a variation cache root is set, use the
         // KvLookupExec (Parquet backend) instead of the interval join.
         #[cfg(feature = "parquet-cache")]
-        if let Some(cache_root) = &self.lance_cache_root {
+        if let Some(cache_root) = &self.cache_root {
             use crate::allele::allele_matches;
-            use crate::lance_cache::lookup_exec::{KvLookupExec, KvMatchMode};
+            use crate::cache::lookup_exec::{KvLookupExec, KvMatchMode};
 
             let _ = self.parquet_backend;
             let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
@@ -292,8 +292,8 @@ impl TableProvider for LookupProvider {
             return wrap_with_projection(plan, projection);
         }
 
-        // Lance is the only supported variation-lookup backend; a LookupProvider
-        // is always constructed with a Lance cache root by the annotation path.
+        // Parquet is the only supported variation-lookup backend; a LookupProvider
+        // is always constructed with a Parquet cache root by the annotation path.
         Err(DataFusionError::Plan(
             "LookupProvider::scan requires a Lance variation cache root".to_string(),
         ))

@@ -620,8 +620,8 @@ impl AnnotateVcfConfig {
 }
 
 fn cache_format_for_backend(_backend: &str) -> &str {
-    // Lance is the only supported backend.
-    "lance"
+    // Parquet is the only supported cache format.
+    "parquet"
 }
 
 fn cache_source_type_from_cache_source_for_backend(
@@ -636,7 +636,7 @@ fn cache_source_type_from_cache_source_for_backend(
     {
         let _ = cache_source;
         Err(DataFusionError::Plan(
-            "annotate_to_vcf(): Parquet cache source metadata requires the lance-cache feature"
+            "annotate_to_vcf(): Parquet cache source metadata requires the parquet-cache feature"
                 .to_string(),
         ))
     }
@@ -1302,7 +1302,7 @@ mod tests {
         let json = config.to_options_json_with_backend("lance");
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(value["cache_format"], "lance");
+        assert_eq!(value["cache_format"], "parquet");
     }
 
     #[test]

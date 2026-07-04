@@ -1,7 +1,7 @@
 //! Parquet point-lookup for the `translation_sift` cache entity.
 //!
 //! Position-sliced SIFT/PolyPhen blobs keyed by a `u64` `(transcript_uid<<32) |
-//! position`. Mirrors the Lance `KeyU64LanceLookup` contract — `open` + a
+//! position`. Mirrors the Parquet `KeyU64LanceLookup` contract — `open` + a
 //! `take_keys(&[u64]) -> (RecordBatch, present)` — but resolves keys through the
 //! footer [`PageDir`] (u64 key column) + [`CoalescingAsyncReader`] instead of an
 //! in-memory BTree. The shard is written no-dictionary, page-indexed, and
@@ -10,7 +10,7 @@
 //! candidate pages → exact key offsets → projected payload take.
 //!
 //! The returned batch (`key: UInt64`, `sift: Binary`, `poly: Binary`) is the same
-//! shape the Lance path yields, so `position_predictions_from_batch` decodes it
+//! shape the Parquet path yields, so `position_predictions_from_batch` decodes it
 //! unchanged.
 
 use std::collections::HashSet;
@@ -106,7 +106,7 @@ impl SinglePathParquetSiftLookup {
 
     /// Resolve `keys` to their rows. Returns the payload batch (`key`/`sift`/`poly`
     /// for the matched keys, in `key` order) and the distinct keys found — the
-    /// same `(RecordBatch, present)` contract as the Lance `take_keys`.
+    /// same `(RecordBatch, present)` contract as the Parquet `take_keys`.
     pub async fn take_keys(&self, keys: &[u64]) -> Result<(RecordBatch, Vec<u64>)> {
         let mut sorted: Vec<u64> = keys.to_vec();
         sorted.sort_unstable();

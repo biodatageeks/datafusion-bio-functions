@@ -4,7 +4,7 @@ use hashbrown::HashMap;
 use nohash_hasher::BuildNoHashHasher;
 use smallvec::SmallVec;
 
-use crate::lance_cache::key_encoding::chrom_to_code;
+use crate::cache::key_encoding::chrom_to_code;
 
 const POSITION_BITS: u64 = 48;
 const MAX_POSITION: u64 = (1_u64 << POSITION_BITS) - 1;

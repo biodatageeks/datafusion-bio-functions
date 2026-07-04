@@ -1,6 +1,6 @@
 //! Public DataFusion UDF that decodes position-sliced SIFT/PolyPhen `Binary`
 //! blobs (v2 de-interleaved fixed-divisor layout) into structured rows, so
-//! tools other than the VEP engine can read `translation_sift.lance`.
+//! tools other than the VEP engine can read `translation_sift.cache`.
 
 use std::any::Any;
 use std::sync::Arc;

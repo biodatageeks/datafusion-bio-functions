@@ -24,16 +24,16 @@ use datafusion_bio_format_ensembl_cache::{
 use futures::StreamExt;
 use log::info;
 
+use crate::cache::manifest::{
+    CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest, canonical_chrom_label,
+};
+use crate::cache::schema::{
+    VARIATION_FORBIDDEN_COLUMNS, VARIATION_REQUIRED_COLUMNS, variation_projected_schema,
+    with_cache_source_metadata,
+};
 use crate::cache_builder::EntityStats;
 use crate::cache_common::{
     FrequencyFields, PositionFrequency, max_global_af, select_warm_positions,
-};
-use crate::lance_cache::manifest::{
-    CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest, canonical_chrom_label, dataset_dir_name,
-};
-use crate::lance_cache::schema::{
-    VARIATION_FORBIDDEN_COLUMNS, VARIATION_REQUIRED_COLUMNS, lance_field_metadata,
-    variation_projected_schema, with_cache_source_metadata,
 };
 use crate::{
     annotate_provider::{read_compact_predictions, string_at},
@@ -48,13 +48,13 @@ const DEFAULT_CHROMS: &[&str] = &[
 /// `start` is "warm" (tier 0) when its max global allele frequency across
 /// `minor_allele_freq`, `AF`, `gnomADg`, `gnomADe` is at least this threshold;
 /// the radius extends warm membership to neighboring positions that exist in the
-/// data. These must match `warm_cache::split` so the Lance tier agrees with any
+/// data. These must match `warm_cache::split` so the Parquet tier agrees with any
 /// other tiered consumer.
 const WARM_AF_THRESHOLD: f64 = 0.01;
 const WARM_POSITION_RADIUS: i64 = 1;
 
 #[derive(Debug, Clone)]
-pub struct LanceCacheBuildOptions {
+pub struct CacheBuildOptions {
     pub cache_root: String,
     pub output_dir: String,
     pub partitions: usize,
@@ -67,9 +67,9 @@ pub struct LanceCacheBuildOptions {
     pub chrom_filter: Option<Vec<String>>,
 }
 
-/// Parquet analogue of [`build_lance_variation_chrom`]: build one chromosome's
+/// Build one chromosome's
 /// variation shard as a single no-dictionary, page-indexed `.parquet` file under
-/// `parquet.variation/<chrom>.parquet`.
+/// `variation/<chrom>.parquet`.
 ///
 /// Reuses the exact tiering pipeline — the warm-start pre-pass
 /// ([`collect_warm_starts`]) and [`transform_variation_tier_batch`] — then applies
@@ -79,14 +79,14 @@ pub struct LanceCacheBuildOptions {
 /// `start`-ordered by the source `ORDER BY start` plan — the two sorted runs the
 /// read-side `PageDir` binary search relies on.
 pub async fn build_parquet_variation_chrom(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     chrom: &str,
 ) -> Result<ChromDatasetEntry> {
     use crate::parquet_cache::write::{
         VariationParquetShardWriter, encode_variation_batch, variation_output_schema,
     };
 
-    let entity_dir = PathBuf::from(&options.output_dir).join("parquet.variation");
+    let entity_dir = PathBuf::from(&options.output_dir).join("variation");
     std::fs::create_dir_all(&entity_dir).map_err(|err| {
         DataFusionError::Execution(format!(
             "failed to create '{}': {err}",
@@ -128,7 +128,7 @@ pub async fn build_parquet_variation_chrom(
     );
 
     // Warm tier (0) first, then cold (1); a chromosome with no warm positions
-    // writes a single cold tier. Mirrors the Lance tiered writer's passes.
+    // writes a single cold tier. Mirrors the Parquet tiered writer's passes.
     let passes: &[i8] = if warm_starts.is_empty() {
         &[1]
     } else {
@@ -163,7 +163,7 @@ pub async fn build_parquet_variation_chrom(
 /// classify each genomic `start` as warm (common) or cold (rare) using the same
 /// allele-frequency selector as the Parquet warm tier.
 async fn collect_warm_starts(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     source_chrom: &str,
 ) -> Result<BTreeSet<i64>> {
     let ctx = make_ctx_and_register(options, EnsemblEntityKind::Variation, "var")?;
@@ -258,9 +258,9 @@ fn column_as_str(batch: &RecordBatch, name: &str) -> Option<ArrayRef> {
         .map(|index| batch.column(index).clone())
 }
 
-/// Parquet analogue of [`build_lance_translation_sift`] for one chromosome: build
+/// Build, for one chromosome,
 /// the position-sliced SIFT/PolyPhen shard as a single no-dictionary,
-/// page-indexed `.parquet` file under `parquet.translation_sift/<chrom>.parquet`,
+/// page-indexed `.parquet` file under `translation_sift/<chrom>.parquet`,
 /// physically sorted by the u64 `key` so the read-side `PageDir` sees one monotone
 /// run.
 ///
@@ -271,10 +271,10 @@ fn column_as_str(batch: &RecordBatch, name: &str) -> Option<ArrayRef> {
 /// [`crate::parquet_cache::sift::write_sift_parquet`]. The schema metadata
 /// (`SIFT_BLOB_VERSION`) is preserved so the reader decodes blobs unchanged.
 pub async fn build_parquet_translation_sift_chrom(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     chrom: &str,
 ) -> Result<ChromDatasetEntry> {
-    let entity_dir = PathBuf::from(&options.output_dir).join("parquet.translation_sift");
+    let entity_dir = PathBuf::from(&options.output_dir).join("translation_sift");
     std::fs::create_dir_all(&entity_dir).map_err(|err| {
         DataFusionError::Execution(format!(
             "failed to create '{}': {err}",
@@ -325,7 +325,7 @@ pub async fn build_parquet_translation_sift_chrom(
     }
 
     // Global sort by the derived u64 `key` (unique by construction) → one monotone
-    // PageDir run, matching the Lance BTree key order.
+    // PageDir run, matching the Parquet BTree key order.
     let schema = batches[0].schema();
     let combined = concat_batches(&schema, &batches).map_err(|err| {
         DataFusionError::Execution(format!("failed to concat sift batches: {err}"))
@@ -358,7 +358,7 @@ fn remove_existing_parquet_shard(path: &Path, overwrite: bool) -> Result<()> {
 /// The provider output schema for an entity (used to build the transcript export
 /// query, which selects an explicit field list keyed on the provider schema).
 fn provider_output_schema(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     kind: EnsemblEntityKind,
 ) -> Result<SchemaRef> {
     use datafusion::catalog::TableProvider;
@@ -370,7 +370,7 @@ fn provider_output_schema(
 
 /// Stream a source query to a dictionary-enabled context Parquet shard, applying
 /// `transform` to each batch. Preserves source (query) order — no explicit sort —
-/// so the shard matches the Lance dataset row order. Returns the row count
+/// so the shard matches the Parquet dataset row order. Returns the row count
 /// (0 → no file written).
 async fn write_query_stream_to_parquet<F>(
     ctx: &SessionContext,
@@ -403,18 +403,18 @@ where
     Ok(rows)
 }
 
-/// Parquet analogue of [`build_lance_context_entity`] for one chromosome and one
+/// Build, for one chromosome, one
 /// scan entity (`transcript`/`exon`/`regulatory`/`motif`): dictionary-enabled
 /// `parquet.<entity>/<chrom>.parquet`, written verbatim from the same export
-/// query + per-batch transform the Lance path uses (transcript also attaches the
+/// query + per-batch transform the Parquet path uses (transcript also attaches the
 /// shared `transcript_uid`). Read back by a full projected scan.
 pub async fn build_parquet_context_entity_chrom(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     kind: EnsemblEntityKind,
     chrom: &str,
 ) -> Result<ChromDatasetEntry> {
     let entity = entity_output_name(kind);
-    let entity_dir = PathBuf::from(&options.output_dir).join(format!("parquet.{entity}"));
+    let entity_dir = PathBuf::from(&options.output_dir).join(entity);
     std::fs::create_dir_all(&entity_dir).map_err(|err| {
         DataFusionError::Execution(format!(
             "failed to create '{}': {err}",
@@ -459,15 +459,15 @@ pub async fn build_parquet_context_entity_chrom(
     Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
 }
 
-/// Parquet analogue of [`build_lance_translation_split`] for `translation_core`,
-/// one chromosome: dictionary-enabled `parquet.translation_core/<chrom>.parquet`,
+/// Build `translation_core`,
+/// one chromosome: dictionary-enabled `translation_core/<chrom>.parquet`,
 /// projected to `translation_core_schema` (big sequences + `list<struct>`
 /// `protein_features`). Read back by a full projected scan.
 pub async fn build_parquet_translation_core_chrom(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     chrom: &str,
 ) -> Result<ChromDatasetEntry> {
-    let entity_dir = PathBuf::from(&options.output_dir).join("parquet.translation_core");
+    let entity_dir = PathBuf::from(&options.output_dir).join("translation_core");
     std::fs::create_dir_all(&entity_dir).map_err(|err| {
         DataFusionError::Execution(format!(
             "failed to create '{}': {err}",
@@ -498,8 +498,8 @@ pub async fn build_parquet_translation_core_chrom(
 }
 
 /// Output directory for a Parquet entity's shard set: `parquet.<entity>/`.
-fn parquet_entity_dir(options: &LanceCacheBuildOptions, entity: &str) -> Result<PathBuf> {
-    let path = Path::new(&options.output_dir).join(format!("parquet.{entity}"));
+fn parquet_entity_dir(options: &CacheBuildOptions, entity: &str) -> Result<PathBuf> {
+    let path = Path::new(&options.output_dir).join(entity);
     std::fs::create_dir_all(&path).map_err(|err| {
         DataFusionError::Execution(format!("failed to create {}: {err}", path.display()))
     })?;
@@ -508,7 +508,6 @@ fn parquet_entity_dir(options: &LanceCacheBuildOptions, entity: &str) -> Result<
 
 /// Skip a Parquet entity build when a manifest and at least one `.parquet` shard
 /// already exist and `overwrite` is false. Parquet analogue of
-/// [`should_skip_lance_entity`].
 fn should_skip_parquet_entity(entity_dir: &Path, overwrite: bool) -> bool {
     !overwrite
         && entity_dir.join(CHROM_MANIFEST_FILE).exists()
@@ -520,11 +519,11 @@ fn should_skip_parquet_entity(entity_dir: &Path, overwrite: bool) -> bool {
 }
 
 /// Build one entity as Parquet shards under `parquet.<entity>/`, writing the
-/// per-chrom `chrom_manifest.json`. Parquet analogue of [`build_lance_entity`];
+/// per-chrom `chrom_manifest.json`.
 /// this is the entry point the [`crate::cache_builder::CacheBuilder`] dispatches
 /// to.
 pub async fn build_parquet_entity(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     kind: EnsemblEntityKind,
 ) -> Result<Vec<EntityStats>> {
     match kind {
@@ -537,12 +536,12 @@ pub async fn build_parquet_entity(
     }
 }
 
-async fn build_parquet_variation(options: &LanceCacheBuildOptions) -> Result<Vec<EntityStats>> {
+async fn build_parquet_variation(options: &CacheBuildOptions) -> Result<Vec<EntityStats>> {
     let entity_dir = parquet_entity_dir(options, "variation")?;
     if should_skip_parquet_entity(&entity_dir, options.overwrite) {
-        info!("parquet.variation already exists, skipping (use overwrite to rebuild)");
+        info!("variation already exists, skipping (use overwrite to rebuild)");
         return Ok(vec![EntityStats {
-            entity: "parquet.variation".to_string(),
+            entity: "variation".to_string(),
             parquet_files: vec![],
         }]);
     }
@@ -561,21 +560,21 @@ async fn build_parquet_variation(options: &LanceCacheBuildOptions) -> Result<Vec
 
     ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
     Ok(vec![EntityStats {
-        entity: "parquet.variation".to_string(),
+        entity: "variation".to_string(),
         parquet_files: files,
     }])
 }
 
 async fn build_parquet_context(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     kind: EnsemblEntityKind,
 ) -> Result<Vec<EntityStats>> {
     let entity = entity_output_name(kind);
     let entity_dir = parquet_entity_dir(options, entity)?;
     if should_skip_parquet_entity(&entity_dir, options.overwrite) {
-        info!("parquet.{entity} already exists, skipping (use overwrite to rebuild)");
+        info!("{entity} already exists, skipping (use overwrite to rebuild)");
         return Ok(vec![EntityStats {
-            entity: format!("parquet.{entity}"),
+            entity: entity.to_string(),
             parquet_files: vec![],
         }]);
     }
@@ -595,23 +594,23 @@ async fn build_parquet_context(
 
     ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
     Ok(vec![EntityStats {
-        entity: format!("parquet.{entity}"),
+        entity: entity.to_string(),
         parquet_files: files,
     }])
 }
 
-async fn build_parquet_translation(options: &LanceCacheBuildOptions) -> Result<Vec<EntityStats>> {
+async fn build_parquet_translation(options: &CacheBuildOptions) -> Result<Vec<EntityStats>> {
     let core = build_parquet_translation_core(options).await?;
     let sift = build_parquet_translation_sift(options).await?;
     Ok(vec![core, sift])
 }
 
-async fn build_parquet_translation_core(options: &LanceCacheBuildOptions) -> Result<EntityStats> {
+async fn build_parquet_translation_core(options: &CacheBuildOptions) -> Result<EntityStats> {
     let entity_dir = parquet_entity_dir(options, "translation_core")?;
     if should_skip_parquet_entity(&entity_dir, options.overwrite) {
-        info!("parquet.translation_core already exists, skipping (use overwrite to rebuild)");
+        info!("translation_core already exists, skipping (use overwrite to rebuild)");
         return Ok(EntityStats {
-            entity: "parquet.translation_core".to_string(),
+            entity: "translation_core".to_string(),
             parquet_files: vec![],
         });
     }
@@ -630,17 +629,17 @@ async fn build_parquet_translation_core(options: &LanceCacheBuildOptions) -> Res
 
     ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
     Ok(EntityStats {
-        entity: "parquet.translation_core".to_string(),
+        entity: "translation_core".to_string(),
         parquet_files: files,
     })
 }
 
-async fn build_parquet_translation_sift(options: &LanceCacheBuildOptions) -> Result<EntityStats> {
+async fn build_parquet_translation_sift(options: &CacheBuildOptions) -> Result<EntityStats> {
     let entity_dir = parquet_entity_dir(options, "translation_sift")?;
     if should_skip_parquet_entity(&entity_dir, options.overwrite) {
-        info!("parquet.translation_sift already exists, skipping (use overwrite to rebuild)");
+        info!("translation_sift already exists, skipping (use overwrite to rebuild)");
         return Ok(EntityStats {
-            entity: "parquet.translation_sift".to_string(),
+            entity: "translation_sift".to_string(),
             parquet_files: vec![],
         });
     }
@@ -659,7 +658,7 @@ async fn build_parquet_translation_sift(options: &LanceCacheBuildOptions) -> Res
 
     ChromManifest::new(manifest_entries).merge_write_to_entity_dir(&entity_dir)?;
     Ok(EntityStats {
-        entity: "parquet.translation_sift".to_string(),
+        entity: "translation_sift".to_string(),
         parquet_files: files,
     })
 }
@@ -681,7 +680,7 @@ fn sort_record_batch_by_key(batch: &RecordBatch) -> Result<RecordBatch> {
 }
 
 async fn discover_chroms(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     kind: EnsemblEntityKind,
     table_name: &str,
 ) -> Result<Vec<String>> {
@@ -691,7 +690,7 @@ async fn discover_chroms(
 }
 
 async fn discover_chroms_and_schema(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     kind: EnsemblEntityKind,
     table_name: &str,
 ) -> Result<(Vec<String>, SchemaRef)> {
@@ -718,7 +717,7 @@ fn filter_chroms(chroms: Vec<String>, allow: Option<&[String]>) -> Vec<String> {
 }
 
 fn make_ctx_and_register(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     kind: EnsemblEntityKind,
     table_name: &str,
 ) -> Result<SessionContext> {
@@ -732,7 +731,7 @@ fn make_ctx_and_register(
     Ok(ctx)
 }
 
-/// Project a source variation batch to the Lance output schema, derive the
+/// Project a source variation batch to the Parquet output schema, derive the
 /// `tier` column from `warm_starts`, and keep only rows whose tier matches
 /// `keep_tier`. The returned batch may be empty (all rows belonged to the other
 /// tier); the streaming writer drops empty batches.
@@ -829,7 +828,7 @@ fn assign_transcript_uids(sorted_unique_ids: &[String]) -> HashMap<String, u32> 
 /// the transcript source's sorted-unique `stable_id`s. Shared by the transcript
 /// build (writes the `transcript_uid` column) and the sift build (keys rows).
 async fn load_transcript_uid_map(
-    options: &LanceCacheBuildOptions,
+    options: &CacheBuildOptions,
     source_chrom: &str,
 ) -> Result<HashMap<String, u32>> {
     let ctx = make_ctx_and_register(options, EnsemblEntityKind::Transcript, "tx")?;
@@ -903,10 +902,9 @@ fn attach_transcript_uid_batch(
 /// `key = (transcript_uid << 32) | position`; small `sift`/`poly` payloads use
 /// miniblock + zstd (v2.1), not FullZip.
 fn compact_translation_sift_position_schema(source_type: &str) -> Schema {
-    let meta = lance_field_metadata();
-    let key = Field::new("key", DataType::UInt64, false).with_metadata(meta.clone());
-    let sift = Field::new("sift", DataType::Binary, false).with_metadata(meta.clone());
-    let poly = Field::new("poly", DataType::Binary, false).with_metadata(meta);
+    let key = Field::new("key", DataType::UInt64, false);
+    let sift = Field::new("sift", DataType::Binary, false);
+    let poly = Field::new("poly", DataType::Binary, false);
     let schema = with_cache_source_metadata(&Schema::new(vec![key, sift, poly]), source_type);
     let mut md = schema.metadata().clone();
     md.insert(
@@ -1426,20 +1424,12 @@ mod tests {
         assert_eq!(p2.polyphen.len(), 1);
         assert_eq!(p2.polyphen[0].prediction, 4);
 
-        // Schema is key/sift/poly with no FullZip (miniblock default).
+        // Schema is key/sift/poly.
         let schema = compact_translation_sift_position_schema("ensembl");
         assert_eq!(schema.field(0).name(), "key");
         assert_eq!(schema.field(0).data_type(), &DataType::UInt64);
         assert_eq!(schema.field(1).name(), "sift");
         assert_eq!(schema.field(2).name(), "poly");
-        assert_ne!(
-            schema
-                .field(1)
-                .metadata()
-                .get("lance-encoding:structural-encoding")
-                .map(String::as_str),
-            Some("fullzip")
-        );
     }
 
     #[test]

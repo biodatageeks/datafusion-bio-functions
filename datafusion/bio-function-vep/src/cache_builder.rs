@@ -1,5 +1,5 @@
 //! Cache builder: converts a raw Ensembl VEP cache to the partitioned Parquet
-//! cache. The actual build work is delegated to [`crate::lance_cache::build`];
+//! cache. The actual build work is delegated to [`crate::cache::build`];
 //! this module provides the public [`CacheBuilder`] entry point and entity
 //! dispatch. Parquet is the only supported output format.
 
@@ -19,7 +19,7 @@ pub enum CacheFormat {
 impl CacheFormat {
     pub fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
-            // "lance" is accepted as a historical alias but always resolves to
+            // "cache" is accepted as a historical alias but always resolves to
             // the Parquet cache — the only supported output format.
             "lance" | "parquet" => Ok(Self::Parquet),
             other => Err(DataFusionError::Execution(format!(
@@ -142,7 +142,7 @@ impl CacheBuilder {
 
         #[cfg(feature = "parquet-cache")]
         {
-            let options = crate::lance_cache::build::LanceCacheBuildOptions {
+            let options = crate::cache::build::CacheBuildOptions {
                 cache_root: self.cache_root.clone(),
                 output_dir: self.output_dir.clone(),
                 partitions: self.partitions,
@@ -150,7 +150,7 @@ impl CacheBuilder {
                 overwrite: self.overwrite,
                 chrom_filter: self.chrom_filter.clone(),
             };
-            crate::lance_cache::build::build_parquet_entity(&options, kind).await
+            crate::cache::build::build_parquet_entity(&options, kind).await
         }
 
         #[cfg(not(feature = "parquet-cache"))]

@@ -1,6 +1,6 @@
-//! Parquet cache backend (Phase 2, zero-Lance migration).
+//! Parquet cache backend (Phase 2, zero-Parquet migration).
 //!
-//! Point-lookup variation reader/writer + cache detection, replacing the Lance
+//! Point-lookup variation reader/writer + cache detection, replacing the Parquet
 //! backend. Design + measured acceptance targets:
 //! `docs/superpowers/plans/2026-07-02-parquet-cache-backend-phase2.md`.
 //!

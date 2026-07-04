@@ -1,7 +1,7 @@
 //! Rebuild one chromosome of the partitioned **Parquet** variation cache from the
 //! Ensembl-cache table provider (Phase 2 backend).
 //!
-//! Writes `parquet.variation/<chrom>.parquet` + upserts `chrom_manifest.json`.
+//! Writes `variation/<chrom>.parquet` + upserts `chrom_manifest.json`.
 //!
 //! Usage:
 //!   cargo run --release -p datafusion-bio-function-vep \
@@ -17,15 +17,13 @@ use std::time::Instant;
 
 use datafusion::common::{DataFusionError, Result};
 use datafusion_bio_format_ensembl_cache::CacheSourceType;
-use datafusion_bio_function_vep::lance_cache::build::{
-    LanceCacheBuildOptions, build_parquet_variation_chrom,
-};
-use datafusion_bio_function_vep::lance_cache::manifest::{
+use datafusion_bio_function_vep::cache::build::{CacheBuildOptions, build_parquet_variation_chrom};
+use datafusion_bio_function_vep::cache::manifest::{
     CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest,
 };
 
 /// Parquet entity directory name (mirrors `parquet_cache::detect`).
-const PARQUET_VARIATION_DIR: &str = "parquet.variation";
+const PARQUET_VARIATION_DIR: &str = "variation";
 
 #[derive(Debug)]
 struct Args {
@@ -42,7 +40,7 @@ async fn main() -> Result<()> {
     let _ = env_logger::try_init();
     let args = parse_args()?;
     let started = Instant::now();
-    let options = LanceCacheBuildOptions {
+    let options = CacheBuildOptions {
         cache_root: args.cache_root.to_string_lossy().to_string(),
         output_dir: args.output_dir.to_string_lossy().to_string(),
         partitions: args.partitions,

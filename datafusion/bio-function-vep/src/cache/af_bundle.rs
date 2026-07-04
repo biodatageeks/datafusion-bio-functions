@@ -1,11 +1,11 @@
-//! AF-column bundling for the Lance variation cache.
+//! AF-column bundling for the Parquet variation cache.
 //!
 //! Physically, the 27 per-population allele-frequency string columns are stored as 3
 //! concatenated scalar `Utf8` columns (one per population family): each row's members are
 //! joined by `|` (verified collision-free), an absent member is an empty field, and a row
 //! with every member absent is null. Encoded miniblock+zstd via the shared string preset,
 //! so a point-take reads ~3.6x fewer bytes than the original separate-27 layout and the AF
-//! columns are ~3.8x smaller on disk, all on stock Lance (no fullzip / no List levels).
+//! columns are ~3.8x smaller on disk, all on stock Parquet (no fullzip / no List levels).
 //!
 //! `bundle_af_columns` (build side, concatenate) and `unbundle_af_columns` (read side, split)
 //! are exact inverses at the column-value level, so the downstream `af_values: Vec<String>`
@@ -19,8 +19,6 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DataFusionError, Result};
-
-use crate::lance_cache::schema::lance_field_metadata;
 
 /// The 3 bundled list columns and, for each, the source AF column names in list order.
 /// The flattened order MUST equal the AF slice of `VARIATION_REQUIRED_COLUMNS` / `AF_COL_NAMES`.
@@ -76,10 +74,10 @@ pub fn af_group_names() -> Vec<&'static str> {
 // The build-time check in `concat_group` guards against future source changes.
 const AF_CONCAT_SEP: char = '|';
 
-/// Field for a concatenated AF group: scalar `Utf8` encoded exactly like the other string
-/// columns (miniblock + zstd + 4 KB minichunk via the shared preset) for full consistency.
+/// Field for a concatenated AF group: scalar `Utf8`, encoded like the other
+/// string columns.
 fn concat_field(name: &str) -> Field {
-    Field::new(name, DataType::Utf8, true).with_metadata(lance_field_metadata())
+    Field::new(name, DataType::Utf8, true)
 }
 
 /// Concatenate one group's members into a single Utf8 column (positional, `|`-joined,

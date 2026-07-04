@@ -18,11 +18,10 @@ use std::time::Instant;
 
 use datafusion::common::{DataFusionError, Result};
 use datafusion_bio_format_ensembl_cache::{CacheSourceType, EnsemblEntityKind};
-use datafusion_bio_function_vep::lance_cache::build::{
-    LanceCacheBuildOptions, build_parquet_context_entity_chrom,
-    build_parquet_translation_core_chrom,
+use datafusion_bio_function_vep::cache::build::{
+    CacheBuildOptions, build_parquet_context_entity_chrom, build_parquet_translation_core_chrom,
 };
-use datafusion_bio_function_vep::lance_cache::manifest::{
+use datafusion_bio_function_vep::cache::manifest::{
     CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest,
 };
 
@@ -41,10 +40,10 @@ struct Args {
 /// `translation_core` is special-cased by the caller.
 fn entity_kind(entity: &str) -> Result<(EnsemblEntityKind, &'static str)> {
     match entity {
-        "transcript" => Ok((EnsemblEntityKind::Transcript, "parquet.transcript")),
-        "exon" => Ok((EnsemblEntityKind::Exon, "parquet.exon")),
-        "regulatory" => Ok((EnsemblEntityKind::RegulatoryFeature, "parquet.regulatory")),
-        "motif" => Ok((EnsemblEntityKind::MotifFeature, "parquet.motif")),
+        "transcript" => Ok((EnsemblEntityKind::Transcript, "transcript")),
+        "exon" => Ok((EnsemblEntityKind::Exon, "exon")),
+        "regulatory" => Ok((EnsemblEntityKind::RegulatoryFeature, "regulatory")),
+        "motif" => Ok((EnsemblEntityKind::MotifFeature, "motif")),
         other => Err(DataFusionError::Execution(format!(
             "unknown --entity '{other}' (expected transcript, exon, regulatory, motif, translation_core)"
         ))),
@@ -56,7 +55,7 @@ async fn main() -> Result<()> {
     let _ = env_logger::try_init();
     let args = parse_args()?;
     let started = Instant::now();
-    let options = LanceCacheBuildOptions {
+    let options = CacheBuildOptions {
         cache_root: args.cache_root.to_string_lossy().to_string(),
         output_dir: args.output_dir.to_string_lossy().to_string(),
         partitions: args.partitions,
@@ -74,7 +73,7 @@ async fn main() -> Result<()> {
     let (entry, dir_name) = if args.entity == "translation_core" {
         (
             build_parquet_translation_core_chrom(&options, &args.chrom).await?,
-            "parquet.translation_core",
+            "translation_core",
         )
     } else {
         let (kind, dir_name) = entity_kind(&args.entity)?;

@@ -1,7 +1,7 @@
 //! Provider for `annotate_vep()` table function.
 //!
 //! Runtime behavior:
-//! - starts from the Lance variation cache lookup for known-variant metadata,
+//! - starts from the Parquet variation cache lookup for known-variant metadata,
 //! - when transcript/exon context is available, computes transcript-driven
 //!   consequence terms and most-severe ranking,
 //! - otherwise falls back to known-variant CSQ placeholders.
@@ -2121,7 +2121,7 @@ impl ColocatedData {
 
 /// Build co-located variant aggregation from the piggybacked collection sink.
 ///
-/// Converts `ColocatedCacheEntry` entries (collected during Lance variation
+/// Converts `ColocatedCacheEntry` entries (collected during Parquet variation
 /// lookup) into the same `ColocatedData` format used by the CSQ assembler,
 /// preserving the per-input-allele separation VEP keeps between different
 /// parser/decomposed alleles at the same locus.
@@ -3127,7 +3127,7 @@ impl crate::cache_common::SiftPredictionStore for PositionSlicedParquetSiftStore
         }
 
         let (batch, _present) =
-            crate::lance_cache::lookup_exec::block_on_lance(self.lookup.take_keys(&uncached))?;
+            crate::cache::lookup_exec::block_on(self.lookup.take_keys(&uncached))?;
         let fetched = position_predictions_from_batch(&batch, self.blob_version)?;
         let mut cache = self.cache.lock().map_err(|error| {
             DataFusionError::Execution(format!("Parquet SIFT position cache poisoned: {error}"))
@@ -3146,7 +3146,7 @@ impl crate::cache_common::SiftPredictionStore for PositionSlicedParquetSiftStore
 
 /// Open the position-sliced SIFT store from the Parquet cache for `chrom`, or
 /// `None` when no Parquet `translation_sift` shard is present (partial migration
-/// falls back to Lance).
+/// falls back to Parquet).
 #[cfg(feature = "parquet-cache")]
 async fn load_parquet_sift_prediction_store_for_chrom(
     cache: &crate::parquet_cache::detect::PartitionedParquetCache,
@@ -4368,7 +4368,7 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    fn parse_lance_transcript_batches(
+    fn parse_transcript_batches(
         table: &str,
         batches: &[RecordBatch],
     ) -> Result<(Vec<TranscriptFeature>, HashMap<String, String>)> {
@@ -4641,7 +4641,7 @@ impl AnnotateProvider {
         Ok((out, translateable_seq_by_tx))
     }
 
-    fn parse_lance_exon_batches(table: &str, batches: &[RecordBatch]) -> Result<Vec<ExonFeature>> {
+    fn parse_exon_batches(table: &str, batches: &[RecordBatch]) -> Result<Vec<ExonFeature>> {
         let mut out = Vec::new();
         for batch in batches {
             let schema = batch.schema();
@@ -4692,7 +4692,7 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    fn parse_lance_translation_batches(
+    fn parse_translation_batches(
         table: &str,
         batches: &[RecordBatch],
     ) -> Result<Vec<TranslationFeature>> {
@@ -4757,7 +4757,7 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    fn parse_lance_regulatory_batches(
+    fn parse_regulatory_batches(
         table: &str,
         batches: &[RecordBatch],
     ) -> Result<Vec<RegulatoryFeature>> {
@@ -4808,10 +4808,7 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    fn parse_lance_motif_batches(
-        table: &str,
-        batches: &[RecordBatch],
-    ) -> Result<Vec<MotifFeature>> {
+    fn parse_motif_batches(table: &str, batches: &[RecordBatch]) -> Result<Vec<MotifFeature>> {
         let mut out = Vec::new();
         for batch in batches {
             let schema = batch.schema();
@@ -5154,7 +5151,7 @@ impl AnnotateProvider {
         let mut cache_chroms: HashSet<String> = HashSet::new();
         let available_chroms = cache.available_chroms();
         for c in &available_chroms {
-            cache_chroms.extend(crate::lance_cache::manifest::contig_alias_set(c));
+            cache_chroms.extend(crate::cache::manifest::contig_alias_set(c));
         }
         let contigs: Vec<String> = vcf_contigs
             .iter()
@@ -5183,7 +5180,7 @@ impl AnnotateProvider {
         #[cfg(feature = "parquet-cache")]
         let parquet_backend = true;
         #[cfg(feature = "parquet-cache")]
-        let lance_cache_root = Some(cache.base_dir().to_path_buf());
+        let cache_root = Some(cache.base_dir().to_path_buf());
 
         let config = ContigAnnotationConfig {
             vcf_table: self.vcf_table.clone(),
@@ -5207,7 +5204,7 @@ impl AnnotateProvider {
             fetch_limit,
             annotation_workers,
             #[cfg(feature = "parquet-cache")]
-            lance_cache_root,
+            cache_root,
             #[cfg(feature = "parquet-cache")]
             parquet_backend,
             #[cfg(feature = "parquet-cache")]
@@ -8281,9 +8278,9 @@ struct ContigAnnotationConfig {
     annotation_workers: usize,
     pick_flags: PickFlags,
     #[cfg(feature = "parquet-cache")]
-    lance_cache_root: Option<std::path::PathBuf>,
+    cache_root: Option<std::path::PathBuf>,
     /// When true, the variation lookup uses the Parquet backend (`new_parquet`)
-    /// while context entities + SIFT still load from the co-located Lance cache.
+    /// while context entities + SIFT still load from the co-located Parquet cache.
     #[cfg(feature = "parquet-cache")]
     parquet_backend: bool,
     /// Shared transcript-id SIFT store (opened once, reused across contigs).
@@ -8552,7 +8549,7 @@ struct ContigPipelineProfile {
     prepare_setup: Duration,
     /// Building the shared annotation context (indexes, cache regions) after loads.
     prepare_shared_ctx: Duration,
-    /// Per-entity Lance scan IO (separate from the parse timers below).
+    /// Per-entity Parquet scan IO (separate from the parse timers below).
     context_transcripts_scan: Duration,
     context_exons_scan: Duration,
     context_translations_scan: Duration,
@@ -8685,14 +8682,14 @@ fn emit_contig_pipeline_profile(profile: &Option<SharedContigPipelineProfile>, c
 }
 
 #[cfg(feature = "parquet-cache")]
-async fn load_lance_contig_context(
+async fn load_contig_context(
     cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     chrom: &str,
     config: &ContigAnnotationConfig,
     profile: &Option<SharedContigPipelineProfile>,
 ) -> Result<LoadedContigContext> {
     let scan_started = Instant::now();
-    let tx_batches = scan_lance_context_entity(
+    let tx_batches = scan_context_entity(
         cache,
         "transcript",
         chrom,
@@ -8755,7 +8752,7 @@ async fn load_lance_contig_context(
     });
     let started = Instant::now();
     let (tx, translateable_seq) =
-        AnnotateProvider::parse_lance_transcript_batches("transcript.lance", &tx_batches)?;
+        AnnotateProvider::parse_transcript_batches("transcript", &tx_batches)?;
     let tx_vec: Vec<_> = tx
         .into_iter()
         .filter(|t| passes_transcript_selection(t, config.transcript_selection))
@@ -8766,7 +8763,7 @@ async fn load_lance_contig_context(
     let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
 
     let scan_started = Instant::now();
-    let ex_batches = scan_lance_context_entity(
+    let ex_batches = scan_context_entity(
         cache,
         "exon",
         chrom,
@@ -8784,7 +8781,7 @@ async fn load_lance_contig_context(
         profile.context_exons_scan += scan_started.elapsed();
     });
     let started = Instant::now();
-    let ex: Vec<_> = AnnotateProvider::parse_lance_exon_batches("exon.lance", &ex_batches)?
+    let ex: Vec<_> = AnnotateProvider::parse_exon_batches("exon", &ex_batches)?
         .into_iter()
         .filter(|exon| tx_ids.contains(&exon.transcript_id))
         .collect();
@@ -8793,7 +8790,7 @@ async fn load_lance_contig_context(
     });
 
     let scan_started = Instant::now();
-    let tl_batches = scan_lance_context_entity(
+    let tl_batches = scan_context_entity(
         cache,
         "translation_core",
         chrom,
@@ -8821,17 +8818,16 @@ async fn load_lance_contig_context(
         profile.context_translations_scan += scan_started.elapsed();
     });
     let started = Instant::now();
-    let tl: Vec<_> =
-        AnnotateProvider::parse_lance_translation_batches("translation_core.lance", &tl_batches)?
-            .into_iter()
-            .filter(|translation| tx_ids.contains(&translation.transcript_id))
-            .collect();
+    let tl: Vec<_> = AnnotateProvider::parse_translation_batches("translation_core", &tl_batches)?
+        .into_iter()
+        .filter(|translation| tx_ids.contains(&translation.transcript_id))
+        .collect();
     record_contig_profile(profile, |profile| {
         profile.context_translations += started.elapsed();
     });
 
     let scan_started = Instant::now();
-    let rg_batches = scan_lance_context_entity(
+    let rg_batches = scan_context_entity(
         cache,
         "regulatory",
         chrom,
@@ -8849,13 +8845,13 @@ async fn load_lance_contig_context(
         profile.context_regulatory_scan += scan_started.elapsed();
     });
     let started = Instant::now();
-    let rg = AnnotateProvider::parse_lance_regulatory_batches("regulatory.lance", &rg_batches)?;
+    let rg = AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)?;
     record_contig_profile(profile, |profile| {
         profile.context_regulatory += started.elapsed();
     });
 
     let scan_started = Instant::now();
-    let mt_batches = scan_lance_context_entity(
+    let mt_batches = scan_context_entity(
         cache,
         "motif",
         chrom,
@@ -8866,7 +8862,7 @@ async fn load_lance_contig_context(
         profile.context_motifs_scan += scan_started.elapsed();
     });
     let started = Instant::now();
-    let mt = AnnotateProvider::parse_lance_motif_batches("motif.lance", &mt_batches)?;
+    let mt = AnnotateProvider::parse_motif_batches("motif", &mt_batches)?;
     record_contig_profile(profile, |profile| {
         profile.context_motifs += started.elapsed();
     });
@@ -8875,7 +8871,7 @@ async fn load_lance_contig_context(
 }
 
 #[cfg(feature = "parquet-cache")]
-async fn scan_lance_context_entity(
+async fn scan_context_entity(
     cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     entity: &str,
     chrom: &str,
@@ -12015,7 +12011,7 @@ impl Stream for ContigAnnotationStream {
 /// chrom region restriction via its tabix index), projecting only `start`(+`alt`),
 /// and replay the serial buffer-cut logic to discover the global input-buffer
 /// boundaries. Partitions are executed in id order (= position order) and
-/// concatenated, matching the annotation scan order; no Lance lookup, no
+/// concatenated, matching the annotation scan order; no Parquet lookup, no
 /// annotation. Returns the boundaries (length `B+1`) and total input-row count.
 async fn count_contig_buffer_boundaries(
     session: &Arc<SessionContext>,
@@ -12076,23 +12072,23 @@ async fn prepare_contig_context(
         .saturating_sub(config.annotation_column_count);
     let vcf_only_schema = Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
 
-    // Lance loads variation + context directly; no ephemeral tables are
+    // Parquet loads variation + context directly; no ephemeral tables are
     // registered, but the field is retained for the cleanup state machine.
     let ephemeral_tables: Vec<String> = Vec::new();
 
-    // Variation table: Lance variation cache (per-chrom dataset under
-    // `variation.lance/`). The KvLookupExec resolves the dataset itself via
+    // Variation table: Parquet variation cache (per-chrom dataset under
+    // `variation.cache/`). The KvLookupExec resolves the dataset itself via
     // the cache root, so a placeholder table name is sufficient.
     #[cfg(feature = "parquet-cache")]
-    let use_lance = config.lance_cache_root.is_some();
+    let cache_enabled = config.cache_root.is_some();
     #[cfg(not(feature = "parquet-cache"))]
-    let use_lance = false;
+    let cache_enabled = false;
 
     let var_table = "__vep_indexed_variation".to_string();
 
-    // 2. Create lookup stream + load context data. Lance loads
+    // 2. Create lookup stream + load context data. Parquet loads
     // transcript/exon/translation/regulatory/motif context via
-    // `load_lance_contig_context`; no per-chrom parquet tables are registered.
+    // `load_contig_context`; no per-chrom parquet tables are registered.
 
     // Lookup arm: build LookupProvider, create stream (cheap — build+probe
     // happens on first poll, NOT here).
@@ -12116,11 +12112,11 @@ async fn prepare_contig_context(
         read_parquet_dataset_schema(&variation_path).await?
     };
     #[cfg(not(feature = "parquet-cache"))]
-    let cache_schema: Schema = unreachable!("lance-cache feature is required");
+    let cache_schema: Schema = unreachable!("parquet-cache feature is required");
     // Stateful Merged/RefSeq at workers>1 runs N grid-aligned per-worker lookup
     // scans (built after the context load below, once overlap_width is known),
     // not the byte-budget partitioning. Keep schema clones for those providers.
-    let stateful_parallel = use_lance
+    let stateful_parallel = cache_enabled
         && config.annotation_workers > 1
         && matches!(
             config.cache_source_type,
@@ -12142,13 +12138,13 @@ async fn prepare_contig_context(
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
     provider.set_target_partitions(config.target_partitions);
     #[cfg(feature = "parquet-cache")]
-    if let Some(root) = &config.lance_cache_root {
-        provider.set_lance_cache_root(root.clone());
+    if let Some(root) = &config.cache_root {
+        provider.set_cache_root(root.clone());
         if config.parquet_backend {
             provider.set_parquet_backend(true);
         }
     }
-    let parallel_lookup = use_lance;
+    let parallel_lookup = cache_enabled;
     let mut lookup_partitions = if stateful_parallel {
         // Deferred: grid-aligned per-worker lookup scans are spawned after the
         // context load below (once overlap_width_bp is known). The `provider`
@@ -12215,7 +12211,7 @@ async fn prepare_contig_context(
         profile.lookup_partitions = lookup_partitions.len();
     });
 
-    // Context arm: load transcripts, exons, translations, etc. (Lance only).
+    // Context arm: load transcripts, exons, translations, etc. (Parquet only).
     // Everything up to here (schema reads, lookup plan build, worker spawn) is
     // setup that runs before any context data is loaded.
     record_contig_profile(&pipeline_profile, |profile| {
@@ -12225,12 +12221,11 @@ async fn prepare_contig_context(
     let context_fut = async {
         let t_ctx = profile_start!();
         pipeline_trace::emit("context", "start", &[("chrom", TraceValue::Str(&chrom))]);
-        let _ = use_lance;
+        let _ = cache_enabled;
         #[cfg(feature = "parquet-cache")]
         {
             let loaded =
-                load_lance_contig_context(cache.as_parquet(), &chrom, &config, &pipeline_profile)
-                    .await?;
+                load_contig_context(cache.as_parquet(), &chrom, &config, &pipeline_profile).await?;
             let context_elapsed = t_ctx.elapsed();
             pipeline_trace::emit(
                 "context",
@@ -12259,11 +12254,11 @@ async fn prepare_contig_context(
         }
         #[cfg(not(feature = "parquet-cache"))]
         {
-            unreachable!("lance-cache feature is required")
+            unreachable!("parquet-cache feature is required")
         }
     };
     // Run the grid count pass (VCF positions only) CONCURRENTLY with the context
-    // load (Lance transcripts/exons) — independent IO, so the count is hidden
+    // load (Parquet transcripts/exons) — independent IO, so the count is hidden
     // behind context load instead of running as a serial prelude before workers.
     let count_fut = async {
         if stateful_parallel {
@@ -12310,7 +12305,7 @@ async fn prepare_contig_context(
     // SIFT source: a shared per-contig prediction store loaded from the Parquet
     // translation_sift shard.
     #[cfg(feature = "parquet-cache")]
-    let use_lookup_sift = config.lance_cache_root.is_some();
+    let use_lookup_sift = config.cache_root.is_some();
     #[cfg(not(feature = "parquet-cache"))]
     let use_lookup_sift = false;
 
@@ -12374,8 +12369,8 @@ async fn prepare_contig_context(
             wprovider.set_vcf_filter(Some(filter));
             wprovider.set_target_partitions(config.target_partitions);
             #[cfg(feature = "parquet-cache")]
-            if let Some(root) = &config.lance_cache_root {
-                wprovider.set_lance_cache_root(root.clone());
+            if let Some(root) = &config.cache_root {
+                wprovider.set_cache_root(root.clone());
                 if config.parquet_backend {
                     wprovider.set_parquet_backend(true);
                 }
@@ -12464,7 +12459,7 @@ impl TableProvider for AnnotateProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Parquet is the only cache backend. `cache_format` is still accepted for
-        // backward compatibility ("lance" is a historical alias) but always
+        // backward compatibility ("cache" is a historical alias) but always
         // resolves to the Parquet shards.
         let cache_format = self
             .options_json
@@ -12480,7 +12475,7 @@ impl TableProvider for AnnotateProvider {
             }
         }
 
-        // Detect the partitioned per-chromosome cache layout (Lance or Parquet).
+        // Detect the partitioned per-chromosome cache layout (Parquet or Parquet).
         // Opt-out via "partitioned": false in options_json.
         let partitioned_opt = self
             .options_json
@@ -12494,7 +12489,7 @@ impl TableProvider for AnnotateProvider {
                 Some(variation) => Some(PartitionedAnnotationCache::Parquet(variation)),
                 None => {
                     return Err(DataFusionError::Plan(format!(
-                        "annotate_vep(): a 'parquet.variation/' cache layout is required at '{}'",
+                        "annotate_vep(): a 'variation/' cache layout is required at '{}'",
                         self.cache_source
                     )));
                 }
@@ -12512,7 +12507,7 @@ impl TableProvider for AnnotateProvider {
             let available_chroms = cache.available_chroms();
             if profiling_enabled() {
                 eprintln!(
-                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {} [lance]",
+                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {} [parquet]",
                     available_chroms.len(),
                     self.cache_source,
                 );
@@ -12596,7 +12591,7 @@ impl TableProvider for AnnotateProvider {
         }
 
         Err(DataFusionError::Execution(format!(
-            "annotate_vep(): no partitioned Parquet cache detected at '{}'. Expected a directory with parquet.variation/chrom_manifest.json.",
+            "annotate_vep(): no partitioned Parquet cache detected at '{}'. Expected a directory with variation/chrom_manifest.json.",
             self.cache_source
         )))
     }
@@ -12788,7 +12783,7 @@ mod tests {
 
     #[cfg(feature = "parquet-cache")]
     #[tokio::test]
-    async fn lance_cache_format_is_accepted() {
+    async fn cache_format_is_accepted() {
         let session = Arc::new(SessionContext::new());
         let vcf_schema = Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -12817,14 +12812,11 @@ mod tests {
         let message = err.to_string();
         assert!(
             !message.contains("cache_format must"),
-            "lance cache_format was rejected: {message}"
+            "the 'lance' cache_format alias was rejected: {message}"
         );
-        // "lance" is accepted as a historical alias and resolves to Parquet, so
+        // "cache" is accepted as a historical alias and resolves to Parquet, so
         // the empty cache dir fails on the missing Parquet variation layout.
-        assert!(
-            message.contains("parquet.variation"),
-            "unexpected error: {message}"
-        );
+        assert!(message.contains("variation"), "unexpected error: {message}");
     }
 
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
@@ -12850,7 +12842,7 @@ mod tests {
             annotation_workers: 1,
             pick_flags: PickFlags::default(),
             #[cfg(feature = "parquet-cache")]
-            lance_cache_root: None,
+            cache_root: None,
             #[cfg(feature = "parquet-cache")]
             parquet_backend: false,
             #[cfg(feature = "parquet-cache")]

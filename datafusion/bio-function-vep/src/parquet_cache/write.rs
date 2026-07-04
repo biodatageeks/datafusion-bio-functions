@@ -22,13 +22,13 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
-use crate::lance_cache::af_bundle::{AF_GROUPS, af_column_order, concat_group};
-use crate::lance_cache::schema::variation_projected_schema;
+use crate::cache::af_bundle::{AF_GROUPS, af_column_order, concat_group};
+use crate::cache::schema::variation_projected_schema;
 use crate::parquet_cache::encode::{
     AfArrays, dedup_variation_name, encode_af_2array, presence_boolean,
 };
 
-/// Row-group size for variation shards (rows). Matches the Lance/Parquet
+/// Row-group size for variation shards (rows). Matches the Parquet/Parquet
 /// reference build; large enough to amortize footer metadata, small enough to
 /// keep row-group pruning useful.
 const VARIATION_ROW_GROUP_ROWS: usize = 1_000_000;
@@ -98,7 +98,7 @@ pub const VARIATION_FLAG_COLUMNS: [&str; 3] = ["failed", "somatic", "phenotype_o
 
 /// Physical output schema for a Parquet variation shard.
 ///
-/// Starts from the Lance projected schema (non-AF required columns with
+/// Starts from the Parquet projected schema (non-AF required columns with
 /// `start`/`end` as `UInt32`, the 27 AF `Utf8` columns, and the derived `tier`),
 /// then: re-types the binary flags to non-nullable `Boolean`, drops the 27 AF
 /// string columns, and appends the 3 struct-of-arrays AF pairs
@@ -147,7 +147,7 @@ fn af_array_datatypes() -> Result<(DataType, DataType)> {
     Ok((af.alleles.data_type().clone(), af.freqs.data_type().clone()))
 }
 
-/// Encode one tiered variation batch (Lance projected schema — `Int8` flags, 27
+/// Encode one tiered variation batch (Parquet projected schema — `Int8` flags, 27
 /// AF `Utf8` columns) into the physical Parquet layout `out_schema` describes:
 /// Boolean presence flags, 2-array AF (per [`AF_GROUPS`]), and `variation_name`
 /// nulled where it equals `dbsnp_ids`. Non-AF, non-flag columns pass through by
@@ -466,7 +466,7 @@ mod tests {
     /// with the types the source provider yields (coords Int64, flags Int8,
     /// `minor_allele_freq` Float64, everything else Utf8).
     fn synthetic_source_schema() -> Schema {
-        use crate::lance_cache::schema::VARIATION_REQUIRED_COLUMNS;
+        use crate::cache::schema::VARIATION_REQUIRED_COLUMNS;
         let fields: Vec<Field> = VARIATION_REQUIRED_COLUMNS
             .iter()
             .map(|&n| {

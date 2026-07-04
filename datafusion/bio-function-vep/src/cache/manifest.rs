@@ -111,22 +111,6 @@ impl ChromManifest {
     }
 }
 
-pub fn dataset_dir_name(chrom: &str) -> String {
-    let label = canonical_chrom_label(chrom);
-    let mut encoded = String::with_capacity(label.len() + ".lance".len());
-    for byte in label.bytes() {
-        let keep = byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.');
-        if keep {
-            encoded.push(byte as char);
-        } else {
-            encoded.push('_');
-            encoded.push_str(&format!("{byte:02X}"));
-        }
-    }
-    encoded.push_str(".lance");
-    encoded
-}
-
 /// All contig spellings equivalent to `chrom` under our canonicalization: the
 /// input itself, its `chr`-prefix add/strip counterpart, and — for the
 /// mitochondrion — the full `M`/`MT`/`chrM`/`chrMT` set. A plain chr-prefix
@@ -170,35 +154,28 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn encodes_labels_without_losing_original_chrom() {
-        assert_eq!(dataset_dir_name("chr1"), "chr1.lance");
-        assert_eq!(dataset_dir_name("1"), "chr1.lance");
+    fn canonicalizes_chrom_labels() {
         assert_eq!(canonical_chrom_label("1"), "chr1");
         assert_eq!(canonical_chrom_label("chr1"), "chr1");
         assert_eq!(canonical_chrom_label("X"), "chrX");
         assert_eq!(canonical_chrom_label("MT"), "chrMT");
-        assert_eq!(
-            dataset_dir_name("HSCHR6_MHC_COX_CTG1"),
-            "HSCHR6_MHC_COX_CTG1.lance"
-        );
-        assert_eq!(dataset_dir_name("foo/bar"), "foo_2Fbar.lance");
     }
 
     #[test]
     fn manifest_round_trips_chrom_paths() {
         let dir = TempDir::new().unwrap();
         let manifest = ChromManifest::new(vec![
-            ChromDatasetEntry::new("chr1", "chr1.lance", 10),
-            ChromDatasetEntry::new("HSCHR6_MHC_COX_CTG1", "HSCHR6_MHC_COX_CTG1.lance", 20),
+            ChromDatasetEntry::new("chr1", "chr1.parquet", 10),
+            ChromDatasetEntry::new("HSCHR6_MHC_COX_CTG1", "HSCHR6_MHC_COX_CTG1.parquet", 20),
         ]);
 
         manifest.write_to_entity_dir(dir.path()).unwrap();
         let loaded = ChromManifest::read_from_entity_dir(dir.path()).unwrap();
 
-        assert_eq!(loaded.path_for_chrom("chr1").unwrap(), "chr1.lance");
+        assert_eq!(loaded.path_for_chrom("chr1").unwrap(), "chr1.parquet");
         assert_eq!(
             loaded.path_for_chrom("HSCHR6_MHC_COX_CTG1").unwrap(),
-            "HSCHR6_MHC_COX_CTG1.lance"
+            "HSCHR6_MHC_COX_CTG1.parquet"
         );
         assert!(loaded.path_for_chrom("other").is_none());
         assert_eq!(loaded.available_chroms(), ["chr1", "HSCHR6_MHC_COX_CTG1"]);
@@ -208,16 +185,16 @@ mod tests {
     fn path_for_chrom_tolerates_chr_prefix_spelling() {
         // Manifest canonicalized to `chr`-prefixed labels.
         let chr_prefixed =
-            ChromManifest::new(vec![ChromDatasetEntry::new("chr1", "chr1.lance", 1)]);
-        assert_eq!(chr_prefixed.path_for_chrom("chr1").unwrap(), "chr1.lance");
+            ChromManifest::new(vec![ChromDatasetEntry::new("chr1", "chr1.parquet", 1)]);
+        assert_eq!(chr_prefixed.path_for_chrom("chr1").unwrap(), "chr1.parquet");
         // A bare VCF contig spelling still resolves.
-        assert_eq!(chr_prefixed.path_for_chrom("1").unwrap(), "chr1.lance");
+        assert_eq!(chr_prefixed.path_for_chrom("1").unwrap(), "chr1.parquet");
         assert!(chr_prefixed.path_for_chrom("2").is_none());
 
         // Manifest with bare labels resolves a `chr`-prefixed query too.
-        let bare = ChromManifest::new(vec![ChromDatasetEntry::new("1", "1.lance", 1)]);
-        assert_eq!(bare.path_for_chrom("1").unwrap(), "1.lance");
-        assert_eq!(bare.path_for_chrom("chr1").unwrap(), "1.lance");
+        let bare = ChromManifest::new(vec![ChromDatasetEntry::new("1", "1.parquet", 1)]);
+        assert_eq!(bare.path_for_chrom("1").unwrap(), "1.parquet");
+        assert_eq!(bare.path_for_chrom("chr1").unwrap(), "1.parquet");
         assert!(bare.path_for_chrom("chrX").is_none());
     }
 
@@ -226,20 +203,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Existing multi-chromosome manifest.
         ChromManifest::new(vec![
-            ChromDatasetEntry::new("chr1", "chr1.lance", 10),
-            ChromDatasetEntry::new("chr2", "chr2.lance", 20),
+            ChromDatasetEntry::new("chr1", "chr1.parquet", 10),
+            ChromDatasetEntry::new("chr2", "chr2.parquet", 20),
         ])
         .write_to_entity_dir(dir.path())
         .unwrap();
 
         // Filtered rebuild of just chr1 (new row count) must keep chr2.
-        ChromManifest::new(vec![ChromDatasetEntry::new("chr1", "chr1.lance", 11)])
+        ChromManifest::new(vec![ChromDatasetEntry::new("chr1", "chr1.parquet", 11)])
             .merge_write_to_entity_dir(dir.path())
             .unwrap();
 
         let merged = ChromManifest::read_from_entity_dir(dir.path()).unwrap();
-        assert_eq!(merged.path_for_chrom("chr1").unwrap(), "chr1.lance");
-        assert_eq!(merged.path_for_chrom("chr2").unwrap(), "chr2.lance");
+        assert_eq!(merged.path_for_chrom("chr1").unwrap(), "chr1.parquet");
+        assert_eq!(merged.path_for_chrom("chr2").unwrap(), "chr2.parquet");
         let chr1 = merged.entries.iter().find(|e| e.chrom == "chr1").unwrap();
         assert_eq!(chr1.rows, 11, "rebuilt chr1 entry overwrites the old one");
         assert_eq!(merged.entries.len(), 2);
@@ -248,7 +225,7 @@ mod tests {
     #[test]
     fn merge_write_into_empty_dir_writes_subset() {
         let dir = TempDir::new().unwrap();
-        ChromManifest::new(vec![ChromDatasetEntry::new("chr1", "chr1.lance", 1)])
+        ChromManifest::new(vec![ChromDatasetEntry::new("chr1", "chr1.parquet", 1)])
             .merge_write_to_entity_dir(dir.path())
             .unwrap();
         let loaded = ChromManifest::read_from_entity_dir(dir.path()).unwrap();
@@ -259,11 +236,11 @@ mod tests {
     fn path_for_chrom_resolves_mitochondrial_aliases() {
         // Builder canonicalizes the mitochondrion to `chrMT`; every VCF spelling
         // must still resolve to it.
-        let mito = ChromManifest::new(vec![ChromDatasetEntry::new("chrMT", "chrMT.lance", 1)]);
+        let mito = ChromManifest::new(vec![ChromDatasetEntry::new("chrMT", "chrMT.parquet", 1)]);
         for query in ["chrMT", "MT", "chrM", "M"] {
             assert_eq!(
                 mito.path_for_chrom(query).unwrap(),
-                "chrMT.lance",
+                "chrMT.parquet",
                 "mito query {query} must resolve to chrMT"
             );
         }

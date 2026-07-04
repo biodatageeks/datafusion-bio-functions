@@ -37,7 +37,7 @@ impl CacheSourceType {
 
     /// Detect the cache source type from a partitioned Parquet cache directory by
     /// reading the `bio.vep.cache_source_type` metadata off the first
-    /// `parquet.variation` shard's schema.
+    /// `variation` shard's schema.
     #[cfg(feature = "parquet-cache")]
     pub(crate) fn from_partitioned_parquet_cache_source(cache_source: &str) -> Result<Self> {
         let shard = first_variation_parquet_shard(cache_source)?;
@@ -48,12 +48,11 @@ impl CacheSourceType {
 
 #[cfg(feature = "parquet-cache")]
 fn first_variation_parquet_shard(cache_source: &str) -> Result<PathBuf> {
-    let variation_dir = Path::new(cache_source).join("parquet.variation");
-    let manifest =
-        crate::lance_cache::manifest::ChromManifest::read_from_entity_dir(&variation_dir)?;
+    let variation_dir = Path::new(cache_source).join("variation");
+    let manifest = crate::cache::manifest::ChromManifest::read_from_entity_dir(&variation_dir)?;
     let first = manifest.entries.first().ok_or_else(|| {
         DataFusionError::Plan(format!(
-            "annotate_vep(): Parquet cache source '{cache_source}' parquet.variation manifest contains no chromosomes"
+            "annotate_vep(): Parquet cache source '{cache_source}' variation manifest contains no chromosomes"
         ))
     })?;
     Ok(variation_dir.join(&first.dataset))

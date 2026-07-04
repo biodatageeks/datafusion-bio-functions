@@ -1,19 +1,19 @@
 //! Footer page-index resolution + a coalescing async reader for Parquet
 //! point lookups.
 //!
-//! Ported from the validated benchmark `research/lance_encoding_sandbox/.../pq_take.rs`
-//! (402,085 rows byte-identical to Lance). Production adaptations: errors via
+//! Ported from the validated benchmark `the validated `pq_take` encoding benchmark`
+//! (402,085 rows byte-identical to Parquet). Production adaptations: errors via
 //! `DataFusionError` instead of `anyhow`; bound to the direct `parquet` 58 crate.
 //!
-//! - [`PageDir`] is the built-in equivalent of Lance's chunked BTree leaf
+//! - [`PageDir`] is the built-in equivalent of Parquet's chunked BTree leaf
 //!   directory: a per-page `min`/`max` of the key column + each page's global
 //!   row range, read straight from the footer `ColumnIndex`/`OffsetIndex` — no
 //!   full-column scan. The key column is written sorted within each tier, so the
 //!   pages form 1–2 monotonically-increasing runs; [`PageDir::resolve_ranges`]
 //!   binary-searches within each run.
 //! - [`CoalescingAsyncReader`] merges nearby page byte-ranges into fewer, larger
-//!   reads (like Lance / `ParquetObjectReader`), which is what makes cold I/O
-//!   competitive (measured ~3.3× fewer read-ops than Lance on chr1).
+//!   reads (like Parquet / `ParquetObjectReader`), which is what makes cold I/O
+//!   competitive (measured ~3.3× fewer read-ops than Parquet on chr1).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

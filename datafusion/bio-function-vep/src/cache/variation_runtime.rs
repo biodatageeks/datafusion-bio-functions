@@ -1,7 +1,7 @@
 use datafusion::arrow::record_batch::RecordBatch;
 
-use crate::lance_cache::row_index::ResolvedRowIds;
-use crate::lance_cache::schema::VARIATION_FORBIDDEN_COLUMNS;
+use crate::cache::row_index::ResolvedRowIds;
+use crate::cache::schema::VARIATION_FORBIDDEN_COLUMNS;
 
 /// The rows taken for a set of resolved positions: the resolution bookkeeping
 /// (`resolved`) plus the projected payload `batch`. Produced by the Parquet

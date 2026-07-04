@@ -100,35 +100,11 @@ pub const VARIATION_REQUIRED_COLUMNS: &[&str] = &[
     "dbsnp_ids",
 ];
 
-pub const LANCE_STRUCTURAL_ENCODING_KEY: &str = "lance-encoding:structural-encoding";
-pub const LANCE_STRUCTURAL_ENCODING_MINIBLOCK: &str = "miniblock";
-pub const LANCE_STRUCTURAL_ENCODING_FULLZIP: &str = "fullzip";
-
-pub fn lance_field_metadata() -> HashMap<String, String> {
-    [
-        (
-            LANCE_STRUCTURAL_ENCODING_KEY,
-            LANCE_STRUCTURAL_ENCODING_MINIBLOCK,
-        ),
-        ("lance-encoding:compression", "zstd"),
-        ("lance-encoding:compression-level", "3"),
-        ("lance-encoding:dict-values-compression", "zstd"),
-        ("lance-encoding:dict-values-compression-level", "3"),
-        ("lance-encoding:rle-threshold", "0.95"),
-        ("lance-encoding:dict-size-ratio", "0.99"),
-        ("lance-encoding:dict-divisor", "1"),
-        ("lance-encoding:minichunk-size", "4096"),
-    ]
-    .into_iter()
-    .map(|(key, value)| (key.to_string(), value.to_string()))
-    .collect()
-}
-
 pub fn validate_variation_schema(schema: &Schema) -> Result<()> {
     for name in VARIATION_FORBIDDEN_COLUMNS {
         if schema.index_of(name).is_ok() {
             return Err(DataFusionError::Execution(format!(
-                "single-path Lance variation schema must not contain {name}"
+                "single-path variation schema must not contain {name}"
             )));
         }
     }
@@ -167,22 +143,6 @@ pub fn with_cache_source_metadata(schema: &Schema, source_type: &str) -> Schema 
         source_type.to_string(),
     );
     Schema::new_with_metadata(schema.fields().clone(), metadata)
-}
-
-pub fn with_lance_field_metadata(schema: &Schema) -> Schema {
-    let defaults = lance_field_metadata();
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let mut metadata = field.metadata().clone();
-            for (key, value) in &defaults {
-                metadata.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-            field.as_ref().clone().with_metadata(metadata)
-        })
-        .collect::<Vec<Field>>();
-    Schema::new_with_metadata(fields, schema.metadata().clone())
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 //! Parquet point-lookup reader for the variation cache, producing the same
-//! [`TakenVariationRows`] contract as the Lance reader.
+//! [`TakenVariationRows`] contract as the Parquet reader.
 //!
 //! Three phases (the proven `pq_take` loop): (1) resolve candidate page
 //! row-ranges from the footer [`PageDir`]; (2) a `start`-only read of those pages
@@ -9,7 +9,7 @@
 //! The physical AF columns are the 2-array struct-of-arrays
 //! (`<grp>_alleles`/`<grp>_freqs`); on read they are reconstructed to the 3
 //! pipe-joined group strings and then expanded to the 27 logical AF columns via
-//! [`unbundle_af_columns`] — byte-identical to the Lance path. `variation_name`
+//! [`unbundle_af_columns`] — byte-identical to the Parquet path. `variation_name`
 //! is reconstructed via `coalesce(variation_name, dbsnp_ids)`. Binary flags stay
 //! `Boolean` (downstream reads them through the `batch_i64_value` Boolean arm).
 
@@ -26,9 +26,9 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use std::sync::Arc;
 
-use crate::lance_cache::af_bundle::{AF_GROUPS, unbundle_af_columns};
-use crate::lance_cache::row_index::ResolvedRowIds;
-use crate::lance_cache::variation_runtime::{TakenVariationRows, ensure_runtime_projection};
+use crate::cache::af_bundle::{AF_GROUPS, unbundle_af_columns};
+use crate::cache::row_index::ResolvedRowIds;
+use crate::cache::variation_runtime::{TakenVariationRows, ensure_runtime_projection};
 use crate::parquet_cache::encode::reconstruct_af_group_string;
 use crate::parquet_cache::page_dir::{
     CoalescingAsyncReader, IoCounters, PageDir, selection_from_offsets, selection_from_ranges,
@@ -38,7 +38,7 @@ use crate::parquet_cache::page_dir::{
 const COALESCE_GAP_BYTES: u64 = 64 * 1024;
 
 /// Per-partition cursor. Parquet resolution is stateless (the [`PageDir`] lives
-/// on the lookup), so this is a placeholder that matches the Lance call shape.
+/// on the lookup), so this is a placeholder that matches the Parquet call shape.
 #[derive(Default)]
 pub struct ParquetPositionCursor;
 
@@ -138,7 +138,7 @@ impl SinglePathParquetVariationLookup {
         // Phase 3: projected payload take at the exact offsets.
         let phys = self.take_payload(&offsets, &counters).await?;
 
-        // Post-process to the Lance-equivalent logical batch.
+        // Post-process to the Parquet-equivalent logical batch.
         let batch = self.to_logical_batch(&phys)?;
 
         // matched positions = distinct requested starts present in the result.

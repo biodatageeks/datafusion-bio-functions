@@ -233,7 +233,7 @@ pub fn dedup_variation_name(vn: &StringArray, dbsnp: &StringArray) -> StringArra
 /// struct-of-arrays. `n_pops` is the group's population count (6/10/11). The
 /// result is the scalar `Utf8` group column that `af_bundle::unbundle_af_columns`
 /// then splits into the per-population logical AF columns — i.e. the exact
-/// physical shape the Lance path yields, so downstream is unchanged.
+/// physical shape the Parquet path yields, so downstream is unchanged.
 ///
 /// Frequencies are formatted with [`format_g4`] (the source is 4 significant
 /// figures), which reproduces the original CSQ text byte-for-byte.

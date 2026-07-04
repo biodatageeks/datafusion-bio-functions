@@ -19,8 +19,8 @@ use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 /// Table function implementing
 /// `annotate_vep(vcf_table, cache_source, backend [, options_json])`.
 ///
-/// Cache source mode is read from Arrow schema metadata on the Lance cache
-/// backend under `{cache_source}/variation.lance`.
+/// Cache source mode is read from Arrow schema metadata on the Parquet cache
+/// backend under `{cache_source}/variation.cache`.
 pub struct AnnotateFunction {
     session: Arc<SessionContext>,
     /// Catalog list captured at registration time to avoid acquiring
@@ -88,7 +88,7 @@ impl TableFunctionImpl for AnnotateFunction {
         #[cfg(not(feature = "parquet-cache"))]
         let cache_source_type: CacheSourceType = {
             return Err(DataFusionError::Plan(
-                "annotate_vep(): Parquet cache source metadata requires the lance-cache feature"
+                "annotate_vep(): Parquet cache source metadata requires the parquet-cache feature"
                     .to_string(),
             ));
         };

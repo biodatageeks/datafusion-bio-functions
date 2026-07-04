@@ -1,12 +1,12 @@
-//! Backend-neutral cache helpers shared by the annotation engine and the Lance
+//! Backend-neutral cache helpers shared by the annotation engine and the Parquet
 //! cache backend.
 //!
-//! These types were extracted from the (now Lance-only) `kv_cache`/`warm_cache`
-//! modules so the Lance path does not depend on the deleted fjall/parquet code:
-//! the `SiftPredictionStore` trait the Lance SIFT stores implement, the
-//! prediction (de)serialization family used by the Lance SIFT layout and
+//! These types were extracted from the (now Parquet-only) `kv_cache`/`warm_cache`
+//! modules so the Parquet path does not depend on the deleted fjall/parquet code:
+//! the `SiftPredictionStore` trait the Parquet SIFT stores implement, the
+//! prediction (de)serialization family used by the Parquet SIFT layout and
 //! builder, and the allele-frequency helpers used to select warm positions
-//! during Lance cache construction.
+//! during Parquet cache construction.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ pub type AlleleMatcher = fn(&str, &str, &str) -> bool;
 // SIFT/PolyPhen prediction store interface
 // ---------------------------------------------------------------------------
 
-/// A store of SIFT/PolyPhen predictions. Implemented by the Lance-backed SIFT
+/// A store of SIFT/PolyPhen predictions. Implemented by the Parquet-backed SIFT
 /// stores (transcript-id-keyed and position-sliced).
 pub trait SiftPredictionStore: Send + Sync {
     fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>>;
@@ -123,7 +123,7 @@ pub(crate) fn deserialize_predictions(data: &[u8]) -> Result<CachedPredictions> 
 }
 
 /// Serialize one protein position's predictions for a single predictor, *without*
-/// the position field — in the position-sliced Lance layout the position is
+/// the position field — in the position-sliced Parquet layout the position is
 /// implicit from the row key, so each entry is 6 bytes:
 ///   [amino_acid u8][prediction u8][score f32 LE]
 /// Entry count is recovered from the byte length (`len / 6`). The caller groups
@@ -312,7 +312,7 @@ pub(crate) fn deserialize_position_predictions_versioned(
 }
 
 // ---------------------------------------------------------------------------
-// Allele-frequency helpers (warm-position selection for Lance cache build)
+// Allele-frequency helpers (warm-position selection for Parquet cache build)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]

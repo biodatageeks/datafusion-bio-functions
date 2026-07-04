@@ -13037,7 +13037,7 @@ mod tests {
         // Measured ~39.5 ns/call (20 segments) → ~0.2-0.4s across chr1's
         // ~1.84M HGVSc calls — below the e2e noise floor, so caching this
         // validity check is not worth the per-transcript cache + test churn.
-        // Run: cargo test --release --features lance-cache --lib -- --nocapture \
+        // Run: cargo test --release --features cache-cache --lib -- --nocapture \
         //      bench_use_cdna_mapper_for_general_coords_per_call
         let mut t = tx(
             "ENSTBENCH.1",

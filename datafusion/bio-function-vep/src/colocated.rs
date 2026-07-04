@@ -1,9 +1,9 @@
 //! Co-located variant metadata types plus allele-comparison and
-//! genomic-shift helpers shared by the Lance variation-lookup path.
+//! genomic-shift helpers shared by the Parquet variation-lookup path.
 //!
 //! Extracted from the former `variant_lookup_exec` module when the legacy
 //! `VariantLookupExec` (Parquet/MemTable interval-join) lookup path was
-//! removed. The Lance lookup (`lance_cache::lookup_exec`) and the annotation
+//! removed. The Parquet lookup (`cache::lookup_exec`) and the annotation
 //! engine (`annotate_provider`) consume these symbols.
 
 use std::collections::{HashMap, HashSet};
@@ -289,7 +289,7 @@ pub(crate) fn compare_existing_variant_alleles(
     }
 }
 
-/// Shared sink key for co-located data collected during Lance variation lookup.
+/// Shared sink key for co-located data collected during Parquet variation lookup.
 ///
 /// Key = VCF (chrom, input_start, input_end, input_allele_string), value =
 /// cache entries attached to that specific parser/input allele.
@@ -309,7 +309,7 @@ pub struct ColocatedSinkValue {
     pub unshifted_output_allele: Option<String>,
 }
 
-/// Shared sink for co-located data collected during Lance variation lookup.
+/// Shared sink for co-located data collected during Parquet variation lookup.
 pub type ColocatedSink = Arc<Mutex<HashMap<ColocatedKey, ColocatedSinkValue>>>;
 
 #[cfg(test)]

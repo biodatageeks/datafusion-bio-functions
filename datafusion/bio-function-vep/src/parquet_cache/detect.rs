@@ -5,9 +5,9 @@
 //!
 //! ```text
 //! 115_GRCh38_vep/
-//!   parquet.variation/chrom_manifest.json
-//!   parquet.variation/chr1.parquet
-//!   parquet.transcript/chr1.parquet
+//!   variation/chrom_manifest.json
+//!   variation/chr1.parquet
+//!   transcript/chr1.parquet
 //!   ...
 //! ```
 //!
@@ -15,11 +15,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::lance_cache::manifest::ChromManifest;
+use crate::cache::manifest::ChromManifest;
 
-/// Directory name for a Parquet cache entity (e.g. `parquet.variation`).
+/// Directory name for a Parquet cache entity (e.g. `variation`).
 fn entity_dir_name(entity: &str) -> String {
-    format!("parquet.{entity}")
+    entity.to_string()
 }
 
 /// A partitioned per-chromosome Parquet cache directory.
@@ -32,7 +32,7 @@ pub struct PartitionedParquetCache {
 impl PartitionedParquetCache {
     /// Detect a Parquet cache layout at `cache_source`.
     ///
-    /// Returns `Some` when `parquet.variation/chrom_manifest.json` can be read.
+    /// Returns `Some` when `variation/chrom_manifest.json` can be read.
     pub fn detect(cache_source: &str) -> Option<Self> {
         let base_dir = PathBuf::from(cache_source);
         let variation_dir = base_dir.join(entity_dir_name("variation"));
@@ -71,10 +71,10 @@ impl PartitionedParquetCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lance_cache::manifest::{ChromDatasetEntry, ChromManifest};
+    use crate::cache::manifest::{ChromDatasetEntry, ChromManifest};
 
     fn write_entity(base: &Path, entity: &str, chrom: &str, file: &str) {
-        let dir = base.join(format!("parquet.{entity}"));
+        let dir = base.join(entity);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(file), b"parquet-shard-placeholder").unwrap();
         ChromManifest::new(vec![ChromDatasetEntry::new(chrom, file, 1)])
@@ -91,7 +91,7 @@ mod tests {
         assert_eq!(cache.available_chroms(), ["chr1"]);
         assert_eq!(
             cache.variation_path("chr1").unwrap(),
-            tmp.path().join("parquet.variation").join("chr1.parquet")
+            tmp.path().join("variation").join("chr1.parquet")
         );
         assert!(cache.variation_path("chr2").is_none());
     }
@@ -111,7 +111,7 @@ mod tests {
         let cache = PartitionedParquetCache::detect(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(
             cache.context_path("transcript", "chr1").unwrap(),
-            tmp.path().join("parquet.transcript").join("chr1.parquet")
+            tmp.path().join("transcript").join("chr1.parquet")
         );
         assert!(cache.context_path("transcript", "chr2").is_none());
     }
