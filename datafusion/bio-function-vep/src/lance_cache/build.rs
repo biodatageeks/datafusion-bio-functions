@@ -33,7 +33,7 @@ use crate::lance_cache::manifest::{
 };
 use crate::lance_cache::schema::{
     VARIATION_FORBIDDEN_COLUMNS, VARIATION_REQUIRED_COLUMNS, lance_field_metadata,
-    validate_variation_schema, with_cache_source_metadata,
+    variation_projected_schema, with_cache_source_metadata,
 };
 use crate::{
     annotate_provider::{read_compact_predictions, string_at},
@@ -730,39 +730,6 @@ fn make_ctx_and_register(
     let provider = EnsemblCacheTableProvider::for_entity(kind, provider_options)?;
     ctx.register_table(table_name, provider)?;
     Ok(ctx)
-}
-
-pub(crate) fn variation_projected_schema(
-    source_schema: &Schema,
-    source_type: &str,
-) -> Result<Schema> {
-    let mut fields = Vec::new();
-    let forbidden = VARIATION_FORBIDDEN_COLUMNS
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-
-    for name in VARIATION_REQUIRED_COLUMNS {
-        if forbidden.contains(name) {
-            continue;
-        }
-        let (_, field) = source_schema.column_with_name(name).ok_or_else(|| {
-            DataFusionError::Execution(format!("variation source batch missing column {name}"))
-        })?;
-        if *name == "start" || *name == "end" {
-            fields.push(Field::new(*name, DataType::UInt32, field.is_nullable()));
-        } else {
-            fields.push(field.as_ref().clone());
-        }
-    }
-
-    // Derived warm/cold tier column (0 = warm/common, 1 = cold/rare). Appended
-    // here rather than read from the source table.
-    fields.push(Field::new("tier", DataType::Int8, false));
-
-    let target_schema = with_cache_source_metadata(&Schema::new(fields), source_type);
-    validate_variation_schema(&target_schema)?;
-    Ok(target_schema)
 }
 
 /// Project a source variation batch to the Lance output schema, derive the

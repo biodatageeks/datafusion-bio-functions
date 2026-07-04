@@ -49,7 +49,7 @@ use tokio::sync::OnceCell;
 /// runtime (`#[tokio::test]`'s default flavor, embedded single-thread callers),
 /// so fall back to a dedicated OS thread there; with no runtime in scope, create
 /// one. Keeps the multi-thread fast path (`block_in_place`) for production.
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 pub(crate) fn block_on_lance<T, F>(fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>> + Send,
@@ -122,7 +122,7 @@ pub struct KvLookupExec {
     /// Per-contig Parquet variation lookup (shard + footer page directory), built
     /// once and shared across all per-partition streams via the Arc. Single-flight
     /// via OnceCell so simultaneous fan-out probes build it exactly once.
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     parquet_lookup_cell: Arc<OnceCell<Arc<SinglePathParquetVariationLookup>>>,
 }
 
@@ -165,7 +165,7 @@ fn build_lookup_output_schema(
 impl KvLookupExec {
     /// Construct a variation lookup exec backed by the Parquet cache. The read
     /// seam resolves through [`SinglePathParquetVariationLookup`].
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     #[allow(clippy::too_many_arguments)]
     pub fn new_parquet(
         input: Arc<dyn ExecutionPlan>,
@@ -209,7 +209,7 @@ impl KvLookupExec {
             colocated_sink: None,
             colocated_partition_sinks: None,
             target_partitions: 1,
-            #[cfg(feature = "lance-cache")]
+            #[cfg(feature = "parquet-cache")]
             parquet_lookup_cell: Arc::new(OnceCell::new()),
         })
     }
@@ -301,7 +301,7 @@ impl ExecutionPlan for KvLookupExec {
         exec = exec.with_target_partitions(self.target_partitions);
         // Carry the shared per-contig variation lookup forward across re-planning
         // instead of letting new_parquet reset it.
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         {
             exec.parquet_lookup_cell = Arc::clone(&self.parquet_lookup_cell);
         }
@@ -320,7 +320,7 @@ impl ExecutionPlan for KvLookupExec {
             .and_then(|sinks| sinks.get(partition).cloned())
             .or_else(|| self.colocated_sink.clone());
 
-        #[cfg_attr(not(feature = "lance-cache"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "parquet-cache"), allow(unused_mut))]
         let mut stream = KvLookupStream::new(
             input_stream,
             self.variation_storage.clone(),
@@ -341,7 +341,7 @@ impl ExecutionPlan for KvLookupExec {
 
         // Share the exec's single per-contig variation lookup with this stream;
         // new() seeded a placeholder empty cell.
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         {
             stream.parquet_lookup_cell = Arc::clone(&self.parquet_lookup_cell);
         }
@@ -374,7 +374,7 @@ struct KvLookupStream {
     target_partitions: usize,
     /// Shared (Arc-cloned from the exec) per-contig Parquet variation lookup,
     /// built once.
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     parquet_lookup_cell: Arc<OnceCell<Arc<SinglePathParquetVariationLookup>>>,
     warm_cold_backend: WarmColdVariationBackend,
     warm_cold_index_mode: WarmColdVariationIndexMode,
@@ -527,7 +527,7 @@ impl WarmColdVariationBackend {
         }
     }
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     fn is_lance(self) -> bool {
         matches!(self, Self::Lance)
     }
@@ -573,12 +573,12 @@ fn format_variation_lookup_profile_line(
 
 fn warm_source_label(backend: WarmColdVariationBackend) -> &'static str {
     match backend {
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         WarmColdVariationBackend::Lance => "lance",
     }
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn parquet_variation_path_for_chrom(
     cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     chrom: &str,
@@ -1203,14 +1203,14 @@ fn probe_lance_taken_batch_position(
     }
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 struct LanceBatchProbeIndices {
     allele_string: usize,
     end: Option<usize>,
     failed: Option<usize>,
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 impl LanceBatchProbeIndices {
     fn new(batch: &RecordBatch) -> Result<Self> {
         let schema = batch.schema();
@@ -1224,7 +1224,7 @@ impl LanceBatchProbeIndices {
     }
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn lance_start_row_map(batch: &RecordBatch) -> Result<HashMap<u32, Vec<u32>>> {
     let schema = batch.schema();
     let start_idx = schema
@@ -1303,7 +1303,7 @@ impl KvLookupStream {
             colocated_sink,
             target_partitions: target_partitions.max(1),
             // Placeholder; execute() overwrites with the exec's shared cell.
-            #[cfg(feature = "lance-cache")]
+            #[cfg(feature = "parquet-cache")]
             parquet_lookup_cell: Arc::new(OnceCell::new()),
             warm_cold_backend,
             warm_cold_index_mode,
@@ -1351,7 +1351,7 @@ impl KvLookupStream {
     }
 
     /// Single-flight build of the shared per-contig Parquet variation lookup.
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     fn ensure_parquet_lookup(
         &mut self,
         chrom: &str,
@@ -1431,7 +1431,7 @@ impl KvLookupStream {
     }
 
     fn input_slice_rows(&self) -> usize {
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         if self.warm_cold_backend.is_lance() {
             return lance_lookup_process_batch_rows();
         }
@@ -1848,7 +1848,7 @@ fn output_order_for_vcf_indices(vcf_indices: &[u32]) -> Option<Vec<u32>> {
     Some(output_order)
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn batch_output_indices(
     batch: &RecordBatch,
     cache_columns: &[String],
@@ -1867,7 +1867,7 @@ fn batch_output_indices(
         .collect()
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn append_batch_row_values(
     batch: &RecordBatch,
     row: usize,
@@ -1884,7 +1884,7 @@ fn append_batch_row_values(
     Ok(())
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn batch_string_value(
     batch: &RecordBatch,
     column_idx: Option<usize>,
@@ -1912,7 +1912,7 @@ fn batch_string_value(
     }
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn batch_i64_value(batch: &RecordBatch, column_idx: Option<usize>, row: usize) -> Option<i64> {
     let array = batch.column(column_idx?);
     if row >= array.len() || array.is_null(row) {
@@ -1946,7 +1946,7 @@ fn batch_i64_value(batch: &RecordBatch, column_idx: Option<usize>, row: usize) -
     }
 }
 
-#[cfg(all(test, feature = "lance-cache"))]
+#[cfg(all(test, feature = "parquet-cache"))]
 mod batch_i64_boolean_tests {
     use super::*;
     use datafusion::arrow::array::BooleanArray;
@@ -1967,7 +1967,7 @@ mod batch_i64_boolean_tests {
     }
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn resolve_batch_coloc_indices(batch: &RecordBatch) -> Option<WarmColocIndices> {
     let schema = batch.schema();
     let find = |name: &str| schema.index_of(name).ok();
@@ -2663,7 +2663,7 @@ mod tests {
         assert!(lines[8].contains("unique_candidate_rows=61"));
     }
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     #[test]
     fn variation_lookup_profile_line_identifies_lance_backend() {
         let line = format_variation_lookup_profile_line(
@@ -2687,7 +2687,7 @@ mod tests {
         assert!(line.contains("variant_bloom_index_dir=/cache/variation.variant_bloom_index"));
     }
 
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     #[test]
     fn warm_source_label_uses_lance_for_lance_backend() {
         assert_eq!(warm_source_label(WarmColdVariationBackend::Lance), "lance");
@@ -2710,7 +2710,7 @@ mod tests {
         let lengths = queue.iter().map(RecordBatch::num_rows).collect::<Vec<_>>();
         assert_eq!(lengths, vec![5_000, 5_000, 2_001]);
     }
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     #[test]
     fn lance_colocated_probe_matches_chr1_homopolymer_deletion() {
         use datafusion::arrow::datatypes::{Field, Schema};

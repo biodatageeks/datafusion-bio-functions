@@ -23,7 +23,7 @@ use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::lance_cache::af_bundle::{AF_GROUPS, af_column_order, concat_group};
-use crate::lance_cache::build::variation_projected_schema;
+use crate::lance_cache::schema::variation_projected_schema;
 use crate::parquet_cache::encode::{
     AfArrays, dedup_variation_name, encode_af_2array, presence_boolean,
 };

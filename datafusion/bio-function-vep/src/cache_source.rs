@@ -1,6 +1,6 @@
 //! VEP cache source-mode metadata helpers.
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -38,7 +38,7 @@ impl CacheSourceType {
     /// Detect the cache source type from a partitioned Parquet cache directory by
     /// reading the `bio.vep.cache_source_type` metadata off the first
     /// `parquet.variation` shard's schema.
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     pub(crate) fn from_partitioned_parquet_cache_source(cache_source: &str) -> Result<Self> {
         let shard = first_variation_parquet_shard(cache_source)?;
         let schema = read_parquet_shard_schema_sync(&shard)?;
@@ -46,7 +46,7 @@ impl CacheSourceType {
     }
 }
 
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn first_variation_parquet_shard(cache_source: &str) -> Result<PathBuf> {
     let variation_dir = Path::new(cache_source).join("parquet.variation");
     let manifest =
@@ -61,7 +61,7 @@ fn first_variation_parquet_shard(cache_source: &str) -> Result<PathBuf> {
 
 /// Read the Arrow schema (including key-value metadata) of a `.parquet` shard
 /// synchronously from its footer.
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 fn read_parquet_shard_schema_sync(shard_path: &Path) -> Result<Schema> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let file = std::fs::File::open(shard_path).map_err(|err| {

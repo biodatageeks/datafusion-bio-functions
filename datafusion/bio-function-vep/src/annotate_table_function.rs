@@ -82,10 +82,10 @@ impl TableFunctionImpl for AnnotateFunction {
         reject_options_json_source_selectors(options_json.as_deref())?;
         // The cache is always the partitioned Parquet cache; read its source-type
         // metadata off the first variation shard.
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         let cache_source_type =
             CacheSourceType::from_partitioned_parquet_cache_source(&cache_source)?;
-        #[cfg(not(feature = "lance-cache"))]
+        #[cfg(not(feature = "parquet-cache"))]
         let cache_source_type: CacheSourceType = {
             return Err(DataFusionError::Plan(
                 "annotate_vep(): Parquet cache source metadata requires the lance-cache feature"

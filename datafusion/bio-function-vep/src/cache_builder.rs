@@ -140,7 +140,7 @@ impl CacheBuilder {
         // Parquet is the only supported cache format.
         let CacheFormat::Parquet = self.cache_format;
 
-        #[cfg(feature = "lance-cache")]
+        #[cfg(feature = "parquet-cache")]
         {
             let options = crate::lance_cache::build::LanceCacheBuildOptions {
                 cache_root: self.cache_root.clone(),
@@ -153,11 +153,11 @@ impl CacheBuilder {
             crate::lance_cache::build::build_parquet_entity(&options, kind).await
         }
 
-        #[cfg(not(feature = "lance-cache"))]
+        #[cfg(not(feature = "parquet-cache"))]
         {
             let _ = kind;
             Err(DataFusionError::Execution(
-                "cache builder requires the lance-cache feature".to_string(),
+                "cache builder requires the parquet-cache feature".to_string(),
             ))
         }
     }

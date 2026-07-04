@@ -628,11 +628,11 @@ fn cache_source_type_from_cache_source_for_backend(
     cache_source: &str,
     _backend: &str,
 ) -> Result<CacheSourceType> {
-    #[cfg(feature = "lance-cache")]
+    #[cfg(feature = "parquet-cache")]
     {
         CacheSourceType::from_partitioned_parquet_cache_source(cache_source)
     }
-    #[cfg(not(feature = "lance-cache"))]
+    #[cfg(not(feature = "parquet-cache"))]
     {
         let _ = cache_source;
         Err(DataFusionError::Plan(

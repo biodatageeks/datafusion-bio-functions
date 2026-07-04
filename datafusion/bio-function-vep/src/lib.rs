@@ -50,12 +50,12 @@ pub(crate) mod colocated;
 pub mod coordinate;
 pub mod golden_benchmark;
 pub mod hgvs;
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 pub mod lance_cache;
 pub mod lookup_provider;
 pub mod miss_worklist;
 pub(crate) mod ordered_drain;
-#[cfg(feature = "lance-cache")]
+#[cfg(feature = "parquet-cache")]
 pub mod parquet_cache;
 pub mod partitioned_cache;
 pub(crate) mod pipeline_trace;
