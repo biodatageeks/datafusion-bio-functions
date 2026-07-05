@@ -54,6 +54,10 @@ name = "vcf_batch_stats"
 required-features = []
 
 [[example]]
+name = "build_plugin"
+required-features = ["parquet-cache"]
+
+[[example]]
 name = "build_parquet_variation_chrom"
 required-features = ["parquet-cache", "cache-builder"]
 
