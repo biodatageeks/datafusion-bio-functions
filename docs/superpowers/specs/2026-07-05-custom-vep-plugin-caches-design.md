@@ -58,9 +58,10 @@ repeatable "add a plugin" workflow on top of it.
 `plugin_cache::join::join_variation_frequency` LEFT-joins each row's
 `(chrom, pos, ref, alt)` to the variation shard for that chrom, pulls
 `max_global_af`, derives `tier` (AF ≥ 0.01 → warm/0, else / no-match → cold/1),
-**discards AF** → streaming writer emits `plugin/<name>/<chrom>.parquet` sorted
-`(tier, pos, ref, alt)`, PageDir-indexed → per-plugin `manifest.json` records
-source kind, key columns, value→CSQ mapping, and per-chrom row/tier counts.
+**discards AF** → streaming writer emits `plugin/<name>/<chrom>.parquet` physically
+ordered `(tier, pos, ref, alt)` and PageDir-indexed (§4.3) → per-plugin
+`manifest.json` records source kind, key columns, value→CSQ mapping, and per-chrom
+row/tier counts.
 
 **Runtime data flow:** at annotation, for each enabled plugin (discovered by
 manifest scan), an independent PageDir point-lookup — a clone of the variation
@@ -96,9 +97,42 @@ Mirrors `build_parquet_variation_chrom` (`cache/build.rs`) almost exactly:
 - A `VariationParquetShardWriter`-style streaming writer **generalized to an
   arbitrary value schema** (value columns come from the manifest, not the fixed
   variation column set).
-- `(tier, pos, ref, alt)` sort runs preserved so the read-side PageDir binary
-  search holds; overwrite/skip semantics and empty-shard cleanup copied verbatim.
+- Rows physically written warm-run then cold-run, each `pos`-monotonic, so the
+  read-side PageDir binary search holds (§4.3); overwrite/skip semantics and
+  empty-shard cleanup copied verbatim.
 - Per-chrom build; `chrom_filter` honored for scoped/parity builds.
+
+### 4.3 Parquet shard layout parameters
+
+Plugin shards reuse the **exact** lookup-optimized `WriterProperties` the
+variation and `translation_sift` shards use —
+`parquet_cache::write::point_lookup_writer_properties(schema, &["tier", "pos"])`
+— so plugin lookups inherit the variation shard's tuned point-lookup behavior
+verbatim. Concrete parameters:
+
+| Parameter | Value | Why |
+|---|---|---|
+| Compression | `ZSTD` level 3 | Recovers size lost by disabling the dictionary; no-dict file is actually smaller |
+| Dictionary | **disabled** | A dictionary forces loading the whole row-group dictionary to read any single row — the per-take "dictionary tax"; disabled for point lookups |
+| Data page size limit | **4 KiB** (`4 * 1024`) | Small pages → fine-grained page index → cheap point-lookup resolution |
+| Data page row count limit | **512 rows** | Same: bounds rows decoded per resolved page |
+| Page statistics | `EnabledStatistics::Page` | Emits the `ColumnIndex` + `OffsetIndex` in the footer that the read-side `PageDir` resolves position→page against |
+| Max row-group rows | **1,000,000** | Amortizes footer metadata while keeping row-group pruning useful |
+| Declared sort (`SortingColumn`) | `(tier ASC, pos ASC)`, nulls last | The two-run (warm/cold) structure with `pos` monotonic *within each run* that the `PageDir` binary search relies on |
+
+**Sort-key contract.** The PageDir search key is `pos` within a tier run —
+identical to variation's `(tier, start)`. `ref`/`alt` are **not** PageDir search
+keys: rows sharing a `pos` are additionally ordered by `(ref, alt)` for
+deterministic, byte-stable output, but allele disambiguation happens in the
+`scan` decode step (probe filters the candidate rows by `ref`/`alt`), exactly as
+the variation lookup filters alleles after resolving position. Only `tier` and
+`pos` are declared as `SortingColumn`s. All sort keys are top-level primitives, so
+leaf index == field index (the `point_lookup_writer_properties` assumption holds).
+
+The physical shape mirrors variation's two-pass write: warm run (tier 0) first,
+cold run (tier 1) second, each written in `pos`-ascending order by the source
+`ORDER BY` — the writer never re-sorts across the run boundary, which is what
+gives the PageDir its two monotonic segments.
 
 ## 5. Runtime lookup & CSQ injection
 
