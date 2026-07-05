@@ -8630,6 +8630,7 @@ impl ContigPipelineProfile {
 
 /// Process peak resident set size in MB (`getrusage` `ru_maxrss`, monotonic
 /// high-water mark). macOS reports bytes; Linux reports kilobytes.
+#[cfg(unix)]
 fn peak_rss_mb() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
@@ -8644,6 +8645,19 @@ fn peak_rss_mb() -> u64 {
     {
         max / 1024
     }
+}
+
+/// Peak-RSS reporting is not implemented on non-UNIX targets (no `getrusage`).
+/// Warns once so the `0` values in profiling output aren't mistaken for real
+/// measurements.
+#[cfg(not(unix))]
+fn peak_rss_mb() -> u64 {
+    use std::sync::Once;
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        log::warn!("peak_rss_mb() is not implemented on this platform; reporting 0");
+    });
+    0
 }
 
 /// Log the current peak RSS at a phase boundary (VEP_PROFILE only). Because
