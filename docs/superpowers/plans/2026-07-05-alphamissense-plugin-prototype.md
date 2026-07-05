@@ -1381,6 +1381,30 @@ git commit -m "docs(plugin-cache): vep-add-plugin skill (author manifest → bui
 
 ---
 
+## Execution Progress (2026-07-05)
+
+**Done & committed** on branch `feat/plugin-cache-alphamissense`:
+- Tasks 1–9: full shared `plugin_cache` subsystem, 13 unit tests green.
+- Task 11: `biodatageeks/vepyr-plugins` seeded locally (`/Users/mwiewior/workspace/vepyr-plugins`, commit `9b5ab1c`) with the AlphaMissense manifest.
+- Task 12: **real chr22 build succeeded** — `plugin/alphamissense/chr22.parquet`, 1,481,489 rows. Verified value: `chr22:15528162 T/C → am_pathogenicity=0.1115, am_class=likely_benign` (exact source match; contig `chr22`→`22`, 1-based, allele merged).
+- Task 14: `vep-add-plugin` skill written.
+
+**Deviations (justified, in-code):** gzip→temp decompress (no DF `compression` feature — liblzma/xz2 collision); explicit value-column projection (no `SELECT * EXCLUDE`); in-memory `PluginLookup` (sync-probe constraint vs async PageDir); `af_max_sql = coalesce(minor_allele_freq,0)` for the prototype (tier = clustering only, not values — so warm=0 here is harmless; a richer af_max incl. gnomAD list maxes would populate warm).
+
+**Remaining:**
+- **Task 10 (engine CSQ emission wiring)** — NOT started; 6 coordinated sites (see map below), parity-critical. Recommend a focused, reviewed session.
+- **Task 13 (golden parity)** — blocked on Task 10 + Ensembl VEP availability.
+
+### Task 10 precise integration map (from Explore agent)
+
+- CSQ field names: `golden_benchmark.rs:661` `csq_field_names_for_mode_with_pick` (`&'static str` — concat plugin `String`s at call sites, don't push).
+- Header: `vcf_sink.rs:637` `csq_header_description` (also `vcf_sink.rs:1202`).
+- Placeholder layout: `annotate_provider.rs:1489-1584` (`CsqPlaceholderField::from_name`, `CsqPlaceholderLayout::append_entry:1576`).
+- Body emission (3 paths) in `annotate_batch_with_transcript_engine` (`5234`, row loop `5479`): cached fast-path `5618-5627`; main per-transcript `write!` `6086-6153` (each line ends `{batch3_suffix}`, built once/row at `5586` via `batch3_suffix_for_csq:1705`); empty-buffer fallback `6161-6170`.
+- Probe site: `annotate_provider.rs:5549` `colocated_map.get(&(chrom, input_start, end_val, input_allele_string))`; `input_allele_string = "{ref}/{alt}"` (`5548`) matches the plugin key form; `start` from `input_start`/`start_val` → cast u32. Call `registry.probe_all(start, &input_allele_string)` alongside.
+- Config/contig: `ContigAnnotationConfig:8255` (has `cache_root`); open `PluginRegistry::open(root, &chrom)` in `prepare_contig_context:12120` (store on `SharedContigAnnotationContext:8905` built at `12469`), thread to worker call `11222-11239`.
+- Invariant: header/body width-alignment test at `annotate_provider.rs:14961` — must stay green.
+
 ## Self-Review Notes
 
 - **Spec coverage:** §3.1 naming (Tasks 1–2, 7), §3.2 key columns (Tasks 5, 7), §3.3 contig/coord normalization (Task 3, wired in 7), §4.1 join (Task 4), §4.2 build (Task 7), §4.3 Parquet params (Task 5 via `point_lookup_writer_properties`), §5 runtime lookup + injection (Tasks 8–10), §6.1 source manifest (Task 1), §6.2 cache manifest (Task 6), §6.3 vepyr-plugins repo (Task 11), §7 skill (Task 14), §8 testing/parity (Tasks 4,7,8,13). Scope non-goals (per-gene/interval) intentionally not implemented.
