@@ -9517,6 +9517,10 @@ struct ParallelContigState {
     join_fut: ShardJoinFuture,
     /// Abort handles for the shard workers (error / drop cleanup).
     abort_handles: Vec<tokio::task::AbortHandle>,
+    /// First global shard id owned by this contig (inclusive). The exclusive end
+    /// is `next_global_shard_id` at contig completion. Published as a
+    /// `ContigShardRange` to the assembler when the contig finishes.
+    contig_first_shard_id: usize,
     /// Per-partition lookup worker tasks (aborted on cleanup).
     lookup_join: Vec<tokio::task::JoinHandle<Result<()>>>,
     ephemeral_tables: Vec<String>,
@@ -9601,7 +9605,8 @@ type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 /// Resolves when all `threads>1` shard workers for a contig have finished,
 /// yielding the total output-row count (or the first worker error).
-type ShardJoinFuture = Pin<Box<dyn Future<Output = Result<usize>> + Send>>;
+// (input_rows, output_body_lines) summed across the contig's shard workers.
+type ShardJoinFuture = Pin<Box<dyn Future<Output = Result<(usize, usize)>> + Send>>;
 
 enum StreamState {
     StartContig,
@@ -9901,6 +9906,11 @@ where
 /// accounting). On error the shard may be left partially written; the
 /// orchestrator aborts the sibling workers and surfaces the error before any
 /// concat, so no partial shard is ever assembled.
+pub(crate) struct ShardResult {
+    pub(crate) input_rows: usize,
+    pub(crate) output_lines: usize,
+}
+
 fn spawn_annotation_from_lookup_sharded(
     shared: Arc<SharedContigAnnotationContext>,
     mut lookup_rx: tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
@@ -9910,7 +9920,7 @@ fn spawn_annotation_from_lookup_sharded(
     shard_ctx: Arc<crate::vcf_sink::VcfShardContext>,
     shard_path: std::path::PathBuf,
     slice: Option<WorkerGridSlice>,
-) -> tokio::task::JoinHandle<Result<usize>> {
+) -> tokio::task::JoinHandle<Result<ShardResult>> {
     tokio::spawn(async move {
         let mut worker = AnnotationWorkerState::new(shared)?;
         let mut shard = crate::vcf_sink::VcfBodyShardWriter::create(
@@ -9919,6 +9929,7 @@ fn spawn_annotation_from_lookup_sharded(
             Arc::clone(&shard_ctx.unique_format_tags),
             Arc::clone(&shard_ctx.sample_names),
             shard_ctx.coordinate_zero_based,
+            shard_ctx.shard_compression,
         )?;
         // Grid bounds (global row ranks). The worker's stream is its
         // [scan_lo_pos, scan_hi_pos) window; its first row is rank `warm_up_start`
@@ -10039,10 +10050,14 @@ fn spawn_annotation_from_lookup_sharded(
                 peak_rss_mb(),
             );
         }
-        let rows = shard.input_rows;
+        let input_rows = shard.input_rows;
+        let output_lines = shard.lines;
         let _ = (emit_start, emit_end, global_row);
         shard.finish()?;
-        Ok(rows)
+        Ok(ShardResult {
+            input_rows,
+            output_lines,
+        })
     })
 }
 
@@ -11568,8 +11583,13 @@ impl Stream for ContigAnnotationStream {
                             let mut handles: Vec<LookupPartitionHandle> =
                                 ready.lookup_partitions.drain(..).collect();
                             handles.sort_by_key(LookupPartitionHandle::partition_id);
-                            let mut shard_handles: Vec<tokio::task::JoinHandle<Result<usize>>> =
-                                Vec::with_capacity(handles.len());
+                            // First shard id this contig owns (inclusive). The
+                            // exclusive end is `next_global_shard_id` after the
+                            // loop; published as a `ContigShardRange` on completion.
+                            let contig_first_shard_id = self.next_global_shard_id;
+                            let mut shard_handles: Vec<
+                                tokio::task::JoinHandle<Result<ShardResult>>,
+                            > = Vec::with_capacity(handles.len());
                             let mut lookup_join = Vec::with_capacity(handles.len());
                             let mut inline_seen = false;
                             for mut handle in handles {
@@ -11622,10 +11642,14 @@ impl Stream for ContigAnnotationStream {
                             // dropped on error, detaching the rest — abort_handles
                             // aborts the still-running siblings).
                             let join_fut: ShardJoinFuture = Box::pin(async move {
-                                let mut total = 0usize;
+                                let mut input_rows = 0usize;
+                                let mut output_lines = 0usize;
                                 for h in shard_handles {
                                     match h.await {
-                                        Ok(Ok(rows)) => total += rows,
+                                        Ok(Ok(r)) => {
+                                            input_rows += r.input_rows;
+                                            output_lines += r.output_lines;
+                                        }
                                         Ok(Err(e)) => return Err(e),
                                         Err(join_err) => {
                                             return Err(DataFusionError::External(Box::new(
@@ -11634,11 +11658,12 @@ impl Stream for ContigAnnotationStream {
                                         }
                                     }
                                 }
-                                Ok(total)
+                                Ok((input_rows, output_lines))
                             });
                             let state = ParallelContigState {
                                 join_fut,
                                 abort_handles,
+                                contig_first_shard_id,
                                 lookup_join,
                                 ephemeral_tables: ready.ephemeral_tables,
                                 chrom: ready.chrom,
@@ -11694,10 +11719,25 @@ impl Stream for ContigAnnotationStream {
                             self.state = StreamState::AnnotatingParallel(state);
                             return Poll::Pending;
                         }
-                        Poll::Ready(Ok(contig_rows)) => {
+                        Poll::Ready(Ok((contig_rows, contig_lines))) => {
                             // Lookups have all closed by now; abort any stragglers.
                             for h in &state.lookup_join {
                                 h.abort();
+                            }
+                            // Publish this contig's completed shard-id range to the
+                            // assembler thread so it can concat these shards while
+                            // the next contig prepares/annotates. `end` is the
+                            // current global counter (later contigs not yet
+                            // allocated). Best-effort: if the assembler is gone
+                            // (error teardown), ignore.
+                            if let Some(shard_ctx) = state.config.vcf_shard_ctx.clone() {
+                                let _ = shard_ctx.contig_done_tx.send(
+                                    crate::vcf_sink::ContigShardRange {
+                                        first_shard_id: state.contig_first_shard_id,
+                                        end_shard_id: self.next_global_shard_id,
+                                        output_lines: contig_lines,
+                                    },
+                                );
                             }
                             profile_end!(
                                 &format!("{}: TOTAL", state.chrom),
