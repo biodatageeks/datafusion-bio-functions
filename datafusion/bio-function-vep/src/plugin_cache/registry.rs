@@ -10,11 +10,33 @@ use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::discover_plugins;
 use crate::plugin_cache::lookup::{PluginLookup, PluginScalar};
 
+/// Per-transcript attributes the engine supplies at probe time, keyed by the
+/// `engine_attr` names a plugin's match columns (§3.4) bind to. Extend as new
+/// discriminators are added.
+#[derive(Debug, Default, Clone)]
+pub struct EngineAttrs {
+    /// `{refAA}{protein_position}{altAA}` (e.g. `"V550A"`); `None` for a
+    /// non-missense consequence (no amino-acid change) — the gate.
+    pub amino_acid_change: Option<String>,
+}
+
+impl EngineAttrs {
+    /// Resolve a named engine attribute; unknown names resolve to `None`.
+    fn get(&self, engine_attr: &str) -> Option<String> {
+        match engine_attr {
+            "amino_acid_change" => self.amino_acid_change.clone(),
+            _ => None,
+        }
+    }
+}
+
 /// One enabled plugin, with its per-chrom lookup (absent if this plugin has no
 /// shard for the current chrom).
 pub struct PluginEntry {
     pub name: String,
     pub csq_fields: Vec<String>,
+    /// The `engine_attr` name for each match column, in order.
+    match_engine_attrs: Vec<String>,
     lookup: Option<PluginLookup>,
 }
 
@@ -37,6 +59,13 @@ impl PluginRegistry {
                 .collect();
             let value_columns: Vec<String> =
                 m.value_columns.iter().map(|v| v.column.clone()).collect();
+            let match_columns: Vec<String> =
+                m.match_columns.iter().map(|mc| mc.column.clone()).collect();
+            let match_engine_attrs: Vec<String> = m
+                .match_columns
+                .iter()
+                .map(|mc| mc.engine_attr.clone())
+                .collect();
             let chrom_entry = m.chroms.iter().find(|c| c.chrom == want);
             let lookup = match chrom_entry {
                 Some(entry) => {
@@ -44,13 +73,14 @@ impl PluginRegistry {
                         .join("plugin")
                         .join(&m.plugin_name)
                         .join(&entry.file);
-                    Some(PluginLookup::open(&shard, value_columns).await?)
+                    Some(PluginLookup::open(&shard, match_columns, value_columns).await?)
                 }
                 None => None,
             };
             plugins.push(PluginEntry {
                 name: m.plugin_name,
                 csq_fields,
+                match_engine_attrs,
                 lookup,
             });
         }
@@ -70,15 +100,24 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// Probe every plugin for `(start, allele_string)`, returning one
+    /// Probe every plugin for `(start, allele_string, attrs)`, returning one
     /// [`PluginScalar`] per entry of [`Self::csq_fields`] (in the same order).
-    /// A plugin with no shard for this chrom, or a position/allele miss, yields
-    /// `PluginScalar::Null` for each of its fields.
-    pub fn probe_all(&self, start: u32, allele_string: &str) -> Result<Vec<PluginScalar>> {
+    /// Each plugin's match discriminator is built by resolving its match columns'
+    /// `engine_attr`s against `attrs`. A plugin with no shard for this chrom, or a
+    /// position/allele/discriminator miss, yields `PluginScalar::Null` per field
+    /// (the per-transcript gate for match-column plugins).
+    pub fn probe_all(
+        &self,
+        start: u32,
+        allele_string: &str,
+        attrs: &EngineAttrs,
+    ) -> Result<Vec<PluginScalar>> {
         let mut out = Vec::new();
         for p in &self.plugins {
+            let match_values: Vec<Option<String>> =
+                p.match_engine_attrs.iter().map(|a| attrs.get(a)).collect();
             let hit = match &p.lookup {
-                Some(lk) => lk.probe(start, allele_string)?,
+                Some(lk) => lk.probe(start, allele_string, &match_values)?,
                 None => None,
             };
             match hit {
@@ -115,7 +154,7 @@ mod tests {
             csq_field: "am_pathogenicity".into(),
             ty: ValueType::Float32,
         }];
-        let schema = plugin_output_schema(&vals);
+        let schema = plugin_output_schema(&[], &vals);
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -142,6 +181,7 @@ mod tests {
                 "end".into(),
                 "allele_string".into(),
             ],
+            match_columns: vec![],
             value_columns: vec![ValueColumnRecord {
                 column: "am_pathogenicity".into(),
                 csq_field: "am_pathogenicity".into(),
@@ -164,14 +204,15 @@ mod tests {
 
         let reg = PluginRegistry::open(cache_root, "1").await.unwrap();
         assert_eq!(reg.csq_fields(), vec!["am_pathogenicity".to_string()]);
-        let hit = reg.probe_all(100, "A/G").unwrap();
+        let attrs = EngineAttrs::default();
+        let hit = reg.probe_all(100, "A/G", &attrs).unwrap();
         assert_eq!(hit.len(), 1);
         match &hit[0] {
             PluginScalar::F32(v) => assert!((*v - 0.9).abs() < 1e-6),
             other => panic!("{other:?}"),
         }
         // miss → Null aligned to the single field
-        let miss = reg.probe_all(999, "A/G").unwrap();
+        let miss = reg.probe_all(999, "A/G", &attrs).unwrap();
         assert_eq!(miss, vec![PluginScalar::Null]);
     }
 }

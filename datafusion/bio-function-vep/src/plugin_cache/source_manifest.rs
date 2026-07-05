@@ -93,6 +93,18 @@ pub struct ValueColumn {
     pub ty: ValueType,
 }
 
+/// A per-transcript match discriminator (§3.4): an extra key column (produced by
+/// `ingest_sql`, stored in the shard key) matched at runtime against a named
+/// per-transcript engine attribute. Empty for pure per-variant plugins.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MatchColumn {
+    /// Cache column name (also the column `ingest_sql` must produce).
+    pub column: String,
+    /// The per-transcript engine attribute supplying the runtime value.
+    /// Currently only `amino_acid_change` (`{refAA}{protpos}{altAA}`).
+    pub engine_attr: String,
+}
+
 /// Warm/cold tier policy.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TierPolicy {
@@ -116,7 +128,20 @@ pub struct SourceManifest {
     pub ingest_sql: String,
     #[serde(rename = "value_columns")]
     pub value_columns: Vec<ValueColumn>,
+    /// Optional per-transcript match discriminators (§3.4). Empty = per-variant.
+    #[serde(default, rename = "match_column")]
+    pub match_columns: Vec<MatchColumn>,
     pub tier: TierPolicy,
+}
+
+impl SourceManifest {
+    /// Match-column names, in order (the discriminator part of the key).
+    pub fn match_column_names(&self) -> Vec<String> {
+        self.match_columns
+            .iter()
+            .map(|m| m.column.clone())
+            .collect()
+    }
 }
 
 impl SourceManifest {

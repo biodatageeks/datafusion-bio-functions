@@ -75,9 +75,11 @@ pub async fn build_plugin_chrom(
     ))
     .await?;
     let value_cols: Vec<String> = src.value_columns.iter().map(|v| v.column.clone()).collect();
+    let match_cols = src.match_column_names();
     let norm_sql = wrap_normalization(
         &src.ingest_view_name(),
         src.coordinate_system.clone(),
+        &match_cols,
         &value_cols,
     );
     let norm_view = format!("plugin_{}_norm", src.plugin_name);
@@ -87,7 +89,7 @@ pub async fn build_plugin_chrom(
     ))
     .await?;
 
-    let out_schema = plugin_output_schema(&src.value_columns);
+    let out_schema = plugin_output_schema(&src.match_columns, &src.value_columns);
     let plugin_dir = output_cache_root.join("plugin").join(&src.plugin_name);
     std::fs::create_dir_all(&plugin_dir)
         .map_err(|e| DataFusionError::Execution(format!("mkdir {}: {e}", plugin_dir.display())))?;

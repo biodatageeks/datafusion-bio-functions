@@ -48,11 +48,14 @@ pub fn canonical_contig_udf() -> ScalarUDF {
 
 /// Build the normalization SQL over `inner_view`: canonicalize `chrom`, cast
 /// `start`/`end` (with the coordinate shift), keep `allele_string`, then append
-/// each value column verbatim. Value columns are enumerated explicitly (no
-/// `SELECT *`/`EXCLUDE`) so the projection is stable across DataFusion versions.
+/// each match column (§3.4 discriminators) and value column verbatim. Columns are
+/// enumerated explicitly (no `SELECT *`/`EXCLUDE`) so the projection is stable
+/// across DataFusion versions. Output column order:
+/// `chrom, start, end, allele_string, <match cols…>, <value cols…>`.
 pub fn wrap_normalization(
     inner_view: &str,
     coord: CoordinateSystem,
+    match_columns: &[String],
     value_columns: &[String],
 ) -> String {
     let start_expr = match coord {
@@ -62,7 +65,7 @@ pub fn wrap_normalization(
     let mut projection = format!(
         "canonical_contig(chrom) AS chrom, {start_expr} AS start, CAST(\"end\" AS BIGINT) AS \"end\", allele_string"
     );
-    for col in value_columns {
+    for col in match_columns.iter().chain(value_columns.iter()) {
         projection.push_str(&format!(", {col}"));
     }
     format!("SELECT {projection} FROM {inner_view}")
@@ -86,7 +89,7 @@ mod tests {
     #[test]
     fn one_based_passes_through_zero_based_shifts() {
         let vals = vec!["demo_score".to_string()];
-        let one = wrap_normalization("plugin_demo_ingest", CoordinateSystem::OneBased, &vals);
+        let one = wrap_normalization("plugin_demo_ingest", CoordinateSystem::OneBased, &[], &vals);
         assert!(one.contains("canonical_contig(chrom) AS chrom"));
         assert!(one.contains("CAST(start AS BIGINT) AS start"));
         assert!(one.contains(", demo_score"));
@@ -95,9 +98,25 @@ mod tests {
         let zero = wrap_normalization(
             "plugin_demo_ingest",
             CoordinateSystem::ZeroBasedHalfOpen,
+            &[],
             &vals,
         );
         assert!(zero.contains("CAST(start AS BIGINT) + 1 AS start"));
+    }
+
+    #[test]
+    fn match_columns_precede_value_columns() {
+        let matches = vec!["protein_variant".to_string()];
+        let vals = vec!["am_pathogenicity".to_string()];
+        let sql = wrap_normalization(
+            "plugin_am_ingest",
+            CoordinateSystem::OneBased,
+            &matches,
+            &vals,
+        );
+        let mi = sql.find("protein_variant").unwrap();
+        let vi = sql.find("am_pathogenicity").unwrap();
+        assert!(mi < vi, "match column must precede value column: {sql}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

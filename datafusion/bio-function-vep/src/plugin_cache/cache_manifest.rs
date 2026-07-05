@@ -36,12 +36,22 @@ pub struct ValueColumnRecord {
     pub ty: String,
 }
 
+/// A per-transcript match discriminator binding (§3.4), recorded so the runtime
+/// knows which engine attribute supplies each match column's value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchColumnRecord {
+    pub column: String,
+    pub engine_attr: String,
+}
+
 /// The cache manifest written by the build and read at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheManifest {
     pub plugin_name: String,
     pub source_manifest: String,
     pub key_columns: Vec<String>,
+    #[serde(default)]
+    pub match_columns: Vec<MatchColumnRecord>,
     pub value_columns: Vec<ValueColumnRecord>,
     pub tier: TierRecord,
     pub chroms: Vec<ChromEntry>,
@@ -68,6 +78,14 @@ impl CacheManifest {
                 "end".into(),
                 "allele_string".into(),
             ],
+            match_columns: src
+                .match_columns
+                .iter()
+                .map(|m| MatchColumnRecord {
+                    column: m.column.clone(),
+                    engine_attr: m.engine_attr.clone(),
+                })
+                .collect(),
             value_columns: src
                 .value_columns
                 .iter()
@@ -142,6 +160,7 @@ mod tests {
                 "end".into(),
                 "allele_string".into(),
             ],
+            match_columns: vec![],
             value_columns: vec![],
             tier: TierRecord {
                 threshold: 0.01,
