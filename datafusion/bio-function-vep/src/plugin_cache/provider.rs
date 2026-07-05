@@ -1,0 +1,188 @@
+//! Provider factory: register a source manifest's raw tables under their
+//! `plugin_<name>_src[_<part>]` names. CSV/TSV/Parquet use builtin DataFusion
+//! providers; VCF/BED (bio-formats) are not wired in the prototype.
+
+use std::io::Read;
+
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::{DataFusionError, Result};
+use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
+
+use crate::plugin_cache::source_manifest::{CsvParams, ProviderKind, SourceManifest, ValueType};
+
+fn arrow_type(ty: ValueType) -> DataType {
+    match ty {
+        ValueType::Utf8 => DataType::Utf8,
+        ValueType::Float32 => DataType::Float32,
+        ValueType::Int32 => DataType::Int32,
+    }
+}
+
+fn csv_schema(csv: &CsvParams) -> Schema {
+    Schema::new(
+        csv.schema
+            .iter()
+            .map(|f| Field::new(&f.name, arrow_type(f.ty), true))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Materialize a plain (uncompressed) CSV/TSV path DataFusion can read.
+///
+/// The workspace builds DataFusion with `default-features = false` and no
+/// `compression` feature (the `xz2`/liblzma link collision with noodles-cram —
+/// see the root `Cargo.toml`), so `register_csv` cannot decompress input files.
+/// For gzip sources we decompress to a kept temp file and register that; plain
+/// sources pass through unchanged. The temp file is intentionally leaked (its
+/// path is returned): it must outlive lazy query execution, and per-chrom
+/// builds are short-lived processes.
+fn materialize_plain(path: &str, gzip: bool) -> Result<String> {
+    if !gzip {
+        return Ok(path.to_string());
+    }
+    let src = std::fs::File::open(path)
+        .map_err(|e| DataFusionError::Execution(format!("open gzip source '{path}': {e}")))?;
+    let mut decoder = flate2::read::MultiGzDecoder::new(src);
+    let tmp = tempfile::Builder::new()
+        .prefix("plugin_src_")
+        .suffix(".tsv")
+        .tempfile()
+        .map_err(|e| DataFusionError::Execution(format!("create temp for '{path}': {e}")))?;
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| DataFusionError::Execution(format!("decompress '{path}': {e}")))?;
+    std::fs::write(tmp.path(), &out)
+        .map_err(|e| DataFusionError::Execution(format!("write temp for '{path}': {e}")))?;
+    // Keep the file on disk beyond this scope for lazy execution.
+    let (_file, kept) = tmp
+        .keep()
+        .map_err(|e| DataFusionError::Execution(format!("persist temp for '{path}': {e}")))?;
+    Ok(kept.to_string_lossy().into_owned())
+}
+
+/// Register every source in `manifest` as a DataFusion table.
+pub async fn register_sources(ctx: &SessionContext, manifest: &SourceManifest) -> Result<()> {
+    for spec in &manifest.sources {
+        let table = spec.table_name(&manifest.plugin_name);
+        match spec.provider {
+            ProviderKind::Csv | ProviderKind::Tsv => {
+                let csv = spec.csv.as_ref().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "csv/tsv source '{table}' missing [source.csv]"
+                    ))
+                })?;
+                let schema = csv_schema(csv);
+                let delim = csv.delimiter.as_bytes().first().copied().unwrap_or(b'\t');
+                let gz = csv.compression.as_deref() == Some("gzip");
+                let plain_path = materialize_plain(&spec.path, gz)?;
+                let ext = std::path::Path::new(&plain_path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| format!(".{e}"))
+                    .unwrap_or_default();
+                let mut opts = CsvReadOptions::new()
+                    .delimiter(delim)
+                    .has_header(csv.has_header)
+                    .schema(&schema)
+                    .file_extension(&ext);
+                if let Some(c) = csv
+                    .comment
+                    .as_ref()
+                    .and_then(|s| s.as_bytes().first().copied())
+                {
+                    opts = opts.comment(c);
+                }
+                ctx.register_csv(&table, &plain_path, opts).await?;
+            }
+            ProviderKind::Parquet => {
+                ctx.register_parquet(&table, &spec.path, ParquetReadOptions::default())
+                    .await?;
+            }
+            ProviderKind::Vcf | ProviderKind::Bed => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "provider {:?} not wired in prototype (table '{table}')",
+                    spec.provider
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin_cache::source_manifest::SourceManifest;
+    use datafusion::arrow::array::Int64Array;
+    use std::io::Write;
+
+    fn write_gz(path: &std::path::Path, body: &str) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        enc.write_all(body.as_bytes()).unwrap();
+        enc.finish().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registers_csv_source_with_declared_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("snv.tsv.gz");
+        // headerless, comment line, two data rows
+        write_gz(
+            &tsv,
+            "#comment\nchr1\t100\tA\tG\t0.9\nchr1\t200\tC\tT\t0.1\n",
+        );
+
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  comment = "#"
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "score"
+csq_field = "DEMO"
+type = "Float32"
+
+[tier]
+threshold = 0.01
+"##,
+            tsv.display()
+        );
+
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let ctx = SessionContext::new();
+        register_sources(&ctx, &manifest).await.unwrap();
+        let n = ctx
+            .sql("SELECT count(*) AS c FROM plugin_demo_src")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let c = n[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(c, 2);
+    }
+}
