@@ -29,7 +29,8 @@ repeatable "add a plugin" workflow on top of it.
 | Plugin data model | Generic / self-describing: plugin declares key columns + value columns |
 | Ingestion | DataFusion table via sibling `datafusion-bio-format-vep-plugin` (`PluginSourceKind` / `register_plugin_source` / `select_query`), or an arbitrary pre-registered table/SQL |
 | Tiering on variation miss | **Cold** (tier 1). Warm (tier 0) = joins variation with max global AF ≥ `WARM_AF_THRESHOLD` (0.01). Consistent with variation. |
-| Frequency join granularity | **Allele-level** LEFT JOIN on `(chrom, pos, ref, alt)`; AF used only to derive tier, **not stored** in the plugin cache |
+| Key columns | **Shared with the variation cache verbatim**: `chrom` (Utf8), `start`/`end` (UInt32), `allele_string` (Utf8, `ref/alt`). Point-lookup key `(chrom, start)` via `encode_position_key`; alleles disambiguated by `allele_string`. |
+| Frequency join granularity | **Allele-level** LEFT JOIN on the shared key `(chrom, start, allele_string)`; AF used only to derive tier, **not stored** in the plugin cache |
 | Runtime layout | **One tiered dataset per plugin** — `plugin/<name>/<chrom>.parquet`, independent PageDir point-lookup (clone of variation lookup path) |
 | Declaration | **Manifest per plugin cache** (`plugin/<name>/manifest.json`), discovered at runtime by scanning `plugin/*/manifest.json` (mirrors `CHROM_MANIFEST_FILE`) |
 
@@ -54,12 +55,13 @@ repeatable "add a plugin" workflow on top of it.
 ```
 
 **Build data flow:** sibling crate registers the raw source →
-`select_query` normalizes to `(chrom, pos, ref, alt, values…)` →
+`select_query` normalizes to the **shared key columns** plus values
+(`chrom, start, end, allele_string, values…` — §3.2) →
 `plugin_cache::join::join_variation_frequency` LEFT-joins each row's
-`(chrom, pos, ref, alt)` to the variation shard for that chrom, pulls
+`(chrom, start, allele_string)` to the variation shard for that chrom, pulls
 `max_global_af`, derives `tier` (AF ≥ 0.01 → warm/0, else / no-match → cold/1),
 **discards AF** → streaming writer emits `plugin/<name>/<chrom>.parquet` physically
-ordered `(tier, pos, ref, alt)` and PageDir-indexed (§4.3) → per-plugin
+ordered `(tier, start)` and PageDir-indexed (§4.3) → per-plugin
 `manifest.json` records source kind, key columns, value→CSQ mapping, and per-chrom
 row/tier counts.
 
@@ -89,10 +91,12 @@ e.g. `plugin_cadd_src_snv`, `plugin_cadd_src_indel`, `plugin_clinvar_src`,
 
 **2. Ingest view** — a `CREATE VIEW` applying the source's normalization projection
 (`select_query` / `cadd_union_query`) over the raw table(s), exposing **only** the
-ingest-ready columns and nothing else:
+ingest-ready columns and nothing else. The projection maps the raw source columns
+onto the shared key convention (§3.2) — `pos → start`/`end`, `ref`/`alt` →
+`allele_string` — followed by the plugin's value columns:
 
 ```
-plugin_<name>_ingest                 # (chrom, pos, ref, alt, <value columns…>)
+plugin_<name>_ingest                 # (chrom, start, end, allele_string, <value columns…>)
 ```
 
 e.g. `plugin_cadd_ingest`, `plugin_dbnsfp_ingest`.
@@ -115,20 +119,56 @@ reference `plugin_<name>_src[...]` — either templated on the registered raw-ta
 name, or the builder registers the raw table(s) under those names before creating
 the view.
 
+### 3.2 Key column convention (shared with the variation cache)
+
+The plugin cache adopts the variation cache's key columns **verbatim**, so the
+join, the physical sort, the PageDir position key, and allele matching are all
+literally the same code path as variation — no parallel key vocabulary.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `chrom` | `Utf8` | Contig label (shard is per-chrom; column retained for the join key) |
+| `start` | `UInt32` | 1-based genomic start. Point plugins set `start == end == pos`; interval plugins use the true span |
+| `end` | `UInt32` | 1-based genomic end |
+| `allele_string` | `Utf8` | `ref/alt` (e.g. `A/G`), the variation cache's allele encoding |
+
+- **Point-lookup key** is `(chrom, start)` via `cache::key_encoding::encode_position_key`
+  — the exact encoder the variation lookup uses. Alleles are disambiguated by
+  `allele_string` in the scan step, exactly as variation does.
+- **`allele_string` is optional per plugin.** Allele-specific plugins (CADD,
+  ClinVar, dbNSFP) populate it; a purely position-level plugin (e.g. a
+  conservation track) may declare only `(chrom, start, end)` in its manifest and
+  match on position alone. The manifest's `key_columns` records which subset
+  applies.
+- The `_ingest` view (§3.1) is where the raw source columns are renamed/derived
+  into this convention; downstream (`join_variation_frequency`, the writer, the
+  runtime probe) only ever sees these names.
+
+**Why `allele_string`, not separate `ref`/`alt` columns in the cache.** The
+variation cache's own key is `allele_string`, so the frequency join *requires* an
+`allele_string` to match against — `ref`/`alt` would have to be merged for the join
+regardless. The merge is therefore done **once**, in the `_ingest` view
+(`concat(ref, '/', alt) AS allele_string`, as the sibling crate's projection
+already does), rather than stored split and re-merged at both join time and
+runtime. `ref`/`alt` carry no downstream value either: a plugin emits its score
+columns as CSQ fields, and the annotated VCF already carries the alleles. A plugin
+that genuinely needs `ref`/`alt` as *output* can still declare them as
+`value_columns`; as the *key*, `allele_string` is the single shared form.
+
 ## 4. Build pipeline & reusable join component
 
 ### 4.1 `plugin_cache::join::join_variation_frequency`
 
 ```
 join_variation_frequency(
-    plugin_stream: SendableRecordBatchStream,  // from plugin_<name>_ingest: (chrom,pos,ref,alt,values…)
+    plugin_stream: SendableRecordBatchStream,  // from plugin_<name>_ingest: (chrom,start,end,allele_string,values…)
     variation_shard: &Path,                     // variation/<chrom>.parquet
     threshold: f64,                             // WARM_AF_THRESHOLD (0.01)
 ) -> SendableRecordBatchStream                  // …values… + tier:Int8
 ```
 
 - Registers the variation shard and the plugin stream in a `SessionContext`,
-  runs a `LEFT JOIN` on `(chrom, pos, ref, alt)`.
+  runs a `LEFT JOIN` on the shared key `(chrom, start, allele_string)`.
 - `tier = CASE WHEN COALESCE(max_global_af(...), 0) >= threshold THEN 0 ELSE 1 END`,
   where the AF reduction reuses **`cache_common::max_global_af`** so plugin
   tiering and variation tiering share one frequency definition.
@@ -144,7 +184,7 @@ Mirrors `build_parquet_variation_chrom` (`cache/build.rs`) almost exactly:
 - A `VariationParquetShardWriter`-style streaming writer **generalized to an
   arbitrary value schema** (value columns come from the manifest, not the fixed
   variation column set).
-- Rows physically written warm-run then cold-run, each `pos`-monotonic, so the
+- Rows physically written warm-run then cold-run, each `start`-monotonic, so the
   read-side PageDir binary search holds (§4.3); overwrite/skip semantics and
   empty-shard cleanup copied verbatim.
 - Per-chrom build; `chrom_filter` honored for scoped/parity builds.
@@ -153,7 +193,7 @@ Mirrors `build_parquet_variation_chrom` (`cache/build.rs`) almost exactly:
 
 Plugin shards reuse the **exact** lookup-optimized `WriterProperties` the
 variation and `translation_sift` shards use —
-`parquet_cache::write::point_lookup_writer_properties(schema, &["tier", "pos"])`
+`parquet_cache::write::point_lookup_writer_properties(schema, &["tier", "start"])`
 — so plugin lookups inherit the variation shard's tuned point-lookup behavior
 verbatim. Concrete parameters:
 
@@ -165,36 +205,40 @@ verbatim. Concrete parameters:
 | Data page row count limit | **512 rows** | Same: bounds rows decoded per resolved page |
 | Page statistics | `EnabledStatistics::Page` | Emits the `ColumnIndex` + `OffsetIndex` in the footer that the read-side `PageDir` resolves position→page against |
 | Max row-group rows | **1,000,000** | Amortizes footer metadata while keeping row-group pruning useful |
-| Declared sort (`SortingColumn`) | `(tier ASC, pos ASC)`, nulls last | The two-run (warm/cold) structure with `pos` monotonic *within each run* that the `PageDir` binary search relies on |
+| Declared sort (`SortingColumn`) | `(tier ASC, start ASC)`, nulls last | The two-run (warm/cold) structure with `start` monotonic *within each run* that the `PageDir` binary search relies on |
 
-**Sort-key contract.** The PageDir search key is `pos` within a tier run —
-identical to variation's `(tier, start)`. `ref`/`alt` are **not** PageDir search
-keys: rows sharing a `pos` are additionally ordered by `(ref, alt)` for
+**Sort-key contract.** The PageDir search key is `start` within a tier run —
+**identical to variation's `(tier, start)`**. `allele_string` is **not** a PageDir
+search key: rows sharing a `start` are additionally ordered by `allele_string` for
 deterministic, byte-stable output, but allele disambiguation happens in the
-`scan` decode step (probe filters the candidate rows by `ref`/`alt`), exactly as
-the variation lookup filters alleles after resolving position. Only `tier` and
-`pos` are declared as `SortingColumn`s. All sort keys are top-level primitives, so
-leaf index == field index (the `point_lookup_writer_properties` assumption holds).
+`scan` decode step (probe filters the candidate rows by `allele_string`), exactly
+as the variation lookup filters alleles after resolving position. Only `tier` and
+`start` are declared as `SortingColumn`s. All sort keys are top-level primitives,
+so leaf index == field index (the `point_lookup_writer_properties` assumption
+holds).
 
 The physical shape mirrors variation's two-pass write: warm run (tier 0) first,
-cold run (tier 1) second, each written in `pos`-ascending order by the source
+cold run (tier 1) second, each written in `start`-ascending order by the source
 `ORDER BY` — the writer never re-sorts across the run boundary, which is what
 gives the PageDir its two monotonic segments.
 
 ## 5. Runtime lookup & CSQ injection
 
 - **`plugin_cache::lookup::PluginLookup`** wraps one plugin's per-chrom
-  PageDir-indexed shard; exposes `probe(chrom, pos, ref, alt) -> Option<PluginValueRow>`
-  reusing `parquet_cache::page_dir` binary search and `parquet_cache::scan` decode
-  verbatim. Same `(tier, pos)` run structure → same warm-first fast path; a
-  cold-miss is a bounded page reject, exactly like variation.
+  PageDir-indexed shard; exposes
+  `probe(chrom, start, allele_string) -> Option<PluginValueRow>` reusing
+  `cache::key_encoding::encode_position_key`, `parquet_cache::page_dir` binary
+  search, and `parquet_cache::scan` decode verbatim. Same `(tier, start)` run
+  structure → same warm-first fast path; a cold-miss is a bounded page reject,
+  exactly like variation.
 - **Wiring point:** plugins resolve in the same per-variant colocated step where
   variation frequency is resolved today (`colocated.rs` / frequency resolution in
   `annotate_provider.rs`). Each plugin's `PluginValueRow` maps positionally onto
   its declared CSQ output fields; a miss emits VEP's empty value.
-- **Allele matching:** the probe key reuses `alt_orig_allele_string`
-  (`colocated.rs:308`), so plugin allele matching is identical to frequency allele
-  matching — no new allele-normalization surface.
+- **Allele matching:** the probe's `allele_string` reuses the same
+  `alt_orig_allele_string` (`colocated.rs:308`) the frequency lookup already
+  computes, so plugin allele matching is identical to frequency allele matching —
+  no new allele-normalization surface.
 - **Output schema:** the plugin's CSQ field names are appended to the CSQ format
   list. One-dataset-per-plugin means enabling/disabling a plugin adds/removes
   exactly its columns, with no effect on variation or other plugins.
@@ -216,7 +260,7 @@ scanning `plugin/*/manifest.json`:
 {
   "plugin_name": "cadd",
   "source_kind": "cadd",
-  "key_columns": ["chrom", "pos", "ref", "alt"],
+  "key_columns": ["chrom", "start", "end", "allele_string"],
   "value_columns": [
     { "column": "raw_score",   "csq_field": "CADD_RAW",   "type": "Float32" },
     { "column": "phred_score", "csq_field": "CADD_PHRED", "type": "Float32" }
@@ -243,9 +287,11 @@ end-to-end process as a short decision tree plus exact file:line touch-points:
 1. **Decide the source.** One of the 5 known `PluginSourceKind`s → skip to step 3;
    a new format → step 2.
 2. **(New source only) add a source kind** in `datafusion-bio-format-vep-plugin`:
-   `PluginSourceKind` variant + `register_plugin_source` arm + `select_query`
-   normalizing to `(chrom, pos, ref, alt, values…)`. Skill provides the checklist
-   and SQL-projection pattern.
+   `PluginSourceKind` variant + `register_plugin_source` arm registering
+   `plugin_<name>_src[...]` (§3.1) + `select_query` whose `_ingest` view normalizes
+   to the shared key columns `(chrom, start, end, allele_string, values…)` (§3.2),
+   merging `ref`/`alt` into `allele_string`. Skill provides the checklist and
+   SQL-projection pattern.
 3. **Author the manifest** (§6) — value→CSQ mapping and tier policy.
 4. **Build** per-chrom for the target chroms; skill documents the driver
    invocation.
