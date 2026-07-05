@@ -96,19 +96,30 @@ impl ExecutionPlan for FastqcExec {
         let n_parts = input.properties().partitioning.partition_count();
         let schema = tidy_schema();
 
-        // kmer_content samples every 50th read in file order, so it is only
-        // exact vs FastQC when reads are seen in order. Accumulating one
-        // ModuleSet per partition and merging would sample each partition
-        // independently (partition-dependent, non-FastQC). When kmer is
-        // selected we therefore read partitions sequentially in index order
-        // (= file order for range-based scans) into a single ModuleSet.
-        let kmer_ordered = match &selection {
-            None => true, // None resolves to all modules, which includes kmer
-            Some(sel) => sel.iter().any(|m| m == "kmer_content"),
+        // Some modules are order-dependent and only match FastQC when reads are
+        // seen in file order:
+        //   - kmer_content samples every 50th read in file order.
+        //   - overrepresented and dup_levels stop tracking NEW distinct keys once
+        //     they hit FastQC's OBSERVATION_CUTOFF (100k uniques); which keys
+        //     survive the freeze depends on the global read order, so applying the
+        //     cutoff per partition can track a different key set than FastQC.
+        // Accumulating one ModuleSet per partition and merging would process each
+        // partition independently (partition-dependent, non-FastQC). When any
+        // order-dependent module is selected we therefore read partitions
+        // sequentially in index order (= file order for range-based scans) into a
+        // single ModuleSet.
+        let order_dependent = match &selection {
+            None => true, // None resolves to all modules, which includes them
+            Some(sel) => sel.iter().any(|m| {
+                matches!(
+                    m.as_str(),
+                    "kmer_content" | "overrepresented" | "dup_levels"
+                )
+            }),
         };
 
         let fut = async move {
-            if kmer_ordered {
+            if order_dependent {
                 let mut set = ModuleSet::build(selection.as_deref())?;
                 for p in 0..n_parts {
                     let mut stream = input.execute(p, context.clone())?;
@@ -120,8 +131,8 @@ impl ExecutionPlan for FastqcExec {
                 return Ok::<RecordBatch, DataFusionError>(batch);
             }
 
-            // No order-dependent module: spawn one task per input partition so
-            // accumulation runs in parallel across runtime worker threads
+            // No order-dependent module selected: spawn one task per input
+            // partition so accumulation runs in parallel across runtime worker threads
             // (CPU-bound work). A plain `try_join_all` would only interleave the
             // futures on a single task, adding overhead without parallelism.
             let mut join_set: JoinSet<Result<ModuleSet>> = JoinSet::new();

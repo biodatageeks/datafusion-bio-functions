@@ -3,9 +3,14 @@ use std::collections::HashMap;
 
 use crate::{QcModule, TidyRow};
 
-/// FastQC truncates a read to its first 50bp before using it as a duplication
-/// key (so downstream miscalls don't split otherwise-identical reads).
+/// FastQC uses the first 50bp of a read as its duplication key, but ONLY for
+/// reads longer than 75bp; reads <= 75bp are keyed on the whole sequence
+/// (FastQC 0.12.1 `SequenceDeDuplication`/`OverRepresentedSeqs`:
+/// `if (seq.length() > 75) seq = seq.substring(0, 50)`). Truncating shorter
+/// reads to 50bp would merge distinct 51-75bp reads that share a prefix.
 const KEY_PREFIX: usize = 50;
+/// Reads longer than this are truncated to `KEY_PREFIX`; shorter reads are kept whole.
+const TRUNCATE_ABOVE: usize = 75;
 
 /// FastQC "Sequence Duplication Levels" (matches FastQC 0.12.1 exactly for
 /// libraries with <= 100k distinct sequences, i.e. the range where FastQC does
@@ -88,7 +93,11 @@ impl DuplicationLevels {
     }
 
     fn key(seq: &[u8]) -> &[u8] {
-        &seq[..seq.len().min(KEY_PREFIX)]
+        if seq.len() > TRUNCATE_ABOVE {
+            &seq[..KEY_PREFIX]
+        } else {
+            seq
+        }
     }
 }
 
@@ -287,15 +296,35 @@ mod tests {
     }
 
     #[test]
-    fn dup_levels_keys_on_50bp_prefix() {
-        // Two 60bp reads share the first 50bp but differ after -> same key.
-        let long_a = vec![b'A'; 60];
-        let mut long_b = vec![b'A'; 60];
-        long_b[55] = b'C';
+    fn dup_levels_keeps_whole_read_up_to_75bp() {
+        // FastQC only truncates reads > 75bp. Two 60bp reads that share the first
+        // 50bp but differ afterwards are DISTINCT (keyed on the whole read), not
+        // duplicates. (Regression guard for the 51-75bp truncation bug.)
+        let read_a = vec![b'A'; 60];
+        let mut read_b = vec![b'A'; 60];
+        read_b[55] = b'C';
         let qual = [b'I'; 60];
         let mut m = DuplicationLevels::new();
-        m.update(b"", &long_a, &qual);
-        m.update(b"", &long_b, &qual);
+        m.update(b"", &read_a, &qual);
+        m.update(b"", &read_b, &qual);
+        let mut rows = Vec::new();
+        m.finalize(&mut rows);
+        // 2 distinct singletons -> bin "1" = 100%, 100% remaining after dedup.
+        assert!((pct_at(&rows, "1") - 100.0).abs() < 1e-9);
+        assert!((scalar(&rows, "total_dedup_pct") - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dup_levels_truncates_reads_over_75bp_to_50bp() {
+        // Reads > 75bp are keyed on their first 50bp, so two 80bp reads sharing the
+        // first 50bp but differing afterwards collapse to one duplicated key.
+        let read_a = vec![b'A'; 80];
+        let mut read_b = vec![b'A'; 80];
+        read_b[60] = b'C';
+        let qual = [b'I'; 80];
+        let mut m = DuplicationLevels::new();
+        m.update(b"", &read_a, &qual);
+        m.update(b"", &read_b, &qual);
         let mut rows = Vec::new();
         m.finalize(&mut rows);
         // 1 distinct seen twice -> bin "2" = 100%, 50% remaining after dedup.

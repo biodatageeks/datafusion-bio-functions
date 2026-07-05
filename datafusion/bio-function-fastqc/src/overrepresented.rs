@@ -3,9 +3,14 @@ use std::collections::HashMap;
 
 use crate::{QcModule, TidyRow};
 
-/// FastQC truncates a read to its first 50bp before using it as a key (same as
-/// the duplication module — FastQC shares one tracker between them).
+/// FastQC uses the first 50bp of a read as its key, but ONLY for reads longer
+/// than 75bp; reads <= 75bp are keyed on the whole sequence (same rule and
+/// tracker as the duplication module — FastQC 0.12.1
+/// `OverRepresentedSeqs.processSequence`: `if (seq.length() > 75) seq =
+/// seq.substring(0, 50)`).
 const KEY_PREFIX: usize = 50;
+/// Reads longer than this are truncated to `KEY_PREFIX`; shorter reads are kept whole.
+const TRUNCATE_ABOVE: usize = 75;
 /// A sequence is "overrepresented" above this % of total (limits.txt: warn 0.1).
 const WARN_PCT: f64 = 0.1;
 /// error threshold (limits.txt: overrepresented error 1).
@@ -36,7 +41,11 @@ impl OverrepresentedSeqs {
     }
 
     fn key(seq: &[u8]) -> &[u8] {
-        &seq[..seq.len().min(KEY_PREFIX)]
+        if seq.len() > TRUNCATE_ABOVE {
+            &seq[..KEY_PREFIX]
+        } else {
+            seq
+        }
     }
 }
 
@@ -429,6 +438,28 @@ mod tests {
             rows.iter()
                 .any(|r| r.metric == "status" && r.value_str.as_deref() == Some("FAIL"))
         );
+    }
+
+    #[test]
+    fn keys_whole_read_up_to_75bp_then_truncates() {
+        // FastQC only truncates reads > 75bp to their first 50bp. Two 60bp reads
+        // sharing the first 50bp but differing afterwards are DISTINCT keys...
+        let mut short = OverrepresentedSeqs::new();
+        let a60 = vec![b'A'; 60];
+        let mut b60 = vec![b'A'; 60];
+        b60[55] = b'C';
+        short.update(b"", &a60, b"");
+        short.update(b"", &b60, b"");
+        assert_eq!(short.seqs.len(), 2, "51-75bp reads must be keyed whole");
+
+        // ...but two 80bp reads sharing the first 50bp collapse to one key.
+        let mut long = OverrepresentedSeqs::new();
+        let a80 = vec![b'A'; 80];
+        let mut b80 = vec![b'A'; 80];
+        b80[60] = b'C';
+        long.update(b"", &a80, b"");
+        long.update(b"", &b80, b"");
+        assert_eq!(long.seqs.len(), 1, ">75bp reads must be truncated to 50bp");
     }
 
     // "Illumina Single End Adapter 1" from the embedded contaminant_list.txt.
