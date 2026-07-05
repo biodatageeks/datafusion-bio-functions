@@ -10,6 +10,7 @@
 pub mod build;
 pub mod cache_manifest;
 pub mod join;
+pub mod lookup;
 pub mod normalize;
 pub mod provider;
 pub mod source_manifest;
