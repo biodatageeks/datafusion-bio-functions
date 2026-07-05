@@ -187,11 +187,19 @@ impl ModuleSet {
             .column_by_name("description")
             .map(|c| c.as_string::<i32>());
         let mut hdr: Vec<u8> = Vec::new();
+        // FastQC uppercases sequence bases at read time (FastQFile builds each read
+        // with `seq.toUpperCase()`), so all modules see uppercase. Mirror that here
+        // via a reusable buffer so lowercase/soft-masked bases don't split or miss
+        // keys in the case-sensitive modules (adapter/kmer/overrepresented/dup).
+        let mut seq_upper: Vec<u8> = Vec::new();
         for i in 0..batch.num_rows() {
             if seq.is_null(i) {
                 continue;
             }
-            let s = seq.value(i).as_bytes();
+            seq_upper.clear();
+            seq_upper.extend_from_slice(seq.value(i).as_bytes());
+            seq_upper.make_ascii_uppercase();
+            let s = &seq_upper[..];
             let q = if qual.is_null(i) {
                 &[][..]
             } else {
