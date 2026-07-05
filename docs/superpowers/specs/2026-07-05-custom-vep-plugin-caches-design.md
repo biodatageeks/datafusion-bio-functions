@@ -93,7 +93,8 @@ e.g. `plugin_cadd_src_snv`, `plugin_cadd_src_indel`, `plugin_clinvar_src`,
 (`select_query` / `cadd_union_query`) over the raw table(s), exposing **only** the
 ingest-ready columns and nothing else. The projection maps the raw source columns
 onto the shared key convention (§3.2) — `pos → start`/`end`, `ref`/`alt` →
-`allele_string` — followed by the plugin's value columns:
+`allele_string` — **standardizes contig names and coordinates to match the
+variation cache** (§3.3), then appends the plugin's value columns:
 
 ```
 plugin_<name>_ingest                 # (chrom, start, end, allele_string, <value columns…>)
@@ -154,6 +155,43 @@ runtime. `ref`/`alt` carry no downstream value either: a plugin emits its score
 columns as CSQ fields, and the annotated VCF already carries the alleles. A plugin
 that genuinely needs `ref`/`alt` as *output* can still declare them as
 `value_columns`; as the *key*, `allele_string` is the single shared form.
+
+### 3.3 Contig & coordinate normalization (in the `_ingest` view)
+
+The frequency join (§4.1) matches plugin rows against the variation shard **on the
+`chrom` column literally**, and the runtime probe shares the variation position-key
+space — so the `_ingest` view must emit `chrom`, `start`, `end` in exactly the form
+the variation cache uses, not the source's raw form. This normalization lives in
+the view (SQL), so no downstream stage ever sees a source-specific contig style or
+coordinate basis.
+
+**Contig standardization.** Plugin sources arrive in mixed styles — `chr1` (UCSC /
+many VCFs), `1` (Ensembl), `chrM` / `M` / `chrMT` (mitochondria). The view maps
+each to the **bare Ensembl form the variation `chrom` column stores** (`1`…`22`,
+`X`, `Y`, `MT`): strip any `chr` prefix, fold `M`/`chrM`/`chrMT` → `MT`, uppercase
+`X`/`Y`. (Note: the *shard filename* still uses `canonical_chrom_label`
+→ `chr1.parquet`, exactly as variation splits stored-column form from
+filename form.)
+
+- **Reusable component.** A single `canonical_contig(chrom) -> Utf8` scalar UDF,
+  backed by the same canonicalization as `cache::key_encoding::chrom_code` /
+  `manifest::canonical_chrom_label`, is registered once and used by **every**
+  `_ingest` view. This guarantees plugin and variation agree on contig spelling by
+  construction rather than by each source's SQL getting it right independently. It
+  is the contig-side sibling of `join_variation_frequency`'s shared tiering.
+- **Correctness note.** `encode_position_key` already strips `chr` at runtime, so a
+  probe would tolerate a mismatched prefix — but the *build-time* join is a plain
+  column equality and would silently drop every row on a `chr1` vs `1` mismatch.
+  Contig standardization is therefore a **join-correctness requirement**, not
+  cosmetics; the parity gate (§8) is what catches a regression here (all-null
+  plugin fields).
+
+**Coordinate standardization.** Variation `start`/`end` are **1-based** `UInt32`.
+The view converts the source's basis to match: 1-based sources (VCF POS, CADD,
+dbNSFP `pos(1-based)`, AlphaMissense) pass through with a `UInt32` cast; a 0-based
+half-open source (BED-like) shifts `start + 1`. Point plugins set
+`start == end == pos`; interval plugins carry the true 1-based span. The source's
+coordinate basis is declared per source kind so the view applies the right shift.
 
 ## 4. Build pipeline & reusable join component
 
@@ -290,8 +328,10 @@ end-to-end process as a short decision tree plus exact file:line touch-points:
    `PluginSourceKind` variant + `register_plugin_source` arm registering
    `plugin_<name>_src[...]` (§3.1) + `select_query` whose `_ingest` view normalizes
    to the shared key columns `(chrom, start, end, allele_string, values…)` (§3.2),
-   merging `ref`/`alt` into `allele_string`. Skill provides the checklist and
-   SQL-projection pattern.
+   merging `ref`/`alt` into `allele_string`, applying `canonical_contig(...)` and
+   the source's coordinate shift (§3.3). The checklist requires declaring the
+   source's **contig style** and **coordinate basis** so the view normalizes both
+   to the variation convention.
 3. **Author the manifest** (§6) — value→CSQ mapping and tier policy.
 4. **Build** per-chrom for the target chroms; skill documents the driver
    invocation.
@@ -305,6 +345,10 @@ that belongs in Rust.
 
 - **Unit:** `join_variation_frequency` tiering table-test (warm / cold / no-match),
   a clone of the existing `transform_variation_tier_batch` tests.
+- **Unit:** `canonical_contig` UDF table-test (`chr1`→`1`, `chrM`/`M`/`chrMT`→`MT`,
+  `X`/`Y` passthrough) plus a coordinate-shift case (0-based source → 1-based
+  `start`), asserting the `_ingest` view matches variation's `chrom`/`start` form —
+  the join-correctness guard from §3.3.
 - **Round-trip:** build a tiny synthetic plugin shard; probe hits and misses via
   `PluginLookup`; assert value + tier.
 - **Golden parity (decisive gate):** chr-scoped run comparing our plugin CSQ
