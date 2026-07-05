@@ -659,18 +659,75 @@ const BGZF_EOF: [u8; 28] = [
 
 /// Read a finished bgzf file and return its bytes with the trailing 28-byte EOF
 /// marker removed, ready for raw concatenation into a larger bgzf stream.
+/// Read a small finished bgzf file (the header) whole and return its bytes with
+/// the trailing 28-byte EOF marker removed. Used only for the header, which is
+/// tiny; shards stream via [`append_bgzf_shard`] instead. The EOF check is a real
+/// runtime error (not a `debug_assert`) so it holds in release builds.
 fn bgzf_blocks_no_eof(path: &Path) -> Result<Vec<u8>> {
     let mut bytes = std::fs::read(path).map_err(|e| {
-        DataFusionError::Execution(format!("read bgzf shard {}: {e}", path.display()))
+        DataFusionError::Execution(format!("read bgzf file {}: {e}", path.display()))
     })?;
-    debug_assert!(
-        bytes.len() >= BGZF_EOF.len() && bytes[bytes.len() - BGZF_EOF.len()..] == BGZF_EOF,
-        "bgzf file {} does not end with the canonical EOF marker",
-        path.display()
-    );
-    let keep = bytes.len().saturating_sub(BGZF_EOF.len());
+    if bytes.len() < BGZF_EOF.len() || bytes[bytes.len() - BGZF_EOF.len()..] != BGZF_EOF {
+        return Err(DataFusionError::Execution(format!(
+            "bgzf file {} does not end with the canonical EOF marker",
+            path.display()
+        )));
+    }
+    let keep = bytes.len() - BGZF_EOF.len();
     bytes.truncate(keep);
     Ok(bytes)
+}
+
+/// Append a finished bgzf shard file to `out`, stripping its trailing 28-byte EOF
+/// marker, streaming the body in `buf`-sized chunks so a large shard is never
+/// loaded whole into memory (mirrors the plain assembler's bounded-buffer copy).
+/// Uses the file length to locate the marker, then reads + validates it. Returns
+/// a real runtime error (holds in release) if the shard is shorter than the
+/// marker or does not end with it — never silently truncating corrupt input.
+fn append_bgzf_shard<W: Write>(path: &Path, out: &mut W, buf: &mut [u8]) -> Result<()> {
+    let mut f = std::fs::File::open(path).map_err(|e| {
+        DataFusionError::Execution(format!("assembler open bgzf shard {}: {e}", path.display()))
+    })?;
+    let total = f
+        .metadata()
+        .map_err(|e| {
+            DataFusionError::Execution(format!("assembler stat bgzf shard {}: {e}", path.display()))
+        })?
+        .len();
+    let eof_len = BGZF_EOF.len() as u64;
+    if total < eof_len {
+        return Err(DataFusionError::Execution(format!(
+            "bgzf shard {} is {total} bytes, shorter than the canonical EOF marker",
+            path.display()
+        )));
+    }
+    // Stream the body (everything except the trailing EOF marker) in bounded chunks.
+    let mut remaining = total - eof_len;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        f.read_exact(&mut buf[..want]).map_err(|e| {
+            DataFusionError::Execution(format!("assembler read bgzf shard {}: {e}", path.display()))
+        })?;
+        out.write_all(&buf[..want])
+            .map_err(|e| DataFusionError::Execution(format!("assembler write bgzf shard: {e}")))?;
+        remaining -= want as u64;
+    }
+    // Read + validate the trailing EOF marker; never write it (the assembler emits
+    // exactly one canonical EOF at the very end of the assembled file).
+    let mut marker = [0u8; 28]; // == BGZF_EOF.len()
+    f.read_exact(&mut marker).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "assembler read bgzf EOF of {}: {e}",
+            path.display()
+        ))
+    })?;
+    if marker != BGZF_EOF {
+        return Err(DataFusionError::Execution(format!(
+            "bgzf shard {} does not end with the canonical EOF marker",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Dedicated assembler thread for Plain/Gzip output. Owns the header-primed
@@ -688,6 +745,7 @@ fn run_assembler_thread(
     temp_output: PathBuf,
     tempdir: PathBuf,
     rx: std::sync::mpsc::Receiver<ContigShardRange>,
+    finalize: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<Result<usize>> {
     std::thread::spawn(move || -> Result<usize> {
         let mut total_lines = 0usize;
@@ -717,7 +775,15 @@ fn run_assembler_thread(
             }
             total_lines += range.output_lines;
         }
-        // Sender dropped == annotation finished with no error.
+        // Channel closed. Finalize (finish + atomic rename) ONLY if the driver
+        // signalled success; otherwise the run failed mid-annotation and this temp
+        // holds only the contigs completed before the error — discard it so no
+        // truncated-but-valid-looking VCF is ever renamed into the output path.
+        if !finalize.load(std::sync::atomic::Ordering::Acquire) {
+            drop(writer);
+            let _ = std::fs::remove_file(&temp_output);
+            return Ok(0);
+        }
         writer.finish()?;
         std::fs::rename(&temp_output, &final_output).map_err(|e| {
             DataFusionError::Execution(format!(
@@ -743,6 +809,7 @@ fn run_assembler_thread_bgzf(
     tempdir: PathBuf,
     header_blocks: Vec<u8>,
     rx: std::sync::mpsc::Receiver<ContigShardRange>,
+    finalize: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<Result<usize>> {
     std::thread::spawn(move || -> Result<usize> {
         let file = std::fs::File::create(&temp_output).map_err(|e| {
@@ -752,16 +819,21 @@ fn run_assembler_thread_bgzf(
         out.write_all(&header_blocks)
             .map_err(|e| DataFusionError::Execution(format!("assembler write header: {e}")))?;
         let mut total_lines = 0usize;
+        let mut buffer = vec![0u8; 8 * 1024 * 1024];
         while let Ok(range) = rx.recv() {
             for id in range.first_shard_id..range.end_shard_id {
                 let path = tempdir.join(format!("partition_{id:04}.vcf.body"));
-                let blocks = bgzf_blocks_no_eof(&path)?;
-                out.write_all(&blocks).map_err(|e| {
-                    DataFusionError::Execution(format!("assembler write shard: {e}"))
-                })?;
+                append_bgzf_shard(&path, &mut out, &mut buffer)?;
                 let _ = std::fs::remove_file(&path);
             }
             total_lines += range.output_lines;
+        }
+        // Channel closed. Discard the partial temp on a mid-run failure (see the
+        // plain assembler) — do NOT write the EOF or rename a truncated file.
+        if !finalize.load(std::sync::atomic::Ordering::Acquire) {
+            drop(out);
+            let _ = std::fs::remove_file(&temp_output);
+            return Ok(0);
         }
         out.write_all(&BGZF_EOF)
             .map_err(|e| DataFusionError::Execution(format!("assembler write EOF: {e}")))?;
@@ -1183,6 +1255,12 @@ pub async fn annotate_to_vcf(
         // Spawn the assembler (owns the output writer); its mode matches the
         // output compression. Header is written BEFORE the field vecs are moved
         // into the shard context.
+        // Set to true only if annotation completes successfully; the assembler
+        // reads it after the channel closes and finalizes (finish + atomic rename)
+        // ONLY when true. On a mid-run error the assembler discards its partial
+        // temp file instead of renaming a truncated-but-valid-looking VCF into the
+        // output path.
+        let finalize = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let assembler = if config.compression == VcfCompressionType::Bgzf {
             // Pre-compress the header into bgzf blocks (strip its EOF); the raw
             // assembler writes those, then the already-compressed shards.
@@ -1203,6 +1281,7 @@ pub async fn annotate_to_vcf(
                 tempdir.path().to_path_buf(),
                 header_blocks,
                 contig_done_rx,
+                Arc::clone(&finalize),
             )
         } else {
             // Plain/Gzip: write the header to the temp writer; the assembler
@@ -1220,6 +1299,7 @@ pub async fn annotate_to_vcf(
                 temp_output.clone(),
                 tempdir.path().to_path_buf(),
                 contig_done_rx,
+                Arc::clone(&finalize),
             )
         };
 
@@ -1233,7 +1313,7 @@ pub async fn annotate_to_vcf(
             rows_done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             contig_done_tx,
         });
-        drive_sharded_vcf_annotation(
+        let drive_result = drive_sharded_vcf_annotation(
             &ctx,
             vcf_table,
             cache_source,
@@ -1247,14 +1327,25 @@ pub async fn annotate_to_vcf(
             config,
             total_input,
         )
-        .await?;
+        .await;
+        // Signal the assembler whether to finalize BEFORE closing the channel, so
+        // a mid-run error never renames a partial file into the output path.
+        if drive_result.is_ok() {
+            finalize.store(true, std::sync::atomic::Ordering::Release);
+        }
         // Drop the last sender (the one held on shard_ctx) so the assembler sees
-        // the channel close and finalizes. Any per-contig senders were already
-        // sent-and-dropped by the stream.
+        // the channel close. Any per-contig senders were already sent-and-dropped
+        // by the stream.
         drop(shard_ctx);
-        total_rows = assembler
+        // ALWAYS join the assembler (even on error) so the thread is never detached
+        // and its cleanup/result is observed. Propagate the drive error first (the
+        // assembler has already discarded its partial temp on failure), then any
+        // assembler error.
+        let assembled = assembler
             .join()
-            .map_err(|_| DataFusionError::Execution("assembler thread panicked".to_string()))??;
+            .map_err(|_| DataFusionError::Execution("assembler thread panicked".to_string()))?;
+        drive_result?;
+        total_rows = assembled?;
         // tempdir (and any leftover shard files) removed on drop here.
         drop(tempdir);
     } else {
@@ -1413,7 +1504,14 @@ mod tests {
         let tmp = dir.join("out.vcf.part");
         let writer = VcfLocalWriter::with_compression(&tmp, VcfCompressionType::Plain).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        let h = run_assembler_thread(writer, out.clone(), tmp, dir.clone(), rx);
+        let h = run_assembler_thread(
+            writer,
+            out.clone(),
+            tmp,
+            dir.clone(),
+            rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
         tx.send(ContigShardRange {
             first_shard_id: 0,
             end_shard_id: 2,
@@ -1479,7 +1577,14 @@ mod tests {
         let out = dir.join("out.vcf.gz");
         let tmp = dir.join("out.vcf.gz.part");
         let (tx, rx) = std::sync::mpsc::channel();
-        let h = run_assembler_thread_bgzf(tmp.clone(), out.clone(), dir.clone(), header_blocks, rx);
+        let h = run_assembler_thread_bgzf(
+            tmp.clone(),
+            out.clone(),
+            dir.clone(),
+            header_blocks,
+            rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
         tx.send(ContigShardRange {
             first_shard_id: 0,
             end_shard_id: 1,
@@ -1496,6 +1601,78 @@ mod tests {
         let total = h.join().unwrap().unwrap();
         assert_eq!(total, 3);
         assert_eq!(gunzip_to_string(&out), "##header\n#CHROM\na\nb\nc\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assembler_discards_partial_output_when_not_finalized() {
+        // On a mid-run failure the driver never sets `finalize`; the assembler must
+        // NOT finish/rename its partial temp into the final output path — it must
+        // discard the temp and produce no output file.
+        use std::io::Write;
+        let dir = unique_dir("asm_nofinal");
+        let mut f = std::fs::File::create(dir.join("partition_0000.vcf.body")).unwrap();
+        f.write_all(b"a\nb\n").unwrap();
+        let out = dir.join("out.vcf");
+        let tmp = dir.join("out.vcf.part");
+        let writer = VcfLocalWriter::with_compression(&tmp, VcfCompressionType::Plain).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = run_assembler_thread(
+            writer,
+            out.clone(),
+            tmp.clone(),
+            dir.clone(),
+            rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)), // driver "failed"
+        );
+        tx.send(ContigShardRange {
+            first_shard_id: 0,
+            end_shard_id: 1,
+            output_lines: 2,
+        })
+        .unwrap();
+        drop(tx); // channel closes, but finalize == false
+        let total = h.join().unwrap().unwrap();
+        assert_eq!(total, 0, "no rows finalized on failure");
+        assert!(!out.exists(), "final output must NOT be created on failure");
+        assert!(!tmp.exists(), "temp .part must be cleaned up on failure");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assembler_bgzf_errors_on_shard_missing_eof_marker() {
+        // A shard that does not end with the canonical 28-byte BGZF EOF marker must
+        // produce a runtime error (not silent truncation) — the check must hold in
+        // release builds too, so it cannot be a debug_assert.
+        use std::io::Write;
+        let dir = unique_dir("asm_bgzf_badeof");
+        let mut f = std::fs::File::create(dir.join("partition_0000.vcf.body")).unwrap();
+        f.write_all(b"this shard does not end with the bgzf eof marker")
+            .unwrap();
+        let out = dir.join("out.vcf.gz");
+        let tmp = dir.join("out.vcf.gz.part");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = run_assembler_thread_bgzf(
+            tmp,
+            out.clone(),
+            dir.clone(),
+            Vec::new(),
+            rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        tx.send(ContigShardRange {
+            first_shard_id: 0,
+            end_shard_id: 1,
+            output_lines: 1,
+        })
+        .unwrap();
+        drop(tx);
+        let res = h.join().unwrap();
+        assert!(
+            res.is_err(),
+            "must error on a shard without the canonical EOF marker"
+        );
+        assert!(!out.exists(), "no output file on error");
         std::fs::remove_dir_all(&dir).ok();
     }
 
