@@ -27,7 +27,7 @@ repeatable "add a plugin" workflow on top of it.
 |---|---|
 | Deliverable | Rust subsystem **and** Claude Code skill, co-designed |
 | Plugin data model | Generic / self-describing: plugin declares key columns + value columns |
-| Ingestion | DataFusion table via sibling `datafusion-bio-format-vep-plugin` (`PluginSourceKind` / `register_plugin_source` / `select_query`), or an arbitrary pre-registered table/SQL |
+| Ingestion | **Declarative source manifest** (§6.1): names a table provider (bio-formats `VcfTableProvider`, or builtin DataFusion CSV/TSV/Parquet) + provider params + input schema + ingest `SELECT` + coordinate system. The cache builder standardizes any declared source into tiered Parquet — no per-plugin Rust for the common case. The sibling `PluginSourceKind`s become shipped **preset** source manifests. |
 | Tiering on variation miss | **Cold** (tier 1). Warm (tier 0) = joins variation with max global AF ≥ `WARM_AF_THRESHOLD` (0.01). Consistent with variation. |
 | Key columns | **Shared with the variation cache verbatim**: `chrom` (Utf8), `start`/`end` (UInt32), `allele_string` (Utf8, `ref/alt`). Point-lookup key `(chrom, start)` via `encode_position_key`; alleles disambiguated by `allele_string`. |
 | Frequency join granularity | **Allele-level** LEFT JOIN on the shared key `(chrom, start, allele_string)`; AF used only to derive tier, **not stored** in the plugin cache |
@@ -37,15 +37,16 @@ repeatable "add a plugin" workflow on top of it.
 ## 3. Component boundaries & data flow
 
 ```
-                 sibling repo                          this repo
+           source manifest (§6.1)                     this repo
 ┌─────────────────────────────────┐   ┌──────────────────────────────────────────┐
-│ datafusion-bio-format-vep-plugin │   │  bio-function-vep                        │
-│  PluginSourceKind / register_    │   │                                          │
-│  plugin_source / select_query    │   │  ┌── plugin_cache/ (new module) ──────┐  │
-│  → normalized DataFusion table   │──▶│  │ build.rs   : tiered per-chrom build │  │
-│    (chrom,pos,ref,alt,values…)   │   │  │ join.rs    : variation-freq join    │  │
+│ provider + params + input schema │   │  bio-function-vep                        │
+│ + ingest_sql + coordinate_system │   │  ┌── plugin_cache/ (new module) ──────┐  │
+│                                  │   │  │ source.rs  : manifest + provider    │  │
+│ providers resolve via factory:   │──▶│  │              factory + ingest view  │  │
+│  vcf/bed → bio-formats (sibling) │   │  │ build.rs   : tiered per-chrom build │  │
+│  csv/tsv/parquet → builtin DF    │   │  │ join.rs    : variation-freq join    │  │
 └─────────────────────────────────┘   │  │ lookup.rs  : per-variant point-look │  │
-                                        │  │ manifest.rs: plugin manifest r/w    │  │
+                                        │  │ manifest.rs: cache manifest r/w     │  │
                                         │  └─────────────────────────────────────┘  │
                                         │        │ reuses cache_common::             │
                                         │        │  {max_global_af, select_warm…}   │
@@ -54,16 +55,16 @@ repeatable "add a plugin" workflow on top of it.
                                         └──────────────────────────────────────────┘
 ```
 
-**Build data flow:** sibling crate registers the raw source →
-`select_query` normalizes to the **shared key columns** plus values
-(`chrom, start, end, allele_string, values…` — §3.2) →
+**Build data flow:** the source manifest's provider factory registers the raw
+table(s) → `ingest_sql` normalizes to the **shared key columns** plus values
+(`chrom, start, end, allele_string, values…` — §3.2) → the builder's shared wrapper
+applies `canonical_contig` + coordinate shift (§3.3) →
 `plugin_cache::join::join_variation_frequency` LEFT-joins each row's
 `(chrom, start, allele_string)` to the variation shard for that chrom, pulls
 `max_global_af`, derives `tier` (AF ≥ 0.01 → warm/0, else / no-match → cold/1),
 **discards AF** → streaming writer emits `plugin/<name>/<chrom>.parquet` physically
-ordered `(tier, start)` and PageDir-indexed (§4.3) → per-plugin
-`manifest.json` records source kind, key columns, value→CSQ mapping, and per-chrom
-row/tier counts.
+ordered `(tier, start)` and PageDir-indexed (§4.3) → the **cache manifest** (§6.2)
+records value→CSQ mapping and per-chrom row/tier counts.
 
 **Runtime data flow:** at annotation, for each enabled plugin (discovered by
 manifest scan), an independent PageDir point-lookup — a clone of the variation
@@ -89,12 +90,14 @@ plugin_<name>_src_<part>             # multi-file source (part ∈ snv, indel, �
 e.g. `plugin_cadd_src_snv`, `plugin_cadd_src_indel`, `plugin_clinvar_src`,
 `plugin_dbnsfp_src`.
 
-**2. Ingest view** — a `CREATE VIEW` applying the source's normalization projection
-(`select_query` / `cadd_union_query`) over the raw table(s), exposing **only** the
-ingest-ready columns and nothing else. The projection maps the raw source columns
-onto the shared key convention (§3.2) — `pos → start`/`end`, `ref`/`alt` →
-`allele_string` — **standardizes contig names and coordinates to match the
-variation cache** (§3.3), then appends the plugin's value columns:
+**2. Ingest view** — a `CREATE VIEW` whose definition is the **source manifest's
+`ingest_sql`** (§6.1) over the raw table(s), exposing **only** the ingest-ready
+columns and nothing else. The `SELECT` maps the raw source columns onto the shared
+key convention (§3.2) — `pos → start`/`end`, `ref`/`alt` → `allele_string` — and
+appends the plugin's value columns. The cache builder then wraps this view in a
+**standard normalization projection** that applies `canonical_contig(...)` and the
+coordinate shift (§3.3), so contig/coordinate standardization is one shared step
+rather than re-authored per source:
 
 ```
 plugin_<name>_ingest                 # (chrom, start, end, allele_string, <value columns…>)
@@ -114,11 +117,10 @@ e.g. `plugin_cadd_ingest`, `plugin_dbnsfp_ingest`.
   exactly the manifest's `key_columns` + `value_columns` — a mismatch is a
   build-time assertion.
 
-**Follow-up on sibling PR #177.** `select_query` / `cadd_union_query` currently
-hardcode `FROM source` / `FROM source_snv`. To honor this convention they must
-reference `plugin_<name>_src[...]` — either templated on the registered raw-table
-name, or the builder registers the raw table(s) under those names before creating
-the view.
+**Follow-up on sibling PR #177.** Its `select_query` / `cadd_union_query` SQL is the
+raw material for the 5 **preset** source manifests' `ingest_sql` (§6.1), but it
+hardcodes `FROM source` / `FROM source_snv`. When lifted into preset manifests it
+must reference `plugin_<name>_src[...]` to match the registered raw-table names.
 
 ### 3.2 Key column convention (shared with the variation cache)
 
@@ -156,17 +158,21 @@ columns as CSQ fields, and the annotated VCF already carries the alleles. A plug
 that genuinely needs `ref`/`alt` as *output* can still declare them as
 `value_columns`; as the *key*, `allele_string` is the single shared form.
 
-### 3.3 Contig & coordinate normalization (in the `_ingest` view)
+### 3.3 Contig & coordinate normalization (builder wrapper over the `_ingest` view)
 
 The frequency join (§4.1) matches plugin rows against the variation shard **on the
 `chrom` column literally**, and the runtime probe shares the variation position-key
-space — so the `_ingest` view must emit `chrom`, `start`, `end` in exactly the form
-the variation cache uses, not the source's raw form. This normalization lives in
-the view (SQL), so no downstream stage ever sees a source-specific contig style or
-coordinate basis.
+space — so the ingested rows must carry `chrom`, `start`, `end` in exactly the form
+the variation cache uses, not the source's raw form. The cache builder applies this
+as a **single shared normalization projection wrapped over the `_ingest` view**,
+driven by the source manifest's `coordinate_system` (§6.1) and the
+`canonical_contig` UDF — so it is written *once* and applied identically to every
+plugin, and no downstream stage ever sees a source-specific contig style or
+coordinate basis. `ingest_sql` therefore stays focused on column mapping; it does
+not re-implement contig/coordinate rules.
 
 **Contig standardization.** Plugin sources arrive in mixed styles — `chr1` (UCSC /
-many VCFs), `1` (Ensembl), `chrM` / `M` / `chrMT` (mitochondria). The view maps
+many VCFs), `1` (Ensembl), `chrM` / `M` / `chrMT` (mitochondria). The wrapper maps
 each to the **bare Ensembl form the variation `chrom` column stores** (`1`…`22`,
 `X`, `Y`, `MT`): strip any `chr` prefix, fold `M`/`chrM`/`chrMT` → `MT`, uppercase
 `X`/`Y`. (Note: the *shard filename* still uses `canonical_chrom_label`
@@ -175,10 +181,11 @@ filename form.)
 
 - **Reusable component.** A single `canonical_contig(chrom) -> Utf8` scalar UDF,
   backed by the same canonicalization as `cache::key_encoding::chrom_code` /
-  `manifest::canonical_chrom_label`, is registered once and used by **every**
-  `_ingest` view. This guarantees plugin and variation agree on contig spelling by
-  construction rather than by each source's SQL getting it right independently. It
-  is the contig-side sibling of `join_variation_frequency`'s shared tiering.
+  `manifest::canonical_chrom_label`, is registered once and applied by the shared
+  normalization wrapper for **every** plugin. This guarantees plugin and variation
+  agree on contig spelling by construction rather than by each source's SQL getting
+  it right independently. It is the contig-side sibling of
+  `join_variation_frequency`'s shared tiering.
 - **Correctness note.** `encode_position_key` already strips `chr` at runtime, so a
   probe would tolerate a mismatched prefix — but the *build-time* join is a plain
   column equality and would silently drop every row on a `chr1` vs `1` mismatch.
@@ -187,11 +194,11 @@ filename form.)
   plugin fields).
 
 **Coordinate standardization.** Variation `start`/`end` are **1-based** `UInt32`.
-The view converts the source's basis to match: 1-based sources (VCF POS, CADD,
-dbNSFP `pos(1-based)`, AlphaMissense) pass through with a `UInt32` cast; a 0-based
-half-open source (BED-like) shifts `start + 1`. Point plugins set
-`start == end == pos`; interval plugins carry the true 1-based span. The source's
-coordinate basis is declared per source kind so the view applies the right shift.
+The wrapper converts the source's basis to match, driven by the manifest's
+`coordinate_system`: `1-based` sources (VCF POS, CADD, dbNSFP `pos(1-based)`,
+AlphaMissense) pass through with a `UInt32` cast; a `0-based-half-open` source
+(BED-like) shifts `start + 1`. Point plugins set `start == end == pos`; interval
+plugins carry the true 1-based span.
 
 ## 4. Build pipeline & reusable join component
 
@@ -215,7 +222,21 @@ join_variation_frequency(
 
 ### 4.2 `plugin_cache::build`
 
-Mirrors `build_parquet_variation_chrom` (`cache/build.rs`) almost exactly:
+Driven by the source manifest (§6.1), per chrom:
+
+1. **Register sources.** For each `[[source]]`, the provider factory (§6.1)
+   registers `plugin_<name>_src[_<part>]` from the declared provider + params +
+   input schema.
+2. **Create the ingest view.** `CREATE VIEW plugin_<name>_ingest AS <ingest_sql>`.
+3. **Normalize.** Wrap the view in the shared normalization projection
+   (`canonical_contig`, coordinate shift from `coordinate_system` — §3.3), filtered
+   to the target chrom.
+4. **Join + tier.** Feed the normalized stream through `join_variation_frequency`
+   (§4.1) to derive `tier` (AF discarded).
+5. **Write.** Stream to `plugin/<name>/<chrom>.parquet` via the tiered writer.
+6. **Emit the cache manifest** (§6.2) with per-chrom row/tier counts.
+
+Steps 4–6 mirror `build_parquet_variation_chrom` (`cache/build.rs`) almost exactly:
 
 - Two ordered passes: warm (0) first, cold (1) second; a chrom with no warm rows
   writes a single cold pass — same `passes` logic as the variation builder.
@@ -289,15 +310,106 @@ thread budget exactly as the variation point-lookup does. N enabled plugins add 
 independent, cheap-on-cold-miss probes per variant; they must not spawn their own
 pools.
 
-## 6. Plugin manifest
+## 6. Manifests
 
-One `manifest.json` per plugin under `plugin/<name>/`, discovered at runtime by
-scanning `plugin/*/manifest.json`:
+Two manifests bracket the build: the **source manifest** is the declarative build
+*input* (how to read and normalize a source), and the **cache manifest** is the
+build *output* (what was built, for runtime discovery). Keeping them separate means
+the runtime never parses provider/SQL details, and a rebuild is fully described by
+the source manifest.
+
+### 6.1 Source manifest (build input)
+
+A per-plugin TOML declaring the provider(s), input schema, ingest `SELECT`,
+coordinate system, value→CSQ mapping, and tier policy. The cache builder consumes
+it end-to-end — **no per-plugin Rust for the common case**.
+
+```toml
+plugin_name       = "cadd"
+coordinate_system = "1-based"          # or "0-based-half-open"; drives the start shift (§3.3)
+
+# One or more raw sources → registered as plugin_<name>_src[_<part>] (§3.1).
+[[source]]
+part     = "snv"                       # optional; omit for a single-file source
+provider = "csv"                       # "vcf" (bio-formats) | "csv"/"tsv" | "parquet" | "bed"
+path     = "…/whole_genome_SNVs.tsv.gz"
+  [source.csv]                         # provider params (CSV/TSV family)
+  delimiter   = "\t"
+  has_header  = false
+  comment     = "#"
+  compression = "gzip"
+  # Explicit input schema for headerless/typed TSV (dbNSFP, CADD).
+  schema = [
+    { name = "chrom", type = "Utf8" },
+    { name = "pos",   type = "Utf8" },
+    { name = "ref",   type = "Utf8" },
+    { name = "alt",   type = "Utf8" },
+    { name = "rawscore", type = "Utf8" },
+    { name = "phred",    type = "Utf8" },
+  ]
+
+[[source]]
+part = "indel"
+provider = "csv"
+path = "…/InDels.tsv.gz"
+  # …same csv params + schema…
+
+# The ingest view SELECT (§3.1). Maps raw cols → shared key cols + values, in the
+# source's own contig-style/coordinate-basis; the builder applies canonical_contig
+# + the coordinate shift as a shared wrapper (§3.3), so this SQL stays focused on
+# column mapping (INFO parsing, split_part, unions, unnest for multi-allelic, …).
+ingest_sql = """
+SELECT chrom, CAST(pos AS INTEGER) AS start, CAST(pos AS INTEGER) AS end,
+       concat(ref, '/', alt) AS allele_string,
+       CAST(rawscore AS FLOAT) AS raw_score, CAST(phred AS FLOAT) AS phred_score
+FROM plugin_cadd_src_snv
+UNION ALL
+SELECT chrom, CAST(pos AS INTEGER) AS start, CAST(pos AS INTEGER) AS end,
+       concat(ref, '/', alt) AS allele_string,
+       CAST(rawscore AS FLOAT) AS raw_score, CAST(phred AS FLOAT) AS phred_score
+FROM plugin_cadd_src_indel
+"""
+
+[[value_columns]]
+column = "raw_score";   csq_field = "CADD_RAW";   type = "Float32"
+[[value_columns]]
+column = "phred_score"; csq_field = "CADD_PHRED"; type = "Float32"
+
+[tier]
+threshold = 0.01
+unmatched = "cold"
+```
+
+**Provider factory.** `provider` names map to a constructor via a small factory:
+
+| `provider` | Backed by | Params (`[source.<provider>]`) |
+|---|---|---|
+| `vcf` | bio-formats `VcfTableProvider` (sibling crate) | INFO fields, etc. |
+| `csv` / `tsv` | builtin `ctx.register_csv` + `CsvReadOptions` | `delimiter`, `has_header`, `comment`, `compression`, `schema` |
+| `parquet` | builtin `ctx.register_parquet` | — |
+| `bed` | bio-formats BED provider (sibling crate) | — |
+
+Bio-formats providers delegate to the sibling crate (which owns those deps);
+builtin providers are registered directly by this repo's build code. The factory
+is the single extension point — a brand-new *format* adds a provider arm here (and,
+if it's a bio-formats reader, in the sibling crate), not a new plugin-specific code
+path. The 5 sibling `PluginSourceKind`s ship as **preset source manifests** built
+on this factory.
+
+**Escape hatch.** Row transforms not expressible in `ingest_sql` (SQL `unnest` for
+multi-allelic split covers most) fall back to a sibling-crate Rust normalizer
+referenced by name — the manifest-first-with-trait-escape spirit, used only when
+SQL cannot.
+
+### 6.2 Cache manifest (build output)
+
+One `manifest.json` per plugin under `plugin/<name>/`, **emitted by the build** and
+discovered at runtime by scanning `plugin/*/manifest.json`:
 
 ```json
 {
   "plugin_name": "cadd",
-  "source_kind": "cadd",
+  "source_manifest": "cadd.source.toml",
   "key_columns": ["chrom", "start", "end", "allele_string"],
   "value_columns": [
     { "column": "raw_score",   "csq_field": "CADD_RAW",   "type": "Float32" },
@@ -309,33 +421,28 @@ scanning `plugin/*/manifest.json`:
 }
 ```
 
-- `source_kind` is a `PluginSourceKind` in the sibling crate, or `"table"` for an
-  arbitrary pre-registered/SQL source.
-- `value_columns` is the **single source of truth** for both the shard's value
-  schema and the emitted CSQ fields — build and runtime read the same list, so
-  they cannot drift.
-- `tier` records the policy actually used, so a rebuild with a different threshold
-  is self-describing.
+- `value_columns` (copied from the source manifest) is the **single source of
+  truth** for both the shard's value schema and the emitted CSQ fields — build and
+  runtime read the same list, so they cannot drift.
+- `tier` records the policy actually used, so a rebuild is self-describing.
+- `source_manifest` back-references the input that produced the cache.
 
 ## 7. Claude Code skill: `vep-add-plugin`
 
 A markdown workflow skill (sibling to `vep-perf-profiling`) packaging the
 end-to-end process as a short decision tree plus exact file:line touch-points:
 
-1. **Decide the source.** One of the 5 known `PluginSourceKind`s → skip to step 3;
-   a new format → step 2.
-2. **(New source only) add a source kind** in `datafusion-bio-format-vep-plugin`:
-   `PluginSourceKind` variant + `register_plugin_source` arm registering
-   `plugin_<name>_src[...]` (§3.1) + `select_query` whose `_ingest` view normalizes
-   to the shared key columns `(chrom, start, end, allele_string, values…)` (§3.2),
-   merging `ref`/`alt` into `allele_string`, applying `canonical_contig(...)` and
-   the source's coordinate shift (§3.3). The checklist requires declaring the
-   source's **contig style** and **coordinate basis** so the view normalizes both
-   to the variation convention.
-3. **Author the manifest** (§6) — value→CSQ mapping and tier policy.
-4. **Build** per-chrom for the target chroms; skill documents the driver
-   invocation.
-5. **Parity-gate** (§8): golden VEP comparison for the plugin's CSQ fields on a
+1. **Author the source manifest** (§6.1) — the primary and usually only step:
+   declare provider(s) + params, input schema (for CSV/TSV), `ingest_sql` mapping
+   raw columns → `(chrom, start, end, allele_string, values…)`, `coordinate_system`,
+   value→CSQ mapping, and tier policy. Ship it as a preset or keep it alongside the
+   plugin's data.
+2. **(New *format* only) add a provider arm** to the factory (§6.1) — and, if it's
+   a bio-formats reader, in `datafusion-bio-format-vep-plugin`. Not needed when the
+   source is VCF / CSV / TSV / Parquet / BED (already covered).
+3. **Build** per-chrom for the target chroms; skill documents the driver invocation
+   (which reads the source manifest and emits the cache manifest).
+4. **Parity-gate** (§8): golden VEP comparison for the plugin's CSQ fields on a
    test chrom; confirm 100% before wiring into production.
 
 The skill stays a thin wrapper over the real subsystem — it does not embed logic
@@ -358,13 +465,28 @@ that belongs in Rust.
 - **Byte-identity across workers:** w1 vs w4 body-identical, per the existing
   parallel-annotation invariants.
 
-## 9. Non-goals (YAGNI)
+## 9. Scope & non-goals (YAGNI)
 
+**Target class.** The Ensembl VEP_plugins survey shows the dominant, highest-value
+class is **per-variant scoring** (CADD, REVEL, dbNSFP, SpliceAI, AlphaMissense,
+PrimateAI, gnomAD-style) — tabular VCF/TSV/BED keyed by `chrom/pos/ref/alt`. This
+design targets that class directly via the shared `(chrom, start, allele_string)`
+key and the frequency join.
+
+**Non-goals:**
+
+- **Per-gene / per-transcript plugins** (LOEUF, pLI, G2P, GO, Phenotypes) are **out
+  of scope**: they key by gene/transcript ID, not genomic position, so neither the
+  variation frequency join nor the position point-lookup applies. They would need a
+  separate gene-keyed mechanism.
+- **Per-interval / overlap plugins** (Conservation, regulatory tracks) are
+  structurally supported by `start`/`end`, but frequency-tiering degrades to the
+  interval's start position; treat as a secondary case, not the primary target.
 - No merged/bundled wide plugin shard (Section-3 option 2/3): revisit only if
   per-variant N-lookup cost is measured to matter for the hot production set.
 - No storing of joined AF in the plugin cache: runtime already gets frequency from
   the variation lookup.
-- No plugin-defined custom transform code in this repo: source-format quirks live
-  in the sibling crate's `select_query`; this repo treats the normalized table
-  generically.
+- No per-plugin Rust transform in this repo for the common case: normalization is
+  declarative (`ingest_sql` + the shared wrapper); a sibling-crate Rust normalizer
+  is the escape hatch only when SQL cannot express the transform (§6.1).
 ```
