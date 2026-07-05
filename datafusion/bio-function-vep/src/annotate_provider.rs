@@ -11417,6 +11417,18 @@ fn poll_lookup_fan_in(
     Poll::Pending
 }
 
+/// Whether `poll_lookup_partitions` may hand control back to the outer serial
+/// loop with a partially-filled (sub-window) buffer when the lookup stalls
+/// (Poll::Pending) after this poll already grabbed >=1 batch. Safe ONLY when
+/// there is in-flight annotation work the outer loop can drain — then it makes
+/// progress and re-polls the lookup. With nothing in flight, yielding a partial
+/// buffer is misread as "contig done" (no full window + empty inflight), which
+/// aborts the still-running lookup and truncates the contig; the caller must
+/// park with a waker (`start_lookup_waits` + Poll::Pending) and keep pulling.
+fn may_yield_partial_buffer(made_progress: bool, has_inflight: bool) -> bool {
+    made_progress && has_inflight
+}
+
 fn poll_lookup_partitions(
     ann: &mut ContigAnnotationState,
     cx: &mut TaskCtx<'_>,
@@ -11442,7 +11454,10 @@ fn poll_lookup_partitions(
             Poll::Pending => {
                 record_lookup_fan_in_profile(&profile, &ann.lookup_partitions);
                 let ordered_blocked = ann.lookup_partitions.has_buffered_after_next();
-                if made_progress {
+                // Only yield a partial buffer when there is in-flight work to
+                // drain; otherwise park (below) so the contig resumes when more
+                // lookup batches arrive rather than being falsely finalized.
+                if may_yield_partial_buffer(made_progress, !ann.inflight.is_empty()) {
                     return Poll::Ready(Ok(()));
                 }
                 if ordered_blocked {
@@ -12643,6 +12658,28 @@ mod tests {
     use crate::transcript_consequence::{
         CachedPredictions, FeatureType, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
     };
+
+    // Regression: the serial (workers==1) AnnotatingContig loop truncated a
+    // contig at ~one buffer when a lookup stall arrived mid-buffer-fill after the
+    // poll had already grabbed >=1 batch (`made_progress`) with nothing in
+    // flight. `poll_lookup_partitions` returned Ready(Ok(())) with a sub-window
+    // buffer and no waker; the outer loop then saw no full window + empty inflight
+    // and misread it as "contig done", aborting the still-running lookup.
+    //
+    // The gate below decides whether yielding a partial buffer is safe: ONLY when
+    // there is in-flight annotation work the outer loop can drain (so it makes
+    // progress and re-polls). With nothing in flight, the caller MUST park with a
+    // waker instead of yielding — else the contig is falsely finalized.
+    #[test]
+    fn partial_buffer_yield_requires_inflight_work() {
+        // The bug case: progress made, nothing in flight → must NOT yield.
+        assert!(!may_yield_partial_buffer(true, false));
+        // Safe: progress made, in-flight window to drain → yield is fine.
+        assert!(may_yield_partial_buffer(true, true));
+        // No progress → always park (waker armed), regardless of inflight.
+        assert!(!may_yield_partial_buffer(false, false));
+        assert!(!may_yield_partial_buffer(false, true));
+    }
 
     /// `colocated::AF_COL_NAMES` is maintained by hand alongside `AF_COLUMNS`
     /// here, and the two must stay in the same order (the colocated AF lookup
