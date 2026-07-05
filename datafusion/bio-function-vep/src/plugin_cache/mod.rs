@@ -11,3 +11,4 @@ pub mod join;
 pub mod normalize;
 pub mod provider;
 pub mod source_manifest;
+pub mod write;
