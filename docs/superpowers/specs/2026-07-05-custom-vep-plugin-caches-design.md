@@ -30,7 +30,8 @@ repeatable "add a plugin" workflow on top of it.
 | Ingestion | **Declarative source manifest** (§6.1): names a table provider (bio-formats `VcfTableProvider`, or builtin DataFusion CSV/TSV/Parquet) + provider params + input schema + ingest `SELECT` + coordinate system. The cache builder standardizes any declared source into tiered Parquet — no per-plugin Rust for the common case. The sibling `PluginSourceKind`s become shipped **preset** source manifests. |
 | Manifest catalog | Source manifests live in a dedicated repo **`biodatageeks/vepyr-plugins`** (§6.3), **TOML** format, pinned by commit/tag — the declarative analog of Ensembl `VEP_plugins`. Built Parquet caches are never committed. |
 | Tiering on variation miss | **Cold** (tier 1). Warm (tier 0) = joins variation with max global AF ≥ `WARM_AF_THRESHOLD` (0.01). Consistent with variation. |
-| Key columns | **Shared with the variation cache verbatim**: `chrom` (Utf8), `start`/`end` (UInt32), `allele_string` (Utf8, `ref/alt`). Point-lookup key `(chrom, start)` via `encode_position_key`; alleles disambiguated by `allele_string`. |
+| Key columns | **Shared with the variation cache verbatim**: `chrom` (Utf8), `start`/`end` (UInt32), `allele_string` (Utf8, `ref/alt`). Point-lookup key `(chrom, start)` via `encode_position_key`; alleles disambiguated by `allele_string`. Plus optional **per-transcript match columns** (§3.4). |
+| Per-transcript matching | Optional `[[match_column]]` discriminator(s) bound to a per-transcript engine attribute (e.g. AlphaMissense `protein_variant` ← `amino_acid_change`). Extends the lookup key so a variant scored differently per transcript (multi-isoform genes) resolves correctly; a no-match (non-missense → no aa-change) emits empty, mirroring VEP's missense gating. See §3.4. |
 | Frequency join granularity | **Allele-level** LEFT JOIN on the shared key `(chrom, start, allele_string)`; AF used only to derive tier, **not stored** in the plugin cache |
 | Runtime layout | **One tiered dataset per plugin** — `plugin/<name>/<chrom>.parquet`, independent PageDir point-lookup (clone of variation lookup path) |
 | Declaration | **Manifest per plugin cache** (`plugin/<name>/manifest.json`), discovered at runtime by scanning `plugin/*/manifest.json` (mirrors `CHROM_MANIFEST_FILE`) |
@@ -200,6 +201,40 @@ The wrapper converts the source's basis to match, driven by the manifest's
 AlphaMissense) pass through with a `UInt32` cast; a `0-based-half-open` source
 (BED-like) shifts `start + 1`. Point plugins set `start == end == pos`; interval
 plugins carry the true 1-based span.
+
+### 3.4 Per-transcript match discriminator
+
+Some scores are per-**transcript**, not per-variant: a genomic variant maps to
+different amino-acid changes in different transcripts, each with its own score
+(AlphaMissense, dbNSFP). Ensembl VEP resolves this by matching each transcript
+consequence's amino-acid change against the source row's `protein_variant`
+(`_aminoacid_changes_match`, `transcript_match=0` by default) and emitting only on
+`missense_variant`.
+
+The plugin cache models this with an optional **match column**: a discriminator
+that (a) is stored in the shard as part of the lookup key, and (b) is supplied at
+runtime from a named per-transcript **engine attribute**.
+
+```toml
+[[match_column]]
+column      = "protein_variant"     # produced by ingest_sql, stored in the key
+engine_attr = "amino_acid_change"   # runtime value per transcript: {refAA}{protpos}{altAA}
+```
+
+- **Cache key** becomes `(chrom, start, allele_string, <match columns…>)`; the
+  build dedups on the full key. Multiple rows per `(start, allele_string)` with
+  distinct `protein_variant` are all kept (the multi-isoform case).
+- **Tiering is unchanged**: the frequency join is still on
+  `(chrom, start, allele_string)`, so every match-column row at a genomic variant
+  shares that variant's tier.
+- **Runtime probe moves into the per-transcript loop.** The engine forms
+  `amino_acid_change` from its existing `amino_acids` (`"V/A"`) + `protein_position`
+  (`"550"`) → `"V550A"` and probes `(start, allele_string, "V550A")`. A miss —
+  including every non-missense consequence, which has no aa-change — emits VEP's
+  empty value, so **missense gating falls out for free**.
+- **Pure per-variant plugins** (CADD, ClinVar) declare no `match_column`; their
+  probe is the plain `(start, allele_string)` key. The engine attribute registry
+  is the single extension point for new discriminators.
 
 ## 4. Build pipeline & reusable join component
 
