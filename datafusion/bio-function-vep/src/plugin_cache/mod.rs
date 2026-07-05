@@ -7,5 +7,6 @@
 //! (AF discarded), and writes `plugin/<name>/<chrom>.parquet` reusing the
 //! variation shard's lookup-optimized writer properties.
 
+pub mod normalize;
 pub mod provider;
 pub mod source_manifest;
