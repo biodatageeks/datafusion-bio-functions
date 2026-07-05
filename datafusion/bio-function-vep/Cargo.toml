@@ -58,6 +58,10 @@ name = "build_plugin"
 required-features = ["parquet-cache"]
 
 [[example]]
+name = "annotate_vcf"
+required-features = ["parquet-cache"]
+
+[[example]]
 name = "build_parquet_variation_chrom"
 required-features = ["parquet-cache", "cache-builder"]
 
