@@ -59,6 +59,8 @@ pub(crate) mod ordered_drain;
 pub mod parquet_cache;
 pub mod partitioned_cache;
 pub(crate) mod pipeline_trace;
+#[cfg(feature = "parquet-cache")]
+pub mod plugin_cache;
 pub mod schema_contract;
 pub mod sift_decode;
 pub mod so_terms;
