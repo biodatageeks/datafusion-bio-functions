@@ -68,13 +68,60 @@ manifest scan), an independent PageDir point-lookup — a clone of the variation
 lookup path — fetches the variant's value row and injects its values into the
 plugin's declared CSQ output fields; a miss emits VEP's empty/`.` value.
 
+### 3.1 Table & view naming convention
+
+Each plugin source registers **two** objects in the build `SessionContext`: a raw
+table over the source file(s), and a view exposing only the ingest-ready columns.
+The view is the single contract the cache builder reads from — all source-format
+quirks stay quarantined behind it.
+
+**1. Raw source table** — registered by the sibling crate directly over the source
+file(s), columns verbatim (lowercased header fields, source quirks intact — e.g.
+`pos(1-based)`, `gerp++_rs`, VCF INFO arrays):
+
+```
+plugin_<name>_src                    # single-file source
+plugin_<name>_src_<part>             # multi-file source (part ∈ snv, indel, …)
+```
+
+e.g. `plugin_cadd_src_snv`, `plugin_cadd_src_indel`, `plugin_clinvar_src`,
+`plugin_dbnsfp_src`.
+
+**2. Ingest view** — a `CREATE VIEW` applying the source's normalization projection
+(`select_query` / `cadd_union_query`) over the raw table(s), exposing **only** the
+ingest-ready columns and nothing else:
+
+```
+plugin_<name>_ingest                 # (chrom, pos, ref, alt, <value columns…>)
+```
+
+e.g. `plugin_cadd_ingest`, `plugin_dbnsfp_ingest`.
+
+**Rationale.**
+
+- **`plugin_` namespace** avoids collision with `variation` / context /
+  `translation_sift` tables when several sources share one `SessionContext`.
+- **`_src` / `_ingest` suffix pair** makes the raw→ready relationship read at a
+  glance; the `_<part>` slot handles multi-file sources (CADD SNV+indel) that
+  union into the single `_ingest` view.
+- **The cache builder touches only the view.** `join_variation_frequency` reads
+  `plugin_<name>_ingest`; it never sees a raw column name. The view's column set is
+  exactly the manifest's `key_columns` + `value_columns` — a mismatch is a
+  build-time assertion.
+
+**Follow-up on sibling PR #177.** `select_query` / `cadd_union_query` currently
+hardcode `FROM source` / `FROM source_snv`. To honor this convention they must
+reference `plugin_<name>_src[...]` — either templated on the registered raw-table
+name, or the builder registers the raw table(s) under those names before creating
+the view.
+
 ## 4. Build pipeline & reusable join component
 
 ### 4.1 `plugin_cache::join::join_variation_frequency`
 
 ```
 join_variation_frequency(
-    plugin_stream: SendableRecordBatchStream,  // (chrom,pos,ref,alt,values…)
+    plugin_stream: SendableRecordBatchStream,  // from plugin_<name>_ingest: (chrom,pos,ref,alt,values…)
     variation_shard: &Path,                     // variation/<chrom>.parquet
     threshold: f64,                             // WARM_AF_THRESHOLD (0.01)
 ) -> SendableRecordBatchStream                  // …values… + tier:Int8
