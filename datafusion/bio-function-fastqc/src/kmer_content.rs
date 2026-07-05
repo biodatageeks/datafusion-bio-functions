@@ -36,7 +36,8 @@ impl Kmer {
 pub struct KmerContent {
     skip_count: u64,
     longest_sequence: usize,
-    /// total k-mers observed at each start position (INCLUDING N-containing ones)
+    /// total k-mers observed at each start position (EXCLUDING N-containing ones,
+    /// matching FastQC's `Kmer.addKmerCount`, which returns before incrementing)
     total_at_position: Vec<u64>,
     kmers: HashMap<[u8; KMER_SIZE], Kmer>,
 }
@@ -81,16 +82,18 @@ impl QcModule for KmerContent {
             return;
         }
         for i in 0..=(seq.len() - KMER_SIZE) {
-            // addKmerCount runs BEFORE the N check, so totals include N k-mers.
+            let window = &seq[i..i + KMER_SIZE];
+            // FastQC's addKmerCount returns before incrementing totalKmerCounts when the
+            // k-mer contains N, so N-containing windows are excluded from the per-position
+            // totals (counting them would inflate the denominator and depress obs/exp).
+            if window.contains(&b'N') {
+                continue;
+            }
             if self.total_at_position.len() <= i {
                 self.total_at_position.resize(i + 1, 0);
             }
             self.total_at_position[i] += 1;
 
-            let window = &seq[i..i + KMER_SIZE];
-            if window.contains(&b'N') {
-                continue;
-            }
             let key: [u8; KMER_SIZE] = window.try_into().unwrap();
             self.kmers.entry(key).or_default().incr(i);
         }
@@ -332,14 +335,15 @@ mod tests {
         assert_eq!(m.total_kmer_count(), (seq.len() - 7 + 1) as u64);
         assert_eq!(m.kmer_count(b"AAAAAAA"), 1);
 
-        // N-containing kmers are counted in the total but not stored per-kmer.
+        // N-containing kmers are EXCLUDED from the totals (FastQC's addKmerCount
+        // returns before incrementing) and not stored per-kmer.
         let mut m2 = KmerContent::new();
         for _ in 0..50 {
             m2.update(b"x", b"NAAAAAAA", &[b'I'; 8]); // len 8 -> windows "NAAAAAA","AAAAAAA"
         }
-        assert_eq!(m2.total_kmer_count(), 2); // both windows counted in totals
-        assert_eq!(m2.kmer_count(b"AAAAAAA"), 1); // only the non-N window stored
-        assert_eq!(m2.kmer_count(b"NAAAAAA"), 0); // N window not stored
+        assert_eq!(m2.total_kmer_count(), 1); // only the non-N window counted in totals
+        assert_eq!(m2.kmer_count(b"AAAAAAA"), 1); // the non-N window stored
+        assert_eq!(m2.kmer_count(b"NAAAAAA"), 0); // N window neither counted nor stored
     }
 
     #[test]
