@@ -97,6 +97,20 @@ impl PluginRegistry {
         self.plugins.is_empty()
     }
 
+    /// The concatenated CSQ field names for a plugin cache, read from manifests
+    /// **without opening any shard** — cheap, contig-independent, for the VCF
+    /// header. Best-effort: unreadable/absent → empty.
+    pub fn field_names(cache_root: &Path) -> Vec<String> {
+        discover_plugins(cache_root)
+            .map(|manifests| {
+                manifests
+                    .iter()
+                    .flat_map(|m| m.value_columns.iter().map(|v| v.csq_field.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Concatenated CSQ field names across all plugins, in plugin-name order.
     pub fn csq_fields(&self) -> Vec<String> {
         self.plugins

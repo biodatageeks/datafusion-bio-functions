@@ -3355,6 +3355,9 @@ pub struct AnnotateProvider {
     /// Set by the `vcf_sink` sharded-output entry to drive per-worker VCF shard
     /// writing on the `threads>1` path. `None` for the normal scan/SQL path.
     vcf_shard_ctx: Option<Arc<crate::vcf_sink::VcfShardContext>>,
+    /// Root of a custom-plugin cache (`<root>/plugin/*`). `None` = no plugins.
+    #[cfg(feature = "parquet-cache")]
+    plugin_cache_root: Option<std::path::PathBuf>,
 }
 
 impl AnnotateProvider {
@@ -3415,7 +3418,16 @@ impl AnnotateProvider {
             annotation_column_defs,
             schema: Arc::new(Schema::new(fields)),
             vcf_shard_ctx: None,
+            #[cfg(feature = "parquet-cache")]
+            plugin_cache_root: None,
         })
+    }
+
+    /// Enable a custom-plugin cache: plugin CSQ fields are appended to output.
+    #[cfg(feature = "parquet-cache")]
+    pub(crate) fn with_plugin_cache_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.plugin_cache_root = root;
+        self
     }
 
     /// Set the VCF shard context, enabling the sharded-output `threads>1` path
@@ -5206,6 +5218,8 @@ impl AnnotateProvider {
             #[cfg(feature = "parquet-cache")]
             cache_root,
             #[cfg(feature = "parquet-cache")]
+            plugin_cache_root: self.plugin_cache_root.clone(),
+            #[cfg(feature = "parquet-cache")]
             parquet_backend,
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
@@ -5247,6 +5261,9 @@ impl AnnotateProvider {
         transcript_selection: TranscriptSelectionFlags,
         pick_flags: &PickFlags,
         hgvs_reference_reader: &mut Option<FastaReader>,
+        #[cfg(feature = "parquet-cache")] plugin_registry: Option<
+            &crate::plugin_cache::registry::PluginRegistry,
+        >,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let include_pick_output = self.include_pick_output;
@@ -5278,6 +5295,27 @@ impl AnnotateProvider {
         let variation_name_idx = schema.index_of("cache_variation_name").ok();
         let cached_csq_idx = schema.index_of("cache_consequence_types").ok();
         let cached_most_idx = schema.index_of("cache_most_severe_consequence").ok();
+
+        // Custom-plugin per-buffer lookup (spec §5.2): one page-scoped take per
+        // plugin for this batch's positions; per-transcript probes happen in the
+        // CSQ emission below. `None`/0 fields ⇒ no plugins ⇒ byte-identical output.
+        #[cfg(feature = "parquet-cache")]
+        let plugin_n_fields = plugin_registry.map(|r| r.csq_fields().len()).unwrap_or(0);
+        #[cfg(feature = "parquet-cache")]
+        let plugin_slices = if let Some(reg) = plugin_registry.filter(|r| !r.is_empty()) {
+            let mut starts: Vec<u32> = (0..batch.num_rows())
+                .filter_map(|row| {
+                    u32::try_from(int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0)).ok()
+                })
+                .collect();
+            starts.sort_unstable();
+            starts.dedup();
+            Some(crate::cache::lookup_exec::block_on(
+                reg.take_buffer_all(&starts),
+            )?)
+        } else {
+            None
+        };
 
         let mut csq_builder = if skip_csq {
             StringBuilder::new()
@@ -5594,8 +5632,19 @@ impl AnnotateProvider {
             let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
             // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
             let mut row_variant: Option<VariantInput> = None;
-            let require_transcript_annotations =
-                pick_flags.requires_transcript_annotations(skip_csq, skip_typed_cols);
+            let require_transcript_annotations = {
+                let base = pick_flags.requires_transcript_annotations(skip_csq, skip_typed_cols);
+                // Plugins need per-transcript amino-acid data → force the
+                // per-transcript path (skip the single-consequence cached path).
+                #[cfg(feature = "parquet-cache")]
+                {
+                    base || plugin_n_fields > 0
+                }
+                #[cfg(not(feature = "parquet-cache"))]
+                {
+                    base
+                }
+            };
             if !skip_csq {
                 csq_buf.clear();
             }
@@ -5625,6 +5674,9 @@ impl AnnotateProvider {
                         variant_fields: &variant_fields,
                     };
                     placeholder_layout.append_entry(&mut csq_buf, &entry);
+                    // No per-transcript amino-acid change here → empty plugin fields.
+                    #[cfg(feature = "parquet-cache")]
+                    csq_buf.push_str(&crate::plugin_cache::csq::empty_suffix(plugin_n_fields));
                 }
                 most_str = most_val;
                 if let Some(started) = cached_fast_started {
@@ -6152,6 +6204,35 @@ impl AnnotateProvider {
                              {batch3_suffix}"
                             );
                         }
+                        // Per-transcript trailing custom-plugin CSQ fields (spec
+                        // §5.2). A non-missense consequence has no amino-acid change
+                        // → discriminator `None` → probe miss → empty fields (gate).
+                        #[cfg(feature = "parquet-cache")]
+                        if plugin_n_fields > 0 {
+                            let attrs = crate::plugin_cache::registry::EngineAttrs {
+                                amino_acid_change: crate::plugin_cache::csq::amino_acid_change(
+                                    amino_acids,
+                                    protein_pos,
+                                ),
+                            };
+                            let plugin_allele = format!("{input_ref}/{input_alt}");
+                            let scalars = plugin_slices
+                                .as_ref()
+                                .map(|s| {
+                                    s.probe_all(
+                                        u32::try_from(start_val).unwrap_or(0),
+                                        &plugin_allele,
+                                        &attrs,
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    vec![
+                                        crate::plugin_cache::lookup::PluginScalar::Null;
+                                        plugin_n_fields
+                                    ]
+                                });
+                            csq_buf.push_str(&crate::plugin_cache::csq::field_suffix(&scalars));
+                        }
                     }
                     if csq_buf.is_empty() {
                         if engine_profile_enabled {
@@ -6168,6 +6249,9 @@ impl AnnotateProvider {
                             variant_fields: &variant_fields,
                         };
                         placeholder_layout.append_entry(&mut csq_buf, &entry);
+                        // Intergenic/no-transcript entry → empty plugin fields.
+                        #[cfg(feature = "parquet-cache")]
+                        csq_buf.push_str(&crate::plugin_cache::csq::empty_suffix(plugin_n_fields));
                     }
                 } // end if !skip_csq (cache-miss CSQ formatting)
                 if let Some(started) = csq_format_started {
@@ -8279,6 +8363,9 @@ struct ContigAnnotationConfig {
     pick_flags: PickFlags,
     #[cfg(feature = "parquet-cache")]
     cache_root: Option<std::path::PathBuf>,
+    /// Root of a custom-plugin cache (`<root>/plugin/*`); `None` = no plugins.
+    #[cfg(feature = "parquet-cache")]
+    plugin_cache_root: Option<std::path::PathBuf>,
     /// When true, the variation lookup uses the Parquet backend (`new_parquet`)
     /// while context entities + SIFT still load from the co-located Parquet cache.
     #[cfg(feature = "parquet-cache")]
@@ -8922,6 +9009,10 @@ struct SharedContigAnnotationContext {
     engine: Arc<TranscriptConsequenceEngine>,
     #[cfg(feature = "parquet-cache")]
     sift_prediction_store: Option<SiftPredictionStoreRef>,
+    /// Per-contig custom-plugin registry (opened when `config.plugin_cache_root`
+    /// is set and non-empty); drives per-buffer plugin CSQ lookup.
+    #[cfg(feature = "parquet-cache")]
+    plugin_registry: Option<Arc<crate::plugin_cache::registry::PluginRegistry>>,
 }
 
 struct AnnotationWorkerState {
@@ -11236,6 +11327,8 @@ fn annotate_worker_window(
                 config.transcript_selection,
                 &config.pick_flags,
                 &mut worker.hgvs_reader,
+                #[cfg(feature = "parquet-cache")]
+                shared.plugin_registry.as_deref(),
             )?;
             record_contig_profile(&profile, |profile| {
                 profile.engine += engine_started.elapsed();
@@ -12466,6 +12559,20 @@ async fn prepare_contig_context(
         });
     }
 
+    // Open the per-contig custom-plugin registry when enabled and non-empty.
+    #[cfg(feature = "parquet-cache")]
+    let plugin_registry = match &config.plugin_cache_root {
+        Some(root) => {
+            let reg = crate::plugin_cache::registry::PluginRegistry::open(root, &chrom).await?;
+            if reg.is_empty() {
+                None
+            } else {
+                Some(Arc::new(reg))
+            }
+        }
+        None => None,
+    };
+
     let shared_context = Arc::new(SharedContigAnnotationContext {
         config: config.clone(),
         profile: pipeline_profile,
@@ -12486,6 +12593,8 @@ async fn prepare_contig_context(
         engine: Arc::new(engine),
         #[cfg(feature = "parquet-cache")]
         sift_prediction_store,
+        #[cfg(feature = "parquet-cache")]
+        plugin_registry,
     });
 
     // `pipeline_profile` was moved into the shared context above; use the cloned
@@ -12935,6 +13044,8 @@ mod tests {
             #[cfg(feature = "parquet-cache")]
             cache_root: None,
             #[cfg(feature = "parquet-cache")]
+            plugin_cache_root: None,
+            #[cfg(feature = "parquet-cache")]
             parquet_backend: false,
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
@@ -13001,6 +13112,8 @@ mod tests {
             )),
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
+            #[cfg(feature = "parquet-cache")]
+            plugin_registry: None,
         })
     }
 

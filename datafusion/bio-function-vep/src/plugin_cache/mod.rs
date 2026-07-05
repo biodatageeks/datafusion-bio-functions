@@ -9,6 +9,7 @@
 
 pub mod build;
 pub mod cache_manifest;
+pub mod csq;
 pub mod join;
 pub mod lookup;
 pub mod normalize;
