@@ -28,6 +28,7 @@ repeatable "add a plugin" workflow on top of it.
 | Deliverable | Rust subsystem **and** Claude Code skill, co-designed |
 | Plugin data model | Generic / self-describing: plugin declares key columns + value columns |
 | Ingestion | **Declarative source manifest** (§6.1): names a table provider (bio-formats `VcfTableProvider`, or builtin DataFusion CSV/TSV/Parquet) + provider params + input schema + ingest `SELECT` + coordinate system. The cache builder standardizes any declared source into tiered Parquet — no per-plugin Rust for the common case. The sibling `PluginSourceKind`s become shipped **preset** source manifests. |
+| Manifest catalog | Source manifests live in a dedicated repo **`biodatageeks/vepyr-plugins`** (§6.3), **TOML** format, pinned by commit/tag — the declarative analog of Ensembl `VEP_plugins`. Built Parquet caches are never committed. |
 | Tiering on variation miss | **Cold** (tier 1). Warm (tier 0) = joins variation with max global AF ≥ `WARM_AF_THRESHOLD` (0.01). Consistent with variation. |
 | Key columns | **Shared with the variation cache verbatim**: `chrom` (Utf8), `start`/`end` (UInt32), `allele_string` (Utf8, `ref/alt`). Point-lookup key `(chrom, start)` via `encode_position_key`; alleles disambiguated by `allele_string`. |
 | Frequency join granularity | **Allele-level** LEFT JOIN on the shared key `(chrom, start, allele_string)`; AF used only to derive tier, **not stored** in the plugin cache |
@@ -427,16 +428,41 @@ discovered at runtime by scanning `plugin/*/manifest.json`:
 - `tier` records the policy actually used, so a rebuild is self-describing.
 - `source_manifest` back-references the input that produced the cache.
 
+### 6.3 Manifest repository (`biodatageeks/vepyr-plugins`)
+
+Source manifests (§6.1) live in a **dedicated repo, `biodatageeks/vepyr-plugins`** —
+the declarative analog of Ensembl's `VEP_plugins` catalog. It stores **only the
+`.toml` source manifests** (plus small test fixtures / golden expectations), never
+the built Parquet caches, which are large build artifacts kept out of git.
+
+- **Format: TOML.** Consistent with the Rust/Cargo workspace; the `toml` crate is
+  first-class and well-maintained, and TOML's strict typing avoids YAML's implicit
+  coercion footguns that bite on genomics values (contig names, version strings).
+  Multiline `ingest_sql` uses triple-quoted strings.
+- **Layout:** one directory per plugin —
+  `plugins/<name>/<name>.source.toml` (+ optional `fixtures/`, `golden/`). The 5
+  presets (CADD, ClinVar, SpliceAI, AlphaMissense, dbNSFP) ship here as the seed
+  catalog.
+- **Resolution & pinning.** The cache builder resolves a manifest by plugin name
+  from a checked-out / vendored `vepyr-plugins` at a **pinned commit or tag**,
+  matching the repo's existing cross-repo pinning convention (git dep by `rev`).
+  This keeps a cache reproducible: `(source_manifest @ vepyr-plugins rev,
+  source data version)` fully determines the built shard, and the cache manifest's
+  `cache_source_version` records it.
+- **Contribution flow.** Adding a community plugin = a PR to `vepyr-plugins` with a
+  new `<name>.source.toml` (and a parity fixture) — no change to this repo unless a
+  brand-new *provider/format* is needed (§6.1 factory).
+
 ## 7. Claude Code skill: `vep-add-plugin`
 
 A markdown workflow skill (sibling to `vep-perf-profiling`) packaging the
 end-to-end process as a short decision tree plus exact file:line touch-points:
 
 1. **Author the source manifest** (§6.1) — the primary and usually only step:
-   declare provider(s) + params, input schema (for CSV/TSV), `ingest_sql` mapping
-   raw columns → `(chrom, start, end, allele_string, values…)`, `coordinate_system`,
-   value→CSQ mapping, and tier policy. Ship it as a preset or keep it alongside the
-   plugin's data.
+   a TOML file contributed to `biodatageeks/vepyr-plugins` (§6.3) declaring
+   provider(s) + params, input schema (for CSV/TSV), `ingest_sql` mapping raw
+   columns → `(chrom, start, end, allele_string, values…)`, `coordinate_system`,
+   value→CSQ mapping, and tier policy.
 2. **(New *format* only) add a provider arm** to the factory (§6.1) — and, if it's
    a bio-formats reader, in `datafusion-bio-format-vep-plugin`. Not needed when the
    source is VCF / CSV / TSV / Parquet / BED (already covered).
