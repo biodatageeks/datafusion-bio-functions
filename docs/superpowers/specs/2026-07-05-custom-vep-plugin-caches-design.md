@@ -33,7 +33,7 @@ repeatable "add a plugin" workflow on top of it.
 | Key columns | **Shared with the variation cache verbatim**: `chrom` (Utf8), `start`/`end` (UInt32), `allele_string` (Utf8, `ref/alt`). Point-lookup key `(chrom, start)` via `encode_position_key`; alleles disambiguated by `allele_string`. Plus optional **per-transcript match columns** (§3.4). |
 | Per-transcript matching | Optional `[[match_column]]` discriminator(s) bound to a per-transcript engine attribute (e.g. AlphaMissense `protein_variant` ← `amino_acid_change`). Extends the lookup key so a variant scored differently per transcript (multi-isoform genes) resolves correctly; a no-match (non-missense → no aa-change) emits empty, mirroring VEP's missense gating. See §3.4. |
 | Frequency join granularity | **Allele-level** LEFT JOIN on the shared key `(chrom, start, allele_string)`; AF used only to derive tier, **not stored** in the plugin cache |
-| Runtime layout | **One tiered dataset per plugin** — `plugin/<name>/<chrom>.parquet`, independent PageDir point-lookup (clone of variation lookup path) |
+| Runtime layout | **One tiered dataset per plugin** — `plugin/<name>/<chrom>.parquet`, buffer-batched page-scoped PageDir take (§5), on the shared `page_dir` primitives; the variation lookup is untouched |
 | Declaration | **Manifest per plugin cache** (`plugin/<name>/manifest.json`), discovered at runtime by scanning `plugin/*/manifest.json` (mirrors `CHROM_MANIFEST_FILE`) |
 
 ## 3. Component boundaries & data flow
@@ -319,32 +319,85 @@ gives the PageDir its two monotonic segments.
 
 ## 5. Runtime lookup & CSQ injection
 
-- **`plugin_cache::lookup::PluginLookup`** wraps one plugin's per-chrom
-  PageDir-indexed shard; exposes
-  `probe(chrom, start, allele_string) -> Option<PluginValueRow>` reusing
-  `cache::key_encoding::encode_position_key`, `parquet_cache::page_dir` binary
-  search, and `parquet_cache::scan` decode verbatim. Same `(tier, start)` run
-  structure → same warm-first fast path; a cold-miss is a bounded page reject,
-  exactly like variation.
-- **Wiring point:** plugins resolve in the same per-variant colocated step where
-  variation frequency is resolved today (`colocated.rs` / frequency resolution in
-  `annotate_provider.rs`). Each plugin's `PluginValueRow` maps positionally onto
-  its declared CSQ output fields; a miss emits VEP's empty value.
-- **Allele matching:** the probe's `allele_string` reuses the same
-  `alt_orig_allele_string` (`colocated.rs:308`) the frequency lookup already
-  computes, so plugin allele matching is identical to frequency allele matching —
-  no new allele-normalization surface.
-- **Output schema:** the plugin's CSQ field names are appended to the CSQ format
-  list. One-dataset-per-plugin means enabling/disabling a plugin adds/removes
-  exactly its columns, with no effect on variation or other plugins.
+The plugin lookup is **buffer-batched and page-scoped**, mirroring the variation
+lookup (`lookup_exec.rs:1649-1683`): per annotation buffer, one PageDir take per
+plugin reads only the candidate pages for that buffer's positions — never the whole
+shard. A parallel `PluginLookup` is built on the **shared low-level primitives**
+(`parquet_cache::page_dir::{PageDir, CoalescingAsyncReader, selection_from_ranges,
+selection_from_offsets, IoCounters}`); the variation lookup
+(`SinglePathParquetVariationLookup`) is **not** touched.
 
-### 5.1 Concurrency constraint (from prior findings)
+### 5.1 Components
 
-Per the aux-pool-oversubscription lesson, `PluginLookup` probes **synchronously on
-the annotating thread** — no internal Rayon/async pool — sharing the engine's
-thread budget exactly as the variation point-lookup does. N enabled plugins add N
-independent, cheap-on-cold-miss probes per variant; they must not spawn their own
-pools.
+- **`plugin_cache::lookup::PluginLookup`** — opened once per contig (footer +
+  `PageDir` over the `start` leaf only; no data read). Exposes:
+  - `async take_buffer(sorted_unique_starts: &[u32]) -> RecordBatch` — the three
+    PageDir phases generalized to a plain projected payload: (1)
+    `page_dir.resolve_ranges(starts)` → candidate page ranges; (2) read **only**
+    the `start` column on those ranges → exact row offsets where `start ∈ set`;
+    (3) projected read of `(start, allele_string, <match cols…>, <value cols…>)`
+    at those offsets. Simpler than variation's take — no AF 2-array
+    reconstruction, just a projected batch.
+- **`plugin_cache::lookup::PluginBufferSlice`** — the in-memory working set for one
+  buffer × one plugin: `from(batch)` builds a `start → row-indices` map (like
+  variation's `start_row_map`); `probe(start, allele_string, match_values: &[Option<String>])
+  -> Option<Vec<PluginScalar>>` filters the candidate rows at `start` by
+  `allele_string` **and** match-discriminator equality (§3.4).
+- **`plugin_cache::registry::PluginRegistry`** — per contig, holds the N
+  `PluginLookup`s; `async take_buffer_all(starts) -> Vec<PluginBufferSlice>` (one
+  batched take per plugin) and `csq_fields()`.
+
+### 5.2 Per-buffer / per-transcript flow
+
+**Once per buffer** (top of `annotate_batch_with_transcript_engine`, where the
+batch is the buffer):
+1. Collect the buffer's unique `start`s (sort + dedup).
+2. `slices = registry.take_buffer_all(&starts)` — `block_on`'d once, in the same
+   block_on-valid seam variation uses for its cold probe (`lookup_exec.rs:1676`).
+   This is the only I/O — page-scoped, bounded by the buffer's positions.
+3. Append `registry.csq_fields()` to the CSQ output order (header + placeholder
+   layout) — once.
+
+**Per transcript consequence** (sync, no I/O), during CSQ emission:
+4. Build the engine attribute(s): `amino_acid_change = {aa_ref}{Protein_position}{aa_alt}`
+   from the engine's `Amino_acids` (`"V/A"`) + `Protein_position` (`"550"`), or
+   `None` when the consequence has no amino-acid change.
+5. For each plugin slice, resolve its match columns' `engine_attr`s → the engine
+   attributes (an `EngineAttrs` carrier), then `slice.probe(start, input_allele_string, &match_values)`.
+   - **Hit** → append the value scalars as CSQ fields.
+   - **Miss** (non-missense → `None` discriminator, or no matching row) → append
+     VEP's empty value. **This is the gate** — reproducing `_aminoacid_changes_match`
+     + the missense-only behavior.
+6. Append the plugin values into the per-transcript CSQ string across all three
+   emission paths + the placeholder layout, aligned with the appended field names.
+
+### 5.3 Generic across per-variant and per-transcript plugins
+
+The single flow covers both, distinguished only by the discriminator:
+
+| Plugin kind | `match_columns` | Per-transcript probe | Result across a variant's lines |
+|---|---|---|---|
+| Per-variant (CADD, ClinVar) | *empty* | `probe(start, allele, &[])` | Same value on **every** line — VEP's variant-level behavior |
+| Per-transcript (AlphaMissense, dbNSFP) | `[protein_variant]` | `probe(start, allele, &[aa_change])` | Value only on matching (missense) lines; empty elsewhere |
+
+Per-variant plugins never touch transcript/amino-acid data (`match_columns = []`
+→ allele-only filter); the engine computes `amino_acid_change` **only if** some
+enabled plugin binds to it. A `match_columns = []` plugin may be probed once per
+variant and reused across its transcript lines (a minor optimization; the generic
+per-transcript path is the default).
+
+### 5.4 Concurrency & memory
+
+Reads happen **once per buffer per plugin** via `take_buffer` — batched, not
+per-variant, page-scoped (bounded by the buffer's positions), so a full-genome
+plugin cache is never loaded whole. Per-transcript `probe`s are synchronous
+in-memory filters against the small per-buffer slice — no Rayon/async pool (the
+aux-pool-oversubscription constraint). This matches variation's model exactly:
+async batched page-read → in-memory slice → sync per-row/per-transcript reads.
+
+**Output schema:** the plugin CSQ field names are appended to the CSQ format list.
+One-dataset-per-plugin means enabling/disabling a plugin adds/removes exactly its
+columns, with no effect on variation or other plugins.
 
 ## 6. Manifests
 
