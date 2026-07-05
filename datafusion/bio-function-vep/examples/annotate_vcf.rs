@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
         "annotate: input={input} cache={cache} plugin_cache={:?} everything={} hgvs={}",
         config.plugin_cache_root, config.everything, config.hgvs
     );
-    let n = annotate_to_vcf(&input, &cache, "local", &out, &config).await?;
+    let n = annotate_to_vcf(&input, &cache, "parquet", &out, &config).await?;
     eprintln!("wrote {n} records -> {out}");
     Ok(())
 }

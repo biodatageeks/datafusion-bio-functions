@@ -4,19 +4,23 @@
 
 use datafusion::common::{DataFusionError, Result};
 
-/// Supported annotation backend types.
+/// Supported annotation backend types. Parquet is the only backend; the variant
+/// name is retained from the pre-migration era (a rename is tracked as part of
+/// the lance-only dead-code removal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnotationBackend {
-    Lance,
+    /// The Parquet point-lookup cache (the only backend).
+    Parquet,
 }
 
 impl AnnotationBackend {
-    /// Parse backend from UDTF argument. Only `"cache"` is accepted.
+    /// Parse the backend from the UDTF argument. `"parquet"` is canonical;
+    /// `"lance"` is accepted as a deprecated alias for the same Parquet backend.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
-            "lance" => Ok(Self::Lance),
+            "parquet" | "lance" => Ok(Self::Parquet),
             other => Err(DataFusionError::Plan(format!(
-                "annotate_vep(): backend must be 'lance'; got: {other}"
+                "annotate_vep(): backend must be 'parquet' (deprecated alias 'lance'); got: {other}"
             ))),
         }
     }
@@ -24,7 +28,7 @@ impl AnnotationBackend {
     /// Stable display value for logs/debugging.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Lance => "lance",
+            Self::Parquet => "parquet",
         }
     }
 }
@@ -34,16 +38,20 @@ mod tests {
     use super::AnnotationBackend;
 
     #[test]
-    fn backend_parse_ok() {
+    fn backend_parse_accepts_parquet_and_lance_alias() {
+        assert_eq!(
+            AnnotationBackend::parse("parquet").unwrap(),
+            AnnotationBackend::Parquet
+        );
         assert_eq!(
             AnnotationBackend::parse("lance").unwrap(),
-            AnnotationBackend::Lance
+            AnnotationBackend::Parquet
         );
     }
 
     #[test]
     fn backend_parse_rejects_unknown() {
-        let err = AnnotationBackend::parse("parquet").unwrap_err().to_string();
-        assert!(err.contains("backend must be 'lance'"));
+        let err = AnnotationBackend::parse("local").unwrap_err().to_string();
+        assert!(err.contains("backend must be 'parquet'"));
     }
 }
