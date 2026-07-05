@@ -100,15 +100,24 @@ impl TableFunctionImpl for AnnotateFunction {
             &vcf_table,
         )?;
 
-        Ok(Arc::new(AnnotateProvider::new(
-            Arc::clone(&self.session),
-            vcf_table,
-            cache_source,
-            backend,
-            cache_source_type,
-            options_json,
-            vcf_schema,
-        )?))
+        // Custom-plugin cache root (workers=1 / SQL path): passed via options_json
+        // so the annotate_vep UDTF-built provider opens the plugin registry too.
+        let plugin_cache_root =
+            options_json_string_value(options_json.as_deref(), "plugin_cache_root")?
+                .map(std::path::PathBuf::from);
+
+        Ok(Arc::new(
+            AnnotateProvider::new(
+                Arc::clone(&self.session),
+                vcf_table,
+                cache_source,
+                backend,
+                cache_source_type,
+                options_json,
+                vcf_schema,
+            )?
+            .with_plugin_cache_root(plugin_cache_root),
+        ))
     }
 }
 

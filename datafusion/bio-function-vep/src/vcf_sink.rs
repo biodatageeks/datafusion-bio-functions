@@ -596,6 +596,15 @@ impl AnnotateVcfConfig {
             "workers".into(),
             serde_json::Value::Number(serde_json::Number::from(self.workers.max(1))),
         );
+        // Custom-plugin cache root flows to the annotate_vep UDTF (workers=1 / SQL
+        // path) via options_json, mirroring every other config field. The sharded
+        // (workers>1) path passes it via `with_plugin_cache_root` instead.
+        if let Some(ref root) = self.plugin_cache_root {
+            opts.insert(
+                "plugin_cache_root".into(),
+                serde_json::Value::String(root.to_string_lossy().into_owned()),
+            );
+        }
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
 
@@ -1726,6 +1735,22 @@ mod tests {
 
         let json = config.to_options_json();
         assert!(json.contains("\"buffer_size\":1234"));
+    }
+
+    // Guards the I1 wiring bug: the workers=1 SQL path builds the AnnotateProvider
+    // from options_json, so plugin_cache_root MUST round-trip through it (else the
+    // plugin registry is never opened and CSQ plugin fields emit empty while the
+    // header still lists them — a header/body width divergence).
+    #[test]
+    fn test_to_options_json_emits_plugin_cache_root() {
+        let none = AnnotateVcfConfig::default().to_options_json();
+        assert!(!none.contains("plugin_cache_root"));
+        let config = AnnotateVcfConfig {
+            plugin_cache_root: Some(std::path::PathBuf::from("/tmp/plugin_cache")),
+            ..Default::default()
+        };
+        let json = config.to_options_json();
+        assert!(json.contains("\"plugin_cache_root\":\"/tmp/plugin_cache\""));
     }
 
     #[test]
