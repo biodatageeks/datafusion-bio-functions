@@ -147,6 +147,16 @@ fn vcf_lines_to_body_chunk(lines: Vec<VcfRecordLine>) -> (Vec<u8>, usize) {
     (bytes, line_count)
 }
 
+/// Published by `ContigAnnotationStream` the instant a contig's shard workers
+/// all finish (shards flushed). The assembler thread appends the id range
+/// `[first_shard_id, end_shard_id)` — which is contiguous and equals final-VCF
+/// position order — and adds `output_lines` to the running body-line total.
+pub(crate) struct ContigShardRange {
+    pub(crate) first_shard_id: usize,
+    pub(crate) end_shard_id: usize,
+    pub(crate) output_lines: usize,
+}
+
 /// Formatter context + tempdir threaded into the `threads>1` engine workers so
 /// each fused worker can serialize its annotated batches directly into its own
 /// VCF body shard (`format_vcf_body_chunk` + `BufWriter<File>`), removing the
@@ -160,11 +170,18 @@ pub(crate) struct VcfShardContext {
     pub(crate) sample_names: Arc<Vec<String>>,
     pub(crate) coordinate_zero_based: bool,
     pub(crate) tempdir: PathBuf,
+    /// Output compression for the per-worker shard files. Only ever `Bgzf`
+    /// (bgzf output → parallel per-worker compression + raw block concat) or
+    /// `Plain` (plain/gzip output → text shards).
+    pub(crate) shard_compression: VcfCompressionType,
     /// Running count of input rows annotated across all shard workers. Polled by
     /// `drive_sharded_vcf_annotation` to drive the progress bar / callback
     /// incrementally during annotation (shards are written concurrently and only
     /// concatenated at the end, so this is the only live progress signal).
     pub(crate) rows_done: Arc<std::sync::atomic::AtomicUsize>,
+    /// One message per completed contig, in completion (= ascending id) order.
+    /// Dropped when annotation finishes, which signals the assembler to finalize.
+    pub(crate) contig_done_tx: std::sync::mpsc::Sender<ContigShardRange>,
 }
 
 fn format_vcf_body_chunk(
@@ -271,37 +288,17 @@ fn drain_ready_vcf_chunks(
     Ok(())
 }
 
-fn copy_body_file_to_writer(path: &Path, writer: &mut VcfLocalWriter) -> Result<Duration> {
-    let started = Instant::now();
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        DataFusionError::Execution(format!(
-            "Failed to open VCF body shard {}: {e}",
-            path.display()
-        ))
-    })?;
-    let mut buffer = vec![0u8; 8 * 1024 * 1024];
-    loop {
-        let bytes = file.read(&mut buffer).map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to read VCF body shard {}: {e}",
-                path.display()
-            ))
-        })?;
-        if bytes == 0 {
-            break;
-        }
-        write_vcf_body_chunk(writer, &buffer[..bytes])?;
-    }
-    Ok(started.elapsed())
-}
-
 /// Reusable streaming VCF body shard writer: owns a `BufWriter<File>` + the
 /// per-batch formatter context, and streams formatted batches into one shard
 /// file with no buffering of the batch. Used by the `workers>1` engine workers
 /// (which call the sync [`write_batch`](Self::write_batch) inside
 /// `block_in_place`).
 pub(crate) struct VcfBodyShardWriter {
-    writer: std::io::BufWriter<std::fs::File>,
+    /// Owns the shard's output sink. `Plain` for text shards (plain/gzip output),
+    /// `Bgzf` for bgzf output — workers compress their own shard in parallel; the
+    /// assembler then does a raw block concat. Reuses the bio-formats writer enum
+    /// so no direct `noodles-bgzf` dependency is needed here.
+    writer: VcfLocalWriter,
     vcf_info_fields: Arc<Vec<String>>,
     unique_format_tags: Arc<Vec<String>>,
     sample_names: Arc<Vec<String>>,
@@ -319,15 +316,11 @@ impl VcfBodyShardWriter {
         unique_format_tags: Arc<Vec<String>>,
         sample_names: Arc<Vec<String>>,
         coordinate_zero_based: bool,
+        compression: VcfCompressionType,
     ) -> Result<Self> {
-        let file = std::fs::File::create(path).map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to create VCF body shard {}: {e}",
-                path.display()
-            ))
-        })?;
+        let writer = VcfLocalWriter::with_compression(path, compression)?;
         Ok(Self {
-            writer: std::io::BufWriter::new(file),
+            writer,
             vcf_info_fields,
             unique_format_tags,
             sample_names,
@@ -368,9 +361,7 @@ impl VcfBodyShardWriter {
     /// [`write_vcf_partition_body`] which formats via `spawn_blocking`.
     fn write_formatted(&mut self, formatted: &FormattedVcfBatch) -> Result<Duration> {
         let started = Instant::now();
-        self.writer.write_all(&formatted.bytes).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to write VCF body shard: {e}"))
-        })?;
+        write_vcf_body_chunk(&mut self.writer, &formatted.bytes)?;
         let elapsed = started.elapsed();
         self.lines += formatted.lines;
         self.input_rows += formatted.input_rows;
@@ -378,10 +369,11 @@ impl VcfBodyShardWriter {
         Ok(elapsed)
     }
 
-    pub(crate) fn finish(mut self) -> Result<()> {
-        self.writer
-            .flush()
-            .map_err(|e| DataFusionError::Execution(format!("Failed to flush VCF body shard: {e}")))
+    pub(crate) fn finish(self) -> Result<()> {
+        // Consumes the writer: flushes (Plain) or writes the final BGZF block +
+        // 28-byte EOF marker (Bgzf). The assembler strips that trailing EOF when
+        // concatenating bgzf shards.
+        self.writer.finish()
     }
 }
 
@@ -656,54 +648,207 @@ fn csq_header_description(
     format!("Consequence annotations from annotate_vep. Format: {format_list}")
 }
 
-/// Annotate a VCF file and write results to an output VCF.
-///
-/// Handles everything in a single call:
-/// 1. Reads the input VCF (all INFO/FORMAT fields preserved)
-/// 2. Creates a session, registers VEP functions and the VCF table
-/// 3. Runs annotation and streams results to the output VCF
-///
-/// The 87 structured annotation columns plus `most_severe_consequence`
-/// are NOT written to the VCF — only core VCF columns, original INFO/FORMAT
-/// fields, and the `csq` annotation are included.
-///
-/// Cache source mode is read from Arrow schema metadata on the selected cache
-/// backend's variation table.
-///
-/// # Returns
-///
-/// The number of rows written.
-/// Copy one VCF body shard into `writer`, returning the number of body lines
-/// (each ends in `\n`, so the newline count is the line count). Used to assemble
-/// the sharded `threads>1` output, where shard line counts are not carried in a
-/// descriptor (the bodies live only as files in the shard tempdir).
-fn copy_body_file_counting_lines(path: &Path, writer: &mut VcfLocalWriter) -> Result<usize> {
-    let mut file = std::fs::File::open(path).map_err(|e| {
+/// Canonical 28-byte BGZF end-of-file marker (an empty BGZF block, SAM spec).
+/// Every finished bgzf file (`VcfLocalWriter::Bgzf::finish()`) ends with exactly
+/// these bytes. Written once, at the very end of an assembled BGZF file; stripped
+/// from each shard/header piece before concatenation.
+const BGZF_EOF: [u8; 28] = [
+    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+    0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Read a finished bgzf file and return its bytes with the trailing 28-byte EOF
+/// marker removed, ready for raw concatenation into a larger bgzf stream.
+/// Read a small finished bgzf file (the header) whole and return its bytes with
+/// the trailing 28-byte EOF marker removed. Used only for the header, which is
+/// tiny; shards stream via [`append_bgzf_shard`] instead. The EOF check is a real
+/// runtime error (not a `debug_assert`) so it holds in release builds.
+fn bgzf_blocks_no_eof(path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = std::fs::read(path).map_err(|e| {
+        DataFusionError::Execution(format!("read bgzf file {}: {e}", path.display()))
+    })?;
+    if bytes.len() < BGZF_EOF.len() || bytes[bytes.len() - BGZF_EOF.len()..] != BGZF_EOF {
+        return Err(DataFusionError::Execution(format!(
+            "bgzf file {} does not end with the canonical EOF marker",
+            path.display()
+        )));
+    }
+    let keep = bytes.len() - BGZF_EOF.len();
+    bytes.truncate(keep);
+    Ok(bytes)
+}
+
+/// Append a finished bgzf shard file to `out`, stripping its trailing 28-byte EOF
+/// marker, streaming the body in `buf`-sized chunks so a large shard is never
+/// loaded whole into memory (mirrors the plain assembler's bounded-buffer copy).
+/// Uses the file length to locate the marker, then reads + validates it. Returns
+/// a real runtime error (holds in release) if the shard is shorter than the
+/// marker or does not end with it — never silently truncating corrupt input.
+fn append_bgzf_shard<W: Write>(path: &Path, out: &mut W, buf: &mut [u8]) -> Result<()> {
+    let mut f = std::fs::File::open(path).map_err(|e| {
+        DataFusionError::Execution(format!("assembler open bgzf shard {}: {e}", path.display()))
+    })?;
+    let total = f
+        .metadata()
+        .map_err(|e| {
+            DataFusionError::Execution(format!("assembler stat bgzf shard {}: {e}", path.display()))
+        })?
+        .len();
+    let eof_len = BGZF_EOF.len() as u64;
+    if total < eof_len {
+        return Err(DataFusionError::Execution(format!(
+            "bgzf shard {} is {total} bytes, shorter than the canonical EOF marker",
+            path.display()
+        )));
+    }
+    // Stream the body (everything except the trailing EOF marker) in bounded chunks.
+    let mut remaining = total - eof_len;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        f.read_exact(&mut buf[..want]).map_err(|e| {
+            DataFusionError::Execution(format!("assembler read bgzf shard {}: {e}", path.display()))
+        })?;
+        out.write_all(&buf[..want])
+            .map_err(|e| DataFusionError::Execution(format!("assembler write bgzf shard: {e}")))?;
+        remaining -= want as u64;
+    }
+    // Read + validate the trailing EOF marker; never write it (the assembler emits
+    // exactly one canonical EOF at the very end of the assembled file).
+    let mut marker = [0u8; 28]; // == BGZF_EOF.len()
+    f.read_exact(&mut marker).map_err(|e| {
         DataFusionError::Execution(format!(
-            "Failed to open VCF body shard {}: {e}",
+            "assembler read bgzf EOF of {}: {e}",
             path.display()
         ))
     })?;
-    let mut buffer = vec![0u8; 8 * 1024 * 1024];
-    let mut lines = 0usize;
-    loop {
-        let bytes = file.read(&mut buffer).map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to read VCF body shard {}: {e}",
-                path.display()
-            ))
-        })?;
-        if bytes == 0 {
-            break;
-        }
-        lines += bytecount(&buffer[..bytes], b'\n');
-        write_vcf_body_chunk(writer, &buffer[..bytes])?;
+    if marker != BGZF_EOF {
+        return Err(DataFusionError::Execution(format!(
+            "bgzf shard {} does not end with the canonical EOF marker",
+            path.display()
+        )));
     }
-    Ok(lines)
+    Ok(())
 }
 
-fn bytecount(haystack: &[u8], needle: u8) -> usize {
-    haystack.iter().filter(|&&b| b == needle).count()
+/// Dedicated assembler thread for Plain/Gzip output. Owns the header-primed
+/// `VcfLocalWriter` (targeting `temp_output`) and appends each completed contig's
+/// shard range — in arrival (= ascending id = position) order — as raw body
+/// bytes (Plain = byte copy; Gzip = compress-on-append). Runs concurrently with
+/// the next contig's prepare + annotation, so the copy overlaps rather than
+/// tailing after 100%. On channel close (annotation finished, no error) it
+/// finalizes the writer and atomically renames `temp_output` → `final_output`.
+/// Returns the total body-line count (summed from worker-reported `output_lines`,
+/// so no re-scan). Never advances the progress bar (already driven by rows_done).
+fn run_assembler_thread(
+    mut writer: VcfLocalWriter,
+    final_output: PathBuf,
+    temp_output: PathBuf,
+    tempdir: PathBuf,
+    rx: std::sync::mpsc::Receiver<ContigShardRange>,
+    finalize: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<Result<usize>> {
+    std::thread::spawn(move || -> Result<usize> {
+        let mut total_lines = 0usize;
+        let mut buffer = vec![0u8; 8 * 1024 * 1024];
+        while let Ok(range) = rx.recv() {
+            for id in range.first_shard_id..range.end_shard_id {
+                let path = tempdir.join(format!("partition_{id:04}.vcf.body"));
+                let mut f = std::fs::File::open(&path).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "assembler open shard {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                loop {
+                    let n = f.read(&mut buffer).map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "assembler read shard {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    write_vcf_body_chunk(&mut writer, &buffer[..n])?;
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+            total_lines += range.output_lines;
+        }
+        // Channel closed. Finalize (finish + atomic rename) ONLY if the driver
+        // signalled success; otherwise the run failed mid-annotation and this temp
+        // holds only the contigs completed before the error — discard it so no
+        // truncated-but-valid-looking VCF is ever renamed into the output path.
+        if !finalize.load(std::sync::atomic::Ordering::Acquire) {
+            drop(writer);
+            let _ = std::fs::remove_file(&temp_output);
+            return Ok(0);
+        }
+        writer.finish()?;
+        std::fs::rename(&temp_output, &final_output).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "assembler rename {} -> {}: {e}",
+                temp_output.display(),
+                final_output.display()
+            ))
+        })?;
+        Ok(total_lines)
+    })
+}
+
+/// Dedicated assembler thread for BGZF output. Shards are already bgzf-compressed
+/// (by the workers, in parallel), so this owns a RAW `BufWriter<File>` — it must
+/// NOT re-compress. It writes the pre-compressed `header_blocks`, then for each
+/// completed contig range raw-appends every shard minus its trailing 28-byte EOF
+/// marker, then writes one canonical `BGZF_EOF`, flushes, and atomically renames.
+/// Returns the total body-line count (worker-reported). Concurrent with the next
+/// contig's prepare + annotation, exactly like the Plain assembler.
+fn run_assembler_thread_bgzf(
+    temp_output: PathBuf,
+    final_output: PathBuf,
+    tempdir: PathBuf,
+    header_blocks: Vec<u8>,
+    rx: std::sync::mpsc::Receiver<ContigShardRange>,
+    finalize: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<Result<usize>> {
+    std::thread::spawn(move || -> Result<usize> {
+        let file = std::fs::File::create(&temp_output).map_err(|e| {
+            DataFusionError::Execution(format!("assembler create {}: {e}", temp_output.display()))
+        })?;
+        let mut out = std::io::BufWriter::new(file);
+        out.write_all(&header_blocks)
+            .map_err(|e| DataFusionError::Execution(format!("assembler write header: {e}")))?;
+        let mut total_lines = 0usize;
+        let mut buffer = vec![0u8; 8 * 1024 * 1024];
+        while let Ok(range) = rx.recv() {
+            for id in range.first_shard_id..range.end_shard_id {
+                let path = tempdir.join(format!("partition_{id:04}.vcf.body"));
+                append_bgzf_shard(&path, &mut out, &mut buffer)?;
+                let _ = std::fs::remove_file(&path);
+            }
+            total_lines += range.output_lines;
+        }
+        // Channel closed. Discard the partial temp on a mid-run failure (see the
+        // plain assembler) — do NOT write the EOF or rename a truncated file.
+        if !finalize.load(std::sync::atomic::Ordering::Acquire) {
+            drop(out);
+            let _ = std::fs::remove_file(&temp_output);
+            return Ok(0);
+        }
+        out.write_all(&BGZF_EOF)
+            .map_err(|e| DataFusionError::Execution(format!("assembler write EOF: {e}")))?;
+        out.flush()
+            .map_err(|e| DataFusionError::Execution(format!("assembler flush: {e}")))?;
+        drop(out);
+        std::fs::rename(&temp_output, &final_output).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "assembler rename {} -> {}: {e}",
+                temp_output.display(),
+                final_output.display()
+            ))
+        })?;
+        Ok(total_lines)
+    })
 }
 
 /// Drive the `threads>1` sharded-VCF-output path: build the annotation plan
@@ -722,11 +867,10 @@ async fn drive_sharded_vcf_annotation(
     vcf_schema: &Arc<datafusion::arrow::datatypes::Schema>,
     projection_names: &[String],
     shard_ctx: Arc<VcfShardContext>,
-    writer: &mut VcfLocalWriter,
     pb: &ProgressBar,
     config: &AnnotateVcfConfig,
     total_input: usize,
-) -> Result<usize> {
+) -> Result<()> {
     use crate::annotate_provider::AnnotateProvider;
     use crate::annotation_store::AnnotationBackend;
     use datafusion::physical_plan::ExecutionPlan;
@@ -832,41 +976,11 @@ async fn drive_sharded_vcf_annotation(
     // Final flush: report any rows annotated since the poller's last tick.
     report(shard_ctx.rows_done.load(Relaxed));
 
-    // Assemble: concat the body shards in ascending (= position) id order.
-    let mut shards: Vec<(usize, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(&shard_ctx.tempdir).map_err(|e| {
-        DataFusionError::Execution(format!(
-            "Failed to read VCF shard tempdir {}: {e}",
-            shard_ctx.tempdir.display()
-        ))
-    })? {
-        let path = entry
-            .map_err(|e| {
-                DataFusionError::Execution(format!("Failed to read VCF shard dir entry: {e}"))
-            })?
-            .path();
-        let id = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("partition_"))
-            .and_then(|name| name.strip_suffix(".vcf.body"))
-            .and_then(|name| name.parse::<usize>().ok());
-        if let Some(id) = id {
-            shards.push((id, path));
-        }
-    }
-    shards.sort_by_key(|(id, _)| *id);
-
-    // Concat is just byte-copy assembly; progress was already reported during
-    // annotation above, so don't advance the bar / callback again here (the
-    // input-row count would otherwise be double-counted against output lines).
-    let mut total_rows = 0usize;
-    for (_, path) in shards {
-        let lines = copy_body_file_counting_lines(&path, writer)?;
-        let _ = std::fs::remove_file(&path);
-        total_rows += lines;
-    }
-    Ok(total_rows)
+    // Shard assembly no longer happens here: each contig's shard range is
+    // published (annotate_provider) and concatenated by the dedicated assembler
+    // thread spawned in `annotate_to_vcf`, concurrently with the next contig's
+    // prepare + annotation. This function only drives annotation + progress.
+    Ok(())
 }
 
 pub async fn annotate_to_vcf(
@@ -1106,13 +1220,6 @@ pub async fn annotate_to_vcf(
 
     // 6. Stream annotated batches to VCF file.
     let output_path = Path::new(output_vcf);
-    let mut writer = VcfLocalWriter::with_compression(output_path, config.compression)?;
-    writer.write_header(
-        &write_schema,
-        &vcf_info_fields,
-        &unique_format_tags,
-        &sample_names,
-    )?;
 
     let coordinate_zero_based = vcf_schema
         .metadata()
@@ -1125,18 +1232,88 @@ pub async fn annotate_to_vcf(
     if config.workers > 1 {
         // Sharded VCF output: bypass the SQL/DataFrame execution and drive the
         // annotation plan directly with a VcfShardContext, so each fused worker
-        // streams its own VCF body shard. The header was already written above;
-        // here we drive the shards to completion then concat them in order.
+        // streams its own position-ordered VCF body shard. A dedicated assembler
+        // thread concatenates each contig's shards the instant that contig
+        // finishes — concurrently with the next contig's prepare + annotation —
+        // then atomically renames the temp output into place.
         let tempdir = VcfBodyTempDir::new()?;
+        // Temp assembly path in the SAME directory as the output (so the final
+        // rename is atomic on one filesystem).
+        let mut temp_os = output_path.as_os_str().to_owned();
+        temp_os.push(".part");
+        let temp_output = PathBuf::from(temp_os);
+
+        let (contig_done_tx, contig_done_rx) = std::sync::mpsc::channel::<ContigShardRange>();
+        // bgzf output → parallel per-worker bgzf shards + raw block concat;
+        // plain/gzip → plain text shards + re-copy/compress at the assembler.
+        let shard_compression = if config.compression == VcfCompressionType::Bgzf {
+            VcfCompressionType::Bgzf
+        } else {
+            VcfCompressionType::Plain
+        };
+
+        // Spawn the assembler (owns the output writer); its mode matches the
+        // output compression. Header is written BEFORE the field vecs are moved
+        // into the shard context.
+        // Set to true only if annotation completes successfully; the assembler
+        // reads it after the channel closes and finalizes (finish + atomic rename)
+        // ONLY when true. On a mid-run error the assembler discards its partial
+        // temp file instead of renaming a truncated-but-valid-looking VCF into the
+        // output path.
+        let finalize = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let assembler = if config.compression == VcfCompressionType::Bgzf {
+            // Pre-compress the header into bgzf blocks (strip its EOF); the raw
+            // assembler writes those, then the already-compressed shards.
+            let header_tmp = tempdir.path().join("header.bgz");
+            let mut hw = VcfLocalWriter::with_compression(&header_tmp, VcfCompressionType::Bgzf)?;
+            hw.write_header(
+                &write_schema,
+                &vcf_info_fields,
+                &unique_format_tags,
+                &sample_names,
+            )?;
+            hw.finish()?;
+            let header_blocks = bgzf_blocks_no_eof(&header_tmp)?;
+            let _ = std::fs::remove_file(&header_tmp);
+            run_assembler_thread_bgzf(
+                temp_output.clone(),
+                output_path.to_path_buf(),
+                tempdir.path().to_path_buf(),
+                header_blocks,
+                contig_done_rx,
+                Arc::clone(&finalize),
+            )
+        } else {
+            // Plain/Gzip: write the header to the temp writer; the assembler
+            // owns it, appends shard bodies, finishes, and renames.
+            let mut writer = VcfLocalWriter::with_compression(&temp_output, config.compression)?;
+            writer.write_header(
+                &write_schema,
+                &vcf_info_fields,
+                &unique_format_tags,
+                &sample_names,
+            )?;
+            run_assembler_thread(
+                writer,
+                output_path.to_path_buf(),
+                temp_output.clone(),
+                tempdir.path().to_path_buf(),
+                contig_done_rx,
+                Arc::clone(&finalize),
+            )
+        };
+
         let shard_ctx = Arc::new(VcfShardContext {
             vcf_info_fields: Arc::new(vcf_info_fields),
             unique_format_tags: Arc::new(unique_format_tags),
             sample_names: Arc::new(sample_names),
             coordinate_zero_based,
+            shard_compression,
             tempdir: tempdir.path().to_path_buf(),
             rows_done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            contig_done_tx,
         });
-        total_rows = drive_sharded_vcf_annotation(
+        let drive_result = drive_sharded_vcf_annotation(
             &ctx,
             vcf_table,
             cache_source,
@@ -1145,16 +1322,40 @@ pub async fn annotate_to_vcf(
             options_json.clone(),
             &vcf_schema,
             &projection_names,
-            shard_ctx,
-            &mut writer,
+            Arc::clone(&shard_ctx),
             &pb,
             config,
             total_input,
         )
-        .await?;
+        .await;
+        // Signal the assembler whether to finalize BEFORE closing the channel, so
+        // a mid-run error never renames a partial file into the output path.
+        if drive_result.is_ok() {
+            finalize.store(true, std::sync::atomic::Ordering::Release);
+        }
+        // Drop the last sender (the one held on shard_ctx) so the assembler sees
+        // the channel close. Any per-contig senders were already sent-and-dropped
+        // by the stream.
+        drop(shard_ctx);
+        // ALWAYS join the assembler (even on error) so the thread is never detached
+        // and its cleanup/result is observed. Propagate the drive error first (the
+        // assembler has already discarded its partial temp on failure), then any
+        // assembler error.
+        let assembled = assembler
+            .join()
+            .map_err(|_| DataFusionError::Execution("assembler thread panicked".to_string()))?;
+        drive_result?;
+        total_rows = assembled?;
         // tempdir (and any leftover shard files) removed on drop here.
         drop(tempdir);
     } else {
+        let mut writer = VcfLocalWriter::with_compression(output_path, config.compression)?;
+        writer.write_header(
+            &write_schema,
+            &vcf_info_fields,
+            &unique_format_tags,
+            &sample_names,
+        )?;
         use futures::StreamExt;
         let mut stream = df.execute_stream().await?;
         let mut next_serial_batch_id = 0usize;
@@ -1236,13 +1437,13 @@ pub async fn annotate_to_vcf(
                 cb(lines.len(), total_rows, total_input);
             }
         }
+        let finish_started = Instant::now();
+        writer.finish()?;
+        if let Some(profile) = sink_profile.as_mut() {
+            profile.writer_finish += finish_started.elapsed();
+        }
     }
 
-    let finish_started = Instant::now();
-    writer.finish()?;
-    if let Some(profile) = sink_profile.as_mut() {
-        profile.writer_finish += finish_started.elapsed();
-    }
     pb.finish_and_clear();
     if let Some(profile) = sink_profile {
         eprintln!("{}", profile.summary_line());
@@ -1256,6 +1457,224 @@ mod tests {
     use super::*;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    // bgzf is a stream of concatenated gzip members; flate2's MultiGzDecoder
+    // decodes it without needing an external bgzip binary.
+    fn gunzip_to_string(path: &Path) -> String {
+        use std::io::Read;
+        let f = std::fs::File::open(path).unwrap();
+        let mut d = flate2::read::MultiGzDecoder::new(f);
+        let mut s = String::new();
+        d.read_to_string(&mut s).unwrap();
+        s
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn contig_shard_range_is_contiguous_and_sums() {
+        let a = ContigShardRange {
+            first_shard_id: 0,
+            end_shard_id: 3,
+            output_lines: 10,
+        };
+        let b = ContigShardRange {
+            first_shard_id: 3,
+            end_shard_id: 5,
+            output_lines: 4,
+        };
+        assert_eq!(a.end_shard_id, b.first_shard_id); // contiguous, no gaps/overlap
+        assert_eq!(a.output_lines + b.output_lines, 14);
+    }
+
+    #[test]
+    fn assembler_plain_appends_ranges_in_order_and_counts_lines() {
+        use std::io::Write;
+        let dir = unique_dir("asm_plain");
+        for (id, body) in [(0usize, "a\nb\n"), (1, "c\n"), (2, "d\ne\nf\n")] {
+            let mut f =
+                std::fs::File::create(dir.join(format!("partition_{id:04}.vcf.body"))).unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+        }
+        let out = dir.join("out.vcf");
+        let tmp = dir.join("out.vcf.part");
+        let writer = VcfLocalWriter::with_compression(&tmp, VcfCompressionType::Plain).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = run_assembler_thread(
+            writer,
+            out.clone(),
+            tmp,
+            dir.clone(),
+            rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        tx.send(ContigShardRange {
+            first_shard_id: 0,
+            end_shard_id: 2,
+            output_lines: 3,
+        })
+        .unwrap();
+        tx.send(ContigShardRange {
+            first_shard_id: 2,
+            end_shard_id: 3,
+            output_lines: 3,
+        })
+        .unwrap();
+        drop(tx);
+        let total = h.join().unwrap().unwrap();
+        assert_eq!(total, 6);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "a\nb\nc\nd\ne\nf\n");
+        assert!(
+            !dir.join("partition_0000.vcf.body").exists(),
+            "shards removed after copy"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shard_writer_bgzf_empty_shard_is_decodable() {
+        let dir = unique_dir("shard_bgzf");
+        let path = dir.join("partition_0000.vcf.body");
+        let w = VcfBodyShardWriter::create(
+            &path,
+            Arc::new(vec![]),
+            Arc::new(vec![]),
+            Arc::new(vec![]),
+            false,
+            VcfCompressionType::Bgzf,
+        )
+        .unwrap();
+        let lines = w.lines;
+        w.finish().unwrap(); // flushes bgzf blocks + EOF
+        assert_eq!(lines, 0);
+        assert_eq!(gunzip_to_string(&path), "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assembler_bgzf_raw_concat_decodes_in_order() {
+        let dir = unique_dir("asm_bgzf");
+        // Produce bgzf shards exactly as VcfBodyShardWriter(Bgzf) does: body
+        // through a VcfLocalWriter::Bgzf, finish() (appends EOF).
+        let write_bgzf = |path: &Path, body: &str| {
+            let mut w = VcfLocalWriter::with_compression(path, VcfCompressionType::Bgzf).unwrap();
+            write_vcf_body_chunk(&mut w, body.as_bytes()).unwrap();
+            w.finish().unwrap();
+        };
+        for (id, body) in [(0usize, "a\nb\n"), (1usize, "c\n")] {
+            write_bgzf(&dir.join(format!("partition_{id:04}.vcf.body")), body);
+        }
+        // Header blocks: compress "##header\n#CHROM\n" and strip its EOF.
+        let hpath = dir.join("hdr.bgz");
+        write_bgzf(&hpath, "##header\n#CHROM\n");
+        let header_blocks = bgzf_blocks_no_eof(&hpath).unwrap();
+        std::fs::remove_file(&hpath).ok();
+
+        let out = dir.join("out.vcf.gz");
+        let tmp = dir.join("out.vcf.gz.part");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = run_assembler_thread_bgzf(
+            tmp.clone(),
+            out.clone(),
+            dir.clone(),
+            header_blocks,
+            rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        tx.send(ContigShardRange {
+            first_shard_id: 0,
+            end_shard_id: 1,
+            output_lines: 2,
+        })
+        .unwrap();
+        tx.send(ContigShardRange {
+            first_shard_id: 1,
+            end_shard_id: 2,
+            output_lines: 1,
+        })
+        .unwrap();
+        drop(tx);
+        let total = h.join().unwrap().unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(gunzip_to_string(&out), "##header\n#CHROM\na\nb\nc\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assembler_discards_partial_output_when_not_finalized() {
+        // On a mid-run failure the driver never sets `finalize`; the assembler must
+        // NOT finish/rename its partial temp into the final output path — it must
+        // discard the temp and produce no output file.
+        use std::io::Write;
+        let dir = unique_dir("asm_nofinal");
+        let mut f = std::fs::File::create(dir.join("partition_0000.vcf.body")).unwrap();
+        f.write_all(b"a\nb\n").unwrap();
+        let out = dir.join("out.vcf");
+        let tmp = dir.join("out.vcf.part");
+        let writer = VcfLocalWriter::with_compression(&tmp, VcfCompressionType::Plain).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = run_assembler_thread(
+            writer,
+            out.clone(),
+            tmp.clone(),
+            dir.clone(),
+            rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)), // driver "failed"
+        );
+        tx.send(ContigShardRange {
+            first_shard_id: 0,
+            end_shard_id: 1,
+            output_lines: 2,
+        })
+        .unwrap();
+        drop(tx); // channel closes, but finalize == false
+        let total = h.join().unwrap().unwrap();
+        assert_eq!(total, 0, "no rows finalized on failure");
+        assert!(!out.exists(), "final output must NOT be created on failure");
+        assert!(!tmp.exists(), "temp .part must be cleaned up on failure");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assembler_bgzf_errors_on_shard_missing_eof_marker() {
+        // A shard that does not end with the canonical 28-byte BGZF EOF marker must
+        // produce a runtime error (not silent truncation) — the check must hold in
+        // release builds too, so it cannot be a debug_assert.
+        use std::io::Write;
+        let dir = unique_dir("asm_bgzf_badeof");
+        let mut f = std::fs::File::create(dir.join("partition_0000.vcf.body")).unwrap();
+        f.write_all(b"this shard does not end with the bgzf eof marker")
+            .unwrap();
+        let out = dir.join("out.vcf.gz");
+        let tmp = dir.join("out.vcf.gz.part");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = run_assembler_thread_bgzf(
+            tmp,
+            out.clone(),
+            dir.clone(),
+            Vec::new(),
+            rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        tx.send(ContigShardRange {
+            first_shard_id: 0,
+            end_shard_id: 1,
+            output_lines: 1,
+        })
+        .unwrap();
+        drop(tx);
+        let res = h.join().unwrap();
+        assert!(
+            res.is_err(),
+            "must error on a shard without the canonical EOF marker"
+        );
+        assert!(!out.exists(), "no output file on error");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn test_to_options_json_emits_pick_flags() {
