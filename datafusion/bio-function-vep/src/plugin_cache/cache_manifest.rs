@@ -10,13 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::plugin_cache::source_manifest::{SourceManifest, ValueType};
 
-/// Tier policy actually used at build time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TierRecord {
-    pub threshold: f64,
-    pub unmatched: String,
-}
-
 /// Per-chromosome build result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChromEntry {
@@ -53,7 +46,6 @@ pub struct CacheManifest {
     #[serde(default)]
     pub match_columns: Vec<MatchColumnRecord>,
     pub value_columns: Vec<ValueColumnRecord>,
-    pub tier: TierRecord,
     pub chroms: Vec<ChromEntry>,
     pub cache_source_version: Option<String>,
 }
@@ -95,10 +87,6 @@ impl CacheManifest {
                     ty: ty_str(v.ty).into(),
                 })
                 .collect(),
-            tier: TierRecord {
-                threshold: src.tier.threshold,
-                unmatched: src.tier.unmatched.clone().unwrap_or_else(|| "cold".into()),
-            },
             chroms: vec![],
             cache_source_version: None,
         }
@@ -162,10 +150,6 @@ mod tests {
             ],
             match_columns: vec![],
             value_columns: vec![],
-            tier: TierRecord {
-                threshold: 0.01,
-                unmatched: "cold".into(),
-            },
             chroms: vec![ChromEntry {
                 chrom: "22".into(),
                 file: "chr22.parquet".into(),

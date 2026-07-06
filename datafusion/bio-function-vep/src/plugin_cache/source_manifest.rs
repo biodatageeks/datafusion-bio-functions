@@ -1,6 +1,7 @@
 //! Declarative source manifest (build input) — TOML from the `vepyr-plugins`
 //! catalog. Declares the table provider(s), input schema, ingest `SELECT`,
-//! coordinate system, value→CSQ mapping, and tier policy for one plugin.
+//! coordinate system, and value→CSQ mapping for one plugin. Tiering is inherited
+//! from the variation cache at build time (see `plugin_cache::join`).
 
 use datafusion::common::{DataFusionError, Result};
 use serde::Deserialize;
@@ -105,19 +106,6 @@ pub struct MatchColumn {
     pub engine_attr: String,
 }
 
-/// Warm/cold tier policy.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TierPolicy {
-    #[serde(default = "default_threshold")]
-    pub threshold: f64,
-    #[serde(default)]
-    pub unmatched: Option<String>,
-}
-
-fn default_threshold() -> f64 {
-    0.01
-}
-
 /// The full source manifest for one plugin.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SourceManifest {
@@ -131,7 +119,6 @@ pub struct SourceManifest {
     /// Optional per-transcript match discriminators (§3.4). Empty = per-variant.
     #[serde(default, rename = "match_column")]
     pub match_columns: Vec<MatchColumn>,
-    pub tier: TierPolicy,
 }
 
 impl SourceManifest {
@@ -198,10 +185,6 @@ path = "/tmp/snv.tsv.gz"
 column = "demo_score"
 csq_field = "DEMO_SCORE"
 type = "Float32"
-
-[tier]
-threshold = 0.01
-unmatched = "cold"
 "##;
 
     #[test]
@@ -217,7 +200,6 @@ unmatched = "cold"
         assert_eq!(m.sources[0].csv.as_ref().unwrap().schema.len(), 5);
         assert_eq!(m.value_columns[0].csq_field, "DEMO_SCORE");
         assert_eq!(m.value_columns[0].ty, ValueType::Float32);
-        assert_eq!(m.tier.threshold, 0.01);
         assert_eq!(m.ingest_view_name(), "plugin_demo_ingest");
     }
 

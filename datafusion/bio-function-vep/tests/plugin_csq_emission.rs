@@ -11,7 +11,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Float32Array, Int8Array, StringArray, UInt32Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion_bio_function_vep::plugin_cache::cache_manifest::{
-    CacheManifest, ChromEntry, MatchColumnRecord, TierRecord, ValueColumnRecord,
+    CacheManifest, ChromEntry, MatchColumnRecord, ValueColumnRecord,
 };
 use datafusion_bio_function_vep::plugin_cache::csq::{
     amino_acid_change, empty_suffix, field_suffix,
@@ -86,10 +86,6 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
                 ty: "Utf8".into(),
             },
         ],
-        tier: TierRecord {
-            threshold: 0.01,
-            unmatched: "cold".into(),
-        },
         chroms: vec![ChromEntry {
             chrom: "chr22".into(),
             file: "chr22.parquet".into(),

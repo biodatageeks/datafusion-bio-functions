@@ -191,7 +191,7 @@ impl BufferSlices {
 mod tests {
     use super::*;
     use crate::plugin_cache::cache_manifest::{
-        CacheManifest, ChromEntry, MatchColumnRecord, TierRecord, ValueColumnRecord,
+        CacheManifest, ChromEntry, MatchColumnRecord, ValueColumnRecord,
     };
     use crate::plugin_cache::source_manifest::{MatchColumn, ValueColumn, ValueType};
     use crate::plugin_cache::write::{PluginShardWriter, plugin_output_schema};
@@ -252,10 +252,6 @@ mod tests {
                 csq_field: "am_pathogenicity".into(),
                 ty: "Float32".into(),
             }],
-            tier: TierRecord {
-                threshold: 0.01,
-                unmatched: "cold".into(),
-            },
             chroms: vec![ChromEntry {
                 chrom: "chr22".into(),
                 file: "chr22.parquet".into(),

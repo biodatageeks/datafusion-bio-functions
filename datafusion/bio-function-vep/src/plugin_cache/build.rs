@@ -245,10 +245,6 @@ path = "{}"
 column = "demo_score"
 csq_field = "DEMO"
 type = "Float32"
-
-[tier]
-threshold = 0.01
-unmatched = "cold"
 "##,
             tsv.display()
         );
