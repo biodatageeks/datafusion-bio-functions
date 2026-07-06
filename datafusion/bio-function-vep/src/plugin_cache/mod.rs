@@ -8,6 +8,7 @@
 //! lookup-optimized writer properties.
 
 pub mod build;
+pub mod builder;
 pub mod cache_manifest;
 pub mod csq;
 pub mod join;
