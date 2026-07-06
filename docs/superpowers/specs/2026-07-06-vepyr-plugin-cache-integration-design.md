@@ -177,7 +177,49 @@ The plugin CSQ fields (header + per-transcript body) are emitted by the upstream
 - An existing chr1–22 ensembl-vep **merged** variation cache (tier source + annotation cache).
 - Docker Ensembl VEP r115 + AlphaMissense plugin data for golden generation.
 
-## 11. Affected files (map)
+## 11. Documentation deliverable
+
+Extend vepyr's `docs/plugins.md` (the user-facing "add a plugin" reference) with two sections. This ships as part of the integration, not a follow-up.
+
+### 11.1 Manifest structure reference
+
+Document the `<plugin>.source.toml` layout as an authoritative reference, section by section:
+
+- **Top-level scalars** — `plugin_name`, `coordinate_system` (`"1-based"` / `"0-based"`), `ingest_sql`. Note the TOML ordering rule: these MUST precede any `[[table]]` header or TOML absorbs them.
+- **`ingest_sql`** — must project the fixed key columns `chrom`, `start`, `end`, `allele_string` (`ref/alt`), plus any discriminator column(s) and the value column(s), from the raw source view `plugin_<name>_src`.
+- **`[[source]]`** — `provider` (`tsv`/`csv`/`parquet`), `path` (overridden at build time by `source_path`), and the `[source.csv]` block (`delimiter`, `has_header`, `comment`, `compression`, `schema` = ordered `{name,type}` list).
+- **`[[match_column]]`** (optional, 0+) — `column` (the stored discriminator column, build-time) + `template` (the runtime expression over the engine-attribute namespace, §11.2). Omit entirely for per-variant plugins.
+- **`[[value_columns]]`** (1+) — `column`, `csq_field` (output field name), `type` (`Utf8`/`Float32`); **declaration order = CSQ output order**.
+- Note the removed sections: there is **no** `[tier]` block — tiering is inherited from the variation cache (§6).
+
+Include the full AlphaMissense manifest as a worked example, and a minimal per-variant example (no `[[match_column]]`).
+
+### 11.2 Engine-attribute namespace table
+
+Document the names a `[[match_column]].template` may reference (the per-consequence values the engine exposes at the probe site). Each is `Option`: **if any placeholder a template references is absent, the discriminator is `None` → probe miss → empty output** (this is how missense-only gating works).
+
+| Attribute | Description |
+|---|---|
+| `Consequence` | Consequence type(s) for the transcript (e.g. `missense_variant`). |
+| `Gene` | Ensembl gene stable ID. |
+| `Feature_type` | Feature type (e.g. `Transcript`). |
+| `Feature` | Transcript stable ID — the transcript-id discriminator (e.g. dbNSFP). |
+| `BIOTYPE` | Transcript biotype (e.g. `protein_coding`). |
+| `HGVSc` | HGVS coding-sequence notation. |
+| `HGVSp` | HGVS protein notation. |
+| `cDNA_position` | Position in cDNA. |
+| `CDS_position` | Position in the CDS. |
+| `Protein_position` | 1-based amino-acid position. |
+| `Amino_acids` | Reference/alternate amino acids as `ref/alt` (e.g. `W/R`); single value when unchanged. |
+| `Codons` | Reference/alternate codons. |
+| `ref_aa` | Reference amino acid (left of `/` in `Amino_acids`). |
+| `alt_aa` | Alternate amino acid (right of `/` in `Amino_acids`). |
+| `ref` | VCF reference allele. |
+| `alt` | VCF alternate allele. |
+
+Worked examples: AlphaMissense (aa-change) `template = "{ref_aa}{Protein_position}{alt_aa}"` → `W320R`; a transcript-keyed plugin `template = "{Feature}"`. State the rule for extending the namespace: a new attribute is added upstream only when a plugin needs a value not already listed here (the common discriminators are all present, so most plugins are manifest-only).
+
+## 12. Affected files (map)
 
 **datafusion-bio-functions (upstream):**
 - `plugin_cache/source_manifest.rs` — remove `TierPolicy`/`tier`; `MatchColumn`: `engine_attr` → `template`.
@@ -194,7 +236,8 @@ The plugin CSQ fields (header + per-transcript body) are emitted by the upstream
 - `src/lib.rs` — `_core.build_plugin_cache` pyfunction + module registration.
 - `src/vepyr/__init__.py` — `build_plugin_cache()` + manifest resolution; `plugin_cache_root` kwarg on `annotate()`.
 - `src/vepyr/_core.pyi` — stubs.
-- `e2e-testing/vep-docker.md`, `e2e-testing/scripts/run_annotation_fast.py` (`_CACHE_PROFILES`), `docs/plugins.md`.
+- `e2e-testing/vep-docker.md`, `e2e-testing/scripts/run_annotation_fast.py` (`_CACHE_PROFILES`).
+- `docs/plugins.md` — `plugin_cache_root` on `annotate()`, `build_plugin_cache()` usage, **manifest structure reference + engine-attribute namespace table (§11)**.
 
 **vepyr-plugins:**
 - `plugins/alphamissense/alphamissense.source.toml` — drop `[tier]`; `engine_attr` → `template`; new tag.
