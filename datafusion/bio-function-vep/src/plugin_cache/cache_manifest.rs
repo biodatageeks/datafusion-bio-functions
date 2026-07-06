@@ -29,12 +29,12 @@ pub struct ValueColumnRecord {
     pub ty: String,
 }
 
-/// A per-transcript match discriminator binding (§3.4), recorded so the runtime
-/// knows which engine attribute supplies each match column's value.
+/// A per-transcript match discriminator binding, recorded so the runtime knows
+/// which template builds each match column's discriminator value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchColumnRecord {
     pub column: String,
-    pub engine_attr: String,
+    pub template: String,
 }
 
 /// The cache manifest written by the build and read at runtime.
@@ -75,7 +75,7 @@ impl CacheManifest {
                 .iter()
                 .map(|m| MatchColumnRecord {
                     column: m.column.clone(),
-                    engine_attr: m.engine_attr.clone(),
+                    template: m.template.clone(),
                 })
                 .collect(),
             value_columns: src

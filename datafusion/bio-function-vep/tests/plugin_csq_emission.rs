@@ -13,13 +13,32 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion_bio_function_vep::plugin_cache::cache_manifest::{
     CacheManifest, ChromEntry, MatchColumnRecord, ValueColumnRecord,
 };
-use datafusion_bio_function_vep::plugin_cache::csq::{
-    amino_acid_change, empty_suffix, field_suffix,
-};
-use datafusion_bio_function_vep::plugin_cache::registry::{EngineAttrs, PluginRegistry};
+use datafusion_bio_function_vep::plugin_cache::csq::{empty_suffix, field_suffix};
+use datafusion_bio_function_vep::plugin_cache::registry::PluginRegistry;
 use datafusion_bio_function_vep::plugin_cache::source_manifest::{
     MatchColumn, ValueColumn, ValueType,
 };
+use datafusion_bio_function_vep::plugin_cache::template::build_attr_namespace;
+
+/// Namespace for a `C/G` variant with the given amino-acid change (rest empty).
+fn ns_aa<'a>(amino_acids: &'a str, protein_pos: &'a str) -> [Option<&'a str>; 16] {
+    build_attr_namespace(
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        protein_pos,
+        amino_acids,
+        "",
+        "C",
+        "G",
+    )
+}
 use datafusion_bio_function_vep::plugin_cache::write::{PluginShardWriter, plugin_output_schema};
 
 fn build_alphamissense_shard(cache_root: &std::path::Path) {
@@ -27,7 +46,7 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
     std::fs::create_dir_all(&plugin_dir).unwrap();
     let matches = vec![MatchColumn {
         column: "protein_variant".into(),
-        engine_attr: "amino_acid_change".into(),
+        template: "{ref_aa}{Protein_position}{alt_aa}".into(),
     }];
     let vals = vec![
         ValueColumn {
@@ -72,7 +91,7 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
         ],
         match_columns: vec![MatchColumnRecord {
             column: "protein_variant".into(),
-            engine_attr: "amino_acid_change".into(),
+            template: "{ref_aa}{Protein_position}{alt_aa}".into(),
         }],
         value_columns: vec![
             ValueColumnRecord {
@@ -114,30 +133,24 @@ async fn plugin_csq_gates_per_transcript() {
     let slices = reg.take_buffer_all(&[22893742]).await.unwrap();
 
     // Transcript line 1: missense C17W (Amino_acids "C/W", Protein_position "17").
-    let attrs_missense = EngineAttrs {
-        amino_acid_change: amino_acid_change("C/W", "17"),
-    };
-    let missense = slices.probe_all(22893742, "C/G", &attrs_missense);
+    let ns_missense = ns_aa("C/W", "17");
+    let missense = slices.probe_all(22893742, "C/G", &ns_missense);
     assert_eq!(field_suffix(&missense), "|0.4833|ambiguous");
 
     // Transcript line 2: intron (no amino-acid change) → gate → empty fields.
-    let attrs_intron = EngineAttrs {
-        amino_acid_change: amino_acid_change("", ""),
-    };
-    let intron = slices.probe_all(22893742, "C/G", &attrs_intron);
+    let ns_intron = ns_aa("", "");
+    let intron = slices.probe_all(22893742, "C/G", &ns_intron);
     assert_eq!(field_suffix(&intron), empty_suffix(n));
     assert_eq!(field_suffix(&intron), "||");
 
     // A different protein change at the same position (wrong isoform) → miss.
-    let attrs_wrong = EngineAttrs {
-        amino_acid_change: amino_acid_change("C/Y", "17"),
-    };
+    let ns_wrong = ns_aa("C/Y", "17");
     assert_eq!(
-        field_suffix(&slices.probe_all(22893742, "C/G", &attrs_wrong)),
+        field_suffix(&slices.probe_all(22893742, "C/G", &ns_wrong)),
         "||"
     );
 
     // A variant with no shard row (different position) → empty fields.
-    let none_here = slices.probe_all(99999999, "A/G", &attrs_missense);
+    let none_here = slices.probe_all(99999999, "A/G", &ns_missense);
     assert_eq!(field_suffix(&none_here), "||");
 }

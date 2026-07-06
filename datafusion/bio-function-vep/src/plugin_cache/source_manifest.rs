@@ -94,16 +94,16 @@ pub struct ValueColumn {
     pub ty: ValueType,
 }
 
-/// A per-transcript match discriminator (§3.4): an extra key column (produced by
-/// `ingest_sql`, stored in the shard key) matched at runtime against a named
-/// per-transcript engine attribute. Empty for pure per-variant plugins.
+/// A per-transcript match discriminator: an extra key column (produced by
+/// `ingest_sql`, stored in the shard key) matched at runtime against a
+/// discriminator built from a `template` over the engine-attribute namespace
+/// (see `plugin_cache::template`). Empty for pure per-variant plugins.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MatchColumn {
     /// Cache column name (also the column `ingest_sql` must produce).
     pub column: String,
-    /// The per-transcript engine attribute supplying the runtime value.
-    /// Currently only `amino_acid_change` (`{refAA}{protpos}{altAA}`).
-    pub engine_attr: String,
+    /// Runtime discriminator template, e.g. `"{ref_aa}{Protein_position}{alt_aa}"`.
+    pub template: String,
 }
 
 /// The full source manifest for one plugin.

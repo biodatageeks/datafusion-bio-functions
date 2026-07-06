@@ -7,22 +7,6 @@
 
 use crate::plugin_cache::lookup::PluginScalar;
 
-/// Form the AlphaMissense-style amino-acid change discriminator from the
-/// transcript's `Amino_acids` (`"V/A"`) + `Protein_position` (`"550"`) →
-/// `"V550A"`. `None` when there is no single-residue substitution (no
-/// `Amino_acids`, not `X/Y` form, or a positional range) — a non-missense
-/// consequence, which then misses the plugin lookup (the gate).
-pub fn amino_acid_change(amino_acids: &str, protein_position: &str) -> Option<String> {
-    let (ref_aa, alt_aa) = amino_acids.split_once('/')?;
-    if ref_aa.len() != 1 || alt_aa.len() != 1 {
-        return None;
-    }
-    if protein_position.is_empty() || protein_position.contains('-') {
-        return None;
-    }
-    Some(format!("{ref_aa}{protein_position}{alt_aa}"))
-}
-
 /// Format one plugin scalar for CSQ output: floats via shortest round-trip,
 /// strings verbatim, `Null` → empty.
 pub fn format_scalar(scalar: &PluginScalar) -> String {
@@ -55,18 +39,6 @@ pub fn empty_suffix(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn amino_acid_change_forms_discriminator() {
-        assert_eq!(amino_acid_change("V/A", "550").as_deref(), Some("V550A"));
-        assert_eq!(amino_acid_change("W/R", "320").as_deref(), Some("W320R"));
-        // non-missense / no aa-change → None (gate)
-        assert_eq!(amino_acid_change("", "550"), None);
-        assert_eq!(amino_acid_change("V/A", ""), None);
-        assert_eq!(amino_acid_change("V", "550"), None); // no '/'
-        assert_eq!(amino_acid_change("VV/A", "550"), None); // multi-residue
-        assert_eq!(amino_acid_change("V/A", "550-551"), None); // range
-    }
 
     #[test]
     fn suffix_widths_and_formatting() {

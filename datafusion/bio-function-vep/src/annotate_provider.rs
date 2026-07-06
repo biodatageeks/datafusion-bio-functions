@@ -6209,12 +6209,22 @@ impl AnnotateProvider {
                         // → discriminator `None` → probe miss → empty fields (gate).
                         #[cfg(feature = "parquet-cache")]
                         if plugin_n_fields > 0 {
-                            let attrs = crate::plugin_cache::registry::EngineAttrs {
-                                amino_acid_change: crate::plugin_cache::csq::amino_acid_change(
-                                    amino_acids,
-                                    protein_pos,
-                                ),
-                            };
+                            let ns = crate::plugin_cache::template::build_attr_namespace(
+                                terms_str,
+                                gene,
+                                feature_type,
+                                feature,
+                                biotype,
+                                hgvsc,
+                                hgvsp.as_str(),
+                                cdna_pos,
+                                cds_pos,
+                                protein_pos,
+                                amino_acids,
+                                codons_str,
+                                input_ref.as_str(),
+                                input_alt.as_str(),
+                            );
                             let plugin_allele = format!("{input_ref}/{input_alt}");
                             let scalars = plugin_slices
                                 .as_ref()
@@ -6222,7 +6232,7 @@ impl AnnotateProvider {
                                     s.probe_all(
                                         u32::try_from(start_val).unwrap_or(0),
                                         &plugin_allele,
-                                        &attrs,
+                                        &ns,
                                     )
                                 })
                                 .unwrap_or_else(|| {

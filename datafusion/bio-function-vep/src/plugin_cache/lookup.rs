@@ -339,7 +339,7 @@ mod tests {
     fn write_shard(path: &std::path::Path) {
         let matches = vec![MatchColumn {
             column: "protein_variant".into(),
-            engine_attr: "amino_acid_change".into(),
+            template: "{ref_aa}{Protein_position}{alt_aa}".into(),
         }];
         let vals = vec![ValueColumn {
             column: "am".into(),

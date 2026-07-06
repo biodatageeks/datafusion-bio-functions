@@ -10,33 +10,14 @@ use datafusion::common::Result;
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::discover_plugins;
 use crate::plugin_cache::lookup::{PluginBufferSlice, PluginLookup, PluginScalar};
-
-/// Per-transcript attributes the engine supplies at probe time, keyed by the
-/// `engine_attr` names a plugin's match columns (§3.4) bind to. Extend as new
-/// discriminators are added.
-#[derive(Debug, Default, Clone)]
-pub struct EngineAttrs {
-    /// `{refAA}{protein_position}{altAA}` (e.g. `"V550A"`); `None` for a
-    /// non-missense consequence (no amino-acid change) — the gate.
-    pub amino_acid_change: Option<String>,
-}
-
-impl EngineAttrs {
-    /// Resolve a named engine attribute; unknown names resolve to `None`.
-    fn get(&self, engine_attr: &str) -> Option<String> {
-        match engine_attr {
-            "amino_acid_change" => self.amino_acid_change.clone(),
-            _ => None,
-        }
-    }
-}
+use crate::plugin_cache::template::CompiledTemplate;
 
 /// One enabled plugin, with its per-chrom lookup (absent if this plugin has no
 /// shard for the current chrom).
 struct PluginEntry {
     csq_fields: Vec<String>,
-    /// The `engine_attr` name for each match column, in order.
-    match_engine_attrs: Vec<String>,
+    /// The compiled discriminator template for each match column, in order.
+    match_templates: Vec<CompiledTemplate>,
     n_match: usize,
     n_values: usize,
     lookup: Option<PluginLookup>,
@@ -63,11 +44,11 @@ impl PluginRegistry {
                 m.value_columns.iter().map(|v| v.column.clone()).collect();
             let match_columns: Vec<String> =
                 m.match_columns.iter().map(|mc| mc.column.clone()).collect();
-            let match_engine_attrs: Vec<String> = m
+            let match_templates: Vec<CompiledTemplate> = m
                 .match_columns
                 .iter()
-                .map(|mc| mc.engine_attr.clone())
-                .collect();
+                .map(|mc| CompiledTemplate::compile(&mc.template))
+                .collect::<Result<Vec<_>>>()?;
             let n_match = match_columns.len();
             let n_values = value_columns.len();
             let chrom_entry = m.chroms.iter().find(|c| c.chrom == want);
@@ -83,7 +64,7 @@ impl PluginRegistry {
             };
             plugins.push(PluginEntry {
                 csq_fields,
-                match_engine_attrs,
+                match_templates,
                 n_match,
                 n_values,
                 lookup,
@@ -136,7 +117,7 @@ impl PluginRegistry {
             };
             entries.push(SliceEntry {
                 csq_fields_len: p.csq_fields.len(),
-                match_engine_attrs: p.match_engine_attrs.clone(),
+                match_templates: p.match_templates.clone(),
                 slice,
             });
         }
@@ -147,7 +128,7 @@ impl PluginRegistry {
 /// Per-plugin buffer slice plus the metadata `probe_all` needs.
 struct SliceEntry {
     csq_fields_len: usize,
-    match_engine_attrs: Vec<String>,
+    match_templates: Vec<CompiledTemplate>,
     slice: Option<PluginBufferSlice>,
 }
 
@@ -160,20 +141,21 @@ pub struct BufferSlices {
 impl BufferSlices {
     /// Probe every plugin for `(start, allele_string, attrs)`, returning one
     /// [`PluginScalar`] per entry of [`PluginRegistry::csq_fields`] (same order).
-    /// Each plugin's discriminator is built by resolving its match columns'
-    /// `engine_attr`s against `attrs`; a plugin with no shard, or a
-    /// position/allele/discriminator miss, yields `PluginScalar::Null` per field
-    /// (the per-transcript gate for match-column plugins).
+    /// Each plugin's discriminator is built by evaluating its match columns'
+    /// templates against the engine-attribute namespace `attrs` (same order as
+    /// [`crate::plugin_cache::template::ATTR_NAMES`]); a plugin with no shard, or
+    /// a position/allele/discriminator miss, yields `PluginScalar::Null` per
+    /// field (the per-transcript gate for match-column plugins).
     pub fn probe_all(
         &self,
         start: u32,
         allele_string: &str,
-        attrs: &EngineAttrs,
+        attrs: &[Option<&str>],
     ) -> Vec<PluginScalar> {
         let mut out = Vec::new();
         for e in &self.entries {
             let match_values: Vec<Option<String>> =
-                e.match_engine_attrs.iter().map(|a| attrs.get(a)).collect();
+                e.match_templates.iter().map(|t| t.eval(attrs)).collect();
             let hit = e
                 .slice
                 .as_ref()
@@ -194,6 +176,7 @@ mod tests {
         CacheManifest, ChromEntry, MatchColumnRecord, ValueColumnRecord,
     };
     use crate::plugin_cache::source_manifest::{MatchColumn, ValueColumn, ValueType};
+    use crate::plugin_cache::template::build_attr_namespace;
     use crate::plugin_cache::write::{PluginShardWriter, plugin_output_schema};
     use datafusion::arrow::array::{Float32Array, Int8Array, StringArray, UInt32Array};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -209,7 +192,7 @@ mod tests {
         // chr22 shard with a per-transcript discriminator; 100 is multi-isoform.
         let matches = vec![MatchColumn {
             column: "protein_variant".into(),
-            engine_attr: "amino_acid_change".into(),
+            template: "{ref_aa}{Protein_position}{alt_aa}".into(),
         }];
         let vals = vec![ValueColumn {
             column: "am_pathogenicity".into(),
@@ -245,7 +228,7 @@ mod tests {
             ],
             match_columns: vec![MatchColumnRecord {
                 column: "protein_variant".into(),
-                engine_attr: "amino_acid_change".into(),
+                template: "{ref_aa}{Protein_position}{alt_aa}".into(),
             }],
             value_columns: vec![ValueColumnRecord {
                 column: "am_pathogenicity".into(),
@@ -267,17 +250,46 @@ mod tests {
         assert_eq!(reg.csq_fields(), vec!["am_pathogenicity".to_string()]);
 
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
-        // isoform-specific hit
-        let attrs = EngineAttrs {
-            amino_acid_change: Some("R78G".into()),
-        };
-        let hit = slices.probe_all(100, "A/G", &attrs);
+        // isoform-specific hit: template {ref_aa}{Protein_position}{alt_aa} -> "R78G"
+        let ns_hit = build_attr_namespace(
+            "missense_variant",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "78",
+            "R/G",
+            "",
+            "A",
+            "G",
+        );
+        let hit = slices.probe_all(100, "A/G", &ns_hit);
         match hit[0] {
             PluginScalar::F32(v) => assert!((v - 0.0427).abs() < 1e-6),
             ref other => panic!("{other:?}"),
         }
         // non-missense (no aa-change) → Null (gate)
-        let none = slices.probe_all(100, "A/G", &EngineAttrs::default());
+        let ns_miss = build_attr_namespace(
+            "synonymous_variant",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "A",
+            "G",
+        );
+        let none = slices.probe_all(100, "A/G", &ns_miss);
         assert_eq!(none, vec![PluginScalar::Null]);
     }
 }

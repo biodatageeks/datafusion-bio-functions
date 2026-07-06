@@ -119,7 +119,7 @@ mod tests {
     fn match_columns_sit_between_allele_and_values() {
         let matches = vec![MatchColumn {
             column: "protein_variant".into(),
-            engine_attr: "amino_acid_change".into(),
+            template: "{ref_aa}{Protein_position}{alt_aa}".into(),
         }];
         let s = plugin_output_schema(&matches, &f32_value_col());
         let names: Vec<_> = s.fields().iter().map(|f| f.name().clone()).collect();
