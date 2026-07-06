@@ -37,8 +37,6 @@ async fn main() -> Result<()> {
     );
     let chrom = arg(&args, "--chrom")
         .ok_or_else(|| DataFusionError::Execution("--chrom required".into()))?;
-    let af_max_sql =
-        arg(&args, "--af-max-sql").unwrap_or_else(|| "coalesce(minor_allele_freq, 0.0)".into());
 
     let mut manifest = SourceManifest::load(&PathBuf::from(&manifest_path))?;
     if let Some(source_path) = arg(&args, "--source-path")
@@ -56,15 +54,8 @@ async fn main() -> Result<()> {
         "Building plugin '{}' chrom {chrom} from '{}'",
         manifest.plugin_name, manifest.sources[0].path
     );
-    let entry = build_plugin_chrom(
-        &manifest,
-        &manifest_file,
-        &variation_shard,
-        &af_max_sql,
-        &out,
-        &chrom,
-    )
-    .await?;
+    let entry =
+        build_plugin_chrom(&manifest, &manifest_file, &variation_shard, &out, &chrom).await?;
     println!(
         "  rows={} warm={} cold={} -> plugin/{}/{}",
         entry.rows, entry.warm, entry.cold, manifest.plugin_name, entry.file

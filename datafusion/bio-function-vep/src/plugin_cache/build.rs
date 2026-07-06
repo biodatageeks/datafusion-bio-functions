@@ -59,7 +59,6 @@ pub async fn build_plugin_chrom(
     src: &SourceManifest,
     _source_manifest_file: &str,
     variation_shard: &Path,
-    af_max_sql: &str,
     output_cache_root: &Path,
     chrom: &str,
 ) -> Result<ChromEntry> {
@@ -96,15 +95,8 @@ pub async fn build_plugin_chrom(
     let file_name = format!("{}.parquet", canonical_chrom_label(chrom));
     let shard_path = plugin_dir.join(&file_name);
 
-    // Materialize tiered rows.
-    let mut stream = tiered_stream(
-        &ctx,
-        &norm_view,
-        variation_shard,
-        af_max_sql,
-        src.tier.threshold,
-    )
-    .await?;
+    // Materialize tiered rows (tier inherited from the variation cache).
+    let mut stream = tiered_stream(&ctx, &norm_view, variation_shard).await?;
     let mut batches = Vec::new();
     while let Some(b) = stream.next().await {
         batches.push(b?);
@@ -169,7 +161,7 @@ pub async fn build_plugin_chrom(
 mod tests {
     use super::*;
     use crate::plugin_cache::source_manifest::SourceManifest;
-    use datafusion::arrow::array::{Float64Array, StringArray, UInt32Array};
+    use datafusion::arrow::array::{Int8Array, StringArray, UInt32Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use std::io::Write;
@@ -182,13 +174,13 @@ mod tests {
         enc.finish().unwrap();
     }
 
-    /// Minimal variation-like shard: (chrom, start, allele_string, minor_allele_freq).
-    fn write_synthetic_variation(path: &std::path::Path, rows: &[(&str, u32, &str, f64)]) {
+    /// Minimal variation-like shard: (chrom, start, allele_string, tier).
+    fn write_synthetic_variation(path: &std::path::Path, rows: &[(&str, u32, &str, i8)]) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::UInt32, false),
             Field::new("allele_string", DataType::Utf8, false),
-            Field::new("minor_allele_freq", DataType::Float64, false),
+            Field::new("tier", DataType::Int8, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -202,7 +194,7 @@ mod tests {
                 Arc::new(StringArray::from(
                     rows.iter().map(|r| r.2).collect::<Vec<_>>(),
                 )),
-                Arc::new(Float64Array::from(
+                Arc::new(Int8Array::from(
                     rows.iter().map(|r| r.3).collect::<Vec<_>>(),
                 )),
             ],
@@ -222,7 +214,7 @@ mod tests {
         write_gz(&tsv, "chr1\t100\tA\tG\t0.9\nchr1\t300\tG\tA\t0.7\n");
 
         let var = dir.path().join("var.parquet");
-        write_synthetic_variation(&var, &[("1", 100, "A/G", 0.5)]);
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]); // 100 warm (tier 0)
 
         let toml = format!(
             r##"
@@ -262,19 +254,12 @@ unmatched = "cold"
         );
         let manifest: SourceManifest = toml::from_str(&toml).unwrap();
         let out = dir.path().join("out");
-        let entry = build_plugin_chrom(
-            &manifest,
-            "demo.source.toml",
-            &var,
-            "minor_allele_freq",
-            &out,
-            "1",
-        )
-        .await
-        .unwrap();
+        let entry = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .unwrap();
         assert_eq!(entry.rows, 2);
-        assert_eq!(entry.warm, 1); // start 100 matched af 0.5
-        assert_eq!(entry.cold, 1); // start 300 miss
+        assert_eq!(entry.warm, 1); // start 100 inherited tier 0
+        assert_eq!(entry.cold, 1); // start 300 miss -> cold
         assert!(
             out.join("plugin")
                 .join("demo")
