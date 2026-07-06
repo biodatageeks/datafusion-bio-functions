@@ -52,15 +52,23 @@ impl PluginRegistry {
             let n_match = match_columns.len();
             let n_values = value_columns.len();
             let chrom_entry = m.chroms.iter().find(|c| c.chrom == want);
+            // Only open a shard for a non-empty chrom whose file actually exists.
+            // An empty chrom (rows == 0) has no shard on disk (build removes any
+            // stale file), so it resolves to `None` → empty plugin fields for that
+            // chrom rather than a failed open on a missing/stale file.
             let lookup = match chrom_entry {
-                Some(entry) => {
+                Some(entry) if entry.rows > 0 => {
                     let shard = cache_root
                         .join("plugin")
                         .join(&m.plugin_name)
                         .join(&entry.file);
-                    Some(PluginLookup::open(&shard, match_columns, value_columns).await?)
+                    if shard.exists() {
+                        Some(PluginLookup::open(&shard, match_columns, value_columns).await?)
+                    } else {
+                        None
+                    }
                 }
-                None => None,
+                _ => None,
             };
             plugins.push(PluginEntry {
                 csq_fields,
@@ -291,5 +299,47 @@ mod tests {
         );
         let none = slices.probe_all(100, "A/G", &ns_miss);
         assert_eq!(none, vec![PluginScalar::Null]);
+    }
+
+    // An empty chrom (rows: 0, no shard file) must open without error and probe
+    // to empty fields — not fail on a missing/stale shard (PR #190 C3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_chrom_entry_opens_without_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path();
+        let plugin_dir = cache_root.join("plugin").join("demo");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let manifest = CacheManifest {
+            plugin_name: "demo".into(),
+            source_manifest: "demo.source.toml".into(),
+            key_columns: vec![
+                "chrom".into(),
+                "start".into(),
+                "end".into(),
+                "allele_string".into(),
+            ],
+            match_columns: vec![],
+            value_columns: vec![ValueColumnRecord {
+                column: "score".into(),
+                csq_field: "SCORE".into(),
+                ty: "Float32".into(),
+            }],
+            // chr22 present in the manifest with rows: 0 and NO file on disk.
+            chroms: vec![ChromEntry {
+                chrom: "chr22".into(),
+                file: "chr22.parquet".into(),
+                rows: 0,
+                warm: 0,
+                cold: 0,
+            }],
+            cache_source_version: None,
+        };
+        manifest.write(&plugin_dir).unwrap();
+
+        let reg = PluginRegistry::open(cache_root, "22").await.unwrap();
+        assert_eq!(reg.csq_fields(), vec!["SCORE".to_string()]);
+        let slices = reg.take_buffer_all(&[100]).await.unwrap();
+        // No shard → empty (Null) field, not an error.
+        assert_eq!(slices.probe_all(100, "A/G", &[]), vec![PluginScalar::Null]);
     }
 }

@@ -7,11 +7,29 @@
 
 use crate::plugin_cache::lookup::PluginScalar;
 
+/// Escape a plugin string value for the CSQ payload, mirroring the engine's
+/// built-in `csq_escape`: `,`/`|` → `&`, `;` → `%3B`, whitespace → `_`. Without
+/// this a Utf8 plugin value containing a CSQ/INFO delimiter would corrupt field
+/// or entry boundaries. (The built-in `-`→empty convention is deliberately NOT
+/// applied to plugin values, so a legitimate `-` is preserved.)
+fn escape_csq_value(val: &str) -> String {
+    let mut out = String::with_capacity(val.len());
+    for ch in val.chars() {
+        match ch {
+            ',' | '|' => out.push('&'),
+            ';' => out.push_str("%3B"),
+            c if c.is_whitespace() => out.push('_'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Format one plugin scalar for CSQ output: floats via shortest round-trip,
-/// strings verbatim, `Null` → empty.
+/// strings CSQ-escaped, `Null` → empty.
 pub fn format_scalar(scalar: &PluginScalar) -> String {
     match scalar {
-        PluginScalar::Str(s) => s.clone(),
+        PluginScalar::Str(s) => escape_csq_value(s),
         PluginScalar::F32(v) => format!("{v}"),
         PluginScalar::I32(v) => format!("{v}"),
         PluginScalar::Null => String::new(),
@@ -39,6 +57,24 @@ pub fn empty_suffix(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escapes_csq_delimiters_in_string_values() {
+        // delimiters that would corrupt the CSQ/INFO payload are escaped
+        assert_eq!(
+            format_scalar(&PluginScalar::Str("a|b;c d".into())),
+            "a&b%3Bc_d"
+        );
+        assert_eq!(format_scalar(&PluginScalar::Str("x,y".into())), "x&y");
+        // AlphaMissense-style values contain none → unchanged (parity-safe)
+        assert_eq!(
+            format_scalar(&PluginScalar::Str("likely_benign".into())),
+            "likely_benign"
+        );
+        // floats/ints/null are unaffected
+        assert_eq!(format_scalar(&PluginScalar::F32(0.2199)), "0.2199");
+        assert_eq!(format_scalar(&PluginScalar::Null), "");
+    }
 
     #[test]
     fn suffix_widths_and_formatting() {

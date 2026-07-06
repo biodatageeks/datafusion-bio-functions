@@ -102,9 +102,12 @@ pub async fn build_plugin_chrom(
         batches.push(b?);
     }
 
-    // Empty chrom → no shard (matches variation builder cleanup).
+    // Empty chrom → no shard (matches variation builder cleanup). Remove any
+    // stale shard from a previous build so the manifest (rows: 0) matches disk
+    // and the runtime never opens a leftover file for an empty chrom.
     let non_empty: Vec<RecordBatch> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
     if non_empty.is_empty() {
+        let _ = std::fs::remove_file(&shard_path);
         return Ok(ChromEntry {
             chrom: canonical_chrom_label(chrom),
             file: file_name,

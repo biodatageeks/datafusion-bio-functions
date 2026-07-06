@@ -5303,9 +5303,19 @@ impl AnnotateProvider {
         let plugin_n_fields = plugin_registry.map(|r| r.csq_fields().len()).unwrap_or(0);
         #[cfg(feature = "parquet-cache")]
         let plugin_slices = if let Some(reg) = plugin_registry.filter(|r| !r.is_empty()) {
+            // Key plugin lookups on the VEP-normalized start (matches the
+            // variation cache and the per-transcript probe below). For SNVs this
+            // equals the raw POS; for indels with a shared anchor base
+            // `vcf_to_vep_input_allele` shifts it, so the take must use the same
+            // normalized start the probe uses or indel plugins would miss.
             let mut starts: Vec<u32> = (0..batch.num_rows())
                 .filter_map(|row| {
-                    u32::try_from(int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0)).ok()
+                    let start_val = int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0);
+                    let ref_al = string_at(batch.column(ref_idx).as_ref(), row).unwrap_or_default();
+                    let alt_al = string_at(batch.column(alt_idx).as_ref(), row).unwrap_or_default();
+                    let (_ir, _ia, input_start) =
+                        vcf_to_vep_input_allele(start_val, &ref_al, &alt_al);
+                    u32::try_from(input_start).ok()
                 })
                 .collect();
             starts.sort_unstable();
@@ -6229,8 +6239,10 @@ impl AnnotateProvider {
                             let scalars = plugin_slices
                                 .as_ref()
                                 .map(|s| {
+                                    // VEP-normalized start (== start_val for SNVs),
+                                    // matching the buffer take above.
                                     s.probe_all(
-                                        u32::try_from(start_val).unwrap_or(0),
+                                        u32::try_from(input_start).unwrap_or(0),
                                         &plugin_allele,
                                         &ns,
                                     )
