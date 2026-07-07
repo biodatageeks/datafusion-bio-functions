@@ -10,7 +10,7 @@ use datafusion::common::{DataFusionError, Result};
 
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::build::build_plugin_chrom;
-use crate::plugin_cache::cache_manifest::CacheManifest;
+use crate::plugin_cache::cache_manifest::{CacheManifest, ChromEntry};
 use crate::plugin_cache::source_manifest::SourceManifest;
 
 /// Builds every requested chromosome's plugin shard against a variation cache.
@@ -90,7 +90,14 @@ impl<'a> PluginCacheBuilder<'a> {
     pub async fn build_all(&self) -> Result<CacheManifest> {
         let plugin_dir = self.out.join("plugin").join(&self.manifest.plugin_name);
         let mut cache = CacheManifest::from_source(self.manifest, &self.manifest_file);
-        cache.chroms.clear();
+        // Preserve chromosomes from a prior build (their shards remain on disk),
+        // so a filtered/incremental build UPSERTs the rebuilt chroms rather than
+        // dropping the others from the manifest that runtime discovery relies on.
+        let mut chroms: Vec<ChromEntry> = std::fs::read_to_string(plugin_dir.join("manifest.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<CacheManifest>(&t).ok())
+            .map(|m| m.chroms)
+            .unwrap_or_default();
         let _ = self.overwrite; // build_plugin_chrom overwrites the shard file per chrom.
         for chrom in self.resolve_chroms()? {
             let shard = self.variation_shard(&chrom);
@@ -108,8 +115,11 @@ impl<'a> PluginCacheBuilder<'a> {
                 &chrom,
             )
             .await?;
-            cache.chroms.push(entry);
+            chroms.retain(|c| c.chrom != entry.chrom);
+            chroms.push(entry);
         }
+        chroms.sort_by(|a, b| a.chrom.cmp(&b.chrom));
+        cache.chroms = chroms;
         std::fs::create_dir_all(&plugin_dir).map_err(|e| {
             DataFusionError::Execution(format!("mkdir {}: {e}", plugin_dir.display()))
         })?;
@@ -241,5 +251,73 @@ type = "Float32"
                 .join("chr2.parquet")
                 .exists()
         );
+    }
+
+    // A filtered/incremental rebuild must UPSERT into the existing manifest, not
+    // drop previously built chromosomes (PR #190 N1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn filtered_rebuild_preserves_other_chroms() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.tsv.gz");
+        write_gz(&src, "chr1\t100\tA\tG\t0.9\nchr2\t200\tC\tT\t0.5\n");
+        let var_dir = dir.path().join("cache").join("variation");
+        std::fs::create_dir_all(&var_dir).unwrap();
+        write_variation(&var_dir.join("chr1.parquet"), &[("1", 100, "A/G", 0)]);
+        write_variation(&var_dir.join("chr2.parquet"), &[("2", 200, "C/T", 1)]);
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            src.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let cache_dir = dir.path().join("cache");
+        let out = dir.path().join("out");
+
+        // Build chr1 only, then rebuild chr2 only into the same output.
+        PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .build_all()
+            .await
+            .unwrap();
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .build_all()
+            .await
+            .unwrap();
+
+        let chroms: Vec<&str> = cache.chroms.iter().map(|c| c.chrom.as_str()).collect();
+        assert!(
+            chroms.contains(&"chr1"),
+            "chr1 must be preserved: {chroms:?}"
+        );
+        assert!(chroms.contains(&"chr2"), "chr2 must be present: {chroms:?}");
+        assert_eq!(cache.chroms.len(), 2);
     }
 }

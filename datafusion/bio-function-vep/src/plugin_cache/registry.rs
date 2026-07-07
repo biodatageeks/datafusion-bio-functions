@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use datafusion::common::Result;
+use datafusion::common::{DataFusionError, Result};
 
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::discover_plugins;
@@ -52,21 +52,29 @@ impl PluginRegistry {
             let n_match = match_columns.len();
             let n_values = value_columns.len();
             let chrom_entry = m.chroms.iter().find(|c| c.chrom == want);
-            // Only open a shard for a non-empty chrom whose file actually exists.
-            // An empty chrom (rows == 0) has no shard on disk (build removes any
-            // stale file), so it resolves to `None` → empty plugin fields for that
-            // chrom rather than a failed open on a missing/stale file.
+            // An empty chrom (rows == 0) legitimately has no shard on disk (build
+            // removes any stale file) → `None` = empty plugin fields. But a chrom
+            // the manifest says has rows MUST have its shard: a missing file then
+            // means a partial/corrupt cache, and silently emitting nulls would
+            // corrupt annotations while the header still lists the plugin fields —
+            // so fail loudly instead.
             let lookup = match chrom_entry {
                 Some(entry) if entry.rows > 0 => {
                     let shard = cache_root
                         .join("plugin")
                         .join(&m.plugin_name)
                         .join(&entry.file);
-                    if shard.exists() {
-                        Some(PluginLookup::open(&shard, match_columns, value_columns).await?)
-                    } else {
-                        None
+                    if !shard.exists() {
+                        return Err(DataFusionError::Execution(format!(
+                            "plugin '{}' manifest lists {} rows for chrom '{}' but its shard is \
+                             missing (partial/corrupt cache): {}",
+                            m.plugin_name,
+                            entry.rows,
+                            want,
+                            shard.display()
+                        )));
                     }
+                    Some(PluginLookup::open(&shard, match_columns, value_columns).await?)
                 }
                 _ => None,
             };
@@ -341,5 +349,49 @@ mod tests {
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
         // No shard → empty (Null) field, not an error.
         assert_eq!(slices.probe_all(100, "A/G", &[]), vec![PluginScalar::Null]);
+    }
+
+    // A manifest advertising rows > 0 with no shard on disk is a partial/corrupt
+    // cache → open must error, not silently null the fields (PR #190 N2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_shard_for_nonempty_chrom_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path();
+        let plugin_dir = cache_root.join("plugin").join("demo");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let manifest = CacheManifest {
+            plugin_name: "demo".into(),
+            source_manifest: "demo.source.toml".into(),
+            key_columns: vec![
+                "chrom".into(),
+                "start".into(),
+                "end".into(),
+                "allele_string".into(),
+            ],
+            match_columns: vec![],
+            value_columns: vec![ValueColumnRecord {
+                column: "score".into(),
+                csq_field: "SCORE".into(),
+                ty: "Float32".into(),
+            }],
+            // rows: 5 but NO chr22.parquet on disk → corrupt cache.
+            chroms: vec![ChromEntry {
+                chrom: "chr22".into(),
+                file: "chr22.parquet".into(),
+                rows: 5,
+                warm: 0,
+                cold: 5,
+            }],
+            cache_source_version: None,
+        };
+        manifest.write(&plugin_dir).unwrap();
+
+        match PluginRegistry::open(cache_root, "22").await {
+            Err(e) => assert!(
+                e.to_string().contains("shard is missing"),
+                "error should name the missing shard, got: {e}"
+            ),
+            Ok(_) => panic!("expected error on missing non-empty shard"),
+        }
     }
 }

@@ -18,7 +18,9 @@ use futures::StreamExt;
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
 use crate::plugin_cache::join::tiered_stream;
-use crate::plugin_cache::normalize::{canonical_contig_udf, wrap_normalization};
+use crate::plugin_cache::normalize::{
+    canonical_contig_str, canonical_contig_udf, wrap_normalization,
+};
 use crate::plugin_cache::provider::register_sources;
 use crate::plugin_cache::source_manifest::SourceManifest;
 use crate::plugin_cache::write::{PluginShardWriter, plugin_output_schema};
@@ -82,7 +84,22 @@ pub async fn build_plugin_chrom(
         &value_cols,
     );
     let norm_view = format!("plugin_{}_norm", src.plugin_name);
-    let source_chrom = chrom.strip_prefix("chr").unwrap_or(chrom);
+    // Filter on the same canonicalized contig the normalization applies to the
+    // data (`canonical_contig_str` folds `M`/`chrM`/`chrMT` → `MT` and uppercases),
+    // so `--chrom M`/`chrM`/`MT` all select the MT rows rather than silently
+    // producing a 0-row shard.
+    let source_chrom = canonical_contig_str(chrom);
+    // Defense-in-depth: `chrom` is a trusted local arg, but reject anything
+    // outside a safe contig charset before interpolating it into SQL.
+    if source_chrom.is_empty()
+        || !source_chrom
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return Err(DataFusionError::Execution(format!(
+            "invalid contig '{chrom}'"
+        )));
+    }
     ctx.sql(&format!(
         "CREATE OR REPLACE VIEW {norm_view} AS SELECT * FROM ({norm_sql}) WHERE chrom = '{source_chrom}'"
     ))
@@ -265,5 +282,56 @@ type = "Float32"
                 .join("chr1.parquet")
                 .exists()
         );
+    }
+
+    // --chrom M / chrM / MT must all select the MT rows (data is folded to "MT"
+    // by canonical_contig), not silently produce a 0-row shard (PR #190 M1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn builds_mt_shard_from_any_mt_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("mt.tsv.gz");
+        write_gz(&tsv, "chrM\t100\tA\tG\t0.9\n");
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("MT", 100, "A/G", 0i8)]);
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        for (i, alias) in ["M", "chrM", "MT"].iter().enumerate() {
+            let out = dir.path().join(format!("out{i}"));
+            let entry = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, alias)
+                .await
+                .unwrap();
+            assert_eq!(entry.rows, 1, "alias '{alias}' should build the MT row");
+        }
     }
 }

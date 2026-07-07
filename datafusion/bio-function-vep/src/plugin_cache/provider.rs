@@ -2,8 +2,6 @@
 //! `plugin_<name>_src[_<part>]` names. CSV/TSV/Parquet use builtin DataFusion
 //! providers; VCF/BED (bio-formats) are not wired in the prototype.
 
-use std::io::Read;
-
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
@@ -43,17 +41,16 @@ fn materialize_plain(path: &str, gzip: bool) -> Result<String> {
     let src = std::fs::File::open(path)
         .map_err(|e| DataFusionError::Execution(format!("open gzip source '{path}': {e}")))?;
     let mut decoder = flate2::read::MultiGzDecoder::new(src);
-    let tmp = tempfile::Builder::new()
+    let mut tmp = tempfile::Builder::new()
         .prefix("plugin_src_")
         .suffix(".tsv")
         .tempfile()
         .map_err(|e| DataFusionError::Execution(format!("create temp for '{path}': {e}")))?;
-    let mut out = Vec::new();
-    decoder
-        .read_to_end(&mut out)
+    // Stream-decompress straight to the temp file. These sources can be tens of
+    // GB uncompressed (CADD/dbNSFP), so buffering the whole thing in memory
+    // (`read_to_end`) would OOM the build.
+    std::io::copy(&mut decoder, tmp.as_file_mut())
         .map_err(|e| DataFusionError::Execution(format!("decompress '{path}': {e}")))?;
-    std::fs::write(tmp.path(), &out)
-        .map_err(|e| DataFusionError::Execution(format!("write temp for '{path}': {e}")))?;
     // Keep the file on disk beyond this scope for lazy execution.
     let (_file, kept) = tmp
         .keep()

@@ -154,3 +154,79 @@ async fn plugin_csq_gates_per_transcript() {
     let none_here = slices.probe_all(99999999, "A/G", &ns_missense);
     assert_eq!(field_suffix(&none_here), "||");
 }
+
+// A shared-anchor indel (VCF POS 100 `A>ATG`) is VEP-normalized to start 101,
+// allele `-/TG`. A plugin cache keyed like the variation cache stores the row at
+// the normalized start, so the lookup must use `input_start` (101), not the raw
+// POS (100). Guards the PR #190 C1 fix (annotate_provider keys the take + probe
+// on `input_start`); the old raw-`start_val` code would have missed here.
+#[tokio::test(flavor = "multi_thread")]
+async fn indel_probe_uses_normalized_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_root = dir.path();
+    let plugin_dir = cache_root.join("plugin").join("demo");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+
+    // Per-variant plugin (no match discriminator).
+    let matches: Vec<MatchColumn> = vec![];
+    let vals = vec![ValueColumn {
+        column: "score".into(),
+        csq_field: "SCORE".into(),
+        ty: ValueType::Float32,
+    }];
+    let schema = plugin_output_schema(&matches, &vals);
+    // One row at the NORMALIZED coordinates: start 101, allele "-/TG".
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["1"])),
+            Arc::new(UInt32Array::from(vec![101u32])),
+            Arc::new(UInt32Array::from(vec![101u32])),
+            Arc::new(StringArray::from(vec!["-/TG"])),
+            Arc::new(Float32Array::from(vec![0.75f32])),
+            Arc::new(Int8Array::from(vec![1i8])),
+        ],
+    )
+    .unwrap();
+    let mut w = PluginShardWriter::create(&plugin_dir.join("chr1.parquet"), schema).unwrap();
+    w.write(&batch).unwrap();
+    w.finish().unwrap();
+
+    let manifest = CacheManifest {
+        plugin_name: "demo".into(),
+        source_manifest: "demo.source.toml".into(),
+        key_columns: vec![
+            "chrom".into(),
+            "start".into(),
+            "end".into(),
+            "allele_string".into(),
+        ],
+        match_columns: vec![],
+        value_columns: vec![ValueColumnRecord {
+            column: "score".into(),
+            csq_field: "SCORE".into(),
+            ty: "Float32".into(),
+        }],
+        chroms: vec![ChromEntry {
+            chrom: "chr1".into(),
+            file: "chr1.parquet".into(),
+            rows: 1,
+            warm: 0,
+            cold: 1,
+        }],
+        cache_source_version: None,
+    };
+    manifest.write(&plugin_dir).unwrap();
+
+    let reg = PluginRegistry::open(cache_root, "1").await.unwrap();
+
+    // Normalized start (101) hits.
+    let hit = reg.take_buffer_all(&[101]).await.unwrap();
+    assert_eq!(field_suffix(&hit.probe_all(101, "-/TG", &[])), "|0.75");
+    // Raw VCF POS (100) misses — this is what the pre-fix code used.
+    let miss = reg.take_buffer_all(&[100]).await.unwrap();
+    assert_eq!(
+        field_suffix(&miss.probe_all(100, "-/TG", &[])),
+        empty_suffix(1)
+    );
+}
