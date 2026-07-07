@@ -447,6 +447,10 @@ pub struct AnnotateVcfConfig {
     /// Optional callback invoked after each batch is written.
     /// Used by Python wrappers to drive tqdm progress bars that work in Jupyter.
     pub on_batch_written: Option<OnBatchWritten>,
+    /// Root of a custom-plugin cache (`<root>/plugin/*/manifest.json`). When
+    /// `Some`, plugin CSQ fields are appended to output. `None` = disabled
+    /// (byte-identical to no-plugin output).
+    pub plugin_cache_root: Option<std::path::PathBuf>,
 }
 
 impl Default for AnnotateVcfConfig {
@@ -484,6 +488,7 @@ impl Default for AnnotateVcfConfig {
             compression: VcfCompressionType::Plain,
             show_progress: false,
             on_batch_written: None,
+            plugin_cache_root: None,
         }
     }
 }
@@ -591,6 +596,15 @@ impl AnnotateVcfConfig {
             "workers".into(),
             serde_json::Value::Number(serde_json::Number::from(self.workers.max(1))),
         );
+        // Custom-plugin cache root flows to the annotate_vep UDTF (workers=1 / SQL
+        // path) via options_json, mirroring every other config field. The sharded
+        // (workers>1) path passes it via `with_plugin_cache_root` instead.
+        if let Some(ref root) = self.plugin_cache_root {
+            opts.insert(
+                "plugin_cache_root".into(),
+                serde_json::Value::String(root.to_string_lossy().into_owned()),
+            );
+        }
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
 
@@ -644,7 +658,15 @@ fn csq_header_description(
         cache_source_type == CacheSourceType::Merged,
         config.include_pick_output(),
     );
-    let format_list = field_names.join("|");
+    let mut format_list = field_names.join("|");
+    // Trailing custom-plugin CSQ fields (spec §5): read cheaply from manifests.
+    #[cfg(feature = "parquet-cache")]
+    if let Some(root) = &config.plugin_cache_root {
+        for name in crate::plugin_cache::registry::PluginRegistry::field_names(root) {
+            format_list.push('|');
+            format_list.push_str(&name);
+        }
+    }
     format!("Consequence annotations from annotate_vep. Format: {format_list}")
 }
 
@@ -888,7 +910,8 @@ async fn drive_sharded_vcf_annotation(
         Some(options_json),
         (**vcf_schema).clone(),
     )?
-    .with_vcf_shard_ctx(Arc::clone(&shard_ctx));
+    .with_vcf_shard_ctx(Arc::clone(&shard_ctx))
+    .with_plugin_cache_root(config.plugin_cache_root.clone());
 
     let full_schema = TableProvider::schema(&provider);
     let projection: Vec<usize> = projection_names
@@ -1712,6 +1735,22 @@ mod tests {
 
         let json = config.to_options_json();
         assert!(json.contains("\"buffer_size\":1234"));
+    }
+
+    // Guards the I1 wiring bug: the workers=1 SQL path builds the AnnotateProvider
+    // from options_json, so plugin_cache_root MUST round-trip through it (else the
+    // plugin registry is never opened and CSQ plugin fields emit empty while the
+    // header still lists them — a header/body width divergence).
+    #[test]
+    fn test_to_options_json_emits_plugin_cache_root() {
+        let none = AnnotateVcfConfig::default().to_options_json();
+        assert!(!none.contains("plugin_cache_root"));
+        let config = AnnotateVcfConfig {
+            plugin_cache_root: Some(std::path::PathBuf::from("/tmp/plugin_cache")),
+            ..Default::default()
+        };
+        let json = config.to_options_json();
+        assert!(json.contains("\"plugin_cache_root\":\"/tmp/plugin_cache\""));
     }
 
     #[test]
