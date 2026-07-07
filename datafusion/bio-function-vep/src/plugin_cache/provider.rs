@@ -30,10 +30,12 @@ fn csv_schema(csv: &CsvParams) -> Schema {
 /// The workspace builds DataFusion with `default-features = false` and no
 /// `compression` feature (the `xz2`/liblzma link collision with noodles-cram —
 /// see the root `Cargo.toml`), so `register_csv` cannot decompress input files.
-/// For gzip sources we decompress to a kept temp file and register that; plain
-/// sources pass through unchanged. The temp file is intentionally leaked (its
-/// path is returned): it must outlive lazy query execution, and per-chrom
-/// builds are short-lived processes.
+/// For gzip sources we stream-decompress to a temp file and register that; plain
+/// sources pass through unchanged. Returns `(path, Some(temp_path))` for gzip:
+/// the caller must keep the `TempPath` alive for the duration of query execution
+/// and drop it afterwards, which deletes the temp — so a multi-chrom `build_all`
+/// keeps at most one decompressed copy on disk at a time (rather than leaking one
+/// per chromosome). Plain sources return `(path, None)`.
 fn materialize_plain(path: &str, gzip: bool) -> Result<(String, Option<tempfile::TempPath>)> {
     if !gzip {
         return Ok((path.to_string(), None));
