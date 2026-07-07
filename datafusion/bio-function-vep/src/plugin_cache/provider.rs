@@ -61,7 +61,7 @@ fn materialize_plain(path: &str, gzip: bool) -> Result<(String, Option<tempfile:
 
 /// Register every source in `manifest` as a DataFusion table. Returns any
 /// decompressed temp files the caller must keep alive for the duration of query
-/// execution (dropping them deletes the temp — see [`materialize_plain`]).
+/// execution (dropping them deletes the temp — see `materialize_plain`).
 pub async fn register_sources(
     ctx: &SessionContext,
     manifest: &SourceManifest,
