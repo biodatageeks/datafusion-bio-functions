@@ -3430,6 +3430,16 @@ impl AnnotateProvider {
         self
     }
 
+    /// No-op without the plugin cache runtime (plugin output requires the
+    /// `parquet-cache` feature). Kept so feature-agnostic callers
+    /// (`annotate_table_function`, `vcf_sink`) compile under
+    /// `--no-default-features`; requesting a plugin cache there surfaces the
+    /// existing "feature required" runtime error, not a build break.
+    #[cfg(not(feature = "parquet-cache"))]
+    pub(crate) fn with_plugin_cache_root(self, _root: Option<std::path::PathBuf>) -> Self {
+        self
+    }
+
     /// Set the VCF shard context, enabling the sharded-output `threads>1` path
     /// when this provider's plan is executed. Used by `vcf_sink`'s direct-plan
     /// entry; the normal UDTF/SQL path leaves this `None`.

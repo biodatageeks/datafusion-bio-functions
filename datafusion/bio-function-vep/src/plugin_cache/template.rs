@@ -71,13 +71,16 @@ impl CompiledTemplate {
     }
 
     /// Evaluate against a namespace array (same order as [`ATTR_NAMES`]). Any
-    /// referenced attribute `None` → whole discriminator `None`.
+    /// referenced attribute `None` → whole discriminator `None`. A short (or empty)
+    /// `attrs` slice treats out-of-range attributes as absent (`None`) rather than
+    /// panicking — the no-transcript placeholder path probes with an empty
+    /// namespace, and a match-column plugin must miss (empty output), not crash.
     pub fn eval(&self, attrs: &[Option<&str>]) -> Option<String> {
         let mut out = String::new();
         for seg in &self.segments {
             match seg {
                 Segment::Lit(s) => out.push_str(s),
-                Segment::Attr(i) => out.push_str(attrs[*i]?),
+                Segment::Attr(i) => out.push_str(attrs.get(*i).copied().flatten()?),
             }
         }
         Some(out)
@@ -206,6 +209,17 @@ mod tests {
         );
         let t = CompiledTemplate::compile("{ref_aa}{Protein_position}{alt_aa}").unwrap();
         assert_eq!(t.eval(&range), None);
+    }
+
+    // An empty (or short) namespace must gate to None, NOT panic — this is the
+    // no-transcript placeholder path probing a match-column plugin (PR #190 P1).
+    #[test]
+    fn empty_namespace_gates_to_none_without_panic() {
+        let t = CompiledTemplate::compile("{ref_aa}{Protein_position}{alt_aa}").unwrap();
+        assert_eq!(t.eval(&[]), None);
+        // a literal-only template still resolves with no attrs
+        let lit = CompiledTemplate::compile("static").unwrap();
+        assert_eq!(lit.eval(&[]).as_deref(), Some("static"));
     }
 
     #[test]
