@@ -12,11 +12,13 @@ use datafusion::arrow::compute::{
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
-use datafusion::prelude::SessionContext;
+use datafusion::datasource::MemTable;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
+use crate::plugin_cache::dedup::dedup_keep_first;
 use crate::plugin_cache::join::tiered_stream;
 use crate::plugin_cache::normalize::{
     canonical_contig_str, canonical_contig_udf, wrap_normalization,
@@ -64,7 +66,12 @@ pub async fn build_plugin_chrom(
     output_cache_root: &Path,
     chrom: &str,
 ) -> Result<ChromEntry> {
-    let ctx = SessionContext::new();
+    // Single partition so the CSV scan yields rows in source-file order — the
+    // dedup pass below needs that order to keep VEP's first-in-file record for a
+    // duplicate probe key (see `dedup::dedup_keep_first`). Builds are offline and
+    // already materialize the whole chrom in RAM, so the lost scan parallelism is
+    // an acceptable trade for correctness.
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     ctx.register_udf(canonical_contig_udf());
     // Held until this chrom's stream is fully materialized below, then dropped
     // (deleting the decompressed temp) — so build_all keeps at most one temp.
@@ -107,6 +114,25 @@ pub async fn build_plugin_chrom(
     ))
     .await?;
 
+    // Collapse duplicate probe keys to their first source-file occurrence BEFORE
+    // the tier join (which reorders rows and would destroy the file-order
+    // tiebreak). Two overlapping genes can map the same genomic variant + aa-change
+    // to different scores; VEP takes the first-in-file record, so we must too. This
+    // reads the (single-partition, file-ordered) normalized stream, keeps the first
+    // row per `(start, allele_string, <match cols>)`, and re-registers the survivors
+    // as a MemTable the join then consumes in place of the raw normalized view.
+    let dedup_view = format!("plugin_{}_dedup", src.plugin_name);
+    let norm_stream = ctx
+        .sql(&format!("SELECT * FROM {norm_view}"))
+        .await?
+        .execute_stream()
+        .await?;
+    let norm_schema = norm_stream.schema();
+    let deduped = dedup_keep_first(norm_stream, &match_cols).await?;
+    let mem = MemTable::try_new(norm_schema, vec![deduped])
+        .map_err(|e| DataFusionError::Execution(format!("dedup memtable: {e}")))?;
+    ctx.register_table(&dedup_view, Arc::new(mem))?;
+
     let out_schema = plugin_output_schema(&src.match_columns, &src.value_columns);
     let plugin_dir = output_cache_root.join("plugin").join(&src.plugin_name);
     std::fs::create_dir_all(&plugin_dir)
@@ -114,8 +140,9 @@ pub async fn build_plugin_chrom(
     let file_name = format!("{}.parquet", canonical_chrom_label(chrom));
     let shard_path = plugin_dir.join(&file_name);
 
-    // Materialize tiered rows (tier inherited from the variation cache).
-    let mut stream = tiered_stream(&ctx, &norm_view, variation_shard).await?;
+    // Materialize tiered rows (tier inherited from the variation cache) from the
+    // deduped rows.
+    let mut stream = tiered_stream(&ctx, &dedup_view, variation_shard).await?;
     let mut batches = Vec::new();
     while let Some(b) = stream.next().await {
         batches.push(b?);
@@ -284,6 +311,96 @@ type = "Float32"
                 .join("chr1.parquet")
                 .exists()
         );
+    }
+
+    // Two source rows sharing the runtime probe key
+    // (start, allele_string, protein_variant) but different scores must collapse
+    // to the FIRST in file order (VEP's first-in-file rule) — PR #190 dedup fix.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dedups_duplicate_aa_change_keeping_first_in_file() {
+        use crate::plugin_cache::lookup::{PluginBufferSlice, PluginLookup, PluginScalar};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("am.tsv.gz");
+        // Same variant chr3:101 C>T, same aa-change H101Y, two UniProts, two
+        // scores. VEP keeps the first (0.0431). A third distinct aa-change at the
+        // same position (K55N) must survive.
+        write_gz(
+            &tsv,
+            "chr3\t101\tC\tT\tH101Y\t0.0431\n\
+             chr3\t101\tC\tT\tH101Y\t0.0898\n\
+             chr3\t101\tC\tT\tK55N\t0.7000\n",
+        );
+
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("3", 101, "C/T", 0i8)]);
+
+        let toml = format!(
+            r##"
+plugin_name = "am"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, pv AS protein_variant,
+       CAST(score AS FLOAT) AS am_pathogenicity
+FROM plugin_am_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "pv",    type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[match_column]]
+column = "protein_variant"
+template = "{{ref_aa}}{{Protein_position}}{{alt_aa}}"
+
+[[value_columns]]
+column = "am_pathogenicity"
+csq_field = "am_pathogenicity"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let entry = build_plugin_chrom(&manifest, "am.source.toml", &var, &out, "3")
+            .await
+            .unwrap();
+        // H101Y duplicate collapsed → 2 rows survive (H101Y once + K55N).
+        assert_eq!(entry.rows, 2, "duplicate H101Y row must be dropped");
+
+        let shard = out.join("plugin").join("am").join("chr3.parquet");
+        let lk = PluginLookup::open(
+            &shard,
+            vec!["protein_variant".into()],
+            vec!["am_pathogenicity".into()],
+        )
+        .await
+        .unwrap();
+        let batch = lk.take_buffer(&[101]).await.unwrap();
+        let slice = PluginBufferSlice::from_batch(&batch, 1, 1).unwrap();
+        // The surviving H101Y row carries the FIRST score (0.0431), not 0.0898.
+        match slice.probe(101, "C/T", &[Some("H101Y".into())]).unwrap()[0] {
+            PluginScalar::F32(v) => assert!((v - 0.0431).abs() < 1e-6, "kept {v}"),
+            ref other => panic!("{other:?}"),
+        }
+        // The distinct aa-change at the same position is untouched.
+        match slice.probe(101, "C/T", &[Some("K55N".into())]).unwrap()[0] {
+            PluginScalar::F32(v) => assert!((v - 0.7).abs() < 1e-6),
+            ref other => panic!("{other:?}"),
+        }
     }
 
     // --chrom M / chrM / MT must all select the MT rows (data is folded to "MT"

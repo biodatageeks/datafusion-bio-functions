@@ -11,6 +11,7 @@ pub mod build;
 pub mod builder;
 pub mod cache_manifest;
 pub mod csq;
+pub mod dedup;
 pub mod join;
 pub mod lookup;
 pub mod normalize;
