@@ -66,7 +66,9 @@ pub async fn build_plugin_chrom(
 ) -> Result<ChromEntry> {
     let ctx = SessionContext::new();
     ctx.register_udf(canonical_contig_udf());
-    register_sources(&ctx, src).await?;
+    // Held until this chrom's stream is fully materialized below, then dropped
+    // (deleting the decompressed temp) — so build_all keeps at most one temp.
+    let _src_temps = register_sources(&ctx, src).await?;
 
     // Ingest view (raw column mapping), then normalized view (contig + coords).
     ctx.sql(&format!(

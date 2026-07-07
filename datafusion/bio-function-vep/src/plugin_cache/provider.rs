@@ -34,9 +34,9 @@ fn csv_schema(csv: &CsvParams) -> Schema {
 /// sources pass through unchanged. The temp file is intentionally leaked (its
 /// path is returned): it must outlive lazy query execution, and per-chrom
 /// builds are short-lived processes.
-fn materialize_plain(path: &str, gzip: bool) -> Result<String> {
+fn materialize_plain(path: &str, gzip: bool) -> Result<(String, Option<tempfile::TempPath>)> {
     if !gzip {
-        return Ok(path.to_string());
+        return Ok((path.to_string(), None));
     }
     let src = std::fs::File::open(path)
         .map_err(|e| DataFusionError::Execution(format!("open gzip source '{path}': {e}")))?;
@@ -51,15 +51,22 @@ fn materialize_plain(path: &str, gzip: bool) -> Result<String> {
     // (`read_to_end`) would OOM the build.
     std::io::copy(&mut decoder, tmp.as_file_mut())
         .map_err(|e| DataFusionError::Execution(format!("decompress '{path}': {e}")))?;
-    // Keep the file on disk beyond this scope for lazy execution.
-    let (_file, kept) = tmp
-        .keep()
-        .map_err(|e| DataFusionError::Execution(format!("persist temp for '{path}': {e}")))?;
-    Ok(kept.to_string_lossy().into_owned())
+    // Return the temp handle so the caller can keep it alive only for this
+    // chrom's build and drop (delete) it afterwards — leaking it (`keep()`)
+    // would accumulate one tens-of-GB temp per chromosome across `build_all`.
+    let temp_path = tmp.into_temp_path();
+    let plain = temp_path.to_string_lossy().into_owned();
+    Ok((plain, Some(temp_path)))
 }
 
-/// Register every source in `manifest` as a DataFusion table.
-pub async fn register_sources(ctx: &SessionContext, manifest: &SourceManifest) -> Result<()> {
+/// Register every source in `manifest` as a DataFusion table. Returns any
+/// decompressed temp files the caller must keep alive for the duration of query
+/// execution (dropping them deletes the temp — see [`materialize_plain`]).
+pub async fn register_sources(
+    ctx: &SessionContext,
+    manifest: &SourceManifest,
+) -> Result<Vec<tempfile::TempPath>> {
+    let mut temps: Vec<tempfile::TempPath> = Vec::new();
     for spec in &manifest.sources {
         let table = spec.table_name(&manifest.plugin_name);
         match spec.provider {
@@ -72,7 +79,10 @@ pub async fn register_sources(ctx: &SessionContext, manifest: &SourceManifest) -
                 let schema = csv_schema(csv);
                 let delim = csv.delimiter.as_bytes().first().copied().unwrap_or(b'\t');
                 let gz = csv.compression.as_deref() == Some("gzip");
-                let plain_path = materialize_plain(&spec.path, gz)?;
+                let (plain_path, temp) = materialize_plain(&spec.path, gz)?;
+                if let Some(t) = temp {
+                    temps.push(t);
+                }
                 let ext = std::path::Path::new(&plain_path)
                     .extension()
                     .and_then(|e| e.to_str())
@@ -104,7 +114,7 @@ pub async fn register_sources(ctx: &SessionContext, manifest: &SourceManifest) -
             }
         }
     }
-    Ok(())
+    Ok(temps)
 }
 
 #[cfg(test)]
@@ -166,7 +176,8 @@ threshold = 0.01
 
         let manifest: SourceManifest = toml::from_str(&toml).unwrap();
         let ctx = SessionContext::new();
-        register_sources(&ctx, &manifest).await.unwrap();
+        // Keep the temp alive for the query below (drop deletes it).
+        let _temps = register_sources(&ctx, &manifest).await.unwrap();
         let n = ctx
             .sql("SELECT count(*) AS c FROM plugin_demo_src")
             .await

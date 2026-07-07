@@ -93,9 +93,14 @@ impl<'a> PluginCacheBuilder<'a> {
         // Preserve chromosomes from a prior build (their shards remain on disk),
         // so a filtered/incremental build UPSERTs the rebuilt chroms rather than
         // dropping the others from the manifest that runtime discovery relies on.
+        // BUT only when the prior manifest's schema matches the new one — a
+        // filtered rebuild after a value/match-column change must NOT keep old
+        // shards under the new schema (that would misproject them / panic in
+        // `from_batch`); in that case we drop the stale entries.
         let mut chroms: Vec<ChromEntry> = std::fs::read_to_string(plugin_dir.join("manifest.json"))
             .ok()
             .and_then(|t| serde_json::from_str::<CacheManifest>(&t).ok())
+            .filter(|old| schema_matches(old, &cache))
             .map(|m| m.chroms)
             .unwrap_or_default();
         let _ = self.overwrite; // build_plugin_chrom overwrites the shard file per chrom.
@@ -126,6 +131,23 @@ impl<'a> PluginCacheBuilder<'a> {
         cache.write(&plugin_dir)?;
         Ok(cache)
     }
+}
+
+/// True when two cache manifests declare the same plugin output schema — same
+/// value columns (name/csq_field/type) and match discriminators (column/template)
+/// in the same order. Used to decide whether prior chrom shards can be preserved
+/// across a filtered rebuild.
+fn schema_matches(a: &CacheManifest, b: &CacheManifest) -> bool {
+    a.value_columns.len() == b.value_columns.len()
+        && a.value_columns
+            .iter()
+            .zip(&b.value_columns)
+            .all(|(x, y)| x.column == y.column && x.csq_field == y.csq_field && x.ty == y.ty)
+        && a.match_columns.len() == b.match_columns.len()
+        && a.match_columns
+            .iter()
+            .zip(&b.match_columns)
+            .all(|(x, y)| x.column == y.column && x.template == y.template)
 }
 
 #[cfg(test)]
@@ -319,5 +341,27 @@ type = "Float32"
         );
         assert!(chroms.contains(&"chr2"), "chr2 must be present: {chroms:?}");
         assert_eq!(cache.chroms.len(), 2);
+    }
+
+    // A filtered rebuild after a value/match-column change must NOT preserve old
+    // chroms (their shards use the old schema) — PR #190 R2.
+    #[test]
+    fn schema_change_drops_stale_chroms() {
+        use crate::plugin_cache::cache_manifest::ValueColumnRecord;
+        let mk = |csq: &str| CacheManifest {
+            plugin_name: "demo".into(),
+            source_manifest: "demo.source.toml".into(),
+            key_columns: vec![],
+            match_columns: vec![],
+            value_columns: vec![ValueColumnRecord {
+                column: "score".into(),
+                csq_field: csq.into(),
+                ty: "Float32".into(),
+            }],
+            chroms: vec![],
+            cache_source_version: None,
+        };
+        assert!(schema_matches(&mk("DEMO"), &mk("DEMO")));
+        assert!(!schema_matches(&mk("DEMO"), &mk("DEMO2")));
     }
 }
