@@ -105,6 +105,15 @@ first-in-file rule regardless of downstream reordering. `<match columns>` =
   equivalent.
 
 ## Verification plan
+
+**Order matters — the cache MUST be rebuilt before re-checking parity.** The current
+`data_vepyr/plugin_cache` chr3/chr8 shards were built by the *buggy* build and still
+contain both duplicate rows, so re-running the gate against them will still show the
+17 mismatches. The fix is a **build-time** dedup, so it only takes effect after the
+affected shards are regenerated. So: implement the fix → **rebuild the chr3 and chr8
+shards** (step 2) → then verify parity on **chr3 and chr8** (step 3). Confirming the
+fix works == those two chromosomes going 17 → 0 `am_pathogenicity` mismatches.
+
 1. Unit test: build a synthetic source with two rows sharing
    `(chrom,start,allele_string, protein_variant)` but different value + different
    `_src_ord`; assert the shard keeps the first and the probe returns its value.
