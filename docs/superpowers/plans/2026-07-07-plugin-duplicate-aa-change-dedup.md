@@ -1,5 +1,12 @@
 # Handoff: plugin cache duplicate aa-change dedup (first-in-file wins)
 
+> **SHIPPED (2026-07-07, commit 3f5087b):** the **Option B** alternative was
+> implemented, not the "Option A" (`_src_ord` + `QUALIFY`) plan headlined below.
+> See `datafusion/bio-function-vep/src/plugin_cache/dedup.rs` (`dedup_keep_first`)
+> and its wiring in `build.rs` (`build_plugin_chrom`): an in-stream `HashSet`
+> keep-first over a single-partition, file-ordered normalized stream, run before
+> the tier join. No `_src_ord` column. Full chr1–22 rebuilt; merged_am gate 17→0.
+
 **Date:** 2026-07-07
 **Repos/branches:** `datafusion-bio-functions` @ `feat/plugin-cache-alphamissense` (PR #190, pushed through `402ec64`); `vepyr` @ `feat/plugin-cache` (pushed `79b3970`); `vepyr-plugins` @ `master` (pushed `e4bd38d`).
 **Status:** Root cause fully diagnosed + VEP behavior confirmed in code. Fix (Option A) **NOT yet implemented**.

@@ -66,24 +66,29 @@ pub async fn build_plugin_chrom(
     output_cache_root: &Path,
     chrom: &str,
 ) -> Result<ChromEntry> {
-    // Single partition so the CSV scan yields rows in source-file order — the
-    // dedup pass below needs that order to keep VEP's first-in-file record for a
-    // duplicate probe key (see `dedup::dedup_keep_first`). Builds are offline and
-    // already materialize the whole chrom in RAM, so the lost scan parallelism is
-    // an acceptable trade for correctness.
-    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-    ctx.register_udf(canonical_contig_udf());
-    // Held until this chrom's stream is fully materialized below, then dropped
-    // (deleting the decompressed temp) — so build_all keeps at most one temp.
-    let _src_temps = register_sources(&ctx, src).await?;
+    // Read context: single partition ONLY for the source scan → normalize →
+    // dedup leg, so the CSV scan yields rows in source-file order (a
+    // multi-partition scan reads byte ranges concurrently and coalescing does not
+    // restore file order). The dedup needs that order to keep VEP's first-in-file
+    // record for a duplicate probe key (see `dedup::dedup_keep_first`). The
+    // downstream tier join + write run in a separate, default-parallel context
+    // (`build_ctx` below) since post-dedup there is one row per key and order no
+    // longer matters — so only this cheap read leg is serialized, not the join
+    // over the (multi-GB) variation shard.
+    let read_ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    read_ctx.register_udf(canonical_contig_udf());
+    // Held until this chrom's stream is fully materialized (dedup) below, then
+    // dropped (deleting the decompressed temp) — so build_all keeps at most one temp.
+    let src_temps = register_sources(&read_ctx, src).await?;
 
     // Ingest view (raw column mapping), then normalized view (contig + coords).
-    ctx.sql(&format!(
-        "CREATE OR REPLACE VIEW {} AS {}",
-        src.ingest_view_name(),
-        src.ingest_sql
-    ))
-    .await?;
+    read_ctx
+        .sql(&format!(
+            "CREATE OR REPLACE VIEW {} AS {}",
+            src.ingest_view_name(),
+            src.ingest_sql
+        ))
+        .await?;
     let value_cols: Vec<String> = src.value_columns.iter().map(|v| v.column.clone()).collect();
     let match_cols = src.match_column_names();
     let norm_sql = wrap_normalization(
@@ -109,29 +114,36 @@ pub async fn build_plugin_chrom(
             "invalid contig '{chrom}'"
         )));
     }
-    ctx.sql(&format!(
-        "CREATE OR REPLACE VIEW {norm_view} AS SELECT * FROM ({norm_sql}) WHERE chrom = '{source_chrom}'"
-    ))
-    .await?;
+    read_ctx
+        .sql(&format!(
+            "CREATE OR REPLACE VIEW {norm_view} AS SELECT * FROM ({norm_sql}) WHERE chrom = '{source_chrom}'"
+        ))
+        .await?;
 
     // Collapse duplicate probe keys to their first source-file occurrence BEFORE
     // the tier join (which reorders rows and would destroy the file-order
     // tiebreak). Two overlapping genes can map the same genomic variant + aa-change
     // to different scores; VEP takes the first-in-file record, so we must too. This
-    // reads the (single-partition, file-ordered) normalized stream, keeps the first
-    // row per `(start, allele_string, <match cols>)`, and re-registers the survivors
-    // as a MemTable the join then consumes in place of the raw normalized view.
-    let dedup_view = format!("plugin_{}_dedup", src.plugin_name);
-    let norm_stream = ctx
+    // reads the (single-partition, file-ordered) normalized stream and keeps the
+    // first row per `(start, allele_string, <match cols>)`.
+    let norm_stream = read_ctx
         .sql(&format!("SELECT * FROM {norm_view}"))
         .await?
         .execute_stream()
         .await?;
     let norm_schema = norm_stream.schema();
     let deduped = dedup_keep_first(norm_stream, &match_cols).await?;
+    // The source scan is done — drop the decompressed temp before the join leg.
+    drop(src_temps);
+
+    // Build context: default parallelism for the tier join over the (multi-GB)
+    // variation shard + write. The deduped survivors are re-registered here as a
+    // MemTable the join consumes in place of the raw normalized view.
+    let build_ctx = SessionContext::new();
+    let dedup_view = format!("plugin_{}_dedup", src.plugin_name);
     let mem = MemTable::try_new(norm_schema, vec![deduped])
         .map_err(|e| DataFusionError::Execution(format!("dedup memtable: {e}")))?;
-    ctx.register_table(&dedup_view, Arc::new(mem))?;
+    build_ctx.register_table(&dedup_view, Arc::new(mem))?;
 
     let out_schema = plugin_output_schema(&src.match_columns, &src.value_columns);
     let plugin_dir = output_cache_root.join("plugin").join(&src.plugin_name);
@@ -142,7 +154,7 @@ pub async fn build_plugin_chrom(
 
     // Materialize tiered rows (tier inherited from the variation cache) from the
     // deduped rows.
-    let mut stream = tiered_stream(&ctx, &dedup_view, variation_shard).await?;
+    let mut stream = tiered_stream(&build_ctx, &dedup_view, variation_shard).await?;
     let mut batches = Vec::new();
     while let Some(b) = stream.next().await {
         batches.push(b?);

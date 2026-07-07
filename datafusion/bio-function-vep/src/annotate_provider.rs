@@ -5684,7 +5684,11 @@ impl AnnotateProvider {
                         variant_fields: &variant_fields,
                     };
                     placeholder_layout.append_entry(&mut csq_buf, &entry);
-                    // No per-transcript amino-acid change here → empty plugin fields.
+                    // Unreachable when plugins are enabled: `plugin_n_fields > 0`
+                    // forces `require_transcript_annotations` above, so the cached
+                    // fast path is never taken and this stays a no-op (`empty_suffix(0)`).
+                    // The reachable per-variant probe lives on the no-transcript
+                    // placeholder path below.
                     #[cfg(feature = "parquet-cache")]
                     csq_buf.push_str(&crate::plugin_cache::csq::empty_suffix(plugin_n_fields));
                 }
@@ -6271,9 +6275,36 @@ impl AnnotateProvider {
                             variant_fields: &variant_fields,
                         };
                         placeholder_layout.append_entry(&mut csq_buf, &entry);
-                        // Intergenic/no-transcript entry → empty plugin fields.
+                        // No transcript here → no amino-acid change to build a
+                        // discriminator from. Match-column plugins (e.g. AlphaMissense)
+                        // therefore miss on the empty namespace → empty fields, exactly
+                        // as `empty_suffix` did before. But a per-variant plugin (no
+                        // match_column) is keyed only on (start, allele_string), so it
+                        // can still hit on an intergenic/no-transcript variant — probe
+                        // with an empty discriminator namespace rather than always
+                        // emitting empty and silently dropping its cached value.
                         #[cfg(feature = "parquet-cache")]
-                        csq_buf.push_str(&crate::plugin_cache::csq::empty_suffix(plugin_n_fields));
+                        if plugin_n_fields > 0 {
+                            // `input_allele_string` was moved upstream; rebuild the
+                            // `ref/alt` allele exactly as the transcript path does.
+                            let plugin_allele = format!("{input_ref}/{input_alt}");
+                            let scalars = plugin_slices
+                                .as_ref()
+                                .map(|s| {
+                                    s.probe_all(
+                                        u32::try_from(input_start).unwrap_or(0),
+                                        &plugin_allele,
+                                        &[],
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    vec![
+                                        crate::plugin_cache::lookup::PluginScalar::Null;
+                                        plugin_n_fields
+                                    ]
+                                });
+                            csq_buf.push_str(&crate::plugin_cache::csq::field_suffix(&scalars));
+                        }
                     }
                 } // end if !skip_csq (cache-miss CSQ formatting)
                 if let Some(started) = csq_format_started {

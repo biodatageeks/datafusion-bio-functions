@@ -351,6 +351,77 @@ mod tests {
         assert_eq!(slices.probe_all(100, "A/G", &[]), vec![PluginScalar::Null]);
     }
 
+    // A per-variant plugin (no match_column) is keyed only on (start,
+    // allele_string), so an empty-namespace probe MUST hit — this is what the
+    // no-transcript placeholder path relies on to emit per-variant values on
+    // intergenic variants (Codex PR #190 per-variant placeholder finding).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_variant_plugin_hits_with_empty_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path();
+        let plugin_dir = cache_root.join("plugin").join("demo");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+
+        // Per-variant shard: no match columns, one value column.
+        let vals = vec![ValueColumn {
+            column: "score".into(),
+            csq_field: "SCORE".into(),
+            ty: ValueType::Float32,
+        }];
+        let schema = plugin_output_schema(&[], &vals);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["22"])),
+                Arc::new(UInt32Array::from(vec![100u32])),
+                Arc::new(UInt32Array::from(vec![100u32])),
+                Arc::new(StringArray::from(vec!["A/G"])),
+                Arc::new(Float32Array::from(vec![0.5f32])),
+                Arc::new(Int8Array::from(vec![1i8])),
+            ],
+        )
+        .unwrap();
+        let mut w = PluginShardWriter::create(&plugin_dir.join("chr22.parquet"), schema).unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+
+        let manifest = CacheManifest {
+            plugin_name: "demo".into(),
+            source_manifest: "demo.source.toml".into(),
+            key_columns: vec![
+                "chrom".into(),
+                "start".into(),
+                "end".into(),
+                "allele_string".into(),
+            ],
+            match_columns: vec![],
+            value_columns: vec![ValueColumnRecord {
+                column: "score".into(),
+                csq_field: "SCORE".into(),
+                ty: "Float32".into(),
+            }],
+            chroms: vec![ChromEntry {
+                chrom: "chr22".into(),
+                file: "chr22.parquet".into(),
+                rows: 1,
+                warm: 0,
+                cold: 1,
+            }],
+            cache_source_version: None,
+        };
+        manifest.write(&plugin_dir).unwrap();
+
+        let reg = PluginRegistry::open(cache_root, "22").await.unwrap();
+        let slices = reg.take_buffer_all(&[100]).await.unwrap();
+        // Empty namespace (no transcript) still hits the per-variant row.
+        match slices.probe_all(100, "A/G", &[])[0] {
+            PluginScalar::F32(v) => assert!((v - 0.5).abs() < 1e-6),
+            ref other => panic!("{other:?}"),
+        }
+        // Wrong allele still misses.
+        assert_eq!(slices.probe_all(100, "C/T", &[]), vec![PluginScalar::Null]);
+    }
+
     // A manifest advertising rows > 0 with no shard on disk is a partial/corrupt
     // cache → open must error, not silently null the fields (PR #190 N2).
     #[tokio::test(flavor = "multi_thread")]

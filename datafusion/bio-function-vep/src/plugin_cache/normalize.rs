@@ -19,10 +19,17 @@ use crate::plugin_cache::source_manifest::CoordinateSystem;
 /// aliases to `MT`, uppercase the rest. Mirrors `cache::key_encoding` prefix
 /// handling so plugin and variation contigs agree by construction.
 pub fn canonical_contig_str(raw: &str) -> String {
-    let bare = raw.strip_prefix("chr").unwrap_or(raw);
-    match bare {
+    // Strip a leading `chr` case-insensitively (`chr1`/`CHR1`/`Chr1` all → `1`);
+    // a source that spells contigs `CHR1` would otherwise canonicalize to `CHR1`
+    // and never match the variation `chrom = '1'` filter, yielding an empty shard.
+    let bare = match raw.get(..3) {
+        Some(p) if p.eq_ignore_ascii_case("chr") => &raw[3..],
+        _ => raw,
+    };
+    let upper = bare.to_ascii_uppercase();
+    match upper.as_str() {
         "M" | "MT" => "MT".to_string(),
-        other => other.to_ascii_uppercase(),
+        _ => upper,
     }
 }
 
@@ -84,6 +91,12 @@ mod tests {
         assert_eq!(canonical_contig_str("M"), "MT");
         assert_eq!(canonical_contig_str("chrMT"), "MT");
         assert_eq!(canonical_contig_str("MT"), "MT");
+        // Prefix strip is case-insensitive (a `CHR1`/`Chr1` source must still
+        // fold to the bare Ensembl contig, else the per-chrom filter drops it).
+        assert_eq!(canonical_contig_str("CHR1"), "1");
+        assert_eq!(canonical_contig_str("Chr1"), "1");
+        assert_eq!(canonical_contig_str("CHRM"), "MT");
+        assert_eq!(canonical_contig_str("ChrX"), "X");
     }
 
     #[test]
