@@ -1,10 +1,13 @@
 //! Transcript/exon-driven consequence evaluation (phase 2).
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use coitrees::{COITree, GenericInterval, Interval, IntervalTree};
 
-use crate::hgvs::HgvsGenomicShift;
+use crate::hgvs::{HgvsGenomicShift, HgvscProfile};
 use crate::so_terms::{ALL_SO_TERMS, SoTerm};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +130,36 @@ impl VariantInput {
     }
 }
 
+/// Lazily-populated, per-transcript cache of the genomic→cDNA coordinate table
+/// (the expensive `to_vec()` + sort in `transcript_cdna_coords`). Mirrors
+/// Ensembl's `Transcript->{_variation_effect_feature_cache}`: built by the first
+/// variant that touches the transcript, reused by every later variant and ALT
+/// allele. Lives on [`TranscriptFeature`] so all the `&TranscriptFeature` leaf
+/// functions can reach it without threading a context parameter.
+///
+/// The newtype lets `TranscriptFeature` keep its `Clone`/`PartialEq`/`Eq`
+/// derives: clones start empty (the cache is not shared state, just a memo) and
+/// the cache never participates in equality. `OnceLock` makes it `Sync`, so the
+/// transcript can be read concurrently across partition threads.
+#[derive(Debug, Default)]
+pub struct GeometryCache(std::sync::OnceLock<Option<Vec<TranscriptCdnaCoord>>>);
+
+impl Clone for GeometryCache {
+    fn clone(&self) -> Self {
+        // A clone is a fresh transcript view; don't copy the memo.
+        Self(std::sync::OnceLock::new())
+    }
+}
+
+impl PartialEq for GeometryCache {
+    fn eq(&self, _: &Self) -> bool {
+        // Derived geometry is a pure function of the other fields; ignore here.
+        true
+    }
+}
+
+impl Eq for GeometryCache {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptCdnaMapperSegment {
     pub genomic_start: i64,
@@ -192,6 +225,12 @@ fn refseq_mapper_edit_offset_delta(edit: &RefSeqEdit) -> Option<i64> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptFeature {
     pub transcript_id: String,
+    /// Dense per-chromosome transcript identity (rank of the stable id within
+    /// the chrom's sorted-unique transcript set), carried from the `transcript`
+    /// table's `transcript_uid` column. Used to build the position-sliced SIFT
+    /// lookup key `(transcript_uid << 32) | protein_position`. `None` for legacy
+    /// caches that predate the column.
+    pub transcript_uid: Option<u32>,
     pub chrom: String,
     pub start: i64,
     pub end: i64,
@@ -275,6 +314,9 @@ pub struct TranscriptFeature {
     /// Format: `"start:end structure_string"` e.g. `"1:81 (19.(6.(2.(4.14)12.)10.)9"`.
     /// Parsed at CSQ output time to determine miRNA_stem/miRNA_loop overlap.
     pub ncrna_structure: Option<String>,
+    /// Lazily-built cDNA coordinate table, memoized once per transcript and
+    /// reused across all overlapping variants/alleles. Not part of identity.
+    pub cdna_coords_cache: GeometryCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -590,6 +632,182 @@ pub struct TranscriptConsequence {
     pub used_ref: Option<String>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct TranscriptEngineProfile {
+    pub rows: usize,
+    pub star_rows: usize,
+    pub structural_candidates: usize,
+    pub structural_hits: usize,
+    pub tx_candidates: usize,
+    pub tx_exon_refs: usize,
+    pub tx_overlap_candidates: usize,
+    pub tx_updown_candidates: usize,
+    pub tx_no_term_candidates: usize,
+    pub tx_outputs: usize,
+    pub tx_updown_outputs: usize,
+    pub regulatory_outputs: usize,
+    pub tfbs_outputs: usize,
+    pub mirna_outputs: usize,
+    pub structural_outputs: usize,
+    pub intergenic_outputs: usize,
+    pub structural_collect: Duration,
+    pub tx_query_total: Duration,
+    pub tx_exon_lookup: Duration,
+    pub tx_overlap_predicate: Duration,
+    pub transcript_overlap_eval: Duration,
+    pub transcript_output_materialize: Duration,
+    pub transcript_position_fields: Duration,
+    pub transcript_reference_fields: Duration,
+    pub transcript_coding_fields: Duration,
+    pub transcript_flags: Duration,
+    pub transcript_hgvsc: Duration,
+    pub transcript_hgvsc_simple_fast: Duration,
+    pub transcript_hgvsc_coord_map: Duration,
+    pub transcript_hgvsc_refseq_edit: Duration,
+    pub transcript_hgvsc_fallback: Duration,
+    pub transcript_hgvsc_format_string: Duration,
+    pub transcript_hgvsc_calls: usize,
+    pub transcript_hgvsc_outputs: usize,
+    pub transcript_hgvsc_simple_fast_calls: usize,
+    pub transcript_hgvsc_simple_fast_outputs: usize,
+    pub transcript_hgvsc_fallback_calls: usize,
+    pub transcript_hgvsc_shift_candidates: usize,
+    pub transcript_hgvsc_refseq_edit_candidates: usize,
+    pub transcript_hgvsc_substitution_candidates: usize,
+    pub transcript_hgvsc_indel_candidates: usize,
+    pub transcript_hgvsp: Duration,
+    pub transcript_hgvsp_prepare: Duration,
+    pub transcript_hgvsp_format: Duration,
+    pub transcript_hgvsp_translation_candidates: usize,
+    pub transcript_hgvsp_data_candidates: usize,
+    pub transcript_hgvsp_outputs: usize,
+    pub transcript_push: Duration,
+    pub overlap_deleted_gap_check: Duration,
+    pub overlap_exon_scan: Duration,
+    pub overlap_cds_checks: Duration,
+    pub overlap_intron_checks: Duration,
+    pub overlap_noncoding_branch: Duration,
+    pub overlap_coding_branch: Duration,
+    pub overlap_utr_branch: Duration,
+    pub overlap_splice_terms: Duration,
+    pub overlap_finalize_terms: Duration,
+    pub overlap_exon_hits: usize,
+    pub overlap_intron_hits: usize,
+    pub overlap_noncoding_hits: usize,
+    pub overlap_coding_hits: usize,
+    pub overlap_utr_hits: usize,
+    pub upstream_downstream_eval: Duration,
+    pub upstream_downstream_materialize: Duration,
+    pub append_regulatory: Duration,
+    pub append_tfbs: Duration,
+    pub append_mirna: Duration,
+    pub append_structural: Duration,
+    pub intergenic_append: Duration,
+}
+
+impl TranscriptEngineProfile {
+    fn add_hgvsc_profile(&mut self, profile: &HgvscProfile) {
+        self.transcript_hgvsc_simple_fast += profile.simple_fast;
+        self.transcript_hgvsc_coord_map += profile.coord_map;
+        self.transcript_hgvsc_refseq_edit += profile.refseq_edit;
+        self.transcript_hgvsc_fallback += profile.fallback;
+        self.transcript_hgvsc_format_string += profile.format_string;
+        self.transcript_hgvsc_simple_fast_calls += profile.simple_fast_calls;
+        self.transcript_hgvsc_simple_fast_outputs += profile.simple_fast_outputs;
+        self.transcript_hgvsc_fallback_calls += profile.fallback_calls;
+    }
+
+    pub fn summary_line(&self) -> String {
+        format!(
+            "[VEP_TX_ENGINE_PROFILE] rows={} star_rows={} structural_candidates={} structural_hits={} tx_candidates={} tx_exon_refs={} tx_overlap_candidates={} tx_updown_candidates={} tx_no_term_candidates={} tx_outputs={} tx_updown_outputs={} regulatory_outputs={} tfbs_outputs={} mirna_outputs={} structural_outputs={} intergenic_outputs={} structural_collect={:.6}s tx_query_total={:.6}s tx_exon_lookup={:.6}s tx_overlap_predicate={:.6}s transcript_overlap_eval={:.6}s transcript_output_materialize={:.6}s transcript_position_fields={:.6}s transcript_reference_fields={:.6}s transcript_coding_fields={:.6}s transcript_flags={:.6}s transcript_hgvsc={:.6}s transcript_hgvsc_simple_fast={:.6}s transcript_hgvsc_coord_map={:.6}s transcript_hgvsc_refseq_edit={:.6}s transcript_hgvsc_fallback={:.6}s transcript_hgvsc_format_string={:.6}s transcript_hgvsc_calls={} transcript_hgvsc_outputs={} transcript_hgvsc_simple_fast_calls={} transcript_hgvsc_simple_fast_outputs={} transcript_hgvsc_fallback_calls={} transcript_hgvsc_shift_candidates={} transcript_hgvsc_refseq_edit_candidates={} transcript_hgvsc_substitution_candidates={} transcript_hgvsc_indel_candidates={} transcript_hgvsp={:.6}s transcript_hgvsp_prepare={:.6}s transcript_hgvsp_format={:.6}s transcript_hgvsp_translation_candidates={} transcript_hgvsp_data_candidates={} transcript_hgvsp_outputs={} transcript_push={:.6}s overlap_deleted_gap_check={:.6}s overlap_exon_scan={:.6}s overlap_cds_checks={:.6}s overlap_intron_checks={:.6}s overlap_noncoding_branch={:.6}s overlap_coding_branch={:.6}s overlap_utr_branch={:.6}s overlap_splice_terms={:.6}s overlap_finalize_terms={:.6}s overlap_exon_hits={} overlap_intron_hits={} overlap_noncoding_hits={} overlap_coding_hits={} overlap_utr_hits={} upstream_downstream_eval={:.6}s upstream_downstream_materialize={:.6}s append_regulatory={:.6}s append_tfbs={:.6}s append_mirna={:.6}s append_structural={:.6}s intergenic_append={:.6}s",
+            self.rows,
+            self.star_rows,
+            self.structural_candidates,
+            self.structural_hits,
+            self.tx_candidates,
+            self.tx_exon_refs,
+            self.tx_overlap_candidates,
+            self.tx_updown_candidates,
+            self.tx_no_term_candidates,
+            self.tx_outputs,
+            self.tx_updown_outputs,
+            self.regulatory_outputs,
+            self.tfbs_outputs,
+            self.mirna_outputs,
+            self.structural_outputs,
+            self.intergenic_outputs,
+            self.structural_collect.as_secs_f64(),
+            self.tx_query_total.as_secs_f64(),
+            self.tx_exon_lookup.as_secs_f64(),
+            self.tx_overlap_predicate.as_secs_f64(),
+            self.transcript_overlap_eval.as_secs_f64(),
+            self.transcript_output_materialize.as_secs_f64(),
+            self.transcript_position_fields.as_secs_f64(),
+            self.transcript_reference_fields.as_secs_f64(),
+            self.transcript_coding_fields.as_secs_f64(),
+            self.transcript_flags.as_secs_f64(),
+            self.transcript_hgvsc.as_secs_f64(),
+            self.transcript_hgvsc_simple_fast.as_secs_f64(),
+            self.transcript_hgvsc_coord_map.as_secs_f64(),
+            self.transcript_hgvsc_refseq_edit.as_secs_f64(),
+            self.transcript_hgvsc_fallback.as_secs_f64(),
+            self.transcript_hgvsc_format_string.as_secs_f64(),
+            self.transcript_hgvsc_calls,
+            self.transcript_hgvsc_outputs,
+            self.transcript_hgvsc_simple_fast_calls,
+            self.transcript_hgvsc_simple_fast_outputs,
+            self.transcript_hgvsc_fallback_calls,
+            self.transcript_hgvsc_shift_candidates,
+            self.transcript_hgvsc_refseq_edit_candidates,
+            self.transcript_hgvsc_substitution_candidates,
+            self.transcript_hgvsc_indel_candidates,
+            self.transcript_hgvsp.as_secs_f64(),
+            self.transcript_hgvsp_prepare.as_secs_f64(),
+            self.transcript_hgvsp_format.as_secs_f64(),
+            self.transcript_hgvsp_translation_candidates,
+            self.transcript_hgvsp_data_candidates,
+            self.transcript_hgvsp_outputs,
+            self.transcript_push.as_secs_f64(),
+            self.overlap_deleted_gap_check.as_secs_f64(),
+            self.overlap_exon_scan.as_secs_f64(),
+            self.overlap_cds_checks.as_secs_f64(),
+            self.overlap_intron_checks.as_secs_f64(),
+            self.overlap_noncoding_branch.as_secs_f64(),
+            self.overlap_coding_branch.as_secs_f64(),
+            self.overlap_utr_branch.as_secs_f64(),
+            self.overlap_splice_terms.as_secs_f64(),
+            self.overlap_finalize_terms.as_secs_f64(),
+            self.overlap_exon_hits,
+            self.overlap_intron_hits,
+            self.overlap_noncoding_hits,
+            self.overlap_coding_hits,
+            self.overlap_utr_hits,
+            self.upstream_downstream_eval.as_secs_f64(),
+            self.upstream_downstream_materialize.as_secs_f64(),
+            self.append_regulatory.as_secs_f64(),
+            self.append_tfbs.as_secs_f64(),
+            self.append_mirna.as_secs_f64(),
+            self.append_structural.as_secs_f64(),
+            self.intergenic_append.as_secs_f64(),
+        )
+    }
+}
+
+fn hgvsc_detail_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("VEP_ENGINE_PROFILE_HGVSC")
+            .map(|value| {
+                let value = value.to_string_lossy();
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FeatureType {
     Transcript,
@@ -626,6 +844,7 @@ impl FeatureType {
 /// across all variants in a batch.
 pub struct PreparedContext<'a> {
     pub exons_by_tx: HashMap<&'a str, Vec<&'a ExonFeature>>,
+    pub exons_by_tx_genomic: HashMap<&'a str, Vec<&'a ExonFeature>>,
     pub translation_by_tx: HashMap<&'a str, &'a TranslationFeature>,
     /// All transcripts stored by index; the COITree metadata is the index
     /// into this vec.
@@ -722,6 +941,26 @@ impl<'a> PreparedContext<'a> {
         mirnas: &'a [MirnaFeature],
         structural: &'a [StructuralFeature],
     ) -> Self {
+        Self::new_from_refs(
+            transcripts.iter().collect(),
+            exons.iter().collect(),
+            translations.iter().collect(),
+            regulatory,
+            motifs,
+            mirnas,
+            structural,
+        )
+    }
+
+    pub fn new_from_refs(
+        transcripts: Vec<&'a TranscriptFeature>,
+        exons: Vec<&'a ExonFeature>,
+        translations: Vec<&'a TranslationFeature>,
+        regulatory: &'a [RegulatoryFeature],
+        motifs: &'a [MotifFeature],
+        mirnas: &'a [MirnaFeature],
+        structural: &'a [StructuralFeature],
+    ) -> Self {
         let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
         for exon in exons {
             exons_by_tx
@@ -729,18 +968,22 @@ impl<'a> PreparedContext<'a> {
                 .or_default()
                 .push(exon);
         }
+        let mut exons_by_tx_genomic = exons_by_tx.clone();
         for tx_exons in exons_by_tx.values_mut() {
             tx_exons.sort_by_key(|e| e.exon_number);
         }
+        for tx_exons in exons_by_tx_genomic.values_mut() {
+            tx_exons.sort_by_key(|e| (e.start, e.end, e.exon_number));
+        }
         let translation_by_tx: HashMap<&str, &TranslationFeature> = translations
-            .iter()
+            .into_iter()
             .map(|t| (t.transcript_id.as_str(), t))
             .collect();
         // Sort transcripts by transcript_id so that source-array index order
         // equals lexicographic feature-ID order.  The downstream CSQ sort can
         // then compare lightweight `transcript_idx` integers instead of heap-
         // allocated transcript_id strings.
-        let mut tx_refs: Vec<&TranscriptFeature> = transcripts.iter().collect();
+        let mut tx_refs = transcripts;
         tx_refs.sort_unstable_by(|a, b| a.transcript_id.cmp(&b.transcript_id));
 
         // Build per-chromosome COITree for fast interval overlap queries.
@@ -790,6 +1033,7 @@ impl<'a> PreparedContext<'a> {
 
         Self {
             exons_by_tx,
+            exons_by_tx_genomic,
             translation_by_tx,
             transcripts: tx_refs,
             tx_trees,
@@ -880,9 +1124,34 @@ impl TranscriptConsequenceEngine {
         variant: &VariantInput,
         ctx: &PreparedContext<'_>,
     ) -> Vec<TranscriptConsequence> {
+        self.evaluate_variant_prepared_inner(variant, ctx, None)
+    }
+
+    pub fn evaluate_variant_prepared_profiled(
+        &self,
+        variant: &VariantInput,
+        ctx: &PreparedContext<'_>,
+        profile: &mut TranscriptEngineProfile,
+    ) -> Vec<TranscriptConsequence> {
+        self.evaluate_variant_prepared_inner(variant, ctx, Some(profile))
+    }
+
+    fn evaluate_variant_prepared_inner(
+        &self,
+        variant: &VariantInput,
+        ctx: &PreparedContext<'_>,
+        mut profile: Option<&mut TranscriptEngineProfile>,
+    ) -> Vec<TranscriptConsequence> {
+        let profiling = profile.is_some();
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.rows += 1;
+        }
         // VEP skips star alleles entirely — they represent upstream deletions
         // that remove the variant site, not real alternate sequences.
         if variant.alt_allele == "*" {
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.star_rows += 1;
+            }
             return Vec::new();
         }
 
@@ -891,35 +1160,65 @@ impl TranscriptConsequenceEngine {
         let is_ins = variant.ref_allele == "-";
         let max_dist = self.upstream_distance.max(self.downstream_distance);
         let mut structural_hits = Vec::new();
+        let structural_started = profiling.then(Instant::now);
         ctx.structural_index.collect_overlapping_indices(
             variant_chrom,
             variant.start,
             variant.end,
             &mut structural_hits,
         );
+        let structural_candidates = structural_hits.len();
         structural_hits.retain(|&idx| {
             let sv = ctx.structural_index.features[idx];
             overlaps(variant.start, variant.end, sv.start, sv.end)
         });
+        if let (Some(started), Some(profile)) = (structural_started, profile.as_deref_mut()) {
+            profile.structural_collect += started.elapsed();
+            profile.structural_candidates += structural_candidates;
+            profile.structural_hits += structural_hits.len();
+        }
 
         // Query the per-chromosome COITree with the variant range expanded
         // by upstream/downstream distance to catch nearby transcripts.
         if let Some(tree) = ctx.tx_trees.get(variant_chrom) {
             let query_first = (variant.start - max_dist) as i32;
             let query_last = (variant.end + max_dist) as i32;
+            let tx_query_started = profiling.then(Instant::now);
             tree.query(query_first, query_last, |node| {
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.tx_candidates += 1;
+                }
                 let tx_idx = *GenericInterval::<usize>::metadata(node);
                 let tx = ctx.transcripts[tx_idx];
+                let exon_lookup_started = profiling.then(Instant::now);
+                // Source genomic-start-ordered exons so the per-output intron/exon
+                // helpers (`start_sorted`) borrow instead of re-sorting per call.
+                // The intron helpers derive introns from start-ordered pairs and
+                // `which_exon_str` is order-independent, so start order is correct
+                // for all consumers here.
                 let tx_exons = ctx
-                    .exons_by_tx
+                    .exons_by_tx_genomic
                     .get(tx.transcript_id.as_str())
-                    .cloned()
-                    .unwrap_or_default();
+                    .map(Vec::as_slice)
+                    .or_else(|| {
+                        ctx.exons_by_tx
+                            .get(tx.transcript_id.as_str())
+                            .map(Vec::as_slice)
+                    })
+                    .unwrap_or(&[]);
+                let tx_exons_for_hgvsc = tx_exons;
                 let tx_translation = ctx
                     .translation_by_tx
                     .get(tx.transcript_id.as_str())
                     .copied();
+                if let (Some(started), Some(profile)) =
+                    (exon_lookup_started, profile.as_deref_mut())
+                {
+                    profile.tx_exon_lookup += started.elapsed();
+                    profile.tx_exon_refs += tx_exons.len();
+                }
 
+                let overlap_predicate_started = profiling.then(Instant::now);
                 let variant_overlaps_tx = if is_ins {
                     // For insertions, require both flanking positions
                     // to be within the transcript (same logic as exon check).
@@ -927,13 +1226,44 @@ impl TranscriptConsequenceEngine {
                 } else {
                     overlaps(variant.start, variant.end, tx.start, tx.end)
                 };
+                if let (Some(started), Some(profile)) =
+                    (overlap_predicate_started, profile.as_deref_mut())
+                {
+                    profile.tx_overlap_predicate += started.elapsed();
+                }
                 if variant_overlaps_tx {
-                    let (terms, coding_class) =
-                        self.evaluate_transcript_overlap(variant, tx, &tx_exons, tx_translation);
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.tx_overlap_candidates += 1;
+                    }
+                    let transcript_eval_started = profiling.then(Instant::now);
+                    let (terms, coding_class) = if let Some(profile) = profile.as_deref_mut() {
+                        self.evaluate_transcript_overlap_profiled(
+                            variant,
+                            tx,
+                            tx_exons,
+                            tx_translation,
+                            profile,
+                        )
+                    } else {
+                        self.evaluate_transcript_overlap(variant, tx, tx_exons, tx_translation)
+                    };
+                    if let (Some(started), Some(profile)) =
+                        (transcript_eval_started, profile.as_deref_mut())
+                    {
+                        profile.transcript_overlap_eval += started.elapsed();
+                    }
                     if !terms.is_empty() {
-                        let exon_str = which_exon_str(variant, &tx_exons);
-                        let intron_str = which_intron_str(variant, &tx_exons, tx.strand);
-                        let cdna_position = compute_cdna_position(variant, tx, &tx_exons);
+                        let materialize_started = profiling.then(Instant::now);
+                        let position_started = profiling.then(Instant::now);
+                        let exon_str = which_exon_str(variant, tx_exons);
+                        let intron_str = which_intron_str(variant, tx_exons, tx.strand);
+                        let cdna_position = compute_cdna_position(variant, tx, tx_exons);
+                        if let (Some(started), Some(profile)) =
+                            (position_started, profile.as_deref_mut())
+                        {
+                            profile.transcript_position_fields += started.elapsed();
+                        }
+                        let reference_started = profiling.then(Instant::now);
                         let given_ref = given_ref_for_output(variant);
                         let hgvs_shift = if self.shift_hgvs {
                             variant.hgvs_shift_for_strand(tx.strand)
@@ -945,7 +1275,7 @@ impl TranscriptConsequenceEngine {
                         let shifted_deletion_uses_protein_hgvs_reference =
                             shifted_deletion_uses_protein_hgvs_reference(
                                 tx,
-                                &tx_exons,
+                                tx_exons,
                                 variant,
                                 original_allows_protein_hgvs,
                                 self.shift_hgvs,
@@ -953,10 +1283,16 @@ impl TranscriptConsequenceEngine {
                         let used_ref = used_ref_for_transcript_variant(
                             variant,
                             tx,
-                            &tx_exons,
+                            tx_exons,
                             hgvs_shift,
                             shifted_deletion_uses_protein_hgvs_reference,
                         );
+                        if let (Some(started), Some(profile)) =
+                            (reference_started, profile.as_deref_mut())
+                        {
+                            profile.transcript_reference_fields += started.elapsed();
+                        }
+                        let coding_started = profiling.then(Instant::now);
                         let (cds_position, protein_position, amino_acids, codons, protein_hgvs) =
                             if let Some(ref cc) = coding_class {
                                 let n_pad_len = tx_translation
@@ -994,7 +1330,7 @@ impl TranscriptConsequenceEngine {
                                 let amino_acids = amino_acids_for_output(tx, tx_translation, cc);
                                 let protein_hgvs = protein_hgvs_for_output(
                                     tx,
-                                    &tx_exons,
+                                    tx_exons,
                                     tx_translation,
                                     variant,
                                     original_allows_protein_hgvs,
@@ -1009,7 +1345,7 @@ impl TranscriptConsequenceEngine {
                                 // original consequence stayed coding_sequence_variant.
                                 let protein_hgvs = protein_hgvs_for_output(
                                     tx,
-                                    &tx_exons,
+                                    tx_exons,
                                     tx_translation,
                                     variant,
                                     original_allows_protein_hgvs,
@@ -1019,32 +1355,123 @@ impl TranscriptConsequenceEngine {
                                 );
                                 (None, None, None, None, protein_hgvs)
                             };
+                        if let (Some(started), Some(profile)) =
+                            (coding_started, profile.as_deref_mut())
+                        {
+                            profile.transcript_coding_fields += started.elapsed();
+                        }
+                        let flags_started = profiling.then(Instant::now);
                         let flags = compute_flags(tx);
+                        if let (Some(started), Some(profile)) =
+                            (flags_started, profile.as_deref_mut())
+                        {
+                            profile.transcript_flags += started.elapsed();
+                        }
                         let hgvsc_ref_allele =
                             used_ref.as_deref().unwrap_or(variant.ref_allele.as_str());
                         // Compute HGVSc notation.
-                        let hgvsc = crate::hgvs::format_hgvsc(
-                            tx,
-                            &tx_exons,
-                            cdna_position.as_deref(),
-                            cds_position.as_deref(),
-                            hgvsc_ref_allele,
-                            &variant.alt_allele,
-                            variant.start,
-                            variant.end,
-                            hgvs_shift,
-                        );
+                        let hgvsc_started = profiling.then(Instant::now);
+                        if let Some(profile) = profile.as_deref_mut() {
+                            profile.transcript_hgvsc_calls += 1;
+                            if hgvs_shift.is_some() {
+                                profile.transcript_hgvsc_shift_candidates += 1;
+                            }
+                            if !tx.refseq_edits.is_empty() {
+                                profile.transcript_hgvsc_refseq_edit_candidates += 1;
+                            }
+                            if variant.ref_allele.len() == variant.alt_allele.len()
+                                && variant.ref_allele != "-"
+                                && variant.alt_allele != "-"
+                            {
+                                profile.transcript_hgvsc_substitution_candidates += 1;
+                            } else {
+                                profile.transcript_hgvsc_indel_candidates += 1;
+                            }
+                        }
+                        let mut hgvsc_detail_profile = (profiling
+                            && hgvsc_detail_profile_enabled())
+                        .then(HgvscProfile::default);
+                        let hgvsc = if let Some(detail_profile) = hgvsc_detail_profile.as_mut() {
+                            crate::hgvs::format_hgvsc_profiled(
+                                tx,
+                                tx_exons_for_hgvsc,
+                                cdna_position.as_deref(),
+                                cds_position.as_deref(),
+                                hgvsc_ref_allele,
+                                &variant.alt_allele,
+                                variant.start,
+                                variant.end,
+                                hgvs_shift,
+                                detail_profile,
+                            )
+                        } else {
+                            crate::hgvs::format_hgvsc(
+                                tx,
+                                tx_exons_for_hgvsc,
+                                cdna_position.as_deref(),
+                                cds_position.as_deref(),
+                                hgvsc_ref_allele,
+                                &variant.alt_allele,
+                                variant.start,
+                                variant.end,
+                                hgvs_shift,
+                            )
+                        };
+                        if let (Some(started), Some(profile)) =
+                            (hgvsc_started, profile.as_deref_mut())
+                        {
+                            profile.transcript_hgvsc += started.elapsed();
+                            if let Some(detail_profile) = hgvsc_detail_profile.as_ref() {
+                                profile.add_hgvsc_profile(detail_profile);
+                            }
+                            if hgvsc.is_some() {
+                                profile.transcript_hgvsc_outputs += 1;
+                            }
+                        }
                         // Compute HGVSp notation.
-                        let hgvsp = tx_translation.and_then(|tl| {
-                            let effective_translation = translation_for_hgvsp(tx, tl);
-                            protein_hgvs.as_ref().and_then(|data| {
-                                crate::hgvs::format_hgvsp(
+                        let hgvsp_started = profiling.then(Instant::now);
+                        let hgvsp = if let Some(tl) = tx_translation {
+                            if let Some(profile) = profile.as_deref_mut() {
+                                profile.transcript_hgvsp_translation_candidates += 1;
+                            }
+                            if let Some(data) = protein_hgvs.as_ref() {
+                                if let Some(profile) = profile.as_deref_mut() {
+                                    profile.transcript_hgvsp_data_candidates += 1;
+                                }
+                                let prepare_started = profiling.then(Instant::now);
+                                let effective_translation = translation_for_hgvsp(tx, tl);
+                                if let (Some(started), Some(profile)) =
+                                    (prepare_started, profile.as_deref_mut())
+                                {
+                                    profile.transcript_hgvsp_prepare += started.elapsed();
+                                }
+                                let format_started = profiling.then(Instant::now);
+                                let formatted = crate::hgvs::format_hgvsp(
                                     &effective_translation,
                                     data,
                                     self.shift_hgvs,
-                                )
-                            })
-                        });
+                                );
+                                if let (Some(started), Some(profile)) =
+                                    (format_started, profile.as_deref_mut())
+                                {
+                                    profile.transcript_hgvsp_format += started.elapsed();
+                                }
+                                formatted
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let (Some(started), Some(profile)) =
+                            (hgvsp_started, profile.as_deref_mut())
+                        {
+                            profile.transcript_hgvsp += started.elapsed();
+                            if hgvsp.is_some() {
+                                profile.transcript_hgvsp_outputs += 1;
+                            }
+                        }
+                        let push_started = profiling.then(Instant::now);
                         out.push(TranscriptConsequence {
                             transcript_id: Some(tx.transcript_id.clone()),
                             transcript_idx: Some(tx_idx),
@@ -1065,38 +1492,74 @@ impl TranscriptConsequenceEngine {
                             used_ref,
                             ..Default::default()
                         });
+                        if let (Some(started), Some(profile)) =
+                            (push_started, profile.as_deref_mut())
+                        {
+                            profile.transcript_push += started.elapsed();
+                        }
+                        if let (Some(started), Some(profile)) =
+                            (materialize_started, profile.as_deref_mut())
+                        {
+                            profile.transcript_output_materialize += started.elapsed();
+                            profile.tx_outputs += 1;
+                        }
+                    } else if let Some(profile) = profile.as_deref_mut() {
+                        profile.tx_no_term_candidates += 1;
                     }
-                } else if let Some((term, dist)) = self.upstream_downstream_term(variant, tx) {
-                    let given_ref = given_ref_for_output(variant);
-                    let used_ref = used_ref_for_transcript_variant(
-                        variant,
-                        tx,
-                        &tx_exons,
-                        if self.shift_hgvs {
-                            variant.hgvs_shift_for_strand(tx.strand)
-                        } else {
-                            None
-                        },
-                        false,
-                    );
-                    out.push(TranscriptConsequence {
-                        transcript_id: Some(tx.transcript_id.clone()),
-                        transcript_idx: Some(tx_idx),
-                        feature_type: FeatureType::Transcript,
-                        terms: vec![term],
-                        distance: Some(dist),
-                        flags: compute_flags(tx),
-                        given_ref,
-                        used_ref,
-                        ..Default::default()
-                    });
+                } else {
+                    let updown_started = profiling.then(Instant::now);
+                    let updown = self.upstream_downstream_term(variant, tx);
+                    if let (Some(started), Some(profile)) = (updown_started, profile.as_deref_mut())
+                    {
+                        profile.upstream_downstream_eval += started.elapsed();
+                    }
+                    if let Some((term, dist)) = updown {
+                        if let Some(profile) = profile.as_deref_mut() {
+                            profile.tx_updown_candidates += 1;
+                        }
+                        let materialize_started = profiling.then(Instant::now);
+                        let given_ref = given_ref_for_output(variant);
+                        let used_ref = used_ref_for_transcript_variant(
+                            variant,
+                            tx,
+                            tx_exons,
+                            if self.shift_hgvs {
+                                variant.hgvs_shift_for_strand(tx.strand)
+                            } else {
+                                None
+                            },
+                            false,
+                        );
+                        out.push(TranscriptConsequence {
+                            transcript_id: Some(tx.transcript_id.clone()),
+                            transcript_idx: Some(tx_idx),
+                            feature_type: FeatureType::Transcript,
+                            terms: vec![term],
+                            distance: Some(dist),
+                            flags: compute_flags(tx),
+                            given_ref,
+                            used_ref,
+                            ..Default::default()
+                        });
+                        if let (Some(started), Some(profile)) =
+                            (materialize_started, profile.as_deref_mut())
+                        {
+                            profile.upstream_downstream_materialize += started.elapsed();
+                            profile.tx_updown_outputs += 1;
+                        }
+                    }
                 }
             });
+            if let (Some(started), Some(profile)) = (tx_query_started, profile.as_deref_mut()) {
+                profile.tx_query_total += started.elapsed();
+            }
         }
 
         // Track whether any transcript was matched (overlap or upstream/downstream).
         let has_transcript_hit = !out.is_empty();
 
+        let before = out.len();
+        let started = profiling.then(Instant::now);
         self.append_regulatory_terms_prepared(
             &mut out,
             variant,
@@ -1104,8 +1567,26 @@ impl TranscriptConsequenceEngine {
             ctx,
             &structural_hits,
         );
+        if let (Some(started), Some(profile)) = (started, profile.as_deref_mut()) {
+            profile.append_regulatory += started.elapsed();
+            profile.regulatory_outputs += out.len().saturating_sub(before);
+        }
+        let before = out.len();
+        let started = profiling.then(Instant::now);
         self.append_tfbs_terms_prepared(&mut out, variant, variant_chrom, ctx, &structural_hits);
+        if let (Some(started), Some(profile)) = (started, profile.as_deref_mut()) {
+            profile.append_tfbs += started.elapsed();
+            profile.tfbs_outputs += out.len().saturating_sub(before);
+        }
+        let before = out.len();
+        let started = profiling.then(Instant::now);
         self.append_mirna_terms_prepared(&mut out, variant, variant_chrom, ctx);
+        if let (Some(started), Some(profile)) = (started, profile.as_deref_mut()) {
+            profile.append_mirna += started.elapsed();
+            profile.mirna_outputs += out.len().saturating_sub(before);
+        }
+        let before = out.len();
+        let started = profiling.then(Instant::now);
         self.append_structural_transcript_terms_prepared(
             &mut out,
             variant,
@@ -1113,14 +1594,23 @@ impl TranscriptConsequenceEngine {
             ctx,
             &structural_hits,
         );
+        if let (Some(started), Some(profile)) = (started, profile.as_mut()) {
+            profile.append_structural += started.elapsed();
+            profile.structural_outputs += out.len().saturating_sub(before);
+        }
 
         // VEP emits intergenic_variant when no transcript was hit, even if
         // regulatory/motif features overlap (those are orthogonal to transcripts).
         if !has_transcript_hit {
+            let started = profiling.then(Instant::now);
             out.push(TranscriptConsequence {
                 terms: vec![SoTerm::IntergenicVariant],
                 ..Default::default()
             });
+            if let (Some(started), Some(profile)) = (started, profile.as_deref_mut()) {
+                profile.intergenic_append += started.elapsed();
+                profile.intergenic_outputs += 1;
+            }
         }
         out
     }
@@ -1150,9 +1640,33 @@ impl TranscriptConsequenceEngine {
         tx_exons: &[&ExonFeature],
         tx_translation: Option<&TranslationFeature>,
     ) -> (Vec<SoTerm>, Option<CodingClassification>) {
+        self.evaluate_transcript_overlap_inner(variant, tx, tx_exons, tx_translation, None)
+    }
+
+    fn evaluate_transcript_overlap_profiled(
+        &self,
+        variant: &VariantInput,
+        tx: &TranscriptFeature,
+        tx_exons: &[&ExonFeature],
+        tx_translation: Option<&TranslationFeature>,
+        profile: &mut TranscriptEngineProfile,
+    ) -> (Vec<SoTerm>, Option<CodingClassification>) {
+        self.evaluate_transcript_overlap_inner(variant, tx, tx_exons, tx_translation, Some(profile))
+    }
+
+    fn evaluate_transcript_overlap_inner(
+        &self,
+        variant: &VariantInput,
+        tx: &TranscriptFeature,
+        tx_exons: &[&ExonFeature],
+        tx_translation: Option<&TranslationFeature>,
+        mut profile: Option<&mut TranscriptEngineProfile>,
+    ) -> (Vec<SoTerm>, Option<CodingClassification>) {
+        let profiling = profile.is_some();
         let mut terms = BTreeSet::new();
         let is_ins = variant.ref_allele == "-";
         let mut coding_class = None;
+        let deleted_gap_started = profiling.then(Instant::now);
         let deleted_refseq_gap = !is_ins
             && prefers_exon_geometry_over_mapper(tx)
             && (variant.start..=variant.end).any(|pos| {
@@ -1161,12 +1675,16 @@ impl TranscriptConsequenceEngine {
             });
         let deleted_refseq_gap_noncoding_exon =
             deleted_refseq_gap && is_non_coding_biotype(&tx.biotype);
+        if let (Some(started), Some(profile)) = (deleted_gap_started, profile.as_deref_mut()) {
+            profile.overlap_deleted_gap_check += started.elapsed();
+        }
 
         // For pure insertions, VEP requires both flanking positions
         // (start-1 and start) to be within the exon.  An insertion at
         // the first base of an exon (start == exon.start) is between the
         // last intron base and the first exon base — VEP considers that
         // intronic.
+        let exon_scan_started = profiling.then(Instant::now);
         let overlaps_exon = !deleted_refseq_gap
             && tx_exons.iter().any(|e| {
                 if is_ins {
@@ -1175,6 +1693,12 @@ impl TranscriptConsequenceEngine {
                     overlaps(variant.start, variant.end, e.start, e.end)
                 }
             });
+        if let (Some(started), Some(profile)) = (exon_scan_started, profile.as_deref_mut()) {
+            profile.overlap_exon_scan += started.elapsed();
+            if overlaps_exon {
+                profile.overlap_exon_hits += 1;
+            }
+        }
 
         // VEP's within_cds() uses inverted insertion coordinates (start > end)
         // which naturally span the CDS boundary in overlap checks.  An insertion
@@ -1188,6 +1712,7 @@ impl TranscriptConsequenceEngine {
         //   checks cds_start/cds_end via genomic2cds mapper which maps both
         //   insertion flanks independently
         //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L627-L648>
+        let cds_checks_started = profiling.then(Instant::now);
         let ins_left_flank_in_cds = is_ins && self.insertion_left_flank_in_cds(variant, tx);
         let cds_end_exon_boundary = ins_left_flank_in_cds
             && !overlaps_exon
@@ -1196,11 +1721,15 @@ impl TranscriptConsequenceEngine {
             && self.overlaps_cds(variant, tx)
             && !overlaps_exon
             && tx_exons.iter().any(|e| variant.start == e.start);
+        if let (Some(started), Some(profile)) = (cds_checks_started, profile.as_deref_mut()) {
+            profile.overlap_cds_checks += started.elapsed();
+        }
 
         // VEP adds intron_variant when the variant overlaps the intron body
         // (excluding splice site positions at the first/last 2bp).  The
         // narrower range in variant_overlaps_intron handles this correctly
         // for both purely-intronic variants and exon-spanning deletions.
+        let intron_checks_started = profiling.then(Instant::now);
         let overlaps_intron = self.variant_overlaps_intron(variant, tx_exons);
         if overlaps_intron {
             terms.insert(SoTerm::IntronVariant);
@@ -1210,12 +1739,19 @@ impl TranscriptConsequenceEngine {
         // of the surrounding coding context.  If the variant is within CDS
         // bounds and sits in a frameshift intron, emit coding_sequence_variant.
         let in_frameshift_intron = !overlaps_exon && self.in_frameshift_intron(variant, tx_exons);
+        if let (Some(started), Some(profile)) = (intron_checks_started, profile.as_deref_mut()) {
+            profile.overlap_intron_checks += started.elapsed();
+            if overlaps_intron {
+                profile.overlap_intron_hits += 1;
+            }
+        }
 
         if deleted_refseq_gap && !deleted_refseq_gap_noncoding_exon {
             terms.insert(SoTerm::IntergenicVariant);
         } else if is_non_coding_biotype(&tx.biotype)
             && (overlaps_exon || deleted_refseq_gap_noncoding_exon)
         {
+            let branch_started = profiling.then(Instant::now);
             // VEP: mature_miRNA_variant for miRNA transcripts where variant
             // overlaps a mature miRNA region (cDNA-mapped from attributes).
             // When within a mature miRNA region, VEP suppresses
@@ -1233,12 +1769,17 @@ impl TranscriptConsequenceEngine {
             if !in_mature_mirna {
                 terms.insert(SoTerm::NonCodingTranscriptExonVariant);
             }
+            if let (Some(started), Some(profile)) = (branch_started, profile.as_deref_mut()) {
+                profile.overlap_noncoding_branch += started.elapsed();
+                profile.overlap_noncoding_hits += 1;
+            }
         } else if (overlaps_exon
             || cds_end_exon_boundary
             || cds_start_exon_boundary
             || (in_frameshift_intron && self.overlaps_cds(variant, tx)))
             && (self.overlaps_cds(variant, tx) || ins_left_flank_in_cds)
         {
+            let branch_started = profiling.then(Instant::now);
             // VEP's TranscriptMapper includes frameshift intron (≤13bp) bases
             // in the CDS, so genomic2cds() returns valid CDS coordinates for
             // positions within frameshift introns.  All normal coding predicates
@@ -1310,9 +1851,18 @@ impl TranscriptConsequenceEngine {
                     }
                 }
             }
+            if let (Some(started), Some(profile)) = (branch_started, profile.as_deref_mut()) {
+                profile.overlap_coding_branch += started.elapsed();
+                profile.overlap_coding_hits += 1;
+            }
         } else if overlaps_exon {
+            let branch_started = profiling.then(Instant::now);
             if let Some(utr_term) = self.utr_term(variant, tx) {
                 terms.insert(utr_term);
+            }
+            if let (Some(started), Some(profile)) = (branch_started, profile.as_deref_mut()) {
+                profile.overlap_utr_branch += started.elapsed();
+                profile.overlap_utr_hits += 1;
             }
         }
 
@@ -1336,8 +1886,13 @@ impl TranscriptConsequenceEngine {
         // into exons (intron_start-4..intron_start+7 and intron_end-8..intron_end+3).
         // This naturally handles both fully-intronic variants AND exon-spanning
         // deletions that reach into splice sites.
+        let splice_started = profiling.then(Instant::now);
         self.add_intron_splice_terms(&mut terms, variant, tx, tx_exons);
+        if let (Some(started), Some(profile)) = (splice_started, profile.as_deref_mut()) {
+            profile.overlap_splice_terms += started.elapsed();
+        }
 
+        let finalize_started = profiling.then(Instant::now);
         if tx.biotype == "nonsense_mediated_decay" {
             terms.insert(SoTerm::NmdTranscriptVariant);
         }
@@ -1358,6 +1913,9 @@ impl TranscriptConsequenceEngine {
 
         let mut terms_vec: Vec<SoTerm> = terms.into_iter().collect();
         terms_vec.sort_by_key(|t| t.rank());
+        if let (Some(started), Some(profile)) = (finalize_started, profile.as_mut()) {
+            profile.overlap_finalize_terms += started.elapsed();
+        }
         (terms_vec, coding_class)
     }
 
@@ -1851,9 +2409,8 @@ impl TranscriptConsequenceEngine {
         if variant.ref_allele == "-" {
             return false;
         }
-        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted.sort_by_key(|e| e.start);
-        for e in &sorted {
+        let sorted = start_sorted(tx_exons);
+        for e in sorted.iter() {
             if !overlaps(variant.start, variant.end, e.start, e.end) {
                 continue;
             }
@@ -2459,8 +3016,7 @@ impl TranscriptConsequenceEngine {
         if tx_exons.len() < 2 {
             return false;
         }
-        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted.sort_by_key(|e| e.start);
+        let sorted = start_sorted(tx_exons);
         for pair in sorted.windows(2) {
             let intron_start = pair[0].end + 1;
             let intron_end = pair[1].start - 1;
@@ -2484,8 +3040,7 @@ impl TranscriptConsequenceEngine {
         if tx_exons.len() < 2 {
             return false;
         }
-        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted.sort_by_key(|e| e.start);
+        let sorted = start_sorted(tx_exons);
         sorted.windows(2).any(|pair| {
             let intron_start = pair[0].end + 1;
             let intron_end = pair[1].start - 1;
@@ -2537,8 +3092,7 @@ impl TranscriptConsequenceEngine {
         if tx_exons.len() < 2 {
             return false;
         }
-        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted.sort_by_key(|e| e.start);
+        let sorted = start_sorted(tx_exons);
         sorted.windows(2).any(|pair| {
             let intron_start = pair[0].end + 1;
             let intron_end = pair[1].start - 1;
@@ -2557,8 +3111,7 @@ impl TranscriptConsequenceEngine {
         if tx_exons.len() < 2 {
             return false;
         }
-        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted.sort_by_key(|e| e.start);
+        let sorted = start_sorted(tx_exons);
         for pair in sorted.windows(2) {
             let intron_start = pair[0].end + 1;
             let intron_end = pair[1].start - 1;
@@ -2610,8 +3163,7 @@ impl TranscriptConsequenceEngine {
             && !self.overlaps_exon_for_consequence_include(sv, tx_exons);
 
         // Derive introns from sorted exon pairs.
-        let mut sorted_exons: Vec<&ExonFeature> = tx_exons.to_vec();
-        sorted_exons.sort_by_key(|e| e.start);
+        let sorted_exons = start_sorted(tx_exons);
 
         for pair in sorted_exons.windows(2) {
             let intron_start = pair[0].end + 1;
@@ -6676,6 +7228,22 @@ fn format_codon_display(
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1414-L1445>
 /// - Ensembl Variation `BaseTranscriptVariation::exon_number()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L698-L724>
+/// Return `tx_exons` ordered by genomic `start`, borrowing when the slice is
+/// already start-ordered (the common case: callers pass `exons_by_tx_genomic`,
+/// pre-sorted once per transcript at context build). Avoids the per-output
+/// `Vec` allocation + sort that several intron/exon helpers used to repeat.
+/// Behavior-identical to `tx_exons.to_vec(); sort_by_key(|e| e.start)` for any
+/// input order (stable sort; ties keep input order).
+fn start_sorted<'a, 'e>(tx_exons: &'a [&'e ExonFeature]) -> Cow<'a, [&'e ExonFeature]> {
+    if tx_exons.windows(2).all(|w| w[0].start <= w[1].start) {
+        Cow::Borrowed(tx_exons)
+    } else {
+        let mut sorted = tx_exons.to_vec();
+        sorted.sort_by_key(|e| e.start);
+        Cow::Owned(sorted)
+    }
+}
+
 fn which_exon_str(variant: &VariantInput, tx_exons: &[&ExonFeature]) -> Option<String> {
     if tx_exons.is_empty() {
         return None;
@@ -6705,8 +7273,7 @@ fn which_intron_str(
     if tx_exons.len() < 2 {
         return None;
     }
-    let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
-    sorted.sort_by_key(|e| e.start);
+    let sorted = start_sorted(tx_exons);
     let total_introns = sorted.len() - 1;
 
     for (i, pair) in sorted.windows(2).enumerate() {
@@ -6747,25 +7314,26 @@ fn which_intron_str(
     None
 }
 
-/// Build ordered exon segments for cDNA coordinate mapping.
-/// Returns (start, end) pairs ordered by transcript direction.
-fn exon_segments(tx_exons: &[&ExonFeature], strand: i8) -> Option<Vec<(i64, i64)>> {
+/// Map a genomic position to 1-based cDNA index (counting all exonic bases).
+///
+/// Walks exons in transcript direction (ascending genomic start on `+`,
+/// descending on `-`) directly over a start-ordered view, avoiding the owned
+/// `(start, end)` segment `Vec` that `exon_segments` allocated per call. Result
+/// is identical to `exon_segments(...)` then offset accumulation.
+fn genomic_to_cdna_index(tx_exons: &[&ExonFeature], strand: i8, pos: i64) -> Option<usize> {
     if tx_exons.is_empty() {
         return None;
     }
-    let mut segments: Vec<(i64, i64)> = tx_exons.iter().map(|e| (e.start, e.end)).collect();
-    segments.sort_by_key(|(s, _)| *s);
-    if strand < 0 {
-        segments.reverse();
-    }
-    Some(segments)
-}
-
-/// Map a genomic position to 1-based cDNA index (counting all exonic bases).
-fn genomic_to_cdna_index(tx_exons: &[&ExonFeature], strand: i8, pos: i64) -> Option<usize> {
-    let segments = exon_segments(tx_exons, strand)?;
+    let sorted = start_sorted(tx_exons);
+    let n = sorted.len();
     let mut offset = 0usize;
-    for (seg_start, seg_end) in segments {
+    for i in 0..n {
+        let e = if strand >= 0 {
+            sorted[i]
+        } else {
+            sorted[n - 1 - i]
+        };
+        let (seg_start, seg_end) = (e.start, e.end);
         let seg_len = usize::try_from(seg_end.saturating_sub(seg_start).saturating_add(1)).ok()?;
         if pos >= seg_start && pos <= seg_end {
             let local = if strand >= 0 {
@@ -6842,6 +7410,39 @@ fn prefers_exon_geometry_over_mapper(tx: &TranscriptFeature) -> bool {
         )
 }
 
+/// Return `tx.cdna_mapper_segments` in genomic-sorted order, borrowing the
+/// original slice when it is already sorted (the common case after build) and
+/// only cloning + sorting when it isn't. Centralizes the sort key shared by
+/// [`use_cdna_mapper_for_general_coords`] and [`mapper_deleted_gap_cdna_index`]
+/// so the per-call `collect + sort` heap churn is skipped on the hot path.
+fn sorted_mapper_segments(tx: &TranscriptFeature) -> Cow<'_, [TranscriptCdnaMapperSegment]> {
+    let segments = &tx.cdna_mapper_segments;
+    let already_sorted = segments.windows(2).all(|pair| {
+        (
+            pair[0].genomic_start,
+            pair[0].genomic_end,
+            pair[0].cdna_start,
+        ) <= (
+            pair[1].genomic_start,
+            pair[1].genomic_end,
+            pair[1].cdna_start,
+        )
+    });
+    if already_sorted {
+        Cow::Borrowed(segments.as_slice())
+    } else {
+        let mut owned = segments.clone();
+        owned.sort_by_key(|segment| {
+            (
+                segment.genomic_start,
+                segment.genomic_end,
+                segment.cdna_start,
+            )
+        });
+        Cow::Owned(owned)
+    }
+}
+
 pub(crate) fn mapper_deleted_gap_cdna_index(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -6856,17 +7457,10 @@ pub(crate) fn mapper_deleted_gap_cdna_index(
     {
         return None;
     }
-    let mut segments = tx.cdna_mapper_segments.iter().collect::<Vec<_>>();
-    segments.sort_by_key(|segment| {
-        (
-            segment.genomic_start,
-            segment.genomic_end,
-            segment.cdna_start,
-        )
-    });
+    let segments = sorted_mapper_segments(tx);
     for window in segments.windows(2) {
-        let prev = window[0];
-        let next = window[1];
+        let prev = &window[0];
+        let next = &window[1];
         let gap_len = next
             .genomic_start
             .saturating_sub(prev.genomic_end)
@@ -6936,17 +7530,10 @@ fn use_cdna_mapper_for_general_coords(tx: &TranscriptFeature) -> bool {
     // geometry for positions downstream of the gap — the same workaround
     // VEP applies when its mapper produces Gap entries for edit-inserted
     // cdna bases that have no genomic mapping.
-    let mut segments = tx.cdna_mapper_segments.iter().collect::<Vec<_>>();
-    segments.sort_by_key(|segment| {
-        (
-            segment.genomic_start,
-            segment.genomic_end,
-            segment.cdna_start,
-        )
-    });
+    let segments = sorted_mapper_segments(tx);
     for window in segments.windows(2) {
-        let prev = window[0];
-        let next = window[1];
+        let prev = &window[0];
+        let next = &window[1];
         if next.genomic_start == prev.genomic_end.saturating_add(1)
             && next.cdna_start != prev.cdna_end.saturating_add(1)
         {
@@ -6977,10 +7564,51 @@ pub(crate) fn genomic_to_cdna_index_for_transcript(
             .iter()
             .find_map(|segment| mapper_segment_cdna_index(segment, pos));
     }
-    genomic_to_cdna_index(tx_exons, tx.strand, pos)
+    // Use the cached coord table (built once per transcript) instead of
+    // rebuilding `exon_segments` on every call.
+    match transcript_cdna_coords(tx, tx_exons) {
+        Some(coords) => cdna_index_from_sorted_coords(tx.strand, pos, &coords),
+        None => genomic_to_cdna_index(tx_exons, tx.strand, pos),
+    }
 }
 
+/// Genomic→cDNA coordinate table for the transcript, memoized once on the
+/// transcript and reused across every overlapping variant/allele (redundancy C).
+/// The first caller pays the `to_vec()` + sort in [`transcript_cdna_coords_uncached`];
+/// later callers clone the cached `Vec` (cheap — a handful of exon segments).
 fn transcript_cdna_coords(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+) -> Option<Vec<TranscriptCdnaCoord>> {
+    tx.cdna_coords_cache
+        .0
+        .get_or_init(|| transcript_cdna_coords_uncached(tx, tx_exons))
+        .clone()
+}
+
+/// Map a genomic position to its 1-based cDNA index using a prebuilt,
+/// genomic-start-sorted coord table. Behaviour-identical to
+/// [`genomic_to_cdna_index`] but reads the cached table instead of rebuilding
+/// `exon_segments` per call. Returns `None` for intronic / outside positions.
+fn cdna_index_from_sorted_coords(
+    strand: i8,
+    pos: i64,
+    coords: &[TranscriptCdnaCoord],
+) -> Option<usize> {
+    for seg in coords {
+        if pos >= seg.start && pos <= seg.end {
+            let local = if strand >= 0 {
+                usize::try_from(pos - seg.start).ok()?
+            } else {
+                usize::try_from(seg.end - pos).ok()?
+            };
+            return Some(seg.cdna_start + local);
+        }
+    }
+    None
+}
+
+fn transcript_cdna_coords_uncached(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
 ) -> Option<Vec<TranscriptCdnaCoord>> {
@@ -7042,6 +7670,139 @@ fn transcript_cdna_coords(
     Some(coords)
 }
 
+fn raw_cdna_position_from_sorted_coords<I>(
+    strand: i8,
+    genomic_pos: i64,
+    coords: I,
+) -> Option<String>
+where
+    I: IntoIterator<Item = TranscriptCdnaCoord>,
+{
+    let mut prev_segment: Option<TranscriptCdnaCoord> = None;
+    let mut saw_segment = false;
+
+    for segment in coords {
+        saw_segment = true;
+        if genomic_pos > segment.end {
+            prev_segment = Some(segment);
+            continue;
+        }
+
+        if genomic_pos < segment.start && prev_segment.is_none() {
+            return None;
+        }
+
+        if genomic_pos >= segment.start {
+            let coord = if strand >= 0 {
+                segment.cdna_start as i64 + (genomic_pos - segment.start)
+            } else {
+                segment.cdna_start as i64 + (segment.end - genomic_pos)
+            };
+            return Some(coord.to_string());
+        }
+
+        let prev_segment = prev_segment?;
+        let updist = (genomic_pos - prev_segment.end).abs();
+        let downdist = (segment.start - genomic_pos).abs();
+        return Some(
+            if updist < downdist || (updist == downdist && strand >= 0) {
+                if strand >= 0 {
+                    format!("{}+{}", prev_segment.cdna_end, updist)
+                } else {
+                    format!("{}-{}", prev_segment.cdna_start, updist)
+                }
+            } else if strand >= 0 {
+                format!("{}-{}", segment.cdna_start, downdist)
+            } else {
+                format!("{}+{}", segment.cdna_end, downdist)
+            },
+        );
+    }
+
+    saw_segment.then_some(())?;
+    None
+}
+
+fn raw_cdna_position_from_mapper_segments(
+    tx: &TranscriptFeature,
+    genomic_pos: i64,
+) -> Option<String> {
+    raw_cdna_position_from_sorted_coords(
+        tx.strand,
+        genomic_pos,
+        tx.cdna_mapper_segments
+            .iter()
+            .map(|segment| TranscriptCdnaCoord {
+                start: segment.genomic_start,
+                end: segment.genomic_end,
+                cdna_start: segment.cdna_start,
+                cdna_end: segment.cdna_end,
+            }),
+    )
+}
+
+fn mapper_segments_sorted_by_genomic_start(tx: &TranscriptFeature) -> bool {
+    tx.cdna_mapper_segments.windows(2).all(|pair| {
+        (pair[0].genomic_start, pair[0].genomic_end) <= (pair[1].genomic_start, pair[1].genomic_end)
+    })
+}
+
+fn exons_sorted_by_genomic_start(tx_exons: &[&ExonFeature]) -> bool {
+    tx_exons
+        .windows(2)
+        .all(|pair| (pair[0].start, pair[0].end) <= (pair[1].start, pair[1].end))
+}
+
+fn raw_cdna_position_from_sorted_exons(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    genomic_pos: i64,
+) -> Option<String> {
+    if tx_exons.is_empty() {
+        return None;
+    }
+    let total_len = if tx.strand < 0 {
+        tx_exons.iter().try_fold(0usize, |total, exon| {
+            let len =
+                usize::try_from(exon.end.saturating_sub(exon.start).saturating_add(1)).ok()?;
+            Some(total.saturating_add(len))
+        })?
+    } else {
+        0
+    };
+    let mut offset = 0usize;
+    let mut consumed = 0usize;
+    raw_cdna_position_from_sorted_coords(
+        tx.strand,
+        genomic_pos,
+        tx_exons.iter().map(move |exon| {
+            let exon_len =
+                usize::try_from(exon.end.saturating_sub(exon.start).saturating_add(1)).unwrap_or(0);
+            if tx.strand >= 0 {
+                let cdna_start = offset + 1;
+                let cdna_end = offset + exon_len;
+                offset = cdna_end;
+                TranscriptCdnaCoord {
+                    start: exon.start,
+                    end: exon.end,
+                    cdna_start,
+                    cdna_end,
+                }
+            } else {
+                let cdna_end = total_len.saturating_sub(consumed);
+                let cdna_start = cdna_end.saturating_sub(exon_len).saturating_add(1);
+                consumed = consumed.saturating_add(exon_len);
+                TranscriptCdnaCoord {
+                    start: exon.start,
+                    end: exon.end,
+                    cdna_start,
+                    cdna_end,
+                }
+            }
+        }),
+    )
+}
+
 /// Resolve a genomic position to raw transcript cDNA numbering, including
 /// intronic offsets, using TranscriptMapper segments when present.
 ///
@@ -7072,49 +7833,16 @@ pub(crate) fn raw_cdna_position_from_genomic(
         }
     }
 
+    if use_cdna_mapper_for_general_coords(tx) && mapper_segments_sorted_by_genomic_start(tx) {
+        return raw_cdna_position_from_mapper_segments(tx, genomic_pos);
+    }
+
+    if exons_sorted_by_genomic_start(tx_exons) {
+        return raw_cdna_position_from_sorted_exons(tx, tx_exons, genomic_pos);
+    }
+
     let coords = transcript_cdna_coords(tx, tx_exons)?;
-    let span_start = coords.iter().map(|segment| segment.start).min()?;
-    let span_end = coords.iter().map(|segment| segment.end).max()?;
-    if genomic_pos < span_start || genomic_pos > span_end {
-        return None;
-    }
-    let mut cdna_position = None;
-
-    for (i, segment) in coords.iter().enumerate() {
-        if genomic_pos > segment.end {
-            continue;
-        }
-
-        if genomic_pos >= segment.start {
-            let coord = if tx.strand >= 0 {
-                segment.cdna_start as i64 + (genomic_pos - segment.start)
-            } else {
-                segment.cdna_start as i64 + (segment.end - genomic_pos)
-            };
-            cdna_position = Some(coord.to_string());
-            break;
-        }
-
-        let prev_segment = &coords[i - 1];
-        let updist = (genomic_pos - prev_segment.end).abs();
-        let downdist = (segment.start - genomic_pos).abs();
-        cdna_position = Some(
-            if updist < downdist || (updist == downdist && tx.strand >= 0) {
-                if tx.strand >= 0 {
-                    format!("{}+{}", prev_segment.cdna_end, updist)
-                } else {
-                    format!("{}-{}", prev_segment.cdna_start, updist)
-                }
-            } else if tx.strand >= 0 {
-                format!("{}-{}", segment.cdna_start, downdist)
-            } else {
-                format!("{}+{}", segment.cdna_end, downdist)
-            },
-        );
-        break;
-    }
-
-    cdna_position
+    raw_cdna_position_from_sorted_coords(tx.strand, genomic_pos, coords)
 }
 
 /// Resolve the unshifted transcript-sequence cDNA bounds Ensembl uses when
@@ -8260,6 +8988,15 @@ fn translate_codon(codon: &str) -> Option<char> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_profile_summary_line_includes_hgvsc_subtimers() {
+        let line = TranscriptEngineProfile::default().summary_line();
+        assert!(line.contains("transcript_hgvsc_simple_fast="));
+        assert!(line.contains("transcript_hgvsc_coord_map="));
+        assert!(line.contains("transcript_hgvsc_refseq_edit="));
+        assert!(line.contains("transcript_hgvsc_fallback="));
+    }
+
     fn tx(
         id: &str,
         chrom: &str,
@@ -8272,6 +9009,7 @@ mod tests {
     ) -> TranscriptFeature {
         TranscriptFeature {
             transcript_id: id.to_string(),
+            transcript_uid: None,
             chrom: chrom.to_string(),
             start,
             end,
@@ -8319,6 +9057,7 @@ mod tests {
             uniprot_isoform: None,
             appris: None,
             ncrna_structure: None,
+            cdna_coords_cache: GeometryCache::default(),
         }
     }
 
@@ -11397,6 +12136,100 @@ mod tests {
     }
 
     #[test]
+    fn cdna_index_from_sorted_coords_matches_linear() {
+        for strand in [1i8, -1] {
+            let t = tx(
+                "tx1",
+                "22",
+                100,
+                210,
+                strand,
+                "protein_coding",
+                Some(100),
+                Some(210),
+            );
+            let exons = vec![exon("tx1", 1, 100, 110), exon("tx1", 2, 200, 210)];
+            let refs: Vec<&ExonFeature> = exons.iter().collect();
+            let coords = transcript_cdna_coords_uncached(&t, &refs).unwrap();
+            for pos in [99, 100, 105, 110, 150, 200, 205, 210, 211] {
+                assert_eq!(
+                    cdna_index_from_sorted_coords(strand, pos, &coords),
+                    genomic_to_cdna_index(&refs, strand, pos),
+                    "strand {strand} pos {pos}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_cdna_coords_cache_equals_uncached() {
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            210,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(210),
+        );
+        let exons = vec![exon("tx1", 1, 100, 110), exon("tx1", 2, 200, 210)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let uncached = transcript_cdna_coords_uncached(&t, &refs);
+        // First call populates the per-transcript cache; second hits it.
+        assert_eq!(transcript_cdna_coords(&t, &refs), uncached);
+        assert_eq!(transcript_cdna_coords(&t, &refs), uncached);
+    }
+
+    #[test]
+    fn genomic_to_cdna_index_for_transcript_populates_cache() {
+        // The engine hot path reaches the cache through this lookup function
+        // (compute_cdna_position / coding_cdna_bounds), so confirm a lookup
+        // memoizes the coord table on the transcript — no parameter threading.
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            210,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(210),
+        );
+        let exons = vec![exon("tx1", 1, 100, 110), exon("tx1", 2, 200, 210)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        assert!(t.cdna_coords_cache.0.get().is_none());
+        let _ = genomic_to_cdna_index_for_transcript(&t, &refs, 205);
+        assert!(
+            t.cdna_coords_cache.0.get().is_some(),
+            "lookup should memoize the coord table on the transcript",
+        );
+    }
+
+    #[test]
+    fn genomic_to_cdna_index_for_transcript_uses_cache_consistently() {
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            210,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(210),
+        );
+        let exons = vec![exon("tx1", 1, 100, 110), exon("tx1", 2, 200, 210)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        for pos in [100, 110, 150, 200, 210] {
+            assert_eq!(
+                genomic_to_cdna_index_for_transcript(&t, &refs, pos),
+                genomic_to_cdna_index(&refs, t.strand, pos),
+                "pos {pos}",
+            );
+        }
+    }
+
+    #[test]
     fn compute_cdna_position_snv() {
         let t = tx(
             "tx1",
@@ -12195,6 +13028,69 @@ mod tests {
     //
     // The three builder helpers below set up exactly those three transcripts
     // and the test matrix below verifies each adjuster function in each case.
+
+    #[test]
+    #[ignore = "microbenchmark harness, run explicitly with --ignored --nocapture"]
+    fn bench_use_cdna_mapper_for_general_coords_per_call() {
+        // Deterministic micro-measurement of the per-call cost of the mapper
+        // validity check on the HGVSc coordinate-mapping hot path.
+        // Measured ~39.5 ns/call (20 segments) → ~0.2-0.4s across chr1's
+        // ~1.84M HGVSc calls — below the e2e noise floor, so caching this
+        // validity check is not worth the per-transcript cache + test churn.
+        // Run: cargo test --release --features cache-cache --lib -- --nocapture \
+        //      bench_use_cdna_mapper_for_general_coords_per_call
+        let mut t = tx(
+            "ENSTBENCH.1",
+            "1",
+            1,
+            100_000,
+            1,
+            "protein_coding",
+            Some(1),
+            Some(100_000),
+        );
+        // ~20 non-genomic-contiguous, cdna-consistent segments (usable=true),
+        // representative of a typical multi-exon gene.
+        let mut segs = Vec::new();
+        let mut g = 1000i64;
+        let mut c = 1usize;
+        for _ in 0..20 {
+            let glen = 150i64;
+            segs.push(TranscriptCdnaMapperSegment {
+                genomic_start: g,
+                genomic_end: g + glen - 1,
+                cdna_start: c,
+                cdna_end: c + glen as usize - 1,
+                ori: 1,
+            });
+            g += glen + 500; // intron gap → not genomic-contiguous → usable
+            c += glen as usize;
+        }
+        t.cdna_mapper_segments = segs;
+
+        let iters = 5_000_000u64;
+        let mut acc = 0u64;
+        for _ in 0..100_000 {
+            if use_cdna_mapper_for_general_coords(std::hint::black_box(&t)) {
+                acc += 1;
+            }
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            if use_cdna_mapper_for_general_coords(std::hint::black_box(&t)) {
+                acc += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+        std::hint::black_box(acc);
+        eprintln!(
+            "BENCH use_cdna_mapper_for_general_coords: {:.1} ns/call ({} segments, {} iters, {:.3}s)",
+            elapsed.as_nanos() as f64 / iters as f64,
+            t.cdna_mapper_segments.len(),
+            iters,
+            elapsed.as_secs_f64(),
+        );
+    }
 
     fn tx_mapper_used_encodes_leading_insertion() -> TranscriptFeature {
         // NM_001177639.3-style: 7bp leading insertion encoded by mapper

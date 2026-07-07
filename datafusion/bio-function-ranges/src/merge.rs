@@ -102,12 +102,12 @@ impl TableProvider for MergeProvider {
             columns: Arc::new(self.columns.clone()),
             min_dist: self.min_dist,
             strict: self.filter_op == FilterOp::Strict,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -119,7 +119,7 @@ struct MergeExec {
     columns: Arc<(String, String, String)>,
     min_dist: i64,
     strict: bool,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl DisplayAs for MergeExec {
@@ -141,7 +141,7 @@ impl ExecutionPlan for MergeExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -172,14 +172,14 @@ impl ExecutionPlan for MergeExec {
             columns: Arc::clone(&self.columns),
             min_dist: self.min_dist,
             strict: self.strict,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(
                     children[0].output_partitioning().partition_count(),
                 ),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 

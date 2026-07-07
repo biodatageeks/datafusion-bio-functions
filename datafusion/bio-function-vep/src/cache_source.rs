@@ -1,12 +1,11 @@
 //! VEP cache source-mode metadata helpers.
 
-use std::fs::File;
+#[cfg(feature = "parquet-cache")]
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use datafusion::arrow::datatypes::Schema;
 use datafusion::common::{DataFusionError, Result};
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 
 pub(crate) const CACHE_SOURCE_METADATA_KEY: &str = "bio.vep.cache_source_type";
 
@@ -36,27 +35,47 @@ impl CacheSourceType {
         raw.parse()
     }
 
-    pub(crate) fn from_partitioned_cache_source(cache_source: &str) -> Result<Self> {
-        let parquet = first_variation_parquet(cache_source)?;
-        Self::from_parquet_file(&parquet)
+    /// Detect the cache source type from a partitioned Parquet cache directory by
+    /// reading the `bio.vep.cache_source_type` metadata off the first
+    /// `variation` shard's schema.
+    #[cfg(feature = "parquet-cache")]
+    pub(crate) fn from_partitioned_parquet_cache_source(cache_source: &str) -> Result<Self> {
+        let shard = first_variation_parquet_shard(cache_source)?;
+        let schema = read_parquet_shard_schema_sync(&shard)?;
+        Self::from_schema(&schema)
     }
+}
 
-    pub(crate) fn from_parquet_file(parquet: &Path) -> Result<Self> {
-        let file = File::open(parquet).map_err(|err| {
-            DataFusionError::Execution(format!(
-                "annotate_vep(): failed to open cache parquet '{}': {err}",
-                parquet.display()
-            ))
-        })?;
-        let metadata =
-            ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).map_err(|err| {
-                DataFusionError::Execution(format!(
-                    "annotate_vep(): failed to read Arrow schema metadata from cache parquet '{}': {err}",
-                    parquet.display()
-                ))
-            })?;
-        Self::from_schema(metadata.schema().as_ref())
-    }
+#[cfg(feature = "parquet-cache")]
+fn first_variation_parquet_shard(cache_source: &str) -> Result<PathBuf> {
+    let variation_dir = Path::new(cache_source).join("variation");
+    let manifest = crate::cache::manifest::ChromManifest::read_from_entity_dir(&variation_dir)?;
+    let first = manifest.entries.first().ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "annotate_vep(): Parquet cache source '{cache_source}' variation manifest contains no chromosomes"
+        ))
+    })?;
+    Ok(variation_dir.join(&first.dataset))
+}
+
+/// Read the Arrow schema (including key-value metadata) of a `.parquet` shard
+/// synchronously from its footer.
+#[cfg(feature = "parquet-cache")]
+fn read_parquet_shard_schema_sync(shard_path: &Path) -> Result<Schema> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let file = std::fs::File::open(shard_path).map_err(|err| {
+        DataFusionError::Execution(format!(
+            "annotate_vep(): failed to open Parquet cache shard '{}': {err}",
+            shard_path.display()
+        ))
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
+        DataFusionError::Execution(format!(
+            "annotate_vep(): failed to read Parquet cache shard schema '{}': {err}",
+            shard_path.display()
+        ))
+    })?;
+    Ok(builder.schema().as_ref().clone())
 }
 
 impl FromStr for CacheSourceType {
@@ -72,48 +91,6 @@ impl FromStr for CacheSourceType {
             ))),
         }
     }
-}
-
-fn first_variation_parquet(cache_source: &str) -> Result<PathBuf> {
-    let variation_dir = Path::new(cache_source).join("variation");
-    if !variation_dir.is_dir() {
-        return Err(DataFusionError::Plan(format!(
-            "annotate_vep(): cache source '{}' must contain a variation/ directory with parquet files carrying {CACHE_SOURCE_METADATA_KEY}",
-            cache_source
-        )));
-    }
-
-    let mut dirs = vec![variation_dir];
-    let mut parquet_files = Vec::new();
-    while let Some(dir) = dirs.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|err| {
-            DataFusionError::Execution(format!(
-                "annotate_vep(): failed to read cache variation directory '{}': {err}",
-                dir.display()
-            ))
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|err| {
-                DataFusionError::Execution(format!(
-                    "annotate_vep(): failed to read cache variation directory '{}': {err}",
-                    dir.display()
-                ))
-            })?;
-            let path = entry.path();
-            if path.is_dir() {
-                dirs.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "parquet") {
-                parquet_files.push(path);
-            }
-        }
-    }
-    parquet_files.sort();
-    parquet_files.into_iter().next().ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "annotate_vep(): cache source '{}' variation/ directory contains no parquet files carrying {CACHE_SOURCE_METADATA_KEY}",
-            cache_source
-        ))
-    })
 }
 
 #[cfg(test)]

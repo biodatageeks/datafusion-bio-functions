@@ -1,7 +1,7 @@
 //! VEP (Variant Effect Predictor) annotation functions for Apache DataFusion.
 //!
 //! Provides:
-//! - `lookup_variants()` table function for known variant lookup via equi-join
+//! - `annotate_vep()` table function for consequence annotation over a Parquet cache
 //! - `match_allele()` scalar UDF for allele matching
 //! - `vep_allele()` scalar UDF for VCF→VEP allele conversion
 #![allow(
@@ -34,33 +34,41 @@
     clippy::assigning_clones,
     clippy::map_entry,
     clippy::cloned_ref_to_slice_refs,
-    clippy::unwrap_or_default
+    clippy::unwrap_or_default,
+    clippy::needless_option_as_deref
 )]
 
 pub mod allele;
 pub mod annotate_provider;
 pub mod annotate_table_function;
 pub mod annotation_store;
+#[cfg(feature = "parquet-cache")]
+pub mod cache;
 #[cfg(feature = "cache-builder")]
 pub mod cache_builder;
+pub(crate) mod cache_common;
 pub(crate) mod cache_source;
-pub mod config;
+pub(crate) mod colocated;
 pub mod coordinate;
 pub mod golden_benchmark;
 pub mod hgvs;
-#[cfg(feature = "kv-cache")]
-pub mod kv_cache;
 pub mod lookup_provider;
 pub mod miss_worklist;
+pub(crate) mod ordered_drain;
+#[cfg(feature = "parquet-cache")]
+pub mod parquet_cache;
 pub mod partitioned_cache;
+pub(crate) mod pipeline_trace;
+#[cfg(feature = "parquet-cache")]
+pub mod plugin_cache;
 pub mod schema_contract;
+pub mod sift_decode;
 pub mod so_terms;
-pub mod table_function;
 pub mod transcript_consequence;
-pub mod variant_lookup_exec;
 pub mod vcf_sink;
+pub(crate) mod window_planner;
 
-pub use config::AnnotationConfig;
+pub use sift_decode::{register_vep_sift_functions, vep_decode_sift_predictions_udf};
 
 use std::sync::Arc;
 
@@ -71,7 +79,6 @@ use crate::allele::{
     vep_norm_start_udf,
 };
 use crate::annotate_table_function::AnnotateFunction;
-use crate::table_function::LookupFunction;
 
 /// Test-only convenience: create a session with VEP functions.
 #[cfg(test)]
@@ -87,7 +94,6 @@ pub(crate) fn create_vep_session() -> SessionContext {
 /// - `match_allele(ref, alt, allele_string)` — scalar UDF
 /// - `match_allele_relaxed(ref, alt, allele_string)` — scalar UDF
 /// - `vep_allele(ref, alt)` — scalar UDF
-/// - `lookup_variants(vcf_table, cache_table [, columns [, match_mode [, extended_probes]]])` — table function
 /// - `annotate_vep(vcf_table, cache_source, backend [, options_json])` — table function
 pub fn register_vep_functions(ctx: &SessionContext) {
     ctx.register_udf(match_allele_udf());
@@ -96,8 +102,6 @@ pub fn register_vep_functions(ctx: &SessionContext) {
     ctx.register_udf(vep_norm_start_udf());
     ctx.register_udf(vep_norm_end_udf());
 
-    let session = Arc::new(ctx.clone());
-    ctx.register_udtf("lookup_variants", Arc::new(LookupFunction::new(session)));
     let session = Arc::new(ctx.clone());
     ctx.register_udtf("annotate_vep", Arc::new(AnnotateFunction::new(session)));
 }

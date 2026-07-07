@@ -74,7 +74,6 @@ fn t1_annotate_vcf_config_default_all_off() {
     assert!(!cfg.flag_pick_allele, "flag_pick_allele default false");
     assert!(!cfg.flag_pick_allele_gene, "flag_pick_allele_gene default false");
     assert!(!cfg.extended_probes, "extended_probes default false");
-    assert!(!cfg.use_fjall, "use_fjall default false");
     assert!(!cfg.hgvs, "hgvs default false");
     assert!(!cfg.hgvsc, "hgvsc default false");
     assert!(!cfg.hgvsp, "hgvsp default false");

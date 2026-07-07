@@ -156,12 +156,12 @@ impl TableProvider for NearestProvider {
             include_overlaps: self.include_overlaps,
             k: self.k,
             compute_distance: self.compute_distance,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -178,7 +178,7 @@ struct NearestExec {
     include_overlaps: bool,
     k: usize,
     compute_distance: bool,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl DisplayAs for NearestExec {
@@ -200,7 +200,7 @@ impl ExecutionPlan for NearestExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -229,14 +229,14 @@ impl ExecutionPlan for NearestExec {
             include_overlaps: self.include_overlaps,
             k: self.k,
             compute_distance: self.compute_distance,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(
                     children[0].output_partitioning().partition_count(),
                 ),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 

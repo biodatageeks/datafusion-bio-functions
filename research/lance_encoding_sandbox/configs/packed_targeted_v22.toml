@@ -1,0 +1,78 @@
+[dataset]
+name = "packed_targeted_v22_position_u32"
+cache_root = "/Users/mwiewior/workspace/data_vepyr/115_GRCh38_merged"
+chrom = "chr1"
+output_root = "/Users/mwiewior/workspace/data_vepyr/lance_encoding_sandbox"
+lance_version = "2.2"
+batch_size = 65536
+overwrite = true
+
+[key]
+mode = "position"
+column = "position"
+type = "uint32"
+
+[indexes]
+position_btree = true
+tier_bitmap = true
+
+[benchmark]
+positions_file = "inputs/chr1_e2e_bloom_positions_u32.txt"
+vcf_path = "/Users/mwiewior/research/git/vepyr/e2e-testing/results/fast_chr1/input_chr1.vcf.gz"
+lookup_batch_sizes = [100, 238, 512, 1024, 2048]
+sort_position_keys = true
+
+[inspect]
+include_physical_columns = true
+include_index_sizes = true
+
+[defaults.encoding]
+structural = "miniblock"
+compression = "zstd"
+compression_level = 3
+dict_values_compression = "zstd"
+dict_values_compression_level = 3
+rle_threshold = 0.95
+dict_size_ratio = 0.99
+dict_divisor = 1
+minichunk_size = 4096
+
+[structs.match_payload]
+enabled = true
+packed_metadata = true
+fields = ["allele_string", "end", "failed"]
+
+[structs.identity_text]
+enabled = true
+packed_metadata = true
+fields = ["variation_name", "dbsnp_ids"]
+
+[structs.clinical_payload]
+enabled = true
+packed_metadata = true
+fields = ["clin_sig", "clin_sig_allele", "clinical_impact", "pubmed", "clinvar_ids", "cosmic_ids"]
+
+[structs.variant_flags]
+enabled = true
+packed_metadata = true
+fields = ["somatic", "phenotype_or_disease", "strand"]
+
+[structs.freq_1kg]
+enabled = true
+packed_metadata = true
+fields = ["AF", "AFR", "AMR", "EAS", "EUR", "SAS"]
+
+[structs.freq_gnomade]
+enabled = true
+packed_metadata = true
+fields = ["gnomADe", "gnomADe_AFR", "gnomADe_AMR", "gnomADe_ASJ", "gnomADe_EAS", "gnomADe_FIN", "gnomADe_NFE", "gnomADe_REMAINING", "gnomADe_SAS", "gnomADe_MID"]
+
+[structs.freq_gnomadg_core]
+enabled = true
+packed_metadata = true
+fields = ["gnomADg", "gnomADg_AFR", "gnomADg_NFE", "gnomADg_AMR"]
+
+[structs.freq_gnomadg_tail]
+enabled = true
+packed_metadata = true
+fields = ["gnomADg_AMI", "gnomADg_ASJ", "gnomADg_EAS", "gnomADg_FIN", "gnomADg_MID", "gnomADg_SAS", "gnomADg_REMAINING"]

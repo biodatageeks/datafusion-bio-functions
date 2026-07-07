@@ -1,0 +1,36 @@
+[package]
+name = "lance_sandbox"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+# Stock lance-encoding 7.0.0 (matches the production cache, now built with stock lance).
+# The fork patch was only needed while testing the miniblock u32 fix.
+
+[dependencies]
+anyhow = "1"
+arrow-array = "58.0.0"
+arrow-schema = "58.0.0"
+clap = { version = "4", features = ["derive"] }
+datafusion-bio-function-vep = { path = "../../../../datafusion/bio-function-vep", features = ["lance-cache"] }
+datafusion-common = "=53.0.0"
+datafusion-physical-plan = "=53.0.0"
+flate2 = "1.1.0"
+futures = "0.3"
+heed = "0.22.1"
+lance = { version = "7.0.0", default-features = false }
+lance-arrow = "7.0.0"
+lance-core = "7.0.0"
+lance-file = "7.0.0"
+lance-index = "7.0.0"
+lance-io = "7.0.0"
+libc = "0.2"
+object_store = "0.13.2"
+parquet = { version = "=58.0.0", features = ["arrow"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+termimad = "0.34.1"
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros"] }
+toml = "0.8"
+zstd = "0.13"
