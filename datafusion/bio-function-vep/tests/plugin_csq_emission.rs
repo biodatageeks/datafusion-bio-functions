@@ -21,8 +21,9 @@ use datafusion_bio_function_vep::plugin_cache::source_manifest::{
 use datafusion_bio_function_vep::plugin_cache::template::build_attr_namespace;
 
 /// Namespace for a `C/G` variant with the given amino-acid change (rest empty).
-fn ns_aa<'a>(amino_acids: &'a str, protein_pos: &'a str) -> [Option<&'a str>; 16] {
+fn ns_aa<'a>(amino_acids: &'a str, protein_pos: &'a str) -> [Option<&'a str>; 17] {
     build_attr_namespace(
+        "",
         "",
         "",
         "",
