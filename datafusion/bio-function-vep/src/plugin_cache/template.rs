@@ -12,6 +12,7 @@ use datafusion::common::{DataFusionError, Result};
 pub const ATTR_NAMES: &[&str] = &[
     "Consequence",
     "Gene",
+    "SYMBOL",
     "Feature_type",
     "Feature",
     "BIOTYPE",
@@ -95,6 +96,7 @@ impl CompiledTemplate {
 pub fn build_attr_namespace<'a>(
     consequence: &'a str,
     gene: &'a str,
+    symbol: &'a str,
     feature_type: &'a str,
     feature: &'a str,
     biotype: &'a str,
@@ -121,6 +123,7 @@ pub fn build_attr_namespace<'a>(
     [
         non_empty(consequence),
         non_empty(gene),
+        non_empty(symbol),
         non_empty(feature_type),
         non_empty(feature),
         non_empty(biotype),
@@ -146,6 +149,7 @@ mod tests {
         build_attr_namespace(
             "missense_variant",
             "ENSG1",
+            "GENE1",
             "Transcript",
             "ENST1",
             "protein_coding",
@@ -185,6 +189,7 @@ mod tests {
         let ns = build_attr_namespace(
             "synonymous_variant",
             "ENSG1",
+            "GENE1",
             "Transcript",
             "ENST1",
             "protein_coding",
@@ -205,7 +210,7 @@ mod tests {
     #[test]
     fn range_position_and_multi_residue_gate() {
         let range = build_attr_namespace(
-            "inframe", "", "", "", "", "", "", "", "", "550-551", "VV/A", "", "C", "T",
+            "inframe", "", "", "", "", "", "", "", "", "", "550-551", "VV/A", "", "C", "T",
         );
         let t = CompiledTemplate::compile("{ref_aa}{Protein_position}{alt_aa}").unwrap();
         assert_eq!(t.eval(&range), None);

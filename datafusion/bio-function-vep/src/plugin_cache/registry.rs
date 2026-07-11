@@ -277,6 +277,7 @@ mod tests {
             "",
             "",
             "",
+            "",
             "78",
             "R/G",
             "",
@@ -291,6 +292,7 @@ mod tests {
         // non-missense (no aa-change) → Null (gate)
         let ns_miss = build_attr_namespace(
             "synonymous_variant",
+            "",
             "",
             "",
             "",

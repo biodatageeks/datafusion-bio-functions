@@ -6236,6 +6236,7 @@ impl AnnotateProvider {
                             let ns = crate::plugin_cache::template::build_attr_namespace(
                                 terms_str,
                                 gene,
+                                symbol,
                                 feature_type,
                                 feature,
                                 biotype,
