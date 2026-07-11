@@ -36,8 +36,13 @@ pub async fn tiered_stream(
     )
     .await?;
     ctx.sql(
+        // DISTINCT: the variation shard can carry multiple source rows for the
+        // same (chrom, start, allele_string) (e.g. distinct dbSNP/COSMIC-origin
+        // entries for one variant). Without it, the tier LEFT JOIN below fans
+        // out the plugin row once per matching variation row, inflating the
+        // built cache with duplicate (but value-identical) rows.
         "CREATE OR REPLACE VIEW plugin_variation_probe AS \
-         SELECT chrom, start, allele_string, tier FROM plugin_variation_raw",
+         SELECT DISTINCT chrom, start, allele_string, tier FROM plugin_variation_raw",
     )
     .await?;
     let df = ctx
