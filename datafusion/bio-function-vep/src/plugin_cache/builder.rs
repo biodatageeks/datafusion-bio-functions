@@ -90,20 +90,21 @@ impl<'a> PluginCacheBuilder<'a> {
     pub async fn build_all(&self) -> Result<CacheManifest> {
         let plugin_dir = self.out.join("plugin").join(&self.manifest.plugin_name);
         let mut cache = CacheManifest::from_source(self.manifest, &self.manifest_file);
-        // Preserve chromosomes from a prior build (their shards remain on disk),
-        // so a filtered/incremental build UPSERTs the rebuilt chroms rather than
-        // dropping the others from the manifest that runtime discovery relies on.
-        // BUT only when the prior manifest's schema matches the new one — a
-        // filtered rebuild after a value/match-column change must NOT keep old
-        // shards under the new schema (that would misproject them / panic in
-        // `from_batch`); in that case we drop the stale entries.
-        let mut chroms: Vec<ChromEntry> = std::fs::read_to_string(plugin_dir.join("manifest.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<CacheManifest>(&t).ok())
-            .filter(|old| schema_matches(old, &cache))
-            .map(|m| m.chroms)
-            .unwrap_or_default();
-        let _ = self.overwrite; // build_plugin_chrom overwrites the shard file per chrom.
+        // Preserve chromosomes from a prior build (their shards remain on disk), so a
+        // filtered/incremental build UPSERTs the rebuilt chroms rather than dropping the
+        // others from the manifest that runtime discovery relies on. Two things suppress
+        // that: an explicit --overwrite (the user asked for a clean build), and a schema
+        // change (old shards would be misprojected under the new schema).
+        let mut chroms: Vec<ChromEntry> = if self.overwrite {
+            Vec::new()
+        } else {
+            std::fs::read_to_string(plugin_dir.join("manifest.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<CacheManifest>(&t).ok())
+                .filter(|old| schema_matches(old, &cache))
+                .map(|m| m.chroms)
+                .unwrap_or_default()
+        };
         for chrom in self.resolve_chroms()? {
             let shard = self.variation_shard(&chrom);
             if !shard.exists() {
@@ -341,6 +342,77 @@ type = "Float32"
         );
         assert!(chroms.contains(&"chr2"), "chr2 must be present: {chroms:?}");
         assert_eq!(cache.chroms.len(), 2);
+    }
+
+    // The mirror image of `filtered_rebuild_preserves_other_chroms`: with --overwrite,
+    // a filtered rebuild must NOT preserve the previously built chroms.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overwrite_drops_chroms_from_a_previous_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.tsv.gz");
+        write_gz(&src, "chr1\t100\tA\tG\t0.9\nchr2\t200\tC\tT\t0.5\n");
+        let var_dir = dir.path().join("cache").join("variation");
+        std::fs::create_dir_all(&var_dir).unwrap();
+        write_variation(&var_dir.join("chr1.parquet"), &[("1", 100, "A/G", 0)]);
+        write_variation(&var_dir.join("chr2.parquet"), &[("2", 200, "C/T", 1)]);
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            src.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let cache_dir = dir.path().join("cache");
+        let out = dir.path().join("out");
+
+        // Build chr1 and chr2, then rebuild chr2 only with --overwrite into the
+        // same output.
+        let baseline = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1", "2"])
+            .build_all()
+            .await
+            .unwrap();
+        assert_eq!(baseline.chroms.len(), 2);
+
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .with_overwrite(true)
+            .build_all()
+            .await
+            .unwrap();
+
+        let chroms: Vec<&str> = cache.chroms.iter().map(|c| c.chrom.as_str()).collect();
+        assert_eq!(
+            chroms,
+            vec!["chr2"],
+            "overwrite must drop chr1 from the manifest: {chroms:?}"
+        );
     }
 
     // A filtered rebuild after a value/match-column change must NOT preserve old
