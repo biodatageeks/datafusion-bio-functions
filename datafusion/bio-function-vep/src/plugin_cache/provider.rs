@@ -1,10 +1,15 @@
 //! Provider factory: register a source manifest's raw tables under their
 //! `plugin_<name>_src[_<part>]` names. CSV/TSV/Parquet use builtin DataFusion
-//! providers; VCF/BED (bio-formats) are not wired in the prototype.
+//! providers; VCF uses bio-formats' `VcfTableProvider`. BED is not wired yet
+//! (no plugin needs it).
+
+use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
+use datafusion_bio_format_core::object_storage::ObjectStorageOptions;
+use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 
 use crate::plugin_cache::source_manifest::{CsvParams, ProviderKind, SourceManifest, ValueType};
 
@@ -108,10 +113,30 @@ pub async fn register_sources(
                 ctx.register_parquet(&table, &spec.path, ParquetReadOptions::default())
                     .await?;
             }
-            ProviderKind::Vcf | ProviderKind::Bed => {
+            ProviderKind::Vcf => {
+                let info_fields = spec.vcf.as_ref().and_then(|v| v.info_fields.clone());
+                // ObjectStorageOptions::default() sets compression_type = AUTO, which is what
+                // lets one code path read both plain `.vcf` and BGZF `.vcf.gz`. Passing `None`
+                // is NOT equivalent — the reader's own tests always pass explicit options.
+                //
+                // coordinate_system_zero_based = false: VCF POS is 1-based and the plugin cache
+                // stores 1-based start/end, so the reader must not shift. The manifest's
+                // `coordinate_system` remains the single source of truth for any shift the
+                // builder applies (see plugin_cache::build::wrap_normalization).
+                let vcf_table = VcfTableProvider::new(
+                    spec.path.clone(),
+                    info_fields,
+                    None,
+                    Some(ObjectStorageOptions::default()),
+                    false,
+                )?;
+                ctx.register_table(table.as_str(), Arc::new(vcf_table))?;
+            }
+            ProviderKind::Bed => {
                 return Err(DataFusionError::NotImplemented(format!(
-                    "provider {:?} not wired in prototype (table '{table}')",
-                    spec.provider
+                    "provider 'bed' is not wired yet (table '{table}'); \
+                     no plugin needs it — wire datafusion-bio-format-bed the way \
+                     ProviderKind::Vcf is wired when one does"
                 )));
             }
         }
@@ -191,5 +216,65 @@ type = "Float32"
             .unwrap()
             .value(0);
         assert_eq!(c, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registers_vcf_source_and_projects_info_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("demo.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=SCORE,Number=1,Type=Float,Description=\"demo score\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr22\t22893742\t.\tC\tG\t.\t.\tSCORE=0.9\n\
+             chr22\t22893800\t.\tA\tT\t.\t.\tSCORE=0.1\n",
+        )
+        .unwrap();
+
+        let toml_src = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "{}"
+  [source.vcf]
+  info_fields = ["SCORE"]
+
+[[value_columns]]
+column = "score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            vcf.display()
+        );
+
+        let manifest: SourceManifest = toml::from_str(&toml_src).unwrap();
+        let ctx = SessionContext::new();
+        let _temps = register_sources(&ctx, &manifest).await.unwrap();
+
+        // The reader exposes VCF POS as `start` (plus a matching `end`), NOT `pos`.
+        // INFO columns are bare, case-sensitive keys -> must be backticked.
+        let batches = ctx
+            .sql("SELECT chrom, `start`, `SCORE` FROM plugin_demo_src ORDER BY `start`")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "both VCF records must be visible");
+
+        // The reader must report 1-based POS (22893742), matching the cache's 1-based start.
+        let pos = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+            .expect("start is UInt32");
+        assert_eq!(pos.value(0), 22_893_742);
     }
 }

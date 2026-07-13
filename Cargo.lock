@@ -1366,6 +1366,7 @@ dependencies = [
  "chrono",
  "coitrees",
  "datafusion",
+ "datafusion-bio-format-core 1.8.8",
  "datafusion-bio-format-ensembl-cache",
  "datafusion-bio-format-vcf",
  "datafusion-bio-function-ranges",

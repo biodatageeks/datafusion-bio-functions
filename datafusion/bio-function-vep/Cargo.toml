@@ -31,6 +31,10 @@ noodles-core = "0.16"
 noodles-fasta = "0.49"
 parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
 datafusion-bio-format-vcf ={ git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.8.8" }
+# Must stay pinned at the SAME tag as `datafusion-bio-format-vcf`: it provides the
+# `ObjectStorageOptions` type that `VcfTableProvider::new` takes, and two different
+# tags would resolve to two incompatible copies of that type.
+datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.8.8" }
 datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.8.8", optional = true }
 indicatif = "0.18.4"
 
