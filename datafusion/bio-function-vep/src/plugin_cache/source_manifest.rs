@@ -65,6 +65,20 @@ fn default_delim() -> String {
     "\t".into()
 }
 
+/// VCF provider parameters.
+///
+/// `info_fields` selects which INFO keys are materialized as columns; omit it to
+/// take every INFO key declared in the VCF header. NOTE: the reader exposes INFO
+/// keys as **bare, case-sensitive column names** (`AF`, `ALLELE_ID`) — not
+/// `info_af` as `bio-format-vcf`'s crate docs claim — so `ingest_sql` must
+/// backtick them: ``SELECT `AF` FROM plugin_x_src``.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VcfParams {
+    #[serde(default)]
+    pub info_fields: Option<Vec<String>>,
+}
+
 /// One raw source file registered as `plugin_<name>_src[_<part>]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +89,8 @@ pub struct SourceSpec {
     pub path: String,
     #[serde(default)]
     pub csv: Option<CsvParams>,
+    #[serde(default)]
+    pub vcf: Option<VcfParams>,
 }
 
 impl SourceSpec {
@@ -216,8 +232,36 @@ type = "Float32"
             provider: ProviderKind::Csv,
             path: "x".into(),
             csv: None,
+            vcf: None,
         };
         assert_eq!(src.table_name("cadd"), "plugin_cadd_src");
+    }
+
+    #[test]
+    fn parses_vcf_source_with_selected_info_fields() {
+        let src = r##"
+plugin_name = "mastermind"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "/tmp/mastermind.vcf.gz"
+  [source.vcf]
+  info_fields = ["MMID3", "MMCNT1"]
+
+[[value_columns]]
+column = "mmid3"
+csq_field = "MM_MMID3"
+type = "Utf8"
+"##;
+        let m: SourceManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.sources[0].provider, ProviderKind::Vcf);
+        let vcf = m.sources[0].vcf.as_ref().expect("[source.vcf] must parse");
+        assert_eq!(
+            vcf.info_fields.as_deref(),
+            Some(["MMID3".to_string(), "MMCNT1".to_string()].as_slice())
+        );
     }
 
     #[test]
