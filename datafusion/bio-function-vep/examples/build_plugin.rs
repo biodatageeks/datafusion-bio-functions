@@ -89,8 +89,9 @@ async fn main() -> Result<()> {
     );
     let mut builder =
         PluginCacheBuilder::new(&manifest, &manifest_file, &variation_cache_dir, &out);
-    if let Some(chrom) = arg(&args, "--chrom") {
-        builder = builder.with_chrom_filter([chrom]);
+    let chroms = args_all(&args, "--chrom");
+    if !chroms.is_empty() {
+        builder = builder.with_chrom_filter(chroms);
     }
     let cache = builder.build_all().await?;
     for c in &cache.chroms {
