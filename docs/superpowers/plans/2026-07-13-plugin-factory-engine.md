@@ -375,7 +375,7 @@ type = "Float32"
 
         // INFO columns are bare, case-sensitive keys -> must be backticked.
         let batches = ctx
-            .sql("SELECT chrom, pos, `SCORE` FROM plugin_demo_src ORDER BY pos")
+            .sql("SELECT chrom, `start`, `SCORE` FROM plugin_demo_src ORDER BY `start`")
             .await
             .unwrap()
             .collect()
@@ -386,17 +386,24 @@ type = "Float32"
         assert_eq!(rows, 2, "both VCF records must be visible");
 
         // The reader must report 1-based POS (22893742), matching the cache's 1-based start.
-        let pos = batches[0]
+        let start = batches[0]
             .column(1)
             .as_any()
             .downcast_ref::<datafusion::arrow::array::UInt32Array>()
-            .expect("pos is UInt32");
-        assert_eq!(pos.value(0), 22_893_742);
+            .expect("start is UInt32");
+        assert_eq!(start.value(0), 22_893_742);
     }
 ```
 
-> If `pos` turns out to be a different integer width, the downcast panics with a message naming the
-> actual type — fix the `downcast_ref` to that type and keep the value assertion. Do not weaken the
+> **The reader has no `pos` column.** Its core schema is `chrom, start, end, id, ref, alt, qual,
+> filter, <INFO…>`; VCF POS is exposed as **`start`** (1-based, `UInt32`), with a matching `end`.
+> Every VCF-sourced manifest's `ingest_sql` must select `start`/`end`. This was confirmed against
+> `bio-format-vcf` v1.8.8 (`header_builder.rs:364-372`) while implementing this task — the original
+> draft of this plan said `pos`, and was wrong.
+>
+> The `coordinate_system_zero_based = false` argument is what makes `start` the true 1-based POS;
+> passing `true` yields `22893741`. The assertion above is the guard against that off-by-one — do not
+> weaken the
 > assertion to "some number".
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -435,8 +442,10 @@ with these two arms. The surrounding loop already binds `let table = spec.table_
             ProviderKind::Vcf => {
                 let info_fields = spec.vcf.as_ref().and_then(|v| v.info_fields.clone());
                 // ObjectStorageOptions::default() sets compression_type = AUTO, which is what
-                // lets one code path read both plain `.vcf` and BGZF `.vcf.gz`. Passing `None`
-                // is NOT equivalent — the reader's own tests always pass explicit options.
+                // lets one code path read both plain `.vcf` and BGZF `.vcf.gz`. `None` would
+                // behave identically today (every consumption site in the reader does
+                // `unwrap_or_default()`), but passing the value explicitly keeps the compression
+                // policy visible at the call site.
                 //
                 // coordinate_system_zero_based = false: VCF POS is 1-based and the plugin cache
                 // stores 1-based start/end, so the reader must not shift. The manifest's
