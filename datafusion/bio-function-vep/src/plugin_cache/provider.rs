@@ -327,4 +327,95 @@ type = "Float32"
             score.value(0)
         );
     }
+
+    /// Pins the two reader behaviours `VcfParams`' docs warn manifest authors about,
+    /// so a bio-formats bump that changes either one fails here instead of silently
+    /// invalidating the documented `ingest_sql` guidance:
+    ///
+    /// 1. a multi-allelic record is ONE row whose `alt` is the ALTs joined by `|`
+    ///    (so `concat(ref,'/',alt)` yields the un-matchable `A/G|T`);
+    /// 2. `end` is `POS + len(REF) - 1` for an indel, not `start`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multiallelic_alt_is_pipe_joined_and_indel_end_extends_past_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("multi.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr1\t100\t.\tA\tG,T\t.\t.\t.\n\
+             chr1\t200\t.\tACGT\tA\t.\t.\t.\n",
+        )
+        .unwrap();
+
+        let toml_src = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "{}"
+
+[[value_columns]]
+column = "score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            vcf.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml_src).unwrap();
+        let ctx = SessionContext::new();
+        let _temps = register_sources(&ctx, &manifest).await.unwrap();
+
+        let batches = ctx
+            .sql(
+                "SELECT `start`, `end`, `ref`, alt, concat(`ref`, '/', alt) AS allele_string \
+                 FROM plugin_demo_src ORDER BY `start`",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let b = &batches[0];
+        let col = |i: usize| {
+            b.column(i)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("Utf8 column")
+        };
+        let starts = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+            .expect("start is UInt32");
+        let ends = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+            .expect("end is UInt32");
+
+        // Row 0: A -> G,T collapses into ONE row, alt = "G|T".
+        assert_eq!(
+            b.num_rows(),
+            2,
+            "the reader does NOT split multi-allelic records into one row per ALT"
+        );
+        assert_eq!(col(3).value(0), "G|T", "ALTs are joined with '|'");
+        assert_eq!(
+            col(4).value(0),
+            "A/G|T",
+            "so the naive concat(ref,'/',alt) yields a key that matches nothing"
+        );
+
+        // Row 1: ACGT -> A is a deletion; end extends past start (200 + 4 - 1 = 203).
+        assert_eq!(starts.value(1), 200);
+        assert_eq!(
+            ends.value(1),
+            203,
+            "an indel's end is POS + len(REF) - 1, not start"
+        );
+    }
 }

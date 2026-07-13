@@ -98,8 +98,42 @@ fn default_delim() -> String {
 ///
 /// The reader's core columns are `chrom`, `start`, `end`, `id`, `ref`, `alt`, `qual`,
 /// `filter` — there is NO `pos`. VCF POS is exposed as `start` (1-based, matching the
-/// cache's coordinate system), with a matching `end`. So `ingest_sql` must select
-/// `start`/`end`, not `pos`.
+/// cache's coordinate system). So `ingest_sql` must select `start`/`end`, not `pos`.
+///
+/// # `end` is not always `start`
+///
+/// `end` equals `start` only for a plain single-ALT ACGT SNV. Otherwise the reader
+/// reports the variant end — `POS + len(REF) - 1` for indels/MNVs (and the INFO `END`
+/// for symbolic alleles). Do not assume `end = start` in `ingest_sql`.
+///
+/// # `alt` is pipe-joined for multi-allelic records — SPLIT IT
+///
+/// The reader joins a record's ALT alleles into ONE `Utf8` column separated by `|`
+/// (`physical_exec.rs`: `join_into(…, '|')`). A multi-allelic record
+/// `chr1 100 . A G,T` therefore arrives as a single row with `alt = "G|T"`.
+///
+/// This is a trap, because the obvious mapping
+///
+/// ```sql
+/// concat(ref, '/', alt) AS allele_string   -- WRONG for multi-allelic records
+/// ```
+///
+/// yields `A/G|T`, which can never equal the runtime probe key (`{ref}/{alt}`, one
+/// ALT at a time) nor the variation cache's per-allele `allele_string`. Such rows are
+/// written to the shard and are dead forever: they match nothing, and nothing warns.
+///
+/// `ingest_sql` must therefore split `alt` into ONE ROW PER ALT ALLELE, e.g.
+///
+/// ```sql
+/// SELECT chrom, `start`, `end`,
+///        concat(`ref`, '/', alt_one) AS allele_string, …
+/// FROM (
+///   SELECT *, unnest(string_to_array(alt, '|')) AS alt_one FROM plugin_x_src
+/// )
+/// ```
+///
+/// A source whose every record is bi-allelic can skip this, but nothing enforces
+/// that — so prefer the split unless the input is known bi-allelic by construction.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VcfParams {
