@@ -21,6 +21,15 @@ fn arg(args: &[String], key: &str) -> Option<String> {
         .cloned()
 }
 
+/// Every occurrence of `--key <value>` (the flag may repeat).
+fn args_all(args: &[String], key: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| a.as_str() == key)
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect()
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -35,10 +44,39 @@ async fn main() -> Result<()> {
     );
 
     let mut manifest = SourceManifest::load(&PathBuf::from(&manifest_path))?;
-    if let Some(source_path) = arg(&args, "--source-path")
-        && let Some(first) = manifest.sources.first_mut()
-    {
-        first.path = source_path;
+    for spec in args_all(&args, "--source-path") {
+        match spec.split_once('=') {
+            // --source-path <part>=<path>
+            Some((part, path)) => {
+                let target = manifest
+                    .sources
+                    .iter_mut()
+                    .find(|s| s.part.as_deref() == Some(part))
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "--source-path '{part}=...': no [[source]] with part = \"{part}\""
+                        ))
+                    })?;
+                target.path = path.to_string();
+            }
+            // --source-path <path> — unambiguous only for a single-source manifest
+            None => {
+                if manifest.sources.len() != 1 {
+                    return Err(DataFusionError::Execution(format!(
+                        "--source-path <path> is ambiguous: the manifest has {} sources; \
+                         use --source-path <part>=<path> (parts: {})",
+                        manifest.sources.len(),
+                        manifest
+                            .sources
+                            .iter()
+                            .map(|s| s.part.as_deref().unwrap_or("<none>"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                manifest.sources[0].path = spec;
+            }
+        }
     }
     let manifest_file = PathBuf::from(&manifest_path)
         .file_name()
