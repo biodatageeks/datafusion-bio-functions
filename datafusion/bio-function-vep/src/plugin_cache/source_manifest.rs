@@ -38,6 +38,7 @@ pub enum ValueType {
 
 /// One field of an explicit input schema (headerless/typed TSV).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaField {
     pub name: String,
     #[serde(rename = "type")]
@@ -46,6 +47,7 @@ pub struct SchemaField {
 
 /// CSV/TSV provider parameters.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CsvParams {
     #[serde(default = "default_delim")]
     pub delimiter: String,
@@ -65,6 +67,7 @@ fn default_delim() -> String {
 
 /// One raw source file registered as `plugin_<name>_src[_<part>]`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSpec {
     #[serde(default)]
     pub part: Option<String>,
@@ -87,6 +90,7 @@ impl SourceSpec {
 
 /// A value column produced by `ingest_sql`, mapped to a CSQ output field.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValueColumn {
     pub column: String,
     pub csq_field: String,
@@ -99,6 +103,7 @@ pub struct ValueColumn {
 /// discriminator built from a `template` over the engine-attribute namespace
 /// (see `plugin_cache::template`). Empty for pure per-variant plugins.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatchColumn {
     /// Cache column name (also the column `ingest_sql` must produce).
     pub column: String,
@@ -108,6 +113,7 @@ pub struct MatchColumn {
 
 /// The full source manifest for one plugin.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceManifest {
     pub plugin_name: String,
     pub coordinate_system: CoordinateSystem,
@@ -212,5 +218,34 @@ type = "Float32"
             csv: None,
         };
         assert_eq!(src.table_name("cadd"), "plugin_cadd_src");
+    }
+
+    #[test]
+    fn rejects_unknown_key_instead_of_ignoring_it() {
+        // `[tier]` is documented in old handoffs but does not exist in SourceManifest.
+        // Before deny_unknown_fields this parsed happily and did nothing.
+        let src = r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "csv"
+path = "/tmp/x.tsv"
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+
+[tier]
+threshold = 0.01
+"##;
+        let err = toml::from_str::<SourceManifest>(src)
+            .expect_err("unknown key [tier] must be rejected");
+        assert!(
+            err.to_string().contains("tier"),
+            "the error must name the offending key, got: {err}"
+        );
     }
 }

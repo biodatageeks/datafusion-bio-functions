@@ -169,9 +169,6 @@ path = "{}"
 column = "score"
 csq_field = "DEMO"
 type = "Float32"
-
-[tier]
-threshold = 0.01
 "##,
             tsv.display()
         );
