@@ -234,13 +234,17 @@ type = "Float32"
     async fn registers_vcf_source_and_projects_info_fields() {
         let dir = tempfile::tempdir().unwrap();
         let vcf = dir.path().join("demo.vcf");
+        // TWO INFO keys, of which the manifest selects one. With a single-key header
+        // every assertion below would hold identically for `info_fields = None`, and
+        // the *selection* half of this test would be vacuous.
         std::fs::write(
             &vcf,
             "##fileformat=VCFv4.2\n\
              ##INFO=<ID=SCORE,Number=1,Type=Float,Description=\"demo score\">\n\
+             ##INFO=<ID=NOISE,Number=1,Type=Float,Description=\"an INFO key the manifest omits\">\n\
              #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
-             chr22\t22893742\t.\tC\tG\t.\t.\tSCORE=0.9\n\
-             chr22\t22893800\t.\tA\tT\t.\t.\tSCORE=0.1\n",
+             chr22\t22893742\t.\tC\tG\t.\t.\tSCORE=0.9;NOISE=1.5\n\
+             chr22\t22893800\t.\tA\tT\t.\t.\tSCORE=0.1;NOISE=2.5\n",
         )
         .unwrap();
 
@@ -267,6 +271,26 @@ type = "Float32"
         let manifest: SourceManifest = toml::from_str(&toml_src).unwrap();
         let ctx = SessionContext::new();
         let _temps = register_sources(&ctx, &manifest).await.unwrap();
+
+        // `info_fields` is a SELECTION: only the requested INFO keys become columns.
+        // NOISE is declared in the header and present in every record, so if the
+        // selection were ignored (or `info_fields` silently dropped, as a typo'd
+        // `[source.vcf]` key once caused) it would show up here.
+        let table = ctx.table("plugin_demo_src").await.unwrap();
+        let columns: Vec<&str> = table
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            columns.contains(&"SCORE"),
+            "the selected INFO key must be materialized, got {columns:?}"
+        );
+        assert!(
+            !columns.contains(&"NOISE"),
+            "an INFO key absent from info_fields must NOT be materialized, got {columns:?}"
+        );
 
         // The reader exposes VCF POS as `start` (plus a matching `end`), NOT `pos`.
         // INFO columns are bare, case-sensitive keys -> must be backticked.
