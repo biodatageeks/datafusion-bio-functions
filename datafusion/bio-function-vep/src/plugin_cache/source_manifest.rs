@@ -72,6 +72,11 @@ fn default_delim() -> String {
 /// keys as **bare, case-sensitive column names** (`AF`, `ALLELE_ID`) — not
 /// `info_af` as `bio-format-vcf`'s crate docs claim — so `ingest_sql` must
 /// backtick them: ``SELECT `AF` FROM plugin_x_src``.
+///
+/// The reader's core columns are `chrom`, `start`, `end`, `id`, `ref`, `alt`, `qual`,
+/// `filter` — there is NO `pos`. VCF POS is exposed as `start` (1-based, matching the
+/// cache's coordinate system), with a matching `end`. So `ingest_sql` must select
+/// `start`/`end`, not `pos`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VcfParams {
