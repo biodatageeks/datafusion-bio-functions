@@ -20,4 +20,6 @@ pub mod provider;
 pub mod registry;
 pub mod source_manifest;
 pub mod template;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 pub mod write;

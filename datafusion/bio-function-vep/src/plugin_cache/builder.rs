@@ -154,50 +154,7 @@ fn schema_matches(a: &CacheManifest, b: &CacheManifest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int8Array, StringArray, UInt32Array};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::arrow::record_batch::RecordBatch;
-    use parquet::arrow::ArrowWriter;
-    use std::io::Write;
-    use std::sync::Arc;
-
-    fn write_gz(path: &Path, body: &str) {
-        let f = std::fs::File::create(path).unwrap();
-        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        enc.write_all(body.as_bytes()).unwrap();
-        enc.finish().unwrap();
-    }
-
-    fn write_variation(path: &Path, rows: &[(&str, u32, &str, i8)]) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("chrom", DataType::Utf8, false),
-            Field::new("start", DataType::UInt32, false),
-            Field::new("allele_string", DataType::Utf8, false),
-            Field::new("tier", DataType::Int8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(
-                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
-                )),
-                Arc::new(UInt32Array::from(
-                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
-                )),
-                Arc::new(StringArray::from(
-                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
-                )),
-                Arc::new(Int8Array::from(
-                    rows.iter().map(|r| r.3).collect::<Vec<_>>(),
-                )),
-            ],
-        )
-        .unwrap();
-        let file = std::fs::File::create(path).unwrap();
-        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
-        w.write(&batch).unwrap();
-        w.close().unwrap();
-    }
+    use crate::plugin_cache::test_fixtures::{write_gz, write_variation};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn builds_all_chroms_and_writes_manifest() {

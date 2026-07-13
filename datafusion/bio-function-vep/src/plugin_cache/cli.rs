@@ -210,7 +210,8 @@ impl PluginBuildArgs {
             self.manifest_file(),
             &self.variation_cache_dir,
             &self.out,
-        );
+        )
+        .with_overwrite(self.overwrite);
         if !self.chroms.is_empty() {
             builder = builder.with_chrom_filter(self.chroms.clone());
         }
@@ -221,6 +222,7 @@ impl PluginBuildArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_cache::test_fixtures::{write_gz, write_variation};
     use std::path::Path;
 
     fn argv(args: &[&str]) -> Vec<String> {
@@ -475,5 +477,144 @@ type = "Float32"
             .expect_err("an unknown part must not be silently ignored");
         let msg = err.to_string();
         assert!(msg.contains("sv"), "must name the offending part: {msg}");
+    }
+
+    /// A buildable single-source manifest over `src` (a gzipped 2-row TSV).
+    fn buildable_manifest(dir: &Path, src: &Path) -> PathBuf {
+        write_manifest(
+            dir,
+            &format!(
+                r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+                src.display()
+            ),
+        )
+    }
+
+    /// A variation cache with chr1 + chr2, and a raw source covering both.
+    fn build_env(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let src = dir.join("src.tsv.gz");
+        write_gz(&src, "chr1\t100\tA\tG\t0.9\nchr2\t200\tC\tT\t0.5\n");
+        let var_dir = dir.join("cache").join("variation");
+        std::fs::create_dir_all(&var_dir).unwrap();
+        write_variation(&var_dir.join("chr1.parquet"), &[("1", 100, "A/G", 0)]);
+        write_variation(&var_dir.join("chr2.parquet"), &[("2", 200, "C/T", 1)]);
+        (
+            buildable_manifest(dir, &src),
+            dir.join("cache"),
+            dir.join("out"),
+        )
+    }
+
+    /// Args driving a real build of `chroms`, exactly as the example assembles them.
+    fn build_args(manifest: &Path, cache: &Path, out: &Path, extra: &[&str]) -> PluginBuildArgs {
+        let mut v = argv(&[
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--variation-cache-dir",
+            cache.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        v.extend(argv(extra));
+        PluginBuildArgs::parse(&v).unwrap()
+    }
+
+    // `PluginCacheBuilder::with_overwrite` is honoured and unit-tested at the builder
+    // level, but the CLI never passed the flag down: `--overwrite` parsed to `true`
+    // and was then dropped on the floor, so a documented clean rebuild silently
+    // stayed an UPSERT. Drive the whole CLI path, not just the parser.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overwrite_flag_reaches_the_builder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest_path, cache, out) = build_env(dir.path());
+
+        // Seed a two-chrom build, then rebuild chr2 only, with --overwrite.
+        let seed = build_args(
+            &manifest_path,
+            &cache,
+            &out,
+            &["--chrom", "1", "--chrom", "2"],
+        );
+        let seeded = seed.build(&seed.load_manifest().unwrap()).await.unwrap();
+        assert_eq!(seeded.chroms.len(), 2, "seed must build chr1 + chr2");
+
+        let args = build_args(
+            &manifest_path,
+            &cache,
+            &out,
+            &["--chrom", "2", "--overwrite"],
+        );
+        assert!(args.overwrite, "precondition: --overwrite parsed");
+        let cache_manifest = args.build(&args.load_manifest().unwrap()).await.unwrap();
+
+        let chroms: Vec<&str> = cache_manifest
+            .chroms
+            .iter()
+            .map(|c| c.chrom.as_str())
+            .collect();
+        assert_eq!(
+            chroms,
+            ["chr2"],
+            "--overwrite must start from an empty chrom list, dropping chr1; got {chroms:?}"
+        );
+    }
+
+    // The mirror image: without --overwrite the same filtered rebuild must UPSERT,
+    // so the fix above must not turn every build into a clean one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_overwrite_a_filtered_rebuild_still_upserts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest_path, cache, out) = build_env(dir.path());
+
+        let seed = build_args(
+            &manifest_path,
+            &cache,
+            &out,
+            &["--chrom", "1", "--chrom", "2"],
+        );
+        seed.build(&seed.load_manifest().unwrap()).await.unwrap();
+
+        let args = build_args(&manifest_path, &cache, &out, &["--chrom", "2"]);
+        assert!(!args.overwrite);
+        let cache_manifest = args.build(&args.load_manifest().unwrap()).await.unwrap();
+
+        let chroms: Vec<&str> = cache_manifest
+            .chroms
+            .iter()
+            .map(|c| c.chrom.as_str())
+            .collect();
+        assert_eq!(
+            chroms,
+            ["chr1", "chr2"],
+            "without --overwrite chr1 must be preserved; got {chroms:?}"
+        );
     }
 }
