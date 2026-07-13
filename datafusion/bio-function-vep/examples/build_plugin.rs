@@ -1,12 +1,19 @@
 //! Build a plugin cache from a source manifest (all chroms, or a filtered set).
 //!
 //! ```text
-//! cargo run -p datafusion-bio-function-vep --example build_plugin -- \
+//! cargo run -p datafusion-bio-function-vep --features parquet-cache --example build_plugin -- \
 //!   --manifest <vepyr-plugins>/plugins/alphamissense/alphamissense.source.toml \
 //!   --source-path /tmp/AlphaMissense_hg38.tsv.gz \
 //!   --variation-cache-dir <cache root containing variation/> \
-//!   --out /tmp/plugin_cache [--chrom 22]
+//!   --out /tmp/plugin_cache \
+//!   [--chrom 21 --chrom 22]        # repeatable; omit to build every chrom in the cache
 //! ```
+//!
+//! `--source-path` takes a bare path only when the manifest declares a single `[[source]]`;
+//! for multi-part manifests use `--source-path <part>=<path>`, repeated once per part.
+//!
+//! `--overwrite` starts from an empty chrom list (a clean rebuild). Without it, a filtered
+//! build UPSERTs into the previous `manifest.json`, preserving chroms it did not rebuild.
 
 use std::path::PathBuf;
 

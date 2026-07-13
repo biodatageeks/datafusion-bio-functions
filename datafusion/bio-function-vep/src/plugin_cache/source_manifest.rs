@@ -346,8 +346,8 @@ type = "Float32"
 [tier]
 threshold = 0.01
 "##;
-        let err = toml::from_str::<SourceManifest>(src)
-            .expect_err("unknown key [tier] must be rejected");
+        let err =
+            toml::from_str::<SourceManifest>(src).expect_err("unknown key [tier] must be rejected");
         assert!(
             err.to_string().contains("tier"),
             "the error must name the offending key, got: {err}"
