@@ -116,21 +116,33 @@ pub async fn register_sources(
             ProviderKind::Vcf => {
                 let info_fields = spec.vcf.as_ref().and_then(|v| v.info_fields.clone());
                 // ObjectStorageOptions::default() sets compression_type = AUTO, which is what
-                // lets one code path read both plain `.vcf` and BGZF `.vcf.gz`. Passing `None`
-                // is NOT equivalent — the reader's own tests always pass explicit options.
+                // lets one code path read both plain `.vcf` and BGZF `.vcf.gz`. `None` would
+                // behave identically today (the reader `unwrap_or_default()`s it at every use),
+                // but passing the value explicitly keeps the compression policy visible here.
                 //
                 // coordinate_system_zero_based = false: VCF POS is 1-based and the plugin cache
                 // stores 1-based start/end, so the reader must not shift. The manifest's
                 // `coordinate_system` remains the single source of truth for any shift the
                 // builder applies (see plugin_cache::build::wrap_normalization).
+                let path = &spec.path;
                 let vcf_table = VcfTableProvider::new(
                     spec.path.clone(),
                     info_fields,
                     None,
                     Some(ObjectStorageOptions::default()),
                     false,
-                )?;
-                ctx.register_table(table.as_str(), Arc::new(vcf_table))?;
+                )
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "open vcf source '{path}' for table '{table}': {e}"
+                    ))
+                })?;
+                ctx.register_table(table.as_str(), Arc::new(vcf_table))
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "register vcf table '{table}' ('{path}'): {e}"
+                        ))
+                    })?;
             }
             ProviderKind::Bed => {
                 return Err(DataFusionError::NotImplemented(format!(
@@ -148,7 +160,7 @@ pub async fn register_sources(
 mod tests {
     use super::*;
     use crate::plugin_cache::source_manifest::SourceManifest;
-    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::array::{Array, Int64Array};
     use std::io::Write;
 
     fn write_gz(path: &std::path::Path, body: &str) {
@@ -276,5 +288,19 @@ type = "Float32"
             .downcast_ref::<datafusion::arrow::array::UInt32Array>()
             .expect("start is UInt32");
         assert_eq!(pos.value(0), 22_893_742);
+
+        // The selected INFO field must actually carry its parsed value — a column that
+        // resolved by name but came back all-null would otherwise pass unnoticed.
+        let score = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float32Array>()
+            .expect("SCORE is Float32");
+        assert!(score.is_valid(0), "SCORE must be parsed, not null");
+        assert!(
+            (score.value(0) - 0.9).abs() < 1e-6,
+            "SCORE = {}, want 0.9",
+            score.value(0)
+        );
     }
 }
