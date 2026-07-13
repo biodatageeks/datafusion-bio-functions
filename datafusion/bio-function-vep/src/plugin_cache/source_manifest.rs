@@ -265,6 +265,62 @@ type = "Utf8"
     }
 
     #[test]
+    fn vcf_source_without_vcf_table_takes_every_info_key() {
+        // No `[source.vcf]` at all: `vcf` stays `None`, which the provider reads as
+        // "materialize every INFO key declared in the VCF header".
+        let src = r##"
+plugin_name = "mastermind"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "/tmp/mastermind.vcf.gz"
+
+[[value_columns]]
+column = "mmid3"
+csq_field = "MM_MMID3"
+type = "Utf8"
+"##;
+        let m: SourceManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.sources[0].provider, ProviderKind::Vcf);
+        assert!(
+            m.sources[0].vcf.is_none(),
+            "an omitted [source.vcf] must leave `vcf` as None (= take all INFO keys)"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_key_inside_vcf_table() {
+        // `info_field` (singular) is the plausible typo for `info_fields`. Without
+        // deny_unknown_fields on VcfParams this parses happily into `info_fields: None`,
+        // i.e. silently indistinguishable from omitting [source.vcf] entirely — the
+        // whole INFO selection would be dropped with no diagnostic.
+        let src = r##"
+plugin_name = "mastermind"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "/tmp/mastermind.vcf.gz"
+  [source.vcf]
+  info_field = ["MMID3", "MMCNT1"]
+
+[[value_columns]]
+column = "mmid3"
+csq_field = "MM_MMID3"
+type = "Utf8"
+"##;
+        let err = toml::from_str::<SourceManifest>(src)
+            .expect_err("unknown key `info_field` inside [source.vcf] must be rejected");
+        assert!(
+            err.to_string().contains("info_field"),
+            "the error must name the offending key, got: {err}"
+        );
+    }
+
+    #[test]
     fn rejects_unknown_key_instead_of_ignoring_it() {
         // `[tier]` is documented in old handoffs but does not exist in SourceManifest.
         // Before deny_unknown_fields this parsed happily and did nothing.
