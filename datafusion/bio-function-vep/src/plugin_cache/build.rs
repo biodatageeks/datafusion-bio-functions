@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, BooleanArray, Int8Array, StringArray};
 use datafusion::arrow::compute::{
-    cast, concat_batches, filter_record_batch, sort_to_indices, take,
+    CastOptions, cast_with_options, concat_batches, filter_record_batch, sort_to_indices, take,
 };
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -29,14 +29,48 @@ use crate::plugin_cache::write::{PluginShardWriter, plugin_output_schema};
 
 /// Reproject `batch` to `schema`'s column order and types (casting where needed,
 /// e.g. the normalized view's `Int64` `start`/`end` → the shard's `UInt32`).
+///
+/// The cast is DELIBERATELY unsafe (`CastOptions { safe: false }`). Arrow's default —
+/// what `arrow::compute::cast` gives you — is `safe: true`, which turns a value it
+/// cannot cast into NULL rather than an error. Applied to a manifest's declared
+/// `[[value_columns]] type`, that made a wrong type a *silent* failure, and the worst
+/// one in the build: declaring `type = "Float32"` for a categorical string column
+/// produced
+///
+/// ```text
+/// build SUCCEEDED: rows=1 warm=1 cold=0    <-- even the counts look healthy
+/// probe(100,"A/G") = Some([Null])          <-- every annotation empty
+/// ```
+///
+/// and the real AlphaMissense manifest has `am_class` (Utf8) sitting directly above
+/// `am_pathogenicity` (Float32), so swapping two adjacent `type =` lines was enough.
+///
+/// `safe: false` makes that a hard build error naming the column and the two types.
+/// It does NOT reject legitimately-null source data: a null slot is not a value that
+/// failed to cast, and arrow preserves it either way (pinned by
+/// `correct_types_and_null_source_values_still_build`).
 fn reproject_cast(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    let strict = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
     let cols = schema
         .fields()
         .iter()
         .map(|f| {
             let idx = batch.schema().index_of(f.name())?;
-            cast(batch.column(idx), f.data_type())
-                .map_err(|e| DataFusionError::Execution(format!("cast {}: {e}", f.name())))
+            let col = batch.column(idx);
+            cast_with_options(col, f.data_type(), &strict).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "plugin value column '{}' is declared type {} but the ingested data is {} \
+                     and does not fit it: {e}. Fix the column's `type` in the manifest (or make \
+                     `ingest_sql` produce the declared type) — a lenient cast would have written \
+                     NULL for every offending row and the plugin would annotate nothing.",
+                    f.name(),
+                    f.data_type(),
+                    col.data_type(),
+                ))
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(Arc::clone(schema), cols)
@@ -587,6 +621,146 @@ type = "Float32"
         assert_eq!(entry.rows, 2, "one row per ALT (A/G and A/T)");
         assert_eq!(entry.warm, 1, "A/G matches the variation cache");
         assert_eq!(entry.cold, 1, "A/T does not");
+    }
+
+    /// The AlphaMissense manifest declares `am_class` (Utf8) directly above
+    /// `am_pathogenicity` (Float32). Swap the two `type =` lines and `reproject_cast`'s
+    /// arrow `cast` — whose default is `CastOptions { safe: true }` — turned every
+    /// unparseable "likely_benign" into NULL instead of erroring:
+    ///
+    /// ```text
+    /// build SUCCEEDED: rows=1 warm=1 cold=0    <-- even the counts look healthy
+    /// probe(100,"A/G") = Some([Null])          <-- every annotation empty
+    /// ```
+    ///
+    /// Worse than the multi-allelic trap, because there the row counts at least hinted
+    /// at it. A declared type the data cannot hold must be a hard build error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn value_column_type_mismatch_fails_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("am.tsv.gz");
+        // The AlphaMissense column layout: a categorical class and a float score.
+        write_gz(&tsv, "chr1\t100\tA\tG\tlikely_benign\t0.0431\n");
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        // `am_class` is declared Float32 — the swap. "likely_benign" is not a float.
+        let toml = format!(
+            r##"
+plugin_name = "am"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string,
+       am_class AS am_class,
+       CAST(score AS FLOAT) AS am_pathogenicity
+FROM plugin_am_src
+"""
+
+[[source]]
+provider = "tsv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom",    type = "Utf8" }},
+    {{ name = "pos",      type = "Utf8" }},
+    {{ name = "ref",      type = "Utf8" }},
+    {{ name = "alt",      type = "Utf8" }},
+    {{ name = "am_class", type = "Utf8" }},
+    {{ name = "score",    type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "am_class"
+csq_field = "am_class"
+type = "Float32"
+
+[[value_columns]]
+column = "am_pathogenicity"
+csq_field = "am_pathogenicity"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let err = build_plugin_chrom(&manifest, "am.source.toml", &var, &out, "1")
+            .await
+            .expect_err("a value column the declared type cannot hold must fail the build");
+        let msg = err.to_string();
+        assert!(msg.contains("am_class"), "must name the column: {msg}");
+        assert!(
+            msg.contains("Utf8") && msg.contains("Float32"),
+            "must name both types: {msg}"
+        );
+    }
+
+    /// The guard must not fire on the AlphaMissense manifest's REAL types (Utf8 class +
+    /// Float32 score), nor on a legitimately NULL source value: `safe: false` rejects
+    /// values that cannot be cast, and a null is not one of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn correct_types_and_null_source_values_still_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("am.tsv.gz");
+        // Row 2 has an EMPTY score field -> a NULL Float32 after the ingest CAST.
+        write_gz(
+            &tsv,
+            "chr1\t100\tA\tG\tlikely_benign\t0.0431\nchr1\t300\tC\tT\tambiguous\t\n",
+        );
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        let toml = format!(
+            r##"
+plugin_name = "am"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string,
+       am_class AS am_class,
+       CAST(score AS FLOAT) AS am_pathogenicity
+FROM plugin_am_src
+"""
+
+[[source]]
+provider = "tsv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom",    type = "Utf8" }},
+    {{ name = "pos",      type = "Utf8" }},
+    {{ name = "ref",      type = "Utf8" }},
+    {{ name = "alt",      type = "Utf8" }},
+    {{ name = "am_class", type = "Utf8" }},
+    {{ name = "score",    type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "am_class"
+csq_field = "am_class"
+type = "Utf8"
+
+[[value_columns]]
+column = "am_pathogenicity"
+csq_field = "am_pathogenicity"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let entry = build_plugin_chrom(&manifest, "am.source.toml", &var, &out, "1")
+            .await
+            .expect("the AlphaMissense types are legitimate and must keep building");
+        assert_eq!(entry.rows, 2);
+        assert_eq!(entry.warm, 1);
+        assert_eq!(entry.cold, 1);
     }
 
     // --chrom M / chrM / MT must all select the MT rows (data is folded to "MT"
