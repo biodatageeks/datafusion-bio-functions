@@ -5,11 +5,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, BooleanArray, Int8Array, StringArray};
+use datafusion::arrow::array::{Array, AsArray, BooleanArray, Int8Array};
 use datafusion::arrow::compute::{
     CastOptions, cast_with_options, concat_batches, filter_record_batch, sort_to_indices, take,
 };
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::MemTable;
@@ -98,16 +98,49 @@ fn reproject_cast(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch
 /// Checked on the normalized, chrom-filtered rows already materialized in memory
 /// (not by re-querying the ingest view), so the guard costs no extra pass over
 /// what can be a tens-of-GB source.
+///
+/// # The guard must not fail OPEN
+///
+/// Which Arrow string encoding `allele_string` arrives in is DataFusion's choice, not
+/// the manifest's: a parquet source yields `Utf8View` (`schema_force_view_types` is on
+/// by default), CSV/TSV and the VCF reader yield `Utf8`, and `LargeUtf8` is reachable
+/// through an `ingest_sql` cast. The first version of this guard downcast to
+/// `StringArray` alone and `continue`d otherwise — so `provider = "parquet"` skipped the
+/// check outright and built the very shard the guard exists to prevent:
+///
+/// ```text
+/// PROBE TYPES: alt=Utf8View allele_string=Utf8View
+/// PROBE RESULT: guard SILENTLY SKIPPED — built ChromEntry { rows: 1, warm: 0, cold: 1 }
+///               with a pipe-joined allele_string
+/// ```
+///
+/// Hence: every string encoding is checked, and anything that is NOT a string is an
+/// ERROR naming the Arrow type found. "I do not recognize this column, so I will assume
+/// it is fine" is precisely the silence this whole guard is here to break.
 fn reject_pipe_joined_alleles(batches: &[RecordBatch], plugin: &str) -> Result<()> {
+    /// First non-null value containing `|`, over any of Arrow's string iterators.
+    fn first_pipe_joined<'a>(mut values: impl Iterator<Item = Option<&'a str>>) -> Option<&'a str> {
+        values.find_map(|v| v.filter(|allele| allele.contains('|')))
+    }
+
     for batch in batches {
         let idx = batch.schema().index_of("allele_string")?;
         let col = batch.column(idx);
-        // The normalized view carries `allele_string` straight through from
-        // `ingest_sql`; a non-Utf8 spelling is caught later by the shard schema.
-        let Some(strings) = col.as_any().downcast_ref::<StringArray>() else {
-            continue;
+        let offender = match col.data_type() {
+            DataType::Utf8 => first_pipe_joined(col.as_string::<i32>().iter()),
+            DataType::LargeUtf8 => first_pipe_joined(col.as_string::<i64>().iter()),
+            DataType::Utf8View => first_pipe_joined(col.as_string_view().iter()),
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin '{plugin}': ingest_sql produced an allele_string of Arrow type \
+                     {other}, but allele_string must be a string (Utf8, Utf8View or LargeUtf8) — \
+                     it is the key the runtime probes on and the variation cache joins on. Fix \
+                     the column's expression in `ingest_sql` (canonically \
+                     `concat(ref, '/', alt) AS allele_string`, one row per ALT)."
+                )));
+            }
         };
-        let Some(offender) = strings.iter().flatten().find(|allele| allele.contains('|')) else {
+        let Some(offender) = offender else {
             continue;
         };
         return Err(DataFusionError::Execution(format!(
@@ -390,6 +423,45 @@ mod tests {
         w.close().unwrap();
     }
 
+    /// A `provider = "parquet"` plugin SOURCE (chrom, pos, allele_string, score).
+    ///
+    /// Written with `Utf8` string columns — but that is NOT what the build reads back:
+    /// DataFusion's parquet reader materializes them as `Utf8View`
+    /// (`schema_force_view_types`, on by default), which is exactly the encoding the
+    /// pipe guard used to skip.
+    fn write_parquet_source(path: &std::path::Path, rows: &[(&str, u32, &str, f32)]) {
+        use datafusion::arrow::array::Float32Array;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("pos", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt32Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float32Array::from(
+                    rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn builds_tiered_shard_with_counts() {
         let dir = tempfile::tempdir().unwrap();
@@ -605,6 +677,135 @@ type = "Float32"
         assert!(
             msg.to_lowercase().contains("split"),
             "must tell the author to split multi-allelic ALTs: {msg}"
+        );
+    }
+
+    /// The guard above, but reached through a `provider = "parquet"` source — the hole
+    /// review found in it.
+    ///
+    /// DataFusion's parquet reader hands string columns back as `Utf8View`, not `Utf8`
+    /// (`schema_force_view_types` is on by default), so the guard's
+    /// `downcast_ref::<StringArray>()` returned `None` and its `else { continue }` SKIPPED
+    /// the check entirely: a pipe-joined `allele_string` sailed through and built the exact
+    /// dead shard the guard exists to prevent (`rows: 1, warm: 0, cold: 1`, annotating
+    /// nothing forever). A guard whose whole thesis is "fail LOUDLY" must not fail OPEN on
+    /// an encoding it did not anticipate.
+    ///
+    /// Pipe-joined `allele_string` values reach parquet sources for real: the VCF-derived
+    /// dumps plugins ship (and any parquet materialized from one with the naive
+    /// `concat(ref, '/', alt)`) carry `A/G|T` verbatim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipe_joined_allele_string_from_a_parquet_source_fails_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.parquet");
+        write_parquet_source(&src, &[("chr1", 100, "A/G|T", 0.9)]);
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "parquet"
+path = "{}"
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            src.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        manifest
+            .validate()
+            .expect("the manifest is structurally valid");
+
+        let out = dir.path().join("out");
+        let err = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .expect_err(
+                "a pipe-joined allele_string must fail the build whatever string encoding \
+                 DataFusion chose for it — parquet gives Utf8View, not Utf8",
+            );
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(
+            msg.contains("A/G|T"),
+            "must show an offending example value: {msg}"
+        );
+        assert!(
+            msg.contains("ingest_sql"),
+            "must tell the author where to fix it: {msg}"
+        );
+    }
+
+    /// The guard's fallback arm must be an ERROR, not a `continue`.
+    ///
+    /// An `allele_string` that is not a string at all is a broken manifest — and it is
+    /// precisely the case the guard cannot check. Skipping it silently is how the
+    /// `Utf8View` hole above stayed invisible; the build must instead say what it found.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_string_allele_string_fails_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("src.tsv.gz");
+        write_gz(&tsv, "chr1\t100\tA\tG\t0.9\n");
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        // `allele_string` is an INT here — a typo'd ingest_sql that names the wrong
+        // column. The shard schema would happily stringify it ("100") and the plugin
+        // would then annotate nothing.
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       CAST(pos AS INT) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let err = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .expect_err("a non-string allele_string is a broken manifest, not a check to skip");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(msg.contains("allele_string"), "must name the column: {msg}");
+        assert!(
+            msg.contains("Int32"),
+            "must name the Arrow type actually found: {msg}"
         );
     }
 
