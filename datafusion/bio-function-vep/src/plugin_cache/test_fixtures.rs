@@ -18,6 +18,19 @@ pub fn write_gz(path: &Path, body: &str) {
     enc.finish().unwrap();
 }
 
+/// Write `body` to `path` as **BGZF** — the block-gzip every real `.vcf.gz` uses.
+///
+/// Not interchangeable with [`write_gz`] here: bio-formats' `get_compression_type`
+/// sniffs the first 18 bytes for BGZF's `BC` extra subfield and routes BGZF and plain
+/// GZIP down *different* header readers. A flate2 fixture would silently exercise the
+/// GZIP path and leave the BGZF one — the one production actually takes — untested.
+pub fn write_bgzf(path: &Path, body: &str) {
+    let f = std::fs::File::create(path).unwrap();
+    let mut w = noodles_bgzf::io::Writer::new(f);
+    w.write_all(body.as_bytes()).unwrap();
+    w.finish().unwrap();
+}
+
 /// Write a minimal `variation/<chrom>.parquet` shard: the columns the plugin build
 /// joins against (`chrom`, `start`, `allele_string`) plus the inherited `tier`.
 pub fn write_variation(path: &Path, rows: &[(&str, u32, &str, i8)]) {

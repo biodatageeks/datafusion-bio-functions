@@ -48,6 +48,11 @@ mimalloc = "0.1"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
 noodles-vcf = { git = "https://github.com/biodatageeks/noodles.git", rev = "9b7b2c5b6531373918302d4c07410e583f1b5b5c" }
+# Writes real BGZF (not plain gzip) test fixtures, so the plugin-cache VCF guards are
+# exercised against the `.vcf.gz` form every real plugin source actually ships in —
+# `get_compression_type` sniffs the BGZF `BC` extra subfield, which flate2 cannot emit.
+# Same rev as `noodles-vcf` above (already in the lockfile via its dependency tree).
+noodles-bgzf = { git = "https://github.com/biodatageeks/noodles.git", rev = "9b7b2c5b6531373918302d4c07410e583f1b5b5c" }
 env_logger = "0.11"
 tempfile = "3"
 arrow-array = "58.0.0"

@@ -9,6 +9,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
 use datafusion_bio_format_core::object_storage::ObjectStorageOptions;
+use datafusion_bio_format_vcf::storage::get_header;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 
 use crate::plugin_cache::source_manifest::{CsvParams, ProviderKind, SourceManifest, ValueType};
@@ -66,6 +67,69 @@ fn materialize_plain(path: &str, gzip: bool) -> Result<(String, Option<tempfile:
     Ok((plain, Some(temp_path)))
 }
 
+/// Reject `info_fields` keys the VCF header does not declare, BEFORE they reach
+/// `VcfTableProvider::new`.
+///
+/// The reader resolves each requested INFO key with `header.infos().get(tag).unwrap()`
+/// (`table_provider.rs:174`), so an unknown key does not return an `Err` — it PANICS:
+///
+/// ```text
+/// thread panicked at datafusion-bio-format-vcf/src/table_provider.rs:174:51:
+/// called `Option::unwrap()` on a `None` value
+/// ```
+///
+/// naming no plugin, no manifest, no key and no file. (Which is why the `.map_err(…)`
+/// wrapped around `VcfTableProvider::new` below cannot help: a panic is not an `Err`.)
+/// And this is the single most likely authoring error, because the reader exposes INFO
+/// keys as bare, CASE-SENSITIVE column names: `info_fields = ["score"]` for a header
+/// that declares `SCORE` is enough.
+///
+/// So diff the request against the header first and fail with a diagnostic that names
+/// the plugin, the file, every offending key, and the keys the header actually declares.
+/// `get_header` is the same entry point the reader itself uses, so this handles plain
+/// `.vcf`, BGZF `.vcf.gz` and remote object stores identically to the read path.
+///
+/// `info_fields = None` (take every declared key) and `info_fields = []` (take none)
+/// both request nothing that could be absent, and are left alone.
+async fn reject_undeclared_info_fields(
+    plugin: &str,
+    table: &str,
+    path: &str,
+    requested: &[String],
+) -> Result<()> {
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let header = get_header(path.to_string(), Some(ObjectStorageOptions::default()))
+        .await
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "plugin '{plugin}': read the VCF header of '{path}' (table '{table}'): {e}"
+            ))
+        })?;
+    let declared: Vec<String> = header.infos().keys().map(ToString::to_string).collect();
+    let missing: Vec<&str> = requested
+        .iter()
+        .map(String::as_str)
+        .filter(|key| !declared.iter().any(|d| d == key))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(DataFusionError::Execution(format!(
+        "plugin '{plugin}': [source.vcf] info_fields names {} the VCF header of '{path}' does \
+         not declare: {}. INFO keys are bare and CASE-SENSITIVE — check the spelling and the \
+         case. The header declares: [{}].",
+        if missing.len() == 1 { "a key" } else { "keys" },
+        missing
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        declared.join(", ")
+    )))
+}
+
 /// Register every source in `manifest` as a DataFusion table. Returns any
 /// decompressed temp files the caller must keep alive for the duration of query
 /// execution (dropping them deletes the temp — see `materialize_plain`).
@@ -115,6 +179,17 @@ pub async fn register_sources(
             }
             ProviderKind::Vcf => {
                 let info_fields = spec.vcf.as_ref().and_then(|v| v.info_fields.clone());
+                // A key the header does not declare would PANIC inside the reader with no
+                // context at all (see `reject_undeclared_info_fields`) — diff it first.
+                if let Some(requested) = info_fields.as_deref() {
+                    reject_undeclared_info_fields(
+                        &manifest.plugin_name,
+                        &table,
+                        &spec.path,
+                        requested,
+                    )
+                    .await?;
+                }
                 // ObjectStorageOptions::default() sets compression_type = AUTO, which is what
                 // lets one code path read both plain `.vcf` and BGZF `.vcf.gz`. `None` would
                 // behave identically today (the reader `unwrap_or_default()`s it at every use),
@@ -160,15 +235,8 @@ pub async fn register_sources(
 mod tests {
     use super::*;
     use crate::plugin_cache::source_manifest::SourceManifest;
+    use crate::plugin_cache::test_fixtures::{write_bgzf, write_gz};
     use datafusion::arrow::array::{Array, Int64Array};
-    use std::io::Write;
-
-    fn write_gz(path: &std::path::Path, body: &str) {
-        let f = std::fs::File::create(path).unwrap();
-        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
-        enc.write_all(body.as_bytes()).unwrap();
-        enc.finish().unwrap();
-    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn registers_csv_source_with_declared_schema() {
@@ -326,6 +394,180 @@ type = "Float32"
             "SCORE = {}, want 0.9",
             score.value(0)
         );
+    }
+
+    /// A manifest that names an INFO key the VCF header does not declare — a typo, or
+    /// (far likelier) the wrong case, since INFO keys are bare and CASE-SENSITIVE — used
+    /// to reach `VcfTableProvider::new`, where the reader does
+    /// `header_infos.get(tag).unwrap()` and PANICS:
+    ///
+    /// ```text
+    /// thread panicked at datafusion-bio-format-vcf/src/table_provider.rs:174:51:
+    /// called `Option::unwrap()` on a `None` value
+    /// ```
+    ///
+    /// No plugin, no manifest, no key, no file. (The careful `.map_err(...)` around
+    /// `VcfTableProvider::new` catches nothing: a panic is not an `Err`.) Diff the
+    /// requested keys against the header BEFORE handing them to the reader instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn miscased_info_field_is_rejected_with_the_header_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("demo.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=SCORE,Number=1,Type=Float,Description=\"demo score\">\n\
+             ##INFO=<ID=NOISE,Number=1,Type=Float,Description=\"noise\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr22\t22893742\t.\tC\tG\t.\t.\tSCORE=0.9;NOISE=1.5\n",
+        )
+        .unwrap();
+
+        // `score` — right key, wrong case. The single most likely authoring error.
+        let toml_src = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "{}"
+  [source.vcf]
+  info_fields = ["score"]
+
+[[value_columns]]
+column = "score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            vcf.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml_src).unwrap();
+        let ctx = SessionContext::new();
+        let err = register_sources(&ctx, &manifest)
+            .await
+            .expect_err("an INFO key the header does not declare must be an error, not a panic");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(msg.contains("score"), "must name the offending key: {msg}");
+        assert!(
+            msg.contains("SCORE") && msg.contains("NOISE"),
+            "must list the INFO keys the header actually declares: {msg}"
+        );
+        assert!(
+            msg.contains(&vcf.display().to_string()),
+            "must name the file: {msg}"
+        );
+    }
+
+    /// The same guard must work on BGZF (`.vcf.gz`) — the form every real plugin source
+    /// ships in — not just plain `.vcf`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_info_field_is_rejected_in_a_bgzf_vcf() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("demo.vcf.gz");
+        write_bgzf(
+            &vcf,
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=MMCNT1,Number=1,Type=Integer,Description=\"mm count\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr1\t100\t.\tA\tG\t.\t.\tMMCNT1=3\n",
+        );
+
+        let toml_src = format!(
+            r##"
+plugin_name = "mastermind"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "{}"
+  [source.vcf]
+  info_fields = ["MMCNT1", "BOGUS"]
+
+[[value_columns]]
+column = "mmcnt1"
+csq_field = "MM"
+type = "Int32"
+"##,
+            vcf.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml_src).unwrap();
+        let ctx = SessionContext::new();
+        let err = register_sources(&ctx, &manifest)
+            .await
+            .expect_err("BOGUS is not declared in the BGZF header");
+        let msg = err.to_string();
+        assert!(msg.contains("BOGUS"), "must name the offending key: {msg}");
+        assert!(
+            msg.contains("MMCNT1"),
+            "must list the header's declared keys: {msg}"
+        );
+        assert!(msg.contains("mastermind"), "must name the plugin: {msg}");
+    }
+
+    /// The valid cases must keep working through the new header check:
+    /// - every requested key is declared -> registers;
+    /// - `info_fields = []` -> no INFO columns, no header complaint;
+    /// - an omitted `[source.vcf]` -> all INFO keys, header never diffed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn declared_empty_and_omitted_info_fields_all_register() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("demo.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=SCORE,Number=1,Type=Float,Description=\"demo score\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr1\t100\t.\tA\tG\t.\t.\tSCORE=0.9\n",
+        )
+        .unwrap();
+
+        let mk = |params: &str| {
+            format!(
+                r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "{}"
+{params}
+
+[[value_columns]]
+column = "score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+                vcf.display()
+            )
+        };
+
+        for (label, params, wants_score) in [
+            (
+                "exact key",
+                "  [source.vcf]\n  info_fields = [\"SCORE\"]",
+                true,
+            ),
+            (
+                "empty selection",
+                "  [source.vcf]\n  info_fields = []",
+                false,
+            ),
+            ("omitted [source.vcf]", "", true),
+        ] {
+            let manifest: SourceManifest = toml::from_str(&mk(params)).unwrap();
+            let ctx = SessionContext::new();
+            let _temps = register_sources(&ctx, &manifest)
+                .await
+                .unwrap_or_else(|e| panic!("{label} must register: {e}"));
+            let table = ctx.table("plugin_demo_src").await.unwrap();
+            let has_score = table.schema().field_with_name(None, "SCORE").is_ok();
+            assert_eq!(has_score, wants_score, "{label}: SCORE column presence");
+        }
     }
 
     /// Pins the two reader behaviours `VcfParams`' docs warn manifest authors about,
