@@ -382,7 +382,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use std::io::Write;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn write_gz(path: &std::path::Path, body: &str) {
         let f = std::fs::File::create(path).unwrap();
@@ -1093,6 +1093,151 @@ type = "Float32"
             no_warm_rows_warning(&manifest.plugin_name, &entry.chrom, entry.rows, entry.warm)
                 .is_some(),
             "the all-cold chrom must be flagged: {entry:?}"
+        );
+    }
+
+    /// Every warn-level record emitted anywhere in this test binary, with its level.
+    ///
+    /// `log::set_logger` is process-global and one-shot, and `build_plugin_chrom`'s
+    /// `warn!` fires on whatever tokio worker thread happens to run the build — so a
+    /// thread-local capture (`testing_logger`) would miss it, and a second logger
+    /// (`env_logger`) could not coexist with it. One shared sink, installed once and
+    /// filtered by the emitting test's unique plugin name, is correct under `cargo test`'s
+    /// parallelism and needs no new dependency.
+    static WARN_RECORDS: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
+
+    struct CapturingLogger;
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, meta: &log::Metadata) -> bool {
+            meta.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                WARN_RECORDS
+                    .lock()
+                    .unwrap()
+                    .push((record.level(), record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Install [`CapturingLogger`] as the process logger (idempotent, one-shot).
+    fn install_capturing_logger() {
+        static LOGGER: CapturingLogger = CapturingLogger;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            log::set_logger(&LOGGER).expect("no other logger may be installed in this test binary");
+            // Without this the default max level is `Off` and `warn!` never even calls us.
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+    }
+
+    /// Records emitted for one plugin — the name is unique per test, so parallel tests
+    /// (and DataFusion's own warnings) cannot be mistaken for ours.
+    fn records_for_plugin(plugin: &str) -> Vec<(log::Level, String)> {
+        let needle = format!("plugin '{plugin}'");
+        WARN_RECORDS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, msg)| msg.contains(&needle))
+            .cloned()
+            .collect()
+    }
+
+    /// The warm==0 warning must actually REACH a logger — not merely be computable.
+    ///
+    /// `contig_mismatch_builds_all_cold_and_is_flagged` above covers only the pure
+    /// `no_warm_rows_warning` helper, i.e. that the string *can be produced*. Nothing
+    /// covered the `warn!` that produces it for real: delete that call and all 869 lib
+    /// tests still pass. That is not a hypothetical regression — it already happened once
+    /// on this branch, in the other half of the same path: the warning was added, no
+    /// logger was installed to receive it, it reached nobody, and it was caught only
+    /// because someone ran the binary by hand.
+    ///
+    /// A warning whose whole purpose is to break silence is worth exactly as much as its
+    /// emission path, so the emission path is what this test pins: a build with
+    /// `rows > 0 && warm == 0` emits one WARN-level record naming the plugin.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_cold_chrom_emits_a_warn_log_record() {
+        install_capturing_logger();
+
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("src.tsv.gz");
+        write_gz(&tsv, "chr1\t100\tA\tG\t0.9\nchr1\t300\tG\tA\t0.7\n");
+        let var = dir.path().join("var.parquet");
+        // Contig mismatch ("chr1" vs the canonicalized "1"): rows are written, NOT ONE
+        // joins the variation cache. The all-cold signature the warning exists to report.
+        write_synthetic_variation(&var, &[("chr1", 100, "A/G", 0i8)]);
+
+        // Unique to this test: the filter below must not pick up other tests' records.
+        let toml = format!(
+            r##"
+plugin_name = "warnemit"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_warnemit_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let entry = build_plugin_chrom(&manifest, "warnemit.source.toml", &var, &out, "1")
+            .await
+            .expect("an all-cold chrom warns, it does not fail");
+        assert_eq!(
+            (entry.rows, entry.warm),
+            (2, 0),
+            "the all-cold setup: {entry:?}"
+        );
+
+        let records = records_for_plugin("warnemit");
+        assert_eq!(
+            records.len(),
+            1,
+            "a chrom with rows > 0 and warm == 0 must EMIT exactly one log record, \
+             not merely be able to compute the text of one; captured: {records:?}"
+        );
+        let (level, msg) = &records[0];
+        assert_eq!(
+            *level,
+            log::Level::Warn,
+            "it must be a WARNING (info/debug is swallowed by every default logger): {msg}"
+        );
+        assert!(
+            msg.contains("warm = 0"),
+            "the emitted record must be the all-cold warning: {msg}"
+        );
+        assert!(
+            msg.contains("chr1"),
+            "the emitted record must name the chrom: {msg}"
         );
     }
 
