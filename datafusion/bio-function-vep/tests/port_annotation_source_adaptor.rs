@@ -293,10 +293,7 @@ mod active {
         );
         let info_txt = cache_root.join("info.txt");
 
-        if !cache_root.exists()
-            || !info_txt.exists()
-            || is_lfs_pointer(&info_txt)
-        {
+        if !cache_root.exists() || !info_txt.exists() || is_lfs_pointer(&info_txt) {
             return None;
         }
 
@@ -310,7 +307,6 @@ mod active {
 
         Some(cache_root)
     }
-
 
     // SUBTEST #7 (L52-88 of AnnotationSourceAdaptor.t): default-config
     // `get_all_from_cache()` returns `[Cache::Transcript blessed-hash]`.

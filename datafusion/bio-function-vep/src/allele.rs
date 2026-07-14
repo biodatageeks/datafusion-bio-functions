@@ -348,7 +348,7 @@ fn vep_prefix_suffix_len_multi(ref_allele: &str, alts: &[&str]) -> (usize, usize
     }
 
     // Per-VEP: SNV-only multi-ALT (all single-base) gets no trimming.
-    if ref_bytes.len() == 1 && alts.iter().all(|a| a.as_bytes().len() == 1) {
+    if ref_bytes.len() == 1 && alts.iter().all(|a| a.len() == 1) {
         return (0, 0);
     }
 
@@ -356,7 +356,7 @@ fn vep_prefix_suffix_len_multi(ref_allele: &str, alts: &[&str]) -> (usize, usize
     let mut prefix_len = 0;
     let max_prefix = std::cmp::min(
         ref_bytes.len(),
-        alts.iter().map(|a| a.as_bytes().len()).min().unwrap_or(0),
+        alts.iter().map(|a| a.len()).min().unwrap_or(0),
     );
     while prefix_len < max_prefix {
         let r = ref_bytes[prefix_len];
@@ -371,13 +371,13 @@ fn vep_prefix_suffix_len_multi(ref_allele: &str, alts: &[&str]) -> (usize, usize
 
     // Longest suffix shared with ref AND every alt, only when at least one
     // alt has a different length from REF (indel context).
-    let any_indel = alts.iter().any(|a| a.as_bytes().len() != ref_bytes.len());
+    let any_indel = alts.iter().any(|a| a.len() != ref_bytes.len());
     let mut suffix_len = 0;
     if any_indel {
         let ref_remaining = ref_bytes.len() - prefix_len;
         let min_alt_remaining = alts
             .iter()
-            .map(|a| a.as_bytes().len().saturating_sub(prefix_len))
+            .map(|a| a.len().saturating_sub(prefix_len))
             .min()
             .unwrap_or(0);
         let max_suffix = std::cmp::min(ref_remaining, min_alt_remaining);

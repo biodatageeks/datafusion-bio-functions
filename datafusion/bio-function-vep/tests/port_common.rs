@@ -30,6 +30,12 @@ use datafusion::prelude::*;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::vcf_sink;
 
+/// Predicate applied to a golden CSQ group's tokens to decide whether the group
+/// takes part in the comparison (REVIEW_NOTES.md §C3). The lifetime parameter
+/// keeps non-`'static` closures usable, which the `dyn` object-lifetime default
+/// would otherwise forbid.
+type RowFilter<'a> = dyn Fn(&[String]) -> bool + Sync + 'a;
+
 // ───────────────────────── path helpers ─────────────────────────
 
 /// Resolve a path relative to the workspace root.
@@ -183,7 +189,7 @@ async fn compare_csq_inner(
     cache_path: &str,
     config: &vcf_sink::AnnotateVcfConfig,
     hard_fields: &[&str],
-    row_filter: Option<&(dyn Fn(&[String]) -> bool + Sync)>,
+    row_filter: Option<&RowFilter<'_>>,
     case_label: &str,
 ) -> Result<bool> {
     // 1. Annotate input.vcf to a tmpfile.
@@ -242,16 +248,12 @@ async fn compare_csq_inner(
         .await?
         .collect()
         .await?;
-    let output_batch = datafusion::arrow::compute::concat_batches(
-        &output_batches[0].schema(),
-        &output_batches,
-    )
-    .unwrap();
-    let golden_batch = datafusion::arrow::compute::concat_batches(
-        &golden_batches[0].schema(),
-        &golden_batches,
-    )
-    .unwrap();
+    let output_batch =
+        datafusion::arrow::compute::concat_batches(&output_batches[0].schema(), &output_batches)
+            .unwrap();
+    let golden_batch =
+        datafusion::arrow::compute::concat_batches(&golden_batches[0].schema(), &golden_batches)
+            .unwrap();
 
     let ours = read_csq_column(&output_batch);
     let golden = read_csq_column(&golden_batch);
@@ -303,10 +305,10 @@ async fn compare_csq_inner(
 
         for (g_idx, (og, gg)) in ours_groups.iter().zip(golden_groups.iter()).enumerate() {
             // Apply row filter (C3) on the GOLDEN group's tokens.
-            if let Some(filter) = row_filter {
-                if !filter(gg) {
-                    continue;
-                }
+            if let Some(filter) = row_filter
+                && !filter(gg)
+            {
+                continue;
             }
             for (fld_idx, fld_name) in csq_format.iter().enumerate() {
                 let ov = og.get(fld_idx).map(String::as_str).unwrap_or("");
@@ -437,9 +439,7 @@ pub async fn run_and_compare_csq_with_flags(
         || is_lfs_pointer(&input_vcf)
         || is_lfs_pointer(&golden_vcf)
     {
-        eprintln!(
-            "Skipping port case '{name}/{flag_subdir}': fixture(s) missing or LFS-stubbed"
-        );
+        eprintln!("Skipping port case '{name}/{flag_subdir}': fixture(s) missing or LFS-stubbed");
         return Ok(false);
     }
 

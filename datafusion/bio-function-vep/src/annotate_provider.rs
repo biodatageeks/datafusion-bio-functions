@@ -16245,8 +16245,7 @@ mod port_tests {
             ],
         )
         .unwrap();
-        let (chrom, min_start, max_end) =
-            buffer_variant_bounds(&[batch]).unwrap().unwrap();
+        let (chrom, min_start, max_end) = buffer_variant_bounds(&[batch]).unwrap().unwrap();
         // First-chrom-wins binding (lines 8141-8143).
         assert_eq!(chrom, "1");
         // Bounds still aggregate across all rows — documents current

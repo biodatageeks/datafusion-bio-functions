@@ -194,10 +194,9 @@ fn any_existing_variation_contains(csq: &str, rs_id: &str) -> bool {
 fn unique_alleles(csq: &str) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
     for group in parse_csq_row(csq) {
-        if group.len() <= csq_idx::ALLELE {
+        let Some(allele) = group.get(csq_idx::ALLELE).cloned() else {
             continue;
-        }
-        let allele = group[csq_idx::ALLELE].clone();
+        };
         if !seen.contains(&allele) {
             seen.push(allele);
         }
@@ -228,8 +227,7 @@ fn any_existing_variation_for_allele(csq: &str, target_allele: &str) -> bool {
         if group.len() <= csq_idx::EXISTING_VARIATION {
             continue;
         }
-        if group[csq_idx::ALLELE] == target_allele
-            && !group[csq_idx::EXISTING_VARIATION].is_empty()
+        if group[csq_idx::ALLELE] == target_allele && !group[csq_idx::EXISTING_VARIATION].is_empty()
         {
             return true;
         }
@@ -276,8 +274,7 @@ async fn annotate_and_read_csq(
         drop(tmp);
         return Vec::new();
     }
-    let batch =
-        datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
     let id_idx = batch.schema().index_of("id").ok();
     let csq_idx = batch.schema().index_of("CSQ").ok();
     let mut out = Vec::new();
@@ -718,8 +715,7 @@ async fn axis_b_b4_star_allele_in_multi_alt_skipped() {
         );
         return;
     }
-    let batch =
-        datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
     if batch.num_rows() == 0 {
         eprintln!("Axis B B4: zero output rows; treating as inconclusive.");
         return;

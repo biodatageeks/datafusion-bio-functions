@@ -21991,16 +21991,17 @@ mod tests {
     // ctx.tx_trees from a &[TranscriptFeature] slice.
     #[test]
     fn tt8_prepared_context_builds_tx_trees() {
-        let tx_a = tx("ENST21A", "21", 1_000, 2_000, 1, "protein_coding", None, None);
-        let ctx = PreparedContext::new(
-            std::slice::from_ref(&tx_a),
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
+        let tx_a = tx(
+            "ENST21A",
+            "21",
+            1_000,
+            2_000,
+            1,
+            "protein_coding",
+            None,
+            None,
         );
+        let ctx = PreparedContext::new(std::slice::from_ref(&tx_a), &[], &[], &[], &[], &[], &[]);
         let tree = ctx
             .tx_trees
             .get("21")
@@ -22010,7 +22011,10 @@ mod tests {
         tree.query(1_500_i32, 1_500_i32, |node| {
             hits.push(*GenericInterval::<usize>::metadata(node));
         });
-        assert!(!hits.is_empty(), "expected a hit for the inserted transcript");
+        assert!(
+            !hits.is_empty(),
+            "expected a hit for the inserted transcript"
+        );
     }
 
     // SUBTEST #9 — architectural-no-analogue.
@@ -22024,14 +22028,43 @@ mod tests {
     #[test]
     fn tt10_prepared_context_exposes_chromosome_keyset() {
         let txs = vec![
-            tx("ENST21", "21", 1_000, 2_000, 1, "protein_coding", None, None),
-            tx("ENST22", "22", 3_000, 4_000, 1, "protein_coding", None, None),
-            tx("ENSTLRG", "LRG_485", 100, 200, 1, "protein_coding", None, None),
+            tx(
+                "ENST21",
+                "21",
+                1_000,
+                2_000,
+                1,
+                "protein_coding",
+                None,
+                None,
+            ),
+            tx(
+                "ENST22",
+                "22",
+                3_000,
+                4_000,
+                1,
+                "protein_coding",
+                None,
+                None,
+            ),
+            tx(
+                "ENSTLRG",
+                "LRG_485",
+                100,
+                200,
+                1,
+                "protein_coding",
+                None,
+                None,
+            ),
         ];
         let ctx = PreparedContext::new(&txs, &[], &[], &[], &[], &[], &[]);
         let keys: HashSet<String> = ctx.tx_trees.keys().cloned().collect();
-        let expected: HashSet<String> =
-            ["21", "22", "LRG_485"].iter().map(|s| s.to_string()).collect();
+        let expected: HashSet<String> = ["21", "22", "LRG_485"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(keys, expected);
     }
 
@@ -22119,15 +22152,7 @@ mod tests {
             None,
             None,
         );
-        let ctx = PreparedContext::new(
-            std::slice::from_ref(&tx_a),
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-        );
+        let ctx = PreparedContext::new(std::slice::from_ref(&tx_a), &[], &[], &[], &[], &[], &[]);
         // The tree was inserted under normalize_chrom("chr21") == "21".
         assert!(ctx.tx_trees.contains_key("21"));
         assert!(!ctx.tx_trees.contains_key("chr21"));

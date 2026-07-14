@@ -517,7 +517,7 @@ mod tests {
         struct Payload {
             tag: &'static str,
         }
-        let payloads = vec![Payload { tag: "bar" }];
+        let payloads = [Payload { tag: "bar" }];
         let tree = mk_coitree(&[(5, 10, 0)]);
         let hits = fetch_hits(&tree, 7, 8);
         assert_eq!(hits, vec![0]);

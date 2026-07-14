@@ -152,7 +152,8 @@ async fn annotate_and_read_csq(
     .unwrap();
 
     let ctx = SessionContext::new();
-    ctx.register_table("output_vcf", Arc::new(output_prov)).ok()?;
+    ctx.register_table("output_vcf", Arc::new(output_prov))
+        .ok()?;
     let batches = ctx
         .sql("SELECT * FROM output_vcf ORDER BY start")
         .await
@@ -163,8 +164,7 @@ async fn annotate_and_read_csq(
     if batches.is_empty() {
         return Some(Vec::new());
     }
-    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches)
-        .ok()?;
+    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).ok()?;
     let csq_idx = batch.schema().index_of("CSQ").ok()?;
     let col = batch.column(csq_idx);
     let rows: Vec<String> = (0..batch.num_rows())
@@ -247,10 +247,7 @@ async fn regulatory_feature_overlap_emits_regulatory_csq() {
     // Subtest #26 / #38 (first stable_id): assert the regulatory group's
     // Feature column carries ENSR21_B6Z6N (the v115 enhancer overlapping
     // chr21:25039632).
-    let feature_ids: Vec<&str> = reg_groups
-        .iter()
-        .map(|g| g[6].as_str())
-        .collect();
+    let feature_ids: Vec<&str> = reg_groups.iter().map(|g| g[6].as_str()).collect();
     assert!(
         feature_ids.contains(&"ENSR21_B6Z6N"),
         "expected ENSR21_B6Z6N (v115 enhancer at 25039631-25040274); got {feature_ids:?}",

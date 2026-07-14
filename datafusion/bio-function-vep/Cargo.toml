@@ -73,6 +73,10 @@ required-features = ["parquet-cache", "cache-builder"]
 name = "build_parquet_context_chrom"
 required-features = ["parquet-cache", "cache-builder"]
 
+[[example]]
+name = "rebuild_port_fixture"
+required-features = ["parquet-cache", "cache-builder"]
+
 [features]
 default = ["parquet-cache"]
 # Parquet cache read runtime (variation/SIFT point-lookups + context scans).

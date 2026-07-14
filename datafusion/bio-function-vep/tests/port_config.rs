@@ -72,14 +72,23 @@ fn t1_annotate_vcf_config_default_all_off() {
     assert!(!cfg.pick_allele_gene, "pick_allele_gene default false");
     assert!(!cfg.flag_pick, "flag_pick default false");
     assert!(!cfg.flag_pick_allele, "flag_pick_allele default false");
-    assert!(!cfg.flag_pick_allele_gene, "flag_pick_allele_gene default false");
+    assert!(
+        !cfg.flag_pick_allele_gene,
+        "flag_pick_allele_gene default false"
+    );
     assert!(!cfg.extended_probes, "extended_probes default false");
     assert!(!cfg.hgvs, "hgvs default false");
     assert!(!cfg.hgvsc, "hgvsc default false");
     assert!(!cfg.hgvsp, "hgvsp default false");
     assert!(!cfg.no_escape, "no_escape default false");
-    assert!(!cfg.remove_hgvsp_version, "remove_hgvsp_version default false");
-    assert!(!cfg.hgvsp_use_prediction, "hgvsp_use_prediction default false");
+    assert!(
+        !cfg.remove_hgvsp_version,
+        "remove_hgvsp_version default false"
+    );
+    assert!(
+        !cfg.hgvsp_use_prediction,
+        "hgvsp_use_prediction default false"
+    );
     assert!(!cfg.refseq, "refseq default false");
     assert!(!cfg.merged, "merged default false");
     assert!(!cfg.gencode_basic, "gencode_basic default false");
