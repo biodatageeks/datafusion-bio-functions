@@ -244,6 +244,9 @@ impl SourceManifest {
     /// together — the ones the build would otherwise accept and silently ignore.
     ///
     /// Rules:
+    /// - at least one `[[source]]` (nothing to read otherwise — and
+    ///   `examples/build_plugin.rs` indexes `sources[0]`);
+    /// - at least one `[[value_columns]]` (a plugin that emits nothing);
     /// - a `vcf` source requires `coordinate_system = "1-based"`;
     /// - `[source.csv]` is only valid for `provider = "csv" | "tsv"`;
     /// - `[source.vcf]` is only valid for `provider = "vcf"`;
@@ -255,6 +258,25 @@ impl SourceManifest {
     /// `Deserialize` would force every one of them through validation.
     pub fn validate(&self) -> Result<()> {
         let plugin = &self.plugin_name;
+
+        // `source = []` and `value_columns = []` are legal TOML and deserialize happily
+        // into empty vectors, leaving a manifest that is structurally useless: nothing to
+        // read from, or nothing to emit. The former also panics `examples/build_plugin.rs`,
+        // which indexes `sources[0]` to announce what it is building.
+        if self.sources.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "plugin '{plugin}': the manifest declares no [[source]]. A plugin cache needs at \
+                 least one source to ingest from."
+            )));
+        }
+        if self.value_columns.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "plugin '{plugin}': the manifest declares no [[value_columns]]. A plugin that \
+                 emits no value column would build shards carrying only the lookup key and the \
+                 tier, and annotate nothing."
+            )));
+        }
+
         for (i, spec) in self.sources.iter().enumerate() {
             let src = spec.label(i);
             let provider = spec.provider.as_manifest_str();
@@ -629,6 +651,54 @@ type = "Float32"
         assert!(
             m.validate().is_err(),
             "the same manifest must fail an explicit validate()"
+        );
+    }
+
+    // `source = []` parses (an empty array of tables is legal TOML) and then panics in
+    // examples/build_plugin.rs, which indexes `manifest.sources[0]` to print what it is
+    // building. A manifest with nothing to read is structurally useless — say so.
+    #[test]
+    fn manifest_without_a_source_is_rejected() {
+        let src = r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+source = []
+
+[[value_columns]]
+column = "s"
+csq_field = "S"
+type = "Float32"
+"##;
+        let err = load_str(src).expect_err("a manifest with no [[source]] must not load");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(
+            msg.contains("[[source]]"),
+            "must name what is missing: {msg}"
+        );
+    }
+
+    // The mirror: no `[[value_columns]]` means a plugin that emits nothing — it would
+    // build shards whose only columns are the key and the tier.
+    #[test]
+    fn manifest_without_a_value_column_is_rejected() {
+        let src = r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+value_columns = []
+
+[[source]]
+provider = "csv"
+path = "/tmp/x"
+"##;
+        let err = load_str(src).expect_err("a manifest with no [[value_columns]] must not load");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(
+            msg.contains("[[value_columns]]"),
+            "must name what is missing: {msg}"
         );
     }
 
