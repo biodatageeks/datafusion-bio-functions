@@ -24,6 +24,19 @@ use datafusion_bio_function_vep::plugin_cache::cli::PluginBuildArgs;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // The builder's diagnostics go through `log` (`build.rs` warns when a chrom builds
+    // with rows > 0 but warm == 0 — nothing joined the variation cache, the signature of
+    // a mis-declared manifest). Without a logger installed those warnings are dropped on
+    // the floor, which is exactly the silence they exist to break. The sibling cache-build
+    // examples all do this; this one did not.
+    //
+    // Default to `warn` rather than env_logger's `error`, so the warning is LOUD by
+    // default; `parse_default_env` still lets RUST_LOG turn it up (or off).
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Warn)
+        .parse_default_env()
+        .try_init();
+
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = PluginBuildArgs::parse(&argv)?;
     let manifest = args.load_manifest()?;
