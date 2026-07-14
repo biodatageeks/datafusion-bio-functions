@@ -33,7 +33,7 @@ behind." **That was wrong.** The branches diverged at `v0.10.0` and both moved:
 
 - `master` took `a6e19ad` — *Lance-only cache, grid-aligned parallel annotation, SIFT v2 + AF
   zero-copy, engine-redundancy trims (#181)* — which rewrote `annotate_provider.rs`
-  (**+6907/−2446**) and **deleted** `variant_lookup_exec.rs`.
+  (**+7130/−2576**) and **deleted** `variant_lookup_exec.rs`.
 - `dev-test` has **45 commits** of its own, including a real engine feature that exists **nowhere
   else**: multi-ALT CSQ per-allele expansion (`PerAltCtx`, `vcf_to_vep_allele_multi`). `master` still
   treats `alt` as a single allele (`annotate_provider.rs:5325`).
@@ -396,10 +396,18 @@ type = "Float32"
 ```
 
 > **The reader has no `pos` column.** Its core schema is `chrom, start, end, id, ref, alt, qual,
-> filter, <INFO…>`; VCF POS is exposed as **`start`** (1-based, `UInt32`), with a matching `end`.
+> filter, <INFO…>`; VCF POS is exposed as **`start`** (1-based, `UInt32`). `end` equals `start` only
+> for a plain single-ALT SNV — for indels and MNVs the reader reports `POS + len(REF) - 1`.
 > Every VCF-sourced manifest's `ingest_sql` must select `start`/`end`. This was confirmed against
 > `bio-format-vcf` v1.8.8 (`header_builder.rs:364-372`) while implementing this task — the original
 > draft of this plan said `pos`, and was wrong.
+>
+> **The reader also pipe-joins multi-allelic ALTs into one value** (`A → G,T` yields `alt = "G|T"`).
+> So the natural `concat(ref, '/', alt) AS allele_string` stores `A/G|T`, which can never equal the
+> runtime probe key (`A/G`) — the rows build clean and are dead forever. `ingest_sql` must split the
+> ALTs so each is its own row (e.g. `unnest(string_to_array(alt, '|'))`). The engine now rejects a
+> pipe-joined `allele_string` at build time rather than letting it through silently, but the manifest
+> author still has to write the split.
 >
 > The `coordinate_system_zero_based = false` argument is what makes `start` the true 1-based POS;
 > passing `true` yields `22893741`. The assertion above is the guard against that off-by-one — do not
@@ -838,7 +846,7 @@ cargo fmt --check
 ```
 Expected: all green. Fix anything that is not before proceeding — do not open the PR on a red suite.
 
-- [ ] **Step 3: Commit and open the PR into `dev-test`**
+- [ ] **Step 3: Commit and open the PR into `master-sitekwb`**
 
 ```bash
 git add datafusion/bio-function-vep/examples/build_plugin.rs

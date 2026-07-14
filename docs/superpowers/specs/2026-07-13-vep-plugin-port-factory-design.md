@@ -43,7 +43,7 @@ code, and following it would waste a session:
 |---|---|
 | `vepyr-plugins` is inaccessible; the blocker is repo access (§5) | It is cloned locally and public to us. It has a **working AlphaMissense manifest on `master`** — a real, parity-passed reference. |
 | "Python surface (already shipped): `vepyr.build_plugin_cache(...)`" (§2) | **Does not exist.** `grep -r plugin_cache` in the `vepyr` repo returns nothing. The builder is `PluginCacheBuilder` (Rust) driven by `cargo run --example build_plugin --features parquet-cache`. |
-| Seed manifests for REVEL/PrimateAI (§6.2–6.3), to be pasted in | Written blind. They use `has_header = true` with no `schema` block; the only working manifest uses `has_header = false` + an explicit `schema`. They also carry a `[tier]` block that **does not exist in `SourceManifest`** and is silently ignored. Discard them; regenerate from the AlphaMissense pattern. |
+| Seed manifests for REVEL/PrimateAI (§6.2–6.3), to be pasted in | Written blind. They declare `has_header = true` and **no `schema` block** — but `provider.rs::csv_schema` builds the Arrow schema *solely* from `[source.csv].schema`, so an absent block yields a zero-field schema. The only working manifest (AlphaMissense) uses `has_header = false` + an explicit `schema`. Discard the seeds; regenerate from that pattern. |
 | Bucket A is "framework READY, port = manifest only" | Only for `csv`/`tsv`/`parquet`. `provider.rs:111-116` returns `NotImplemented` for **`vcf`** and **`bed`**, and roughly a third of Bucket A's sources are tabix VCF (EVE, Mastermind, Geno2MP, gnomADMt, SubsetVCF). |
 
 Two facts the handoff missed, both favourable:
@@ -59,15 +59,29 @@ Two facts the handoff missed, both favourable:
 
 ---
 
-## 2. Prerequisite 0 — `dev-test` does not contain `plugin_cache`
+## 2. Base branch — `master-sitekwb` (and why it is not `dev-test`)
 
-Branch policy for this work is: **branch off `dev-test`, PR back into `dev-test`, never touch
-`master`.** But `plugin_cache` lives only on `master` (14 files); `origin/dev-test` is 14 commits
-behind and has **zero** of them.
+`plugin_cache` lives only on `master` (14 files). `dev-test` has **zero** of them, so nothing in this
+spec compiles there.
 
-So the first PR of this effort is mechanical and independent: **sync `dev-test` with `master`.**
-Nothing else in this spec can be built until it lands. It is called out here because it is invisible
-until you try to compile.
+The obvious move — "sync `dev-test` with `master`" — is **not** the mechanical merge it looks like.
+The branches diverged at `v0.10.0` and both moved:
+
+- `master` took `a6e19ad` (#181, *Lance-only cache, grid-aligned parallel annotation*), which rewrote
+  `annotate_provider.rs` (**+7130/−2576**) and **deleted** `variant_lookup_exec.rs`.
+- `dev-test` has **45 commits** of its own, including an engine feature that exists nowhere else:
+  multi-ALT CSQ per-allele expansion (`PerAltCtx`, `vcf_to_vep_allele_multi`). `master` still treats
+  `alt` as a single allele.
+
+So merging them means **porting a feature into a rewritten hot path**: 149 files merge cleanly, and
+the 5 conflicting hunks are all CSQ per-allele assembly. Get it wrong and nothing crashes — every
+multi-allelic variant is just silently mis-annotated. That deserves its own PR and its own parity
+test, and it has **nothing to do with the plugin factory**.
+
+**Decision (2026-07-13): decouple.** All factory work is based on **`master-sitekwb`** (cut from
+`master`, so it already has `plugin_cache`). It is treated as our `main`: every PR targets it, and
+**`master`/`main` are never committed to**. The multi-ALT port from `dev-test` is tracked separately
+and blocks nothing here.
 
 ---
 
@@ -278,8 +292,8 @@ Wave 0 is done when `parity --check` passes for three clients, each proving a di
 
 ## 11. Sequencing
 
-0. Sync `dev-test` with `master` (§2). Blocks everything.
-1. Engine: provider wiring + hardening (§7). PR → `dev-test`.
+0. Cut `master-sitekwb` from `master` (§2). Every PR below targets it.
+1. Engine: provider wiring + hardening (§7). PR → `master-sitekwb`.
 2. `vepyr`: `build_plugin_cache` binding + `vepyr.parity` module + `slice_cache.py`; publish the
    mini-cache release asset (§5).
 3. `vepyr-plugins`: harness `--check`/`--refresh-golden`, `parity.toml`, CI (§6).
