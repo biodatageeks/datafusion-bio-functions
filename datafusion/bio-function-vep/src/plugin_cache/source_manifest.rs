@@ -119,8 +119,8 @@ fn default_delim() -> String {
 /// ```
 ///
 /// yields `A/G|T`, which can never equal the runtime probe key (`{ref}/{alt}`, one
-/// ALT at a time) nor the variation cache's per-allele `allele_string`. Such rows are
-/// written to the shard and are dead forever: they match nothing, and nothing warns.
+/// ALT at a time) nor the variation cache's per-allele `allele_string`. Such a row
+/// would be dead forever: it matches nothing.
 ///
 /// `ingest_sql` must therefore split `alt` into ONE ROW PER ALT ALLELE, e.g.
 ///
@@ -132,8 +132,10 @@ fn default_delim() -> String {
 /// )
 /// ```
 ///
-/// A source whose every record is bi-allelic can skip this, but nothing enforces
-/// that — so prefer the split unless the input is known bi-allelic by construction.
+/// This is ENFORCED, not merely advised: `build::reject_pipe_joined_alleles` fails the
+/// build with a diagnostic if any `allele_string` reaching the shard contains `|`. A
+/// source whose every record is bi-allelic passes the guard unchanged, but prefer the
+/// split unless the input is known bi-allelic by construction.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VcfParams {

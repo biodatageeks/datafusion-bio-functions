@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, BooleanArray, Int8Array};
+use datafusion::arrow::array::{Array, BooleanArray, Int8Array, StringArray};
 use datafusion::arrow::compute::{
     cast, concat_batches, filter_record_batch, sort_to_indices, take,
 };
@@ -41,6 +41,53 @@ fn reproject_cast(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(Arc::clone(schema), cols)
         .map_err(|e| DataFusionError::Execution(format!("reproject: {e}")))
+}
+
+/// Reject an `allele_string` that still carries the VCF reader's pipe-joined
+/// multi-ALT form (`A/G|T`).
+///
+/// The bio-formats VCF reader collapses a record's ALT alleles into ONE `Utf8`
+/// value joined by `|` (`chr1 100 . A G,T` → one row, `alt = "G|T"`), so the
+/// obvious — and spec-canonical — mapping `concat(ref, '/', alt) AS allele_string`
+/// stores `A/G|T`. The runtime probes one ALT at a time (`A/G`), and the variation
+/// cache's `allele_string` is likewise per-allele, so such a row matches NOTHING:
+/// the build succeeds, the shard is written, and the plugin annotates nothing,
+/// forever, without a warning. Every VCF-backed plugin this provider unblocks
+/// (Mastermind, gnomADMt, EVE, Geno2MP) is a multi-allelic source, so this is the
+/// default outcome, not an edge case.
+///
+/// One predicate kills the whole class: no `allele_string` written to a plugin
+/// shard may contain `|`. `ingest_sql` must split the ALTs into one row per
+/// allele instead (see [`VcfParams`](crate::plugin_cache::source_manifest::VcfParams)).
+///
+/// Checked on the normalized, chrom-filtered rows already materialized in memory
+/// (not by re-querying the ingest view), so the guard costs no extra pass over
+/// what can be a tens-of-GB source.
+fn reject_pipe_joined_alleles(batches: &[RecordBatch], plugin: &str) -> Result<()> {
+    for batch in batches {
+        let idx = batch.schema().index_of("allele_string")?;
+        let col = batch.column(idx);
+        // The normalized view carries `allele_string` straight through from
+        // `ingest_sql`; a non-Utf8 spelling is caught later by the shard schema.
+        let Some(strings) = col.as_any().downcast_ref::<StringArray>() else {
+            continue;
+        };
+        let Some(offender) = strings.iter().flatten().find(|allele| allele.contains('|')) else {
+            continue;
+        };
+        return Err(DataFusionError::Execution(format!(
+            "plugin '{plugin}': ingest_sql produced an allele_string containing '|' \
+             (e.g. \"{offender}\"). The VCF reader joins a multi-allelic record's ALT \
+             alleles into ONE `alt` value ('G|T'), so `concat(ref, '/', alt)` yields a key \
+             that can never equal the runtime probe key ('{{ref}}/{{alt}}', one ALT at a time) \
+             nor the variation cache's per-allele allele_string — the shard would build \
+             cleanly and annotate nothing. Split the multi-allelic ALTs in `ingest_sql` so \
+             each ALT is its own row, e.g.\n  \
+             SELECT chrom, `start`, `end`, concat(`ref`, '/', alt_one) AS allele_string, …\n  \
+             FROM (SELECT *, unnest(string_to_array(alt, '|')) AS alt_one FROM plugin_{plugin}_src)"
+        )));
+    }
+    Ok(())
 }
 
 /// Sort a batch ascending by `start` (the per-tier run order the PageDir needs).
@@ -135,6 +182,10 @@ pub async fn build_plugin_chrom(
     let deduped = dedup_keep_first(norm_stream, &match_cols).await?;
     // The source scan is done — drop the decompressed temp before the join leg.
     drop(src_temps);
+
+    // Fail LOUDLY on a pipe-joined multi-allelic allele_string before spending the
+    // (multi-GB) tier join on rows that could never match anything.
+    reject_pipe_joined_alleles(&deduped, &src.plugin_name)?;
 
     // Build context: default parallelism for the tier join over the (multi-GB)
     // variation shard + write. The deduped survivors are re-registered here as a
@@ -413,6 +464,129 @@ type = "Float32"
             PluginScalar::F32(v) => assert!((v - 0.7).abs() < 1e-6),
             ref other => panic!("{other:?}"),
         }
+    }
+
+    // The VCF reader pipe-joins a multi-allelic record's ALTs into ONE `alt`
+    // value ("G|T"), so the canonical `concat(ref, '/', alt) AS allele_string`
+    // stores "A/G|T" — a key the runtime probe ("A/G", one ALT at a time) can
+    // never produce. Before the guard this built cleanly (rows=1) and annotated
+    // nothing, forever, with no warning. It must now be a hard build error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipe_joined_allele_string_fails_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("multi.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=SCORE,Number=1,Type=Float,Description=\"demo score\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr1\t100\t.\tA\tG,T\t.\t.\tSCORE=0.9\n",
+        )
+        .unwrap();
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        // The naive mapping the spec's own canonical example uses.
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, `start`, `end`,
+       concat(`ref`, '/', alt) AS allele_string,
+       CAST(`SCORE` AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "vcf"
+path = "{}"
+  [source.vcf]
+  info_fields = ["SCORE"]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            vcf.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        manifest
+            .validate()
+            .expect("the manifest is structurally valid");
+
+        let out = dir.path().join("out");
+        let err = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .expect_err("a pipe-joined allele_string must fail the build, not build a dead shard");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(
+            msg.contains("A/G|T"),
+            "must show an offending example value: {msg}"
+        );
+        assert!(
+            msg.contains("ingest_sql"),
+            "must tell the author where to fix it: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("split"),
+            "must tell the author to split multi-allelic ALTs: {msg}"
+        );
+    }
+
+    // The mirror: an `ingest_sql` that DOES split the pipe-joined ALTs into one
+    // row per ALT passes the guard and builds both alleles.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn splitting_multiallelic_alts_passes_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("multi.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=SCORE,Number=1,Type=Float,Description=\"demo score\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr1\t100\t.\tA\tG,T\t.\t.\tSCORE=0.9\n",
+        )
+        .unwrap();
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, `start`, `end`,
+       concat(`ref`, '/', alt_one) AS allele_string,
+       CAST(`SCORE` AS FLOAT) AS demo_score
+FROM (
+  SELECT *, unnest(string_to_array(alt, '|')) AS alt_one FROM plugin_demo_src
+)
+"""
+
+[[source]]
+provider = "vcf"
+path = "{}"
+  [source.vcf]
+  info_fields = ["SCORE"]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            vcf.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let entry = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .expect("a per-ALT split must build");
+        assert_eq!(entry.rows, 2, "one row per ALT (A/G and A/T)");
+        assert_eq!(entry.warm, 1, "A/G matches the variation cache");
+        assert_eq!(entry.cold, 1, "A/T does not");
     }
 
     // --chrom M / chrM / MT must all select the MT rows (data is folded to "MT"

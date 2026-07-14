@@ -335,6 +335,10 @@ type = "Float32"
     /// 1. a multi-allelic record is ONE row whose `alt` is the ALTs joined by `|`
     ///    (so `concat(ref,'/',alt)` yields the un-matchable `A/G|T`);
     /// 2. `end` is `POS + len(REF) - 1` for an indel, not `start`.
+    ///
+    /// This is WHY `build::reject_pipe_joined_alleles` exists — and the tail of this
+    /// test asserts that guard actually fires on exactly the value pinned here, so the
+    /// characterization and the guard can never drift apart.
     #[tokio::test(flavor = "multi_thread")]
     async fn multiallelic_alt_is_pipe_joined_and_indel_end_extends_past_start() {
         let dir = tempfile::tempdir().unwrap();
@@ -416,6 +420,47 @@ type = "Float32"
             ends.value(1),
             203,
             "an indel's end is POS + len(REF) - 1, not start"
+        );
+
+        // …and the un-matchable "A/G|T" pinned above must now FAIL the build rather
+        // than silently produce a shard that annotates nothing. (Before the guard this
+        // returned ChromEntry { rows: 1, warm: 0, cold: 1 } and no error.)
+        let var = dir.path().join("var.parquet");
+        crate::plugin_cache::test_fixtures::write_variation(&var, &[("1", 100, "A/G", 0)]);
+        let naive = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, `start`, `end`, concat(`ref`, '/', alt) AS allele_string,
+       CAST(qual AS FLOAT) AS score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "vcf"
+path = "{}"
+
+[[value_columns]]
+column = "score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            vcf.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&naive).unwrap();
+        let err = crate::plugin_cache::build::build_plugin_chrom(
+            &manifest,
+            "demo.source.toml",
+            &var,
+            &dir.path().join("out"),
+            "1",
+        )
+        .await
+        .expect_err("the pipe-joined allele_string pinned above must fail the build");
+        assert!(
+            err.to_string().contains("A/G|T"),
+            "the guard must quote the very value this test pins: {err}"
         );
     }
 }
