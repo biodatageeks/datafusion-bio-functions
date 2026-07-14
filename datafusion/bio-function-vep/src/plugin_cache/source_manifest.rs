@@ -8,12 +8,22 @@ use serde::Deserialize;
 
 /// Coordinate basis of the raw source. Drives the build-time `start` shift so
 /// ingested coordinates match the variation cache's 1-based `start`/`end`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum CoordinateSystem {
     #[serde(rename = "1-based")]
     OneBased,
     #[serde(rename = "0-based-half-open")]
     ZeroBasedHalfOpen,
+}
+
+impl CoordinateSystem {
+    /// The manifest spelling, for diagnostics.
+    pub const fn as_manifest_str(self) -> &'static str {
+        match self {
+            Self::OneBased => "1-based",
+            Self::ZeroBasedHalfOpen => "0-based-half-open",
+        }
+    }
 }
 
 /// Table provider backing a raw source. `vcf`/`bed` delegate to bio-formats
@@ -28,6 +38,19 @@ pub enum ProviderKind {
     Bed,
 }
 
+impl ProviderKind {
+    /// The manifest spelling, for diagnostics.
+    pub const fn as_manifest_str(self) -> &'static str {
+        match self {
+            Self::Vcf => "vcf",
+            Self::Csv => "csv",
+            Self::Tsv => "tsv",
+            Self::Parquet => "parquet",
+            Self::Bed => "bed",
+        }
+    }
+}
+
 /// Arrow value type for a declared column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum ValueType {
@@ -38,6 +61,7 @@ pub enum ValueType {
 
 /// One field of an explicit input schema (headerless/typed TSV).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchemaField {
     pub name: String,
     #[serde(rename = "type")]
@@ -46,6 +70,7 @@ pub struct SchemaField {
 
 /// CSV/TSV provider parameters.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CsvParams {
     #[serde(default = "default_delim")]
     pub delimiter: String,
@@ -63,8 +88,64 @@ fn default_delim() -> String {
     "\t".into()
 }
 
+/// VCF provider parameters.
+///
+/// `info_fields` selects which INFO keys are materialized as columns; omit it to
+/// take every INFO key declared in the VCF header. NOTE: the reader exposes INFO
+/// keys as **bare, case-sensitive column names** (`AF`, `ALLELE_ID`) — not
+/// `info_af` as `bio-format-vcf`'s crate docs claim — so `ingest_sql` must
+/// backtick them: ``SELECT `AF` FROM plugin_x_src``.
+///
+/// The reader's core columns are `chrom`, `start`, `end`, `id`, `ref`, `alt`, `qual`,
+/// `filter` — there is NO `pos`. VCF POS is exposed as `start` (1-based, matching the
+/// cache's coordinate system). So `ingest_sql` must select `start`/`end`, not `pos`.
+///
+/// # `end` is not always `start`
+///
+/// `end` equals `start` only for a plain single-ALT ACGT SNV. Otherwise the reader
+/// reports the variant end — `POS + len(REF) - 1` for indels/MNVs (and the INFO `END`
+/// for symbolic alleles). Do not assume `end = start` in `ingest_sql`.
+///
+/// # `alt` is pipe-joined for multi-allelic records — SPLIT IT
+///
+/// The reader joins a record's ALT alleles into ONE `Utf8` column separated by `|`
+/// (`physical_exec.rs`: `join_into(…, '|')`). A multi-allelic record
+/// `chr1 100 . A G,T` therefore arrives as a single row with `alt = "G|T"`.
+///
+/// This is a trap, because the obvious mapping
+///
+/// ```sql
+/// concat(ref, '/', alt) AS allele_string   -- WRONG for multi-allelic records
+/// ```
+///
+/// yields `A/G|T`, which can never equal the runtime probe key (`{ref}/{alt}`, one
+/// ALT at a time) nor the variation cache's per-allele `allele_string`. Such a row
+/// would be dead forever: it matches nothing.
+///
+/// `ingest_sql` must therefore split `alt` into ONE ROW PER ALT ALLELE, e.g.
+///
+/// ```sql
+/// SELECT chrom, `start`, `end`,
+///        concat(`ref`, '/', alt_one) AS allele_string, …
+/// FROM (
+///   SELECT *, unnest(string_to_array(alt, '|')) AS alt_one FROM plugin_x_src
+/// )
+/// ```
+///
+/// This is ENFORCED, not merely advised: `build::reject_pipe_joined_alleles` fails the
+/// build with a diagnostic if any `allele_string` reaching the shard contains `|`. A
+/// source whose every record is bi-allelic passes the guard unchanged, but prefer the
+/// split unless the input is known bi-allelic by construction.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VcfParams {
+    #[serde(default)]
+    pub info_fields: Option<Vec<String>>,
+}
+
 /// One raw source file registered as `plugin_<name>_src[_<part>]`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSpec {
     #[serde(default)]
     pub part: Option<String>,
@@ -72,6 +153,8 @@ pub struct SourceSpec {
     pub path: String,
     #[serde(default)]
     pub csv: Option<CsvParams>,
+    #[serde(default)]
+    pub vcf: Option<VcfParams>,
 }
 
 impl SourceSpec {
@@ -83,10 +166,20 @@ impl SourceSpec {
             None => format!("plugin_{plugin_name}_src"),
         }
     }
+
+    /// How to name this source in a diagnostic: its `part` if it has one, else its
+    /// 1-based position (so an error always points at exactly one `[[source]]`).
+    fn label(&self, index: usize) -> String {
+        match &self.part {
+            Some(p) => format!("[[source]] part = \"{p}\""),
+            None => format!("[[source]] #{}", index + 1),
+        }
+    }
 }
 
 /// A value column produced by `ingest_sql`, mapped to a CSQ output field.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValueColumn {
     pub column: String,
     pub csq_field: String,
@@ -99,6 +192,7 @@ pub struct ValueColumn {
 /// discriminator built from a `template` over the engine-attribute namespace
 /// (see `plugin_cache::template`). Empty for pure per-variant plugins.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatchColumn {
     /// Cache column name (also the column `ingest_sql` must produce).
     pub column: String,
@@ -108,6 +202,7 @@ pub struct MatchColumn {
 
 /// The full source manifest for one plugin.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceManifest {
     pub plugin_name: String,
     pub coordinate_system: CoordinateSystem,
@@ -132,14 +227,98 @@ impl SourceManifest {
 }
 
 impl SourceManifest {
-    /// Parse a source manifest from a TOML file.
+    /// Parse a source manifest from a TOML file, then [`validate`](Self::validate) it.
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|e| {
             DataFusionError::Execution(format!("read source manifest '{}': {e}", path.display()))
         })?;
-        toml::from_str(&text).map_err(|e| {
+        let manifest: Self = toml::from_str(&text).map_err(|e| {
             DataFusionError::Execution(format!("parse source manifest '{}': {e}", path.display()))
-        })
+        })?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Reject manifests whose declarations contradict each other. `deny_unknown_fields`
+    /// catches keys that do not exist; this catches keys that exist but do not belong
+    /// together — the ones the build would otherwise accept and silently ignore.
+    ///
+    /// Rules:
+    /// - at least one `[[source]]` (nothing to read otherwise — and
+    ///   `examples/build_plugin.rs` indexes `sources[0]`);
+    /// - at least one `[[value_columns]]` (a plugin that emits nothing);
+    /// - a `vcf` source requires `coordinate_system = "1-based"`;
+    /// - `[source.csv]` is only valid for `provider = "csv" | "tsv"`;
+    /// - `[source.vcf]` is only valid for `provider = "vcf"`;
+    /// - hence `parquet` (and `bed`) accept neither params block.
+    ///
+    /// Called from [`load`](Self::load) — the file path every real manifest takes —
+    /// and deliberately NOT from `Deserialize`: unit tests across this crate build
+    /// manifests straight from TOML strings via `toml::from_str`, and hooking
+    /// `Deserialize` would force every one of them through validation.
+    pub fn validate(&self) -> Result<()> {
+        let plugin = &self.plugin_name;
+
+        // `source = []` and `value_columns = []` are legal TOML and deserialize happily
+        // into empty vectors, leaving a manifest that is structurally useless: nothing to
+        // read from, or nothing to emit. The former also panics `examples/build_plugin.rs`,
+        // which indexes `sources[0]` to announce what it is building.
+        if self.sources.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "plugin '{plugin}': the manifest declares no [[source]]. A plugin cache needs at \
+                 least one source to ingest from."
+            )));
+        }
+        if self.value_columns.is_empty() {
+            return Err(DataFusionError::Execution(format!(
+                "plugin '{plugin}': the manifest declares no [[value_columns]]. A plugin that \
+                 emits no value column would build shards carrying only the lookup key and the \
+                 tier, and annotate nothing."
+            )));
+        }
+
+        for (i, spec) in self.sources.iter().enumerate() {
+            let src = spec.label(i);
+            let provider = spec.provider.as_manifest_str();
+
+            // provider.rs registers the VCF reader with coordinate_system_zero_based =
+            // false, because VCF POS is 1-based. If the manifest nonetheless claims
+            // 0-based, the builder believes the manifest and shifts every start by +1
+            // (normalize.rs). The build then succeeds, rows > 0, the cache manifest looks
+            // healthy — and every runtime key misses, so the plugin annotates nothing.
+            if spec.provider == ProviderKind::Vcf
+                && self.coordinate_system != CoordinateSystem::OneBased
+            {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin '{plugin}': {src} declares provider = \"vcf\", which requires \
+                     coordinate_system = \"1-based\" (VCF POS is 1-based), but the manifest \
+                     declares coordinate_system = \"{}\". The build would shift every start \
+                     by +1, and the plugin would silently annotate nothing.",
+                    self.coordinate_system.as_manifest_str()
+                )));
+            }
+
+            // A params block that does not match its provider is read by nobody: the
+            // provider factory reaches for `spec.csv` only for csv/tsv and `spec.vcf`
+            // only for vcf. Declaring the other one is always a mistake, and silently
+            // dropping it costs (e.g.) the whole `info_fields` INFO selection.
+            if spec.csv.is_some() && !matches!(spec.provider, ProviderKind::Csv | ProviderKind::Tsv)
+            {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin '{plugin}': {src} declares provider = \"{provider}\" with a \
+                     [source.csv] block. [source.csv] is only valid for provider = \"csv\" \
+                     or \"tsv\"; here it would be silently ignored."
+                )));
+            }
+            if spec.vcf.is_some() && spec.provider != ProviderKind::Vcf {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin '{plugin}': {src} declares provider = \"{provider}\" with a \
+                     [source.vcf] block. [source.vcf] (e.g. info_fields) is only valid for \
+                     provider = \"vcf\"; here it would be silently ignored."
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The ingest view name: `plugin_<name>_ingest`.
@@ -210,7 +389,345 @@ type = "Float32"
             provider: ProviderKind::Csv,
             path: "x".into(),
             csv: None,
+            vcf: None,
         };
         assert_eq!(src.table_name("cadd"), "plugin_cadd_src");
+    }
+
+    #[test]
+    fn parses_vcf_source_with_selected_info_fields() {
+        let src = r##"
+plugin_name = "mastermind"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "/tmp/mastermind.vcf.gz"
+  [source.vcf]
+  info_fields = ["MMID3", "MMCNT1"]
+
+[[value_columns]]
+column = "mmid3"
+csq_field = "MM_MMID3"
+type = "Utf8"
+"##;
+        let m: SourceManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.sources[0].provider, ProviderKind::Vcf);
+        let vcf = m.sources[0].vcf.as_ref().expect("[source.vcf] must parse");
+        assert_eq!(
+            vcf.info_fields.as_deref(),
+            Some(["MMID3".to_string(), "MMCNT1".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn vcf_source_without_vcf_table_takes_every_info_key() {
+        // No `[source.vcf]` at all: `vcf` stays `None`, which the provider reads as
+        // "materialize every INFO key declared in the VCF header".
+        let src = r##"
+plugin_name = "mastermind"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "/tmp/mastermind.vcf.gz"
+
+[[value_columns]]
+column = "mmid3"
+csq_field = "MM_MMID3"
+type = "Utf8"
+"##;
+        let m: SourceManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.sources[0].provider, ProviderKind::Vcf);
+        assert!(
+            m.sources[0].vcf.is_none(),
+            "an omitted [source.vcf] must leave `vcf` as None (= take all INFO keys)"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_key_inside_vcf_table() {
+        // `info_field` (singular) is the plausible typo for `info_fields`. Without
+        // deny_unknown_fields on VcfParams this parses happily into `info_fields: None`,
+        // i.e. silently indistinguishable from omitting [source.vcf] entirely — the
+        // whole INFO selection would be dropped with no diagnostic.
+        let src = r##"
+plugin_name = "mastermind"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "/tmp/mastermind.vcf.gz"
+  [source.vcf]
+  info_field = ["MMID3", "MMCNT1"]
+
+[[value_columns]]
+column = "mmid3"
+csq_field = "MM_MMID3"
+type = "Utf8"
+"##;
+        let err = toml::from_str::<SourceManifest>(src)
+            .expect_err("unknown key `info_field` inside [source.vcf] must be rejected");
+        assert!(
+            err.to_string().contains("info_field"),
+            "the error must name the offending key, got: {err}"
+        );
+    }
+
+    /// `validate()` runs on the file path, so these go through a real temp file.
+    fn load_str(body: &str) -> Result<SourceManifest> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.source.toml");
+        std::fs::write(&path, body).unwrap();
+        SourceManifest::load(&path)
+    }
+
+    /// A manifest with one `[[source]]` of the given provider, coordinate system and
+    /// optional params block.
+    fn manifest_with(provider: &str, coord: &str, params: &str) -> String {
+        format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "{coord}"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "{provider}"
+path = "/tmp/x"
+{params}
+
+[[value_columns]]
+column = "s"
+csq_field = "S"
+type = "Float32"
+"##
+        )
+    }
+
+    // provider.rs hard-wires the VCF reader to `coordinate_system_zero_based = false`
+    // because VCF POS is 1-based. Nothing stopped a manifest from ALSO declaring
+    // `0-based-half-open`, in which case the builder trusts the manifest and shifts
+    // every start by +1 (normalize.rs). The build then succeeds with rows > 0 and a
+    // healthy-looking manifest, while every key misses and the plugin annotates
+    // nothing. Total, silent failure — so it must be rejected at load.
+    #[test]
+    fn vcf_source_with_zero_based_coordinates_is_rejected() {
+        let err = load_str(&manifest_with("vcf", "0-based-half-open", ""))
+            .expect_err("vcf + 0-based-half-open must not load");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(msg.contains("vcf"), "must name the provider: {msg}");
+        assert!(
+            msg.contains("0-based-half-open"),
+            "must name the offending value: {msg}"
+        );
+        assert!(msg.contains("1-based"), "must say what is required: {msg}");
+    }
+
+    #[test]
+    fn vcf_source_with_one_based_coordinates_loads() {
+        let m = load_str(&manifest_with("vcf", "1-based", "")).expect("vcf + 1-based is valid");
+        assert_eq!(m.sources[0].provider, ProviderKind::Vcf);
+    }
+
+    // A [source.csv] block under provider = "vcf" parses fine and is then silently
+    // discarded by the provider factory. Say so instead.
+    #[test]
+    fn csv_params_on_a_vcf_source_are_rejected() {
+        let err = load_str(&manifest_with(
+            "vcf",
+            "1-based",
+            "  [source.csv]\n  delimiter = \"\\t\"",
+        ))
+        .expect_err("[source.csv] under provider = \"vcf\" must not load");
+        let msg = err.to_string();
+        assert!(msg.contains("[source.csv]"), "must name the block: {msg}");
+        assert!(msg.contains("vcf"), "must name the provider: {msg}");
+    }
+
+    // The mirror: `[source.vcf] info_fields = [...]` under provider = "csv" silently
+    // drops the INFO selection.
+    #[test]
+    fn vcf_params_on_a_csv_source_are_rejected() {
+        let err = load_str(&manifest_with(
+            "csv",
+            "1-based",
+            "  [source.vcf]\n  info_fields = [\"AF\"]",
+        ))
+        .expect_err("[source.vcf] under provider = \"csv\" must not load");
+        let msg = err.to_string();
+        assert!(msg.contains("[source.vcf]"), "must name the block: {msg}");
+        assert!(msg.contains("csv"), "must name the provider: {msg}");
+    }
+
+    #[test]
+    fn parquet_source_accepts_neither_params_block() {
+        let csv_err = load_str(&manifest_with(
+            "parquet",
+            "1-based",
+            "  [source.csv]\n  delimiter = \"\\t\"",
+        ))
+        .expect_err("parquet + [source.csv] must not load");
+        assert!(csv_err.to_string().contains("[source.csv]"), "{csv_err}");
+
+        let vcf_err = load_str(&manifest_with(
+            "parquet",
+            "1-based",
+            "  [source.vcf]\n  info_fields = [\"AF\"]",
+        ))
+        .expect_err("parquet + [source.vcf] must not load");
+        assert!(vcf_err.to_string().contains("[source.vcf]"), "{vcf_err}");
+
+        load_str(&manifest_with("parquet", "1-based", "")).expect("bare parquet source is valid");
+    }
+
+    // With several sources, a diagnostic that does not say WHICH one is nearly
+    // useless — name the offending `part`.
+    #[test]
+    fn validation_error_names_the_offending_part() {
+        let src = r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+part = "snv"
+provider = "csv"
+path = "/tmp/snv.tsv"
+  [source.csv]
+  delimiter = "\t"
+
+[[source]]
+part = "sites"
+provider = "csv"
+path = "/tmp/sites.vcf"
+  [source.vcf]
+  info_fields = ["AF"]
+
+[[value_columns]]
+column = "s"
+csq_field = "S"
+type = "Float32"
+"##;
+        let err = load_str(src).expect_err("the second source is misconfigured");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sites"),
+            "must name the offending part, not just the plugin: {msg}"
+        );
+    }
+
+    // The shape of the real AlphaMissense manifest: tsv + [source.csv] + 1-based.
+    // It must keep loading.
+    #[test]
+    fn tsv_source_with_csv_params_stays_valid() {
+        let m = load_str(&manifest_with(
+            "tsv",
+            "1-based",
+            "  [source.csv]\n  delimiter = \"\\t\"\n  compression = \"gzip\"",
+        ))
+        .expect("tsv + [source.csv] + 1-based is the AlphaMissense shape and must stay valid");
+        assert_eq!(m.sources[0].provider, ProviderKind::Tsv);
+        assert!(m.sources[0].csv.is_some());
+    }
+
+    // A csv/tsv source may legitimately be 0-based; only `vcf` is pinned to 1-based.
+    #[test]
+    fn zero_based_is_still_allowed_for_non_vcf_providers() {
+        let m = load_str(&manifest_with("csv", "0-based-half-open", ""))
+            .expect("a 0-based csv source is legitimate (the builder shifts it)");
+        assert_eq!(m.coordinate_system, CoordinateSystem::ZeroBasedHalfOpen);
+    }
+
+    // validate() hangs off load(), NOT Deserialize: the tests above and elsewhere
+    // build manifests straight from TOML strings, and must keep working.
+    #[test]
+    fn toml_from_str_does_not_validate() {
+        let m: SourceManifest =
+            toml::from_str(&manifest_with("vcf", "0-based-half-open", "")).unwrap();
+        assert!(
+            m.validate().is_err(),
+            "the same manifest must fail an explicit validate()"
+        );
+    }
+
+    // `source = []` parses (an empty array of tables is legal TOML) and then panics in
+    // examples/build_plugin.rs, which indexes `manifest.sources[0]` to print what it is
+    // building. A manifest with nothing to read is structurally useless — say so.
+    #[test]
+    fn manifest_without_a_source_is_rejected() {
+        let src = r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+source = []
+
+[[value_columns]]
+column = "s"
+csq_field = "S"
+type = "Float32"
+"##;
+        let err = load_str(src).expect_err("a manifest with no [[source]] must not load");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(
+            msg.contains("[[source]]"),
+            "must name what is missing: {msg}"
+        );
+    }
+
+    // The mirror: no `[[value_columns]]` means a plugin that emits nothing — it would
+    // build shards whose only columns are the key and the tier.
+    #[test]
+    fn manifest_without_a_value_column_is_rejected() {
+        let src = r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+value_columns = []
+
+[[source]]
+provider = "csv"
+path = "/tmp/x"
+"##;
+        let err = load_str(src).expect_err("a manifest with no [[value_columns]] must not load");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(
+            msg.contains("[[value_columns]]"),
+            "must name what is missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_key_instead_of_ignoring_it() {
+        // `[tier]` is documented in old handoffs but does not exist in SourceManifest.
+        // Before deny_unknown_fields this parsed happily and did nothing.
+        let src = r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "csv"
+path = "/tmp/x.tsv"
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+
+[tier]
+threshold = 0.01
+"##;
+        let err =
+            toml::from_str::<SourceManifest>(src).expect_err("unknown key [tier] must be rejected");
+        assert!(
+            err.to_string().contains("tier"),
+            "the error must name the offending key, got: {err}"
+        );
     }
 }

@@ -10,6 +10,7 @@
 pub mod build;
 pub mod builder;
 pub mod cache_manifest;
+pub mod cli;
 pub mod csq;
 pub mod dedup;
 pub mod join;
@@ -19,4 +20,6 @@ pub mod provider;
 pub mod registry;
 pub mod source_manifest;
 pub mod template;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 pub mod write;

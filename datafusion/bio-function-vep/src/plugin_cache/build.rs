@@ -5,16 +5,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, BooleanArray, Int8Array};
+use datafusion::arrow::array::{Array, AsArray, BooleanArray, Int8Array};
 use datafusion::arrow::compute::{
-    cast, concat_batches, filter_record_batch, sort_to_indices, take,
+    CastOptions, cast_with_options, concat_batches, filter_record_batch, sort_to_indices, take,
 };
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
+use log::warn;
 
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
@@ -29,18 +30,163 @@ use crate::plugin_cache::write::{PluginShardWriter, plugin_output_schema};
 
 /// Reproject `batch` to `schema`'s column order and types (casting where needed,
 /// e.g. the normalized view's `Int64` `start`/`end` → the shard's `UInt32`).
+///
+/// The cast is DELIBERATELY unsafe (`CastOptions { safe: false }`). Arrow's default —
+/// what `arrow::compute::cast` gives you — is `safe: true`, which turns a value it
+/// cannot cast into NULL rather than an error. Applied to a manifest's declared
+/// `[[value_columns]] type`, that made a wrong type a *silent* failure, and the worst
+/// one in the build: declaring `type = "Float32"` for a categorical string column
+/// produced
+///
+/// ```text
+/// build SUCCEEDED: rows=1 warm=1 cold=0    <-- even the counts look healthy
+/// probe(100,"A/G") = Some([Null])          <-- every annotation empty
+/// ```
+///
+/// and the real AlphaMissense manifest has `am_class` (Utf8) sitting directly above
+/// `am_pathogenicity` (Float32), so swapping two adjacent `type =` lines was enough.
+///
+/// `safe: false` makes that a hard build error naming the column and the two types.
+/// It does NOT reject legitimately-null source data: a null slot is not a value that
+/// failed to cast, and arrow preserves it either way (pinned by
+/// `correct_types_and_null_source_values_still_build`).
 fn reproject_cast(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    let strict = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
     let cols = schema
         .fields()
         .iter()
         .map(|f| {
             let idx = batch.schema().index_of(f.name())?;
-            cast(batch.column(idx), f.data_type())
-                .map_err(|e| DataFusionError::Execution(format!("cast {}: {e}", f.name())))
+            let col = batch.column(idx);
+            cast_with_options(col, f.data_type(), &strict).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "plugin value column '{}' is declared type {} but the ingested data is {} \
+                     and does not fit it: {e}. Fix the column's `type` in the manifest (or make \
+                     `ingest_sql` produce the declared type) — a lenient cast would have written \
+                     NULL for every offending row and the plugin would annotate nothing.",
+                    f.name(),
+                    f.data_type(),
+                    col.data_type(),
+                ))
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(Arc::clone(schema), cols)
         .map_err(|e| DataFusionError::Execution(format!("reproject: {e}")))
+}
+
+/// Reject an `allele_string` that still carries the VCF reader's pipe-joined
+/// multi-ALT form (`A/G|T`).
+///
+/// The bio-formats VCF reader collapses a record's ALT alleles into ONE `Utf8`
+/// value joined by `|` (`chr1 100 . A G,T` → one row, `alt = "G|T"`), so the
+/// obvious — and spec-canonical — mapping `concat(ref, '/', alt) AS allele_string`
+/// stores `A/G|T`. The runtime probes one ALT at a time (`A/G`), and the variation
+/// cache's `allele_string` is likewise per-allele, so such a row matches NOTHING:
+/// the build succeeds, the shard is written, and the plugin annotates nothing,
+/// forever, without a warning. Every VCF-backed plugin this provider unblocks
+/// (Mastermind, gnomADMt, EVE, Geno2MP) is a multi-allelic source, so this is the
+/// default outcome, not an edge case.
+///
+/// One predicate kills the whole class: no `allele_string` written to a plugin
+/// shard may contain `|`. `ingest_sql` must split the ALTs into one row per
+/// allele instead (see [`VcfParams`](crate::plugin_cache::source_manifest::VcfParams)).
+///
+/// Checked on the normalized, chrom-filtered rows already materialized in memory
+/// (not by re-querying the ingest view), so the guard costs no extra pass over
+/// what can be a tens-of-GB source.
+///
+/// # The guard must not fail OPEN
+///
+/// Which Arrow string encoding `allele_string` arrives in is DataFusion's choice, not
+/// the manifest's: a parquet source yields `Utf8View` (`schema_force_view_types` is on
+/// by default), CSV/TSV and the VCF reader yield `Utf8`, and `LargeUtf8` is reachable
+/// through an `ingest_sql` cast. The first version of this guard downcast to
+/// `StringArray` alone and `continue`d otherwise — so `provider = "parquet"` skipped the
+/// check outright and built the very shard the guard exists to prevent:
+///
+/// ```text
+/// PROBE TYPES: alt=Utf8View allele_string=Utf8View
+/// PROBE RESULT: guard SILENTLY SKIPPED — built ChromEntry { rows: 1, warm: 0, cold: 1 }
+///               with a pipe-joined allele_string
+/// ```
+///
+/// Hence: every string encoding is checked, and anything that is NOT a string is an
+/// ERROR naming the Arrow type found. "I do not recognize this column, so I will assume
+/// it is fine" is precisely the silence this whole guard is here to break.
+fn reject_pipe_joined_alleles(batches: &[RecordBatch], plugin: &str) -> Result<()> {
+    /// First non-null value containing `|`, over any of Arrow's string iterators.
+    fn first_pipe_joined<'a>(mut values: impl Iterator<Item = Option<&'a str>>) -> Option<&'a str> {
+        values.find_map(|v| v.filter(|allele| allele.contains('|')))
+    }
+
+    for batch in batches {
+        let idx = batch.schema().index_of("allele_string")?;
+        let col = batch.column(idx);
+        let offender = match col.data_type() {
+            DataType::Utf8 => first_pipe_joined(col.as_string::<i32>().iter()),
+            DataType::LargeUtf8 => first_pipe_joined(col.as_string::<i64>().iter()),
+            DataType::Utf8View => first_pipe_joined(col.as_string_view().iter()),
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin '{plugin}': ingest_sql produced an allele_string of Arrow type \
+                     {other}, but allele_string must be a string (Utf8, Utf8View or LargeUtf8) — \
+                     it is the key the runtime probes on and the variation cache joins on. Fix \
+                     the column's expression in `ingest_sql` (canonically \
+                     `concat(ref, '/', alt) AS allele_string`, one row per ALT)."
+                )));
+            }
+        };
+        let Some(offender) = offender else {
+            continue;
+        };
+        return Err(DataFusionError::Execution(format!(
+            "plugin '{plugin}': ingest_sql produced an allele_string containing '|' \
+             (e.g. \"{offender}\"). The VCF reader joins a multi-allelic record's ALT \
+             alleles into ONE `alt` value ('G|T'), so `concat(ref, '/', alt)` yields a key \
+             that can never equal the runtime probe key ('{{ref}}/{{alt}}', one ALT at a time) \
+             nor the variation cache's per-allele allele_string — the shard would build \
+             cleanly and annotate nothing. Split the multi-allelic ALTs in `ingest_sql` so \
+             each ALT is its own row, e.g.\n  \
+             SELECT chrom, `start`, `end`, concat(`ref`, '/', alt_one) AS allele_string, …\n  \
+             FROM (SELECT *, unnest(string_to_array(alt, '|')) AS alt_one FROM plugin_{plugin}_src)"
+        )));
+    }
+    Ok(())
+}
+
+/// The warning text for a chrom that wrote rows of which NOT ONE joined the variation
+/// cache — or `None` when there is nothing to say.
+///
+/// `warm == 0` with `rows > 0` is the shared signature of every silent failure this
+/// build can produce: a wrong `coordinate_system` (every start off by one), a
+/// `chr1`-vs-`1` contig mismatch, an `allele_string` in the wrong shape. The variation
+/// LEFT JOIN is on `(chrom, start, allele_string)`, so if not one row of a whole
+/// chromosome matched, the probe key almost certainly does not have the shape the
+/// runtime will ask for — and the runtime will therefore find nothing either.
+///
+/// A WARNING, not an error: cold rows remain probeable, and a legitimately all-cold
+/// plugin (every variant absent from the variation cache) is conceivable. But the
+/// number was already computed and printed, and nothing acted on it. It must not be
+/// silent.
+///
+/// Returned as a value rather than logged in place so the condition is unit-testable
+/// without installing a process-global `log` sink.
+fn no_warm_rows_warning(plugin: &str, chrom: &str, rows: usize, warm: usize) -> Option<String> {
+    (rows > 0 && warm == 0).then(|| {
+        format!(
+            "plugin '{plugin}' chrom {chrom}: {rows} rows written but warm = 0 — NOT ONE row \
+             joined the variation cache on (chrom, start, allele_string). The runtime probes on \
+             that same key, so it will most likely find nothing either and this plugin will \
+             annotate nothing. Usual causes: contig naming (`chr1` vs `1`), the manifest's \
+             coordinate_system (every start off by one), or the allele_string format (it must be \
+             per-allele `{{ref}}/{{alt}}`). If this source genuinely holds no variant present in \
+             the variation cache, this warning is expected."
+        )
+    })
 }
 
 /// Sort a batch ascending by `start` (the per-tier run order the PageDir needs).
@@ -136,6 +282,10 @@ pub async fn build_plugin_chrom(
     // The source scan is done — drop the decompressed temp before the join leg.
     drop(src_temps);
 
+    // Fail LOUDLY on a pipe-joined multi-allelic allele_string before spending the
+    // (multi-GB) tier join on rows that could never match anything.
+    reject_pipe_joined_alleles(&deduped, &src.plugin_name)?;
+
     // Build context: default parallelism for the tier join over the (multi-GB)
     // variation shard + write. The deduped survivors are re-registered here as a
     // MemTable the join consumes in place of the raw normalized view.
@@ -209,8 +359,14 @@ pub async fn build_plugin_chrom(
     if rows == 0 {
         let _ = std::fs::remove_file(&shard_path);
     }
+    let label = canonical_chrom_label(chrom);
+    // A shard whose every row missed the variation cache is the signature of a
+    // mis-declared manifest — say so instead of printing `warm=0` and moving on.
+    if let Some(msg) = no_warm_rows_warning(&src.plugin_name, &label, rows, warm) {
+        warn!("{msg}");
+    }
     Ok(ChromEntry {
-        chrom: canonical_chrom_label(chrom),
+        chrom: label,
         file: file_name,
         rows,
         warm,
@@ -226,7 +382,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use std::io::Write;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn write_gz(path: &std::path::Path, body: &str) {
         let f = std::fs::File::create(path).unwrap();
@@ -256,6 +412,45 @@ mod tests {
                     rows.iter().map(|r| r.2).collect::<Vec<_>>(),
                 )),
                 Arc::new(Int8Array::from(
+                    rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// A `provider = "parquet"` plugin SOURCE (chrom, pos, allele_string, score).
+    ///
+    /// Written with `Utf8` string columns — but that is NOT what the build reads back:
+    /// DataFusion's parquet reader materializes them as `Utf8View`
+    /// (`schema_force_view_types`, on by default), which is exactly the encoding the
+    /// pipe guard used to skip.
+    fn write_parquet_source(path: &std::path::Path, rows: &[(&str, u32, &str, f32)]) {
+        use datafusion::arrow::array::Float32Array;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("pos", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt32Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float32Array::from(
                     rows.iter().map(|r| r.3).collect::<Vec<_>>(),
                 )),
             ],
@@ -413,6 +608,637 @@ type = "Float32"
             PluginScalar::F32(v) => assert!((v - 0.7).abs() < 1e-6),
             ref other => panic!("{other:?}"),
         }
+    }
+
+    // The VCF reader pipe-joins a multi-allelic record's ALTs into ONE `alt`
+    // value ("G|T"), so the canonical `concat(ref, '/', alt) AS allele_string`
+    // stores "A/G|T" — a key the runtime probe ("A/G", one ALT at a time) can
+    // never produce. Before the guard this built cleanly (rows=1) and annotated
+    // nothing, forever, with no warning. It must now be a hard build error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipe_joined_allele_string_fails_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("multi.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=SCORE,Number=1,Type=Float,Description=\"demo score\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr1\t100\t.\tA\tG,T\t.\t.\tSCORE=0.9\n",
+        )
+        .unwrap();
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        // The naive mapping the spec's own canonical example uses.
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, `start`, `end`,
+       concat(`ref`, '/', alt) AS allele_string,
+       CAST(`SCORE` AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "vcf"
+path = "{}"
+  [source.vcf]
+  info_fields = ["SCORE"]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            vcf.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        manifest
+            .validate()
+            .expect("the manifest is structurally valid");
+
+        let out = dir.path().join("out");
+        let err = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .expect_err("a pipe-joined allele_string must fail the build, not build a dead shard");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(
+            msg.contains("A/G|T"),
+            "must show an offending example value: {msg}"
+        );
+        assert!(
+            msg.contains("ingest_sql"),
+            "must tell the author where to fix it: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("split"),
+            "must tell the author to split multi-allelic ALTs: {msg}"
+        );
+    }
+
+    /// The guard above, but reached through a `provider = "parquet"` source — the hole
+    /// review found in it.
+    ///
+    /// DataFusion's parquet reader hands string columns back as `Utf8View`, not `Utf8`
+    /// (`schema_force_view_types` is on by default), so the guard's
+    /// `downcast_ref::<StringArray>()` returned `None` and its `else { continue }` SKIPPED
+    /// the check entirely: a pipe-joined `allele_string` sailed through and built the exact
+    /// dead shard the guard exists to prevent (`rows: 1, warm: 0, cold: 1`, annotating
+    /// nothing forever). A guard whose whole thesis is "fail LOUDLY" must not fail OPEN on
+    /// an encoding it did not anticipate.
+    ///
+    /// Pipe-joined `allele_string` values reach parquet sources for real: the VCF-derived
+    /// dumps plugins ship (and any parquet materialized from one with the naive
+    /// `concat(ref, '/', alt)`) carry `A/G|T` verbatim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipe_joined_allele_string_from_a_parquet_source_fails_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.parquet");
+        write_parquet_source(&src, &[("chr1", 100, "A/G|T", 0.9)]);
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "parquet"
+path = "{}"
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            src.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        manifest
+            .validate()
+            .expect("the manifest is structurally valid");
+
+        let out = dir.path().join("out");
+        let err = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .expect_err(
+                "a pipe-joined allele_string must fail the build whatever string encoding \
+                 DataFusion chose for it — parquet gives Utf8View, not Utf8",
+            );
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(
+            msg.contains("A/G|T"),
+            "must show an offending example value: {msg}"
+        );
+        assert!(
+            msg.contains("ingest_sql"),
+            "must tell the author where to fix it: {msg}"
+        );
+    }
+
+    /// The guard's fallback arm must be an ERROR, not a `continue`.
+    ///
+    /// An `allele_string` that is not a string at all is a broken manifest — and it is
+    /// precisely the case the guard cannot check. Skipping it silently is how the
+    /// `Utf8View` hole above stayed invisible; the build must instead say what it found.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_string_allele_string_fails_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("src.tsv.gz");
+        write_gz(&tsv, "chr1\t100\tA\tG\t0.9\n");
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        // `allele_string` is an INT here — a typo'd ingest_sql that names the wrong
+        // column. The shard schema would happily stringify it ("100") and the plugin
+        // would then annotate nothing.
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       CAST(pos AS INT) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let err = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .expect_err("a non-string allele_string is a broken manifest, not a check to skip");
+        let msg = err.to_string();
+        assert!(msg.contains("demo"), "must name the plugin: {msg}");
+        assert!(msg.contains("allele_string"), "must name the column: {msg}");
+        assert!(
+            msg.contains("Int32"),
+            "must name the Arrow type actually found: {msg}"
+        );
+    }
+
+    // The mirror: an `ingest_sql` that DOES split the pipe-joined ALTs into one
+    // row per ALT passes the guard and builds both alleles.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn splitting_multiallelic_alts_passes_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("multi.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n\
+             ##INFO=<ID=SCORE,Number=1,Type=Float,Description=\"demo score\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr1\t100\t.\tA\tG,T\t.\t.\tSCORE=0.9\n",
+        )
+        .unwrap();
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, `start`, `end`,
+       concat(`ref`, '/', alt_one) AS allele_string,
+       CAST(`SCORE` AS FLOAT) AS demo_score
+FROM (
+  SELECT *, unnest(string_to_array(alt, '|')) AS alt_one FROM plugin_demo_src
+)
+"""
+
+[[source]]
+provider = "vcf"
+path = "{}"
+  [source.vcf]
+  info_fields = ["SCORE"]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            vcf.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let entry = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .expect("a per-ALT split must build");
+        assert_eq!(entry.rows, 2, "one row per ALT (A/G and A/T)");
+        assert_eq!(entry.warm, 1, "A/G matches the variation cache");
+        assert_eq!(entry.cold, 1, "A/T does not");
+    }
+
+    /// The AlphaMissense manifest declares `am_class` (Utf8) directly above
+    /// `am_pathogenicity` (Float32). Swap the two `type =` lines and `reproject_cast`'s
+    /// arrow `cast` — whose default is `CastOptions { safe: true }` — turned every
+    /// unparseable "likely_benign" into NULL instead of erroring:
+    ///
+    /// ```text
+    /// build SUCCEEDED: rows=1 warm=1 cold=0    <-- even the counts look healthy
+    /// probe(100,"A/G") = Some([Null])          <-- every annotation empty
+    /// ```
+    ///
+    /// Worse than the multi-allelic trap, because there the row counts at least hinted
+    /// at it. A declared type the data cannot hold must be a hard build error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn value_column_type_mismatch_fails_the_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("am.tsv.gz");
+        // The AlphaMissense column layout: a categorical class and a float score.
+        write_gz(&tsv, "chr1\t100\tA\tG\tlikely_benign\t0.0431\n");
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        // `am_class` is declared Float32 — the swap. "likely_benign" is not a float.
+        let toml = format!(
+            r##"
+plugin_name = "am"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string,
+       am_class AS am_class,
+       CAST(score AS FLOAT) AS am_pathogenicity
+FROM plugin_am_src
+"""
+
+[[source]]
+provider = "tsv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom",    type = "Utf8" }},
+    {{ name = "pos",      type = "Utf8" }},
+    {{ name = "ref",      type = "Utf8" }},
+    {{ name = "alt",      type = "Utf8" }},
+    {{ name = "am_class", type = "Utf8" }},
+    {{ name = "score",    type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "am_class"
+csq_field = "am_class"
+type = "Float32"
+
+[[value_columns]]
+column = "am_pathogenicity"
+csq_field = "am_pathogenicity"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let err = build_plugin_chrom(&manifest, "am.source.toml", &var, &out, "1")
+            .await
+            .expect_err("a value column the declared type cannot hold must fail the build");
+        let msg = err.to_string();
+        assert!(msg.contains("am_class"), "must name the column: {msg}");
+        assert!(
+            msg.contains("Utf8") && msg.contains("Float32"),
+            "must name both types: {msg}"
+        );
+    }
+
+    /// The guard must not fire on the AlphaMissense manifest's REAL types (Utf8 class +
+    /// Float32 score), nor on a legitimately NULL source value: `safe: false` rejects
+    /// values that cannot be cast, and a null is not one of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn correct_types_and_null_source_values_still_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("am.tsv.gz");
+        // Row 2 has an EMPTY score field -> a NULL Float32 after the ingest CAST.
+        write_gz(
+            &tsv,
+            "chr1\t100\tA\tG\tlikely_benign\t0.0431\nchr1\t300\tC\tT\tambiguous\t\n",
+        );
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+
+        let toml = format!(
+            r##"
+plugin_name = "am"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string,
+       am_class AS am_class,
+       CAST(score AS FLOAT) AS am_pathogenicity
+FROM plugin_am_src
+"""
+
+[[source]]
+provider = "tsv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom",    type = "Utf8" }},
+    {{ name = "pos",      type = "Utf8" }},
+    {{ name = "ref",      type = "Utf8" }},
+    {{ name = "alt",      type = "Utf8" }},
+    {{ name = "am_class", type = "Utf8" }},
+    {{ name = "score",    type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "am_class"
+csq_field = "am_class"
+type = "Utf8"
+
+[[value_columns]]
+column = "am_pathogenicity"
+csq_field = "am_pathogenicity"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let entry = build_plugin_chrom(&manifest, "am.source.toml", &var, &out, "1")
+            .await
+            .expect("the AlphaMissense types are legitimate and must keep building");
+        assert_eq!(entry.rows, 2);
+        assert_eq!(entry.warm, 1);
+        assert_eq!(entry.cold, 1);
+    }
+
+    /// `warm == 0` with `rows > 0` is the shared signature of EVERY silent failure in
+    /// this build — a wrong coordinate_system, a `chr1`-vs-`1` contig mismatch, a
+    /// mis-shaped allele_string: not one row joined the variation cache. The number was
+    /// already computed and printed; nothing acted on it. It must at least warn.
+    #[test]
+    fn all_cold_chrom_is_detected() {
+        assert!(
+            no_warm_rows_warning("demo", "chr1", 1_000, 0).is_some(),
+            "rows > 0 with warm == 0 must be flagged"
+        );
+        let msg = no_warm_rows_warning("demo", "chr1", 1_000, 0).unwrap();
+        assert!(msg.contains("demo") && msg.contains("chr1"), "{msg}");
+        // The usual causes, so the author has somewhere to look.
+        assert!(msg.contains("contig"), "must list contig naming: {msg}");
+        assert!(
+            msg.contains("coordinate"),
+            "must list coordinate system: {msg}"
+        );
+        assert!(
+            msg.contains("allele_string"),
+            "must list allele-string format: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_or_empty_chrom_does_not_warn() {
+        // At least one row joined -> the key format is demonstrably right.
+        assert!(no_warm_rows_warning("demo", "chr1", 1_000, 1).is_none());
+        // No rows at all -> a different (already visible) problem, not this one.
+        assert!(no_warm_rows_warning("demo", "chr1", 0, 0).is_none());
+    }
+
+    /// End-to-end: a `chr1`-vs-`1` contig mismatch in the VARIATION shard (the plugin
+    /// side is canonicalized, the variation side here is not) builds cleanly with
+    /// rows > 0 and warm == 0 — and the detector fires on the returned entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contig_mismatch_builds_all_cold_and_is_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("src.tsv.gz");
+        write_gz(&tsv, "chr1\t100\tA\tG\t0.9\nchr1\t300\tG\tA\t0.7\n");
+        let var = dir.path().join("var.parquet");
+        // The variation shard spells the contig "chr1"; the plugin side canonicalizes to
+        // "1", so NOTHING joins — exactly the failure this warning exists to surface.
+        write_synthetic_variation(&var, &[("chr1", 100, "A/G", 0i8)]);
+
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let entry = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .expect("a contig mismatch is a warning, NOT an error: cold rows stay probeable");
+        assert_eq!(entry.rows, 2, "the rows are written");
+        assert_eq!(
+            entry.warm, 0,
+            "…but not one of them joined the variation cache"
+        );
+        assert!(
+            no_warm_rows_warning(&manifest.plugin_name, &entry.chrom, entry.rows, entry.warm)
+                .is_some(),
+            "the all-cold chrom must be flagged: {entry:?}"
+        );
+    }
+
+    /// Every warn-level record emitted anywhere in this test binary, with its level.
+    ///
+    /// `log::set_logger` is process-global and one-shot, and `build_plugin_chrom`'s
+    /// `warn!` fires on whatever tokio worker thread happens to run the build — so a
+    /// thread-local capture (`testing_logger`) would miss it, and a second logger
+    /// (`env_logger`) could not coexist with it. One shared sink, installed once and
+    /// filtered by the emitting test's unique plugin name, is correct under `cargo test`'s
+    /// parallelism and needs no new dependency.
+    static WARN_RECORDS: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
+
+    struct CapturingLogger;
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, meta: &log::Metadata) -> bool {
+            meta.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                WARN_RECORDS
+                    .lock()
+                    .unwrap()
+                    .push((record.level(), record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Install [`CapturingLogger`] as the process logger (idempotent, one-shot).
+    fn install_capturing_logger() {
+        static LOGGER: CapturingLogger = CapturingLogger;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            log::set_logger(&LOGGER).expect("no other logger may be installed in this test binary");
+            // Without this the default max level is `Off` and `warn!` never even calls us.
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+    }
+
+    /// Records emitted for one plugin — the name is unique per test, so parallel tests
+    /// (and DataFusion's own warnings) cannot be mistaken for ours.
+    fn records_for_plugin(plugin: &str) -> Vec<(log::Level, String)> {
+        let needle = format!("plugin '{plugin}'");
+        WARN_RECORDS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, msg)| msg.contains(&needle))
+            .cloned()
+            .collect()
+    }
+
+    /// The warm==0 warning must actually REACH a logger — not merely be computable.
+    ///
+    /// `contig_mismatch_builds_all_cold_and_is_flagged` above covers only the pure
+    /// `no_warm_rows_warning` helper, i.e. that the string *can be produced*. Nothing
+    /// covered the `warn!` that produces it for real: delete that call and all 869 lib
+    /// tests still pass. That is not a hypothetical regression — it already happened once
+    /// on this branch, in the other half of the same path: the warning was added, no
+    /// logger was installed to receive it, it reached nobody, and it was caught only
+    /// because someone ran the binary by hand.
+    ///
+    /// A warning whose whole purpose is to break silence is worth exactly as much as its
+    /// emission path, so the emission path is what this test pins: a build with
+    /// `rows > 0 && warm == 0` emits one WARN-level record naming the plugin.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_cold_chrom_emits_a_warn_log_record() {
+        install_capturing_logger();
+
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("src.tsv.gz");
+        write_gz(&tsv, "chr1\t100\tA\tG\t0.9\nchr1\t300\tG\tA\t0.7\n");
+        let var = dir.path().join("var.parquet");
+        // Contig mismatch ("chr1" vs the canonicalized "1"): rows are written, NOT ONE
+        // joins the variation cache. The all-cold signature the warning exists to report.
+        write_synthetic_variation(&var, &[("chr1", 100, "A/G", 0i8)]);
+
+        // Unique to this test: the filter below must not pick up other tests' records.
+        let toml = format!(
+            r##"
+plugin_name = "warnemit"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_warnemit_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let entry = build_plugin_chrom(&manifest, "warnemit.source.toml", &var, &out, "1")
+            .await
+            .expect("an all-cold chrom warns, it does not fail");
+        assert_eq!(
+            (entry.rows, entry.warm),
+            (2, 0),
+            "the all-cold setup: {entry:?}"
+        );
+
+        let records = records_for_plugin("warnemit");
+        assert_eq!(
+            records.len(),
+            1,
+            "a chrom with rows > 0 and warm == 0 must EMIT exactly one log record, \
+             not merely be able to compute the text of one; captured: {records:?}"
+        );
+        let (level, msg) = &records[0];
+        assert_eq!(
+            *level,
+            log::Level::Warn,
+            "it must be a WARNING (info/debug is swallowed by every default logger): {msg}"
+        );
+        assert!(
+            msg.contains("warm = 0"),
+            "the emitted record must be the all-cold warning: {msg}"
+        );
+        assert!(
+            msg.contains("chr1"),
+            "the emitted record must name the chrom: {msg}"
+        );
     }
 
     // --chrom M / chrM / MT must all select the MT rows (data is folded to "MT"

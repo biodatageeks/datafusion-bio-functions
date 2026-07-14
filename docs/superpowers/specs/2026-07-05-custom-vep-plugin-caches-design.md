@@ -217,8 +217,8 @@ runtime from a named per-transcript **engine attribute**.
 
 ```toml
 [[match_column]]
-column      = "protein_variant"     # produced by ingest_sql, stored in the key
-engine_attr = "amino_acid_change"   # runtime value per transcript: {refAA}{protpos}{altAA}
+column   = "protein_variant"                   # produced by ingest_sql, stored in the key
+template = "{ref_aa}{Protein_position}{alt_aa}"  # built per transcript from engine attributes
 ```
 
 - **Cache key** becomes `(chrom, start, allele_string, <match columns…>)`; the
@@ -414,8 +414,28 @@ coordinate system, value→CSQ mapping, and tier policy. The cache builder consu
 it end-to-end — **no per-plugin Rust for the common case**.
 
 ```toml
+# NOTE: every top-level scalar key (plugin_name, coordinate_system, ingest_sql) MUST
+# precede the first [[source]] header. TOML absorbs a scalar key that follows a table
+# header INTO that table, so a trailing `ingest_sql` parses as `source.ingest_sql` and
+# is rejected as an unknown field.
 plugin_name       = "cadd"
 coordinate_system = "1-based"          # or "0-based-half-open"; drives the start shift (§3.3)
+
+# The ingest view SELECT (§3.1). Maps raw cols → shared key cols + values, in the
+# source's own contig-style/coordinate-basis; the builder applies canonical_contig
+# + the coordinate shift as a shared wrapper (§3.3), so this SQL stays focused on
+# column mapping (INFO parsing, split_part, unions, unnest for multi-allelic, …).
+ingest_sql = """
+SELECT chrom, CAST(pos AS INTEGER) AS start, CAST(pos AS INTEGER) AS end,
+       concat(ref, '/', alt) AS allele_string,
+       CAST(rawscore AS FLOAT) AS raw_score, CAST(phred AS FLOAT) AS phred_score
+FROM plugin_cadd_src_snv
+UNION ALL
+SELECT chrom, CAST(pos AS INTEGER) AS start, CAST(pos AS INTEGER) AS end,
+       concat(ref, '/', alt) AS allele_string,
+       CAST(rawscore AS FLOAT) AS raw_score, CAST(phred AS FLOAT) AS phred_score
+FROM plugin_cadd_src_indel
+"""
 
 # One or more raw sources → registered as plugin_<name>_src[_<part>] (§3.1).
 [[source]]
@@ -441,42 +461,51 @@ path     = "…/whole_genome_SNVs.tsv.gz"
 part = "indel"
 provider = "csv"
 path = "…/InDels.tsv.gz"
-  # …same csv params + schema…
-
-# The ingest view SELECT (§3.1). Maps raw cols → shared key cols + values, in the
-# source's own contig-style/coordinate-basis; the builder applies canonical_contig
-# + the coordinate shift as a shared wrapper (§3.3), so this SQL stays focused on
-# column mapping (INFO parsing, split_part, unions, unnest for multi-allelic, …).
-ingest_sql = """
-SELECT chrom, CAST(pos AS INTEGER) AS start, CAST(pos AS INTEGER) AS end,
-       concat(ref, '/', alt) AS allele_string,
-       CAST(rawscore AS FLOAT) AS raw_score, CAST(phred AS FLOAT) AS phred_score
-FROM plugin_cadd_src_snv
-UNION ALL
-SELECT chrom, CAST(pos AS INTEGER) AS start, CAST(pos AS INTEGER) AS end,
-       concat(ref, '/', alt) AS allele_string,
-       CAST(rawscore AS FLOAT) AS raw_score, CAST(phred AS FLOAT) AS phred_score
-FROM plugin_cadd_src_indel
-"""
+  [source.csv]
+  # …same csv params + schema as the snv source above…
+  delimiter   = "\t"
+  has_header  = false
+  comment     = "#"
+  compression = "gzip"
+  schema = [
+    { name = "chrom", type = "Utf8" },
+    { name = "pos",   type = "Utf8" },
+    { name = "ref",   type = "Utf8" },
+    { name = "alt",   type = "Utf8" },
+    { name = "rawscore", type = "Utf8" },
+    { name = "phred",    type = "Utf8" },
+  ]
 
 [[value_columns]]
-column = "raw_score";   csq_field = "CADD_RAW";   type = "Float32"
-[[value_columns]]
-column = "phred_score"; csq_field = "CADD_PHRED"; type = "Float32"
+column    = "raw_score"
+csq_field = "CADD_RAW"
+type      = "Float32"
 
-[tier]
-threshold = 0.01
-unmatched = "cold"
+[[value_columns]]
+column    = "phred_score"
+csq_field = "CADD_PHRED"
+type      = "Float32"
 ```
+
+> **No `[tier]` block.** Tiering is *inherited from the variation cache* at build time
+> (the builder LEFT-joins the variation shard and takes its warm/cold `tier` — see
+> `plugin_cache::join`), so a plugin never declares its own threshold. `SourceManifest`
+> has no `tier` field and sets `deny_unknown_fields`: a stray `[tier]` block is a hard
+> parse error, not a no-op.
 
 **Provider factory.** `provider` names map to a constructor via a small factory:
 
 | `provider` | Backed by | Params (`[source.<provider>]`) |
 |---|---|---|
-| `vcf` | bio-formats `VcfTableProvider` (sibling crate) | INFO fields, etc. |
+| `vcf` | bio-formats `VcfTableProvider` (sibling crate) | `info_fields` (INFO keys to materialize) |
 | `csv` / `tsv` | builtin `ctx.register_csv` + `CsvReadOptions` | `delimiter`, `has_header`, `comment`, `compression`, `schema` |
 | `parquet` | builtin `ctx.register_parquet` | — |
-| `bed` | bio-formats BED provider (sibling crate) | — |
+| `bed` | **not wired yet** — `ProviderKind::Bed` returns `NotImplemented` (no plugin needs it; wire the bio-formats BED provider the way `vcf` is wired when one does) | — |
+
+A params block must match its provider: `[source.csv]` is only valid for `csv`/`tsv`
+and `[source.vcf]` only for `vcf`, so `parquet` and `bed` accept neither. A `vcf`
+source additionally requires `coordinate_system = "1-based"`. `SourceManifest::validate`
+enforces all of this at load time rather than silently ignoring the mismatch.
 
 Bio-formats providers delegate to the sibling crate (which owns those deps);
 builtin providers are registered directly by this repo's build code. The factory
