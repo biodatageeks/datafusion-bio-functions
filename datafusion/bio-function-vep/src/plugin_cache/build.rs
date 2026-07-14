@@ -15,6 +15,7 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
+use log::warn;
 
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
@@ -122,6 +123,37 @@ fn reject_pipe_joined_alleles(batches: &[RecordBatch], plugin: &str) -> Result<(
         )));
     }
     Ok(())
+}
+
+/// The warning text for a chrom that wrote rows of which NOT ONE joined the variation
+/// cache — or `None` when there is nothing to say.
+///
+/// `warm == 0` with `rows > 0` is the shared signature of every silent failure this
+/// build can produce: a wrong `coordinate_system` (every start off by one), a
+/// `chr1`-vs-`1` contig mismatch, an `allele_string` in the wrong shape. The variation
+/// LEFT JOIN is on `(chrom, start, allele_string)`, so if not one row of a whole
+/// chromosome matched, the probe key almost certainly does not have the shape the
+/// runtime will ask for — and the runtime will therefore find nothing either.
+///
+/// A WARNING, not an error: cold rows remain probeable, and a legitimately all-cold
+/// plugin (every variant absent from the variation cache) is conceivable. But the
+/// number was already computed and printed, and nothing acted on it. It must not be
+/// silent.
+///
+/// Returned as a value rather than logged in place so the condition is unit-testable
+/// without installing a process-global `log` sink.
+fn no_warm_rows_warning(plugin: &str, chrom: &str, rows: usize, warm: usize) -> Option<String> {
+    (rows > 0 && warm == 0).then(|| {
+        format!(
+            "plugin '{plugin}' chrom {chrom}: {rows} rows written but warm = 0 — NOT ONE row \
+             joined the variation cache on (chrom, start, allele_string). The runtime probes on \
+             that same key, so it will most likely find nothing either and this plugin will \
+             annotate nothing. Usual causes: contig naming (`chr1` vs `1`), the manifest's \
+             coordinate_system (every start off by one), or the allele_string format (it must be \
+             per-allele `{{ref}}/{{alt}}`). If this source genuinely holds no variant present in \
+             the variation cache, this warning is expected."
+        )
+    })
 }
 
 /// Sort a batch ascending by `start` (the per-tier run order the PageDir needs).
@@ -294,8 +326,14 @@ pub async fn build_plugin_chrom(
     if rows == 0 {
         let _ = std::fs::remove_file(&shard_path);
     }
+    let label = canonical_chrom_label(chrom);
+    // A shard whose every row missed the variation cache is the signature of a
+    // mis-declared manifest — say so instead of printing `warm=0` and moving on.
+    if let Some(msg) = no_warm_rows_warning(&src.plugin_name, &label, rows, warm) {
+        warn!("{msg}");
+    }
     Ok(ChromEntry {
-        chrom: canonical_chrom_label(chrom),
+        chrom: label,
         file: file_name,
         rows,
         warm,
@@ -761,6 +799,100 @@ type = "Float32"
         assert_eq!(entry.rows, 2);
         assert_eq!(entry.warm, 1);
         assert_eq!(entry.cold, 1);
+    }
+
+    /// `warm == 0` with `rows > 0` is the shared signature of EVERY silent failure in
+    /// this build — a wrong coordinate_system, a `chr1`-vs-`1` contig mismatch, a
+    /// mis-shaped allele_string: not one row joined the variation cache. The number was
+    /// already computed and printed; nothing acted on it. It must at least warn.
+    #[test]
+    fn all_cold_chrom_is_detected() {
+        assert!(
+            no_warm_rows_warning("demo", "chr1", 1_000, 0).is_some(),
+            "rows > 0 with warm == 0 must be flagged"
+        );
+        let msg = no_warm_rows_warning("demo", "chr1", 1_000, 0).unwrap();
+        assert!(msg.contains("demo") && msg.contains("chr1"), "{msg}");
+        // The usual causes, so the author has somewhere to look.
+        assert!(msg.contains("contig"), "must list contig naming: {msg}");
+        assert!(
+            msg.contains("coordinate"),
+            "must list coordinate system: {msg}"
+        );
+        assert!(
+            msg.contains("allele_string"),
+            "must list allele-string format: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_or_empty_chrom_does_not_warn() {
+        // At least one row joined -> the key format is demonstrably right.
+        assert!(no_warm_rows_warning("demo", "chr1", 1_000, 1).is_none());
+        // No rows at all -> a different (already visible) problem, not this one.
+        assert!(no_warm_rows_warning("demo", "chr1", 0, 0).is_none());
+    }
+
+    /// End-to-end: a `chr1`-vs-`1` contig mismatch in the VARIATION shard (the plugin
+    /// side is canonicalized, the variation side here is not) builds cleanly with
+    /// rows > 0 and warm == 0 — and the detector fires on the returned entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contig_mismatch_builds_all_cold_and_is_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("src.tsv.gz");
+        write_gz(&tsv, "chr1\t100\tA\tG\t0.9\nchr1\t300\tG\tA\t0.7\n");
+        let var = dir.path().join("var.parquet");
+        // The variation shard spells the contig "chr1"; the plugin side canonicalizes to
+        // "1", so NOTHING joins — exactly the failure this warning exists to surface.
+        write_synthetic_variation(&var, &[("chr1", 100, "A/G", 0i8)]);
+
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let entry = build_plugin_chrom(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .expect("a contig mismatch is a warning, NOT an error: cold rows stay probeable");
+        assert_eq!(entry.rows, 2, "the rows are written");
+        assert_eq!(
+            entry.warm, 0,
+            "…but not one of them joined the variation cache"
+        );
+        assert!(
+            no_warm_rows_warning(&manifest.plugin_name, &entry.chrom, entry.rows, entry.warm)
+                .is_some(),
+            "the all-cold chrom must be flagged: {entry:?}"
+        );
     }
 
     // --chrom M / chrM / MT must all select the MT rows (data is folded to "MT"
