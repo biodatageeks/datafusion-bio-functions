@@ -13,6 +13,8 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::{StreamExt, TryStreamExt};
+use log::info;
+use std::time::Instant;
 
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
@@ -49,6 +51,11 @@ pub async fn build_plugin_chrom(
     output_cache_root: &Path,
     chrom: &str,
 ) -> Result<ChromEntry> {
+    // Coarse-grained stage timing at `info` level — cheap (a handful of
+    // `Instant::now()` calls) and the only thing that would have turned CADD
+    // chr6's multi-hour "is it stuck?" investigation (no visibility into
+    // which stage was running) into a 30-second log check.
+    let t_start = Instant::now();
     // Read context: single partition ONLY for the source scan → normalize →
     // dedup leg, so the CSV scan yields rows in source-file order (a
     // multi-partition scan reads byte ranges concurrently and coalescing does not
@@ -126,6 +133,12 @@ pub async fn build_plugin_chrom(
     };
     // The source scan is done — drop the decompressed temp before the join leg.
     drop(src_temps);
+    let read_rows: usize = deduped.iter().map(|b| b.num_rows()).sum();
+    info!(
+        "plugin_cache[{}/{chrom}]: read+normalize+dedup done, {read_rows} rows, {:.1}s elapsed",
+        src.plugin_name,
+        t_start.elapsed().as_secs_f64()
+    );
 
     // Build context: single partition, same reasoning as `read_ctx` above — the
     // streaming write below (see `tiered_stream` consumption) relies on the join
@@ -210,6 +223,11 @@ pub async fn build_plugin_chrom(
     }
     warm_writer.finish()?;
     cold_writer.finish()?;
+    info!(
+        "plugin_cache[{}/{chrom}]: tier-join+streaming-write done, warm={warm} cold={cold}, {:.1}s elapsed",
+        src.plugin_name,
+        t_start.elapsed().as_secs_f64()
+    );
 
     // Empty chrom → no shard (matches variation builder cleanup). Remove any
     // stale shard from a previous build so the manifest (rows: 0) matches disk
@@ -250,6 +268,11 @@ pub async fn build_plugin_chrom(
     if rows == 0 {
         let _ = std::fs::remove_file(&shard_path);
     }
+    info!(
+        "plugin_cache[{}/{chrom}]: done, rows={rows}, {:.1}s total",
+        src.plugin_name,
+        t_start.elapsed().as_secs_f64()
+    );
     Ok(ChromEntry {
         chrom: canonical_chrom_label(chrom),
         file: file_name,

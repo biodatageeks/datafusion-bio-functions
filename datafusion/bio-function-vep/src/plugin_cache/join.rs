@@ -36,13 +36,25 @@ pub async fn tiered_stream(
     )
     .await?;
     ctx.sql(
-        // DISTINCT: the variation shard can carry multiple source rows for the
-        // same (chrom, start, allele_string) (e.g. distinct dbSNP/COSMIC-origin
-        // entries for one variant). Without it, the tier LEFT JOIN below fans
-        // out the plugin row once per matching variation row, inflating the
-        // built cache with duplicate (but value-identical) rows.
+        // GROUP BY (not DISTINCT): the variation shard can carry multiple
+        // source rows for the same (chrom, start, allele_string) (e.g.
+        // distinct dbSNP/COSMIC-origin entries for one variant). If those
+        // duplicates ever disagree on `tier` (one warm, one cold), a plain
+        // `SELECT DISTINCT chrom, start, allele_string, tier` keeps BOTH rows
+        // — the join key is then non-unique on the build side, so the tier
+        // LEFT JOIN below fans out the plugin row once per surviving variant,
+        // silently inflating the cache with duplicate rows for that key
+        // (worse: two rows with the same (start, allele_string) but different
+        // tier, which the point-lookup path never expects). `MIN(tier)`
+        // collapses to exactly one row per key regardless of how many
+        // conflicting-tier duplicates the raw shard has — 0 (warm) wins over
+        // 1 (cold), i.e. any evidence of a known/frequent variant marks it
+        // warm. This also guarantees `HashJoinExec`'s build side can never
+        // fan out, which is a (data-dependent) join-skew risk this GROUP BY
+        // removes entirely rather than merely reduces.
         "CREATE OR REPLACE VIEW plugin_variation_probe AS \
-         SELECT DISTINCT chrom, start, allele_string, tier FROM plugin_variation_raw",
+         SELECT chrom, start, allele_string, MIN(tier) AS tier \
+         FROM plugin_variation_raw GROUP BY chrom, start, allele_string",
     )
     .await?;
     let df = ctx
