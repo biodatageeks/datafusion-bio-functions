@@ -6,15 +6,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, BooleanArray, Int8Array};
-use datafusion::arrow::compute::{
-    cast, concat_batches, filter_record_batch, sort_to_indices, take,
-};
+use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
@@ -41,21 +39,6 @@ fn reproject_cast(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(Arc::clone(schema), cols)
         .map_err(|e| DataFusionError::Execution(format!("reproject: {e}")))
-}
-
-/// Sort a batch ascending by `start` (the per-tier run order the PageDir needs).
-fn sort_by_start(batch: &RecordBatch) -> Result<RecordBatch> {
-    let start = batch.column(batch.schema().index_of("start")?);
-    let idx = sort_to_indices(start, None, None)
-        .map_err(|e| DataFusionError::Execution(format!("sort_to_indices: {e}")))?;
-    let cols = batch
-        .columns()
-        .iter()
-        .map(|c| take(c, &idx, None))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| DataFusionError::Execution(format!("take: {e}")))?;
-    RecordBatch::try_new(batch.schema(), cols)
-        .map_err(|e| DataFusionError::Execution(format!("rebuild sorted: {e}")))
 }
 
 /// Build one chromosome's plugin shard. Returns the cache-manifest chrom entry.
@@ -132,14 +115,31 @@ pub async fn build_plugin_chrom(
         .execute_stream()
         .await?;
     let norm_schema = norm_stream.schema();
-    let deduped = dedup_keep_first(norm_stream, &match_cols).await?;
+    // `assume_unique` sources are structurally guaranteed to never repeat a
+    // probe key, so the keep-first pass (a HashSet<String> with one entry per
+    // row — the dominant memory cost on the largest chromosomes) is skipped;
+    // batches are collected as-is.
+    let deduped = if src.assume_unique {
+        norm_stream.try_collect::<Vec<_>>().await?
+    } else {
+        dedup_keep_first(norm_stream, &match_cols).await?
+    };
     // The source scan is done — drop the decompressed temp before the join leg.
     drop(src_temps);
 
-    // Build context: default parallelism for the tier join over the (multi-GB)
-    // variation shard + write. The deduped survivors are re-registered here as a
-    // MemTable the join consumes in place of the raw normalized view.
-    let build_ctx = SessionContext::new();
+    // Build context: single partition, same reasoning as `read_ctx` above — the
+    // streaming write below (see `tiered_stream` consumption) relies on the join
+    // emitting rows in the same position-ascending order the dedup pass fed it,
+    // so it never has to buffer more than one batch. With `target_partitions=1`
+    // there is exactly one task for the whole join, so HashJoinExec has no
+    // opportunity to reorder rows across partitions. The join's build side
+    // (`plugin_variation_probe`, DISTINCT-projected and typically far smaller
+    // than the plugin's own per-chrom row count for whole-genome plugins like
+    // CADD/SpliceAI) is unaffected by this — it's still a single hash-table
+    // build regardless of partition count. The deduped survivors are
+    // re-registered here as a MemTable the join consumes in place of the raw
+    // normalized view.
+    let build_ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     let dedup_view = format!("plugin_{}_dedup", src.plugin_name);
     let mem = MemTable::try_new(norm_schema, vec![deduped])
         .map_err(|e| DataFusionError::Execution(format!("dedup memtable: {e}")))?;
@@ -152,19 +152,71 @@ pub async fn build_plugin_chrom(
     let file_name = format!("{}.parquet", canonical_chrom_label(chrom));
     let shard_path = plugin_dir.join(&file_name);
 
-    // Materialize tiered rows (tier inherited from the variation cache) from the
-    // deduped rows.
+    // Stream the tiered join output straight into two per-tier temp shards
+    // (warm run, cold run) instead of collecting the whole chromosome into one
+    // Vec<RecordBatch>, concat_batches-ing it into a single allocation, and
+    // sorting it in memory. That collect+concat+sort was the dominant remaining
+    // memory cost after `assume_unique` removed the dedup HashSet, and still
+    // OOM'd on the largest chromosomes (chr7, chr8, chrX for CADD). This keeps
+    // peak memory at O(one batch) instead of O(whole chromosome).
+    //
+    // Correctness relies on the join preserving row order end to end: the
+    // source scan (`read_ctx`, single partition) yields rows in file order,
+    // which for these per-chrom tabix-extracted sources is position-ascending;
+    // dedup (`dedup_keep_first`/`try_collect`) filters within that order without
+    // reordering; and the tier join (`build_ctx`, now also single partition)
+    // streams the probe side through unreordered. A per-batch tier filter
+    // (`filter_record_batch`) never reorders survivors either, so each tier's
+    // rows stay position-ascending both within a batch and across batches —
+    // meeting the on-disk (tier, start)-sorted contract (`point_lookup_writer_
+    // properties`'s `sorting_columns`) without any explicit sort.
     let mut stream = tiered_stream(&build_ctx, &dedup_view, variation_shard).await?;
-    let mut batches = Vec::new();
+
+    let warm_tmp = plugin_dir.join(format!("{file_name}.warm.tmp"));
+    let cold_tmp = plugin_dir.join(format!("{file_name}.cold.tmp"));
+    let mut warm_writer = PluginShardWriter::create(&warm_tmp, Arc::clone(&out_schema))?;
+    let mut cold_writer = PluginShardWriter::create(&cold_tmp, Arc::clone(&out_schema))?;
+    let (mut warm, mut cold) = (0usize, 0usize);
+
     while let Some(b) = stream.next().await {
-        batches.push(b?);
+        let batch = b?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let reordered = reproject_cast(&batch, &out_schema)?;
+        let tier_col = reordered
+            .column(out_schema.index_of("tier")?)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .ok_or_else(|| DataFusionError::Execution("tier column not Int8".into()))?
+            .clone();
+        for keep in [0i8, 1i8] {
+            let mask: BooleanArray = (0..reordered.num_rows())
+                .map(|i| Some(tier_col.value(i) == keep))
+                .collect();
+            let filtered = filter_record_batch(&reordered, &mask)
+                .map_err(|e| DataFusionError::Execution(format!("filter tier {keep}: {e}")))?;
+            if filtered.num_rows() == 0 {
+                continue;
+            }
+            if keep == 0 {
+                warm += filtered.num_rows();
+                warm_writer.write(&filtered)?;
+            } else {
+                cold += filtered.num_rows();
+                cold_writer.write(&filtered)?;
+            }
+        }
     }
+    warm_writer.finish()?;
+    cold_writer.finish()?;
 
     // Empty chrom → no shard (matches variation builder cleanup). Remove any
     // stale shard from a previous build so the manifest (rows: 0) matches disk
     // and the runtime never opens a leftover file for an empty chrom.
-    let non_empty: Vec<RecordBatch> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
-    if non_empty.is_empty() {
+    if warm + cold == 0 {
+        let _ = std::fs::remove_file(&warm_tmp);
+        let _ = std::fs::remove_file(&cold_tmp);
         let _ = std::fs::remove_file(&shard_path);
         return Ok(ChromEntry {
             chrom: canonical_chrom_label(chrom),
@@ -174,36 +226,25 @@ pub async fn build_plugin_chrom(
             cold: 0,
         });
     }
-    let joined_schema = non_empty[0].schema();
-    let full = concat_batches(&joined_schema, &non_empty)
-        .map_err(|e| DataFusionError::Execution(format!("concat: {e}")))?;
-    let reordered = reproject_cast(&full, &out_schema)?;
 
-    // Split into warm (0) then cold (1) runs, each start-sorted, and write.
-    let tier_col = reordered
-        .column(out_schema.index_of("tier")?)
-        .as_any()
-        .downcast_ref::<Int8Array>()
-        .ok_or_else(|| DataFusionError::Execution("tier column not Int8".into()))?
-        .clone();
-    let (mut warm, mut cold) = (0usize, 0usize);
+    // Merge: final shard = warm run then cold run. Both temps are already
+    // start-sorted by construction (see above), so this is a plain streaming
+    // batch-by-batch copy into the final writer (which carries the point-lookup
+    // page-index properties) — no sort, O(one batch) memory.
     let mut writer = PluginShardWriter::create(&shard_path, Arc::clone(&out_schema))?;
-    for keep in [0i8, 1i8] {
-        let mask: BooleanArray = (0..reordered.num_rows())
-            .map(|i| Some(tier_col.value(i) == keep))
-            .collect();
-        let filtered = filter_record_batch(&reordered, &mask)
-            .map_err(|e| DataFusionError::Execution(format!("filter tier {keep}: {e}")))?;
-        if filtered.num_rows() == 0 {
-            continue;
+    for tmp in [&warm_tmp, &cold_tmp] {
+        let file = std::fs::File::open(tmp)
+            .map_err(|e| DataFusionError::Execution(format!("open temp {}: {e}", tmp.display())))?;
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| DataFusionError::Execution(format!("open temp reader: {e}")))?
+            .build()
+            .map_err(|e| DataFusionError::Execution(format!("build temp reader: {e}")))?;
+        for batch in reader {
+            let batch =
+                batch.map_err(|e| DataFusionError::Execution(format!("read temp batch: {e}")))?;
+            writer.write(&batch)?;
         }
-        let sorted = sort_by_start(&filtered)?;
-        if keep == 0 {
-            warm += sorted.num_rows();
-        } else {
-            cold += sorted.num_rows();
-        }
-        writer.write(&sorted)?;
+        let _ = std::fs::remove_file(tmp);
     }
     let rows = writer.finish()?;
     if rows == 0 {

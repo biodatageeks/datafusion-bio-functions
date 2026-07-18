@@ -1,12 +1,19 @@
 //! Provider factory: register a source manifest's raw tables under their
 //! `plugin_<name>_src[_<part>]` names. CSV/TSV/Parquet use builtin DataFusion
-//! providers; VCF/BED (bio-formats) are not wired in the prototype.
+//! providers; VCF uses `datafusion-bio-format-vcf`'s `VcfTableProvider` (INFO
+//! fields come back as typed top-level columns named after the raw INFO tag —
+//! query them directly in `ingest_sql`). BED is not wired in the prototype.
+
+use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
+use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 
-use crate::plugin_cache::source_manifest::{CsvParams, ProviderKind, SourceManifest, ValueType};
+use crate::plugin_cache::source_manifest::{
+    CoordinateSystem, CsvParams, ProviderKind, SourceManifest, ValueType,
+};
 
 fn arrow_type(ty: ValueType) -> DataType {
     match ty {
@@ -108,7 +115,27 @@ pub async fn register_sources(
                 ctx.register_parquet(&table, &spec.path, ParquetReadOptions::default())
                     .await?;
             }
-            ProviderKind::Vcf | ProviderKind::Bed => {
+            ProviderKind::Vcf => {
+                // `coordinate_system` describes how the manifest's `ingest_sql`
+                // should interpret positions; the VCF provider's own
+                // `coordinate_system_zero_based` flag controls how IT reports
+                // `start`/`end` from the file's native 1-based VCF `POS` — keep
+                // them in lock-step so `ingest_sql` always sees the coordinate
+                // system the manifest declares, regardless of source format.
+                let zero_based = matches!(manifest.coordinate_system, CoordinateSystem::ZeroBasedHalfOpen);
+                // No manifest knob yet for selecting a INFO/FORMAT subset — read
+                // every INFO field the VCF header declares (`None`) and let
+                // `ingest_sql` project down to what it needs, same as the CSV
+                // path relies on `ingest_sql` rather than a narrower provider
+                // schema. Revisit if a source has so many INFO fields that
+                // schema inference itself becomes the bottleneck.
+                let provider = VcfTableProvider::new(spec.path.clone(), None, None, None, zero_based)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("open VCF source '{table}': {e}"))
+                    })?;
+                ctx.register_table(&table, Arc::new(provider))?;
+            }
+            ProviderKind::Bed => {
                 return Err(DataFusionError::NotImplemented(format!(
                     "provider {:?} not wired in prototype (table '{table}')",
                     spec.provider
