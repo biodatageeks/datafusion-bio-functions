@@ -119,6 +119,20 @@ pub struct SourceManifest {
     /// Optional per-transcript match discriminators (§3.4). Empty = per-variant.
     #[serde(default, rename = "match_column")]
     pub match_columns: Vec<MatchColumn>,
+    /// Skip the build-time keep-first dedup pass (`dedup::dedup_keep_first`)
+    /// when the source is structurally guaranteed to never emit two rows
+    /// sharing a runtime probe key `(start, allele_string, <match cols>)` —
+    /// e.g. SpliceAI's masked release (one prediction per variant) or CADD's
+    /// SNV+indel files (disjoint allele-string shapes, so they can't collide
+    /// with each other or within themselves). Dedup's `HashSet<String>` costs
+    /// one heap-allocated key per row and is the dominant memory cost on the
+    /// largest chromosomes; skipping it for sources that provably have no
+    /// duplicates avoids that cost entirely. Do NOT set this for sources that
+    /// can legitimately repeat a key (e.g. AlphaMissense's overlapping
+    /// UniProt entries) — the manifest author must justify this per-plugin,
+    /// it is not a generic performance knob.
+    #[serde(default)]
+    pub assume_unique: bool,
 }
 
 impl SourceManifest {
