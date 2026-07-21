@@ -122,17 +122,21 @@ pub async fn register_sources(
                 // `start`/`end` from the file's native 1-based VCF `POS` — keep
                 // them in lock-step so `ingest_sql` always sees the coordinate
                 // system the manifest declares, regardless of source format.
-                let zero_based = matches!(manifest.coordinate_system, CoordinateSystem::ZeroBasedHalfOpen);
+                let zero_based = matches!(
+                    manifest.coordinate_system,
+                    CoordinateSystem::ZeroBasedHalfOpen
+                );
                 // No manifest knob yet for selecting a INFO/FORMAT subset — read
                 // every INFO field the VCF header declares (`None`) and let
                 // `ingest_sql` project down to what it needs, same as the CSV
                 // path relies on `ingest_sql` rather than a narrower provider
                 // schema. Revisit if a source has so many INFO fields that
                 // schema inference itself becomes the bottleneck.
-                let provider = VcfTableProvider::new(spec.path.clone(), None, None, None, zero_based)
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!("open VCF source '{table}': {e}"))
-                    })?;
+                let provider =
+                    VcfTableProvider::new(spec.path.clone(), None, None, None, zero_based)
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!("open VCF source '{table}': {e}"))
+                        })?;
                 ctx.register_table(&table, Arc::new(provider))?;
             }
             ProviderKind::Bed => {
@@ -150,7 +154,7 @@ pub async fn register_sources(
 mod tests {
     use super::*;
     use crate::plugin_cache::source_manifest::SourceManifest;
-    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::array::{Int64Array, StringArray};
     use std::io::Write;
 
     fn write_gz(path: &std::path::Path, body: &str) {
@@ -221,5 +225,71 @@ threshold = 0.01
             .unwrap()
             .value(0);
         assert_eq!(c, 2);
+    }
+
+    // I4: document (and pin, so a `datafusion-bio-format-vcf` version bump that
+    // changes this can't slip by silently) how the VCF provider actually
+    // reports a multi-allelic ALT. It comes back as one string joined per-
+    // allele (confirmed below: '|', not the VCF spec's own ','), not split
+    // into separate rows -- an `ingest_sql` that assumes the wrong separator
+    // (or assumes it's split already) builds an `allele_string` that never
+    // matches the per-allele variation key, i.e. a silent miss on every
+    // multi-allelic site. This test exists so that would fail loudly here
+    // instead of being discovered downstream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcf_source_multiallelic_alt_shape_is_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("multiallelic.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.2\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             1\t100\t.\tG\tA,C\t.\t.\t.\n",
+        )
+        .unwrap();
+
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+value_columns = []
+
+[[source]]
+provider = "vcf"
+path = "{}"
+"##,
+            vcf.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let ctx = SessionContext::new();
+        let _temps = register_sources(&ctx, &manifest).await.unwrap();
+        let rows = ctx
+            .sql("SELECT alt FROM plugin_demo_src")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "one row per VCF line, not per allele");
+        let alt = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("alt column is a plain string, not a list -- if this ever fails, the ALT shape changed and every manifest built on this provider needs re-auditing");
+        // Pinned current behavior: `datafusion-bio-format-vcf` v1.8.8 joins a
+        // multi-allelic ALT with '|' (NOT ',' -- the naive guess from the VCF
+        // spec's own comma-separated ALT column would be wrong here). Any
+        // manifest built directly on `ProviderKind::Vcf` for a source that can
+        // be multi-allelic MUST split `alt` on '|' in its own `ingest_sql`
+        // (the way the CADD/ClinVar bcftools-flatten preprocessing already
+        // splits multi-value INFO tags for VCF sources that go through the
+        // CSV path instead).
+        assert_eq!(
+            alt.value(0),
+            "A|C",
+            "ALT shape changed -- re-audit every VCF-provider manifest's \
+             ingest_sql for correct multi-allelic splitting"
+        );
     }
 }

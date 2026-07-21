@@ -96,6 +96,77 @@ pub async fn dedup_keep_first(
     Ok(out)
 }
 
+/// Bound on how many distinct keys `check_assume_unique_sample` tracks before
+/// it stops checking. An `assume_unique` source skips `dedup_keep_first`
+/// entirely to avoid materializing a `HashSet<String>` sized to the whole
+/// chromosome (the dominant remaining memory cost on CADD/SpliceAI's largest
+/// chromosomes) -- so this check trades exhaustive coverage for a hard,
+/// small memory ceiling: it validates the FIRST `SAMPLE_CAP` distinct keys
+/// seen (in source-file order) and then stops, rather than either costing
+/// nothing (leaving the assumption fully untested) or costing exactly what
+/// the flag exists to avoid (an exhaustive `HashSet`).
+const SAMPLE_CAP: usize = 2_000_000;
+
+/// Validate (a bounded prefix of) an `assume_unique` source's claim that it
+/// never repeats a runtime probe key, without filtering anything.
+///
+/// A violated assumption is caught here rather than left to the runtime
+/// lookup `HashMap`, which keeps the *last* row of a duplicate key --
+/// silently inverting VEP's first-in-file rule (see module docs). This
+/// checks only the first `SAMPLE_CAP` distinct keys encountered so memory
+/// stays bounded regardless of chromosome size; a source whose duplicates
+/// only occur past that prefix will not be caught by this pass.
+pub async fn check_assume_unique_sample(
+    mut stream: SendableRecordBatchStream,
+    match_columns: &[String],
+) -> Result<Vec<RecordBatch>> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<RecordBatch> = Vec::new();
+    let opts = FormatOptions::default().with_null("\u{0}NULL");
+
+    let mut key_names: Vec<&str> = vec!["start", "allele_string"];
+    key_names.extend(match_columns.iter().map(|s| s.as_str()));
+
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        if seen.len() < SAMPLE_CAP {
+            let schema = batch.schema();
+            let formatters = key_names
+                .iter()
+                .map(|name| {
+                    let idx = schema.index_of(name)?;
+                    ArrayFormatter::try_new(batch.column(idx).as_ref(), &opts).map_err(|e| {
+                        DataFusionError::Execution(format!("key formatter {name}: {e}"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut key = String::new();
+            for r in 0..batch.num_rows() {
+                if seen.len() >= SAMPLE_CAP {
+                    break;
+                }
+                use std::fmt::Write;
+                key.clear();
+                for f in &formatters {
+                    let _ = write!(key, "{}{KEY_SEP}", f.value(r));
+                }
+                if !seen.insert(std::mem::take(&mut key)) {
+                    return Err(DataFusionError::Execution(
+                        "assume_unique source violated its own claim: a duplicate runtime \
+                         probe key was found in the first sampled rows. The manifest's \
+                         `assume_unique = true` is unsafe for this source -- remove it so \
+                         the keep-first dedup pass runs (VEP's first-in-file rule), or fix \
+                         the source if the duplicate is unexpected."
+                            .into(),
+                    ));
+                }
+            }
+        }
+        out.push(batch);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +259,44 @@ mod tests {
         // The distinct aa-change at the same position survives (not over-deduped).
         assert!(survivors.iter().any(|(pv, _)| pv == "K55N"));
         assert!(survivors.iter().any(|(pv, _)| pv == "D43Y"));
+    }
+
+    // I2 fix: an `assume_unique` source that actually repeats a probe key must
+    // be caught, not silently accepted (the runtime lookup would then keep the
+    // *last* duplicate, inverting VEP's first-in-file rule).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_assume_unique_sample_rejects_a_real_duplicate() {
+        let stream = stream_of(norm_batch()).await;
+        let err = check_assume_unique_sample(stream, &["protein_variant".to_string()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("violated its own claim"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_assume_unique_sample_passes_genuinely_unique_input() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![50i64, 51])),
+                Arc::new(Int64Array::from(vec![50i64, 51])),
+                Arc::new(StringArray::from(vec!["A/G", "C/T"])),
+                Arc::new(Float32Array::from(vec![Some(1.0f32), Some(2.0)])),
+            ],
+        )
+        .unwrap();
+        let stream = stream_of(batch).await;
+        let out = check_assume_unique_sample(stream, &[]).await.unwrap();
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "unique input must pass through untouched");
     }
 
     #[tokio::test(flavor = "multi_thread")]
