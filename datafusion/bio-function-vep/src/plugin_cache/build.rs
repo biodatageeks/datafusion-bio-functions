@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, BooleanArray, Int8Array};
+use datafusion::arrow::array::{Array, BooleanArray, Int8Array, UInt32Array};
 use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -41,6 +41,51 @@ fn reproject_cast(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(Arc::clone(schema), cols)
         .map_err(|e| DataFusionError::Execution(format!("reproject: {e}")))
+}
+
+/// Verify `start` is non-decreasing within `batch` and against `last_seen` (the
+/// previous batch's final `start` for this tier), returning the batch's own
+/// final `start` on success.
+///
+/// The streaming shard write below relies on the tiered join emitting rows in
+/// position-ascending order per tier; that holds by construction for the
+/// query shapes exercised so far (see the comment above the call site), but
+/// `HashJoinExec`'s build/probe side can flip based on table-size statistics
+/// for other plugin/variation size ratios, and a flipped build side does not
+/// preserve row order. Rather than trust that silently, check it: a real
+/// violation aborts the build immediately (no shard is written) instead of
+/// producing a page directory whose binary-search lookup can silently miss
+/// rows that are actually present (`PageDir::resolve_ranges` assumes a
+/// genuinely sorted run).
+fn assert_start_monotonic(
+    batch: &RecordBatch,
+    start_idx: usize,
+    tier: i8,
+    chrom: &str,
+    last_seen: Option<u32>,
+) -> Result<Option<u32>> {
+    let starts = batch
+        .column(start_idx)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| DataFusionError::Execution("start column not UInt32".into()))?;
+    let mut prev = last_seen;
+    for i in 0..starts.len() {
+        let v = starts.value(i);
+        if let Some(p) = prev
+            && v < p
+        {
+            return Err(DataFusionError::Execution(format!(
+                "plugin_cache[{chrom}]: tier {tier} shard write is not position-ascending \
+                 (start {v} follows {p}) -- the tier join did not preserve row order for \
+                 this plugin/variation size ratio; the on-disk point-lookup directory \
+                 requires a sorted shard, so refusing to write a corrupt one. This needs \
+                 a real re-sort of the tier's output, not just a bigger error message."
+            )));
+        }
+        prev = Some(v);
+    }
+    Ok(prev)
 }
 
 /// Build one chromosome's plugin shard. Returns the cache-manifest chrom entry.
@@ -173,16 +218,21 @@ pub async fn build_plugin_chrom(
     // OOM'd on the largest chromosomes (chr7, chr8, chrX for CADD). This keeps
     // peak memory at O(one batch) instead of O(whole chromosome).
     //
-    // Correctness relies on the join preserving row order end to end: the
-    // source scan (`read_ctx`, single partition) yields rows in file order,
-    // which for these per-chrom tabix-extracted sources is position-ascending;
-    // dedup (`dedup_keep_first`/`try_collect`) filters within that order without
-    // reordering; and the tier join (`build_ctx`, now also single partition)
-    // streams the probe side through unreordered. A per-batch tier filter
-    // (`filter_record_batch`) never reorders survivors either, so each tier's
-    // rows stay position-ascending both within a batch and across batches —
-    // meeting the on-disk (tier, start)-sorted contract (`point_lookup_writer_
-    // properties`'s `sorting_columns`) without any explicit sort.
+    // Correctness needs each tier's rows position-ascending on disk
+    // (`PageDir::resolve_ranges`'s binary search assumes a sorted run). That
+    // does NOT follow from `target_partitions=1` alone: `p LEFT JOIN v` plans
+    // as `HashJoinExec`, and the query optimizer picks which side to hash
+    // (`join_type`) based on relative table size -- for a whole-genome plugin
+    // bigger than the variation probe (CADD, SpliceAI: the configs actually
+    // built and shipped so far) it swaps to `join_type=Right` with the plugin
+    // on the probe side, which DOES stream through unreordered; for a plugin
+    // smaller than the probe (a sparse plugin, a small custom subset, a
+    // low-coverage chrom) it can plan `join_type=Left` with the plugin on the
+    // *build* side instead, whose row order a hash join does not preserve.
+    // `assert_start_monotonic` below checks the actual invariant directly
+    // rather than trusting which side the optimizer chose: a real violation
+    // aborts the build loudly instead of silently writing a shard whose
+    // point-lookup can miss rows that are actually present.
     let mut stream = tiered_stream(&build_ctx, &dedup_view, variation_shard).await?;
 
     let warm_tmp = plugin_dir.join(format!("{file_name}.warm.tmp"));
@@ -190,6 +240,8 @@ pub async fn build_plugin_chrom(
     let mut warm_writer = PluginShardWriter::create(&warm_tmp, Arc::clone(&out_schema))?;
     let mut cold_writer = PluginShardWriter::create(&cold_tmp, Arc::clone(&out_schema))?;
     let (mut warm, mut cold) = (0usize, 0usize);
+    let start_idx = out_schema.index_of("start")?;
+    let (mut warm_last_start, mut cold_last_start): (Option<u32>, Option<u32>) = (None, None);
 
     while let Some(b) = stream.next().await {
         let batch = b?;
@@ -213,9 +265,13 @@ pub async fn build_plugin_chrom(
                 continue;
             }
             if keep == 0 {
+                warm_last_start =
+                    assert_start_monotonic(&filtered, start_idx, keep, chrom, warm_last_start)?;
                 warm += filtered.num_rows();
                 warm_writer.write(&filtered)?;
             } else {
+                cold_last_start =
+                    assert_start_monotonic(&filtered, start_idx, keep, chrom, cold_last_start)?;
                 cold += filtered.num_rows();
                 cold_writer.write(&filtered)?;
             }
@@ -477,6 +533,62 @@ type = "Float32"
             PluginScalar::F32(v) => assert!((v - 0.7).abs() < 1e-6),
             ref other => panic!("{other:?}"),
         }
+    }
+
+    // C1 regression: a tiered join that does NOT preserve row order (e.g. the
+    // planner puts the plugin on the hash-build side for a small-plugin/
+    // large-probe query shape) must fail the build loudly rather than write a
+    // shard whose on-disk (tier, start) sort claim is false.
+    #[test]
+    fn assert_start_monotonic_catches_within_batch_disorder() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "start",
+            DataType::UInt32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(UInt32Array::from(vec![10u32, 20, 15]))],
+        )
+        .unwrap();
+        let err = assert_start_monotonic(&batch, 0, 1, "1", None).unwrap_err();
+        assert!(err.to_string().contains("not position-ascending"));
+    }
+
+    #[test]
+    fn assert_start_monotonic_catches_cross_batch_regression() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "start",
+            DataType::UInt32,
+            false,
+        )]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from(vec![100u32]))],
+        )
+        .unwrap();
+        let last_seen = assert_start_monotonic(&first, 0, 0, "1", None).unwrap();
+        assert_eq!(last_seen, Some(100));
+        let second =
+            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from(vec![50u32]))]).unwrap();
+        let err = assert_start_monotonic(&second, 0, 0, "1", last_seen).unwrap_err();
+        assert!(err.to_string().contains("not position-ascending"));
+    }
+
+    #[test]
+    fn assert_start_monotonic_accepts_sorted_input() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "start",
+            DataType::UInt32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(UInt32Array::from(vec![10u32, 10, 20, 30]))],
+        )
+        .unwrap();
+        let last_seen = assert_start_monotonic(&batch, 0, 0, "1", None).unwrap();
+        assert_eq!(last_seen, Some(30));
     }
 
     // --chrom M / chrM / MT must all select the MT rows (data is folded to "MT"
