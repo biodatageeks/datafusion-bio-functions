@@ -258,6 +258,7 @@ pub async fn build_plugin_chrom(
             .downcast_ref::<Int8Array>()
             .ok_or_else(|| DataFusionError::Execution("tier column not Int8".into()))?
             .clone();
+        let mut kept_this_batch = 0usize;
         for keep in [0i8, 1i8] {
             let mask: BooleanArray = (0..reordered.num_rows())
                 .map(|i| Some(tier_col.value(i) == keep))
@@ -267,6 +268,7 @@ pub async fn build_plugin_chrom(
             if filtered.num_rows() == 0 {
                 continue;
             }
+            kept_this_batch += filtered.num_rows();
             if keep == 0 {
                 warm_last_start =
                     assert_start_monotonic(&filtered, start_idx, keep, chrom, warm_last_start)?;
@@ -278,6 +280,19 @@ pub async fn build_plugin_chrom(
                 cold += filtered.num_rows();
                 cold_writer.write(&filtered)?;
             }
+        }
+        // `tier` is derived as `COALESCE(v.tier, 1)` upstream, so it should
+        // never be anything but 0 or 1 -- but the `[0i8, 1i8]` split above
+        // would silently drop a row with any other value rather than error,
+        // so check explicitly instead of trusting that invariant blindly.
+        if kept_this_batch != reordered.num_rows() {
+            return Err(DataFusionError::Execution(format!(
+                "plugin_cache[{}/{chrom}]: {} row(s) had a tier value outside {{0,1}} and were \
+                 dropped by the warm/cold split -- COALESCE(v.tier,1) should make this \
+                 impossible; investigate before trusting this shard",
+                src.plugin_name,
+                reordered.num_rows() - kept_this_batch
+            )));
         }
     }
     warm_writer.finish()?;
@@ -308,7 +323,16 @@ pub async fn build_plugin_chrom(
     // start-sorted by construction (see above), so this is a plain streaming
     // batch-by-batch copy into the final writer (which carries the point-lookup
     // page-index properties) — no sort, O(one batch) memory.
-    let mut writer = PluginShardWriter::create(&shard_path, Arc::clone(&out_schema))?;
+    //
+    // Written to a `.merge.tmp` path and renamed into place only once fully
+    // flushed, rather than directly to `shard_path`: a crash mid-merge already
+    // fails loudly on next open (a parquet file with no footer, not a silent
+    // half-written one), but writing in place still leaves a corrupt file
+    // *at the path the runtime looks up* until the next successful rebuild
+    // overwrites it -- a rename is atomic on the same filesystem, so a crash
+    // here instead leaves either the previous good shard (if any) or nothing.
+    let merge_tmp = plugin_dir.join(format!("{file_name}.merge.tmp"));
+    let mut writer = PluginShardWriter::create(&merge_tmp, Arc::clone(&out_schema))?;
     for tmp in [&warm_tmp, &cold_tmp] {
         let file = std::fs::File::open(tmp)
             .map_err(|e| DataFusionError::Execution(format!("open temp {}: {e}", tmp.display())))?;
@@ -325,7 +349,16 @@ pub async fn build_plugin_chrom(
     }
     let rows = writer.finish()?;
     if rows == 0 {
+        let _ = std::fs::remove_file(&merge_tmp);
         let _ = std::fs::remove_file(&shard_path);
+    } else {
+        std::fs::rename(&merge_tmp, &shard_path).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "rename {} -> {}: {e}",
+                merge_tmp.display(),
+                shard_path.display()
+            ))
+        })?;
     }
     info!(
         "plugin_cache[{}/{chrom}]: done, rows={rows}, {:.1}s total",
