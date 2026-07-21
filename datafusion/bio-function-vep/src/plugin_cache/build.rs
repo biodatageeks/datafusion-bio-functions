@@ -12,13 +12,13 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use log::info;
 use std::time::Instant;
 
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
-use crate::plugin_cache::dedup::dedup_keep_first;
+use crate::plugin_cache::dedup::{check_assume_unique_sample, dedup_keep_first};
 use crate::plugin_cache::join::tiered_stream;
 use crate::plugin_cache::normalize::{
     canonical_contig_str, canonical_contig_udf, wrap_normalization,
@@ -167,12 +167,15 @@ pub async fn build_plugin_chrom(
         .execute_stream()
         .await?;
     let norm_schema = norm_stream.schema();
-    // `assume_unique` sources are structurally guaranteed to never repeat a
-    // probe key, so the keep-first pass (a HashSet<String> with one entry per
-    // row — the dominant memory cost on the largest chromosomes) is skipped;
-    // batches are collected as-is.
+    // `assume_unique` sources are claimed to never repeat a probe key, so the
+    // exhaustive keep-first pass (a HashSet<String> with one entry per row —
+    // the dominant memory cost on the largest chromosomes) is skipped in
+    // favor of a bounded-memory sampled check that still catches a violated
+    // claim instead of trusting it blindly (see `check_assume_unique_sample`
+    // docs for why this can't be exhaustive without reintroducing the same
+    // memory cost the flag exists to avoid).
     let deduped = if src.assume_unique {
-        norm_stream.try_collect::<Vec<_>>().await?
+        check_assume_unique_sample(norm_stream, &match_cols).await?
     } else {
         dedup_keep_first(norm_stream, &match_cols).await?
     };
