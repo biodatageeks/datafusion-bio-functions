@@ -1,6 +1,19 @@
 //! End-to-end per-chrom plugin cache build: register sources → ingest view →
 //! normalization wrapper → variation-frequency join/tier → two-pass tiered
 //! shard write → cache-manifest chrom entry.
+//!
+//! Known tradeoff (noted during PR #196 review): the tiered join is only
+//! guaranteed to stream in position-ascending order per tier when the
+//! optimizer keeps the plugin on the join's probe side, which needs the
+//! plugin's own row count to be large relative to the chromosome's variation
+//! shard (true for whole-genome plugins like CADD/SpliceAI). A sparse or
+//! low-coverage-chromosome plugin can end up on the *build* side instead,
+//! whose order a hash join doesn't preserve -- `assert_start_monotonic`
+//! below then hard-fails that build rather than silently writing a
+//! wrong-order shard. There is currently no re-sort fallback for that case
+//! (see the review thread on PR #196 for the tradeoff analysis); a future
+//! sparse-plugin manifest that hits this needs one added here, not just a
+//! bigger `assume_unique`-style flag.
 
 use std::path::Path;
 use std::sync::Arc;
