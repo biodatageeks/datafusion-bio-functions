@@ -6706,16 +6706,26 @@ impl AnnotateProvider {
                             b_mirna.values().append_null();
                         }
 
-                        // HGVS_OFFSET (Int64)
+                        // HGVS_OFFSET (Int64). This Arrow list-column path must stay
+                        // byte-for-byte identical to the CSQ-string HGVS_OFFSET path
+                        // above: both go through `hgvsc_offset_for_output`, so a single
+                        // shift-gating decision drives both outputs. Previously this path
+                        // read the raw `hgvs_shift_for_strand` shift directly (bypassing
+                        // the gate), so a failed-BAM RefSeq row could report the offset
+                        // in the Arrow column while the CSQ string dropped it (vepyr#32).
                         if flags.everything && hgvs_flags.hgvsc && tc.hgvsc.is_some() {
-                            let tx_strand = tx_opt.map(|tx| tx.strand).unwrap_or(1);
-                            let offset_val = row_variant
-                                .as_ref()
-                                .and_then(|v| v.hgvs_shift_for_strand(tx_strand))
-                                .filter(|s| s.shift_length > 0)
-                                .map(|s| {
-                                    let signed = s.shift_length as i64;
-                                    if tx_strand < 0 { -signed } else { signed }
+                            let offset_val =
+                                tx_opt.zip(row_variant.as_ref()).and_then(|(tx, variant)| {
+                                    let ref_allele = tc
+                                        .used_ref
+                                        .as_deref()
+                                        .unwrap_or(variant.ref_allele.as_str());
+                                    crate::hgvs::hgvsc_offset_for_output(
+                                        tx,
+                                        variant,
+                                        ref_allele,
+                                        tc.hgvsc.as_deref(),
+                                    )
                                 });
                             match offset_val {
                                 Some(v) => b_hgvs_offset.values().append_value(v),

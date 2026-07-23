@@ -553,20 +553,19 @@ pub(crate) fn hgvsc_uses_genomic_shift(
         return false;
     }
 
-    let Some(shift) = genomic_shift else {
-        return false;
-    };
-
-    // When RefSeq BAM edit replay failed, VEP only suppresses transcript HGVS
-    // shifting when the transcript-space HGVS alleles no longer match the
-    // original shifted allele payload. Failed BAM-edit rows whose HGVS alleles
-    // still match the original genomic payload keep the shift.
-    if is_native_refseq_transcript(tx) && tx.bam_edit_status.as_deref() == Some("failed") {
-        return ref_allele.eq_ignore_ascii_case(&shift.ref_orig_allele_string)
-            && alt_allele.eq_ignore_ascii_case(&shift.alt_orig_allele_string);
-    }
-
-    true
+    // VEP applies the HGVS 3'-most shift to every shiftable indel that has a
+    // genomic shift; it is gated solely by `--shift_hgvs` (BaseRunner.pm:494-496).
+    // VEP has NO `bam_edit_status` / native-RefSeq guard at any level: the
+    // transcript's `_bam_edit_status` is written once
+    // (AnnotationType/Transcript.pm:579-601) and read once
+    // (OutputFactory.pm:1505-1507) solely to populate the BAM_EDIT output field,
+    // and `apply_edits`' return value is discarded at
+    // AnnotationType/Transcript.pm:118 — a transcript with `bam_edit_status = 'failed'`
+    // is therefore annotated exactly as if `--bam` had never been given, so its HGVS
+    // is still 3'-shifted. Suppressing the shift here produced an un-shifted HGVSc and
+    // an empty HGVS_OFFSET only for failed-BAM RefSeq rows (vepyr#32); see
+    // porting-tests/2026-07-14-issues-30-31-32-design.md §7.
+    genomic_shift.is_some()
 }
 
 pub(crate) fn hgvsc_offset_for_output(
@@ -5235,7 +5234,12 @@ mod tests {
     }
 
     #[test]
-    fn test_format_hgvsc_refseq_failed_bam_edit_suppresses_shifted_utr_deletion() {
+    fn test_format_hgvsc_refseq_failed_bam_edit_still_applies_3prime_shift() {
+        // VEP has no `bam_edit_status`/native-RefSeq guard on HGVS shifting: a
+        // `failed` BAM-edit RefSeq transcript is 3'-shifted exactly like any other
+        // (vepyr#32; see design doc §7.1). Before the fix this row's HGVSc was left
+        // un-shifted at c.*3245_*3248del; VEP shifts it 3' by shift_length (4) to
+        // c.*3249_*3252del.
         let (tx, exons_owned) = make_nm_001172437_failed_bam_edit_transcript();
         let exons = exons_owned.iter().collect::<Vec<_>>();
         let variant = crate::transcript_consequence::VariantInput::from_vcf(
@@ -5273,11 +5277,13 @@ mod tests {
             Some(&shift),
         );
 
-        assert_eq!(hgvsc.as_deref(), Some("NM_001172437.2:c.*3245_*3248del"));
+        assert_eq!(hgvsc.as_deref(), Some("NM_001172437.2:c.*3249_*3252del"));
     }
 
     #[test]
-    fn test_hgvsc_offset_refseq_failed_bam_edit_suppresses_shifted_utr_deletion() {
+    fn test_hgvsc_offset_refseq_failed_bam_edit_still_applies_3prime_shift() {
+        // Companion to the HGVSc test above: the same failed-BAM RefSeq row must
+        // expose HGVS_OFFSET = shift_length (4), not an empty offset (vepyr#32).
         let (tx, _) = make_nm_001172437_failed_bam_edit_transcript();
         let mut variant = crate::transcript_consequence::VariantInput::from_vcf(
             "7".to_string(),
@@ -5307,9 +5313,9 @@ mod tests {
                 &tx,
                 &variant,
                 "CAGA",
-                Some("NM_001172437.2:c.*3245_*3248del"),
+                Some("NM_001172437.2:c.*3249_*3252del"),
             ),
-            None
+            Some(4)
         );
     }
 
@@ -5385,6 +5391,34 @@ mod tests {
             hgvsc_offset_for_output(&tx, &variant, "T", Some("NM_001172437.2:c.*2307del"),),
             Some(6)
         );
+    }
+
+    #[test]
+    fn test_hgvsc_uses_genomic_shift_failed_bam_edit_has_no_native_refseq_guard() {
+        // Regression pin for vepyr#32. The removed guard returned `false` here
+        // because the transcript-space HGVS ref ("CAGA") no longer matched the
+        // shift's original payload ("ACAG") on a native-RefSeq `bam_edit_status =
+        // 'failed'` transcript, which suppressed the 3'-shift (wrong HGVSc, empty
+        // HGVS_OFFSET). VEP has no such guard, so a shiftable deletion carrying a
+        // genomic shift must always report `true`.
+        let (tx, _) = make_nm_001172437_failed_bam_edit_transcript();
+        assert_eq!(tx.bam_edit_status.as_deref(), Some("failed"));
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 4,
+            start: 5864,
+            end: 5867,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "ACAG".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "ACAG".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+        assert!(hgvsc_uses_genomic_shift(&tx, "CAGA", "-", Some(&shift)));
     }
 
     #[test]
