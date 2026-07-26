@@ -1714,11 +1714,18 @@ impl TranscriptConsequenceEngine {
         //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L627-L648>
         let cds_checks_started = profiling.then(Instant::now);
         let ins_left_flank_in_cds = is_ins && self.insertion_left_flank_in_cds(variant, tx);
+        // `overlaps_cds()` normalises a pure insertion to `start == end`,
+        // which makes it accept the position immediately after the last CDS
+        // base on the reverse strand.  VEP's `within_cds()` rejects it — the
+        // inverted CDS coordinate has `start == cds_len + 1` — and
+        // `_after_coding()` routes the variant into the 3' UTR instead.
+        let overlaps_cds = self.overlaps_cds(variant, tx)
+            && !(is_ins && self.insertion_after_cds_terminus(variant, tx));
         let cds_end_exon_boundary = ins_left_flank_in_cds
             && !overlaps_exon
             && tx_exons.iter().any(|e| variant.start == e.end + 1);
         let cds_start_exon_boundary = is_ins
-            && self.overlaps_cds(variant, tx)
+            && overlaps_cds
             && !overlaps_exon
             && tx_exons.iter().any(|e| variant.start == e.start);
         if let (Some(started), Some(profile)) = (cds_checks_started, profile.as_deref_mut()) {
@@ -1776,8 +1783,8 @@ impl TranscriptConsequenceEngine {
         } else if (overlaps_exon
             || cds_end_exon_boundary
             || cds_start_exon_boundary
-            || (in_frameshift_intron && self.overlaps_cds(variant, tx)))
-            && (self.overlaps_cds(variant, tx) || ins_left_flank_in_cds)
+            || (in_frameshift_intron && overlaps_cds))
+            && (overlaps_cds || ins_left_flank_in_cds)
         {
             let branch_started = profiling.then(Instant::now);
             // VEP's TranscriptMapper includes frameshift intron (≤13bp) bases
@@ -2356,22 +2363,37 @@ impl TranscriptConsequenceEngine {
         overlaps(variant.start, variant.end, cds_start, cds_end)
     }
 
-    /// For insertions, check if the left flanking base (variant.start - 1)
-    /// is within the CDS at the 3' end (stop-codon side).
+    /// VEP's `within_cds()` for a pure insertion, expressed on genomic
+    /// coordinates via the insertion's left flanking base
+    /// (`variant.start - 1`).
     ///
-    /// VEP's `_overlap_cds()` uses inverted insertion coordinates
-    /// (start = pos+1, end = pos) with `overlap(coding_start, coding_end,
-    /// vf.start, vf.end)`.  This resolves to:
-    ///   coding_start <= pos  AND  coding_end >= pos+1
-    /// i.e., the VCF padding base must be strictly before the last CDS base.
+    /// `within_cds()` accepts a CDS `Mapper::Coordinate` only when
+    /// `end > 0 && start <= length(_translateable_seq)`.  For an insertion
+    /// `genomic2cds()` returns the *inverted* coordinate (`start == end + 1`)
+    /// where `end` is the number of CDS bases preceding the insertion point,
+    /// so the predicate reduces to
     ///
-    /// On **negative strand**, the 5' CDS end is at cds_end (genomic).
-    /// An insertion at cds_end+1 is in the 5'UTR, not the CDS.  VEP's
-    /// overlap returns FALSE (coding_end < vf.start).  Exclude this case.
+    /// ```text
+    /// 1 <= (CDS bases before the insertion point) <= cds_len - 1
+    /// ```
+    ///
+    /// which — for both strands — is exactly
+    /// `cds_start <= left_flank < cds_end`:
+    ///
+    /// * an insertion **before** the first CDS base is in the 5' UTR
+    ///   (`_before_coding()`'s insertion special case), and
+    /// * an insertion **after** the last CDS base is in the 3' UTR
+    ///   (`_after_coding()`'s insertion special case) — which is also what
+    ///   the `c.<n>_*1ins…` HGVSc emitted for the same variant says.
     ///
     /// Traceability:
-    /// - Ensembl Variation `BaseTranscriptVariationAllele::_overlap_cds()`
-    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L511-L518>
+    /// - Ensembl Variation `VariationEffect::within_cds()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L636-L668>
+    /// - Ensembl Variation `VariationEffect::_after_coding()` /
+    ///   `_before_coding()` insertion special cases
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L696-L728>
+    /// - Ensembl `Mapper::map_insert()` produces the inverted coordinate
+    ///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm#L485-L505>
     fn insertion_left_flank_in_cds(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return false;
@@ -2380,17 +2402,24 @@ impl TranscriptConsequenceEngine {
             return false;
         }
         let left_flank = variant.start.saturating_sub(1);
-        if left_flank < cds_start || left_flank > cds_end {
+        left_flank >= cds_start && left_flank < cds_end
+    }
+
+    /// True when a pure insertion sits immediately **after** the last CDS
+    /// base in transcript orientation.
+    ///
+    /// `overlaps_cds()` normalises a pure insertion to `start == end`, so on
+    /// the reverse strand it still accepts this position; VEP's
+    /// `within_cds()` does not (see `insertion_left_flank_in_cds`).
+    fn insertion_after_cds_terminus(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
+        let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return false;
+        };
+        if tx.strand >= 0 {
+            variant.start == cds_end + 1
+        } else {
+            variant.start == cds_start
         }
-        // On negative strand, the 5' CDS boundary is at cds_end (genomic).
-        // Insertions at cds_end+1 are in the 5'UTR — VEP's _overlap_cds
-        // returns FALSE for these.  On positive strand, cds_end is the 3'
-        // boundary and insertions there are within CDS.
-        if tx.strand < 0 && left_flank == cds_end {
-            return false;
-        }
-        true
     }
 
     /// Returns true when a deletion extends beyond the exons it overlaps
@@ -5948,6 +5977,39 @@ fn classify_coding_change(
         }
     }
 
+    // VEP's `_get_peptide_alleles()` works on the LOCAL codon window only.
+    // `TranscriptVariationAllele::codon()` takes `codon_len` bytes from
+    // `codon_cds_start = translation_start * 3 - 2` for the reference and
+    // `codon_len + allele_len - vf_nt_len` bytes from the same offset for the
+    // alternate.  Every stop predicate (`stop_gained`, `stop_lost`,
+    // `stop_retained`) is expressed over those two peptides — never over the
+    // full downstream translation.
+    //
+    // Traceability:
+    // - `TranscriptVariationAllele::codon()` window arithmetic
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L861-L876>
+    // - `VariationEffect::_get_peptide_alleles()`
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L772-L798>
+    let local_codon_start = (start_idx / 3) * 3;
+    let local_codon_len = (end_idx / 3 + 1) * 3 - local_codon_start;
+    let local_alt_len = (local_codon_len + alt_len).saturating_sub(ref_len);
+    let local_ref_pep = translate_local_codon_window(
+        cds_seq
+            .as_bytes()
+            .get(local_codon_start..(local_codon_start + local_codon_len).min(cds_seq.len()))
+            .unwrap_or_default(),
+    );
+    let local_alt_pep = translate_local_codon_window(
+        mutated
+            .get(local_codon_start..(local_codon_start + local_alt_len).min(mutated.len()))
+            .unwrap_or_default(),
+    );
+    // Number of *complete* alternate codons the local window actually
+    // contains.  Alt codon indices beyond this are not part of the alternate
+    // peptide at all: for a deletion they are downstream sequence shifted up
+    // by the deleted length, which VEP never inspects.
+    let local_alt_codon_end = local_codon_start / 3 + local_alt_len / 3;
+
     let old_stop = old_aas.iter().position(|aa| *aa == '*');
     let new_stop = new_aas.iter().position(|aa| *aa == '*');
     let skip_global_stop_compare = ref_len == alt_len
@@ -5964,21 +6026,35 @@ fn classify_coding_change(
         {
             class.stop_retained = true;
         }
-        // For indels where the stop index shifted by exactly the indel
-        // length (in codons): the stop codon itself is preserved but
-        // moved due to the length change. VEP calls this stop_retained
-        // when the variant is near the stop codon region.
+        // VEP's `stop_retained()` branches on whether the LOCAL alternate
+        // peptide is empty (VariationEffect.pm L1305-L1314):
         //
-        // Traceability: VEP's `stop_retained` for indels uses
-        // `_overlaps_stop_codon && !_ins_del_stop_altered`.
+        //   alt_pep ne ''  ->  ref_eq_alt_sequence(...)
+        //   alt_pep eq ''  ->  (increase|decrease length)
+        //                      && _overlaps_stop_codon && !_ins_del_stop_altered
+        //
+        // Only the second branch may reason about proximity to the stop
+        // codon.  The first is a pure peptide comparison, so a peptide allele
+        // that contains no `*` at all (e.g. `PP/P` for an in-frame deletion
+        // abutting the stop codon) can never be `stop_retained`.
+        //
+        // Traceability:
+        // - `VariationEffect::stop_retained()`
+        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1284-L1319>
         if !class.stop_retained && ref_len != alt_len {
-            let len_diff = alt_len as i64 - ref_len as i64;
-            let idx_diff = new_stop_idx as i64 - old_stop_idx as i64;
-            // The stop index shift should match the codon-level length
-            // change, and the variant must be near the stop codon (within
-            // 3 codons upstream of the original stop position).
-            let near_stop = end_idx >= stop_nt_start.saturating_sub(9) && start_idx <= stop_nt_end;
-            if near_stop && len_diff % 3 == 0 && idx_diff == len_diff / 3 {
+            if local_alt_pep.is_empty() {
+                // Whole affected codon(s) removed — VEP's nucleotide-level
+                // branch.  The stop index shift matching the codon-level
+                // length change, plus proximity to the stop codon, stands in
+                // for `_overlaps_stop_codon && !_ins_del_stop_altered`.
+                let len_diff = alt_len as i64 - ref_len as i64;
+                let idx_diff = new_stop_idx as i64 - old_stop_idx as i64;
+                let near_stop =
+                    end_idx >= stop_nt_start.saturating_sub(9) && start_idx <= stop_nt_end;
+                if near_stop && len_diff % 3 == 0 && idx_diff == len_diff / 3 {
+                    class.stop_retained = true;
+                }
+            } else if local_ref_eq_alt_sequence(&local_ref_pep, &local_alt_pep) {
                 class.stop_retained = true;
             }
         }
@@ -6109,7 +6185,13 @@ fn classify_coding_change(
                 // - VEP codon() local window: TranscriptVariationAllele.pm L877
                 // - Partial codon → 'X': TranscriptVariationAllele.pm L774
                 // - stop_gained checks /\*/: VariationEffect.pm L1218
-                if !frameshift && old_aa != '*' && new_aa == '*' {
+                // `ci < local_alt_codon_end` keeps the alternate codon inside
+                // VEP's local `codon()` window.  For a deletion the alternate
+                // window is `codon_len - deleted` bytes long, so codons past
+                // its end are downstream sequence shifted up by the deletion
+                // — inspecting them invents a stop_gained that VEP's
+                // `alt_pep =~ /\*/` never sees (e.g. peptide allele `PP/P`).
+                if !frameshift && old_aa != '*' && new_aa == '*' && ci < local_alt_codon_end {
                     class.stop_gained = true;
                 } else if old_aa == '*' && new_aa != '*' {
                     class.stop_lost = true;
@@ -6560,30 +6642,38 @@ fn classify_insertion(
         adjust_refseq_cds_output_position(tx, raw_cds_position_end, leading_n_offset)
             .or(Some(raw_cds_position_end));
 
-    // Protein position follows the two displayed CDS flanks. This matches
-    // VEP's genomic2pep() output for standard insertions and also for
-    // exon-start boundary insertions where only the right genomic flank maps
-    // into the CDS and the left side is recovered from the insertion-point
-    // CDS coordinates.
+    // Protein position follows the two displayed CDS flanks.  VEP derives
+    // `translation_start`/`translation_end` from an independent
+    // `genomic2pep()` call that maps `coord->start` and `coord->end`
+    // separately (`pep = int((cds + phase_shift + 2) / 3)`), and
+    // `format_coords()` prints `end-start` whenever `start > end` — always
+    // the case for an insertion, because `genomic2cds()` yields the inverted
+    // coordinate (`start == end + 1`).  The range end is therefore a pure
+    // function of the CDS flanks and must never be dropped, including when
+    // only one genomic flank maps into the CDS (insertion at the 3' end of a
+    // coding exon, or immediately after the last CDS base).
+    //
+    // `ins_at_boundary` is then simply "the insertion point falls on a codon
+    // boundary", which is equivalent to `pep_a != pep_b`.  It matches VEP's
+    // `codon()` window arithmetic: at a codon boundary
+    // `codon_len = translation_end * 3 - (translation_start * 3 - 2) + 1`
+    // collapses to 0, so the reference peptide is empty ("-").
+    //
+    // Traceability:
+    // - `TranscriptMapper::genomic2pep()`
+    //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L504-L536>
+    // - VEP `Utils::format_coords()`
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159>
+    // - `TranscriptVariationAllele::codon()` window arithmetic
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L861-L876>
     let codon_at = cds_idx / 3;
     let display_cds_position_start = class.cds_position_start.unwrap_or(raw_cds_position_start);
     let display_cds_position_end = class.cds_position_end.unwrap_or(raw_cds_position_end);
     let pep_a = (display_cds_position_start + 2) / 3;
     let pep_b = (display_cds_position_end + 2) / 3;
-    let ins_at_boundary = if primary_anchor_cds.is_some() && alternate_anchor_cds.is_some() {
-        pep_a != pep_b
-    } else if primary_anchor_cds.is_none() && alternate_anchor_cds.is_some() {
-        ins_point.is_multiple_of(3)
-    } else {
-        false
-    };
-    if ins_at_boundary {
-        class.protein_position_start = Some(pep_a.min(pep_b));
-        class.protein_position_end = Some(pep_a.max(pep_b));
-    } else {
-        class.protein_position_start = Some(pep_a);
-        class.protein_position_end = Some(pep_a);
-    }
+    let ins_at_boundary = pep_a != pep_b;
+    class.protein_position_start = Some(pep_a.min(pep_b));
+    class.protein_position_end = Some(pep_a.max(pep_b));
 
     // Start codon check — use cds_idx < 2 because an insertion anchored
     // at position 2 (0-based last base of codon 1) inserts AFTER the start
@@ -8943,6 +9033,58 @@ fn three_prime_utr_seq(tx: &TranscriptFeature) -> Option<String> {
     } else {
         Some(utr.to_ascii_uppercase())
     }
+}
+
+/// Translate a *local* codon window the way VEP's
+/// `TranscriptVariationAllele::peptide()` does: complete codons translate
+/// normally and a trailing partial codon becomes `X` (BioPerl's
+/// `Bio::Seq::translate` behaviour for an incomplete final codon).
+///
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::peptide()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L760-L797>
+fn translate_local_codon_window(window: &[u8]) -> String {
+    let mut out = String::with_capacity(window.len() / 3 + 1);
+    for codon in window.chunks(3) {
+        if codon.len() < 3 {
+            out.push('X');
+            break;
+        }
+        match std::str::from_utf8(codon).ok().and_then(translate_codon) {
+            Some(aa) => out.push(aa),
+            None => out.push('X'),
+        }
+    }
+    out
+}
+
+/// Port of VEP's `ref_eq_alt_sequence()` over the local peptide alleles.
+///
+/// Conditions 1 and 3 are peptide-local and reproduced verbatim.  Condition 2
+/// (`ref_seq eq mut_substring && final_stop_length < 3`) requires the mutated
+/// *whole* protein to be longer than the reference, so it can only fire for
+/// net insertions; `classify_coding_change` is only reached with a non-empty
+/// reference allele, where the mutated protein is never longer at the codon
+/// window level, and the pure-insertion path documents the same gap.
+///
+/// Traceability:
+/// - Ensembl Variation `VariationEffect::ref_eq_alt_sequence()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1321-L1356>
+fn local_ref_eq_alt_sequence(ref_pep: &str, alt_pep: &str) -> bool {
+    // "this is to account for incomplete coding terminal"
+    if ref_pep == "X" && alt_pep == "X" {
+        return false;
+    }
+    // 1: $ref_pep eq substr($alt_pep, 0, 1) && $alt_pep =~ /\*/
+    let alt_first: String = alt_pep.chars().take(1).collect();
+    if ref_pep == alt_first && alt_pep.contains('*') {
+        return true;
+    }
+    // 3: $ref_pep =~ /\*/ && index($ref_pep, "*") == index($alt_pep, "*")
+    if ref_pep.contains('*') && ref_pep.find('*') == alt_pep.find('*') {
+        return true;
+    }
+    false
 }
 
 fn translate_protein_from_cds(cds: &[u8]) -> Option<Vec<char>> {
@@ -19767,8 +19909,6 @@ mod tests {
 
     #[test]
     fn insertion_left_flank_in_cds_positive_strand() {
-        // Insertion just past CDS end: variant.start = cds_end + 1.
-        // Left flanking base (start - 1) is within CDS.
         let engine = TranscriptConsequenceEngine::default();
         let t = tx(
             "T1",
@@ -19780,10 +19920,20 @@ mod tests {
             Some(1000),
             Some(1100),
         );
-        let v = var("22", 1101, 1101, "-", "G");
+        // Insertion before the last CDS base (left flank = 1099 < cds_end):
+        // the inverted CDS coordinate has start = 101 <= cds_len = 101, so
+        // VEP's within_cds() accepts it.
         assert!(
-            engine.insertion_left_flank_in_cds(&v, &t),
-            "Insertion at cds_end+1 should have left flank in CDS"
+            engine.insertion_left_flank_in_cds(&var("22", 1100, 1100, "-", "G"), &t),
+            "Insertion before the last CDS base is within CDS"
+        );
+        // Insertion just past the CDS end: the inverted CDS coordinate has
+        // start = cds_len + 1, so genomic2cds() returns a Gap and within_cds()
+        // is false — VEP routes this through _after_coding() into the 3' UTR
+        // (vepyr#31, defect 2; the same variant's HGVSc is `c.<n>_*1ins…`).
+        assert!(
+            !engine.insertion_left_flank_in_cds(&var("22", 1101, 1101, "-", "G"), &t),
+            "Insertion at cds_end+1 is outside the CDS"
         );
     }
 
@@ -19808,9 +19958,20 @@ mod tests {
         );
     }
 
+    /// vepyr#31 defect 2: an insertion whose insertion point is immediately
+    /// after the last CDS base is **not** within the CDS.  `genomic2cds()`
+    /// gaps out the inverted coordinate (`start == cds_len + 1 > cds_len`), so
+    /// `within_cds()` is false, every coding predicate returns 0, and
+    /// `_after_coding()`'s insertion special case yields `3_prime_UTR_variant`
+    /// with empty CDS/protein fields.
+    ///
+    /// (This test previously asserted a coding consequence here.  That
+    /// expectation came from issue #118, whose real variants are exon/intron
+    /// boundary insertions *inside* the CDS — e.g. `CDS_position=680-681`,
+    /// a codon interior — and not CDS-terminus insertions; see the re-modelled
+    /// `issue_118_*_at_exon_boundary` tests below.)
     #[test]
-    fn cds_boundary_insertion_gets_frameshift_and_coding_positions() {
-        // Issue #118: insertion at CDS end should enter coding path.
+    fn cds_boundary_insertion_is_three_prime_utr_not_coding() {
         // CDS: ATG GAA TGA (9 bases, M E *), positions 1000-1008.
         // Exon: 1000-1020 (extends into UTR).
         // Insert "G" at position 1009 (just past CDS end).
@@ -19836,27 +19997,20 @@ mod tests {
             engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
         let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
         assert!(
-            term_set.contains(&SoTerm::FrameshiftVariant)
-                || term_set.contains(&SoTerm::InframeInsertion),
-            "Insertion at CDS boundary should produce coding consequence, got: {:?}",
+            term_set.contains(&SoTerm::ThreePrimeUtrVariant),
+            "Insertion after the last CDS base is 3' UTR, got: {:?}",
             terms
         );
         assert!(
-            coding_class.is_some(),
-            "Coding classification should be present for CDS boundary insertion"
-        );
-        let cc = coding_class.unwrap();
-        assert!(
-            cc.cds_position_start.is_some(),
-            "CDS position start should be set"
+            !term_set.contains(&SoTerm::FrameshiftVariant)
+                && !term_set.contains(&SoTerm::InframeInsertion)
+                && !term_set.contains(&SoTerm::CodingSequenceVariant),
+            "No coding term may fire outside the CDS, got: {:?}",
+            terms
         );
         assert!(
-            cc.cds_position_end.is_some(),
-            "CDS position end should be set"
-        );
-        assert!(
-            cc.protein_position_start.is_some(),
-            "Protein position start should be set"
+            coding_class.is_none(),
+            "cds_coords is a Gap, so VEP emits no CDS/protein fields at all"
         );
     }
 
@@ -19994,13 +20148,13 @@ mod tests {
         );
     }
 
+    /// vepyr#31 defect 2, exon-boundary flavour: when `exon.end == cds_end`
+    /// there is no following CDS base either, so `within_cds()` is still false
+    /// and the variant is 3' UTR.  (`within_cdna()` is satisfied — the cDNA
+    /// coordinate is a real `Coordinate` — so `_after_coding()` produces
+    /// `3_prime_UTR_variant`.)
     #[test]
-    fn cds_end_exon_boundary_insertion_enters_coding_path() {
-        // Issue #118: insertion at exon end where exon.end == cds_end.
-        // The exon does NOT extend into UTR, so overlaps_exon is FALSE.
-        // But VEP's within_cds() maps the left flank to CDS and gives
-        // coding consequences.
-        //
+    fn cds_end_exon_boundary_insertion_is_three_prime_utr() {
         // Transcript: 990-1030, CDS: 1000-1008, Exon: 1000-1008
         // (exon ends exactly at CDS end — no UTR extension)
         // Insertion at position 1009 (exon.end + 1 == cds_end + 1)
@@ -20025,36 +20179,41 @@ mod tests {
         let (terms, coding_class) =
             engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
         let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
-        // 1bp insertion at the stop codon: local codon window includes '*',
-        // so stop_retained fires → frameshift overridden to inframe_insertion.
         assert!(
-            term_set.contains(&SoTerm::InframeInsertion),
-            "Exon-boundary CDS-end 1bp insertion at stop should get inframe_insertion (via stop_retained), got: {:?}",
+            term_set.contains(&SoTerm::ThreePrimeUtrVariant),
+            "Exon-boundary CDS-end insertion is 3' UTR, got: {:?}",
             terms
         );
         assert!(
-            term_set.contains(&SoTerm::StopRetainedVariant),
-            "Should have stop_retained_variant, got: {:?}",
-            terms
-        );
-        // Should NOT have 3'UTR (VEP's _after_coding gates on !within_cds)
-        assert!(
-            !term_set.contains(&SoTerm::ThreePrimeUtrVariant),
-            "Should NOT have 3'UTR for CDS boundary insertion, got: {:?}",
+            !term_set.contains(&SoTerm::InframeInsertion)
+                && !term_set.contains(&SoTerm::StopRetainedVariant)
+                && !term_set.contains(&SoTerm::FrameshiftVariant),
+            "No coding term may fire outside the CDS, got: {:?}",
             terms
         );
         assert!(
-            coding_class.is_some(),
-            "Coding classification should be present"
+            coding_class.is_none(),
+            "cds_coords is a Gap, so VEP emits no CDS/protein fields at all"
         );
     }
 
     // ---------------------------------------------------------------
     // Issue #118 — real-variant regression tests
     //
-    // Each test reproduces the exact pattern from the E2E mismatch
-    // report: an insertion at an exon boundary where exon.end ==
-    // cds_end, causing empty CDS/protein fields.
+    // Each test reproduces the pattern from the E2E mismatch report: an
+    // insertion at an exon/intron boundary that lands **inside** the CDS, so
+    // only one genomic flank maps into a coding exon while the CDS continues
+    // in the next exon.  VEP's cited coordinates prove that geometry:
+    //
+    //   chr3  CDS_position=680-681, Codons=aga/agCa      (codon interior)
+    //   chr16 CDS_position=118-119, Codons=gaa/gGTGAaa   (codon interior)
+    //   chr20 CDS_position=92-93,   Codons=aac/aaAGT…c   (codon interior)
+    //
+    // An insertion after the *last* CDS base is a different case entirely —
+    // `genomic2cds()` gaps out and VEP emits `3_prime_UTR_variant` with empty
+    // coding fields; that is covered by
+    // `cds_boundary_insertion_is_three_prime_utr_not_coding` and
+    // `cds_end_exon_boundary_insertion_is_three_prime_utr` (vepyr#31).
     // ---------------------------------------------------------------
 
     #[test]
@@ -20064,30 +20223,31 @@ mod tests {
         //      Protein_position=227, Amino_acids=R/SX, Codons=aga/agCa
         // vepyr (before fix): splice_region_variant only, all coding fields empty.
         //
-        // Simplified model: CDS = 12 bases (4 codons), exon ends at CDS end.
-        // Insert 1 base at exon.end + 1 → frameshift.
+        // Model: CDS = ATG GCT GAA AGA TAA (15 bases).  The coding exon ends
+        // after CDS base 11 — i.e. inside codon 4 ("AGA" = Arg, VEP's ref
+        // amino acid) — and the CDS resumes in the next exon, exactly like
+        // VEP's 680-681 / codon-227-interior coordinates.
         let engine = TranscriptConsequenceEngine::default();
-        // CDS: ATG GCT GAA AGA = M A E R (12 bases, positions 1000-1011)
-        // Last codon "AGA" = Arg (R), matching VEP's ref amino acid.
-        let cds = "ATGGCTGAAAGA";
+        let cds = "ATGGCTGAAAGATAA";
         let mut t = tx(
             "T1",
             "1",
             990,
-            1030,
+            1130,
             1,
             "protein_coding",
             Some(1000),
-            Some(1011),
+            Some(1103),
         );
-        t.cdna_coding_end = Some(12);
+        t.cdna_coding_end = Some(15);
         t.spliced_seq = Some(format!("{cds}CCCGGG")); // CDS + UTR
-        // Exon ends exactly at CDS end — no UTR extension in this exon
-        let e = exon("T1", 1, 1000, 1011);
-        let exons_ref: Vec<&ExonFeature> = vec![&e];
-        let tr = translation("T1", Some(12), Some(4), Some("MAER"), Some(cds));
-        // Insert "G" at position 1012 (exon.end + 1 == cds_end + 1)
-        let v = var("1", 1012, 1012, "-", "G");
+        let e1 = exon("T1", 1, 1000, 1010); // CDS bases 1-11
+        let e2 = exon("T1", 2, 1100, 1103); // CDS bases 12-15
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        let tr = translation("T1", Some(15), Some(5), Some("MAER*"), Some(cds));
+        // Insert "C" (the transcript-orientation base — VEP's Codons show
+        // `agCa`) at position 1011 == exon1.end + 1.
+        let v = var("1", 1011, 1011, "-", "C");
         let (terms, coding_class) =
             engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
         let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
@@ -20104,16 +20264,19 @@ mod tests {
         );
 
         let cc = coding_class.expect("Coding classification must be present");
-        assert_eq!(cc.cds_position_start, Some(12), "CDS position start");
-        assert_eq!(cc.cds_position_end, Some(13), "CDS position end");
-        assert_eq!(cc.protein_position_start, Some(4), "Protein position");
-        assert!(
-            cc.amino_acids.is_some(),
-            "Amino acids must be populated, got None"
-        );
-        assert!(cc.codons.is_some(), "Codons must be populated, got None");
+        assert_eq!(cc.cds_position_start, Some(11), "CDS position start");
+        assert_eq!(cc.cds_position_end, Some(12), "CDS position end");
+        // Codon interior → both CDS flanks map to the same codon, so
+        // format_coords() prints a single protein position (VEP: 227).
+        assert_eq!(cc.protein_position_start, Some(4), "Protein position start");
+        assert_eq!(cc.protein_position_end, Some(4), "Protein position end");
+        // Same shape as VEP's `aga/agCa`.
+        assert_eq!(cc.codons.as_deref(), Some("aga/agCa"), "Codons");
         // Ref amino acid should be R (Arg, from codon AGA)
-        let aa = cc.amino_acids.as_ref().unwrap();
+        let aa = cc
+            .amino_acids
+            .as_ref()
+            .expect("Amino acids must be populated");
         assert!(
             aa.starts_with("R/"),
             "Ref amino acid should be R (Arg), got: {aa}"
@@ -20127,28 +20290,30 @@ mod tests {
         //      Protein_position=40, Amino_acids=E/GEX, Codons=gaa/gGTGAaa
         // vepyr (before fix): splice_region_variant only, all coding fields empty.
         //
-        // Simplified model: CDS = 15 bases (5 codons), last codon = GAA (Glu).
-        // Insert 4 bases "GTGA" at exon.end + 1 → frameshift.
+        // Model: CDS = ATG GCT AAA GCT GAA TAA (18 bases).  The coding exon
+        // ends after CDS base 13 — inside codon 5 ("GAA" = Glu, VEP's ref
+        // amino acid, insertion after its 1st base as VEP's `gaa/gGTGAaa`
+        // shows) — and the CDS resumes in the next exon.
         let engine = TranscriptConsequenceEngine::default();
-        // CDS: ATG GCT AAA GCT GAA = M A K A E (15 bases, positions 1000-1014)
-        let cds = "ATGGCTAAAGCTGAA";
+        let cds = "ATGGCTAAAGCTGAATAA";
         let mut t = tx(
             "T1",
             "1",
             990,
-            1030,
+            1130,
             1,
             "protein_coding",
             Some(1000),
-            Some(1014),
+            Some(1104),
         );
-        t.cdna_coding_end = Some(15);
+        t.cdna_coding_end = Some(18);
         t.spliced_seq = Some(format!("{cds}CCCGGGAAA")); // CDS + UTR
-        let e = exon("T1", 1, 1000, 1014);
-        let exons_ref: Vec<&ExonFeature> = vec![&e];
-        let tr = translation("T1", Some(15), Some(5), Some("MARAE"), Some(cds));
-        // Insert "GTGA" at position 1015 (exon.end + 1)
-        let v = var("1", 1015, 1015, "-", "GTGA");
+        let e1 = exon("T1", 1, 1000, 1012); // CDS bases 1-13
+        let e2 = exon("T1", 2, 1100, 1104); // CDS bases 14-18
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        let tr = translation("T1", Some(18), Some(6), Some("MAKAE*"), Some(cds));
+        // Insert "GTGA" at position 1013 == exon1.end + 1
+        let v = var("1", 1013, 1013, "-", "GTGA");
         let (terms, coding_class) =
             engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
         let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
@@ -20165,16 +20330,17 @@ mod tests {
         );
 
         let cc = coding_class.expect("Coding classification must be present");
-        assert_eq!(cc.cds_position_start, Some(15), "CDS position start");
-        assert_eq!(cc.cds_position_end, Some(16), "CDS position end");
-        assert_eq!(cc.protein_position_start, Some(5), "Protein position");
-        assert!(
-            cc.amino_acids.is_some(),
-            "Amino acids must be populated, got None"
-        );
-        assert!(cc.codons.is_some(), "Codons must be populated, got None");
+        assert_eq!(cc.cds_position_start, Some(13), "CDS position start");
+        assert_eq!(cc.cds_position_end, Some(14), "CDS position end");
+        assert_eq!(cc.protein_position_start, Some(5), "Protein position start");
+        assert_eq!(cc.protein_position_end, Some(5), "Protein position end");
+        // Same shape as VEP's `gaa/gGTGAaa`.
+        assert_eq!(cc.codons.as_deref(), Some("gaa/gGTGAaa"), "Codons");
         // Ref amino acid should be E (Glu, from codon GAA)
-        let aa = cc.amino_acids.as_ref().unwrap();
+        let aa = cc
+            .amino_acids
+            .as_ref()
+            .expect("Amino acids must be populated");
         assert!(
             aa.starts_with("E/"),
             "Ref amino acid should be E (Glu), got: {aa}"
@@ -20191,28 +20357,34 @@ mod tests {
         //      Codons=aac/aaAGTGCCGGCCGCGGGGCCCTGTCTATAAGc
         // vepyr (before fix): coding_sequence_variant only, all coding fields empty.
         //
-        // Simplified model: CDS = 12 bases (4 codons), last codon = AAC (Asn).
-        // Insert 29 bases at exon.end + 1 → frameshift.
+        // Model: CDS = ATG GCT GAA AAC TAA (15 bases).  The coding exon ends
+        // after CDS base 11 — inside codon 4 ("AAC" = Asn, VEP's ref amino
+        // acid, insertion after its 2nd base as VEP's
+        // `aac/aaAGTGCCGGCCGCGGGGCCCTGTCTATAAGc` shows) — and the CDS resumes
+        // in the next exon.  The alt allele is the transcript-orientation
+        // insert (the reported variant is on the reverse strand), so the local
+        // alt peptide reproduces VEP's `KVPAAGPCL*` and with it both
+        // `stop_gained` and `frameshift_variant`.
         let engine = TranscriptConsequenceEngine::default();
-        // CDS: ATG GCT GAA AAC = M A E N (12 bases, positions 1000-1011)
-        let cds = "ATGGCTGAAAAC";
+        let cds = "ATGGCTGAAAACTAA";
         let mut t = tx(
             "T1",
             "1",
             990,
-            1060,
+            1130,
             1,
             "protein_coding",
             Some(1000),
-            Some(1011),
+            Some(1103),
         );
-        t.cdna_coding_end = Some(12);
+        t.cdna_coding_end = Some(15);
         t.spliced_seq = Some(format!("{cds}CCCGGGAAATTTCCCGGGAAATTT")); // CDS + UTR
-        let e = exon("T1", 1, 1000, 1011);
-        let exons_ref: Vec<&ExonFeature> = vec![&e];
-        let tr = translation("T1", Some(12), Some(4), Some("MAEN"), Some(cds));
-        // Insert 29 bases at position 1012 (exon.end + 1)
-        let v = var("1", 1012, 1012, "-", "CTTATAGACAGGGCCCCGCGGCCGGCACT");
+        let e1 = exon("T1", 1, 1000, 1010); // CDS bases 1-11
+        let e2 = exon("T1", 2, 1100, 1103); // CDS bases 12-15
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        let tr = translation("T1", Some(15), Some(5), Some("MAEN*"), Some(cds));
+        // Insert 29 bases at position 1011 == exon1.end + 1
+        let v = var("1", 1011, 1011, "-", "AGTGCCGGCCGCGGGGCCCTGTCTATAAG");
         let (terms, coding_class) =
             engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
         let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
@@ -20223,22 +20395,33 @@ mod tests {
             terms
         );
         assert!(
+            term_set.contains(&SoTerm::StopGained),
+            "Should have stop_gained (VEP: alt peptide KVPAAGPCL*X), got: {:?}",
+            terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::StopRetainedVariant),
+            "ref_eq_alt_sequence is 0 when the first alt residue differs from \
+             the ref residue (N vs K), got: {:?}",
+            terms
+        );
+        assert!(
             !term_set.contains(&SoTerm::ThreePrimeUtrVariant),
             "Should NOT have 3'UTR, got: {:?}",
             terms
         );
 
         let cc = coding_class.expect("Coding classification must be present");
-        assert_eq!(cc.cds_position_start, Some(12), "CDS position start");
-        assert_eq!(cc.cds_position_end, Some(13), "CDS position end");
-        assert_eq!(cc.protein_position_start, Some(4), "Protein position");
-        assert!(
-            cc.amino_acids.is_some(),
-            "Amino acids must be populated, got None"
-        );
+        assert_eq!(cc.cds_position_start, Some(11), "CDS position start");
+        assert_eq!(cc.cds_position_end, Some(12), "CDS position end");
+        assert_eq!(cc.protein_position_start, Some(4), "Protein position start");
+        assert_eq!(cc.protein_position_end, Some(4), "Protein position end");
         assert!(cc.codons.is_some(), "Codons must be populated, got None");
         // Ref amino acid should be N (Asn, from codon AAC)
-        let aa = cc.amino_acids.as_ref().unwrap();
+        let aa = cc
+            .amino_acids
+            .as_ref()
+            .expect("Amino acids must be populated");
         assert!(
             aa.starts_with("N/"),
             "Ref amino acid should be N (Asn), got: {aa}"
@@ -20290,12 +20473,13 @@ mod tests {
         );
     }
 
+    /// vepyr#31 defect 2, within-exon flavour: the insertion sits inside the
+    /// exon (so `overlaps_exon` is true) but immediately after the last CDS
+    /// base, so `within_cds()` is still false and VEP emits
+    /// `3_prime_UTR_variant` — this is the `chr20:45840343 A>AC` reproducer,
+    /// where vepyr's own HGVSc already said `c.462_*1insC`.
     #[test]
     fn issue_118_insertion_within_exon_extending_past_cds() {
-        // Test the overlaps_exon=true + ins_left_flank_in_cds path:
-        // insertion at cds_end+1 where the exon extends into UTR
-        // (overlaps_exon is TRUE because the insertion is within the exon).
-        // VEP's within_cds() returns TRUE because the left flank maps to CDS.
         let engine = TranscriptConsequenceEngine::default();
         // CDS: ATG GCT GAA TGA (12 bases), positions 1000-1011
         // Exon: 1000-1020 (extends 9 bases past CDS into UTR)
@@ -20321,27 +20505,21 @@ mod tests {
             engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
         let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
 
-        // 1bp insertion at cds_end+1 (stop codon region): local codon window
-        // includes '*' → stop_retained → inframe_insertion override.
         assert!(
-            term_set.contains(&SoTerm::InframeInsertion),
-            "Within-exon CDS boundary 1bp insertion at stop should get inframe_insertion, got: {:?}",
+            term_set.contains(&SoTerm::ThreePrimeUtrVariant),
+            "Within-exon insertion after the last CDS base is 3' UTR, got: {:?}",
             terms
         );
         assert!(
-            term_set.contains(&SoTerm::StopRetainedVariant),
-            "Should have stop_retained_variant, got: {:?}",
+            !term_set.contains(&SoTerm::InframeInsertion)
+                && !term_set.contains(&SoTerm::StopRetainedVariant)
+                && !term_set.contains(&SoTerm::FrameshiftVariant),
+            "No coding term may fire outside the CDS, got: {:?}",
             terms
         );
         assert!(
-            coding_class.is_some(),
-            "Coding classification must be present for within-exon CDS boundary insertion"
-        );
-        let cc = coding_class.unwrap();
-        assert!(cc.cds_position_start.is_some(), "CDS position must be set");
-        assert!(
-            cc.protein_position_start.is_some(),
-            "Protein position must be set"
+            coding_class.is_none(),
+            "cds_coords is a Gap, so VEP emits no CDS/protein fields at all"
         );
     }
 
@@ -21913,6 +22091,307 @@ mod tests {
             consequence.hgvsp.as_deref(),
             Some("ENSPDUP001.1:p.Ala3dup"),
             "In-frame insertion of Ala in Ala repeat should produce p.Ala3dup"
+        );
+    }
+
+    // ── vepyr#31: CDS-terminus edge cases ───────────────────────────────
+    //
+    // Expectations below come from the Ensembl Perl predicates, not from
+    // vepyr's own output:
+    //
+    // 1. `Protein_position` — `TranscriptMapper::genomic2pep()` maps the two
+    //    CDS flanks independently (`pep = int((cds + phase_shift + 2) / 3)`
+    //    applied to `coord->start` and `coord->end`), and
+    //    `OutputFactory::format_coords()` prints `end-start` whenever
+    //    `start > end`.  For an insertion `genomic2cds()` always yields the
+    //    inverted coordinate (`start == end + 1`), so the protein range is a
+    //    pure function of the two CDS flanks — never collapsed to one value
+    //    when the two flanks fall in different codons.
+    //      <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L504-L536>
+    //      <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159>
+    //
+    // 2. `within_cds()` accepts a CDS `Mapper::Coordinate` only when
+    //    `end > 0 && start <= length(_translateable_seq)`.  For an insertion
+    //    immediately after the last CDS base the inverted coordinate has
+    //    `start == cds_len + 1`, so `within_cds()` is false and
+    //    `_after_coding()`'s insertion special case
+    //    (`bvf_s == bvf_e + 1 && bvf_e == cds_e`) puts the variant in the
+    //    3' UTR.
+    //      <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L636-L668>
+    //      <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L713-L728>
+    //
+    // 3. `stop_retained()` delegates to `ref_eq_alt_sequence()` whenever the
+    //    local alt peptide is non-empty.  That predicate needs a `*` in the
+    //    alt peptide (condition 1) or a `*` at the same index in both
+    //    peptides (condition 3), so a peptide allele such as `PP/P` — which
+    //    contains no stop codon at all — is never `stop_retained`.  Nor is it
+    //    `stop_gained`, whose test is `alt_pep =~ /\*/`.
+    //      <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1284-L1356>
+    //      <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1208-L1228>
+
+    /// Two coding exons, insertion at the internal exon/intron boundary so
+    /// only the left genomic flank maps into the CDS (the reproducer
+    /// configuration of `chr16:5072071 G>GGTCT`, where VEP reports
+    /// `CDS_position=222-223` **and** `Protein_position=74-75`).
+    #[test]
+    fn insertion_at_coding_exon_boundary_reports_protein_position_range() {
+        // CDS = exon1(12nt) + exon2(9nt) = ATG CCC GGG AAA TTT CCC TGA
+        let cds = "ATGCCCGGGAAATTTCCCTGA";
+        let t = tx(
+            "T31A",
+            "16",
+            1000,
+            1108,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1108),
+        );
+        let e1 = exon("T31A", 1, 1000, 1011);
+        let e2 = exon("T31A", 2, 1100, 1108);
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        let tr = translation(
+            "T31A",
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            None,
+            Some(cds),
+        );
+        // Insertion between genomic 1011 (last base of exon 1 = CDS base 12)
+        // and 1012 (intronic): the right flank does not map into the CDS.
+        let v = var("16", 1012, 1012, "-", "GGG");
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+            .expect("boundary insertion should still be classified as coding");
+        assert_eq!(c.cds_position_start, Some(12));
+        assert_eq!(c.cds_position_end, Some(13));
+        assert_eq!(
+            (c.protein_position_start, c.protein_position_end),
+            (Some(4), Some(5)),
+            "genomic2pep maps CDS 13 -> codon 5 and CDS 12 -> codon 4; the \
+             range end must not be dropped"
+        );
+        assert_eq!(c.amino_acids.as_deref(), Some("-/G"));
+    }
+
+    /// `chr20:45840343 A>AC` / `ENST00000984773`: an insertion whose
+    /// insertion point is immediately after the last CDS base is in the
+    /// 3' UTR, not in the CDS — consistent with the `c.462_*1insC` HGVSc the
+    /// same code already produces.
+    #[test]
+    fn insertion_immediately_after_last_cds_base_is_three_prime_utr() {
+        let engine = TranscriptConsequenceEngine::default();
+        // CDS 1000-1008 = ATG CCC TGA (M P *), 3' UTR 1009-1020.
+        let cds = "ATGCCCTGA";
+        let utr = "AAACCCGGGTTT";
+        let mut t = tx(
+            "T31B",
+            "20",
+            1000,
+            1020,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(cds.len());
+        t.cdna_seq = Some(format!("{cds}{utr}"));
+        let exons = vec![exon("T31B", 1, 1000, 1020)];
+        let tr = translation(
+            "T31B",
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            None,
+            Some(cds),
+        );
+        let out = engine.evaluate_variant_with_context(
+            &var("20", 1009, 1009, "-", "C"),
+            std::slice::from_ref(&t),
+            &exons,
+            std::slice::from_ref(&tr),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &out
+            .iter()
+            .find(|e| e.transcript_id.as_deref() == Some("T31B"))
+            .expect("expected transcript consequence")
+            .terms;
+        assert!(
+            terms.contains(&SoTerm::ThreePrimeUtrVariant),
+            "insertion after the last CDS base is 3' UTR, got {terms:?}"
+        );
+        for forbidden in [
+            SoTerm::InframeInsertion,
+            SoTerm::StopRetainedVariant,
+            SoTerm::FrameshiftVariant,
+            SoTerm::CodingSequenceVariant,
+            SoTerm::ProteinAlteringVariant,
+        ] {
+            assert!(
+                !terms.contains(&forbidden),
+                "{forbidden:?} must not fire outside the CDS, got {terms:?}"
+            );
+        }
+    }
+
+    /// Reverse-strand mirror of the previous test.  Here `overlaps_cds()`
+    /// accepts the position (it normalises the insertion to `start == end`, and
+    /// `variant.start == cds_start` is inside the genomic CDS span) even though
+    /// the insertion point in *transcript* orientation is after the last CDS
+    /// base, so the narrowing must be applied there too.
+    #[test]
+    fn insertion_after_last_cds_base_on_reverse_strand_is_three_prime_utr() {
+        let engine = TranscriptConsequenceEngine::default();
+        // CDS (transcript orientation) = ATG CCC TGA; genomic CDS 1000-1008,
+        // 3' UTR at 900-999 (lower genomic coordinates on the reverse strand).
+        let cds = "ATGCCCTGA";
+        let t = tx(
+            "T31E",
+            "20",
+            900,
+            1008,
+            -1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        let exons = vec![exon("T31E", 1, 900, 1008)];
+        let tr = translation(
+            "T31E",
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            None,
+            Some(cds),
+        );
+        // Insertion between genomic 999 and 1000: in transcript orientation the
+        // insertion point is immediately after CDS base 9 (genomic 1000).
+        let out = engine.evaluate_variant_with_context(
+            &var("20", 1000, 1000, "-", "G"),
+            std::slice::from_ref(&t),
+            &exons,
+            std::slice::from_ref(&tr),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &out
+            .iter()
+            .find(|e| e.transcript_id.as_deref() == Some("T31E"))
+            .expect("expected transcript consequence")
+            .terms;
+        assert!(
+            terms.contains(&SoTerm::ThreePrimeUtrVariant),
+            "reverse-strand insertion after the last CDS base is 3' UTR, got {terms:?}"
+        );
+        for forbidden in [
+            SoTerm::InframeInsertion,
+            SoTerm::StopRetainedVariant,
+            SoTerm::FrameshiftVariant,
+            SoTerm::CodingSequenceVariant,
+            SoTerm::ProteinAlteringVariant,
+        ] {
+            assert!(
+                !terms.contains(&forbidden),
+                "{forbidden:?} must not fire outside the CDS, got {terms:?}"
+            );
+        }
+    }
+
+    /// `chr17:28915425 TGGA>T` (and `chr1:207362678 AATG>A`,
+    /// `chr11:119309671 TGGA>T`): an in-frame deletion that abuts the stop
+    /// codon has peptide allele `PP/P` — no stop codon in either peptide — so
+    /// neither `stop_retained_variant` nor `stop_gained` may fire.
+    #[test]
+    fn inframe_deletion_abutting_stop_codon_is_plain_inframe_deletion() {
+        // CDS = ATG CCA CCA TGA (M P P *)
+        let cds = "ATGCCACCATGA";
+        let t = tx(
+            "T31C",
+            "17",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        let e = exon("T31C", 1, 1000, 1011);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation(
+            "T31C",
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            None,
+            Some(cds),
+        );
+        // Delete CDS 6-8 ("ACC"), spanning codons 2 and 3: PP -> P.
+        let v = var("17", 1005, 1007, "ACC", "-");
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+            .expect("inframe deletion should be classified");
+        assert_eq!(c.amino_acids.as_deref(), Some("PP/P"));
+        assert!(
+            !c.stop_retained,
+            "ref_eq_alt_sequence returns 0 for PP/P (no '*' in either peptide)"
+        );
+        assert!(
+            !c.stop_gained,
+            "stop_gained tests the LOCAL alt peptide ('P'), which has no '*'"
+        );
+        assert!(!c.stop_lost, "the stop codon is untouched");
+    }
+
+    #[test]
+    fn inframe_deletion_abutting_stop_codon_emits_only_inframe_deletion_term() {
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGCCACCATGA";
+        let t = tx(
+            "T31D",
+            "17",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        let exons = vec![exon("T31D", 1, 1000, 1011)];
+        let tr = translation(
+            "T31D",
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            None,
+            Some(cds),
+        );
+        let out = engine.evaluate_variant_with_context(
+            &var("17", 1005, 1007, "ACC", "-"),
+            std::slice::from_ref(&t),
+            &exons,
+            std::slice::from_ref(&tr),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &out
+            .iter()
+            .find(|e| e.transcript_id.as_deref() == Some("T31D"))
+            .expect("expected transcript consequence")
+            .terms;
+        assert!(
+            terms.contains(&SoTerm::InframeDeletion),
+            "expected inframe_deletion, got {terms:?}"
+        );
+        assert!(
+            !terms.contains(&SoTerm::StopRetainedVariant),
+            "spurious stop_retained_variant, got {terms:?}"
+        );
+        assert!(
+            !terms.contains(&SoTerm::StopGained),
+            "spurious stop_gained, got {terms:?}"
         );
     }
 }
