@@ -16085,4 +16085,219 @@ mod tests {
         assert!(line.contains("projection=0.014s"));
         assert!(line.contains("input_buffers=15"));
     }
+
+    /// Drive the real CSQ emission path (`annotate_batch_with_transcript_engine`)
+    /// over a single synthetic VCF row with an empty feature context, and return
+    /// `(CSQ string, typed "Allele" column value, CSQ Format header field count)`.
+    ///
+    /// An empty `PreparedContext` keeps the fixture standalone (no cache, no
+    /// Docker, no network) while still exercising the production row loop,
+    /// allele derivation and CSQ serializer: every variant resolves to a single
+    /// `intergenic_variant` consequence, so the number of CSQ entries equals the
+    /// number of consequence *alleles* the emission loop iterates over.
+    fn annotate_one_row_csq(
+        chrom: &str,
+        start: i64,
+        end: i64,
+        ref_allele: &str,
+        alt_column: &str,
+    ) -> (String, String, usize) {
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let provider = AnnotateProvider::new(
+            Arc::new(SessionContext::new()),
+            "vcf".to_string(),
+            String::new(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Ensembl,
+            None,
+            vcf_schema.clone(),
+        )
+        .unwrap();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(vcf_schema),
+            vec![
+                Arc::new(StringArray::from(vec![chrom])),
+                Arc::new(Int64Array::from(vec![start])),
+                Arc::new(Int64Array::from(vec![end])),
+                Arc::new(StringArray::from(vec![ref_allele])),
+                Arc::new(StringArray::from(vec![alt_column])),
+            ],
+        )
+        .unwrap();
+
+        let engine = TranscriptConsequenceEngine::new(5000, 5000);
+        let ctx =
+            crate::transcript_consequence::PreparedContext::new(&[], &[], &[], &[], &[], &[], &[]);
+        let colocated_map: HashMap<ColocatedKey, ColocatedData> = HashMap::new();
+        let mut sift_cache = SiftPolyphenCache::new();
+        #[cfg(feature = "parquet-cache")]
+        let sift_store: Option<SiftPredictionStoreRef> = None;
+        #[cfg(not(feature = "parquet-cache"))]
+        let sift_store: Option<()> = None;
+        let flags = VepFlags::from_options_json(None);
+        let hgvs_flags = HgvsFlags::from_options_json(None);
+        let pick_flags = PickFlags::from_options_json(None).unwrap();
+        let mut hgvs_reader: Option<FastaReader> = None;
+
+        let out = provider
+            .annotate_batch_with_transcript_engine(
+                &batch,
+                &engine,
+                &ctx,
+                &colocated_map,
+                &mut sift_cache,
+                &sift_store,
+                false,
+                false,
+                &flags,
+                &hgvs_flags,
+                provider.transcript_selection,
+                &pick_flags,
+                &mut hgvs_reader,
+                #[cfg(feature = "parquet-cache")]
+                None,
+            )
+            .unwrap();
+
+        let string_col = |name: &str| {
+            let idx = out.schema().index_of(name).unwrap();
+            out.column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_string()
+        };
+        let header_field_count = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
+            flags.everything,
+            provider.transcript_selection.cache_source_type == CacheSourceType::RefSeq,
+            provider.transcript_selection.cache_source_type == CacheSourceType::Merged,
+            provider.include_pick_output,
+        )
+        .len();
+
+        (string_col("CSQ"), string_col("Allele"), header_field_count)
+    }
+
+    /// Repro for biodatageeks/vepyr#35 — raw multi-allelic CSQ corruption.
+    ///
+    /// `datafusion-bio-format-vcf` delivers a multi-ALT VCF record as ONE row
+    /// whose `alt` value is the ALT alleles **pipe-joined** (upstream
+    /// `datafusion/bio-format-vcf/src/physical_exec.rs`, `join_into(record
+    /// .alternate_bases()…, '|')`). `annotate_batch_with_transcript_engine`
+    /// then derives a single `vep_allele` from that whole string
+    /// (`vcf_to_vep_allele(&ref_al, &alt_allele)` at the top of the row loop)
+    /// and emits one CSQ entry per *transcript*, interpolating that one
+    /// `vep_allele` into CSQ field 1. Consequences:
+    ///
+    /// 1. `|` is the CSQ *field* separator, so a `|` inside the `Allele`
+    ///    sub-field makes every entry one token too wide for the CSQ `Format`
+    ///    header — the output is structurally malformed, not just semantically
+    ///    off.
+    /// 2. The per-allele dimension VEP emits is missing entirely.
+    ///
+    /// Real VEP, `Bio::EnsEMBL::VEP::Parser::VCF::create_VariationFeatures()`
+    /// (modules/Bio/EnsEMBL/VEP/Parser/VCF.pm, the `scalar @$alts > 1 &&
+    /// $is_indel` branch): when a multi-ALT record is an indel and REF plus all
+    /// ALTs share the same first base, it strips exactly that one anchor base
+    /// from REF and from every ALT, increments `start`, maps an emptied ALT to
+    /// `-`, and builds `allele_string = REF/ALT1/ALT2`. It then emits one
+    /// consequence per (allele × feature).
+    ///
+    /// For `chr22:22027537 TACAC>TACACAC,T` that gives `allele_string` =
+    /// `ACAC/ACACAC/-`, i.e. two per-allele CSQ groups with `Allele=ACACAC`
+    /// (the insertion) and `Allele=-` (the deletion) — exactly what the issue
+    /// measured against real VEP on the parity-harness region.
+    ///
+    /// IGNORED, not fixed: the per-allele dimension cannot be threaded through
+    /// this emission path locally. The row loop carries exactly one
+    /// `vep_allele`, one `VariantInput`, one colocated key and one plugin probe
+    /// key per row, and the typed output schema declares `Allele` as a *scalar*
+    /// `Utf8` column (`annotation_column_defs()`: "Allele (scalar, same for all
+    /// transcripts)") whose Nth element is contractually the Nth CSQ entry.
+    /// Fanning out over alleles therefore changes the 87/88-column output
+    /// contract, so it is a deliberate design change rather than a local patch.
+    /// Un-ignore this test together with that change; it is the acceptance
+    /// criterion for biodatageeks/vepyr#35.
+    #[test]
+    #[ignore = "biodatageeks/vepyr#35: per-(allele x transcript) CSQ emission not implemented"]
+    fn multiallelic_record_emits_one_csq_entry_per_allele_issue_35() {
+        // chr22:22027537 TACAC>TACACAC,T as the VCF reader delivers it: one row,
+        // ALTs pipe-joined into the `alt` column.
+        let (csq, typed_allele, header_field_count) =
+            annotate_one_row_csq("chr22", 22027537, 22027541, "TACAC", "TACACAC|T");
+
+        let entries: Vec<&str> = csq.split(',').collect();
+        let widths: Vec<usize> = entries.iter().map(|e| e.split('|').count()).collect();
+        let alleles: Vec<&str> = entries
+            .iter()
+            .map(|e| e.split('|').next().unwrap_or_default())
+            .collect();
+
+        // (1) Structural validity: every CSQ entry must have exactly as many
+        // `|`-separated tokens as the CSQ `Format` header declares.
+        assert_eq!(
+            widths,
+            vec![header_field_count; entries.len()],
+            "malformed CSQ: entry token counts {widths:?} != header field count \
+             {header_field_count}; a `|` inside the Allele sub-field adds a \
+             phantom field. CSQ={csq}"
+        );
+
+        // (2) VEP emits one entry per (allele x feature). With an empty feature
+        // context each allele yields exactly one `intergenic_variant` entry, so
+        // a two-ALT record must produce two entries.
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected one CSQ entry per ALT allele (2), got {}: CSQ={csq}",
+            entries.len()
+        );
+
+        // (3) Per-allele minimal VEP alleles, in input ALT order.
+        assert_eq!(
+            alleles,
+            vec!["ACACAC", "-"],
+            "expected VEP per-allele CSQ alleles from allele_string ACAC/ACACAC/-, \
+             got {alleles:?}: CSQ={csq}"
+        );
+
+        // (4) The typed `Allele` output column must never carry a `|`-joined
+        // multi-ALT value either.
+        assert!(
+            !typed_allele.contains('|'),
+            "typed Allele column is a pipe-joined multi-ALT value: {typed_allele:?}"
+        );
+    }
+
+    /// Biallelic control for `multiallelic_record_emits_one_csq_entry_per_allele_issue_35`.
+    ///
+    /// Pins today's (VEP-concordant) single-ALT behaviour so that a future
+    /// per-allele fan-out cannot silently drift the biallelic output that vepyr
+    /// is validated on: exactly one CSQ entry, header-width, minimal `Allele`,
+    /// and a pipe-free scalar `Allele` column.
+    #[test]
+    fn biallelic_record_emits_single_header_width_csq_entry() {
+        // The same locus after `bcftools norm -m -both`: the insertion allele of
+        // chr22:22027537 TACAC>TACACAC, left-anchored on its own row.
+        let (csq, typed_allele, header_field_count) =
+            annotate_one_row_csq("chr22", 22027541, 22027541, "C", "CAC");
+
+        let entries: Vec<&str> = csq.split(',').collect();
+        assert_eq!(entries.len(), 1, "CSQ={csq}");
+        assert_eq!(
+            entries[0].split('|').count(),
+            header_field_count,
+            "CSQ={csq}"
+        );
+        assert_eq!(entries[0].split('|').next(), Some("AC"), "CSQ={csq}");
+        assert_eq!(typed_allele, "AC");
+    }
 }
