@@ -2090,6 +2090,9 @@ impl TranscriptConsequenceEngine {
         }
     }
 
+    /// Non-prepared analogue of `append_tfbs_terms_prepared`; see that method for
+    /// traceability. Emits one MotifFeature entry per overlapping motif, each with
+    /// its stable id in `Feature`, mirroring `append_regulatory_terms`.
     fn append_tfbs_terms(
         &self,
         out: &mut Vec<TranscriptConsequence>,
@@ -2097,14 +2100,11 @@ impl TranscriptConsequenceEngine {
         motifs: &[MotifFeature],
         structural: &[StructuralFeature],
     ) {
-        let mut terms = BTreeSet::new();
         let chrom = normalize_chrom(&variant.chrom);
-        let overlaps_tfbs = motifs.iter().any(|m| {
-            normalize_chrom(&m.chrom) == chrom && feature_overlaps(variant, m.start, m.end)
-        });
-        if overlaps_tfbs {
-            terms.insert(SoTerm::TfBindingSiteVariant);
-        }
+
+        // SV-derived TFBS terms (ablation/amplification) apply across every
+        // overlapping motif feature.
+        let mut sv_terms = BTreeSet::new();
         for sv in structural {
             if normalize_chrom(&sv.chrom) != chrom
                 || !overlaps(variant.start, variant.end, sv.start, sv.end)
@@ -2116,16 +2116,47 @@ impl TranscriptConsequenceEngine {
             }
             match sv.event_kind {
                 SvEventKind::Ablation => {
-                    terms.insert(SoTerm::TfbsAblation);
+                    sv_terms.insert(SoTerm::TfbsAblation);
                 }
                 SvEventKind::Amplification => {
-                    terms.insert(SoTerm::TfbsAmplification);
+                    sv_terms.insert(SoTerm::TfbsAmplification);
                 }
                 SvEventKind::Elongation | SvEventKind::Truncation => {}
             }
         }
-        if !terms.is_empty() {
+
+        // Emit one CSQ entry per overlapping motif feature (matching VEP behavior).
+        let mut seen_motif_ids: HashSet<&str> = HashSet::new();
+        let is_deletion =
+            variant.ref_allele.len() > variant.alt_allele.len() || variant.alt_allele == "-";
+        let mut matched_motif = false;
+        for m in motifs {
+            if normalize_chrom(&m.chrom) != chrom || !feature_overlaps(variant, m.start, m.end) {
+                continue;
+            }
+            if !seen_motif_ids.insert(m.motif_id.as_str()) {
+                continue;
+            }
+            matched_motif = true;
+            let mut terms: BTreeSet<SoTerm> = sv_terms.clone();
+            // VEP: TFBS_ablation requires complete_overlap_feature AND deletion.
+            if is_deletion && variant.start <= m.start && variant.end >= m.end {
+                terms.insert(SoTerm::TfbsAblation);
+            }
+            terms.insert(SoTerm::TfBindingSiteVariant);
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
+            ordered.sort_by_key(|t| t.rank());
+            out.push(TranscriptConsequence {
+                transcript_id: Some(m.motif_id.clone()),
+                feature_type: FeatureType::MotifFeature,
+                terms: ordered,
+                ..Default::default()
+            });
+        }
+
+        // If no motif overlaps but SV terms exist, emit a single entry.
+        if !sv_terms.is_empty() && !matched_motif {
+            let mut ordered: Vec<SoTerm> = sv_terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
             out.push(TranscriptConsequence {
                 feature_type: FeatureType::MotifFeature,
@@ -2135,6 +2166,27 @@ impl TranscriptConsequenceEngine {
         }
     }
 
+    /// Traceability:
+    /// - Ensembl VEP `OutputFactory::MotifFeatureVariationAllele_to_output_hash()`
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/release/116/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1857-L1876>
+    /// - Ensembl Variation `VariationEffect::within_motif_feature()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1575-L1578>
+    /// - `TFBS_ablation` uses the same `feature_ablation` predicate
+    ///   (`complete_overlap && deletion`) as `regulatory_region_ablation`
+    ///   (Constants.pm), so the deletion-ablation branch here mirrors the
+    ///   regulatory sibling exactly.
+    ///
+    /// VEP emits ONE MotifFeature CSQ entry **per overlapping motif feature**,
+    /// each carrying that motif's stable id in the `Feature` column. This mirrors
+    /// the per-feature fan-out of `append_regulatory_terms_prepared`. Collapsing
+    /// all overlapping motifs into a single `.any()` entry (with an empty
+    /// `Feature` id) was issue #30 — it accounted for 100% of the VEP-116
+    /// coverage gap.
+    ///
+    /// Phase 1 only: this restores the per-motif fan-out and populates `Feature`.
+    /// The PWM-derived fields (`MOTIF_NAME`, `HIGH_INF_POS`, `MOTIF_SCORE_CHANGE`,
+    /// `TRANSCRIPTION_FACTORS`) remain default and are tracked as issue #30
+    /// Phase 2 (BindingMatrix port).
     fn append_tfbs_terms_prepared(
         &self,
         out: &mut Vec<TranscriptConsequence>,
@@ -2143,20 +2195,9 @@ impl TranscriptConsequenceEngine {
         ctx: &PreparedContext<'_>,
         structural_hits: &[usize],
     ) {
-        let mut terms = BTreeSet::new();
-        let mut motif_hits = Vec::new();
-        ctx.motif_index.collect_overlapping_indices(
-            chrom,
-            variant.start,
-            variant.end,
-            &mut motif_hits,
-        );
-        if motif_hits.into_iter().any(|idx| {
-            let motif = ctx.motif_index.features[idx];
-            feature_overlaps(variant, motif.start, motif.end)
-        }) {
-            terms.insert(SoTerm::TfBindingSiteVariant);
-        }
+        // SV-derived TFBS terms (ablation/amplification) apply across every
+        // overlapping motif feature, mirroring the regulatory sibling.
+        let mut sv_terms = BTreeSet::new();
         for &idx in structural_hits {
             let sv = ctx.structural_index.features[idx];
             if sv.feature_kind != SvFeatureKind::Tfbs {
@@ -2164,16 +2205,55 @@ impl TranscriptConsequenceEngine {
             }
             match sv.event_kind {
                 SvEventKind::Ablation => {
-                    terms.insert(SoTerm::TfbsAblation);
+                    sv_terms.insert(SoTerm::TfbsAblation);
                 }
                 SvEventKind::Amplification => {
-                    terms.insert(SoTerm::TfbsAmplification);
+                    sv_terms.insert(SoTerm::TfbsAmplification);
                 }
                 SvEventKind::Elongation | SvEventKind::Truncation => {}
             }
         }
-        if !terms.is_empty() {
+
+        let mut motif_hits = Vec::new();
+        ctx.motif_index.collect_overlapping_indices(
+            chrom,
+            variant.start,
+            variant.end,
+            &mut motif_hits,
+        );
+        let mut matched_motif = false;
+        let mut seen_motif_ids: HashSet<&str> = HashSet::new();
+        let is_deletion =
+            variant.ref_allele.len() > variant.alt_allele.len() || variant.alt_allele == "-";
+        for idx in motif_hits {
+            let m = ctx.motif_index.features[idx];
+            if !feature_overlaps(variant, m.start, m.end) {
+                continue;
+            }
+            if !seen_motif_ids.insert(m.motif_id.as_str()) {
+                continue;
+            }
+            matched_motif = true;
+            let mut terms: BTreeSet<SoTerm> = sv_terms.clone();
+            // VEP: TFBS_ablation requires complete_overlap_feature AND deletion
+            // (feature_ablation predicate) — mirrors regulatory_region_ablation.
+            if is_deletion && variant.start <= m.start && variant.end >= m.end {
+                terms.insert(SoTerm::TfbsAblation);
+            }
+            terms.insert(SoTerm::TfBindingSiteVariant);
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
+            ordered.sort_by_key(|t| t.rank());
+            out.push(TranscriptConsequence {
+                transcript_id: Some(m.motif_id.clone()),
+                feature_type: FeatureType::MotifFeature,
+                terms: ordered,
+                ..Default::default()
+            });
+        }
+
+        // If no motif overlaps but SV terms exist, emit a single entry.
+        if !sv_terms.is_empty() && !matched_motif {
+            let mut ordered: Vec<SoTerm> = sv_terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
             out.push(TranscriptConsequence {
                 feature_type: FeatureType::MotifFeature,
@@ -10996,6 +11076,171 @@ mod tests {
             .collect();
         assert_eq!(reg_entries.len(), 1);
         assert_eq!(reg_entries[0].transcript_id.as_deref(), Some("ENSR22_A"));
+    }
+
+    // --- issue #30: MotifFeature per-motif fan-out + Feature id population ---
+    //
+    // These mirror the regulatory per-feature tests above. Before the fix,
+    // `append_tfbs_terms(_prepared)` used `.any()` to collapse all overlapping
+    // motifs into a single MotifFeature entry built with `..Default::default()`,
+    // leaving `Feature` (transcript_id) empty. The fix mirrors
+    // `append_regulatory_terms`: one entry per overlapping motif, each with its
+    // stable id in `Feature`.
+
+    /// Reproducer analogue of `chr1:102114682 C>T` (VEP emits two MotifFeature
+    /// entries `ENSM00000042097`, `ENSM00000042098`; vepyr previously emitted one
+    /// collapsed entry with an empty id).
+    #[test]
+    fn tfbs_emits_per_motif_entries_with_stable_ids() {
+        let engine = TranscriptConsequenceEngine::default();
+        let m1 = motif("ENSM00000042097", "22", 100, 200);
+        let m2 = motif("ENSM00000042098", "22", 150, 250);
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 160, 160, "A", "G"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[m1, m2],
+            &[],
+            &[],
+        );
+        let motif_entries: Vec<_> = assignments
+            .iter()
+            .filter(|tc| tc.feature_type == FeatureType::MotifFeature)
+            .collect();
+        assert_eq!(motif_entries.len(), 2);
+        let ids: Vec<_> = motif_entries
+            .iter()
+            .map(|tc| tc.transcript_id.as_deref().unwrap_or(""))
+            .collect();
+        assert!(ids.contains(&"ENSM00000042097"));
+        assert!(ids.contains(&"ENSM00000042098"));
+        for tc in &motif_entries {
+            assert!(tc.terms.contains(&SoTerm::TfBindingSiteVariant));
+        }
+    }
+
+    /// Reproducer analogue of `chr1:1899573 C>T` (VEP emits `Feature=ENSM00000002062`;
+    /// vepyr previously emitted an empty `Feature`).
+    #[test]
+    fn tfbs_single_motif_populates_feature_id() {
+        let engine = TranscriptConsequenceEngine::default();
+        let m = motif("ENSM00000002062", "22", 150, 160);
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 155, 155, "A", "G"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[m],
+            &[],
+            &[],
+        );
+        let motif_entries: Vec<_> = assignments
+            .iter()
+            .filter(|tc| tc.feature_type == FeatureType::MotifFeature)
+            .collect();
+        assert_eq!(motif_entries.len(), 1);
+        assert_eq!(
+            motif_entries[0].transcript_id.as_deref(),
+            Some("ENSM00000002062")
+        );
+        assert!(
+            motif_entries[0]
+                .terms
+                .contains(&SoTerm::TfBindingSiteVariant)
+        );
+    }
+
+    /// Duplicate rows for a single motif stable id collapse to one entry
+    /// (matches the regulatory dedup-by-id semantics).
+    #[test]
+    fn tfbs_dedups_repeated_motif_id() {
+        let engine = TranscriptConsequenceEngine::default();
+        let m1 = motif("ENSM00000002062", "22", 150, 160);
+        let m1_dup = motif("ENSM00000002062", "22", 150, 160);
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 155, 155, "A", "G"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[m1, m1_dup],
+            &[],
+            &[],
+        );
+        let motif_entries: Vec<_> = assignments
+            .iter()
+            .filter(|tc| tc.feature_type == FeatureType::MotifFeature)
+            .collect();
+        assert_eq!(motif_entries.len(), 1);
+        assert_eq!(
+            motif_entries[0].transcript_id.as_deref(),
+            Some("ENSM00000002062")
+        );
+    }
+
+    /// A non-overlapping motif produces no entry.
+    #[test]
+    fn tfbs_non_overlapping_motif_excluded() {
+        let engine = TranscriptConsequenceEngine::default();
+        let overlap = motif("ENSM00000000001", "22", 100, 200);
+        let no_overlap = motif("ENSM00000000002", "22", 300, 400);
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 150, 150, "A", "G"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[overlap, no_overlap],
+            &[],
+            &[],
+        );
+        let motif_entries: Vec<_> = assignments
+            .iter()
+            .filter(|tc| tc.feature_type == FeatureType::MotifFeature)
+            .collect();
+        assert_eq!(motif_entries.len(), 1);
+        assert_eq!(
+            motif_entries[0].transcript_id.as_deref(),
+            Some("ENSM00000000001")
+        );
+    }
+
+    /// A deletion that completely spans a motif adds `TFBS_ablation` to that
+    /// motif's entry (VEP `feature_ablation` predicate = complete_overlap &&
+    /// deletion), mirroring the regulatory ablation branch. Feature id is still
+    /// populated.
+    #[test]
+    fn tfbs_deletion_complete_overlap_emits_ablation() {
+        let engine = TranscriptConsequenceEngine::default();
+        let m = motif("ENSM00000002062", "22", 150, 160);
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 148, 162, "ACGTACGTACGTAC", "A"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[m],
+            &[],
+            &[],
+        );
+        let motif_entries: Vec<_> = assignments
+            .iter()
+            .filter(|tc| tc.feature_type == FeatureType::MotifFeature)
+            .collect();
+        assert_eq!(motif_entries.len(), 1);
+        assert_eq!(
+            motif_entries[0].transcript_id.as_deref(),
+            Some("ENSM00000002062")
+        );
+        assert!(motif_entries[0].terms.contains(&SoTerm::TfbsAblation));
+        assert!(
+            motif_entries[0]
+                .terms
+                .contains(&SoTerm::TfBindingSiteVariant)
+        );
     }
 
     #[test]
