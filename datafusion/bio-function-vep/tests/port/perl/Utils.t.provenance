@@ -1,0 +1,9 @@
+upstream:  https://github.com/Ensembl/ensembl-vep/blob/release/115/t/Utils.t
+path:      t/Utils.t
+ref:       release/115 @ 2beada0d57ca6234f467b14a6c60280f4a082717 (tag release/115.2)
+sha256:    13d1318bd6dc93dd41707b2de2a65b0806f95ae4788a3f9db887c4047d1ffe57
+vendored:  2026-07-27
+licence:   Apache-2.0, Copyright [2016-2025] EMBL-European Bioinformatics Institute
+verbatim:  yes — byte-for-byte, so ledger line numbers match upstream
+why:       the ledger gate (tests/port_ledger.rs) enumerates assertions from this
+           file in CI, which must work with no network and no ensembl-vep checkout.

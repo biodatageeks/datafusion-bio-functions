@@ -1,0 +1,10 @@
+Third-party notices for datafusion-bio-functions
+================================================
+
+This product includes test files from Ensembl VEP (https://github.com/Ensembl/ensembl-vep),
+Copyright [2016-2025] EMBL-European Bioinformatics Institute, licensed under the
+Apache License, Version 2.0.
+
+Vendored verbatim under datafusion/bio-function-vep/tests/port/perl/. Each file has a
+.provenance sidecar recording its upstream path and vendoring date. These files are used
+only as the reference corpus for the port ledger gate; they are not executed.

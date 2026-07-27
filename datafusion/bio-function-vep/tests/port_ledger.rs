@@ -370,4 +370,25 @@ mod enumerate {
     fn errors_on_a_file_with_no_assertions() {
         assert!(enumerate_assertions("use strict;\nmy $x = 1;\n").is_err());
     }
+
+    /// The decisive cross-check: the machine numbering must equal the numbering a human
+    /// used by hand in the pre-existing `port_utils.rs` (rows 1-44, with row 30 = L218,
+    /// row 31 = L219, row 32 = L220, row 33 = L221, row 44 = L310).
+    #[test]
+    fn matches_the_hand_numbering_of_utils_t() {
+        let src = include_str!("port/perl/Utils.t");
+        let found = enumerate_assertions(src).unwrap();
+        assert_eq!(
+            found.len(),
+            44,
+            "expected 44 assertions, got {}",
+            found.len()
+        );
+        let at = |n: usize| found[n - 1].line;
+        assert_eq!(at(30), 218, "row 30 should be the get_compressed_filehandle ok()");
+        assert_eq!(at(31), 219);
+        assert_eq!(at(32), 220);
+        assert_eq!(at(33), 221);
+        assert_eq!(at(44), 310, "row 44 should be the get_version_string ok()");
+    }
 }
