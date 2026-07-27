@@ -672,3 +672,96 @@ mod conditions {
         assert!(errs.is_empty(), "should be clean, got {errs:?}");
     }
 }
+
+fn crate_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The gate. Walks every `tests/port/*.ledger.toml`, enumerates its vendored Perl, and
+/// asserts the contract. Also asserts the reverse direction: every `tests/port_*.rs`
+/// file must be referenced by at least one ledger row, so a port cannot land by simply
+/// not writing a ledger.
+#[test]
+fn every_port_ledger_is_complete() {
+    let root = crate_root();
+    let port_dir = root.join("tests/port");
+    let rust_tests = index_rust_tests(&[root.join("src"), root.join("tests")], &root);
+
+    let mut ledgers = Vec::new();
+    for entry in std::fs::read_dir(&port_dir).expect("tests/port must exist") {
+        let p = entry.expect("readable dir entry").path();
+        if p.to_string_lossy().ends_with(".ledger.toml") {
+            ledgers.push(p);
+        }
+    }
+    ledgers.sort();
+    assert!(
+        !ledgers.is_empty(),
+        "no ledgers found in {} — the gate would be vacuous",
+        port_dir.display()
+    );
+
+    let mut errs: Vec<String> = Vec::new();
+    let mut referenced: Vec<String> = Vec::new();
+
+    for lp in &ledgers {
+        let text = std::fs::read_to_string(lp).expect("readable ledger");
+        let ledger = match parse_ledger(&text) {
+            Ok(l) => l,
+            Err(e) => {
+                errs.push(format!("{}: {e}", lp.display()));
+                continue;
+            }
+        };
+        let perl_path = port_dir.join(&ledger.vendored);
+        let src = match std::fs::read_to_string(&perl_path) {
+            Ok(s) => s,
+            Err(e) => {
+                errs.push(format!(
+                    "{}: cannot read vendored Perl {}: {e}",
+                    lp.display(),
+                    perl_path.display()
+                ));
+                continue;
+            }
+        };
+        match enumerate_assertions(&src) {
+            Ok(assertions) => {
+                errs.extend(check_ledger(&ledger, &assertions, &rust_tests));
+                referenced.extend(
+                    ledger
+                        .rows
+                        .iter()
+                        .filter_map(|r| r.rust.clone())
+                        .filter_map(|t| t.split("::").next().map(str::to_owned)),
+                );
+            }
+            Err(e) => errs.push(format!("{}: {e}", perl_path.display())),
+        }
+    }
+
+    // Reverse direction: no orphan port test files.
+    for entry in std::fs::read_dir(root.join("tests")).expect("tests/ must exist") {
+        let p = entry.expect("readable dir entry").path();
+        let Some(fname) = p.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
+        if !fname.starts_with("port_") || !fname.ends_with(".rs") || fname == "port_ledger.rs" {
+            continue;
+        }
+        let rel = format!("tests/{fname}");
+        if !referenced.contains(&rel) {
+            errs.push(format!(
+                "{rel} is a port test file but no ledger row references it — \
+                 every ported test must be accounted for by a ledger."
+            ));
+        }
+    }
+
+    assert!(
+        errs.is_empty(),
+        "port ledger gate failed with {} problem(s):\n  - {}",
+        errs.len(),
+        errs.join("\n  - ")
+    );
+}
