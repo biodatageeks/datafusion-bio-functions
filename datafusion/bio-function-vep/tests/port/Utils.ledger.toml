@@ -1,0 +1,371 @@
+# Ledger for ensembl-vep t/Utils.t — see tests/port/README.md for the contract.
+#
+# Row numbering is the machine enumeration produced by tests/port_ledger.rs, verified to
+# equal the hand numbering used by the original port on the archived `dev-test` branch
+# (anchors: n=30 → L218, n=31 → L219, n=32 → L220, n=33 → L221, n=44 → L310).
+#
+# `desc` quotes the Perl test name (the last argument of the assertion) so a reviewer can
+# grep the vendored file, followed by what the assertion actually pins down.
+#
+# Split: 11 unit-port · 31 architectural-no-analogue · 2 blocked-future-work.
+# The `dev-test` header this was transcribed from claimed "32 architectural" rows; the
+# correct count is 31, and rows 3 and 6 are reclassified — see their `issue` fields.
+perl_file           = "t/Utils.t"
+vendored            = "perl/Utils.t"
+perl_sha256         = "13d1318bd6dc93dd41707b2de2a65b0806f95ae4788a3f9db887c4047d1ffe57"
+expected_assertions = 44
+
+# ---------------------------------------------------------------------------
+# format_coords — the only Utils.pm helper that is directly CSQ-observable. It
+# renders Location, cDNA_position, CDS_position and Protein_position.
+# vepyr's analogue is `format_coords_ensembl()` in src/transcript_consequence.rs.
+# ---------------------------------------------------------------------------
+
+[[row]]
+n     = 1
+line  = 43
+desc  = "format_coords - same: format_coords(1,1) collapses an equal start/end to a bare '1'"
+class = "unit-port"
+rust  = "src/transcript_consequence.rs::format_coords_ensembl_supports_unknown_bounds"
+
+[[row]]
+n     = 2
+line  = 44
+desc  = "format_coords - diff 1: an ordered pair renders as 'start-end'"
+class = "unit-port"
+rust  = "src/transcript_consequence.rs::format_coords_ensembl_supports_unknown_bounds"
+
+[[row]]
+n      = 3
+line   = 45
+desc   = "format_coords - diff 2: a reversed pair (2,1) is swapped and still renders '1-2'"
+class  = "blocked-future-work"
+issue  = "biodatageeks/vepyr#TBD-3"
+reason = "vepyr IMPLEMENTS this — `format_coords_ensembl` has the `(Some(s), Some(e)) if s > e => format!(\"{e}-{s}\")` arm — but nothing asserts it. The in-src unit test `format_coords_ensembl_supports_unknown_bounds` covers only 4 of the 6 Perl cases (rows 1, 2, 4, 5); the swap is untested. This is a one-line fix inside that test, and this branch is test-infrastructure-only with a hard no-`src/`-changes rule, so it is deferred rather than claimed. Reclassified from the `dev-test` port's `unit-port`, which pointed all six rows at a test that does not cover six cases."
+
+[[row]]
+n     = 4
+line  = 47
+desc  = "format_coords - missing 1: an undefined end renders as 'start-?'"
+class = "unit-port"
+rust  = "src/transcript_consequence.rs::format_coords_ensembl_supports_unknown_bounds"
+
+[[row]]
+n     = 5
+line  = 48
+desc  = "format_coords - missing 2: an undefined start renders as '?-end'"
+class = "unit-port"
+rust  = "src/transcript_consequence.rs::format_coords_ensembl_supports_unknown_bounds"
+
+[[row]]
+n      = 6
+line   = 49
+desc   = "format_coords - missing 3: both bounds undefined renders as '-'"
+class  = "blocked-future-work"
+issue  = "biodatageeks/vepyr#TBD-6"
+reason = "Same gap as row 3. vepyr encodes 'no coordinate' as `Option::None` rather than the literal '-', which is behaviourally equivalent on vepyr's only output surface — VEP's own VCF writer maps '-' to the empty string (OutputFactory/VCF.pm L397) — but `format_coords_ensembl(None, None)` is asserted nowhere. Deferred for the same reason as row 3: fixing it means editing the in-src unit test."
+
+# ---------------------------------------------------------------------------
+# convert_arrayref — Perl's scalar-or-arrayref polymorphic stringifier for
+# multi-valued CSQ subfields.
+# ---------------------------------------------------------------------------
+
+[[row]]
+n      = 7
+line   = 55
+desc   = "convert_arrayref - scalar: a plain scalar passes straight through"
+class  = "architectural-no-analogue"
+reason = "The subtest exists only because one Perl symbol dispatches over both a scalar and an arrayref. In Rust a value is one or the other at the type level: vepyr's call sites hold either a `String` or a `Vec<String>` and the compiler settles which, so there is no polymorphic entry point whose scalar branch could be exercised. See porting-tests/detailed_plans/Utils.md row 7."
+
+[[row]]
+n     = 8
+line  = 56
+desc  = "convert_arrayref - arrayref: an arrayref joins on the default ',' separator"
+class = "unit-port"
+rust  = "tests/port_utils.rs::row8_convert_arrayref_default_join"
+
+[[row]]
+n     = 9
+line  = 57
+desc  = "convert_arrayref - arrayref with separator: an explicit separator overrides ','"
+class = "unit-port"
+rust  = "tests/port_utils.rs::row9_convert_arrayref_custom_separator"
+
+# ---------------------------------------------------------------------------
+# numberify — Perl's pre-JSON coercion of stringified numbers inside arbitrarily
+# nested structures, with an exempt-key map.
+# ---------------------------------------------------------------------------
+
+[[row]]
+n      = 10
+line   = 63
+desc   = "numberify - arrayref: ['0','1'] coerces to the numbers [0, 1]"
+class  = "architectural-no-analogue"
+reason = "numberify exists because Perl scalars carry no type, so JSON output would otherwise quote every number. vepyr never has a string-typed intermediate to coerce: consequence data is built directly into typed Arrow arrays (Int64/Float64/Utf8) whose type is fixed by the schema contract in src/schema_contract.rs. There is no structure on which a numberifier could operate. Anti-goal in porting-tests/detailed_plans/Utils.md: do NOT build a generic numberify."
+
+[[row]]
+n      = 11
+line   = 69
+desc   = "numberify - hashref: {foo=>'0', bar=>'0.1'} coerces both values"
+class  = "architectural-no-analogue"
+reason = "Same as row 10 — no untyped nested structure exists in vepyr to coerce."
+
+[[row]]
+n      = 12
+line   = 75
+desc   = "numberify - mixed: coercion recurses into an arrayref nested in a hashref"
+class  = "architectural-no-analogue"
+reason = "Same as row 10; additionally, the recursion this pins down has no counterpart because vepyr's output is a flat Arrow record batch, not a nested Perl structure."
+
+[[row]]
+n      = 13
+line   = 81
+desc   = "numberify - float: '0.0001' coerces to a float rather than an integer"
+class  = "architectural-no-analogue"
+reason = "Same as row 10. The int-vs-float decision vepyr makes is made once, statically, by the Arrow field type; there is no runtime inference step to test."
+
+[[row]]
+n      = 14
+line   = 87
+desc   = "numberify - exponential: '1e3' coerces to 1000"
+class  = "architectural-no-analogue"
+reason = "Same as row 10. Exponential literals reach vepyr only inside cache values already parsed into f64 by the Parquet/Lance reader, so no string form survives to be coerced."
+
+[[row]]
+n      = 15
+line   = 93
+desc   = "numberify - exempt keys intact: 'id' and 'seq_region_name' stay strings"
+class  = "architectural-no-analogue"
+reason = "The exempt-key map is a workaround for numberify's own over-eagerness — identifiers that look numeric must be protected from it. vepyr declares those columns Utf8 in the schema, so the hazard the exemption guards against cannot arise and there is nothing to exempt."
+
+# ---------------------------------------------------------------------------
+# merge_hashes — Perl's deep hash accumulator with optional numeric add-mode.
+# ---------------------------------------------------------------------------
+
+[[row]]
+n      = 16
+line   = 104
+desc   = "merge_hashes - simple: disjoint keys are unioned"
+class  = "architectural-no-analogue"
+reason = "VEP accumulates per-VariationFeatureOverlapAllele output into nested hashes and merges them before emit. vepyr appends directly into per-field Arrow ArrayBuilders (src/annotate_provider.rs), one builder per CSQ column, so no merge primitive exists to test. Anti-goal in porting-tests/detailed_plans/Utils.md: do NOT build merge_hashes."
+
+[[row]]
+n      = 17
+line   = 110
+desc   = "merge_hashes - complex: a nested sub-hash is merged rather than replaced"
+class  = "architectural-no-analogue"
+reason = "Same as row 16. vepyr's CSQ record has a fixed, flat field set, so there is no nested sub-structure whose recursive merge could be observed."
+
+[[row]]
+n      = 18
+line   = 116
+desc   = "merge_hashes - complex inverted: the merge is commutative over disjoint keys"
+class  = "architectural-no-analogue"
+reason = "Same as row 16 — a commutativity property of a primitive vepyr does not have."
+
+[[row]]
+n      = 19
+line   = 122
+desc   = "merge_hashes - overwrite: without add-mode, b's value replaces a's"
+class  = "architectural-no-analogue"
+reason = "Same as row 16. vepyr's builders are append-only; a later value never overwrites an earlier one at the same column-and-row position, so this precedence rule has no analogue."
+
+[[row]]
+n      = 20
+line   = 128
+desc   = "merge_hashes - add: with the add flag, numeric values are summed"
+class  = "architectural-no-analogue"
+reason = "Same as row 16. Add-mode exists for VEP's `--stats` counters, which vepyr does not produce (its statistics come from DataFusion aggregation over the emitted batches, not from hash merging)."
+
+[[row]]
+n      = 21
+line   = 134
+desc   = "merge_hashes - array: arrayref values are concatenated, not replaced"
+class  = "architectural-no-analogue"
+reason = "Same as row 16 — the array branch of a merge primitive vepyr does not have."
+
+# ---------------------------------------------------------------------------
+# merge_arrays — concat-then-dedupe preserving the order of the first array.
+# ---------------------------------------------------------------------------
+
+[[row]]
+n      = 22
+line   = 145
+desc   = "merge_arrays - simple: two disjoint arrays concatenate"
+class  = "architectural-no-analogue"
+reason = "vepyr has no centralised array merger: the two or three sites that need one use `Vec::extend` plus an explicit dedupe inline. Porting this would mean inventing a helper solely so a test could exist, which inverts the point of the port. See porting-tests/detailed_plans/Utils.md rows 22-24."
+
+[[row]]
+n      = 23
+line   = 151
+desc   = "merge_arrays - duplicates: a value already present in a is not appended twice"
+class  = "architectural-no-analogue"
+reason = "Same as row 22. vepyr's equivalent dedupe is per-call-site and is covered where it matters by the CSQ-level assertions in the annotate_provider tests, not by a helper unit test."
+
+[[row]]
+n      = 24
+line   = 157
+desc   = "merge_arrays - order: a's order is preserved and only new values from b are appended"
+class  = "architectural-no-analogue"
+reason = "Same as row 22 — an ordering guarantee of a helper that does not exist."
+
+# ---------------------------------------------------------------------------
+# find_in_ref — recursive walker over an arbitrary Perl structure, collecting
+# the scalar values found under a set of wanted keys.
+# ---------------------------------------------------------------------------
+
+[[row]]
+n      = 25
+line   = 169
+desc   = "find_in_ref - simple: a wanted key in a flat hash yields {key => [value]}"
+class  = "architectural-no-analogue"
+reason = "find_in_ref exists to flatten the output of VEP's Perl plugins, which return arbitrary untyped nested structures. vepyr's plugin mechanism (src/plugin_cache/) is manifest-driven: a plugin declares its columns in TOML and their values arrive as typed Arrow columns, so there is no unknown structure to introspect and no dynamic key search to perform. See porting-tests/detailed_plans/Utils.md rows 25-29."
+
+[[row]]
+n      = 26
+line   = 178
+desc   = "find_in_ref - two keys: several wanted keys are collected in one pass"
+class  = "architectural-no-analogue"
+reason = "Same as row 25 — multi-key search over an untyped structure vepyr never builds."
+
+[[row]]
+n      = 27
+line   = 187
+desc   = "find_in_ref - multiple values: the same key across array elements accumulates"
+class  = "architectural-no-analogue"
+reason = "Same as row 25. vepyr accumulates repeated plugin values by appending to a typed column, and the joining is done with an explicit `&` separator at emit time (see rows 8-9), not by a generic walker."
+
+[[row]]
+n      = 28
+line   = 196
+desc   = "find_in_ref - multiple values in arrayref: an arrayref value is flattened"
+class  = "architectural-no-analogue"
+reason = "Same as row 25 — flattening of an untyped arrayref value."
+
+[[row]]
+n      = 29
+line   = 205
+desc   = "find_in_ref - dont get non-scalars: nested refs are descended into, not captured"
+class  = "architectural-no-analogue"
+reason = "Same as row 25. This subtest pins the scalar-only capture rule, which is the walker's trickiest behaviour — and the strongest argument for porting it *if* vepyr ever grows a dynamic plugin-output flattener. It does not have one today."
+
+# ---------------------------------------------------------------------------
+# get_compressed_filehandle — opens a gzipped file, choosing among three Perl
+# backends. vepyr's analogue is `flate2::read::MultiGzDecoder`, used
+# unconditionally; the reachable public entry point is
+# `golden_benchmark::sample_gz_vcf_first_n`.
+# ---------------------------------------------------------------------------
+
+[[row]]
+n     = 30
+line  = 218
+desc  = "get_compressed_filehandle: a real gzipped VCF opens and yields its contents"
+class = "unit-port"
+rust  = "tests/port_utils.rs::row30_gzdecoder_reads_single_member_gzip"
+
+[[row]]
+n     = 31
+line  = 219
+desc  = "get_compressed_filehandle - no file: an absent path is an error, not an empty reader"
+class = "unit-port"
+rust  = "tests/port_utils.rs::row31_empty_path_errors_on_open"
+
+[[row]]
+n     = 32
+line  = 220
+desc  = "get_compressed_filehandle - file does not exist: a nonexistent path errors at open"
+class = "unit-port"
+rust  = "tests/port_utils.rs::row32_missing_path_errors_on_open"
+
+[[row]]
+n     = 33
+line  = 221
+desc  = "get_compressed_filehandle - file not compressed: uncompressed input is rejected, not read as text"
+class = "unit-port"
+rust  = "tests/port_utils.rs::row33_uncompressed_input_rejected_by_gzdecoder"
+
+[[row]]
+n      = 34
+line   = 232
+desc   = "get_compressed_filehandle - PerlIO::Gzip: the PerlIO backend returns a GLOB"
+class  = "architectural-no-analogue"
+reason = "This asserts *which* of three interchangeable Perl backends served the open, by inspecting the handle's ref type. vepyr has exactly one backend — flate2, a compile-time dependency — so there is no dispatch decision and no per-backend handle type to observe. The behaviour those three subtests jointly guarantee (a gzipped file opens) is what row 30 asserts."
+
+[[row]]
+n     = 35
+line  = 237
+desc  = "get_compressed_filehandle - PerlIO::Gzip with multistream uses gzip: the multistream flag reads concatenated gzip members"
+class = "unit-port"
+rust  = "tests/port_utils.rs::row35_multigzdecoder_reads_concatenated_members"
+
+[[row]]
+n      = 36
+line   = 244
+desc   = "get_compressed_filehandle - gzip: the gzip(1) fallback backend returns a GLOB"
+class  = "architectural-no-analogue"
+reason = "Same as row 34 — backend identity, not behaviour. vepyr also never shells out to gzip(1), so the fallback this asserts has no code path to correspond to."
+
+[[row]]
+n      = 37
+line   = 256
+desc   = "get_compressed_filehandle - IO::Uncompress::Gunzip: the last-resort backend returns an IO::Uncompress::Gunzip"
+class  = "architectural-no-analogue"
+reason = "Same as row 34 — the third of three backend-identity assertions."
+
+[[row]]
+n      = 38
+line   = 267
+desc   = "get_compressed_filehandle - no available library: with all three backends disabled, opening throws"
+class  = "architectural-no-analogue"
+reason = "Unreachable by construction in vepyr: flate2 is a non-optional dependency in Cargo.toml, so 'no decompression library is installed' is not a state the binary can be in. The Perl subtest reaches it only by mutating the package globals CAN_USE_PERLIO_GZIP / CAN_USE_GZIP / CAN_USE_IO_UNCOMPRESS at run time, which Rust has no analogue for."
+
+# ---------------------------------------------------------------------------
+# get_time
+# ---------------------------------------------------------------------------
+
+[[row]]
+n      = 39
+line   = 281
+desc   = "get_time: the returned timestamp matches /\\d{4}(-\\d\\d){2} \\d\\d(:\\d\\d){2}/"
+class  = "architectural-no-analogue"
+reason = "VEP's get_time formats the timestamp it stamps into its own log and stats output. vepyr exposes no timestamp helper: it depends on `chrono` but never formats a wall-clock string itself — log timestamps are produced inside env_logger's formatter, which is a third-party crate's contract, not vepyr's. Porting this row would test env_logger. See porting-tests/detailed_plans/Utils.md row 39."
+
+# ---------------------------------------------------------------------------
+# get_version_data / get_version_string — parsers over VEP's on-disk
+# `<dir>/<component>/version` text files.
+# ---------------------------------------------------------------------------
+
+[[row]]
+n      = 40
+line   = 291
+desc   = "get_version_data - ensembl-vep hashref: the ensembl-vep entry parses to a hash"
+class  = "architectural-no-analogue"
+reason = "VEP reports the versions of several sibling Perl distributions (ensembl, ensembl-variation, ensembl-vep) by reading a `version` text file out of each component's directory. vepyr is a single Rust crate whose version is `env!(\"CARGO_PKG_VERSION\")`, fixed at compile time; there are no sibling components and no version files, so there is nothing to parse. Anti-goal in porting-tests/detailed_plans/Utils.md: do NOT build a multi-component version-file parser."
+
+[[row]]
+n      = 41
+line   = 292
+desc   = "get_version_data - ensembl-vep release: the parsed release is numeric"
+class  = "architectural-no-analogue"
+reason = "Same as row 40 — a property of a parse result vepyr never produces. Cargo already guarantees the crate version is well-formed semver at build time."
+
+[[row]]
+n      = 42
+line   = 293
+desc   = "get_version_data - ensembl-vep sub: the parsed sub-version is numeric"
+class  = "architectural-no-analogue"
+reason = "Same as row 40. VEP's release/sub split (86.0000001) is a git-describe artefact of the Ensembl release process and has no counterpart in a semver crate version."
+
+[[row]]
+n      = 43
+line   = 295
+desc   = "get_version_data - the rest: ensembl and ensembl-variation parse to the expected release/sub pairs"
+class  = "architectural-no-analogue"
+reason = "Same as row 40. The sibling components this pins down (ensembl, ensembl-variation) are Perl distributions vepyr does not depend on; it reads the *cache* those projects produce, not their source trees."
+
+[[row]]
+n      = 44
+line   = 310
+desc   = "get_version_string: the multi-line report matches the expected component/version layout"
+class  = "architectural-no-analogue"
+reason = "Same as row 40, at the formatting layer: this asserts the shape of VEP's own multi-line `--show_cache_info`-style version banner. vepyr's version output is a single semver line with its own shape, deliberately not VEP's, so a faithful port would assert a format vepyr must not have."
