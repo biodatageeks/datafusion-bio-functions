@@ -103,8 +103,10 @@ fn parse_ledger(text: &str) -> Result<Ledger, String> {
             n: int("n")?,
             line: int("line")?,
             desc: opt("desc").ok_or_else(|| ctx("missing `desc`".into()))?,
+            // `&ctx`, not `ctx`: passing it by value would move a closure that `int`
+            // and the `ok_or_else` calls above still borrow.
             class: Class::parse(&opt("class").ok_or_else(|| ctx("missing `class`".into()))?)
-                .map_err(|e| ctx(e))?,
+                .map_err(&ctx)?,
             rust: opt("rust"),
             reason: opt("reason"),
             issue: opt("issue"),
@@ -170,7 +172,10 @@ reason = "vepyr is cache-only by design"
     fn rejects_a_missing_expected_assertions() {
         let bad = MINIMAL.replace("expected_assertions = 2", "");
         let err = parse_ledger(&bad).expect_err("must require expected_assertions");
-        assert!(err.contains("expected_assertions"), "unhelpful error: {err}");
+        assert!(
+            err.contains("expected_assertions"),
+            "unhelpful error: {err}"
+        );
     }
 }
 
@@ -385,10 +390,285 @@ mod enumerate {
             found.len()
         );
         let at = |n: usize| found[n - 1].line;
-        assert_eq!(at(30), 218, "row 30 should be the get_compressed_filehandle ok()");
+        assert_eq!(
+            at(30),
+            218,
+            "row 30 should be the get_compressed_filehandle ok()"
+        );
         assert_eq!(at(31), 219);
         assert_eq!(at(32), 220);
         assert_eq!(at(33), 221);
         assert_eq!(at(44), 310, "row 44 should be the get_version_string ok()");
+    }
+}
+
+/// Index of Rust test functions declared in the crate, keyed `"<rel path>::<fn>"`.
+///
+/// Built by scanning source text for a `#[test]` / `#[tokio::test]` attribute followed
+/// by a `fn` declaration. This is what makes the gate uncheatable: a comment claiming
+/// coverage does not create an entry here.
+fn index_rust_tests(roots: &[PathBuf], crate_root: &Path) -> BTreeMap<String, bool> {
+    let mut idx = BTreeMap::new();
+    let mut stack: Vec<PathBuf> = roots.to_vec();
+    while let Some(p) = stack.pop() {
+        if p.is_dir() {
+            let Ok(rd) = std::fs::read_dir(&p) else {
+                continue;
+            };
+            stack.extend(rd.filter_map(Result::ok).map(|e| e.path()));
+            continue;
+        }
+        if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let rel = p
+            .strip_prefix(crate_root)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let mut pending_test = false;
+        let mut pending_ignore: Option<String> = None;
+        for line in text.lines() {
+            let t = line.trim();
+            if t == "#[test]" || t == "#[tokio::test]" || t.starts_with("#[tokio::test(") {
+                pending_test = true;
+                continue;
+            }
+            if t.starts_with("#[ignore") {
+                pending_ignore = Some(t.to_owned());
+                continue;
+            }
+            if pending_test {
+                if let Some(rest) = t.strip_prefix("fn ").or_else(|| {
+                    t.strip_prefix("async fn ")
+                        .or_else(|| t.strip_prefix("pub fn "))
+                }) {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        // value = "is ignored with a reason"
+                        let ok_ignore = pending_ignore
+                            .as_deref()
+                            .map(|a| a.contains('=') && a.contains('#'))
+                            .unwrap_or(true);
+                        idx.insert(format!("{rel}::{name}"), ok_ignore);
+                    }
+                    pending_test = false;
+                    pending_ignore = None;
+                } else if !t.is_empty() && !t.starts_with("//") && !t.starts_with("#[") {
+                    pending_test = false;
+                    pending_ignore = None;
+                }
+            }
+        }
+    }
+    idx
+}
+
+/// All the ways a ledger can fail its contract. Returns one message per violation so a
+/// contributor sees every problem at once instead of fixing them one build at a time.
+fn check_ledger(
+    ledger: &Ledger,
+    assertions: &[Assertion],
+    rust_tests: &BTreeMap<String, bool>,
+) -> Vec<String> {
+    let mut errs = Vec::new();
+    let name = &ledger.perl_file;
+
+    if assertions.len() != ledger.expected_assertions {
+        errs.push(format!(
+            "{name}: enumerator found {} assertions but the ledger declares expected_assertions = {}. \
+             Either the vendored file changed (re-audit) or the scanner mis-read it (fix the scanner) \
+             — do NOT simply update the number.",
+            assertions.len(),
+            ledger.expected_assertions
+        ));
+    }
+
+    let by_n: BTreeMap<usize, &Row> = ledger.rows.iter().map(|r| (r.n, r)).collect();
+    for a in assertions {
+        match by_n.get(&a.n) {
+            None => errs.push(format!(
+                "{name}: Perl assertion #{} ({} at line {}) has NO ledger row — \
+                 sztywno 1:1 violated. Add a [[row]] classifying it.",
+                a.n, a.func, a.line
+            )),
+            Some(r) if r.line != a.line => errs.push(format!(
+                "{name}: row n={} says line {} but assertion #{} is at line {} — \
+                 the ledger is out of sync with the vendored Perl.",
+                r.n, r.line, a.n, a.line
+            )),
+            Some(_) => {}
+        }
+    }
+    for r in &ledger.rows {
+        if r.n == 0 || r.n > assertions.len() {
+            errs.push(format!(
+                "{name}: row n={} does not correspond to any assertion (file has {})",
+                r.n,
+                assertions.len()
+            ));
+        }
+        match r.class {
+            Class::UnitPort => match r.rust.as_deref() {
+                None => errs.push(format!(
+                    "{name}: row n={} is unit-port but has no `rust` field",
+                    r.n
+                )),
+                Some(target) if !rust_tests.contains_key(target) => errs.push(format!(
+                    "{name}: row n={} names Rust test `{target}`, which does not exist. \
+                     A claim of coverage must resolve to a real #[test] fn.",
+                    r.n
+                )),
+                Some(target) if rust_tests.get(target) == Some(&false) => errs.push(format!(
+                    "{name}: row n={} names `{target}`, which is #[ignore]d without a reason. \
+                     Use #[ignore = \"vepyr#NN: why\"].",
+                    r.n
+                )),
+                Some(_) => {}
+            },
+            Class::ArchitecturalNoAnalogue => {
+                if r.reason.as_deref().unwrap_or("").trim().is_empty() {
+                    errs.push(format!(
+                        "{name}: row n={} is architectural-no-analogue but has no `reason`. \
+                         An unjustified claim of impossibility is a hidden gap.",
+                        r.n
+                    ));
+                }
+            }
+            Class::BlockedFutureWork => {
+                let issue = r.issue.as_deref().unwrap_or("");
+                if !issue.contains('#') {
+                    errs.push(format!(
+                        "{name}: row n={} is blocked-future-work but `issue` ({issue:?}) \
+                         is not an issue reference — deferred work must be tracked.",
+                        r.n
+                    ));
+                }
+            }
+        }
+        if r.desc.trim().is_empty() {
+            errs.push(format!("{name}: row n={} has an empty `desc`", r.n));
+        }
+    }
+    errs
+}
+
+#[cfg(test)]
+mod conditions {
+    use super::*;
+
+    fn assertions(n: usize) -> Vec<Assertion> {
+        (1..=n)
+            .map(|i| Assertion {
+                n: i,
+                line: 9 + i,
+                func: "is".into(),
+            })
+            .collect()
+    }
+
+    fn ledger_with(rows: &str, expected: usize) -> Ledger {
+        parse_ledger(&format!(
+            "perl_file = \"t/E.t\"\nvendored = \"perl/E.t\"\n\
+             perl_sha256 = \"00\"\nexpected_assertions = {expected}\n{rows}"
+        ))
+        .expect("fixture must parse")
+    }
+
+    fn tests_with(name: &str) -> BTreeMap<String, bool> {
+        let mut m = BTreeMap::new();
+        m.insert(name.to_owned(), true);
+        m
+    }
+
+    #[test]
+    fn flags_an_assertion_with_no_row() {
+        let l = ledger_with(
+            "[[row]]\nn=1\nline=10\ndesc=\"a\"\nclass=\"unit-port\"\nrust=\"tests/p.rs::a\"\n",
+            2,
+        );
+        let errs = check_ledger(&l, &assertions(2), &tests_with("tests/p.rs::a"));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("#2") && e.contains("NO ledger row")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn flags_a_unit_port_naming_a_nonexistent_rust_test() {
+        let l = ledger_with(
+            "[[row]]\nn=1\nline=10\ndesc=\"a\"\nclass=\"unit-port\"\nrust=\"tests/p.rs::ghost\"\n",
+            1,
+        );
+        let errs = check_ledger(&l, &assertions(1), &BTreeMap::new());
+        assert!(
+            errs.iter().any(|e| e.contains("does not exist")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn flags_blocked_future_work_without_an_issue() {
+        let l = ledger_with(
+            "[[row]]\nn=1\nline=10\ndesc=\"a\"\nclass=\"blocked-future-work\"\n",
+            1,
+        );
+        let errs = check_ledger(&l, &assertions(1), &BTreeMap::new());
+        assert!(
+            errs.iter().any(|e| e.contains("not an issue reference")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn flags_architectural_no_analogue_without_a_reason() {
+        let l = ledger_with(
+            "[[row]]\nn=1\nline=10\ndesc=\"a\"\nclass=\"architectural-no-analogue\"\n",
+            1,
+        );
+        let errs = check_ledger(&l, &assertions(1), &BTreeMap::new());
+        assert!(errs.iter().any(|e| e.contains("no `reason`")), "{errs:?}");
+    }
+
+    #[test]
+    fn flags_an_expected_assertions_mismatch() {
+        let l = ledger_with(
+            "[[row]]\nn=1\nline=10\ndesc=\"a\"\nclass=\"architectural-no-analogue\"\nreason=\"x\"\n",
+            7,
+        );
+        let errs = check_ledger(&l, &assertions(1), &BTreeMap::new());
+        assert!(
+            errs.iter().any(|e| e.contains("expected_assertions")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn flags_a_line_drift_between_ledger_and_perl() {
+        let l = ledger_with(
+            "[[row]]\nn=1\nline=999\ndesc=\"a\"\nclass=\"architectural-no-analogue\"\nreason=\"x\"\n",
+            1,
+        );
+        let errs = check_ledger(&l, &assertions(1), &BTreeMap::new());
+        assert!(errs.iter().any(|e| e.contains("out of sync")), "{errs:?}");
+    }
+
+    #[test]
+    fn accepts_a_complete_ledger() {
+        let l = ledger_with(
+            "[[row]]\nn=1\nline=10\ndesc=\"a\"\nclass=\"unit-port\"\nrust=\"tests/p.rs::a\"\n\
+             [[row]]\nn=2\nline=11\ndesc=\"b\"\nclass=\"blocked-future-work\"\nissue=\"biodatageeks/vepyr#42\"\n",
+            2,
+        );
+        let errs = check_ledger(&l, &assertions(2), &tests_with("tests/p.rs::a"));
+        assert!(errs.is_empty(), "should be clean, got {errs:?}");
     }
 }
