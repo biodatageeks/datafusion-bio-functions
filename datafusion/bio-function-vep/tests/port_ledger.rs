@@ -173,3 +173,201 @@ reason = "vepyr is cache-only by design"
         assert!(err.contains("expected_assertions"), "unhelpful error: {err}");
     }
 }
+
+/// One Test::More / Test::Exception assertion found in a vendored `.t`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Assertion {
+    /// 1-based ordinal in source order. This is the ledger's `n`.
+    n: usize,
+    /// 1-based line on which the assertion statement starts.
+    line: usize,
+    /// The assertion function, e.g. `is_deeply`.
+    func: String,
+}
+
+/// Functions that constitute a subtest. `skip`, `plan`, `done_testing`, `diag` and
+/// `note` are deliberately absent: they declare or annotate, they do not assert.
+const ASSERTION_FNS: &[&str] = &[
+    "ok",
+    "is",
+    "isnt",
+    "is_deeply",
+    "like",
+    "unlike",
+    "cmp_ok",
+    "isa_ok",
+    "can_ok",
+    "new_ok",
+    "pass",
+    "fail",
+    "throws_ok",
+    "lives_ok",
+    "dies_ok",
+    "lives_and",
+    "warning_like",
+    "warnings_like",
+    "is_passing",
+];
+
+/// Enumerate the assertions in Perl source, in source order.
+///
+/// Recognition rule: an assertion is a call to one of `ASSERTION_FNS` appearing at a
+/// **statement boundary** — i.e. the previous significant character was `;`, `{`, `}`,
+/// or nothing (start of file). This is what makes multi-line argument lists safe: the
+/// continuation lines of `is_deeply(\n  foo(),\n  bar,\n)` are not at a boundary, so a
+/// nested `is(` inside an argument list is never miscounted as a new subtest, while an
+/// assertion inside a `SKIP: { ... }` block — which *is* at a boundary — is counted,
+/// exactly as the hand numbering does.
+///
+/// Single-quoted and double-quoted strings, and `#` comments, are skipped when looking
+/// for boundary characters, so a `;` inside a message string is not a boundary.
+fn enumerate_assertions(src: &str) -> Result<Vec<Assertion>, String> {
+    let mut out = Vec::new();
+    let mut at_boundary = true;
+
+    for (idx, raw) in src.lines().enumerate() {
+        let line_no = idx + 1;
+        let bytes = raw.as_bytes();
+        let mut i = 0usize;
+
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+
+            // A `#` outside a string starts a comment: nothing else on this line matters,
+            // and a comment does not change the boundary state.
+            if c == '#' {
+                break;
+            }
+
+            // Skip over quoted strings wholesale, honouring backslash escapes.
+            if c == '\'' || c == '"' {
+                let quote = c;
+                i += 1;
+                while i < bytes.len() {
+                    let d = bytes[i] as char;
+                    if d == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    if d == quote {
+                        break;
+                    }
+                }
+                at_boundary = false;
+                continue;
+            }
+
+            if c.is_whitespace() {
+                i += 1;
+                continue;
+            }
+
+            if at_boundary && (c.is_ascii_alphabetic() || c == '_') {
+                // Read the identifier and see whether it is an assertion call.
+                let start = i;
+                while i < bytes.len() {
+                    let d = bytes[i] as char;
+                    if d.is_ascii_alphanumeric() || d == '_' {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let ident = &raw[start..i];
+                // The call must be followed by `(` or a block `{`, allowing whitespace.
+                let rest = raw[i..].trim_start();
+                let is_call = rest.starts_with('(') || rest.starts_with('{');
+                if is_call && ASSERTION_FNS.contains(&ident) {
+                    out.push(Assertion {
+                        n: out.len() + 1,
+                        line: line_no,
+                        func: ident.to_owned(),
+                    });
+                }
+                at_boundary = false;
+                continue;
+            }
+
+            at_boundary = matches!(c, ';' | '{' | '}');
+            i += 1;
+        }
+    }
+
+    if out.is_empty() {
+        return Err("no assertions found — the scanner almost certainly mis-read this file".into());
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod enumerate {
+    use super::*;
+
+    fn lines_of(src: &str) -> Vec<usize> {
+        enumerate_assertions(src)
+            .unwrap()
+            .iter()
+            .map(|a| a.line)
+            .collect()
+    }
+
+    #[test]
+    fn counts_single_line_assertions() {
+        let src = "is(f(1, 1), '1', 'same');\nis(f(1, 2), '1-2', 'diff');\n";
+        assert_eq!(lines_of(src), vec![1, 2]);
+    }
+
+    #[test]
+    fn treats_a_multi_line_call_as_one_assertion() {
+        // A nested `is(` inside the argument list must NOT be counted.
+        let src = "is_deeply(\n  numberify(['0', '1']),\n  [0, 1],\n  'arrayref'\n);\n";
+        let found = enumerate_assertions(src).unwrap();
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].func, "is_deeply");
+        assert_eq!(found[0].line, 1);
+    }
+
+    #[test]
+    fn recognises_a_block_form_assertion() {
+        let src = "throws_ok {get_fh()} qr/No file/, 'no file';\n";
+        let found = enumerate_assertions(src).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].func, "throws_ok");
+    }
+
+    #[test]
+    fn is_not_confused_by_a_regex_containing_slashes_and_parens() {
+        let src = r"ok(get_time =~ /\d{4}(\-\d\d){2} \d\d(\:\d\d){2}/, 'get_time');";
+        assert_eq!(enumerate_assertions(src).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn counts_assertions_inside_a_skip_block_but_not_skip_itself() {
+        let src = "SKIP: {\n  skip 'no gzip', 2 unless $HAVE_GZIP;\n  is(ref($fh), 'GLOB', 'a');\n  is(ref($gh), 'GLOB', 'b');\n}\n";
+        let found = enumerate_assertions(src).unwrap();
+        assert_eq!(found.len(), 2, "skip must not count: {found:?}");
+        assert_eq!(lines_of(src), vec![3, 4]);
+    }
+
+    #[test]
+    fn ignores_done_testing_and_comments() {
+        let src = "# is(1, 1, 'commented out');\nis(1, 1, 'real');\ndone_testing();\n";
+        let found = enumerate_assertions(src).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].line, 2);
+    }
+
+    #[test]
+    fn a_semicolon_inside_a_string_is_not_a_statement_boundary() {
+        let src = "my $x = 'a; is(1,1)';\nis(1, 1, 'only me');\n";
+        let found = enumerate_assertions(src).unwrap();
+        assert_eq!(found.len(), 1, "string contents must be inert: {found:?}");
+        assert_eq!(found[0].line, 2);
+    }
+
+    #[test]
+    fn errors_on_a_file_with_no_assertions() {
+        assert!(enumerate_assertions("use strict;\nmy $x = 1;\n").is_err());
+    }
+}
