@@ -40,7 +40,7 @@ n      = 3
 line   = 45
 desc   = "format_coords - diff 2: a reversed pair (2,1) is swapped and still renders '1-2'"
 class  = "blocked-future-work"
-issue  = "biodatageeks/vepyr#TBD-3"
+issue  = "biodatageeks/vepyr#38"
 reason = "vepyr IMPLEMENTS this — `format_coords_ensembl` has the `(Some(s), Some(e)) if s > e => format!(\"{e}-{s}\")` arm — but nothing asserts it. The in-src unit test `format_coords_ensembl_supports_unknown_bounds` covers only 4 of the 6 Perl cases (rows 1, 2, 4, 5); the swap is untested. This is a one-line fix inside that test, and this branch is test-infrastructure-only with a hard no-`src/`-changes rule, so it is deferred rather than claimed. Reclassified from the `dev-test` port's `unit-port`, which pointed all six rows at a test that does not cover six cases."
 
 [[row]]
@@ -62,7 +62,7 @@ n      = 6
 line   = 49
 desc   = "format_coords - missing 3: both bounds undefined renders as '-'"
 class  = "blocked-future-work"
-issue  = "biodatageeks/vepyr#TBD-6"
+issue  = "biodatageeks/vepyr#38"
 reason = "Same gap as row 3. vepyr encodes 'no coordinate' as `Option::None` rather than the literal '-', which is behaviourally equivalent on vepyr's only output surface — VEP's own VCF writer maps '-' to the empty string (OutputFactory/VCF.pm L397) — but `format_coords_ensembl(None, None)` is asserted nowhere. Deferred for the same reason as row 3: fixing it means editing the in-src unit test."
 
 # ---------------------------------------------------------------------------
