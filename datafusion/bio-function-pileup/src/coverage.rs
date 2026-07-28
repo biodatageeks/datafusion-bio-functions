@@ -39,8 +39,9 @@ fn block_end(next_pos: usize, zero_based: bool) -> i32 {
 /// Zero-coverage gaps are NOT emitted.
 ///
 /// `zero_based` selects the interval convention for `pos_end`: half-open
-/// (exclusive) when `true`, closed (inclusive) when `false`. See
-/// [`block_end`].
+/// (exclusive) when `true`, closed (inclusive) when `false`. Either way a
+/// block covers `pos_end - pos_start` (0-based) or `pos_end - pos_start + 1`
+/// (1-based) bases.
 pub fn events_to_coverage_blocks(
     contig: &str,
     events: &mut [(u32, i32)],
