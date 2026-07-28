@@ -4355,6 +4355,9 @@ impl AnnotateProvider {
                 "transcription_factors",
                 "strand",
                 "binding_matrix_length",
+                "binding_matrix_elements",
+                "binding_matrix_unit",
+                "motif_seq",
             ],
         )
         .await;
@@ -4389,6 +4392,9 @@ impl AnnotateProvider {
             let tf_idx = schema.index_of("transcription_factors").ok();
             let strand_idx = schema.index_of("strand").ok();
             let matrix_len_idx = schema.index_of("binding_matrix_length").ok();
+            let matrix_elements_idx = schema.index_of("binding_matrix_elements").ok();
+            let matrix_unit_idx = schema.index_of("binding_matrix_unit").ok();
+            let motif_seq_idx = schema.index_of("motif_seq").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
@@ -4421,6 +4427,12 @@ impl AnnotateProvider {
                     binding_matrix_length: matrix_len_idx
                         .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                         .map(|v| v as i32),
+                    binding_matrix_elements: matrix_elements_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    binding_matrix_unit: matrix_unit_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    motif_seq: motif_seq_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
                 });
             }
         }
@@ -4897,6 +4909,9 @@ impl AnnotateProvider {
             let tf_idx = schema.index_of("transcription_factors").ok();
             let strand_idx = schema.index_of("strand").ok();
             let matrix_len_idx = schema.index_of("binding_matrix_length").ok();
+            let matrix_elements_idx = schema.index_of("binding_matrix_elements").ok();
+            let matrix_unit_idx = schema.index_of("binding_matrix_unit").ok();
+            let motif_seq_idx = schema.index_of("motif_seq").ok();
             for row in 0..batch.num_rows() {
                 let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
                     continue;
@@ -4924,6 +4939,12 @@ impl AnnotateProvider {
                     binding_matrix_length: matrix_len_idx
                         .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                         .map(|v| v as i32),
+                    binding_matrix_elements: matrix_elements_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    binding_matrix_unit: matrix_unit_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    motif_seq: motif_seq_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
                 });
             }
         }
@@ -6012,6 +6033,12 @@ impl AnnotateProvider {
                         };
                         let motif_name = tc.motif_name.as_deref().unwrap_or("");
                         let motif_pos = OptDisplay(tc.motif_pos);
+                        let high_inf_pos = match tc.high_inf_pos {
+                            Some(true) => "Y",
+                            Some(false) => "N",
+                            None => "",
+                        };
+                        let motif_score_change = tc.motif_score_change.as_deref().unwrap_or("");
                         let motif_tfs = csq_multi_value(
                             tc.motif_transcription_factors.as_deref().unwrap_or(""),
                         );
@@ -6262,7 +6289,7 @@ impl AnnotateProvider {
                                 "|{gene_pheno}|\
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
-                             {batch3_suffix}|{motif_name}|{motif_pos}|||{motif_tfs}"
+                             {batch3_suffix}|{motif_name}|{motif_pos}|{high_inf_pos}|{motif_score_change}|{motif_tfs}"
                             );
                         } else {
                             // 74-field CSQ base layout, with optional PICK and RefSeq fields.
@@ -9098,6 +9125,10 @@ async fn load_contig_context(
             "binding_matrix",
             "transcription_factors",
             "strand",
+            "binding_matrix_length",
+            "binding_matrix_elements",
+            "binding_matrix_unit",
+            "motif_seq",
         ],
     )
     .await?;

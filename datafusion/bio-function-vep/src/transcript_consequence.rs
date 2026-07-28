@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use coitrees::{COITree, GenericInterval, Interval, IntervalTree};
 
 use crate::hgvs::{HgvsGenomicShift, HgvscProfile};
+use crate::motif_matrix::{FREQUENCIES_UNIT, MotifMatrix, MotifPlacement, motif_score_delta};
 use crate::so_terms::{ALL_SO_TERMS, SoTerm};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -562,6 +563,16 @@ pub struct MotifFeature {
     /// BindingMatrix length; Ensembl VEP uses it to place a variant within a
     /// reverse-strand motif and to bounds-check MOTIF_POS.
     pub binding_matrix_length: Option<i32>,
+    /// Position frequency matrix, flattened as `A,C,G,T` per position with
+    /// positions joined by `;`. Drives `HIGH_INF_POS` and
+    /// `MOTIF_SCORE_CHANGE`; both stay empty without it.
+    pub binding_matrix_elements: Option<String>,
+    /// Unit of `binding_matrix_elements`. Scoring only applies to
+    /// "Frequencies", the only unit Ensembl caches ship.
+    pub binding_matrix_unit: Option<String>,
+    /// The motif's reference sequence in motif orientation, scored against the
+    /// matrix to obtain `MOTIF_SCORE_CHANGE`.
+    pub motif_seq: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -649,6 +660,13 @@ pub struct TranscriptConsequence {
     /// MOTIF_POS: 1-based offset of the variant within the motif, in motif
     /// orientation.
     pub motif_pos: Option<i64>,
+    /// HIGH_INF_POS: whether the variant sits in a high-information position of
+    /// the binding matrix. Emitted as Y/N for every MotifFeature consequence
+    /// whose matrix is known, `None` when it is not.
+    pub high_inf_pos: Option<bool>,
+    /// MOTIF_SCORE_CHANGE, already formatted to three decimals the way VEP's
+    /// `sprintf("%.3f", $delta)` does.
+    pub motif_score_change: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2109,26 +2127,125 @@ impl TranscriptConsequenceEngine {
         }
     }
 
-    /// 1-based offset of `variant` within a motif, in motif orientation.
+    /// Where `variant` falls inside a motif, in motif orientation, before
+    /// either end is bounds-checked.
     ///
-    /// Forward-strand motifs count from the motif start, reverse-strand motifs
-    /// from the motif end, matching Ensembl VEP's MOTIF_POS.
-    fn motif_position(variant: &VariantInput, m: &MotifFeature) -> Option<i64> {
-        // Mirrors MotifFeatureVariationAllele::motif_start in Ensembl VEP 116:
-        //   $mf_start = $vf->seq_region_start - $mf->seq_region_start + 1;
-        //   $mf_start = $matrix->length - $mf_start + 1 if $mf->strand < 0;
-        //   return undef if $mf_start > $mf->length or $mf_start < 1;
-        // The reverse-strand flip uses the *matrix* length, which equals the
-        // motif span only when the motif is not clipped; fall back to the span
-        // for caches predating the binding_matrix_length column.
+    /// Mirrors MotifFeatureVariationAllele::motif_start / motif_end in Ensembl
+    /// VEP 116:
+    ///   $mf_start = $vf->seq_region_start - $mf->seq_region_start + 1;
+    ///   $mf_start = $matrix->length - $mf_start + 1 if $mf->strand < 0;
+    /// The reverse-strand flip uses the *matrix* length, which equals the motif
+    /// span only when the motif is not clipped; fall back to the span for
+    /// caches predating the binding_matrix_length column. Note the flip leaves
+    /// `end` before `start` on the reverse strand — Ensembl does the same.
+    fn motif_placement(variant: &VariantInput, m: &MotifFeature) -> Option<MotifPlacement> {
         let strand = m.strand?;
         let motif_len = m.end - m.start + 1;
         let matrix_len = m.binding_matrix_length.map(i64::from).unwrap_or(motif_len);
-        let mut pos = variant.start - m.start + 1;
+        let mut start = variant.start - m.start + 1;
+        let mut end = variant.end - m.start + 1;
         if strand < 0 {
-            pos = matrix_len - pos + 1;
+            start = matrix_len - start + 1;
+            end = matrix_len - end + 1;
         }
+        Some(MotifPlacement { start, end })
+    }
+
+    /// 1-based offset of `variant` within a motif, in motif orientation.
+    ///
+    /// Forward-strand motifs count from the motif start, reverse-strand motifs
+    /// from the motif end, matching Ensembl VEP's MOTIF_POS. `motif_start`
+    /// bounds-checks against the motif span:
+    ///   return undef if $mf_start > $mf->length or $mf_start < 1;
+    fn motif_position(variant: &VariantInput, m: &MotifFeature) -> Option<i64> {
+        let motif_len = m.end - m.start + 1;
+        let pos = Self::motif_placement(variant, m)?.start;
         (pos >= 1 && pos <= motif_len).then_some(pos)
+    }
+
+    /// The motif's frequency matrix, if the cache carried a usable one.
+    ///
+    /// Ensembl's frequency-to-weights conversion is defined for frequency
+    /// matrices only, so an unexpected unit disables scoring rather than
+    /// producing a number that means something else.
+    fn motif_matrix(m: &MotifFeature) -> Option<MotifMatrix> {
+        match m.binding_matrix_unit.as_deref() {
+            None => {}
+            Some(unit) if unit.eq_ignore_ascii_case(FREQUENCIES_UNIT) => {}
+            Some(_) => return None,
+        }
+        MotifMatrix::parse(m.binding_matrix_elements.as_deref()?)
+    }
+
+    /// HIGH_INF_POS: whether the variant sits in a high-information position.
+    ///
+    /// `in_informative_position` scores true SNVs only — Ensembl returns 0
+    /// unless the variant spans a single base and neither side is an empty
+    /// allele — and every other MotifFeature consequence with a known matrix
+    /// still reports `N`.
+    fn motif_high_inf_pos(
+        variant: &VariantInput,
+        m: &MotifFeature,
+        matrix: &MotifMatrix,
+    ) -> Option<bool> {
+        let is_snv = variant.start == variant.end
+            && variant.ref_allele != "-"
+            && variant.alt_allele != "-"
+            && variant.alt_allele.len() == 1;
+        if !is_snv {
+            return Some(false);
+        }
+        let Some(position) = Self::motif_position(variant, m) else {
+            return Some(false);
+        };
+        Some(matrix.is_position_informative(position as usize))
+    }
+
+    /// MOTIF_SCORE_CHANGE, formatted the way VEP's `sprintf("%.3f", $delta)`
+    /// does. VEP only asks for a delta when the variant allele is plain DNA.
+    fn motif_score_change(
+        variant: &VariantInput,
+        m: &MotifFeature,
+        matrix: &MotifMatrix,
+    ) -> Option<String> {
+        if variant.alt_allele.is_empty()
+            || !variant
+                .alt_allele
+                .bytes()
+                .all(|b| matches!(b.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T'))
+        {
+            return None;
+        }
+
+        let motif_seq = m.motif_seq.as_deref()?;
+        let placement = Self::motif_placement(variant, m)?;
+        // motif_start rejects anything outside the motif; motif_end only
+        // rejects positions before it.
+        let motif_len = m.end - m.start + 1;
+        if placement.start < 1 || placement.start > motif_len || placement.end < 1 {
+            return None;
+        }
+
+        // Alleles are scored in motif orientation, as VEP's `feature_seq` is.
+        let strand = m.strand.unwrap_or(1);
+        let (reference, variant_allele) = if strand < 0 {
+            (
+                reverse_complement(&variant.ref_allele)?,
+                reverse_complement(&variant.alt_allele)?,
+            )
+        } else {
+            (variant.ref_allele.clone(), variant.alt_allele.clone())
+        };
+
+        let delta = motif_score_delta(
+            matrix,
+            motif_seq,
+            motif_len,
+            placement,
+            &reference,
+            &variant_allele,
+        )?;
+        Some(format!("{delta:.3}"))
     }
 
     fn append_tfbs_terms(
@@ -2176,6 +2293,7 @@ impl TranscriptConsequenceEngine {
             terms.insert(SoTerm::TfBindingSiteVariant);
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
+            let matrix = Self::motif_matrix(m);
             out.push(TranscriptConsequence {
                 transcript_id: Some(m.motif_id.clone()),
                 feature_type: FeatureType::MotifFeature,
@@ -2184,6 +2302,12 @@ impl TranscriptConsequenceEngine {
                 motif_transcription_factors: m.transcription_factors.clone(),
                 motif_strand: m.strand,
                 motif_pos: Self::motif_position(variant, m),
+                high_inf_pos: matrix
+                    .as_ref()
+                    .and_then(|matrix| Self::motif_high_inf_pos(variant, m, matrix)),
+                motif_score_change: matrix
+                    .as_ref()
+                    .and_then(|matrix| Self::motif_score_change(variant, m, matrix)),
                 ..Default::default()
             });
         }
@@ -2247,6 +2371,7 @@ impl TranscriptConsequenceEngine {
             terms.insert(SoTerm::TfBindingSiteVariant);
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
+            let matrix = Self::motif_matrix(m);
             out.push(TranscriptConsequence {
                 transcript_id: Some(m.motif_id.clone()),
                 feature_type: FeatureType::MotifFeature,
@@ -2255,6 +2380,12 @@ impl TranscriptConsequenceEngine {
                 motif_transcription_factors: m.transcription_factors.clone(),
                 motif_strand: m.strand,
                 motif_pos: Self::motif_position(variant, m),
+                high_inf_pos: matrix
+                    .as_ref()
+                    .and_then(|matrix| Self::motif_high_inf_pos(variant, m, matrix)),
+                motif_score_change: matrix
+                    .as_ref()
+                    .and_then(|matrix| Self::motif_score_change(variant, m, matrix)),
                 ..Default::default()
             });
         }
@@ -9209,6 +9340,9 @@ mod tests {
             transcription_factors: None,
             strand: None,
             binding_matrix_length: None,
+            binding_matrix_elements: None,
+            binding_matrix_unit: None,
+            motif_seq: None,
         }
     }
 
@@ -9230,6 +9364,9 @@ mod tests {
             transcription_factors: Some(transcription_factors.to_string()),
             strand: Some(strand),
             binding_matrix_length: Some((end - start + 1) as i32),
+            binding_matrix_elements: None,
+            binding_matrix_unit: None,
+            motif_seq: None,
         }
     }
 
@@ -22285,6 +22422,166 @@ mod tests {
             .collect();
         assert_eq!(by_id.get("ENSM00000588617"), Some(&Some(3)));
         assert_eq!(by_id.get("ENSM00000588616"), Some(&Some(21)));
+    }
+
+    /// ENSPFM0042 (CTCF), the release-116 matrix behind chr22:17037897.
+    const ENSPFM0042: &str = "5461,545,1745,4231;2613,450,11439,632;0,8101,0,668;\
+        64,0,12567,86;639,9651,8,46;45,10170,0,0;5877,5220,207,241;87,7119,0,3957;\
+        0,8928,1,0;39,48,23,14241;10634,290,1632,1371;91,1625,9894,774;\
+        186,5181,0,8026;2,0,8521,121;409,113,7515,2252;2682,4990,153,9808;\
+        4226,3598,2490,1308";
+
+    /// ENSPFM0510 (TBX21), the matrix behind the reverse-strand chr22:17088127
+    /// motifs.
+    const ENSPFM0510: &str = "121,2673,669,8917;359,3880,51,7751;6,11,50,10437;\
+        592,10452,589,12;8668,16,2607,46;11,11094,12,8;10304,128,73,26;2,11103,4,3;\
+        2064,9030,43,626;54,226,302,10463;341,5870,515,3943;4493,525,477,4449;\
+        3893,522,5666,338;10475,354,202,53;628,59,9016,2021;4,4,11092,6;\
+        24,72,131,10337;6,15,11024,9;54,2673,20,8608;16,606,10470,615;\
+        10432,65,10,5;7706,68,3935,335;8919,658,2618,116";
+
+    fn motif_with_pwm(
+        id: &str,
+        start: i64,
+        end: i64,
+        strand: i8,
+        elements: &str,
+        seq: &str,
+    ) -> MotifFeature {
+        let mut m = motif_with_matrix(id, "22", start, end, "ENSPFM", "TF", strand);
+        m.binding_matrix_elements = Some(elements.to_string());
+        m.binding_matrix_unit = Some("Frequencies".to_string());
+        m.motif_seq = Some(seq.to_string());
+        m
+    }
+
+    fn motif_consequence<'a>(
+        out: &'a [TranscriptConsequence],
+        id: &str,
+    ) -> &'a TranscriptConsequence {
+        out.iter()
+            .find(|a| {
+                a.feature_type == FeatureType::MotifFeature
+                    && a.transcript_id.as_deref() == Some(id)
+            })
+            .expect("motif consequence")
+    }
+
+    /// Real chr22:17037897 C>T against ENSM00000588585. VEP 116 reports
+    /// MOTIF_POS 5, HIGH_INF_POS Y, MOTIF_SCORE_CHANGE -0.045.
+    #[test]
+    fn motif_scoring_matches_vep_on_a_forward_strand_snv() {
+        let engine = TranscriptConsequenceEngine::default();
+        let motifs = vec![motif_with_pwm(
+            "ENSM00000588585",
+            17_037_893,
+            17_037_909,
+            1,
+            ENSPFM0042,
+            "ACCTCCACCTCCCGGTT",
+        )];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 17_037_897, 17_037_897, "C", "T"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &motifs,
+            &[],
+            &[],
+        );
+        let consequence = motif_consequence(&out, "ENSM00000588585");
+        assert_eq!(consequence.motif_pos, Some(5));
+        assert_eq!(consequence.high_inf_pos, Some(true));
+        assert_eq!(consequence.motif_score_change.as_deref(), Some("-0.045"));
+    }
+
+    /// Real chr22:17088127 T>A against the reverse-strand ENSM00000588616.
+    /// VEP 116 reports MOTIF_POS 21, HIGH_INF_POS Y, MOTIF_SCORE_CHANGE -0.058
+    /// — the allele has to be reverse-complemented before it is scored.
+    #[test]
+    fn motif_scoring_matches_vep_on_a_reverse_strand_snv() {
+        let engine = TranscriptConsequenceEngine::default();
+        let motifs = vec![motif_with_pwm(
+            "ENSM00000588616",
+            17_088_125,
+            17_088_147,
+            -1,
+            ENSPFM0510,
+            "TAGCACTCATTAGCTGTGCGACC",
+        )];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 17_088_127, 17_088_127, "T", "A"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &motifs,
+            &[],
+            &[],
+        );
+        let consequence = motif_consequence(&out, "ENSM00000588616");
+        assert_eq!(consequence.motif_pos, Some(21));
+        assert_eq!(consequence.high_inf_pos, Some(true));
+        assert_eq!(consequence.motif_score_change.as_deref(), Some("-0.058"));
+    }
+
+    /// A deletion is not a "true SNP", so HIGH_INF_POS reports N and
+    /// MOTIF_SCORE_CHANGE stays empty — the sequence would change length.
+    #[test]
+    fn motif_scoring_declines_indels() {
+        let engine = TranscriptConsequenceEngine::default();
+        let motifs = vec![motif_with_pwm(
+            "ENSM00000588585",
+            17_037_893,
+            17_037_909,
+            1,
+            ENSPFM0042,
+            "ACCTCCACCTCCCGGTT",
+        )];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 17_037_896, 17_037_897, "CC", "C"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &motifs,
+            &[],
+            &[],
+        );
+        let consequence = motif_consequence(&out, "ENSM00000588585");
+        assert_eq!(consequence.high_inf_pos, Some(false));
+        assert_eq!(consequence.motif_score_change, None);
+    }
+
+    /// Caches built before the matrix columns landed leave both fields empty
+    /// rather than guessing.
+    #[test]
+    fn motif_scoring_is_absent_without_a_matrix() {
+        let engine = TranscriptConsequenceEngine::default();
+        let motifs = vec![motif_with_matrix(
+            "ENSM00000588585",
+            "22",
+            17_037_893,
+            17_037_909,
+            "ENSPFM0042",
+            "CTCF",
+            1,
+        )];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 17_037_897, 17_037_897, "C", "T"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &motifs,
+            &[],
+            &[],
+        );
+        let consequence = motif_consequence(&out, "ENSM00000588585");
+        assert_eq!(consequence.motif_pos, Some(5));
+        assert_eq!(consequence.high_inf_pos, None);
+        assert_eq!(consequence.motif_score_change, None);
     }
 
     #[test]
