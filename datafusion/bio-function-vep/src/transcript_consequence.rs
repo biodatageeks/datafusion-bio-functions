@@ -2163,6 +2163,21 @@ impl TranscriptConsequenceEngine {
         (pos >= 1 && pos <= motif_len).then_some(pos)
     }
 
+    /// Whether a plain deletion removes a motif outright, which Ensembl calls
+    /// TFBS_ablation.
+    ///
+    /// `VariationEffect::feature_ablation` is `complete_overlap_feature and
+    /// deletion`: the variant has to span the whole feature and shorten the
+    /// reference. It applies to ordinary sequence variants, not just to
+    /// structural ones, which is where vepyr had been reading it.
+    fn ablates_motif(variant: &VariantInput, m: &MotifFeature) -> bool {
+        let spans_feature = variant.start <= m.start && variant.end >= m.end;
+        let is_deletion = variant.ref_allele != "-"
+            && !variant.ref_allele.is_empty()
+            && (variant.alt_allele == "-" || variant.alt_allele.len() < variant.ref_allele.len());
+        spans_feature && is_deletion
+    }
+
     /// The motif's frequency matrix, if the cache carried a usable one.
     ///
     /// Ensembl's frequency-to-weights conversion is defined for frequency
@@ -2291,6 +2306,9 @@ impl TranscriptConsequenceEngine {
             matched_motif = true;
             let mut terms: BTreeSet<SoTerm> = sv_terms.clone();
             terms.insert(SoTerm::TfBindingSiteVariant);
+            if Self::ablates_motif(variant, m) {
+                terms.insert(SoTerm::TfbsAblation);
+            }
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
             let matrix = Self::motif_matrix(m);
@@ -2369,6 +2387,9 @@ impl TranscriptConsequenceEngine {
             matched_motif = true;
             let mut terms: BTreeSet<SoTerm> = sv_terms.clone();
             terms.insert(SoTerm::TfBindingSiteVariant);
+            if Self::ablates_motif(variant, m) {
+                terms.insert(SoTerm::TfbsAblation);
+            }
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
             let matrix = Self::motif_matrix(m);
@@ -22524,6 +22545,90 @@ mod tests {
         assert_eq!(consequence.motif_pos, Some(21));
         assert_eq!(consequence.high_inf_pos, Some(true));
         assert_eq!(consequence.motif_score_change.as_deref(), Some("-0.058"));
+    }
+
+    /// Real chr22:48837364, a 22 bp deletion spanning ENSM00000589970 whole.
+    /// VEP 116 reports TFBS_ablation alongside TF_binding_site_variant, which
+    /// lifts IMPACT from MODIFIER to MODERATE.
+    #[test]
+    fn deletion_spanning_a_motif_is_a_tfbs_ablation() {
+        let engine = TranscriptConsequenceEngine::default();
+        let motifs = vec![motif_with_matrix(
+            "ENSM00000589970",
+            "22",
+            48_837_370,
+            48_837_380,
+            "ENSPFM0042",
+            "CTCF",
+            1,
+        )];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 48_837_365, 48_837_386, "ACACACGTGTCCTCACACATGC", "-"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &motifs,
+            &[],
+            &[],
+        );
+        let consequence = motif_consequence(&out, "ENSM00000589970");
+        assert!(consequence.terms.contains(&SoTerm::TfbsAblation));
+        assert!(consequence.terms.contains(&SoTerm::TfBindingSiteVariant));
+    }
+
+    /// A deletion that only clips the motif is not an ablation.
+    #[test]
+    fn partial_deletion_is_not_a_tfbs_ablation() {
+        let engine = TranscriptConsequenceEngine::default();
+        let motifs = vec![motif_with_matrix(
+            "ENSM00000589970",
+            "22",
+            48_837_370,
+            48_837_380,
+            "ENSPFM0042",
+            "CTCF",
+            1,
+        )];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 48_837_375, 48_837_377, "ACG", "-"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &motifs,
+            &[],
+            &[],
+        );
+        let consequence = motif_consequence(&out, "ENSM00000589970");
+        assert!(!consequence.terms.contains(&SoTerm::TfbsAblation));
+    }
+
+    /// An insertion spanning the same span is not a deletion, so no ablation.
+    #[test]
+    fn insertion_over_a_motif_is_not_a_tfbs_ablation() {
+        let engine = TranscriptConsequenceEngine::default();
+        let motifs = vec![motif_with_matrix(
+            "ENSM00000589970",
+            "22",
+            48_837_370,
+            48_837_371,
+            "ENSPFM0042",
+            "CTCF",
+            1,
+        )];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 48_837_369, 48_837_372, "AC", "ACGTGT"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &motifs,
+            &[],
+            &[],
+        );
+        let consequence = motif_consequence(&out, "ENSM00000589970");
+        assert!(!consequence.terms.contains(&SoTerm::TfbsAblation));
     }
 
     /// A deletion is not a "true SNP", so HIGH_INF_POS reports N and
