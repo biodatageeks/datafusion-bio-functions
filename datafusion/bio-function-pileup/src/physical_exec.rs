@@ -49,8 +49,10 @@ pub struct PileupConfig {
     /// The actual format is detected from the schema, but this flag controls what we request
     /// from the upstream `BamTableProvider`.
     pub binary_cigar: bool,
-    /// When `true`, output coordinates are 0-based (start inclusive, end inclusive).
-    /// When `false` (default), output coordinates are 1-based.
+    /// When `true`, output coordinates are 0-based half-open: `pos_start` is
+    /// inclusive and `pos_end` is exclusive.
+    /// When `false` (default), output coordinates are 1-based closed: both
+    /// `pos_start` and `pos_end` are inclusive.
     /// This also controls the coordinate system passed to the BAM reader.
     pub zero_based: bool,
     /// When `true`, emit one row per genomic position (like `samtools depth -a`)
@@ -357,7 +359,7 @@ fn merge_results(
     if !dense_results.is_empty() {
         merge_dense_results(dense_results, schema, batch_size, config)
     } else if !sparse_results.is_empty() {
-        merge_sparse_results(sparse_results, schema, batch_size)
+        merge_sparse_results(sparse_results, schema, batch_size, config)
     } else {
         StreamPhase::Done
     }
@@ -416,8 +418,13 @@ fn merge_dense_results(
         let mut pending_batches = VecDeque::new();
         for contig in &contigs {
             if let Some(depth) = merged_depths.get(contig)
-                && let Ok(batches) =
-                    coverage::dense_depth_to_record_batches(contig, depth, schema, batch_size)
+                && let Ok(batches) = coverage::dense_depth_to_record_batches(
+                    contig,
+                    depth,
+                    schema,
+                    batch_size,
+                    config.zero_based,
+                )
             {
                 pending_batches.extend(batches);
             }
@@ -435,6 +442,7 @@ fn merge_sparse_results(
     partitions: Vec<PartitionResult>,
     schema: &SchemaRef,
     batch_size: usize,
+    config: &PileupConfig,
 ) -> StreamPhase {
     let mut merged: HashMap<String, events::ContigEvents> = HashMap::new();
 
@@ -452,7 +460,8 @@ fn merge_sparse_results(
         return StreamPhase::Done;
     }
 
-    match coverage::all_events_to_record_batches(&mut merged, schema, batch_size) {
+    match coverage::all_events_to_record_batches(&mut merged, schema, batch_size, config.zero_based)
+    {
         Ok(batches) => StreamPhase::Emitting {
             pending_batches: VecDeque::from(batches),
             per_base_emitter: None,
@@ -695,8 +704,61 @@ mod tests {
 
         assert_eq!(contigs.value(0), "chr1");
         assert_eq!(starts.value(0), 0);
-        assert_eq!(ends.value(0), 9);
+        // 0-based half-open: a 10M read at 0 covers [0, 10)
+        assert_eq!(ends.value(0), 10);
         assert_eq!(covs.value(0), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_basic_coverage_one_based() {
+        // Same single 10bp read, but the reader hands us 1-based starts.
+        let batch = make_batch(vec![("chr1", 1, 11, 0, "10M", 60)]);
+        let schema = bam_schema();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+
+        let ctx = SessionContext::new();
+        ctx.register_table("reads", Arc::new(mem_table)).unwrap();
+
+        let df = ctx.table("reads").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let pileup = PileupExec::new(
+            plan,
+            PileupConfig {
+                zero_based: false,
+                ..PileupConfig::default()
+            },
+        );
+        let task_ctx = ctx.task_ctx();
+        let stream = pileup.execute(0, task_ctx).unwrap();
+        let batches: Vec<RecordBatch> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+
+        let starts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let ends = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        // 1-based closed: a 10M read at 1 covers [1, 10]
+        assert_eq!(starts.value(0), 1);
+        assert_eq!(ends.value(0), 10);
+
+        // Same base count as the 0-based half-open case in test_basic_coverage
+        assert_eq!(ends.value(0) - starts.value(0) + 1, 10);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -833,7 +895,7 @@ mod tests {
     async fn test_multi_partition_merge_overlapping() {
         // Partition 0: chr1 read at [0, 10)
         // Partition 1: chr1 read at [5, 15)
-        // Merged: chr1 [0,4] cov=1, [5,9] cov=2, [10,14] cov=1
+        // Merged (0-based half-open): [0,5) cov=1, [5,10) cov=2, [10,15) cov=1
         let batch1 = make_batch(vec![("chr1", 0, 10, 0, "10M", 60)]);
         let batch2 = make_batch(vec![("chr1", 5, 15, 0, "10M", 60)]);
         let schema = bam_schema();
@@ -887,7 +949,7 @@ mod tests {
             .collect();
 
         assert_eq!(starts, vec![0, 5, 10]);
-        assert_eq!(ends, vec![4, 9, 14]);
+        assert_eq!(ends, vec![5, 10, 15]);
         assert_eq!(covs, vec![1, 2, 1]);
     }
 
@@ -947,7 +1009,8 @@ mod tests {
 
         assert_eq!(contigs.value(0), "chr1");
         assert_eq!(starts.value(0), 0);
-        assert_eq!(ends.value(0), 9);
+        // 0-based half-open: a 10M read at 0 covers [0, 10)
+        assert_eq!(ends.value(0), 10);
         assert_eq!(covs.value(0), 1);
     }
 
