@@ -30,8 +30,8 @@ tempfile = "3"
 noodles-core = "0.16"
 noodles-fasta = "0.49"
 parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
-datafusion-bio-format-vcf ={ git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.8.8" }
-datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.8.8", optional = true }
+datafusion-bio-format-vcf ={ git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "d760d5a50fd7455db8748d09c4da5a6ac63cd379" }
+datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "d760d5a50fd7455db8748d09c4da5a6ac63cd379", optional = true }
 indicatif = "0.18.4"
 
 # `libc` is only used by `peak_rss_mb()` (getrusage) on UNIX; scoping it here
