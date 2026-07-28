@@ -104,12 +104,14 @@ async fn main() {
                 .unwrap();
 
             for i in 0..batch.num_rows() {
-                // Convert from 0-based closed to 0-based half-open (BED format)
+                // Printed verbatim: `--zero-based` output is already 0-based
+                // half-open (directly comparable to mosdepth's BED), and the
+                // default is 1-based closed (comparable to `samtools depth`).
                 println!(
                     "{}\t{}\t{}\t{}",
                     contigs.value(i),
                     starts.value(i),
-                    ends.value(i) + 1,
+                    ends.value(i),
                     covs.value(i)
                 );
             }
