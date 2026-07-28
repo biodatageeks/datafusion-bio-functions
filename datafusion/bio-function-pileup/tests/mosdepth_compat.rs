@@ -1,3 +1,29 @@
+//! Golden-parity tests against mosdepth.
+//!
+//! The expected 0-based values below are real mosdepth output. Regenerate them
+//! with mosdepth 0.3.11:
+//!
+//! ```text
+//! mosdepth --fast-mode out tests/data/ovl.bam
+//! gunzip -c out.per-base.bed.gz
+//! MT      0       6       1
+//! MT      6       42      2
+//! MT      42      80      1
+//!
+//! mosdepth --fast-mode out tests/data/overlapping-pairs.bam
+//! gunzip -c out.per-base.bed.gz | awk '$4 != 0'
+//! 1       565173  565253  2
+//! ```
+//!
+//! `--fast-mode` matters: mosdepth's default deduplicates overlapping mate
+//! pairs, which this crate deliberately does not do, so without the flag the
+//! overlap region reads as coverage 1 instead of 2.
+//!
+//! mosdepth writes BED, which is 0-based half-open — the same convention the
+//! `zero_based` output uses. Cross-check with `samtools depth -a`, which is
+//! 1-based closed: it reports `MT [1,6] cov=1`, `[7,42] cov=2`, `[43,80]
+//! cov=1` for `ovl.bam`, i.e. the same intervals in the other convention.
+
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Int16Array, Int32Array, StringArray};
@@ -245,12 +271,13 @@ async fn test_ovl_fast_mode_sql_default_one_based() {
 /// Regression guard for issue #204: the two coordinate systems must describe
 /// the *same* intervals, just in different conventions.
 ///
-/// Ground truth from `samtools depth -a` on `ovl.bam` (1-based, closed):
-/// `MT [1,6] cov=1`, `MT [7,42] cov=2`, `MT [43,80] cov=1` — which as 0-based
-/// half-open BED is `[0,6)`, `[6,42)`, `[42,80)`.
+/// `mosdepth --fast-mode` on `ovl.bam` emits `MT [0,6)`, `[6,42)`, `[42,80)`;
+/// `samtools depth -a` reports the same intervals 1-based closed as `[1,6]`,
+/// `[7,42]`, `[43,80]`.
 ///
 /// Before the fix, 0-based output was closed rather than half-open, so every
-/// block silently covered one base fewer than its 1-based counterpart.
+/// block silently covered one base fewer than its 1-based counterpart — and
+/// matched neither reference tool.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_zero_based_and_one_based_describe_the_same_intervals() {
     let bam_path = format!("{}/tests/data/ovl.bam", env!("CARGO_MANIFEST_DIR"));
