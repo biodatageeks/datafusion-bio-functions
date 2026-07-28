@@ -9068,16 +9068,7 @@ async fn load_contig_context(
         cache,
         "motif",
         chrom,
-        &[
-            "motif_id",
-            "feature_id",
-            "chrom",
-            "start",
-            "\"end\"",
-            "binding_matrix",
-            "transcription_factors",
-            "strand",
-        ],
+        &["motif_id", "feature_id", "chrom", "start", "\"end\""],
     )
     .await?;
     record_contig_profile(profile, |profile| {
