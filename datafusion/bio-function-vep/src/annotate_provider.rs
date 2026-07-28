@@ -4336,7 +4336,16 @@ impl AnnotateProvider {
         let cols = Self::projected_columns_for_table(
             &self.session,
             table,
-            &["motif_id", "feature_id", "chrom", "start", "\"end\""],
+            &[
+                "motif_id",
+                "feature_id",
+                "chrom",
+                "start",
+                "\"end\"",
+                "binding_matrix",
+                "transcription_factors",
+                "strand",
+            ],
         )
         .await;
         let query = format!("SELECT {cols} FROM `{table}`{filter}");
@@ -4364,6 +4373,11 @@ impl AnnotateProvider {
                     "annotate_vep(): motif table '{table}' is missing required column end"
                 ))
             })?;
+            // Optional: absent on caches built before the BindingMatrix
+            // extraction fix, in which case these CSQ fields stay empty.
+            let matrix_idx = schema.index_of("binding_matrix").ok();
+            let tf_idx = schema.index_of("transcription_factors").ok();
+            let strand_idx = schema.index_of("strand").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
@@ -4378,11 +4392,21 @@ impl AnnotateProvider {
                 let motif_id = id_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                     .unwrap_or_else(|| "motif".to_string());
+                let binding_matrix =
+                    matrix_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let transcription_factors =
+                    tf_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let strand = strand_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .map(|v| v as i8);
                 out.push(MotifFeature {
                     motif_id,
                     chrom,
                     start,
                     end,
+                    binding_matrix,
+                    transcription_factors,
+                    strand,
                 });
             }
         }
@@ -4853,6 +4877,11 @@ impl AnnotateProvider {
                     "annotate_vep(): motif table '{table}' is missing required column end"
                 ))
             })?;
+            // Optional: absent on caches built before the BindingMatrix
+            // extraction fix, in which case these CSQ fields stay empty.
+            let matrix_idx = schema.index_of("binding_matrix").ok();
+            let tf_idx = schema.index_of("transcription_factors").ok();
+            let strand_idx = schema.index_of("strand").ok();
             for row in 0..batch.num_rows() {
                 let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
                     continue;
@@ -4870,6 +4899,13 @@ impl AnnotateProvider {
                     chrom,
                     start,
                     end,
+                    binding_matrix: matrix_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    transcription_factors: tf_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    strand: strand_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .map(|v| v as i8),
                 });
             }
         }
@@ -5945,6 +5981,19 @@ impl AnnotateProvider {
                             } else {
                                 ("", "", "", "", "", "", "")
                             };
+                        // MotifFeature consequences have no transcript to take
+                        // orientation from; use the motif's own strand.
+                        let strand_str = if strand_str.is_empty() {
+                            match tc.motif_strand {
+                                Some(v) if v >= 0 => "1",
+                                Some(_) => "-1",
+                                None => "",
+                            }
+                        } else {
+                            strand_str
+                        };
+                        let motif_name = tc.motif_name.as_deref().unwrap_or("");
+                        let motif_tfs = tc.motif_transcription_factors.as_deref().unwrap_or("");
                         let biotype = tc.biotype_override.as_deref().unwrap_or(biotype_tx);
                         let exon = tc.exon_str.as_deref().unwrap_or("");
                         let intron = tc.intron_str.as_deref().unwrap_or("");
@@ -6192,7 +6241,7 @@ impl AnnotateProvider {
                                 "|{gene_pheno}|\
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
-                             {batch3_suffix}|||||"
+                             {batch3_suffix}|{motif_name}||||{motif_tfs}"
                             );
                         } else {
                             // 74-field CSQ base layout, with optional PICK and RefSeq fields.
@@ -15250,6 +15299,8 @@ mod tests {
         assert_eq!(merged_values[merged_index("VARIANT_CLASS")], "SNV");
         assert_eq!(merged_values[merged_index("CLIN_SIG")], "pathogenic");
         assert_eq!(merged_values[merged_index("PUBMED")], "12345");
+        // Transcript consequences carry no motif metadata; motif entries are
+        // covered by the MotifFeature tests in transcript_consequence.rs.
         assert_eq!(merged_values[merged_index("MOTIF_NAME")], "");
         assert_eq!(merged_values[merged_index("TRANSCRIPTION_FACTORS")], "");
     }

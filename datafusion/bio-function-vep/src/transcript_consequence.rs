@@ -553,6 +553,12 @@ pub struct MotifFeature {
     pub chrom: String,
     pub start: i64,
     pub end: i64,
+    /// BindingMatrix stable id, surfaced as VEP's `MOTIF_NAME`.
+    pub binding_matrix: Option<String>,
+    /// Comma-separated TF names, surfaced as `TRANSCRIPTION_FACTORS`.
+    pub transcription_factors: Option<String>,
+    /// Motif orientation, surfaced as `STRAND` for motif consequences.
+    pub strand: Option<i8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -630,6 +636,13 @@ pub struct TranscriptConsequence {
     /// USED_REF field: transcript-reference allele after RefSeq edit handling,
     /// emitted in VF/genomic orientation.
     pub used_ref: Option<String>,
+    /// MOTIF_NAME: BindingMatrix stable id, MotifFeature consequences only.
+    pub motif_name: Option<String>,
+    /// TRANSCRIPTION_FACTORS: comma-separated TF names, MotifFeature only.
+    pub motif_transcription_factors: Option<String>,
+    /// STRAND for MotifFeature consequences, which have no transcript to
+    /// derive orientation from.
+    pub motif_strand: Option<i8>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2139,6 +2152,9 @@ impl TranscriptConsequenceEngine {
                 transcript_id: Some(m.motif_id.clone()),
                 feature_type: FeatureType::MotifFeature,
                 terms: ordered,
+                motif_name: m.binding_matrix.clone(),
+                motif_transcription_factors: m.transcription_factors.clone(),
+                motif_strand: m.strand,
                 ..Default::default()
             });
         }
@@ -2206,6 +2222,9 @@ impl TranscriptConsequenceEngine {
                 transcript_id: Some(m.motif_id.clone()),
                 feature_type: FeatureType::MotifFeature,
                 terms: ordered,
+                motif_name: m.binding_matrix.clone(),
+                motif_transcription_factors: m.transcription_factors.clone(),
+                motif_strand: m.strand,
                 ..Default::default()
             });
         }
@@ -9156,6 +9175,29 @@ mod tests {
             chrom: chrom.to_string(),
             start,
             end,
+            binding_matrix: None,
+            transcription_factors: None,
+            strand: None,
+        }
+    }
+
+    fn motif_with_matrix(
+        id: &str,
+        chrom: &str,
+        start: i64,
+        end: i64,
+        binding_matrix: &str,
+        transcription_factors: &str,
+        strand: i8,
+    ) -> MotifFeature {
+        MotifFeature {
+            motif_id: id.to_string(),
+            chrom: chrom.to_string(),
+            start,
+            end,
+            binding_matrix: Some(binding_matrix.to_string()),
+            transcription_factors: Some(transcription_factors.to_string()),
+            strand: Some(strand),
         }
     }
 
@@ -22129,5 +22171,44 @@ mod tests {
                 .iter()
                 .any(|a| a.feature_type == FeatureType::RegulatoryFeature)
         );
+    }
+
+    /// MOTIF_NAME / TRANSCRIPTION_FACTORS / STRAND must reach the consequence
+    /// from the cache row, matching Ensembl VEP for chr22:17088127.
+    #[test]
+    fn motif_consequence_carries_binding_matrix_metadata() {
+        let engine = TranscriptConsequenceEngine::default();
+        let motifs = vec![motif_with_matrix(
+            "ENSM00000588617",
+            "22",
+            17_088_125,
+            17_088_147,
+            "ENSPFM0510",
+            "TBX21",
+            1,
+        )];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 17_088_127, 17_088_127, "T", "A"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &motifs,
+            &[],
+            &[],
+        );
+
+        let motif_csq = assignments
+            .iter()
+            .find(|a| a.feature_type == FeatureType::MotifFeature)
+            .expect("expected a MotifFeature consequence");
+        assert_eq!(motif_csq.transcript_id.as_deref(), Some("ENSM00000588617"));
+        assert_eq!(motif_csq.motif_name.as_deref(), Some("ENSPFM0510"));
+        assert_eq!(
+            motif_csq.motif_transcription_factors.as_deref(),
+            Some("TBX21")
+        );
+        assert_eq!(motif_csq.motif_strand, Some(1));
     }
 }
