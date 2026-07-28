@@ -22098,4 +22098,36 @@ mod tests {
             .collect();
         assert!(motif_terms.contains(&&SoTerm::TfbsAblation));
     }
+
+    /// Caches without MotifFeature data must be unaffected. Release 115 ships
+    /// no motif features at all (its `_reg.gz` bins contain RegulatoryFeature
+    /// only), so per-motif emission must stay inert there rather than change
+    /// existing output.
+    #[test]
+    fn emits_no_motif_consequence_when_cache_has_no_motifs() {
+        let engine = TranscriptConsequenceEngine::default();
+        let regulatory = vec![regulatory("ENSR001", "22", 100, 200)];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 155, 155, "A", "G"),
+            &[],
+            &[],
+            &[],
+            &regulatory,
+            &[],
+            &[],
+            &[],
+        );
+
+        assert!(
+            !assignments
+                .iter()
+                .any(|a| a.feature_type == FeatureType::MotifFeature)
+        );
+        assert!(
+            assignments
+                .iter()
+                .any(|a| a.feature_type == FeatureType::RegulatoryFeature)
+        );
+    }
 }
