@@ -2235,6 +2235,15 @@ fn merge_colocated_delta(
 /// array separators become `&`, semicolons are percent-encoded, spaces become
 /// underscores, pipes become `&`, and `-` is serialized as an empty field.
 #[inline]
+/// Renders a multi-valued CSQ sub-field.
+///
+/// The cache joins list values with `,`, but `,` separates whole CSQ *entries*,
+/// so emitting them raw splits one entry into several. Ensembl VEP joins
+/// multi-valued sub-fields with `&` (e.g. `TRANSCRIPTION_FACTORS=FOS&ATF7&JUN`).
+fn csq_multi_value(raw: &str) -> String {
+    raw.replace(',', "&")
+}
+
 fn csq_escape(val: &str) -> std::borrow::Cow<'_, str> {
     if val == "-" {
         return std::borrow::Cow::Borrowed("");
@@ -5993,7 +6002,9 @@ impl AnnotateProvider {
                             strand_str
                         };
                         let motif_name = tc.motif_name.as_deref().unwrap_or("");
-                        let motif_tfs = tc.motif_transcription_factors.as_deref().unwrap_or("");
+                        let motif_tfs = csq_multi_value(
+                            tc.motif_transcription_factors.as_deref().unwrap_or(""),
+                        );
                         let biotype = tc.biotype_override.as_deref().unwrap_or(biotype_tx);
                         let exon = tc.exon_str.as_deref().unwrap_or("");
                         let intron = tc.intron_str.as_deref().unwrap_or("");
@@ -9068,7 +9079,16 @@ async fn load_contig_context(
         cache,
         "motif",
         chrom,
-        &["motif_id", "feature_id", "chrom", "start", "\"end\""],
+        &[
+            "motif_id",
+            "feature_id",
+            "chrom",
+            "start",
+            "\"end\"",
+            "binding_matrix",
+            "transcription_factors",
+            "strand",
+        ],
     )
     .await?;
     record_contig_profile(profile, |profile| {
@@ -16135,5 +16155,14 @@ mod tests {
         assert!(line.contains("engine=0.013s"));
         assert!(line.contains("projection=0.014s"));
         assert!(line.contains("input_buffers=15"));
+    }
+
+    #[test]
+    fn csq_multi_value_uses_ampersand_like_vep() {
+        // Ensembl VEP 116 emits TRANSCRIPTION_FACTORS=FOS&ATF7&JUN; the cache
+        // stores FOS,ATF7,JUN. A raw comma would split the CSQ entry.
+        assert_eq!(csq_multi_value("FOS,ATF7,JUN"), "FOS&ATF7&JUN");
+        assert_eq!(csq_multi_value("CTCF"), "CTCF");
+        assert_eq!(csq_multi_value(""), "");
     }
 }
