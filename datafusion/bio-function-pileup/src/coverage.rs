@@ -115,6 +115,10 @@ pub fn all_events_to_record_batch(
 /// The key optimization: most positions have `delta == 0` and are skipped
 /// (~99.9% of positions for typical WES/WGS data).
 /// Zero-coverage gaps are NOT emitted.
+///
+/// `zero_based` selects the interval convention for `pos_end`, exactly as in
+/// [`events_to_coverage_blocks`]: half-open (exclusive) when `true`, closed
+/// (inclusive) when `false`.
 pub fn dense_depth_to_coverage_blocks(
     contig: &str,
     depth: &[i32],
@@ -154,7 +158,8 @@ pub fn dense_depth_to_coverage_blocks(
 
 /// Convert a dense depth slice to coverage blocks with a position offset.
 ///
-/// Same RLE logic as `dense_depth_to_coverage_blocks` but positions are
+/// Same RLE logic as [`dense_depth_to_coverage_blocks`] — including the
+/// `zero_based` interval convention for `pos_end` — but positions are
 /// shifted by `start_offset`, allowing callers to pass a sub-slice of
 /// the full depth array (the touched region) instead of the entire contig.
 pub fn dense_depth_to_coverage_blocks_bounded(
