@@ -643,6 +643,9 @@ pub struct TranscriptConsequence {
     /// STRAND for MotifFeature consequences, which have no transcript to
     /// derive orientation from.
     pub motif_strand: Option<i8>,
+    /// MOTIF_POS: 1-based offset of the variant within the motif, in motif
+    /// orientation.
+    pub motif_pos: Option<i64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2103,6 +2106,20 @@ impl TranscriptConsequenceEngine {
         }
     }
 
+    /// 1-based offset of `variant` within a motif, in motif orientation.
+    ///
+    /// Forward-strand motifs count from the motif start, reverse-strand motifs
+    /// from the motif end, matching Ensembl VEP's MOTIF_POS.
+    fn motif_position(variant: &VariantInput, m: &MotifFeature) -> Option<i64> {
+        let strand = m.strand?;
+        let pos = if strand >= 0 {
+            variant.start - m.start + 1
+        } else {
+            m.end - variant.start + 1
+        };
+        (pos >= 1).then_some(pos)
+    }
+
     fn append_tfbs_terms(
         &self,
         out: &mut Vec<TranscriptConsequence>,
@@ -2155,6 +2172,7 @@ impl TranscriptConsequenceEngine {
                 motif_name: m.binding_matrix.clone(),
                 motif_transcription_factors: m.transcription_factors.clone(),
                 motif_strand: m.strand,
+                motif_pos: Self::motif_position(variant, m),
                 ..Default::default()
             });
         }
@@ -2225,6 +2243,7 @@ impl TranscriptConsequenceEngine {
                 motif_name: m.binding_matrix.clone(),
                 motif_transcription_factors: m.transcription_factors.clone(),
                 motif_strand: m.strand,
+                motif_pos: Self::motif_position(variant, m),
                 ..Default::default()
             });
         }
@@ -22210,5 +22229,48 @@ mod tests {
             Some("TBX21")
         );
         assert_eq!(motif_csq.motif_strand, Some(1));
+    }
+
+    #[test]
+    fn motif_pos_counts_from_motif_orientation() {
+        let engine = TranscriptConsequenceEngine::default();
+        // Real chr22:17088127 motifs; VEP 116 reports MOTIF_POS 3 and 21.
+        let motifs = vec![
+            motif_with_matrix(
+                "ENSM00000588617",
+                "22",
+                17_088_125,
+                17_088_147,
+                "ENSPFM0510",
+                "TBX21",
+                1,
+            ),
+            motif_with_matrix(
+                "ENSM00000588616",
+                "22",
+                17_088_125,
+                17_088_147,
+                "ENSPFM0510",
+                "TBX21",
+                -1,
+            ),
+        ];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 17_088_127, 17_088_127, "T", "A"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &motifs,
+            &[],
+            &[],
+        );
+        let by_id: std::collections::HashMap<_, _> = out
+            .iter()
+            .filter(|a| a.feature_type == FeatureType::MotifFeature)
+            .map(|a| (a.transcript_id.clone().unwrap_or_default(), a.motif_pos))
+            .collect();
+        assert_eq!(by_id.get("ENSM00000588617"), Some(&Some(3)));
+        assert_eq!(by_id.get("ENSM00000588616"), Some(&Some(21)));
     }
 }

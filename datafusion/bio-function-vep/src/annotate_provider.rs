@@ -6002,6 +6002,7 @@ impl AnnotateProvider {
                             strand_str
                         };
                         let motif_name = tc.motif_name.as_deref().unwrap_or("");
+                        let motif_pos = OptDisplay(tc.motif_pos);
                         let motif_tfs = csq_multi_value(
                             tc.motif_transcription_factors.as_deref().unwrap_or(""),
                         );
@@ -6252,7 +6253,7 @@ impl AnnotateProvider {
                                 "|{gene_pheno}|\
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
-                             {batch3_suffix}|{motif_name}||||{motif_tfs}"
+                             {batch3_suffix}|{motif_name}|{motif_pos}|||{motif_tfs}"
                             );
                         } else {
                             // 74-field CSQ base layout, with optional PICK and RefSeq fields.
