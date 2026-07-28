@@ -2111,6 +2111,12 @@ impl TranscriptConsequenceEngine {
     /// Forward-strand motifs count from the motif start, reverse-strand motifs
     /// from the motif end, matching Ensembl VEP's MOTIF_POS.
     fn motif_position(variant: &VariantInput, m: &MotifFeature) -> Option<i64> {
+        // Ensembl VEP leaves MOTIF_POS empty for multi-base reference alleles;
+        // observed on chr22 @116 for ATCT>A and TACACACGTGTCCTCACACATGC>T,
+        // where VEP emits no value while every single-base case is populated.
+        if normalize_allele_seq(&variant.ref_allele).len() != 1 {
+            return None;
+        }
         let strand = m.strand?;
         let pos = if strand >= 0 {
             variant.start - m.start + 1
@@ -22272,5 +22278,34 @@ mod tests {
             .collect();
         assert_eq!(by_id.get("ENSM00000588617"), Some(&Some(3)));
         assert_eq!(by_id.get("ENSM00000588616"), Some(&Some(21)));
+    }
+
+    #[test]
+    fn motif_pos_is_empty_for_multi_base_reference_alleles() {
+        let engine = TranscriptConsequenceEngine::default();
+        let motifs = vec![motif_with_matrix(
+            "ENSM_del",
+            "22",
+            17_088_125,
+            17_088_147,
+            "ENSPFM0510",
+            "TBX21",
+            1,
+        )];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 17_088_127, 17_088_130, "ATCT", "A"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &motifs,
+            &[],
+            &[],
+        );
+        let m = out
+            .iter()
+            .find(|a| a.feature_type == FeatureType::MotifFeature)
+            .expect("motif consequence");
+        assert_eq!(m.motif_pos, None);
     }
 }
