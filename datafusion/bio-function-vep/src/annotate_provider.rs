@@ -4354,6 +4354,7 @@ impl AnnotateProvider {
                 "binding_matrix",
                 "transcription_factors",
                 "strand",
+                "binding_matrix_length",
             ],
         )
         .await;
@@ -4387,6 +4388,7 @@ impl AnnotateProvider {
             let matrix_idx = schema.index_of("binding_matrix").ok();
             let tf_idx = schema.index_of("transcription_factors").ok();
             let strand_idx = schema.index_of("strand").ok();
+            let matrix_len_idx = schema.index_of("binding_matrix_length").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
@@ -4416,6 +4418,9 @@ impl AnnotateProvider {
                     binding_matrix,
                     transcription_factors,
                     strand,
+                    binding_matrix_length: matrix_len_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .map(|v| v as i32),
                 });
             }
         }
@@ -4891,6 +4896,7 @@ impl AnnotateProvider {
             let matrix_idx = schema.index_of("binding_matrix").ok();
             let tf_idx = schema.index_of("transcription_factors").ok();
             let strand_idx = schema.index_of("strand").ok();
+            let matrix_len_idx = schema.index_of("binding_matrix_length").ok();
             for row in 0..batch.num_rows() {
                 let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
                     continue;
@@ -4915,6 +4921,9 @@ impl AnnotateProvider {
                     strand: strand_idx
                         .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                         .map(|v| v as i8),
+                    binding_matrix_length: matrix_len_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .map(|v| v as i32),
                 });
             }
         }

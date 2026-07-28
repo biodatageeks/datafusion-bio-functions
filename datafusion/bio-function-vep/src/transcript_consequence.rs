@@ -559,6 +559,9 @@ pub struct MotifFeature {
     pub transcription_factors: Option<String>,
     /// Motif orientation, surfaced as `STRAND` for motif consequences.
     pub strand: Option<i8>,
+    /// BindingMatrix length; Ensembl VEP uses it to place a variant within a
+    /// reverse-strand motif and to bounds-check MOTIF_POS.
+    pub binding_matrix_length: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2111,13 +2114,21 @@ impl TranscriptConsequenceEngine {
     /// Forward-strand motifs count from the motif start, reverse-strand motifs
     /// from the motif end, matching Ensembl VEP's MOTIF_POS.
     fn motif_position(variant: &VariantInput, m: &MotifFeature) -> Option<i64> {
+        // Mirrors MotifFeatureVariationAllele::motif_start in Ensembl VEP 116:
+        //   $mf_start = $vf->seq_region_start - $mf->seq_region_start + 1;
+        //   $mf_start = $matrix->length - $mf_start + 1 if $mf->strand < 0;
+        //   return undef if $mf_start > $mf->length or $mf_start < 1;
+        // The reverse-strand flip uses the *matrix* length, which equals the
+        // motif span only when the motif is not clipped; fall back to the span
+        // for caches predating the binding_matrix_length column.
         let strand = m.strand?;
-        let pos = if strand >= 0 {
-            variant.start - m.start + 1
-        } else {
-            m.end - variant.start + 1
-        };
-        (pos >= 1).then_some(pos)
+        let motif_len = m.end - m.start + 1;
+        let matrix_len = m.binding_matrix_length.map(i64::from).unwrap_or(motif_len);
+        let mut pos = variant.start - m.start + 1;
+        if strand < 0 {
+            pos = matrix_len - pos + 1;
+        }
+        (pos >= 1 && pos <= motif_len).then_some(pos)
     }
 
     fn append_tfbs_terms(
@@ -9197,6 +9208,7 @@ mod tests {
             binding_matrix: None,
             transcription_factors: None,
             strand: None,
+            binding_matrix_length: None,
         }
     }
 
@@ -9217,6 +9229,7 @@ mod tests {
             binding_matrix: Some(binding_matrix.to_string()),
             transcription_factors: Some(transcription_factors.to_string()),
             strand: Some(strand),
+            binding_matrix_length: Some((end - start + 1) as i32),
         }
     }
 
@@ -22272,5 +22285,52 @@ mod tests {
             .collect();
         assert_eq!(by_id.get("ENSM00000588617"), Some(&Some(3)));
         assert_eq!(by_id.get("ENSM00000588616"), Some(&Some(21)));
+    }
+
+    #[test]
+    fn motif_pos_uses_matrix_length_on_the_reverse_strand() {
+        // Matrix shorter than the motif span: VEP flips against the matrix
+        // length, so a naive end-based flip would disagree.
+        let engine = TranscriptConsequenceEngine::default();
+        let mut m = motif_with_matrix("ENSM_x", "22", 100, 120, "ENSPFM1", "TF", -1);
+        m.binding_matrix_length = Some(10);
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 103, 103, "A", "G"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[m],
+            &[],
+            &[],
+        );
+        let c = out
+            .iter()
+            .find(|a| a.feature_type == FeatureType::MotifFeature)
+            .unwrap();
+        // pos = 103-100+1 = 4; reverse: 10-4+1 = 7
+        assert_eq!(c.motif_pos, Some(7));
+    }
+
+    #[test]
+    fn motif_pos_is_none_out_of_bounds() {
+        let engine = TranscriptConsequenceEngine::default();
+        let mut m = motif_with_matrix("ENSM_y", "22", 100, 120, "ENSPFM1", "TF", -1);
+        m.binding_matrix_length = Some(2);
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 118, 118, "A", "G"),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[m],
+            &[],
+            &[],
+        );
+        let c = out
+            .iter()
+            .find(|a| a.feature_type == FeatureType::MotifFeature)
+            .unwrap();
+        assert_eq!(c.motif_pos, None);
     }
 }
