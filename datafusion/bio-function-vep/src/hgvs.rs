@@ -2022,6 +2022,20 @@ pub fn format_hgvsp(
         }
     }
 
+    // VEP normalizes peptide terminators from `*` to BioPerl's `X` after
+    // `_clip_alleles()` and before converting the peptide strings to
+    // three-letter HGVS residues. That ordering is observable when an
+    // ambiguous affected peptide contains `X`: `*/X` becomes synonymous,
+    // while `*/YX` remains a delins ending in Ter instead of a stop-loss
+    // extension.
+    //
+    // Traceability:
+    // - Ensembl Variation
+    //   `TranscriptVariationAllele::_get_hgvs_protein_type()`
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2041-L2077>
+    notation.ref_allele = notation.ref_allele.replace('*', "X");
+    notation.alt_allele = notation.alt_allele.replace('*', "X");
+
     format_hgvsp_notation(&protein_id, &notation, protein)
 }
 
@@ -2880,6 +2894,42 @@ mod tests {
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ter3GlnextTer1".to_string())
         );
+    }
+
+    #[test]
+    fn test_format_hgvsp_ambiguous_terminal_peptides_follow_vep_x_normalization() {
+        let translation = make_translation();
+        let cases = [
+            (144, 144, "*", "X", "ENSPHGVS000001.1:p.Ter144="),
+            (
+                172,
+                173,
+                "S*",
+                "X",
+                "ENSPHGVS000001.1:p.Ser172_Ter173delinsTer",
+            ),
+            (760, 760, "*", "YX", "ENSPHGVS000001.1:p.Ter760delinsTyrTer"),
+        ];
+
+        for (start, end, ref_peptide, alt_peptide, expected) in cases {
+            let protein = ProteinHgvsData {
+                start,
+                end,
+                ref_peptide: ref_peptide.to_string(),
+                alt_peptide: alt_peptide.to_string(),
+                ref_translation: "MA*".to_string(),
+                alt_translation: "MAY*".to_string(),
+                alt_translation_extension: Some("MAY*".to_string()),
+                frameshift: false,
+                start_lost: false,
+                stop_lost: true,
+                native_refseq: false,
+            };
+            assert_eq!(
+                format_hgvsp(&translation, &protein, true),
+                Some(expected.to_string())
+            );
+        }
     }
 
     #[test]

@@ -1386,7 +1386,7 @@ impl TranscriptConsequenceEngine {
                                 };
                                 let codons = cc.codons.clone();
                                 let amino_acids = amino_acids_for_output(tx, tx_translation, cc);
-                                let protein_hgvs = protein_hgvs_for_output(
+                                let protein_hgvs = protein_hgvs_for_output_with_semantics(
                                     tx,
                                     tx_exons,
                                     tx_translation,
@@ -1395,13 +1395,14 @@ impl TranscriptConsequenceEngine {
                                     cc.protein_position_start
                                         .zip(cc.protein_position_end.or(cc.protein_position_start)),
                                     cc.protein_hgvs.as_ref(),
+                                    self.semantics,
                                     self.shift_hgvs,
                                 );
                                 (cds_pos, prot_pos, amino_acids, codons, protein_hgvs)
                             } else {
                                 // VEP can still emit HGVSp for HGVS-shifted indels whose
                                 // original consequence stayed coding_sequence_variant.
-                                let protein_hgvs = protein_hgvs_for_output(
+                                let protein_hgvs = protein_hgvs_for_output_with_semantics(
                                     tx,
                                     tx_exons,
                                     tx_translation,
@@ -1409,6 +1410,7 @@ impl TranscriptConsequenceEngine {
                                     original_allows_protein_hgvs,
                                     None,
                                     None,
+                                    self.semantics,
                                     self.shift_hgvs,
                                 );
                                 (None, None, None, None, protein_hgvs)
@@ -5966,11 +5968,49 @@ fn protein_hgvs_for_output(
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
     shift_hgvs: bool,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
+    protein_hgvs_for_output_with_semantics(
+        tx,
+        tx_exons,
+        tx_translation,
+        variant,
+        original_allows_protein_hgvs,
+        original_protein_bounds,
+        fallback,
+        crate::vep_semantics::VepSemantics::V115,
+        shift_hgvs,
+    )
+}
+
+fn protein_hgvs_for_output_with_semantics(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+    original_allows_protein_hgvs: bool,
+    original_protein_bounds: Option<(usize, usize)>,
+    fallback: Option<&crate::hgvs::ProteinHgvsData>,
+    semantics: crate::vep_semantics::VepSemantics,
+    shift_hgvs: bool,
+) -> Option<crate::hgvs::ProteinHgvsData> {
     // Ensembl only emits HGVSp when the original transcript variation is
     // coding (`$pre->{coding}`), even if HGVS 3' shifting later moves an
     // intronic indel into CDS coordinates for HGVSc.
     if !original_allows_protein_hgvs {
         return None;
+    }
+
+    // Release 116's stop-predicate changes expose ambiguous local terminal
+    // peptides such as `*/X`, `S*/X`, and `*/YX`. VEP's shifted TVA replay
+    // preserves that original local peptide window for protein HGVS. Keep the
+    // same window here instead of replacing it with a translated extension
+    // that drops the terminal `X`; `format_hgvsp()` then applies VEP's
+    // star-to-X normalization in the official order.
+    if semantics.vep116_stop_predicates()
+        && fallback.is_some_and(|protein| {
+            protein.ref_peptide.contains('*') && protein.alt_peptide.contains('X')
+        })
+    {
+        return fallback.cloned();
     }
 
     if !shift_hgvs {
