@@ -6774,6 +6774,26 @@ fn classify_coding_change_with_semantics(
     let local_alt_codon = &mutated[local_codon_start..local_alt_end];
     class.affected_ref_peptide = local_peptide_from_codon_window(local_ref_codon);
     class.affected_alt_peptide = local_peptide_from_codon_window(local_alt_codon);
+    if skip_global_stop_compare {
+        // Failed RefSeq BAM edits can leave the genomic codon representation
+        // different from the trusted cached protein. VEP exposes that split
+        // for NM_173600.2 at chr12:40526308: Codons is `Tga/Cga`, but both
+        // reference and alternate `peptide()` values consumed by
+        // `_get_peptide_alleles()` are Arg (`R/R`), producing synonymous
+        // rather than stop_lost.
+        //
+        // `reference_aas_for_consequence()` already selected the cached RefSeq
+        // translation for `old_aas`; `new_aas` is the translated alternate
+        // CDS. Use those same peptide-space windows for the VEP 116 stop
+        // predicates while preserving the genomic codons for CSQ output.
+        let peptide_end = local_last_codon.saturating_add(1);
+        class.affected_ref_peptide = old_aas
+            .get(local_first_codon..peptide_end)
+            .map(|peptide| peptide.iter().collect());
+        class.affected_alt_peptide = new_aas
+            .get(local_first_codon..peptide_end)
+            .map(|peptide| peptide.iter().collect());
+    }
     let partial_terminal_codon = {
         let codon_start = local_first_codon.saturating_mul(3);
         let last_codon_len = cds_seq.len().saturating_sub(codon_start);
@@ -15249,6 +15269,21 @@ mod tests {
         let protein = c.protein_hgvs.as_ref().expect("protein hgvs");
         let formatted = crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), protein, true);
         assert_eq!(formatted.as_deref(), Some("NP_775871.2:p.Arg3="));
+
+        let v116 = classify_coding_change_with_semantics(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            &v,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("VEP 116 classification");
+        assert_eq!(v116.affected_ref_peptide.as_deref(), Some("R"));
+        assert_eq!(v116.affected_alt_peptide.as_deref(), Some("R"));
+        assert!(
+            v116.synonymous && !v116.stop_lost,
+            "VEP 116 must apply stop predicates to the edited RefSeq peptide: {v116:?}"
+        );
     }
 
     #[test]
