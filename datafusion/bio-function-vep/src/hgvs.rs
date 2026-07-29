@@ -2033,8 +2033,10 @@ pub fn format_hgvsp(
     // - Ensembl Variation
     //   `TranscriptVariationAllele::_get_hgvs_protein_type()`
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2041-L2077>
-    notation.ref_allele = notation.ref_allele.replace('*', "X");
-    notation.alt_allele = notation.alt_allele.replace('*', "X");
+    if !protein.frameshift {
+        notation.ref_allele = notation.ref_allele.replace('*', "X");
+        notation.alt_allele = notation.alt_allele.replace('*', "X");
+    }
 
     format_hgvsp_notation(&protein_id, &notation, protein)
 }
@@ -2126,7 +2128,15 @@ fn resolve_frameshift_hgvs(
 ) -> Option<()> {
     notation.kind = "fs".to_string();
     let ref_translation = append_terminal_stop(&protein.ref_translation);
-    let alt_translation = protein.alt_translation.as_str();
+    // VEP `_get_fs_peptides()` translates `_get_alternate_cds()`, whose
+    // frameshift path includes the 3' UTR. The local alternate translation can
+    // end in an incomplete `X` even when that exact extended CDS translates to
+    // an immediate stop; use the replayed alternate-CDS translation whenever
+    // it is available.
+    let alt_translation = protein
+        .alt_translation_extension
+        .as_deref()
+        .unwrap_or(&protein.alt_translation);
     let mut start = notation.start;
 
     if start > alt_translation.len() {
@@ -2451,7 +2461,7 @@ fn format_hgvsp_notation(
         }
         "delins" | "ins" => {
             let mut alt_allele = notation.alt_allele.clone();
-            if let Some(stop_idx) = alt_allele.find('*') {
+            if let Some(stop_idx) = alt_allele.find('X') {
                 alt_allele.truncate(stop_idx.saturating_add(1));
             }
             let mut alt = peptide_to_three_letter(&alt_allele);
@@ -6551,6 +6561,31 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ala2Ter".into())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_frameshift_uses_extended_alternate_cds_immediate_stop() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 3,
+            end: 3,
+            ref_peptide: "-".into(),
+            alt_peptide: "X".into(),
+            ref_translation: "MAY*".into(),
+            // The local codon window is incomplete, but VEP
+            // `_get_fs_peptides()` translates `_get_alternate_cds()` including
+            // 3' UTR and sees an immediate stop at the first changed residue.
+            alt_translation: "MAX".into(),
+            alt_translation_extension: Some("MA*".into()),
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Tyr3Ter".into())
         );
     }
 

@@ -4190,6 +4190,10 @@ fn vep116_stop_retained_without_alt_peptide(
     let Some(cds_seq) = reference_translateable_seq_for_vep(tx, tx_translation) else {
         return false;
     };
+    let leading_n_offset = cds_seq
+        .bytes()
+        .take_while(|base| base.eq_ignore_ascii_case(&b'N'))
+        .count();
     let mut combined = cds_seq.clone().into_bytes();
     combined.extend_from_slice(three_prime_utr_seq(tx).unwrap_or_default().as_bytes());
 
@@ -4211,32 +4215,36 @@ fn vep116_stop_retained_without_alt_peptide(
         let Some(cds_idx) = genomic_to_cds_index(tx, tx_exons, anchor) else {
             return false;
         };
-        (cds_idx.saturating_add(1), 0)
+        (
+            cds_idx.saturating_add(leading_n_offset).saturating_add(1),
+            0,
+        )
     } else {
-        let mut cdna_positions = Vec::new();
-        for exon in tx_exons {
-            let overlap_start = variant.start.max(exon.start);
-            let overlap_end = variant.end.min(exon.end);
-            if overlap_start > overlap_end {
-                continue;
-            }
-            for position in [overlap_start, overlap_end] {
-                if let Some(cdna) = genomic_to_cdna_index_for_transcript(tx, tx_exons, position) {
-                    cdna_positions.push(cdna);
-                }
-            }
-        }
-        let (Some(min_cdna), Some(max_cdna), Some(coding_start)) = (
-            cdna_positions.iter().min().copied(),
-            cdna_positions.iter().max().copied(),
-            tx.cdna_coding_start,
+        // VEP reads `$bvfo->cdna_start`, `$bvfo->cdna_end`, and
+        // `$bvfo->cds_start` directly. When either genomic endpoint cannot be
+        // mapped to cDNA, `_ins_del_stop_altered_cil()` returns 0; because
+        // `stop_retained()` negates that result, the stop is retained.
+        let (Some(cdna_at_start), Some(cdna_at_end)) = (
+            genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start),
+            genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.end),
         ) else {
-            return false;
+            return true;
+        };
+        let (min_cdna, max_cdna) = if cdna_at_start <= cdna_at_end {
+            (cdna_at_start, cdna_at_end)
+        } else {
+            (cdna_at_end, cdna_at_start)
+        };
+        let Some(coding_start) = tx.cdna_coding_start else {
+            return true;
         };
         let Some(edit_start) = min_cdna.checked_sub(coding_start) else {
-            return false;
+            return true;
         };
-        (edit_start, max_cdna.saturating_sub(min_cdna) + 1)
+        (
+            edit_start.saturating_add(leading_n_offset),
+            max_cdna.saturating_sub(min_cdna) + 1,
+        )
     };
 
     if edit_start > combined.len() {
@@ -4422,10 +4430,11 @@ fn frameshift_under_semantics(
 ) -> bool {
     raw_frameshift
         && !(semantics.vep116_stop_predicates()
-            && class
-                .affected_ref_peptide
-                .as_deref()
-                .is_some_and(|peptide| peptide.starts_with('*')))
+            && (class.stop_retained
+                || class
+                    .affected_ref_peptide
+                    .as_deref()
+                    .is_some_and(|peptide| peptide.starts_with('*'))))
 }
 
 fn apply_vep116_primary_indel_predicates(
@@ -4494,6 +4503,12 @@ fn vep116_ref_eq_alt_sequence_for_class(
     ref_translation: &[char],
     translation_start: usize,
 ) -> bool {
+    // VEP passes `$bvfo->_peptide` here. Ensembl's transcript translation
+    // excludes the terminal stop, while our CDS translation retains it.
+    // Internal stops remain part of both representations.
+    let ref_translation = ref_translation
+        .strip_suffix(&['*'])
+        .unwrap_or(ref_translation);
     match (
         class.affected_ref_peptide.as_deref(),
         class.affected_alt_peptide.as_deref(),
@@ -4564,6 +4579,22 @@ fn build_protein_hgvs_data(
         stop_lost: class.stop_lost,
         native_refseq: false,
     })
+}
+
+fn vep116_ambiguous_terminal_hgvsp_alleles(
+    class: &CodingClassification,
+    semantics: crate::vep_semantics::VepSemantics,
+) -> Option<String> {
+    if !semantics.vep116_stop_predicates() {
+        return None;
+    }
+    let (Some(reference), Some(alternate)) = (
+        class.affected_ref_peptide.as_deref(),
+        class.affected_alt_peptide.as_deref(),
+    ) else {
+        return None;
+    };
+    (reference.contains('*') && alternate.contains('X')).then(|| format!("{reference}/{alternate}"))
 }
 
 /// Traceability:
@@ -5999,12 +6030,12 @@ fn protein_hgvs_for_output_with_semantics(
         return None;
     }
 
-    // Release 116's stop-predicate changes expose ambiguous local terminal
-    // peptides such as `*/X`, `S*/X`, and `*/YX`. VEP's shifted TVA replay
-    // preserves that original local peptide window for protein HGVS. Keep the
-    // same window here instead of replacing it with a translated extension
-    // that drops the terminal `X`; `format_hgvsp()` then applies VEP's
-    // star-to-X normalization in the official order.
+    // In release 116, VEP's shifted TVA peptide replay retains ambiguous
+    // terminal windows such as `*/X`, `S*/X`, and `*/YX`. The release-116
+    // affected peptide window above is built by the same `codon()` /
+    // `peptide()` rules and is the exact state observed after VEP's
+    // `_return_3prime()` replay for these terminal alleles. Do not replace it
+    // with an extension-only translation that loses the terminal `X`.
     if semantics.vep116_stop_predicates()
         && fallback.is_some_and(|protein| {
             protein.ref_peptide.contains('*') && protein.alt_peptide.contains('X')
@@ -7110,12 +7141,14 @@ fn classify_coding_change_with_semantics(
         .as_ref()
         .map(|seq| seq.chars().collect::<Vec<_>>())
         .unwrap_or_else(|| new_aas.clone());
-    let hgvs_amino_acids = class.amino_acids.clone().or_else(|| {
-        class
-            .codons
-            .as_deref()
-            .and_then(pep_allele_string_from_codon_allele_string)
-    });
+    let hgvs_amino_acids = vep116_ambiguous_terminal_hgvsp_alleles(&class, semantics)
+        .or_else(|| class.amino_acids.clone())
+        .or_else(|| {
+            class
+                .codons
+                .as_deref()
+                .and_then(pep_allele_string_from_codon_allele_string)
+        });
     class.protein_hgvs = build_protein_hgvs_data(
         &class,
         hgvs_amino_acids.as_deref(),
@@ -7653,12 +7686,14 @@ fn classify_insertion_with_semantics(
         .as_ref()
         .map(|seq| seq.chars().collect::<Vec<_>>())
         .unwrap_or_else(|| new_aas.clone());
-    let hgvs_amino_acids = class.amino_acids.clone().or_else(|| {
-        class
-            .codons
-            .as_deref()
-            .and_then(pep_allele_string_from_codon_allele_string)
-    });
+    let hgvs_amino_acids = vep116_ambiguous_terminal_hgvsp_alleles(&class, semantics)
+        .or_else(|| class.amino_acids.clone())
+        .or_else(|| {
+            class
+                .codons
+                .as_deref()
+                .and_then(pep_allele_string_from_codon_allele_string)
+        });
     class.protein_hgvs = build_protein_hgvs_data(
         &class,
         hgvs_amino_acids.as_deref(),
@@ -10180,14 +10215,14 @@ mod tests {
         plus.cdna_coding_start = Some(1);
         plus.cdna_coding_end = Some(6);
         plus.three_prime_utr_seq = Some("A".to_string());
-        let exon = exon("T1", 1, 1000, 1006);
-        let exon_refs = vec![&exon];
-        let translation = translation("T1", Some(6), Some(2), None, Some("ATGTAA"));
+        let exon_t1 = exon("T1", 1, 1000, 1006);
+        let exon_refs = vec![&exon_t1];
+        let translation_t1 = translation("T1", Some(6), Some(2), None, Some("ATGTAA"));
         let deletion = var("22", 1005, 1005, "A", "-");
         assert!(vep116_stop_retained_without_alt_peptide(
             &plus,
             &exon_refs,
-            Some(&translation),
+            Some(&translation_t1),
             &deletion,
         ));
 
@@ -10198,6 +10233,30 @@ mod tests {
         let old_overlap = insertion.end >= 1003 && insertion.start <= 1005;
         assert!(old_overlap);
         assert!(!vep116_overlaps_stop_codon_cil(&plus, &insertion, 3));
+
+        let mut partial_mapper = tx(
+            "T2",
+            "18",
+            1000,
+            1015,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1012),
+        );
+        partial_mapper.cdna_coding_start = Some(1);
+        partial_mapper.cdna_coding_end = Some(6);
+        partial_mapper.three_prime_utr_seq = Some("CAT".to_string());
+        let partial_exons = [exon("T2", 1, 1000, 1002), exon("T2", 2, 1010, 1015)];
+        let partial_exon_refs: Vec<&ExonFeature> = partial_exons.iter().collect();
+        let partial_translation = translation("T2", Some(6), Some(2), None, Some("ATGTAA"));
+        let intron_to_stop_deletion = var("18", 1005, 1012, "AAAAAAAA", "-");
+        assert!(vep116_stop_retained_without_alt_peptide(
+            &partial_mapper,
+            &partial_exon_refs,
+            Some(&partial_translation),
+            &intron_to_stop_deletion,
+        ));
     }
 
     #[test]
@@ -10228,6 +10287,17 @@ mod tests {
             "Q*",
             "R*",
         ));
+
+        let terminal_insertion = CodingClassification {
+            affected_ref_peptide: Some("T".to_string()),
+            affected_alt_peptide: Some("TL*ARATQG".to_string()),
+            ..Default::default()
+        };
+        assert!(vep116_ref_eq_alt_sequence_for_class(
+            &terminal_insertion,
+            &['A', 'T', 'L', '*'],
+            1,
+        ));
     }
 
     #[test]
@@ -10246,6 +10316,48 @@ mod tests {
             &class,
             crate::vep_semantics::VepSemantics::V116,
         ));
+
+        let stop_retained_after_nonterminal_residue = CodingClassification {
+            stop_retained: true,
+            affected_ref_peptide: Some("S*".to_string()),
+            affected_alt_peptide: Some("X".to_string()),
+            ..Default::default()
+        };
+        assert!(frameshift_under_semantics(
+            true,
+            &stop_retained_after_nonterminal_residue,
+            crate::vep_semantics::VepSemantics::V115,
+        ));
+        assert!(!frameshift_under_semantics(
+            true,
+            &stop_retained_after_nonterminal_residue,
+            crate::vep_semantics::VepSemantics::V116,
+        ));
+    }
+
+    #[test]
+    fn vep116_hgvsp_keeps_ambiguous_terminal_peptide_window() {
+        let class = CodingClassification {
+            amino_acids: Some("*/Y".to_string()),
+            affected_ref_peptide: Some("*".to_string()),
+            affected_alt_peptide: Some("YX".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vep116_ambiguous_terminal_hgvsp_alleles(
+                &class,
+                crate::vep_semantics::VepSemantics::V115,
+            ),
+            None,
+        );
+        assert_eq!(
+            vep116_ambiguous_terminal_hgvsp_alleles(
+                &class,
+                crate::vep_semantics::VepSemantics::V116,
+            )
+            .as_deref(),
+            Some("*/YX"),
+        );
     }
 
     fn patch_spliced_seq(len: usize, patches: &[(usize, &str)]) -> String {
