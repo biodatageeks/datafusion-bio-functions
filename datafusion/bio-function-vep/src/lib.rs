@@ -47,6 +47,8 @@ pub mod cache;
 #[cfg(feature = "cache-builder")]
 pub mod cache_builder;
 pub(crate) mod cache_common;
+#[cfg(feature = "parquet-cache")]
+pub mod cache_identity;
 pub(crate) mod cache_source;
 pub(crate) mod colocated;
 pub mod coordinate;
@@ -67,6 +69,7 @@ pub mod sift_decode;
 pub mod so_terms;
 pub mod transcript_consequence;
 pub mod vcf_sink;
+pub mod vep_semantics;
 pub(crate) mod window_planner;
 
 pub use sift_decode::{register_vep_sift_functions, vep_decode_sift_predictions_udf};

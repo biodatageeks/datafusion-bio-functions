@@ -12,6 +12,7 @@ use crate::transcript_consequence::{
     mapper_deleted_gap_cdna_index, raw_cdna_position_from_genomic, refseq_deleted_edit_cdna_index,
     refseq_sequence_offset_for_cdna,
 };
+use crate::vep_semantics::VepSemantics;
 use datafusion::common::{DataFusionError, Result};
 use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
@@ -179,6 +180,33 @@ pub fn format_hgvsc(
     variant_end: i64,
     genomic_shift: Option<&HgvsGenomicShift>,
 ) -> Option<String> {
+    format_hgvsc_with_semantics(
+        tx,
+        tx_exons,
+        cdna_position,
+        cds_position,
+        ref_allele,
+        alt_allele,
+        variant_start,
+        variant_end,
+        genomic_shift,
+        VepSemantics::V115,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn format_hgvsc_with_semantics(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    cdna_position: Option<&str>,
+    cds_position: Option<&str>,
+    ref_allele: &str,
+    alt_allele: &str,
+    variant_start: i64,
+    variant_end: i64,
+    genomic_shift: Option<&HgvsGenomicShift>,
+    semantics: VepSemantics,
+) -> Option<String> {
     format_hgvsc_inner(
         tx,
         tx_exons,
@@ -190,6 +218,7 @@ pub fn format_hgvsc(
         variant_end,
         genomic_shift,
         None,
+        semantics,
     )
 }
 
@@ -206,6 +235,35 @@ pub fn format_hgvsc_profiled(
     genomic_shift: Option<&HgvsGenomicShift>,
     profile: &mut HgvscProfile,
 ) -> Option<String> {
+    format_hgvsc_profiled_with_semantics(
+        tx,
+        tx_exons,
+        cdna_position,
+        cds_position,
+        ref_allele,
+        alt_allele,
+        variant_start,
+        variant_end,
+        genomic_shift,
+        profile,
+        VepSemantics::V115,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn format_hgvsc_profiled_with_semantics(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    cdna_position: Option<&str>,
+    cds_position: Option<&str>,
+    ref_allele: &str,
+    alt_allele: &str,
+    variant_start: i64,
+    variant_end: i64,
+    genomic_shift: Option<&HgvsGenomicShift>,
+    profile: &mut HgvscProfile,
+    semantics: VepSemantics,
+) -> Option<String> {
     format_hgvsc_inner(
         tx,
         tx_exons,
@@ -217,6 +275,7 @@ pub fn format_hgvsc_profiled(
         variant_end,
         genomic_shift,
         Some(profile),
+        semantics,
     )
 }
 
@@ -232,6 +291,7 @@ fn format_hgvsc_inner(
     variant_end: i64,
     genomic_shift: Option<&HgvsGenomicShift>,
     mut profile: Option<&mut HgvscProfile>,
+    semantics: VepSemantics,
 ) -> Option<String> {
     // Traceability:
     // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
@@ -242,7 +302,7 @@ fn format_hgvsc_inner(
     //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1416
     if ref_allele != "-" && alt_allele == "-" {
         // Deletion: check if either end extends beyond transcript boundaries.
-        if variant_start < tx.start || variant_end > tx.end {
+        if !semantics.partial_overlap_hgvs() && (variant_start < tx.start || variant_end > tx.end) {
             return None;
         }
     }
@@ -285,6 +345,7 @@ fn format_hgvsc_inner(
         variant_end,
         genomic_shift,
         profile.as_deref_mut(),
+        semantics,
     );
     if let (Some(started), Some(profile)) = (fallback_started, profile.as_deref_mut()) {
         profile.fallback += started.elapsed();
@@ -304,6 +365,7 @@ fn format_hgvsc_fallback(
     variant_end: i64,
     genomic_shift: Option<&HgvsGenomicShift>,
     mut profile: Option<&mut HgvscProfile>,
+    semantics: VepSemantics,
 ) -> Option<String> {
     let tx_id = versioned_id(&tx.transcript_id, tx.version);
     let numbering = if tx.cds_start.is_some() && tx.cds_end.is_some() {
@@ -320,8 +382,32 @@ fn format_hgvsc_fallback(
             && !shift.shifted_output_allele.is_empty()
             && shift.shifted_output_allele != "-"
     });
+    let partial_deletion = (ref_allele != "-"
+        && alt_allele == "-"
+        && (variant_start < tx.start || variant_end > tx.end))
+        .then(|| {
+            vep116_partial_overlap_deletion(
+                tx,
+                ref_allele,
+                variant_start,
+                variant_end,
+                use_genomic_shift,
+            )
+        })
+        .flatten();
+    if ref_allele != "-"
+        && alt_allele == "-"
+        && (variant_start < tx.start || variant_end > tx.end)
+        && (!semantics.partial_overlap_hgvs() || partial_deletion.is_none())
+    {
+        return None;
+    }
+    let partial_ref;
     let (ref_allele, alt_allele, variant_start, variant_end) =
-        if let Some(shift) = use_genomic_shift {
+        if let Some((clamped_ref, clamped_start, clamped_end)) = partial_deletion {
+            partial_ref = clamped_ref;
+            (partial_ref.as_str(), alt_allele, clamped_start, clamped_end)
+        } else if let Some(shift) = use_genomic_shift {
             (
                 ref_allele,
                 if ref_allele == "-" {
@@ -433,6 +519,88 @@ fn format_hgvsc_fallback(
         profile.format_string += started.elapsed();
     }
     hgvsc
+}
+
+/// Reproduce the release/116 `_var2transcript_slice_coords` behavior for a
+/// deletion that overlaps only part of a transcript.
+///
+/// VEP clamps the unshifted interval in transcript-slice coordinates and only
+/// then adds the non-negative HGVS 3' offset. In particular, substituting a
+/// precomputed shifted genomic interval before clamping is not equivalent at a
+/// transcript boundary.
+fn vep116_partial_overlap_deletion(
+    tx: &TranscriptFeature,
+    ref_allele: &str,
+    variant_start: i64,
+    variant_end: i64,
+    genomic_shift: Option<&HgvsGenomicShift>,
+) -> Option<(String, i64, i64)> {
+    let transcript_length = tx.end.checked_sub(tx.start)?.checked_add(1)?;
+    if transcript_length <= 0 {
+        return None;
+    }
+
+    let (slice_start, slice_end) = if tx.strand >= 0 {
+        (
+            variant_start.checked_sub(tx.start)?.checked_add(1)?,
+            variant_end.checked_sub(tx.start)?.checked_add(1)?,
+        )
+    } else {
+        (
+            tx.end.checked_sub(variant_end)?.checked_add(1)?,
+            tx.end.checked_sub(variant_start)?.checked_add(1)?,
+        )
+    };
+
+    // Release/116 rejects only variants wholly before or wholly after the
+    // transcript slice.
+    if (slice_start < 1 && slice_end < 1)
+        || (slice_start > transcript_length && slice_end > transcript_length)
+    {
+        return None;
+    }
+
+    let clamped_start = slice_start.clamp(1, transcript_length);
+    let clamped_end = slice_end.clamp(1, transcript_length);
+    let shift_offset = genomic_shift
+        .map(|shift| i64::try_from(shift.shift_length).ok())
+        .unwrap_or(Some(0))?;
+    let shifted_start = clamped_start.checked_add(shift_offset)?;
+    let shifted_end = clamped_end.checked_add(shift_offset)?;
+
+    // This is the separate guard in `hgvs_transcript`: a clamped partial
+    // overlap can still become invalid when its 3' shift overruns the slice.
+    if shifted_end > transcript_length {
+        return None;
+    }
+
+    let (genomic_start, genomic_end) = if tx.strand >= 0 {
+        (
+            tx.start.checked_add(shifted_start)?.checked_sub(1)?,
+            tx.start.checked_add(shifted_end)?.checked_sub(1)?,
+        )
+    } else {
+        (
+            tx.end.checked_sub(shifted_end)?.checked_add(1)?,
+            tx.end.checked_sub(shifted_start)?.checked_add(1)?,
+        )
+    };
+
+    // VEP extracts the reference from the clamped transcript slice. Cache
+    // annotation already carries that sequence as the deletion allele, so
+    // retain only the genomic-overlap portion when its span is exact.
+    let overlap_start = variant_start.max(tx.start);
+    let overlap_end = variant_end.min(tx.end);
+    let variant_span = variant_end.checked_sub(variant_start)?.checked_add(1)?;
+    let clamped_ref = if usize::try_from(variant_span).ok() == Some(ref_allele.len()) {
+        let start = usize::try_from(overlap_start.checked_sub(variant_start)?).ok()?;
+        let end = usize::try_from(overlap_end.checked_sub(variant_start)?.checked_add(1)?).ok()?;
+        ref_allele.get(start..end)?.to_string()
+    } else {
+        ref_allele.to_string()
+    };
+
+    Some((clamped_ref, genomic_start, genomic_end))
 }
 
 fn format_hgvsc_simple_substitution_fast(
@@ -557,13 +725,18 @@ pub(crate) fn hgvsc_uses_genomic_shift(
         return false;
     };
 
-    // When RefSeq BAM edit replay failed, VEP only suppresses transcript HGVS
-    // shifting when the transcript-space HGVS alleles no longer match the
-    // original shifted allele payload. Failed BAM-edit rows whose HGVS alleles
-    // still match the original genomic payload keep the shift.
+    // A failed RefSeq BAM edit removes the attempted `_rna_edit` attributes,
+    // but VEP still runs `_return_3prime()` against the remaining transcript
+    // state. Accept both representations that can therefore reach
+    // `hgvs_transcript()`: the original normalized allele and the allele
+    // rotated by the genomic 3' shift. The latter is also VEP's USED_REF for
+    // repeat deletions (for example NM_002457.5 at chr11:1094638).
     if is_native_refseq_transcript(tx) && tx.bam_edit_status.as_deref() == Some("failed") {
-        return ref_allele.eq_ignore_ascii_case(&shift.ref_orig_allele_string)
-            && alt_allele.eq_ignore_ascii_case(&shift.alt_orig_allele_string);
+        let ref_matches = ref_allele.eq_ignore_ascii_case(&shift.ref_orig_allele_string)
+            || ref_allele.eq_ignore_ascii_case(&shift.shifted_allele_string);
+        let alt_matches = alt_allele.eq_ignore_ascii_case(&shift.alt_orig_allele_string)
+            || alt_allele.eq_ignore_ascii_case(&shift.shifted_output_allele);
+        return ref_matches && alt_matches;
     }
 
     true
@@ -2835,6 +3008,158 @@ mod tests {
     }
 
     #[test]
+    fn test_format_hgvsc_partial_overlap_is_release_gated_and_strand_aware() {
+        let exon = make_exon();
+        let exons = [&exon];
+        let ref_allele = "A".repeat(16);
+
+        let forward = make_transcript("lncRNA", 1, None, None);
+        assert_eq!(
+            format_hgvsc_with_semantics(
+                &forward,
+                &exons,
+                None,
+                None,
+                &ref_allele,
+                "-",
+                80,
+                95,
+                None,
+                VepSemantics::V115,
+            ),
+            None
+        );
+        assert_eq!(
+            format_hgvsc_with_semantics(
+                &forward,
+                &exons,
+                None,
+                None,
+                &ref_allele,
+                "-",
+                80,
+                95,
+                None,
+                VepSemantics::V116,
+            )
+            .as_deref(),
+            Some("ENSTHGVS000001.1:n.1_6del")
+        );
+
+        let reverse = make_transcript("lncRNA", -1, None, None);
+        assert_eq!(
+            format_hgvsc_with_semantics(
+                &reverse,
+                &exons,
+                None,
+                None,
+                &ref_allele,
+                "-",
+                135,
+                150,
+                None,
+                VepSemantics::V116,
+            )
+            .as_deref(),
+            Some("ENSTHGVS000001.1:n.1_6del")
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_clamps_before_hgvs_offset() {
+        let tx = make_transcript("lncRNA", 1, None, None);
+        let exon = make_exon();
+        let exons = [&exon];
+        let ref_allele = "A".repeat(16);
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 3,
+            start: 83,
+            end: 98,
+            shifted_allele_string: ref_allele.clone(),
+            shifted_compare_allele: ref_allele.clone(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: ref_allele.clone(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+
+        assert_eq!(
+            format_hgvsc_with_semantics(
+                &tx,
+                &exons,
+                None,
+                None,
+                &ref_allele,
+                "-",
+                80,
+                95,
+                Some(&shift),
+                VepSemantics::V116,
+            )
+            .as_deref(),
+            Some("ENSTHGVS000001.1:n.4_9del")
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_rejects_wholly_outside_and_shift_overrun() {
+        let tx = make_transcript("lncRNA", 1, None, None);
+        let exon = make_exon();
+        let exons = [&exon];
+        let ref_allele = "A".repeat(16);
+        assert_eq!(
+            format_hgvsc_with_semantics(
+                &tx,
+                &exons,
+                None,
+                None,
+                &ref_allele,
+                "-",
+                50,
+                65,
+                None,
+                VepSemantics::V116,
+            ),
+            None
+        );
+
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 1,
+            start: 136,
+            end: 151,
+            shifted_allele_string: ref_allele.clone(),
+            shifted_compare_allele: ref_allele.clone(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: ref_allele.clone(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+        assert_eq!(
+            format_hgvsc_with_semantics(
+                &tx,
+                &exons,
+                None,
+                None,
+                &ref_allele,
+                "-",
+                135,
+                150,
+                Some(&shift),
+                VepSemantics::V116,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn test_format_hgvsc_uses_negative_utr_coordinate() {
         let tx = make_transcript("protein_coding", 1, Some(100), Some(108));
         let exon = make_exon();
@@ -4071,6 +4396,38 @@ mod tests {
     fn make_nm_001172437_failed_bam_edit_transcript() -> (TranscriptFeature, [ExonFeature; 1]) {
         let (mut tx, exons) = make_nm_001172437_same_coordinate_multibase_edit_transcript();
         tx.bam_edit_status = Some("failed".to_string());
+        (tx, exons)
+    }
+
+    fn make_nm_002457_failed_bam_repeat_transcript() -> (TranscriptFeature, [ExonFeature; 1]) {
+        // Exact release/116 cache state needed for the chr11:1094638
+        // repeat-deletion residual. The selected mapper segment is sufficient
+        // to reproduce the cDNA/CDS coordinates around the variant.
+        let mut tx = make_transcript("protein_coding", 1, Some(1_074_902), Some(1_110_355));
+        tx.transcript_id = "NM_002457.5".to_string();
+        tx.version = Some(1);
+        tx.source = Some("BestRefSeq".to_string());
+        tx.source_cache = Some("RefSeq".to_string());
+        tx.start = 1_074_874;
+        tx.end = 1_110_508;
+        tx.cdna_coding_start = Some(29);
+        tx.cdna_coding_end = Some(12_502);
+        tx.bam_edit_status = Some("failed".to_string());
+        tx.has_non_polya_rna_edit = false;
+        tx.refseq_edits.clear();
+        tx.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 1_094_142,
+            genomic_end: 1_098_212,
+            cdna_start: 3_927,
+            cdna_end: 7_997,
+            ori: 1,
+        }];
+        let exons = [ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 30,
+            start: 1_094_142,
+            end: 1_098_212,
+        }];
         (tx, exons)
     }
 
@@ -5384,6 +5741,82 @@ mod tests {
         assert_eq!(
             hgvsc_offset_for_output(&tx, &variant, "T", Some("NM_001172437.2:c.*2307del"),),
             Some(6)
+        );
+    }
+
+    #[test]
+    fn test_nm_002457_failed_bam_repeat_uses_shifted_used_ref_for_hgvsc() {
+        let (tx, exons_owned) = make_nm_002457_failed_bam_repeat_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let given_ref = "CCAACCACCACTCCCAGCCCT";
+        let used_ref = "CACCACTCCCAGCCCTCCAAC";
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 47,
+            start: 1_094_686,
+            end: 1_094_706,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: used_ref.to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: given_ref.to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+
+        assert_eq!(
+            format_hgvsc(
+                &tx,
+                &exons,
+                None,
+                None,
+                used_ref,
+                "-",
+                1_094_639,
+                1_094_659,
+                Some(&shift),
+            )
+            .as_deref(),
+            Some("NM_002457.5:c.4443_4463del")
+        );
+    }
+
+    #[test]
+    fn test_nm_002457_failed_bam_repeat_reports_47_base_hgvs_offset() {
+        let (tx, _) = make_nm_002457_failed_bam_repeat_transcript();
+        let given_ref = "CCAACCACCACTCCCAGCCCT";
+        let used_ref = "CACCACTCCCAGCCCTCCAAC";
+        let mut variant = VariantInput::from_vcf(
+            "11".to_string(),
+            1_094_638,
+            1_094_659,
+            format!("A{given_ref}"),
+            "A".to_string(),
+        );
+        assert_eq!(variant.ref_allele, given_ref);
+        assert_eq!(variant.start, 1_094_639);
+        assert_eq!(variant.end, 1_094_659);
+        variant.hgvs_shift_forward = Some(HgvsGenomicShift {
+            strand: 1,
+            shift_length: 47,
+            start: 1_094_686,
+            end: 1_094_706,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: used_ref.to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: given_ref.to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+
+        assert_eq!(
+            hgvsc_offset_for_output(&tx, &variant, used_ref, Some("NM_002457.5:c.4443_4463del"),),
+            Some(47)
         );
     }
 

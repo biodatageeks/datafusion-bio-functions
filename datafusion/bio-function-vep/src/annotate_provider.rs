@@ -176,7 +176,8 @@ use std::borrow::Cow;
 use std::fmt::Write;
 
 use crate::allele::{
-    MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
+    MatchedVariantAllele, reverse_complement_allele, vcf_to_vep_allele, vcf_to_vep_input_allele,
+    vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::AnnotationBackend;
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
@@ -863,6 +864,7 @@ pub fn cache_lookup_column_names() -> Vec<&'static str> {
         // Clinical
         "clin_sig",
         "clin_sig_allele",
+        "clin_sig_ref_allele",
         "clinical_impact",
         "phenotype_or_disease",
         "pubmed",
@@ -1604,6 +1606,7 @@ struct ColocatedEntry {
     pheno: i64,
     clin_sig: Option<String>,
     clin_sig_allele: Option<String>,
+    clin_sig_ref_allele: Option<String>,
     pubmed: Option<String>,
     /// Zero-copy AF columns (shared by `Arc` from the source cache batch) +
     /// this entry's row. Same column order as `AF_COL_NAMES` / `AF_COLUMNS`.
@@ -1881,6 +1884,7 @@ impl ColocatedData {
         &self,
         output_allele: &str,
         output_allele_unshifted: Option<&str>,
+        live_ref_allele: &str,
         include_pubmed: bool,
     ) -> ColocatedVariantFields {
         let mut fields = ColocatedVariantFields::default();
@@ -1906,10 +1910,27 @@ impl ColocatedData {
             }
 
             if let Some(clin_sig_allele) = &entry.clin_sig_allele {
+                let reverse_labels =
+                    entry
+                        .clin_sig_ref_allele
+                        .as_deref()
+                        .is_some_and(|cached_ref| {
+                            !cached_ref.is_empty() && cached_ref != live_ref_allele
+                        });
                 allele_terms.clear();
                 for chunk in clin_sig_allele.split(';') {
                     let Some((allele, value)) = chunk.split_once(':') else {
                         continue;
+                    };
+                    let transformed_allele;
+                    let allele = if reverse_labels {
+                        let Some(reverse) = reverse_complement_allele(allele) else {
+                            continue;
+                        };
+                        transformed_allele = reverse;
+                        transformed_allele.as_str()
+                    } else {
+                        allele
                     };
                     let slot = allele_terms.entry(allele.to_string()).or_default();
                     if !slot.is_empty() {
@@ -2161,6 +2182,9 @@ fn build_colocated_map_from_sink(
                         existing.matched_alleles.push(matched.clone());
                     }
                 }
+                if existing.clin_sig_ref_allele.is_none() {
+                    existing.clin_sig_ref_allele = ce.clin_sig_ref_allele.clone();
+                }
                 continue;
             }
             seen.insert(ce.variation_name.clone(), entries.len());
@@ -2172,6 +2196,7 @@ fn build_colocated_map_from_sink(
                 pheno: ce.pheno,
                 clin_sig: ce.clin_sig.clone(),
                 clin_sig_allele: ce.clin_sig_allele.clone(),
+                clin_sig_ref_allele: ce.clin_sig_ref_allele.clone(),
                 pubmed: ce.pubmed.clone(),
                 // Arc ref-count bump — no AF string data copied (was a deep Vec<String> clone).
                 af: ce.af.clone(),
@@ -5177,7 +5202,7 @@ impl AnnotateProvider {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        requested_columns: &[&str],
+        preferred_columns: &[&str],
         extended_probes: bool,
         cache: PartitionedAnnotationCache,
         translations_sift_table: Option<&str>,
@@ -5255,6 +5280,25 @@ impl AnnotateProvider {
             .filter(|c| cache_chroms.contains(c.as_str()))
             .cloned()
             .collect();
+        let first_contig = contigs.first().ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "annotate_vep(): none of the VCF's data-bearing contigs have a \
+                 variation shard in cache '{}'",
+                cache.base_dir().display()
+            ))
+        })?;
+        #[cfg(feature = "parquet-cache")]
+        let first_identity = cache.validate_contig_identity(first_contig).await?;
+        #[cfg(feature = "parquet-cache")]
+        if first_identity.source_type != self.cache_source_type {
+            return Err(DataFusionError::Execution(format!(
+                "annotate_vep(): cache source identity differs between the eagerly \
+                 resolved provider schema ({}) and requested contig '{}' ({})",
+                self.cache_source_type.as_str(),
+                first_contig,
+                first_identity.source_type.as_str()
+            )));
+        }
         profile_end!(
             "0. discover_contigs",
             t_contigs,
@@ -5266,7 +5310,31 @@ impl AnnotateProvider {
             )
         );
 
-        let cache_columns: Vec<String> = requested_columns.iter().map(|s| s.to_string()).collect();
+        // Inspect the first *requested* contig for optional variation columns.
+        // This replaces the old arbitrary-manifest-first schema sample.
+        #[cfg(feature = "parquet-cache")]
+        let available_cache_columns: HashSet<String> =
+            {
+                let path = cache.as_parquet().variation_path(first_contig).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Parquet cache has no variation shard for requested contig {first_contig}"
+                ))
+            })?;
+                read_parquet_dataset_schema(&path)
+                    .await?
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect()
+            };
+        #[cfg(not(feature = "parquet-cache"))]
+        let available_cache_columns: HashSet<String> = HashSet::new();
+        let cache_columns: Vec<String> = preferred_columns
+            .iter()
+            .copied()
+            .filter(|name| available_cache_columns.contains(*name))
+            .map(ToString::to_string)
+            .collect();
         let projected_schema = if let Some(indices) = projection {
             Arc::new(self.schema.project(indices)?)
         } else {
@@ -5288,6 +5356,10 @@ impl AnnotateProvider {
             flags,
             hgvs_flags,
             cache_source_type: self.cache_source_type,
+            #[cfg(feature = "parquet-cache")]
+            vep_semantics: first_identity.target.semantics,
+            #[cfg(not(feature = "parquet-cache"))]
+            vep_semantics: crate::vep_semantics::VepSemantics::V115,
             transcript_selection,
             pick_flags,
             allowed_failed,
@@ -5696,6 +5768,7 @@ impl AnnotateProvider {
                     data.variant_fields(
                         &vep_allele,
                         data.variant_match_output_allele(&vep_allele),
+                        &ref_al,
                         flags.pubmed,
                     )
                 } else {
@@ -8505,6 +8578,7 @@ struct ContigAnnotationConfig {
     flags: VepFlags,
     hgvs_flags: HgvsFlags,
     cache_source_type: CacheSourceType,
+    vep_semantics: crate::vep_semantics::VepSemantics,
     transcript_selection: TranscriptSelectionFlags,
     allowed_failed: i64,
     reference_fasta_path: Option<String>,
@@ -8547,14 +8621,17 @@ enum PartitionedAnnotationCache {
     // handle's base dir. (A single variant keeps the type uninhabited — and all
     // methods trivially valid — when the cache feature is disabled.)
     #[cfg(feature = "parquet-cache")]
-    Parquet(crate::parquet_cache::detect::PartitionedParquetCache),
+    Parquet {
+        cache: crate::parquet_cache::detect::PartitionedParquetCache,
+        identity_validator: Arc<crate::cache_identity::LazyCacheIdentityValidator>,
+    },
 }
 
 impl PartitionedAnnotationCache {
     fn available_chroms(&self) -> Vec<String> {
         match self {
             #[cfg(feature = "parquet-cache")]
-            Self::Parquet(variation) => variation
+            Self::Parquet { cache, .. } => cache
                 .available_chroms()
                 .into_iter()
                 .map(ToString::to_string)
@@ -8565,7 +8642,7 @@ impl PartitionedAnnotationCache {
     fn base_dir(&self) -> &std::path::Path {
         match self {
             #[cfg(feature = "parquet-cache")]
-            Self::Parquet(variation) => variation.base_dir(),
+            Self::Parquet { cache, .. } => cache.base_dir(),
         }
     }
 
@@ -8573,7 +8650,20 @@ impl PartitionedAnnotationCache {
     #[cfg(feature = "parquet-cache")]
     fn as_parquet(&self) -> &crate::parquet_cache::detect::PartitionedParquetCache {
         match self {
-            Self::Parquet(variation) => variation,
+            Self::Parquet { cache, .. } => cache,
+        }
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    async fn validate_contig_identity(
+        &self,
+        chrom: &str,
+    ) -> Result<crate::cache_identity::CacheIdentity> {
+        match self {
+            Self::Parquet {
+                cache,
+                identity_validator,
+            } => identity_validator.validate_contig(cache, chrom).await,
         }
     }
 }
@@ -12387,7 +12477,7 @@ async fn prepare_contig_context(
     session: Arc<SessionContext>,
     cache: Arc<PartitionedAnnotationCache>,
     chrom: String,
-    config: ContigAnnotationConfig,
+    mut config: ContigAnnotationConfig,
     full_schema: SchemaRef,
 ) -> Result<Option<ContigReadyState>> {
     let t_contig = profile_start!();
@@ -12398,6 +12488,22 @@ async fn prepare_contig_context(
     let profile_handle = pipeline_profile.clone();
     if profiling_enabled() {
         eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
+    }
+
+    // Identity is a contig-local precondition: validate every participating
+    // shard footer before opening variation or context data for this contig.
+    #[cfg(feature = "parquet-cache")]
+    {
+        let identity = cache.validate_contig_identity(&chrom).await?;
+        if identity.source_type != config.cache_source_type {
+            return Err(DataFusionError::Execution(format!(
+                "annotate_vep(): cache source identity changed at contig '{chrom}': \
+                 provider source={}, contig source={}",
+                config.cache_source_type.as_str(),
+                identity.source_type.as_str()
+            )));
+        }
+        config.vep_semantics = identity.target.semantics;
     }
 
     // Derive VCF-only schema.
@@ -12631,10 +12737,11 @@ async fn prepare_contig_context(
         config.options_json.clone(),
         vcf_only_schema,
     )?;
-    let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
+    let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
         config.upstream_distance,
         config.downstream_distance,
         config.hgvs_flags.shift_hgvs,
+        config.vep_semantics,
     );
 
     // SIFT source: a shared per-contig prediction store loaded from the Parquet
@@ -12835,9 +12942,19 @@ impl TableProvider for AnnotateProvider {
 
         #[cfg(feature = "parquet-cache")]
         let partitioned_annotation_cache = if partitioned_opt != Some(false) {
+            let expected_cache_version = self
+                .options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_string_option(opts, "expected_cache_version"));
+            let identity_validator = Arc::new(
+                crate::cache_identity::LazyCacheIdentityValidator::new(expected_cache_version)?,
+            );
             match crate::parquet_cache::detect::PartitionedParquetCache::detect(&self.cache_source)
             {
-                Some(variation) => Some(PartitionedAnnotationCache::Parquet(variation)),
+                Some(cache) => Some(PartitionedAnnotationCache::Parquet {
+                    cache,
+                    identity_validator,
+                }),
                 None => {
                     return Err(DataFusionError::Plan(format!(
                         "annotate_vep(): a 'variation/' cache layout is required at '{}'",
@@ -12864,27 +12981,6 @@ impl TableProvider for AnnotateProvider {
                 );
             }
 
-            // Read available variation columns from a sample Parquet shard.
-            #[cfg(feature = "parquet-cache")]
-            let available_cache_columns: HashSet<String> = {
-                let sample_chrom = &available_chroms[0];
-                let sample_path = cache.as_parquet().variation_path(sample_chrom).ok_or_else(
-                    || {
-                        DataFusionError::Execution(format!(
-                            "Parquet cache has no variation shard for sample chrom {sample_chrom}"
-                        ))
-                    },
-                )?;
-                let cache_schema = read_parquet_dataset_schema(&sample_path).await?;
-                cache_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .collect()
-            };
-            #[cfg(not(feature = "parquet-cache"))]
-            let available_cache_columns: HashSet<String> = HashSet::new();
-
             let mut preferred_columns = vec!["consequence_types", "most_severe_consequence"];
             for c in cache_lookup_column_names() {
                 if !preferred_columns.contains(&c) {
@@ -12910,12 +13006,7 @@ impl TableProvider for AnnotateProvider {
                     },
                 }
             };
-            let requested_columns: Vec<&str> = preferred_columns
-                .iter()
-                .copied()
-                .filter(|name| available_cache_columns.contains(*name))
-                .filter(|name| cache_only_selected(name))
-                .collect();
+            preferred_columns.retain(|name| cache_only_selected(name));
 
             let extended_probes = self
                 .options_json
@@ -12932,7 +13023,7 @@ impl TableProvider for AnnotateProvider {
                 .scan_with_transcript_engine_partitioned(
                     state,
                     projection,
-                    &requested_columns,
+                    &preferred_columns,
                     extended_probes,
                     cache,
                     translations_sift_table.as_deref(),
@@ -13082,6 +13173,7 @@ mod tests {
             pheno: 0,
             clin_sig: None,
             clin_sig_allele: None,
+            clin_sig_ref_allele: None,
             pubmed: None,
             af: af.clone(),
             af_row: 0,
@@ -13130,6 +13222,7 @@ mod tests {
                 pheno: 0,
                 clin_sig: None,
                 clin_sig_allele: None,
+                clin_sig_ref_allele: None,
                 pubmed: None,
                 af,
                 af_row: 0,
@@ -13139,7 +13232,8 @@ mod tests {
         };
         let flags = VepFlags::from_options_json(Some("{\"everything\":true}"));
 
-        let variant_fields = data.variant_fields("-", data.variant_match_output_allele("-"), false);
+        let variant_fields =
+            data.variant_fields("-", data.variant_match_output_allele("-"), "A", false);
         assert_eq!(variant_fields.existing_variation, "rs34467003");
 
         let frequency_fields =
@@ -13152,6 +13246,89 @@ mod tests {
         );
         assert!(frequency_fields.max_af.is_empty());
         assert!(frequency_fields.max_af_pops.is_empty());
+    }
+
+    fn clinical_colocated_data(
+        count: usize,
+        labelled_allele: &str,
+        significance: &str,
+        cached_ref: Option<&str>,
+    ) -> ColocatedData {
+        let af = AfColumns::new(
+            (0..AF_COLUMNS.len())
+                .map(|_| Arc::new(StringArray::from(vec![""])) as Arc<dyn Array>)
+                .collect(),
+        );
+        let entries = (0..count)
+            .map(|index| ColocatedEntry {
+                variation_name: format!("clinvar_{index}"),
+                allele_string: String::new(),
+                matched_alleles: Vec::new(),
+                somatic: 0,
+                pheno: 0,
+                clin_sig: None,
+                clin_sig_allele: Some(format!("{labelled_allele}:{significance}")),
+                clin_sig_ref_allele: cached_ref.map(ToString::to_string),
+                pubmed: None,
+                af: af.clone(),
+                af_row: 0,
+            })
+            .collect();
+        ColocatedData {
+            entries,
+            compare_output_allele: None,
+            unshifted_output_allele: None,
+        }
+    }
+
+    #[test]
+    fn clinvar_116_chr3_strand_flip_removes_41_false_matches() {
+        let data = clinical_colocated_data(41, "GGAGGA", "benign", Some("AGG"));
+        assert_eq!(data.entries.len(), 41);
+        let fields = data.variant_fields("GGAGGA", None, "C", false);
+        assert_eq!(fields.clin_sig, "");
+    }
+
+    #[test]
+    fn clinvar_116_chr15_strand_flip_removes_63_false_matches() {
+        let data = clinical_colocated_data(
+            63,
+            "TGC",
+            "conflicting_interpretations_of_pathogenicity",
+            Some("TGC"),
+        );
+        assert_eq!(data.entries.len(), 63);
+        let fields = data.variant_fields("TGC", None, "T", false);
+        assert_eq!(fields.clin_sig, "");
+    }
+
+    #[test]
+    fn clinvar_116_chr14_strand_flip_restores_8_benign_matches() {
+        let data = clinical_colocated_data(8, "ATGCGCGC", "benign", Some("ATGCGCGC"));
+        assert_eq!(data.entries.len(), 8);
+        let fields = data.variant_fields("GCGCGCAT", None, "C", false);
+        assert_eq!(fields.clin_sig, "benign");
+    }
+
+    #[test]
+    fn clinvar_absent_or_matching_reference_preserves_115_label_matching() {
+        let absent = clinical_colocated_data(1, "GGAGGA", "benign", None);
+        assert_eq!(
+            absent.variant_fields("GGAGGA", None, "C", false).clin_sig,
+            "benign"
+        );
+
+        let matching = clinical_colocated_data(1, "GGAGGA", "benign", Some("C"));
+        assert_eq!(
+            matching.variant_fields("GGAGGA", None, "C", false).clin_sig,
+            "benign"
+        );
+
+        let empty = clinical_colocated_data(1, "GGAGGA", "benign", Some(""));
+        assert_eq!(
+            empty.variant_fields("GGAGGA", None, "C", false).clin_sig,
+            "benign"
+        );
     }
 
     #[cfg(feature = "parquet-cache")]
@@ -13202,6 +13379,7 @@ mod tests {
             flags: VepFlags::from_options_json(None),
             hgvs_flags: HgvsFlags::default(),
             cache_source_type: CacheSourceType::Ensembl,
+            vep_semantics: crate::vep_semantics::VepSemantics::V115,
             transcript_selection: TranscriptSelectionFlags::default(),
             allowed_failed: 0,
             reference_fasta_path: None,
