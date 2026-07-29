@@ -4340,23 +4340,38 @@ fn apply_vep116_stop_predicate_flags(
     class: &mut CodingClassification,
     semantics: crate::vep_semantics::VepSemantics,
     partial_terminal_codon: bool,
+    ref_eq_alt_sequence: bool,
 ) {
     if !semantics.vep116_stop_predicates() {
         return;
     }
-    let alt_has_x = class
-        .affected_alt_peptide
-        .as_deref()
-        .is_some_and(|peptide| peptide.contains('X'));
-    if partial_terminal_codon || alt_has_x {
-        class.stop_lost = false;
-    }
-    if alt_has_x {
-        class.stop_retained = false;
-    }
-    if class.stop_lost {
-        class.stop_gained = false;
-    }
+    let ref_peptide = class.affected_ref_peptide.as_deref();
+    let alt_peptide = class.affected_alt_peptide.as_deref();
+
+    // Release 116 evaluates these predicates recursively in this order:
+    // stop_lost -> stop_retained -> stop_gained. Recompute them from the
+    // predicate inputs instead of amending flags produced by V115 heuristics.
+    let stop_lost = !partial_terminal_codon
+        && matches!(
+            (ref_peptide, alt_peptide),
+            (Some(reference), Some(alternate))
+                if !alternate.contains('X')
+                    && reference.contains('*')
+                    && !alternate.contains('*')
+        );
+    let stop_retained = !partial_terminal_codon
+        && !stop_lost
+        && alt_peptide.is_some_and(|alternate| {
+            !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
+        });
+    let stop_gained = !stop_retained
+        && !stop_lost
+        && ref_peptide.is_some_and(|reference| !reference.contains('*'))
+        && alt_peptide.is_some_and(|alternate| alternate.contains('*'));
+
+    class.stop_lost = stop_lost;
+    class.stop_retained = stop_retained;
+    class.stop_gained = stop_gained;
 }
 
 fn apply_vep116_nucleotide_stop_fallbacks(
@@ -4372,20 +4387,28 @@ fn apply_vep116_nucleotide_stop_fallbacks(
         return;
     }
 
-    let has_unambiguous_peptides = class.affected_ref_peptide.is_some()
+    let stop_lost_uses_peptides = class.affected_ref_peptide.is_some()
         && class
             .affected_alt_peptide
             .as_deref()
-            .is_some_and(|peptide| !peptide.is_empty() && !peptide.contains('X'));
-    if has_unambiguous_peptides {
-        return;
-    }
-
-    if vep116_stop_lost_without_unambiguous_alt_peptide(tx, tx_exons, tx_translation, variant) {
+            .is_some_and(|peptide| !peptide.contains('X'));
+    if !stop_lost_uses_peptides
+        && vep116_stop_lost_without_unambiguous_alt_peptide(tx, tx_exons, tx_translation, variant)
+    {
         class.stop_gained = false;
         class.stop_retained = false;
         class.stop_lost = true;
-    } else if vep116_stop_retained_without_alt_peptide(tx, tx_exons, tx_translation, variant) {
+        return;
+    }
+
+    let stop_retained_uses_peptides = class
+        .affected_alt_peptide
+        .as_deref()
+        .is_some_and(|peptide| !peptide.is_empty() && !peptide.contains('X'));
+    if !stop_retained_uses_peptides
+        && vep116_stop_retained_without_alt_peptide(tx, tx_exons, tx_translation, variant)
+    {
+        class.stop_gained = false;
         class.stop_retained = true;
     }
 }
@@ -4438,6 +4461,16 @@ fn vep116_ref_eq_alt_sequence_final_stop(
     if ref_peptide == "X" && alt_peptide == "X" {
         return false;
     }
+    // VEP's early TranscriptVariationAllele clause: an insertion mapped
+    // beyond the cached reference translation retains the terminal stop when
+    // the alternate local peptide begins with one. The Rust index is 0-based,
+    // so `>= len` corresponds to Perl's 1-based `tl_start > length(ref_seq)`.
+    if translation_start >= ref_translation.len() {
+        return alt_peptide.starts_with('*');
+    }
+    let same_stop_index = ref_peptide
+        .find('*')
+        .is_some_and(|stop_index| alt_peptide.find('*') == Some(stop_index));
     let mut mutated = ref_translation.to_vec();
     let ref_len = ref_peptide.chars().count();
     let replace_end = translation_start.saturating_add(ref_len).min(mutated.len());
@@ -4447,10 +4480,30 @@ fn vep116_ref_eq_alt_sequence_final_stop(
         alt_peptide.chars().collect()
     };
     mutated.splice(translation_start..replace_end, replacement);
-    mutated.starts_with(ref_translation)
-        && mutated
-            .get(ref_translation.len())
-            .is_some_and(|residue| *residue == '*')
+    same_stop_index
+        || (mutated.starts_with(ref_translation)
+            && mutated
+                .get(ref_translation.len())
+                .is_some_and(|residue| *residue == '*'))
+}
+
+fn vep116_ref_eq_alt_sequence_for_class(
+    class: &CodingClassification,
+    ref_translation: &[char],
+    translation_start: usize,
+) -> bool {
+    match (
+        class.affected_ref_peptide.as_deref(),
+        class.affected_alt_peptide.as_deref(),
+    ) {
+        (Some(ref_peptide), Some(alt_peptide)) => vep116_ref_eq_alt_sequence_final_stop(
+            ref_translation,
+            translation_start,
+            ref_peptide,
+            alt_peptide,
+        ),
+        _ => false,
+    }
 }
 
 /// Traceability:
@@ -6723,7 +6776,14 @@ fn classify_coding_change_with_semantics(
         }
     }
 
-    apply_vep116_stop_predicate_flags(&mut class, semantics, partial_terminal_codon);
+    let vep116_ref_eq_alt_sequence =
+        vep116_ref_eq_alt_sequence_for_class(&class, &old_aas, local_first_codon);
+    apply_vep116_stop_predicate_flags(
+        &mut class,
+        semantics,
+        partial_terminal_codon,
+        vep116_ref_eq_alt_sequence,
+    );
     apply_vep116_nucleotide_stop_fallbacks(
         &mut class,
         semantics,
@@ -6974,7 +7034,12 @@ fn classify_coding_change_with_semantics(
             class.stop_lost = true;
         }
     }
-    apply_vep116_stop_predicate_flags(&mut class, semantics, partial_terminal_codon);
+    apply_vep116_stop_predicate_flags(
+        &mut class,
+        semantics,
+        partial_terminal_codon,
+        vep116_ref_eq_alt_sequence,
+    );
     apply_vep116_nucleotide_stop_fallbacks(
         &mut class,
         semantics,
@@ -7372,19 +7437,6 @@ fn classify_insertion_with_semantics(
         if !class.stop_retained && ref_aa == '*' && local_aas.first() == Some(&'*') {
             class.stop_retained = true;
         }
-        if !class.stop_retained && semantics.vep116_stop_predicates() {
-            if let (Some(ref_peptide), Some(alt_peptide)) = (
-                class.affected_ref_peptide.as_deref(),
-                class.affected_alt_peptide.as_deref(),
-            ) {
-                class.stop_retained = vep116_ref_eq_alt_sequence_final_stop(
-                    &old_aas,
-                    codon_at,
-                    ref_peptide,
-                    alt_peptide,
-                );
-            }
-        }
     }
 
     // stop_lost: VEP's stop_lost uses the same local peptide window and can
@@ -7416,7 +7468,14 @@ fn classify_insertion_with_semantics(
             class.stop_gained = true;
         }
     }
-    apply_vep116_stop_predicate_flags(&mut class, semantics, partial_terminal_codon);
+    let vep116_ref_eq_alt_sequence =
+        vep116_ref_eq_alt_sequence_for_class(&class, &old_aas, codon_at);
+    apply_vep116_stop_predicate_flags(
+        &mut class,
+        semantics,
+        partial_terminal_codon,
+        vep116_ref_eq_alt_sequence,
+    );
     apply_vep116_nucleotide_stop_fallbacks(
         &mut class,
         semantics,
@@ -9937,6 +9996,7 @@ mod tests {
         let base = CodingClassification {
             stop_gained: true,
             stop_lost: true,
+            affected_ref_peptide: Some("*".to_string()),
             affected_alt_peptide: Some("Y".to_string()),
             ..Default::default()
         };
@@ -9946,10 +10006,12 @@ mod tests {
             &mut v115,
             crate::vep_semantics::VepSemantics::V115,
             false,
+            false,
         );
         apply_vep116_stop_predicate_flags(
             &mut v116,
             crate::vep_semantics::VepSemantics::V116,
+            false,
             false,
         );
         assert!(v115.stop_gained && v115.stop_lost);
@@ -9957,9 +10019,30 @@ mod tests {
     }
 
     #[test]
+    fn vep116_stop_predicates_do_not_inherit_contradictory_v115_flags() {
+        let mut class = CodingClassification {
+            stop_gained: true,
+            stop_retained: true,
+            affected_ref_peptide: Some("Q".to_string()),
+            affected_alt_peptide: Some("R".to_string()),
+            ..Default::default()
+        };
+        apply_vep116_stop_predicate_flags(
+            &mut class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+            false,
+        );
+        assert!(!class.stop_gained);
+        assert!(!class.stop_lost);
+        assert!(!class.stop_retained);
+    }
+
+    #[test]
     fn vep116_hunk4_rejects_stop_lost_for_partial_terminal_codon() {
         let base = CodingClassification {
             stop_lost: true,
+            affected_ref_peptide: Some("*".to_string()),
             affected_alt_peptide: Some("Y".to_string()),
             ..Default::default()
         };
@@ -9969,11 +10052,13 @@ mod tests {
             &mut v115,
             crate::vep_semantics::VepSemantics::V115,
             true,
+            false,
         );
         apply_vep116_stop_predicate_flags(
             &mut v116,
             crate::vep_semantics::VepSemantics::V116,
             true,
+            false,
         );
         assert!(v115.stop_lost);
         assert!(!v116.stop_lost);
@@ -9984,6 +10069,7 @@ mod tests {
         let base = CodingClassification {
             stop_lost: true,
             stop_retained: true,
+            affected_ref_peptide: Some("*".to_string()),
             affected_alt_peptide: Some("YX".to_string()),
             ..Default::default()
         };
@@ -9993,10 +10079,12 @@ mod tests {
             &mut v115,
             crate::vep_semantics::VepSemantics::V115,
             false,
+            false,
         );
         apply_vep116_stop_predicate_flags(
             &mut v116,
             crate::vep_semantics::VepSemantics::V116,
+            false,
             false,
         );
         assert!(v115.stop_lost && v115.stop_retained);
@@ -10073,7 +10161,7 @@ mod tests {
     }
 
     #[test]
-    fn vep116_hunk8_removes_first_peptide_clause_and_keeps_anchored_final_stop() {
+    fn vep116_hunk8_uses_all_release_116_sequence_equivalence_clauses() {
         let old_first_peptide_clause = "A" == &"A*"[..1] && "A*".contains('*');
         assert!(old_first_peptide_clause);
         assert!(!vep116_ref_eq_alt_sequence_final_stop(
@@ -10084,9 +10172,21 @@ mod tests {
         ));
         assert!(vep116_ref_eq_alt_sequence_final_stop(
             &['A', 'B'],
-            2,
+            3,
             "",
             "*",
+        ));
+        assert!(!vep116_ref_eq_alt_sequence_final_stop(
+            &['A', 'B'],
+            3,
+            "",
+            "Q",
+        ));
+        assert!(vep116_ref_eq_alt_sequence_final_stop(
+            &['A', 'Q', '*'],
+            1,
+            "Q*",
+            "R*",
         ));
     }
 
