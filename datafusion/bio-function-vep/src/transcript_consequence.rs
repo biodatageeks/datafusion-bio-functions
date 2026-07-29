@@ -4254,6 +4254,44 @@ fn vep116_stop_retained_without_alt_peptide(
         .is_some_and(is_stop_codon)
 }
 
+/// VEP 116 `stop_lost()` falls back to `_ins_del_stop_altered()` when the
+/// local alternate peptide is missing or contains `X`. Unlike the
+/// stop-retained fallback, this path uses the ordinary (unextended) stop-codon
+/// overlap interval.
+fn vep116_stop_lost_without_unambiguous_alt_peptide(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+) -> bool {
+    let ref_seq = normalize_allele_seq(&variant.ref_allele);
+    let alt_seq = normalize_allele_seq(&variant.alt_allele);
+    if tx.cds_end_nf
+        || ref_seq.len() == alt_seq.len()
+        || !ref_seq
+            .bytes()
+            .chain(alt_seq.bytes())
+            .all(|base| matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'N'))
+    {
+        return false;
+    }
+
+    let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
+        return false;
+    };
+    let (stop_start, stop_end) = if tx.strand >= 0 {
+        (cds_end.saturating_sub(2), cds_end)
+    } else {
+        (cds_start, cds_start.saturating_add(2))
+    };
+    if !overlaps(variant.start, variant.end, stop_start, stop_end) {
+        return false;
+    }
+
+    reference_translateable_seq_for_vep(tx, tx_translation)
+        .is_some_and(|cds_seq| !mutated_cds_stop_preserved(&cds_seq, variant, tx, tx_exons))
+}
+
 #[derive(Debug, Clone, Default)]
 struct CodingClassification {
     synonymous: bool,
@@ -4318,6 +4356,37 @@ fn apply_vep116_stop_predicate_flags(
     }
     if class.stop_lost {
         class.stop_gained = false;
+    }
+}
+
+fn apply_vep116_nucleotide_stop_fallbacks(
+    class: &mut CodingClassification,
+    semantics: crate::vep_semantics::VepSemantics,
+    partial_terminal_codon: bool,
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+) {
+    if !semantics.vep116_stop_predicates() || partial_terminal_codon {
+        return;
+    }
+
+    let has_unambiguous_peptides = class.affected_ref_peptide.is_some()
+        && class
+            .affected_alt_peptide
+            .as_deref()
+            .is_some_and(|peptide| !peptide.is_empty() && !peptide.contains('X'));
+    if has_unambiguous_peptides {
+        return;
+    }
+
+    if vep116_stop_lost_without_unambiguous_alt_peptide(tx, tx_exons, tx_translation, variant) {
+        class.stop_gained = false;
+        class.stop_retained = false;
+        class.stop_lost = true;
+    } else if vep116_stop_retained_without_alt_peptide(tx, tx_exons, tx_translation, variant) {
+        class.stop_retained = true;
     }
 }
 
@@ -6655,15 +6724,15 @@ fn classify_coding_change_with_semantics(
     }
 
     apply_vep116_stop_predicate_flags(&mut class, semantics, partial_terminal_codon);
-    if semantics.vep116_stop_predicates()
-        && class
-            .affected_alt_peptide
-            .as_deref()
-            .is_none_or(|peptide| peptide.is_empty() || peptide.contains('X'))
-        && vep116_stop_retained_without_alt_peptide(tx, tx_exons, tx_translation, variant)
-    {
-        class.stop_retained = true;
-    }
+    apply_vep116_nucleotide_stop_fallbacks(
+        &mut class,
+        semantics,
+        partial_terminal_codon,
+        tx,
+        tx_exons,
+        tx_translation,
+        variant,
+    );
 
     if ref_len == alt_len {
         let use_display_peptide_window = skip_global_stop_compare;
@@ -6906,15 +6975,15 @@ fn classify_coding_change_with_semantics(
         }
     }
     apply_vep116_stop_predicate_flags(&mut class, semantics, partial_terminal_codon);
-    if semantics.vep116_stop_predicates()
-        && class
-            .affected_alt_peptide
-            .as_deref()
-            .is_none_or(|peptide| peptide.is_empty() || peptide.contains('X'))
-        && vep116_stop_retained_without_alt_peptide(tx, tx_exons, tx_translation, variant)
-    {
-        class.stop_retained = true;
-    }
+    apply_vep116_nucleotide_stop_fallbacks(
+        &mut class,
+        semantics,
+        partial_terminal_codon,
+        tx,
+        tx_exons,
+        tx_translation,
+        variant,
+    );
 
     // For HGVS stop-loss / frameshift extension distance, translate the
     // mutated CDS + 3' UTR so that the new stop codon can be found even
@@ -7348,15 +7417,15 @@ fn classify_insertion_with_semantics(
         }
     }
     apply_vep116_stop_predicate_flags(&mut class, semantics, partial_terminal_codon);
-    if semantics.vep116_stop_predicates()
-        && class
-            .affected_alt_peptide
-            .as_deref()
-            .is_none_or(|peptide| peptide.is_empty() || peptide.contains('X'))
-        && vep116_stop_retained_without_alt_peptide(tx, tx_exons, tx_translation, variant)
-    {
-        class.stop_retained = true;
-    }
+    apply_vep116_nucleotide_stop_fallbacks(
+        &mut class,
+        semantics,
+        partial_terminal_codon,
+        tx,
+        tx_exons,
+        tx_translation,
+        variant,
+    );
 
     // When stop_retained, VEP overrides frameshift → inframe (regardless of alt_len % 3).
     let raw_frameshift = if class.stop_retained {
@@ -9911,7 +9980,7 @@ mod tests {
     }
 
     #[test]
-    fn vep116_hunks5_and6_reject_x_for_stop_lost_and_stop_retained() {
+    fn vep116_hunks5_and6_route_x_peptides_to_nucleotide_stop_fallbacks() {
         let base = CodingClassification {
             stop_lost: true,
             stop_retained: true,
@@ -9932,6 +10001,40 @@ mod tests {
         );
         assert!(v115.stop_lost && v115.stop_retained);
         assert!(!v116.stop_lost && !v116.stop_retained);
+
+        let mut plus = tx(
+            "T1",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        plus.cdna_coding_start = Some(1);
+        plus.cdna_coding_end = Some(9);
+        plus.three_prime_utr_seq = Some("CCC".to_string());
+        let exon = exon("T1", 1, 1000, 1011);
+        let exon_refs = vec![&exon];
+        let translation = translation("T1", Some(9), Some(3), None, Some("ATGAAATAA"));
+        let insertion = var("22", 1007, 1007, "-", "T");
+        let mut fallback = CodingClassification {
+            affected_ref_peptide: Some("*".to_string()),
+            affected_alt_peptide: Some("LX".to_string()),
+            ..Default::default()
+        };
+        apply_vep116_nucleotide_stop_fallbacks(
+            &mut fallback,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+            &plus,
+            &exon_refs,
+            Some(&translation),
+            &insertion,
+        );
+        assert!(fallback.stop_lost);
+        assert!(!fallback.stop_retained);
     }
 
     #[test]
