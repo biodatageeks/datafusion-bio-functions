@@ -6030,20 +6030,6 @@ fn protein_hgvs_for_output_with_semantics(
         return None;
     }
 
-    // In release 116, VEP's shifted TVA peptide replay retains ambiguous
-    // terminal windows such as `*/X`, `S*/X`, and `*/YX`. The release-116
-    // affected peptide window above is built by the same `codon()` /
-    // `peptide()` rules and is the exact state observed after VEP's
-    // `_return_3prime()` replay for these terminal alleles. Do not replace it
-    // with an extension-only translation that loses the terminal `X`.
-    if semantics.vep116_stop_predicates()
-        && fallback.is_some_and(|protein| {
-            protein.ref_peptide.contains('*') && protein.alt_peptide.contains('X')
-        })
-    {
-        return fallback.cloned();
-    }
-
     if !shift_hgvs {
         return fallback.cloned();
     }
@@ -6213,6 +6199,25 @@ fn protein_hgvs_for_output_with_semantics(
             let shifted_variant = protein_hgvs_shifted_variant(variant, shift, tx.strand);
             shifted_tva_coords_from_mapper(tx, tx_exons, translation, &shifted_variant)?;
         }
+    }
+
+    // In release 116, VEP's shifted TVA peptide replay retains ambiguous
+    // terminal windows such as `*/X`, `S*/X`, and `*/YX`. The release-116
+    // affected peptide window above is built by the same `codon()` /
+    // `peptide()` rules and is the exact state observed after VEP's
+    // `_return_3prime()` replay for these terminal alleles. Do not replace it
+    // with an extension-only translation that loses the terminal `X`.
+    //
+    // This preservation must run after the shifted translation-coordinate
+    // guard. `hgvs_protein()` calls `_return_3prime()` first and suppresses
+    // HGVSp when the shifted `translation_start/end` fall outside the CDS,
+    // even if the unshifted consequence peptide is an ambiguous `*/X`.
+    if semantics.vep116_stop_predicates()
+        && fallback.is_some_and(|protein| {
+            protein.ref_peptide.contains('*') && protein.alt_peptide.contains('X')
+        })
+    {
+        return fallback.cloned();
     }
 
     shifted_preferred.or_else(|| fallback.cloned())
@@ -18708,6 +18713,105 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn chr6_terminal_deletion_shifted_to_three_prime_utr_suppresses_hgvsp() {
+        // Minimal terminal-exon model for chr6:68956855 GA>G on
+        // ENST00001108876.1. Its final CDS base is at 68956856 and is followed
+        // by a nine-A 3' UTR ending at 68956865. VEP shifts the deleted A by
+        // nine bases to c.*9, where genomic2pep returns Gap.
+        let mut t = tx(
+            "ENST00001108876",
+            "6",
+            68_956_845,
+            68_956_865,
+            1,
+            "protein_coding",
+            Some(68_956_845),
+            Some(68_956_856),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(12);
+        t.spliced_seq = Some("ATGCCCAAATGAAAAAAAAAA".to_string());
+        t.translateable_seq = Some("ATGCCCAAATGA".to_string());
+        t.translation_stable_id = Some("ENSP00000778681".to_string());
+
+        let exons = vec![exon("ENST00001108876", 1, 68_956_845, 68_956_865)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let tr = translation(
+            "ENST00001108876",
+            Some(12),
+            Some(4),
+            Some("MPK*"),
+            Some("ATGCCCAAATGA"),
+        );
+        let fallback = crate::hgvs::ProteinHgvsData {
+            start: 4,
+            end: 4,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "X".to_string(),
+            ref_translation: "MPK*".to_string(),
+            alt_translation: "MPKX".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        let mut v =
+            VariantInput::from_vcf("6".into(), 68_956_855, 68_956_856, "GA".into(), "G".into());
+        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 9,
+            start: 68_956_865,
+            end: 68_956_865,
+            shifted_allele_string: "A".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "A".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+
+        assert_eq!((v.start, v.end), (68_956_856, 68_956_856));
+        let shift = v.hgvs_shift_forward.as_ref().expect("forward HGVS shift");
+        let shifted = protein_hgvs_shifted_variant(&v, shift, t.strand);
+        assert_eq!((shifted.start, shifted.end), (68_956_865, 68_956_865));
+        assert_eq!(
+            genomic_to_cdna_index_for_hgvsp(&t, &exons_ref, shifted.start),
+            Some(21),
+            "the shifted deletion maps to c.*9"
+        );
+        assert_eq!(
+            shifted_tva_coords_from_mapper(&t, &exons_ref, &tr, &shifted),
+            None,
+            "the c.*9 position has no CDS or peptide coordinate"
+        );
+
+        for semantics in [
+            crate::vep_semantics::VepSemantics::V115,
+            crate::vep_semantics::VepSemantics::V116,
+        ] {
+            assert_eq!(
+                protein_hgvs_for_output_with_semantics(
+                    &t,
+                    &exons_ref,
+                    Some(&tr),
+                    &v,
+                    true,
+                    None,
+                    Some(&fallback),
+                    semantics,
+                    true,
+                ),
+                None,
+                "{semantics:?} must suppress HGVSp after the shift leaves the CDS"
+            );
+        }
     }
 
     #[test]
