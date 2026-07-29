@@ -147,11 +147,11 @@ async fn main() -> datafusion::error::Result<()> {
     let ctx = SessionContext::new();
     register_pileup_functions(&ctx);
 
-    // 1-based coordinates (default, matches polars-bio)
+    // 1-based closed coordinates (default, matches polars-bio)
     let df = ctx.sql("SELECT * FROM depth('path/to/alignments.bam')").await?;
     df.show().await?;
 
-    // 0-based coordinates (explicit)
+    // 0-based half-open coordinates (explicit)
     let df = ctx.sql("SELECT * FROM depth('path/to/alignments.bam', true)").await?;
     df.show().await?;
 
@@ -176,7 +176,7 @@ SELECT * FROM depth('file.bam', false, true)   -- 1-based, per-base output
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `path` | string | (required) | Path to BAM file |
-| `zero_based` | bool | `false` | Use 0-based coordinates |
+| `zero_based` | bool | `false` | Use 0-based half-open coordinates (BED-style). Default is 1-based closed |
 | `per_base` | bool | `false` | Emit one row per position instead of RLE blocks |
 
 #### Block output schema (default)
@@ -184,9 +184,20 @@ SELECT * FROM depth('file.bam', false, true)   -- 1-based, per-base output
 | Column | Type | Description |
 |--------|------|-------------|
 | `contig` | Utf8 | Chromosome/contig name |
-| `pos_start` | Int32 | Block start position (inclusive) |
-| `pos_end` | Int32 | Block end position (inclusive) |
+| `pos_start` | Int32 | Block start position (always inclusive) |
+| `pos_end` | Int32 | Block end position — **exclusive** when `zero_based=true`, inclusive when `zero_based=false` |
 | `coverage` | Int16 | Read depth in this block |
+
+The end convention follows the coordinate system, so a block covers the same
+bases either way:
+
+| `zero_based` | Interval | Bases covered | Example (a 10bp read at the start of a contig) |
+|--------------|----------|---------------|------------------------------------------------|
+| `true` | 0-based half-open `[start, end)` | `pos_end - pos_start` | `0, 10` — directly comparable to BED / `mosdepth` |
+| `false` | 1-based closed `[start, end]` | `pos_end - pos_start + 1` | `1, 10` — directly comparable to `samtools depth` |
+
+Expanding a block to per-position rows therefore runs to `pos_end` when
+`zero_based=true`, and to `pos_end + 1` when `zero_based=false`.
 
 #### Per-base output schema (`per_base=true`)
 
@@ -454,7 +465,7 @@ When `binary_cigar=true`, the CIGAR column has `DataType::Binary` (packed LE u32
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `zero_based` | `false` | 1-based coordinates (matches polars-bio default) |
+| `zero_based` | `false` | 1-based closed coordinates (matches polars-bio default); `true` gives 0-based half-open |
 | `per_base` | `false` | RLE block output; set `true` for one-row-per-position |
 | `binary_cigar` | `true` | Use binary CIGAR (zero-copy, no string parsing) |
 | `dense_mode` | `Auto` (dense) | Dense `i32[]` array accumulation with streaming emission |
@@ -465,7 +476,7 @@ To override specific fields:
 
 ```rust
 let config = PileupConfig {
-    zero_based: true,                       // 0-based coordinates
+    zero_based: true,                       // 0-based half-open coordinates
     per_base: true,                         // one row per position (requires dense mode)
     binary_cigar: false,                    // force string CIGAR (e.g., for debugging)
     dense_mode: DenseMode::Disable,         // force sparse BTreeMap accumulation

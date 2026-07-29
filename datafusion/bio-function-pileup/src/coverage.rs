@@ -16,13 +16,37 @@ pub struct CoverageBlock {
     pub coverage: i16,
 }
 
+/// Convert the position at which coverage changed into a block end.
+///
+/// A block runs up to but not including `next_pos`. 0-based output is
+/// half-open, so `next_pos` is the end as-is; 1-based output is closed, so the
+/// end is the last covered position. Either way the block spans
+/// `next_pos - block_start` bases.
+#[inline]
+fn block_end(next_pos: usize, zero_based: bool) -> i32 {
+    if zero_based {
+        next_pos as i32
+    } else {
+        (next_pos - 1) as i32
+    }
+}
+
 /// Convert per-contig events (Vec) to coverage blocks.
 ///
 /// Sorts the events in-place, merges same-position deltas, then walks with
 /// cumulative sum. For coordinate-sorted BAM input the Vec is nearly sorted,
 /// so `sort_unstable` (timsort) runs in ~O(n).
 /// Zero-coverage gaps are NOT emitted.
-pub fn events_to_coverage_blocks(contig: &str, events: &mut [(u32, i32)]) -> Vec<CoverageBlock> {
+///
+/// `zero_based` selects the interval convention for `pos_end`: half-open
+/// (exclusive) when `true`, closed (inclusive) when `false`. Either way a
+/// block covers `pos_end - pos_start` (0-based) or `pos_end - pos_start + 1`
+/// (1-based) bases.
+pub fn events_to_coverage_blocks(
+    contig: &str,
+    events: &mut [(u32, i32)],
+    zero_based: bool,
+) -> Vec<CoverageBlock> {
     if events.is_empty() {
         return Vec::new();
     }
@@ -48,7 +72,7 @@ pub fn events_to_coverage_blocks(contig: &str, events: &mut [(u32, i32)]) -> Vec
             blocks.push(CoverageBlock {
                 contig: Arc::clone(&contig_arc),
                 pos_start: block_start as i32,
-                pos_end: (pos - 1) as i32,
+                pos_end: block_end(pos as usize, zero_based),
                 coverage: prev_cov as i16,
             });
             if cov != 0 {
@@ -68,6 +92,7 @@ pub fn events_to_coverage_blocks(contig: &str, events: &mut [(u32, i32)]) -> Vec
 pub fn all_events_to_record_batch(
     contig_events: &mut HashMap<String, ContigEvents>,
     schema: &SchemaRef,
+    zero_based: bool,
 ) -> datafusion::common::Result<RecordBatch> {
     let mut all_blocks = Vec::new();
 
@@ -77,7 +102,7 @@ pub fn all_events_to_record_batch(
 
     for contig in &contigs {
         let events = &mut contig_events.get_mut(contig).unwrap().events;
-        let blocks = events_to_coverage_blocks(contig, events);
+        let blocks = events_to_coverage_blocks(contig, events, zero_based);
         all_blocks.extend(blocks);
     }
 
@@ -90,7 +115,15 @@ pub fn all_events_to_record_batch(
 /// The key optimization: most positions have `delta == 0` and are skipped
 /// (~99.9% of positions for typical WES/WGS data).
 /// Zero-coverage gaps are NOT emitted.
-pub fn dense_depth_to_coverage_blocks(contig: &str, depth: &[i32]) -> Vec<CoverageBlock> {
+///
+/// `zero_based` selects the interval convention for `pos_end`, exactly as in
+/// [`events_to_coverage_blocks`]: half-open (exclusive) when `true`, closed
+/// (inclusive) when `false`.
+pub fn dense_depth_to_coverage_blocks(
+    contig: &str,
+    depth: &[i32],
+    zero_based: bool,
+) -> Vec<CoverageBlock> {
     let contig_arc: Arc<str> = Arc::from(contig);
     let mut blocks = Vec::new();
     let mut cov: i32 = 0;
@@ -107,7 +140,7 @@ pub fn dense_depth_to_coverage_blocks(contig: &str, depth: &[i32]) -> Vec<Covera
             blocks.push(CoverageBlock {
                 contig: Arc::clone(&contig_arc),
                 pos_start: block_start as i32,
-                pos_end: (pos - 1) as i32,
+                pos_end: block_end(pos, zero_based),
                 coverage: prev_cov as i16,
             });
             if cov != 0 {
@@ -125,13 +158,15 @@ pub fn dense_depth_to_coverage_blocks(contig: &str, depth: &[i32]) -> Vec<Covera
 
 /// Convert a dense depth slice to coverage blocks with a position offset.
 ///
-/// Same RLE logic as `dense_depth_to_coverage_blocks` but positions are
+/// Same RLE logic as [`dense_depth_to_coverage_blocks`] — including the
+/// `zero_based` interval convention for `pos_end` — but positions are
 /// shifted by `start_offset`, allowing callers to pass a sub-slice of
 /// the full depth array (the touched region) instead of the entire contig.
 pub fn dense_depth_to_coverage_blocks_bounded(
     contig: &str,
     depth_slice: &[i32],
     start_offset: usize,
+    zero_based: bool,
 ) -> Vec<CoverageBlock> {
     let contig_arc: Arc<str> = Arc::from(contig);
     let mut blocks = Vec::new();
@@ -150,7 +185,7 @@ pub fn dense_depth_to_coverage_blocks_bounded(
             blocks.push(CoverageBlock {
                 contig: Arc::clone(&contig_arc),
                 pos_start: block_start as i32,
-                pos_end: (pos - 1) as i32,
+                pos_end: block_end(pos, zero_based),
                 coverage: prev_cov as i16,
             });
             if cov != 0 {
@@ -174,11 +209,13 @@ pub fn dense_depth_to_record_batch(
     contig: &str,
     depth: &DenseContigDepth,
     schema: &SchemaRef,
+    zero_based: bool,
 ) -> datafusion::common::Result<RecordBatch> {
     let blocks = dense_depth_to_coverage_blocks_bounded(
         contig,
         depth.touched_range(),
         depth.touched_start(),
+        zero_based,
     );
     coverage_blocks_to_record_batch(&blocks, schema)
 }
@@ -189,11 +226,13 @@ pub fn dense_depth_to_record_batches(
     depth: &DenseContigDepth,
     schema: &SchemaRef,
     batch_size: usize,
+    zero_based: bool,
 ) -> datafusion::common::Result<Vec<RecordBatch>> {
     let blocks = dense_depth_to_coverage_blocks_bounded(
         contig,
         depth.touched_range(),
         depth.touched_start(),
+        zero_based,
     );
     coverage_blocks_to_chunked_batches(&blocks, schema, batch_size)
 }
@@ -203,6 +242,7 @@ pub fn all_events_to_record_batches(
     contig_events: &mut HashMap<String, ContigEvents>,
     schema: &SchemaRef,
     batch_size: usize,
+    zero_based: bool,
 ) -> datafusion::common::Result<Vec<RecordBatch>> {
     let mut all_blocks = Vec::new();
 
@@ -211,7 +251,7 @@ pub fn all_events_to_record_batches(
 
     for contig in &contigs {
         let events = &mut contig_events.get_mut(contig).unwrap().events;
-        let blocks = events_to_coverage_blocks(contig, events);
+        let blocks = events_to_coverage_blocks(contig, events, zero_based);
         all_blocks.extend(blocks);
     }
 
@@ -373,7 +413,7 @@ mod tests {
     fn test_single_read() {
         let mut events = vec![(100u32, 1i32), (110, -1)];
 
-        let blocks = events_to_coverage_blocks("chr1", &mut events);
+        let blocks = events_to_coverage_blocks("chr1", &mut events, false);
         assert_eq!(
             blocks,
             vec![CoverageBlock {
@@ -390,7 +430,7 @@ mod tests {
         // Read1: [0, 10), Read2: [5, 15)
         let mut events = vec![(0u32, 1i32), (10, -1), (5, 1), (15, -1)];
 
-        let blocks = events_to_coverage_blocks("chr1", &mut events);
+        let blocks = events_to_coverage_blocks("chr1", &mut events, false);
         assert_eq!(
             blocks,
             vec![
@@ -421,7 +461,7 @@ mod tests {
         // Read1: [0, 5), Read2: [10, 15)
         let mut events = vec![(0u32, 1i32), (5, -1), (10, 1), (15, -1)];
 
-        let blocks = events_to_coverage_blocks("chr1", &mut events);
+        let blocks = events_to_coverage_blocks("chr1", &mut events, false);
         assert_eq!(
             blocks,
             vec![
@@ -447,7 +487,7 @@ mod tests {
         // Events: (0, +1), (5, -1), (8, +1), (13, -1)
         let mut events = vec![(0u32, 1i32), (5, -1), (8, 1), (13, -1)];
 
-        let blocks = events_to_coverage_blocks("chr1", &mut events);
+        let blocks = events_to_coverage_blocks("chr1", &mut events, false);
         assert_eq!(
             blocks,
             vec![
@@ -470,7 +510,7 @@ mod tests {
     #[test]
     fn test_empty_input() {
         let mut events = Vec::new();
-        let blocks = events_to_coverage_blocks("chr1", &mut events);
+        let blocks = events_to_coverage_blocks("chr1", &mut events, false);
         assert!(blocks.is_empty());
     }
 
@@ -533,7 +573,7 @@ mod tests {
         depth[100] = 1;
         depth[110] = -1;
 
-        let blocks = dense_depth_to_coverage_blocks("chr1", &depth);
+        let blocks = dense_depth_to_coverage_blocks("chr1", &depth, false);
         assert_eq!(
             blocks,
             vec![CoverageBlock {
@@ -554,7 +594,7 @@ mod tests {
         depth[10] += -1;
         depth[15] = -1;
 
-        let blocks = dense_depth_to_coverage_blocks("chr1", &depth);
+        let blocks = dense_depth_to_coverage_blocks("chr1", &depth, false);
         assert_eq!(
             blocks,
             vec![
@@ -589,7 +629,7 @@ mod tests {
         depth[10] = 1;
         depth[15] = -1;
 
-        let blocks = dense_depth_to_coverage_blocks("chr1", &depth);
+        let blocks = dense_depth_to_coverage_blocks("chr1", &depth, false);
         assert_eq!(
             blocks,
             vec![
@@ -612,7 +652,7 @@ mod tests {
     #[test]
     fn test_dense_empty() {
         let depth = vec![0i32; 100];
-        let blocks = dense_depth_to_coverage_blocks("chr1", &depth);
+        let blocks = dense_depth_to_coverage_blocks("chr1", &depth, false);
         assert!(blocks.is_empty());
     }
 
@@ -620,14 +660,14 @@ mod tests {
     fn test_dense_matches_sparse() {
         // Verify dense and sparse produce identical results
         let mut events = vec![(0u32, 1i32), (5, 1), (10, -1), (15, -1)];
-        let sparse_blocks = events_to_coverage_blocks("chr1", &mut events);
+        let sparse_blocks = events_to_coverage_blocks("chr1", &mut events, false);
 
         let mut depth = vec![0i32; 20];
         depth[0] = 1;
         depth[5] = 1;
         depth[10] = -1;
         depth[15] = -1;
-        let dense_blocks = dense_depth_to_coverage_blocks("chr1", &depth);
+        let dense_blocks = dense_depth_to_coverage_blocks("chr1", &depth, false);
 
         assert_eq!(sparse_blocks, dense_blocks);
     }
@@ -771,5 +811,247 @@ mod tests {
         assert_eq!(batches.len(), 4);
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 10);
+    }
+
+    // --- Tests for 0-based half-open block ends (issue #204) ---
+
+    #[test]
+    fn test_zero_based_single_read_end_is_exclusive() {
+        // One 10bp read at 0-based position 100 covers [100, 110)
+        let mut events = vec![(100u32, 1i32), (110, -1)];
+
+        let blocks = events_to_coverage_blocks("chr1", &mut events, true);
+        assert_eq!(
+            blocks,
+            vec![CoverageBlock {
+                contig: Arc::from("chr1"),
+                pos_start: 100,
+                pos_end: 110,
+                coverage: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_zero_based_adjacent_blocks_share_a_boundary() {
+        // Read1: [0, 10), Read2: [5, 15)
+        let mut events = vec![(0u32, 1i32), (10, -1), (5, 1), (15, -1)];
+
+        let blocks = events_to_coverage_blocks("chr1", &mut events, true);
+        assert_eq!(
+            blocks,
+            vec![
+                CoverageBlock {
+                    contig: Arc::from("chr1"),
+                    pos_start: 0,
+                    pos_end: 5,
+                    coverage: 1,
+                },
+                CoverageBlock {
+                    contig: Arc::from("chr1"),
+                    pos_start: 5,
+                    pos_end: 10,
+                    coverage: 2,
+                },
+                CoverageBlock {
+                    contig: Arc::from("chr1"),
+                    pos_start: 10,
+                    pos_end: 15,
+                    coverage: 1,
+                },
+            ]
+        );
+
+        // The defining property of half-open intervals: with no coverage gap
+        // between them, one block's end is the next block's start.
+        assert_eq!(blocks[0].pos_end, blocks[1].pos_start);
+        assert_eq!(blocks[1].pos_end, blocks[2].pos_start);
+    }
+
+    #[test]
+    fn test_zero_based_gap_between_reads_end_is_exclusive() {
+        // Read1: [0, 5), Read2: [10, 15)
+        let mut events = vec![(0u32, 1i32), (5, -1), (10, 1), (15, -1)];
+
+        let blocks = events_to_coverage_blocks("chr1", &mut events, true);
+        assert_eq!(
+            blocks,
+            vec![
+                CoverageBlock {
+                    contig: Arc::from("chr1"),
+                    pos_start: 0,
+                    pos_end: 5,
+                    coverage: 1,
+                },
+                CoverageBlock {
+                    contig: Arc::from("chr1"),
+                    pos_start: 10,
+                    pos_end: 15,
+                    coverage: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_zero_based_deletion_gap_end_is_exclusive() {
+        // 5M3D5M at position 0
+        let mut events = vec![(0u32, 1i32), (5, -1), (8, 1), (13, -1)];
+
+        let blocks = events_to_coverage_blocks("chr1", &mut events, true);
+        assert_eq!(
+            blocks,
+            vec![
+                CoverageBlock {
+                    contig: Arc::from("chr1"),
+                    pos_start: 0,
+                    pos_end: 5,
+                    coverage: 1,
+                },
+                CoverageBlock {
+                    contig: Arc::from("chr1"),
+                    pos_start: 8,
+                    pos_end: 13,
+                    coverage: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_zero_based_blocks_cover_the_same_bases_as_one_based() {
+        // The regression guard for issue #204: switching coordinate system must
+        // not change how many bases a block covers. A 1-based closed block spans
+        // `end - start + 1` bases; a 0-based half-open block spans `end - start`.
+        let events = vec![(0u32, 1i32), (5, 1), (10, -1), (15, -1)];
+
+        let closed = events_to_coverage_blocks("chr1", &mut events.clone(), false);
+        let half_open = events_to_coverage_blocks("chr1", &mut events.clone(), true);
+
+        assert_eq!(closed.len(), half_open.len());
+        assert!(!closed.is_empty());
+        for (c, h) in closed.iter().zip(&half_open) {
+            assert_eq!(c.pos_start, h.pos_start);
+            assert_eq!(c.coverage, h.coverage);
+            assert_eq!(
+                c.pos_end - c.pos_start + 1,
+                h.pos_end - h.pos_start,
+                "block width changed between coordinate systems"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dense_zero_based_end_is_exclusive() {
+        // One 10bp read at 0-based position 100 covers [100, 110)
+        let mut depth = vec![0i32; 120];
+        depth[100] = 1;
+        depth[110] = -1;
+
+        let blocks = dense_depth_to_coverage_blocks("chr1", &depth, true);
+        assert_eq!(
+            blocks,
+            vec![CoverageBlock {
+                contig: Arc::from("chr1"),
+                pos_start: 100,
+                pos_end: 110,
+                coverage: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_dense_bounded_zero_based_end_is_exclusive() {
+        // Same read, but scanned as a sub-slice starting at offset 100
+        let mut depth = vec![0i32; 20];
+        depth[0] = 1;
+        depth[10] = -1;
+
+        let blocks = dense_depth_to_coverage_blocks_bounded("chr1", &depth, 100, true);
+        assert_eq!(
+            blocks,
+            vec![CoverageBlock {
+                contig: Arc::from("chr1"),
+                pos_start: 100,
+                pos_end: 110,
+                coverage: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_dense_matches_sparse_zero_based() {
+        // Dense and sparse accumulation must agree in 0-based mode too
+        let mut events = vec![(0u32, 1i32), (5, 1), (10, -1), (15, -1)];
+        let sparse_blocks = events_to_coverage_blocks("chr1", &mut events, true);
+
+        let mut depth = vec![0i32; 20];
+        depth[0] = 1;
+        depth[5] = 1;
+        depth[10] = -1;
+        depth[15] = -1;
+        let dense_blocks = dense_depth_to_coverage_blocks("chr1", &depth, true);
+
+        assert_eq!(sparse_blocks, dense_blocks);
+    }
+
+    #[test]
+    fn test_dense_record_batches_zero_based_end_is_exclusive() {
+        // Through the DenseContigDepth path used by the physical operator
+        let mut contig_depth = DenseContigDepth::new(200);
+        contig_depth.depth[100] = 1;
+        contig_depth.depth[110] = -1;
+        contig_depth.update_bounds(100, 110);
+
+        let schema = crate::schema::coverage_output_schema(true);
+        let batches =
+            dense_depth_to_record_batches("chr1", &contig_depth, &schema, 1024, true).unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+
+        let starts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let ends = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(starts.value(0), 100);
+        assert_eq!(ends.value(0), 110);
+    }
+
+    #[test]
+    fn test_all_events_record_batches_zero_based_end_is_exclusive() {
+        // Through the sparse merge path used by the physical operator
+        let mut contig_events: HashMap<String, ContigEvents> = HashMap::new();
+        let entry = contig_events.entry("chr1".to_string()).or_default();
+        entry.push(100, 1);
+        entry.push(110, -1);
+
+        let schema = crate::schema::coverage_output_schema(true);
+        let batches =
+            all_events_to_record_batches(&mut contig_events, &schema, 1024, true).unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+
+        let starts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let ends = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(starts.value(0), 100);
+        assert_eq!(ends.value(0), 110);
     }
 }

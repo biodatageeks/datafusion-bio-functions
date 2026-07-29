@@ -1,3 +1,29 @@
+//! Golden-parity tests against mosdepth.
+//!
+//! The expected 0-based values below are real mosdepth output. Regenerate them
+//! with mosdepth 0.3.11:
+//!
+//! ```text
+//! mosdepth --fast-mode out tests/data/ovl.bam
+//! gunzip -c out.per-base.bed.gz
+//! MT      0       6       1
+//! MT      6       42      2
+//! MT      42      80      1
+//!
+//! mosdepth --fast-mode out tests/data/overlapping-pairs.bam
+//! gunzip -c out.per-base.bed.gz | awk '$4 != 0'
+//! 1       565173  565253  2
+//! ```
+//!
+//! `--fast-mode` matters: mosdepth's default deduplicates overlapping mate
+//! pairs, which this crate deliberately does not do, so without the flag the
+//! overlap region reads as coverage 1 instead of 2.
+//!
+//! mosdepth writes BED, which is 0-based half-open — the same convention the
+//! `zero_based` output uses. Cross-check with `samtools depth -a`, which is
+//! 1-based closed: it reports `MT [1,6] cov=1`, `[7,42] cov=2`, `[43,80]
+//! cov=1` for `ovl.bam`, i.e. the same intervals in the other convention.
+
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Int16Array, Int32Array, StringArray};
@@ -137,9 +163,9 @@ async fn test_ovl_fast_mode() {
         mt_rows
     );
 
-    assert_eq!(mt_rows[0], &("MT".to_string(), 0, 5, 1));
-    assert_eq!(mt_rows[1], &("MT".to_string(), 6, 41, 2));
-    assert_eq!(mt_rows[2], &("MT".to_string(), 42, 79, 1));
+    assert_eq!(mt_rows[0], &("MT".to_string(), 0, 6, 1));
+    assert_eq!(mt_rows[1], &("MT".to_string(), 6, 42, 2));
+    assert_eq!(mt_rows[2], &("MT".to_string(), 42, 80, 1));
 }
 
 /// Tests overlapping mate pairs (no overlap deduplication).
@@ -149,7 +175,7 @@ async fn test_ovl_fast_mode() {
 /// dedup), both reads contribute coverage, giving coverage=2.
 ///
 /// Mosdepth default mode deduplicates overlapping mates, yielding coverage=1.
-/// Our output (0-based closed): 1:565173-565252 → coverage=2
+/// Our output (0-based half-open): 1:[565173, 565253) → coverage=2
 #[tokio::test(flavor = "multi_thread")]
 async fn test_overlapping_pairs() {
     let bam_path = format!(
@@ -177,7 +203,7 @@ async fn test_overlapping_pairs() {
     );
 
     // Both mates align to same region — coverage=2 (no overlap dedup)
-    assert_eq!(chr1_rows[0], &("1".to_string(), 565173, 565252, 2));
+    assert_eq!(chr1_rows[0], &("1".to_string(), 565173, 565253, 2));
 }
 
 /// Test coverage via SQL UDTF: SELECT * FROM depth('path/to/file.bam', true)
@@ -195,9 +221,9 @@ async fn test_ovl_fast_mode_sql() {
     let mt_rows: Vec<_> = rows.iter().filter(|r| r.0 == "MT").collect();
 
     assert_eq!(mt_rows.len(), 3);
-    assert_eq!(mt_rows[0], &("MT".to_string(), 0, 5, 1));
-    assert_eq!(mt_rows[1], &("MT".to_string(), 6, 41, 2));
-    assert_eq!(mt_rows[2], &("MT".to_string(), 42, 79, 1));
+    assert_eq!(mt_rows[0], &("MT".to_string(), 0, 6, 1));
+    assert_eq!(mt_rows[1], &("MT".to_string(), 6, 42, 2));
+    assert_eq!(mt_rows[2], &("MT".to_string(), 42, 80, 1));
 }
 
 /// Test coverage via SQL UDTF for overlapping pairs.
@@ -218,7 +244,7 @@ async fn test_overlapping_pairs_sql() {
     let chr1_rows: Vec<_> = rows.iter().filter(|r| r.0 == "1").collect();
 
     assert_eq!(chr1_rows.len(), 1);
-    assert_eq!(chr1_rows[0], &("1".to_string(), 565173, 565252, 2));
+    assert_eq!(chr1_rows[0], &("1".to_string(), 565173, 565253, 2));
 }
 
 /// Test that the default coordinate system (1-based) works via SQL.
@@ -240,6 +266,49 @@ async fn test_ovl_fast_mode_sql_default_one_based() {
     assert_eq!(mt_rows[0], &("MT".to_string(), 1, 6, 1));
     assert_eq!(mt_rows[1], &("MT".to_string(), 7, 42, 2));
     assert_eq!(mt_rows[2], &("MT".to_string(), 43, 80, 1));
+}
+
+/// Regression guard for issue #204: the two coordinate systems must describe
+/// the *same* intervals, just in different conventions.
+///
+/// `mosdepth --fast-mode` on `ovl.bam` emits `MT [0,6)`, `[6,42)`, `[42,80)`;
+/// `samtools depth -a` reports the same intervals 1-based closed as `[1,6]`,
+/// `[7,42]`, `[43,80]`.
+///
+/// Before the fix, 0-based output was closed rather than half-open, so every
+/// block silently covered one base fewer than its 1-based counterpart — and
+/// matched neither reference tool.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_zero_based_and_one_based_describe_the_same_intervals() {
+    let bam_path = format!("{}/tests/data/ovl.bam", env!("CARGO_MANIFEST_DIR"));
+
+    let ctx = SessionContext::new();
+    register_pileup_functions(&ctx);
+
+    let zero_based =
+        collect_coverage_sql(&ctx, &format!("SELECT * FROM depth('{bam_path}', true)")).await;
+    let one_based =
+        collect_coverage_sql(&ctx, &format!("SELECT * FROM depth('{bam_path}', false)")).await;
+
+    assert_eq!(zero_based.len(), one_based.len());
+    assert!(!zero_based.is_empty());
+
+    for (z, o) in zero_based.iter().zip(&one_based) {
+        assert_eq!(z.0, o.0, "contig differs");
+        assert_eq!(z.3, o.3, "coverage differs");
+
+        // 0-based start is the 1-based start minus one...
+        assert_eq!(z.1, o.1 - 1, "start conversion wrong for {z:?} vs {o:?}");
+        // ...while the half-open end equals the 1-based closed end.
+        assert_eq!(z.2, o.2, "end conversion wrong for {z:?} vs {o:?}");
+
+        // The invariant that actually broke: same number of bases covered.
+        assert_eq!(
+            z.2 - z.1,
+            o.2 - o.1 + 1,
+            "block width changed between coordinate systems: {z:?} vs {o:?}"
+        );
+    }
 }
 
 /// Helper to collect per-base coverage results from SQL UDTF.
@@ -446,7 +515,8 @@ async fn test_block_vs_per_base_consistency() {
 
     // For each block, verify all per-base positions within it have matching coverage
     for block in &mt_blocks {
-        for pos in block.1..=block.2 {
+        // Blocks are 0-based half-open, so pos_end is exclusive.
+        for pos in block.1..block.2 {
             let pb = mt_per_base.iter().find(|r| r.1 == pos).unwrap_or_else(|| {
                 panic!("Per-base missing position {pos}");
             });
