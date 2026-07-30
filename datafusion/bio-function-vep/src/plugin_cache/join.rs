@@ -21,12 +21,47 @@ pub fn tier_sql(normalized_view: &str, variation_probe: &str) -> String {
     )
 }
 
+/// Same join, with an explicit `ORDER BY` so the output is position-ascending
+/// regardless of which side of the physical `HashJoinExec` the optimizer put
+/// the plugin on (see `build.rs`'s module doc). Used only as the retry path
+/// after the cheap, unsorted `tiered_stream` trips `assert_start_monotonic` --
+/// the sort is real work, so it's not paid by the common case (a whole-genome
+/// plugin bigger than the variation probe, which streams through unreordered
+/// already).
+pub fn tier_sql_sorted(normalized_view: &str, variation_probe: &str) -> String {
+    format!(
+        "{} ORDER BY p.start",
+        tier_sql(normalized_view, variation_probe)
+    )
+}
+
 /// Register the variation shard as a `tier`-bearing probe view, then stream the
-/// tiered rows (tier inherited from the variation record).
+/// tiered rows (tier inherited from the variation record) in whatever order
+/// the join happens to produce.
 pub async fn tiered_stream(
     ctx: &SessionContext,
     normalized_view: &str,
     variation_shard: &Path,
+) -> Result<SendableRecordBatchStream> {
+    tiered_stream_impl(ctx, normalized_view, variation_shard, false).await
+}
+
+/// Same as `tiered_stream`, but the output is guaranteed position-ascending on
+/// `start` (see `tier_sql_sorted`). Costs a real sort -- use only as the
+/// fallback once the unsorted stream has been shown to need it.
+pub async fn tiered_stream_sorted(
+    ctx: &SessionContext,
+    normalized_view: &str,
+    variation_shard: &Path,
+) -> Result<SendableRecordBatchStream> {
+    tiered_stream_impl(ctx, normalized_view, variation_shard, true).await
+}
+
+async fn tiered_stream_impl(
+    ctx: &SessionContext,
+    normalized_view: &str,
+    variation_shard: &Path,
+    sorted: bool,
 ) -> Result<SendableRecordBatchStream> {
     let shard = variation_shard.to_string_lossy();
     ctx.register_parquet(
@@ -74,9 +109,12 @@ pub async fn tiered_stream(
          GROUP BY v.chrom, v.start, v.allele_string"
     ))
     .await?;
-    let df = ctx
-        .sql(&tier_sql(normalized_view, "plugin_variation_probe"))
-        .await?;
+    let sql = if sorted {
+        tier_sql_sorted(normalized_view, "plugin_variation_probe")
+    } else {
+        tier_sql(normalized_view, "plugin_variation_probe")
+    };
+    let df = ctx.sql(&sql).await?;
     df.execute_stream().await
 }
 
