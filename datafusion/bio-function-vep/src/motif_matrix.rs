@@ -150,8 +150,11 @@ impl MotifMatrix {
 /// `MotifFeatureVariationAllele::motif_start` / `motif_end` produce it.
 ///
 /// On the reverse strand both are mirrored, which puts `end` *before* `start`
-/// for multi-base variants. That is what Ensembl does, and the splice below
-/// keys off `start` either way.
+/// for multi-base variants. Ensembl release 116 deliberately still splices at
+/// `motif_start - 1`, not at the lower of the two mirrored coordinates:
+/// <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/MotifFeatureVariationAllele.pm#L211-L251>.
+/// Preserve that behavior even though it looks counter-intuitive; this module
+/// implements VEP concordance rather than an independent PWM correction.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MotifPlacement {
     pub start: i64,
@@ -351,6 +354,30 @@ mod tests {
             .relative_sequence_similarity_score("ACTCTCCAGGGAAA")
             .unwrap();
         assert!((delta - (variant - reference)).abs() < 1e-12);
+    }
+
+    /// Release 116 reverse-complements the allele but still uses
+    /// `motif_start - 1` when `motif_end < motif_start` for a reverse-strand
+    /// MNV. Pin that exact VEP behavior rather than "correcting" the offset to
+    /// `min(start, end)`.
+    #[test]
+    fn score_delta_reverse_strand_mnv_uses_vep_116_motif_start() {
+        let matrix = ebf1_matrix();
+        let motif_seq = "ACTCTCCAGGGATT";
+        let placement = MotifPlacement { start: 8, end: 7 };
+        let delta = motif_score_delta(&matrix, motif_seq, 14, placement, "AC", "AA").unwrap();
+
+        let reference = matrix
+            .relative_sequence_similarity_score(motif_seq)
+            .unwrap();
+        let vep_variant = matrix
+            .relative_sequence_similarity_score("ACTCTCCAAGGATT")
+            .unwrap();
+        let lower_coordinate_variant = matrix
+            .relative_sequence_similarity_score("ACTCTCAAGGGATT")
+            .unwrap();
+        assert!((delta - (vep_variant - reference)).abs() < 1e-12);
+        assert!((delta - (lower_coordinate_variant - reference)).abs() > 1e-12);
     }
 
     #[test]

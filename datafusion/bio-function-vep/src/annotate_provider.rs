@@ -14,6 +14,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Seek};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskCtx, Poll};
@@ -164,6 +165,7 @@ use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties,
@@ -5275,18 +5277,19 @@ impl AnnotateProvider {
         for c in &available_chroms {
             cache_chroms.extend(crate::cache::manifest::contig_alias_set(c));
         }
-        let contigs: Vec<String> = vcf_contigs
-            .iter()
-            .filter(|c| cache_chroms.contains(c.as_str()))
-            .cloned()
-            .collect();
-        let first_contig = contigs.first().ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "annotate_vep(): none of the VCF's data-bearing contigs have a \
-                 variation shard in cache '{}'",
-                cache.base_dir().display()
-            ))
-        })?;
+        let contigs = select_cache_backed_contigs(&vcf_contigs, &cache_chroms, cache.base_dir())?;
+        let projected_schema = if let Some(indices) = projection {
+            Arc::new(self.schema.project(indices)?)
+        } else {
+            self.schema.clone()
+        };
+        if contigs.is_empty() {
+            // An empty VCF is a valid input. No cache shard participates, so
+            // preserve lazy identity validation and return the projected empty
+            // result without selecting an arbitrary shard for schema/identity.
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
+        }
+        let first_contig = &contigs[0];
         #[cfg(feature = "parquet-cache")]
         let first_identity = cache.validate_contig_identity(first_contig).await?;
         #[cfg(feature = "parquet-cache")]
@@ -5335,11 +5338,6 @@ impl AnnotateProvider {
             .filter(|name| available_cache_columns.contains(*name))
             .map(ToString::to_string)
             .collect();
-        let projected_schema = if let Some(indices) = projection {
-            Arc::new(self.schema.project(indices)?)
-        } else {
-            self.schema.clone()
-        };
         // The base dir holds the parquet.* shards; the variation exec is always
         // built via `new_parquet`.
         #[cfg(feature = "parquet-cache")]
@@ -8783,6 +8781,26 @@ impl ExecutionPlan for ContigAnnotationExec {
             self.config.clone(),
         )))
     }
+}
+
+fn select_cache_backed_contigs(
+    vcf_contigs: &[String],
+    cache_chroms: &HashSet<String>,
+    cache_root: &Path,
+) -> Result<Vec<String>> {
+    let contigs: Vec<String> = vcf_contigs
+        .iter()
+        .filter(|contig| cache_chroms.contains(contig.as_str()))
+        .cloned()
+        .collect();
+    if !vcf_contigs.is_empty() && contigs.is_empty() {
+        return Err(DataFusionError::Execution(format!(
+            "annotate_vep(): none of the VCF's data-bearing contigs have a \
+             variation shard in cache '{}'",
+            cache_root.display()
+        )));
+    }
+    Ok(contigs)
 }
 
 fn partition_contigs_for_execution(contigs: Vec<String>) -> Vec<Vec<String>> {
@@ -13066,6 +13084,25 @@ mod tests {
         // No progress → always park (waker armed), regardless of inflight.
         assert!(!may_yield_partial_buffer(false, false));
         assert!(!may_yield_partial_buffer(false, true));
+    }
+
+    #[test]
+    fn cache_contig_selection_preserves_empty_input_but_rejects_missing_shards() {
+        let cache_chroms = HashSet::from(["chr1".to_string()]);
+        assert_eq!(
+            select_cache_backed_contigs(&[], &cache_chroms, Path::new("/cache")).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            select_cache_backed_contigs(&["chr1".to_string()], &cache_chroms, Path::new("/cache"))
+                .unwrap(),
+            vec!["chr1".to_string()]
+        );
+
+        let error =
+            select_cache_backed_contigs(&["chr2".to_string()], &cache_chroms, Path::new("/cache"))
+                .unwrap_err();
+        assert!(error.to_string().contains("none of the VCF"));
     }
 
     /// `colocated::AF_COL_NAMES` is maintained by hand alongside `AF_COLUMNS`
