@@ -1,6 +1,6 @@
 [package]
 name = "datafusion-bio-function-fastqc"
-version = "0.13.1"
+version = "0.14.0"
 description = "Streaming FastQC quality-control modules for Apache DataFusion"
 license.workspace = true
 authors.workspace = true
