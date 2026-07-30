@@ -19,7 +19,6 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_bio_format_ensembl_cache::{
     CacheSourceType as BioFormatsCacheSourceType, EnsemblCacheOptions, EnsemblCacheTableProvider,
     EnsemblEntityKind, VEP_CACHE_REGION_SIZE_BP, build_export_query, translation_core_schema,
-    translation_sift_schema,
 };
 use futures::StreamExt;
 use log::info;
@@ -384,7 +383,8 @@ fn provider_output_schema(
 ) -> Result<SchemaRef> {
     use datafusion::catalog::TableProvider;
     let mut provider_options = EnsemblCacheOptions::new(&options.cache_root)
-        .with_cache_source_type(options.cache_source_type);
+        .with_cache_source_type(options.cache_source_type)
+        .with_expected_cache_version(&options.cache_version);
     provider_options.target_partitions = Some(options.partitions);
     Ok(EnsemblCacheTableProvider::for_entity(kind, provider_options)?.schema())
 }
@@ -507,7 +507,8 @@ pub async fn build_parquet_translation_core_chrom(
     let shard_path = entity_dir.join(&file_name);
     remove_existing_parquet_shard(&shard_path, options.overwrite)?;
 
-    let target_schema = translation_core_schema(false, options.cache_source_type);
+    let target_schema =
+        translation_core_schema(false, options.cache_source_type, &options.cache_version);
     let source_type = options.cache_source_type.as_str().to_string();
     let cache_version = options.cache_version.clone();
     let ctx = make_ctx_and_register(options, EnsemblEntityKind::Translation, "tl")?;
@@ -747,7 +748,8 @@ fn make_ctx_and_register(
     let config = SessionConfig::new().with_target_partitions(options.partitions);
     let ctx = SessionContext::new_with_config(config);
     let mut provider_options = EnsemblCacheOptions::new(&options.cache_root)
-        .with_cache_source_type(options.cache_source_type);
+        .with_cache_source_type(options.cache_source_type)
+        .with_expected_cache_version(&options.cache_version);
     provider_options.target_partitions = Some(options.partitions);
     let provider = EnsemblCacheTableProvider::for_entity(kind, provider_options)?;
     ctx.register_table(table_name, provider)?;

@@ -183,8 +183,11 @@ impl CacheBuilder {
 
     #[cfg(feature = "parquet-cache")]
     fn validate_raw_cache_identity(&self, kind: EnsemblEntityKind) -> Result<String> {
-        let options = EnsemblCacheOptions::new(&self.cache_root)
+        let mut options = EnsemblCacheOptions::new(&self.cache_root)
             .with_cache_source_type(self.cache_source_type);
+        if let Some(expected) = self.expected_cache_version.as_deref() {
+            options = options.with_expected_cache_version(expected);
+        }
         let provider = EnsemblCacheTableProvider::for_entity(kind, options)?;
         let schema = provider.schema();
         let detected = schema
