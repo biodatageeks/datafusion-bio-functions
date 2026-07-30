@@ -2,13 +2,20 @@
 //! `plugin_<name>_src[_<part>]` names. CSV/TSV/Parquet use builtin DataFusion
 //! providers; VCF uses `datafusion-bio-format-vcf`'s `VcfTableProvider` (INFO
 //! fields come back as typed top-level columns named after the raw INFO tag —
-//! query them directly in `ingest_sql`). BED is not wired in the prototype.
+//! query them directly in `ingest_sql`); BED uses `datafusion-bio-format-bed`'s
+//! `BedTableProvider`, whose schema is only ever `chrom, start, end, name`
+//! regardless of the declared column count (`BEDFields` selects how many
+//! columns the reader parses off each line, not how many it exposes) — a
+//! source needing more than one extra field packs it into `name` and splits
+//! it back out in `ingest_sql`, the same trick SpliceAI's flattened INFO tag
+//! uses.
 
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
+use datafusion_bio_format_bed::table_provider::{BEDFields, BedTableProvider};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 
 use crate::plugin_cache::source_manifest::{
@@ -140,10 +147,24 @@ pub async fn register_sources(
                 ctx.register_table(&table, Arc::new(provider))?;
             }
             ProviderKind::Bed => {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "provider {:?} not wired in prototype (table '{table}')",
-                    spec.provider
-                )));
+                // Same reasoning as the VCF branch above: the manifest's
+                // `coordinate_system` drives what `ingest_sql` expects, so
+                // keep the provider's own zero-based flag in lock-step with
+                // it rather than trusting the file's own convention.
+                let zero_based = matches!(
+                    manifest.coordinate_system,
+                    CoordinateSystem::ZeroBasedHalfOpen
+                );
+                // No manifest knob yet for BED4/5/6 -- `determine_schema` in
+                // `datafusion-bio-format-bed` only ever exposes `chrom, start,
+                // end, name` regardless of variant, so BED4 is the only
+                // choice that matters until a source needs more raw columns
+                // parsed off each line than that.
+                let provider = BedTableProvider::new(spec.path.clone(), BEDFields::BED4, None, zero_based)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("open BED source '{table}': {e}"))
+                    })?;
+                ctx.register_table(&table, Arc::new(provider))?;
             }
         }
     }
