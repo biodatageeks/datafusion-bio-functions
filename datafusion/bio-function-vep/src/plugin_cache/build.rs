@@ -2,18 +2,22 @@
 //! normalization wrapper → variation-frequency join/tier → two-pass tiered
 //! shard write → cache-manifest chrom entry.
 //!
-//! Known tradeoff (noted during PR #196 review): the tiered join is only
-//! guaranteed to stream in position-ascending order per tier when the
-//! optimizer keeps the plugin on the join's probe side, which needs the
-//! plugin's own row count to be large relative to the chromosome's variation
-//! shard (true for whole-genome plugins like CADD/SpliceAI). A sparse or
-//! low-coverage-chromosome plugin can end up on the *build* side instead,
-//! whose order a hash join doesn't preserve -- `assert_start_monotonic`
-//! below then hard-fails that build rather than silently writing a
-//! wrong-order shard. There is currently no re-sort fallback for that case
-//! (see the review thread on PR #196 for the tradeoff analysis); a future
-//! sparse-plugin manifest that hits this needs one added here, not just a
-//! bigger `assume_unique`-style flag.
+//! The tiered join (`p LEFT JOIN v`) plans as `HashJoinExec` in `CollectLeft`
+//! mode: the plugin (`p`, the LEFT side) is collected into a hash table, and
+//! the variation probe (`v`) streams as the probe side. A row that MATCHES
+//! comes out in the probe's own scan order, which is fine -- a real variation
+//! shard is itself position-sorted. A row that MISSES gets appended
+//! afterward by iterating the plugin's own original row order. So this holds
+//! in position-ascending order for any plugin whose input already arrives
+//! globally sorted (true whenever the source is a single position-sorted
+//! file, or a `bcftools`/`tabix` query over one) -- but a source built by
+//! concatenating multiple files without a merge sort (the original CADD
+//! SNV+indel bug) surfaces here as soon as any of its rows miss the variation
+//! probe. `assert_start_monotonic` catches a real violation as it writes;
+//! `build_plugin_chrom` responds by re-running the join once with an explicit
+//! `ORDER BY` (see `join::tiered_stream_sorted`) rather than hard-failing the
+//! build. The sort only runs on the retry, so a normally-sorted source (every
+//! plugin shipped so far) pays nothing extra.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -24,6 +28,9 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::MemTable;
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use log::info;
@@ -32,7 +39,7 @@ use std::time::Instant;
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
 use crate::plugin_cache::dedup::{check_assume_unique_sample, dedup_keep_first};
-use crate::plugin_cache::join::tiered_stream;
+use crate::plugin_cache::join::{tiered_stream, tiered_stream_sorted};
 use crate::plugin_cache::normalize::{
     canonical_contig_str, canonical_contig_udf, wrap_normalization,
 };
@@ -61,15 +68,15 @@ fn reproject_cast(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch
 /// final `start` on success.
 ///
 /// The streaming shard write below relies on the tiered join emitting rows in
-/// position-ascending order per tier; that holds by construction for the
-/// query shapes exercised so far (see the comment above the call site), but
-/// `HashJoinExec`'s build/probe side can flip based on table-size statistics
-/// for other plugin/variation size ratios, and a flipped build side does not
-/// preserve row order. Rather than trust that silently, check it: a real
-/// violation aborts the build immediately (no shard is written) instead of
-/// producing a page directory whose binary-search lookup can silently miss
-/// rows that are actually present (`PageDir::resolve_ranges` assumes a
-/// genuinely sorted run).
+/// position-ascending order per tier; that holds whenever the plugin's own
+/// input already arrives globally sorted (see the module doc for why), but a
+/// source that isn't -- multiple files concatenated without a merge sort,
+/// say -- can surface a genuine regression here. Rather than trust the
+/// assumption silently, check it: a real violation aborts the fast write
+/// immediately (no shard is written) instead of producing a page directory
+/// whose binary-search lookup can silently miss rows that are actually
+/// present (`PageDir::resolve_ranges` assumes a genuinely sorted run);
+/// `build_plugin_chrom` catches this and retries with an explicit sort.
 fn assert_start_monotonic(
     batch: &RecordBatch,
     start_idx: usize,
@@ -90,15 +97,108 @@ fn assert_start_monotonic(
         {
             return Err(DataFusionError::Execution(format!(
                 "plugin_cache[{chrom}]: tier {tier} shard write is not position-ascending \
-                 (start {v} follows {p}) -- the tier join did not preserve row order for \
-                 this plugin/variation size ratio; the on-disk point-lookup directory \
-                 requires a sorted shard, so refusing to write a corrupt one. This needs \
-                 a real re-sort of the tier's output, not just a bigger error message."
+                 (start {v} follows {p}) -- the tier join did not preserve row order; the \
+                 on-disk point-lookup directory requires a sorted shard, so refusing to \
+                 write a corrupt one from the fast path. The caller retries with an \
+                 explicit sort instead of trusting this shard."
             )));
         }
         prev = Some(v);
     }
     Ok(prev)
+}
+
+/// `assert_start_monotonic` reports a genuine reorder with this exact phrase;
+/// matching on it (rather than introducing a dedicated error variant threaded
+/// through every `Result<_, DataFusionError>` in this module) is enough to
+/// distinguish "the join lost row order, retry with a sort" from any other
+/// failure in the write pass (I/O, cast errors, tier-value corruption), which
+/// must still propagate as-is rather than trigger a pointless retry.
+fn is_order_violation(e: &DataFusionError) -> bool {
+    e.to_string().contains("is not position-ascending")
+}
+
+/// Memory budget for the sorted retry's `FairSpillPool`: generous for the
+/// sparse plugins this path exists for (ClinVar-scale, low hundreds of
+/// thousands of rows per chromosome), but bounded so a plugin that turns out
+/// far larger than expected spills to disk instead of raising the OOM risk
+/// the streaming write (the common/fast path) exists to avoid.
+const RETRY_SORT_MEMORY_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Consume `stream`, split rows by `tier` into warm (0) / cold (1), and write
+/// each run through its own `PluginShardWriter`. Checks `start` is
+/// position-ascending within each tier as it writes (`assert_start_monotonic`)
+/// and returns that error immediately without finishing the writers -- the
+/// caller decides whether to retry with a sorted stream or propagate.
+///
+/// `PluginShardWriter::create` truncates its target path, so calling this
+/// twice at the same `warm_path`/`cold_path` (fast attempt, then sorted retry)
+/// is safe -- the first attempt's partial output is simply overwritten.
+async fn write_tiered_shard(
+    mut stream: SendableRecordBatchStream,
+    out_schema: &SchemaRef,
+    warm_path: &Path,
+    cold_path: &Path,
+    chrom: &str,
+    plugin_name: &str,
+) -> Result<(usize, usize)> {
+    let mut warm_writer = PluginShardWriter::create(warm_path, Arc::clone(out_schema))?;
+    let mut cold_writer = PluginShardWriter::create(cold_path, Arc::clone(out_schema))?;
+    let (mut warm, mut cold) = (0usize, 0usize);
+    let start_idx = out_schema.index_of("start")?;
+    let (mut warm_last_start, mut cold_last_start): (Option<u32>, Option<u32>) = (None, None);
+
+    while let Some(b) = stream.next().await {
+        let batch = b?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let reordered = reproject_cast(&batch, out_schema)?;
+        let tier_col = reordered
+            .column(out_schema.index_of("tier")?)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .ok_or_else(|| DataFusionError::Execution("tier column not Int8".into()))?
+            .clone();
+        let mut kept_this_batch = 0usize;
+        for keep in [0i8, 1i8] {
+            let mask: BooleanArray = (0..reordered.num_rows())
+                .map(|i| Some(tier_col.value(i) == keep))
+                .collect();
+            let filtered = filter_record_batch(&reordered, &mask)
+                .map_err(|e| DataFusionError::Execution(format!("filter tier {keep}: {e}")))?;
+            if filtered.num_rows() == 0 {
+                continue;
+            }
+            kept_this_batch += filtered.num_rows();
+            if keep == 0 {
+                warm_last_start =
+                    assert_start_monotonic(&filtered, start_idx, keep, chrom, warm_last_start)?;
+                warm += filtered.num_rows();
+                warm_writer.write(&filtered)?;
+            } else {
+                cold_last_start =
+                    assert_start_monotonic(&filtered, start_idx, keep, chrom, cold_last_start)?;
+                cold += filtered.num_rows();
+                cold_writer.write(&filtered)?;
+            }
+        }
+        // `tier` is derived as `COALESCE(v.tier, 1)` upstream, so it should
+        // never be anything but 0 or 1 -- but the `[0i8, 1i8]` split above
+        // would silently drop a row with any other value rather than error,
+        // so check explicitly instead of trusting that invariant blindly.
+        if kept_this_batch != reordered.num_rows() {
+            return Err(DataFusionError::Execution(format!(
+                "plugin_cache[{plugin_name}/{chrom}]: {} row(s) had a tier value outside {{0,1}} \
+                 and were dropped by the warm/cold split -- COALESCE(v.tier,1) should make this \
+                 impossible; investigate before trusting this shard",
+                reordered.num_rows() - kept_this_batch
+            )));
+        }
+    }
+    warm_writer.finish()?;
+    cold_writer.finish()?;
+    Ok((warm, cold))
 }
 
 /// Build one chromosome's plugin shard. Returns the cache-manifest chrom entry.
@@ -213,9 +313,14 @@ pub async fn build_plugin_chrom(
     // build regardless of partition count. The deduped survivors are
     // re-registered here as a MemTable the join consumes in place of the raw
     // normalized view.
+    // Kept for the sorted retry below (see the fast/retry split further down):
+    // cloning a `Vec<RecordBatch>` only clones the `Arc`-backed column data,
+    // not the underlying buffers, so holding a second copy here is cheap
+    // regardless of chromosome size.
+    let deduped_for_retry = deduped.clone();
     let build_ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     let dedup_view = format!("plugin_{}_dedup", src.plugin_name);
-    let mem = MemTable::try_new(norm_schema, vec![deduped])
+    let mem = MemTable::try_new(norm_schema.clone(), vec![deduped])
         .map_err(|e| DataFusionError::Execution(format!("dedup memtable: {e}")))?;
     build_ctx.register_table(&dedup_view, Arc::new(mem))?;
 
@@ -225,6 +330,8 @@ pub async fn build_plugin_chrom(
         .map_err(|e| DataFusionError::Execution(format!("mkdir {}: {e}", plugin_dir.display())))?;
     let file_name = format!("{}.parquet", canonical_chrom_label(chrom));
     let shard_path = plugin_dir.join(&file_name);
+    let warm_tmp = plugin_dir.join(format!("{file_name}.warm.tmp"));
+    let cold_tmp = plugin_dir.join(format!("{file_name}.cold.tmp"));
 
     // Stream the tiered join output straight into two per-tier temp shards
     // (warm run, cold run) instead of collecting the whole chromosome into one
@@ -232,86 +339,64 @@ pub async fn build_plugin_chrom(
     // sorting it in memory. That collect+concat+sort was the dominant remaining
     // memory cost after `assume_unique` removed the dedup HashSet, and still
     // OOM'd on the largest chromosomes (chr7, chr8, chrX for CADD). This keeps
-    // peak memory at O(one batch) instead of O(whole chromosome).
-    //
-    // Correctness needs each tier's rows position-ascending on disk
-    // (`PageDir::resolve_ranges`'s binary search assumes a sorted run). That
-    // does NOT follow from `target_partitions=1` alone: `p LEFT JOIN v` plans
-    // as `HashJoinExec`, and the query optimizer picks which side to hash
-    // (`join_type`) based on relative table size -- for a whole-genome plugin
-    // bigger than the variation probe (CADD, SpliceAI: the configs actually
-    // built and shipped so far) it swaps to `join_type=Right` with the plugin
-    // on the probe side, which DOES stream through unreordered; for a plugin
-    // smaller than the probe (a sparse plugin, a small custom subset, a
-    // low-coverage chrom) it can plan `join_type=Left` with the plugin on the
-    // *build* side instead, whose row order a hash join does not preserve.
-    // `assert_start_monotonic` below checks the actual invariant directly
-    // rather than trusting which side the optimizer chose: a real violation
-    // aborts the build loudly instead of silently writing a shard whose
-    // point-lookup can miss rows that are actually present.
-    let mut stream = tiered_stream(&build_ctx, &dedup_view, variation_shard).await?;
-
-    let warm_tmp = plugin_dir.join(format!("{file_name}.warm.tmp"));
-    let cold_tmp = plugin_dir.join(format!("{file_name}.cold.tmp"));
-    let mut warm_writer = PluginShardWriter::create(&warm_tmp, Arc::clone(&out_schema))?;
-    let mut cold_writer = PluginShardWriter::create(&cold_tmp, Arc::clone(&out_schema))?;
-    let (mut warm, mut cold) = (0usize, 0usize);
-    let start_idx = out_schema.index_of("start")?;
-    let (mut warm_last_start, mut cold_last_start): (Option<u32>, Option<u32>) = (None, None);
-
-    while let Some(b) = stream.next().await {
-        let batch = b?;
-        if batch.num_rows() == 0 {
-            continue;
+    // peak memory at O(one batch) instead of O(whole chromosome) -- this is
+    // the fast path, and it's correct as long as the plugin's own input
+    // already arrives position-ascending (see the module doc for why that's
+    // enough, regardless of the plugin's size relative to the variation
+    // shard). `write_tiered_shard`'s `assert_start_monotonic` check catches it
+    // directly if that assumption doesn't hold, and the fallback below
+    // re-runs the join with an explicit sort instead of failing.
+    let fast_stream = tiered_stream(&build_ctx, &dedup_view, variation_shard).await?;
+    let (warm, cold) = match write_tiered_shard(
+        fast_stream,
+        &out_schema,
+        &warm_tmp,
+        &cold_tmp,
+        chrom,
+        &src.plugin_name,
+    )
+    .await
+    {
+        Ok(counts) => counts,
+        Err(e) if is_order_violation(&e) => {
+            // The plugin's input wasn't globally position-ascending by the
+            // time it reached the join (see the module doc), so a miss row
+            // surfaced out of order. Re-run with `ORDER BY` on a session
+            // whose memory pool can spill to disk -- this is the exception,
+            // not the common case the O(1)-memory streaming write above is
+            // optimized for.
+            info!(
+                "plugin_cache[{}/{chrom}]: tier join did not preserve row order \
+                 ({read_rows} plugin rows this chrom) -- retrying with an explicit sort",
+                src.plugin_name
+            );
+            let sort_runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(FairSpillPool::new(RETRY_SORT_MEMORY_LIMIT_BYTES)))
+                .build_arc()
+                .map_err(|e| DataFusionError::Execution(format!("retry runtime env: {e}")))?;
+            let sort_ctx = SessionContext::new_with_config_rt(
+                SessionConfig::new().with_target_partitions(1),
+                sort_runtime,
+            );
+            let sort_mem = MemTable::try_new(norm_schema, vec![deduped_for_retry])
+                .map_err(|e| DataFusionError::Execution(format!("retry dedup memtable: {e}")))?;
+            sort_ctx.register_table(&dedup_view, Arc::new(sort_mem))?;
+            let sorted_stream =
+                tiered_stream_sorted(&sort_ctx, &dedup_view, variation_shard).await?;
+            write_tiered_shard(
+                sorted_stream,
+                &out_schema,
+                &warm_tmp,
+                &cold_tmp,
+                chrom,
+                &src.plugin_name,
+            )
+            .await?
         }
-        let reordered = reproject_cast(&batch, &out_schema)?;
-        let tier_col = reordered
-            .column(out_schema.index_of("tier")?)
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .ok_or_else(|| DataFusionError::Execution("tier column not Int8".into()))?
-            .clone();
-        let mut kept_this_batch = 0usize;
-        for keep in [0i8, 1i8] {
-            let mask: BooleanArray = (0..reordered.num_rows())
-                .map(|i| Some(tier_col.value(i) == keep))
-                .collect();
-            let filtered = filter_record_batch(&reordered, &mask)
-                .map_err(|e| DataFusionError::Execution(format!("filter tier {keep}: {e}")))?;
-            if filtered.num_rows() == 0 {
-                continue;
-            }
-            kept_this_batch += filtered.num_rows();
-            if keep == 0 {
-                warm_last_start =
-                    assert_start_monotonic(&filtered, start_idx, keep, chrom, warm_last_start)?;
-                warm += filtered.num_rows();
-                warm_writer.write(&filtered)?;
-            } else {
-                cold_last_start =
-                    assert_start_monotonic(&filtered, start_idx, keep, chrom, cold_last_start)?;
-                cold += filtered.num_rows();
-                cold_writer.write(&filtered)?;
-            }
-        }
-        // `tier` is derived as `COALESCE(v.tier, 1)` upstream, so it should
-        // never be anything but 0 or 1 -- but the `[0i8, 1i8]` split above
-        // would silently drop a row with any other value rather than error,
-        // so check explicitly instead of trusting that invariant blindly.
-        if kept_this_batch != reordered.num_rows() {
-            return Err(DataFusionError::Execution(format!(
-                "plugin_cache[{}/{chrom}]: {} row(s) had a tier value outside {{0,1}} and were \
-                 dropped by the warm/cold split -- COALESCE(v.tier,1) should make this \
-                 impossible; investigate before trusting this shard",
-                src.plugin_name,
-                reordered.num_rows() - kept_this_batch
-            )));
-        }
-    }
-    warm_writer.finish()?;
-    cold_writer.finish()?;
+        Err(e) => return Err(e),
+    };
     info!(
-        "plugin_cache[{}/{chrom}]: tier-join+streaming-write done, warm={warm} cold={cold}, {:.1}s elapsed",
+        "plugin_cache[{}/{chrom}]: tier-join+write done, warm={warm} cold={cold}, {:.1}s elapsed",
         src.plugin_name,
         t_start.elapsed().as_secs_f64()
     );
@@ -638,6 +723,170 @@ type = "Float32"
         .unwrap();
         let last_seen = assert_start_monotonic(&batch, 0, 0, "1", None).unwrap();
         assert_eq!(last_seen, Some(30));
+    }
+
+    // `write_tiered_shard` must surface a genuine reorder as the same
+    // "not position-ascending" error `assert_start_monotonic` raises directly
+    // (this is what `build_plugin_chrom` pattern-matches on via
+    // `is_order_violation` to decide whether to retry with a sort), and it
+    // must do so without finishing the writers on the failing tier.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_tiered_shard_flags_disordered_input_as_order_violation() {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::UInt32, false),
+            Field::new("end", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("tier", DataType::Int8, false),
+        ]));
+        let make_batch = |starts: &[u32]| {
+            let n = starts.len();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["1"; n])),
+                    Arc::new(UInt32Array::from(starts.to_vec())),
+                    Arc::new(UInt32Array::from(starts.to_vec())),
+                    Arc::new(StringArray::from(vec!["A/G"; n])),
+                    Arc::new(Int8Array::from(vec![0i8; n])),
+                ],
+            )
+            .unwrap()
+        };
+        // Two batches, both internally sorted, but the second regresses
+        // relative to the first -- exactly what a hash join's build side can
+        // produce (each batch may look locally fine, the cross-batch order is
+        // what breaks).
+        let batches: Vec<Result<RecordBatch>> =
+            vec![Ok(make_batch(&[100, 200])), Ok(make_batch(&[50, 300]))];
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(batches),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let warm = dir.path().join("warm.tmp");
+        let cold = dir.path().join("cold.tmp");
+        let err = write_tiered_shard(stream, &schema, &warm, &cold, "1", "demo")
+            .await
+            .unwrap_err();
+        assert!(is_order_violation(&err), "unexpected error: {err}");
+    }
+
+    // C1 regression, end-to-end: `HashJoinExec`'s `CollectLeft` mode collects
+    // the plugin (LEFT of the LEFT JOIN) into a hash table and streams the
+    // variation probe; a MATCHED row's emission order follows the probe's
+    // scan (fine, since a real variation shard is itself position-sorted),
+    // but an UNMATCHED plugin row is appended afterward by iterating the
+    // plugin's own original row order. A plugin whose rows are already
+    // ascending never regresses under this mechanism regardless of its size
+    // relative to the probe -- but a source that isn't globally sorted (two
+    // files concatenated, an upstream ordering bug) surfaces here as soon as
+    // any of its rows miss the variation probe. Confirmed empirically (not
+    // just asserted) via a temporary EXPLAIN probe against this exact
+    // mechanism before writing this test.
+    //
+    // `build_plugin_chrom` must recover from that with a sort, not hard-fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sparse_plugin_with_disordered_source_still_builds_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Plugin: 20 rows, DESCENDING -- simulates a source that isn't
+        // globally position-sorted (e.g. two per-chrom files concatenated
+        // without a merge sort, à la the original CADD SNV+indel bug).
+        let mut tsv_body = String::new();
+        for i in (1..=20u32).rev() {
+            tsv_body.push_str(&format!("chr1\t{}\tA\tG\t0.{i}\n", i * 100));
+        }
+        let tsv = dir.path().join("sparse.tsv.gz");
+        write_gz(&tsv, &tsv_body);
+
+        // Variation shard: none of the plugin's positions have an entry, so
+        // every plugin row misses (tier=1/cold) -- cold-row emission order
+        // follows the plugin's own (here: descending) row order, reproducing
+        // a genuine `assert_start_monotonic` violation. The other 5000 rows
+        // are unrelated positions, matching production's scale (chr22's
+        // variation shard vs. ClinVar's row count is a ~157x skew).
+        let mut var_rows: Vec<(&str, u32, String, i8)> = Vec::new();
+        for i in 0..5000u32 {
+            var_rows.push(("1", 10_000_000 + i, "C/T".to_string(), 1i8));
+        }
+        let var_path = dir.path().join("var.parquet");
+        let var_rows_ref: Vec<(&str, u32, &str, i8)> = var_rows
+            .iter()
+            .map(|(c, s, a, t)| (*c, *s, a.as_str(), *t))
+            .collect();
+        write_synthetic_variation(&var_path, &var_rows_ref);
+
+        let toml = format!(
+            r##"
+plugin_name = "sparse"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_sparse_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let entry = build_plugin_chrom(&manifest, "sparse.source.toml", &var_path, &out, "1")
+            .await
+            .unwrap();
+        assert_eq!(entry.rows, 20);
+        assert_eq!(entry.warm, 0);
+        assert_eq!(
+            entry.cold, 20,
+            "all 20 plugin rows miss the variation shard"
+        );
+
+        // The on-disk shard must actually be position-ascending -- this is
+        // the real invariant `PageDir::resolve_ranges` depends on, and the
+        // one thing a passing `entry.rows` count alone can't prove.
+        let shard_path = out.join("plugin").join("sparse").join("chr1.parquet");
+        let file = std::fs::File::open(&shard_path).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut starts = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let col = batch
+                .column(batch.schema().index_of("start").unwrap())
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .clone();
+            starts.extend((0..col.len()).map(|i| col.value(i)));
+        }
+        assert_eq!(starts.len(), 20);
+        let mut sorted = starts.clone();
+        sorted.sort_unstable();
+        assert_eq!(starts, sorted, "shard on disk is not position-ascending");
     }
 
     // --chrom M / chrM / MT must all select the MT rows (data is folded to "MT"
