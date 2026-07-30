@@ -1257,6 +1257,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-bio-format-bed"
+version = "1.11.0"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=80f3a6c043899f8ded44eaab204b42735f805272#80f3a6c043899f8ded44eaab204b42735f805272"
+dependencies = [
+ "async-compression",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "datafusion",
+ "datafusion-bio-format-core 1.11.0",
+ "datafusion-execution",
+ "env_logger",
+ "futures",
+ "futures-util",
+ "log",
+ "noodles-bed",
+ "noodles-bgzf 0.49.0",
+ "opendal",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "datafusion-bio-format-core"
 version = "1.8.0"
 source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?tag=v1.8.0#7f7fdcd6e4c3f818d08fa42a60866f57a76daa08"
@@ -1402,6 +1425,7 @@ dependencies = [
  "chrono",
  "coitrees",
  "datafusion",
+ "datafusion-bio-format-bed",
  "datafusion-bio-format-core 1.11.0",
  "datafusion-bio-format-ensembl-cache",
  "datafusion-bio-format-vcf",
@@ -3462,6 +3486,20 @@ dependencies = [
  "noodles-vcf 0.90.0",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "noodles-bed"
+version = "0.36.0"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=42a3c0165617b7b8f9f5c5905287968eef92e31e#42a3c0165617b7b8f9f5c5905287968eef92e31e"
+dependencies = [
+ "bstr",
+ "lexical-core",
+ "memchr",
+ "noodles-bgzf 0.49.0",
+ "noodles-core 0.20.0",
+ "noodles-csi 0.58.0",
+ "noodles-tabix 0.64.0",
 ]
 
 [[package]]
