@@ -400,6 +400,7 @@ struct WarmColocIndices {
     pheno: Option<usize>,
     clin_sig: Option<usize>,
     clin_sig_allele: Option<usize>,
+    clin_sig_ref_allele: Option<usize>,
     pubmed: Option<usize>,
     af_indices: Vec<Option<usize>>,
 }
@@ -1150,6 +1151,11 @@ fn probe_taken_batch_position(
                         pheno: batch_i64_value(batch, ci.pheno, row_usize).unwrap_or(0),
                         clin_sig: batch_string_value(batch, ci.clin_sig, row_usize)?,
                         clin_sig_allele: batch_string_value(batch, ci.clin_sig_allele, row_usize)?,
+                        clin_sig_ref_allele: batch_string_value(
+                            batch,
+                            ci.clin_sig_ref_allele,
+                            row_usize,
+                        )?,
                         pubmed: batch_string_value(batch, ci.pubmed, row_usize)?,
                         af: af_cols.clone(),
                         af_row: row,
@@ -1979,6 +1985,7 @@ fn resolve_batch_coloc_indices(batch: &RecordBatch) -> Option<WarmColocIndices> 
         pheno: find("phenotype_or_disease"),
         clin_sig: find("clin_sig"),
         clin_sig_allele: find("clin_sig_allele"),
+        clin_sig_ref_allele: find("clin_sig_ref_allele"),
         pubmed: find("pubmed"),
         af_indices: AF_COL_NAMES.iter().map(|name| find(name)).collect(),
     })

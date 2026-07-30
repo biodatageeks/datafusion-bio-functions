@@ -19,7 +19,6 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_bio_format_ensembl_cache::{
     CacheSourceType as BioFormatsCacheSourceType, EnsemblCacheOptions, EnsemblCacheTableProvider,
     EnsemblEntityKind, VEP_CACHE_REGION_SIZE_BP, build_export_query, translation_core_schema,
-    translation_sift_schema,
 };
 use futures::StreamExt;
 use log::info;
@@ -28,8 +27,8 @@ use crate::cache::manifest::{
     CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest, canonical_chrom_label,
 };
 use crate::cache::schema::{
-    VARIATION_FORBIDDEN_COLUMNS, VARIATION_REQUIRED_COLUMNS, variation_projected_schema,
-    with_cache_source_metadata,
+    VARIATION_FORBIDDEN_COLUMNS, VARIATION_OPTIONAL_COLUMNS, VARIATION_REQUIRED_COLUMNS,
+    variation_projected_schema, with_cache_identity_metadata,
 };
 use crate::cache_builder::EntityStats;
 use crate::cache_common::{
@@ -59,6 +58,9 @@ pub struct CacheBuildOptions {
     pub output_dir: String,
     pub partitions: usize,
     pub cache_source_type: BioFormatsCacheSourceType,
+    /// Release independently established from the raw cache and validated
+    /// against the compiled vepyr support matrix before any shard is written.
+    pub cache_version: String,
     pub overwrite: bool,
     /// Optional allow-list of chromosomes to build (e.g. `["chr1"]`). Matched
     /// after stripping any `chr` prefix, so `"1"` and `"chr1"` are equivalent.
@@ -139,7 +141,12 @@ pub async fn build_parquet_variation_chrom(
     // Derive the output schema once from the source plan schema and reuse it for
     // every written batch so the shard carries one stable Arrow schema.
     let schema_plan = ctx.sql(&query).await?.create_physical_plan().await?;
-    let out_schema = variation_output_schema(schema_plan.schema().as_ref(), &source_type)?;
+    let projected = variation_output_schema(schema_plan.schema().as_ref(), &source_type)?;
+    let out_schema = Arc::new(with_cache_identity_metadata(
+        projected.as_ref(),
+        &source_type,
+        &options.cache_version,
+    ));
 
     let mut writer = VariationParquetShardWriter::create(&shard_path, Arc::clone(&out_schema))?;
     for &keep_tier in passes {
@@ -323,7 +330,12 @@ pub async fn build_parquet_translation_sift_chrom(
     let mut batches: Vec<RecordBatch> = Vec::new();
     while let Some(batch) = stream.next().await {
         let batch = drop_row_number_batch(batch?)?;
-        let out = transform_translation_sift_position_batch(batch, &source_type, &uid_map)?;
+        let out = transform_translation_sift_position_batch(
+            batch,
+            &source_type,
+            &options.cache_version,
+            &uid_map,
+        )?;
         if out.num_rows() > 0 {
             batches.push(out);
         }
@@ -371,7 +383,8 @@ fn provider_output_schema(
 ) -> Result<SchemaRef> {
     use datafusion::catalog::TableProvider;
     let mut provider_options = EnsemblCacheOptions::new(&options.cache_root)
-        .with_cache_source_type(options.cache_source_type);
+        .with_cache_source_type(options.cache_source_type)
+        .with_expected_cache_version(&options.cache_version);
     provider_options.target_partitions = Some(options.partitions);
     Ok(EnsemblCacheTableProvider::for_entity(kind, provider_options)?.schema())
 }
@@ -450,17 +463,18 @@ pub async fn build_parquet_context_entity_chrom(
         provider_schema.as_deref(),
     );
     let source_type = options.cache_source_type.as_str().to_string();
+    let cache_version = options.cache_version.clone();
     let ctx = make_ctx_and_register(options, kind, table_name)?;
 
     let rows = if kind == EnsemblEntityKind::Transcript {
         let uid_map = Arc::new(load_transcript_uid_map(options, source_chrom).await?);
         write_query_stream_to_parquet(&ctx, &query, &shard_path, move |batch| {
-            attach_transcript_uid_batch(batch, &source_type, &uid_map)
+            attach_transcript_uid_batch(batch, &source_type, &cache_version, &uid_map)
         })
         .await?
     } else {
         write_query_stream_to_parquet(&ctx, &query, &shard_path, move |batch| {
-            attach_schema_metadata_to_batch(batch, &source_type)
+            attach_schema_metadata_to_batch(batch, &source_type, &cache_version)
         })
         .await?
     };
@@ -493,13 +507,15 @@ pub async fn build_parquet_translation_core_chrom(
     let shard_path = entity_dir.join(&file_name);
     remove_existing_parquet_shard(&shard_path, options.overwrite)?;
 
-    let target_schema = translation_core_schema(false, options.cache_source_type);
+    let target_schema =
+        translation_core_schema(false, options.cache_source_type, &options.cache_version);
     let source_type = options.cache_source_type.as_str().to_string();
+    let cache_version = options.cache_version.clone();
     let ctx = make_ctx_and_register(options, EnsemblEntityKind::Translation, "tl")?;
     let rows = write_query_stream_to_parquet(&ctx, &query, &shard_path, move |batch| {
         let batch = drop_row_number_batch(batch)?;
         let batch = project_batch_to_schema(batch, Arc::clone(&target_schema))?;
-        attach_schema_metadata_to_batch(batch, &source_type)
+        attach_schema_metadata_to_batch(batch, &source_type, &cache_version)
     })
     .await?;
     Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
@@ -732,7 +748,8 @@ fn make_ctx_and_register(
     let config = SessionConfig::new().with_target_partitions(options.partitions);
     let ctx = SessionContext::new_with_config(config);
     let mut provider_options = EnsemblCacheOptions::new(&options.cache_root)
-        .with_cache_source_type(options.cache_source_type);
+        .with_cache_source_type(options.cache_source_type)
+        .with_expected_cache_version(&options.cache_version);
     provider_options.target_partitions = Some(options.partitions);
     let provider = EnsemblCacheTableProvider::for_entity(kind, provider_options)?;
     ctx.register_table(table_name, provider)?;
@@ -775,6 +792,13 @@ fn transform_variation_tier_batch(
         } else {
             columns.push(batch.column(index).clone());
         }
+        if *name == "clin_sig_allele" {
+            for optional_name in VARIATION_OPTIONAL_COLUMNS {
+                if let Some((optional_index, _)) = schema.column_with_name(optional_name) {
+                    columns.push(batch.column(optional_index).clone());
+                }
+            }
+        }
     }
 
     // Derive tier from the source `start` and build the keep mask in one pass.
@@ -813,8 +837,12 @@ fn transform_variation_tier_batch(
     })
 }
 
-fn attach_schema_metadata_to_batch(batch: RecordBatch, source_type: &str) -> Result<RecordBatch> {
-    let schema = with_cache_source_metadata(batch.schema().as_ref(), source_type);
+fn attach_schema_metadata_to_batch(
+    batch: RecordBatch,
+    source_type: &str,
+    cache_version: &str,
+) -> Result<RecordBatch> {
+    let schema = with_cache_identity_metadata(batch.schema().as_ref(), source_type, cache_version);
     RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).map_err(|err| {
         DataFusionError::Execution(format!("failed to attach Lance schema metadata: {err}"))
     })
@@ -870,6 +898,7 @@ async fn load_transcript_uid_map(
 fn attach_transcript_uid_batch(
     batch: RecordBatch,
     source_type: &str,
+    cache_version: &str,
     uid_map: &HashMap<String, u32>,
 ) -> Result<RecordBatch> {
     let schema = batch.schema();
@@ -900,7 +929,10 @@ fn attach_transcript_uid_batch(
     let mut columns = batch.columns().to_vec();
     columns.push(Arc::new(UInt32Array::from(uids)) as ArrayRef);
 
-    let new_schema = with_cache_source_metadata(&Schema::new(fields), source_type);
+    let schema_with_upstream_metadata =
+        Schema::new_with_metadata(fields, schema.metadata().clone());
+    let new_schema =
+        with_cache_identity_metadata(&schema_with_upstream_metadata, source_type, cache_version);
     RecordBatch::try_new(Arc::new(new_schema), columns).map_err(|err| {
         DataFusionError::Execution(format!("failed to attach transcript_uid column: {err}"))
     })
@@ -909,11 +941,15 @@ fn attach_transcript_uid_batch(
 /// Position-sliced translation_sift schema: one row per `(transcript, position)`.
 /// `key = (transcript_uid << 32) | position`; small `sift`/`poly` payloads use
 /// miniblock + zstd (v2.1), not FullZip.
-fn compact_translation_sift_position_schema(source_type: &str) -> Schema {
+fn compact_translation_sift_position_schema(source_type: &str, cache_version: &str) -> Schema {
     let key = Field::new("key", DataType::UInt64, false);
     let sift = Field::new("sift", DataType::Binary, false);
     let poly = Field::new("poly", DataType::Binary, false);
-    let schema = with_cache_source_metadata(&Schema::new(vec![key, sift, poly]), source_type);
+    let schema = with_cache_identity_metadata(
+        &Schema::new(vec![key, sift, poly]),
+        source_type,
+        cache_version,
+    );
     let mut md = schema.metadata().clone();
     md.insert(
         crate::cache_common::SIFT_BLOB_VERSION_KEY.to_string(),
@@ -928,6 +964,7 @@ fn compact_translation_sift_position_schema(source_type: &str) -> Schema {
 fn transform_translation_sift_position_batch(
     batch: RecordBatch,
     source_type: &str,
+    cache_version: &str,
     uid_map: &HashMap<String, u32>,
 ) -> Result<RecordBatch> {
     let schema = batch.schema();
@@ -965,7 +1002,10 @@ fn transform_translation_sift_position_batch(
         )?;
     }
 
-    let target_schema = Arc::new(compact_translation_sift_position_schema(source_type));
+    let target_schema = Arc::new(compact_translation_sift_position_schema(
+        source_type,
+        cache_version,
+    ));
     RecordBatch::try_new(
         target_schema,
         vec![
@@ -1224,6 +1264,45 @@ mod tests {
     }
 
     #[test]
+    fn variation_transform_preserves_optional_clin_sig_ref_allele_when_present() {
+        let mut fields = Vec::new();
+        let mut columns = Vec::<ArrayRef>::new();
+        for name in VARIATION_REQUIRED_COLUMNS {
+            match *name {
+                "start" | "end" => {
+                    fields.push(Field::new(*name, DataType::Int64, false));
+                    columns.push(Arc::new(Int64Array::from(vec![10])) as ArrayRef);
+                }
+                "failed" => {
+                    fields.push(Field::new(*name, DataType::Int8, true));
+                    columns.push(Arc::new(Int8Array::from(vec![Some(0)])) as ArrayRef);
+                }
+                _ => {
+                    fields.push(Field::new(*name, DataType::Utf8, true));
+                    columns.push(Arc::new(StringArray::from(vec![Some("value")])) as ArrayRef);
+                }
+            }
+            if *name == "clin_sig_allele" {
+                fields.push(Field::new("clin_sig_ref_allele", DataType::Utf8, false));
+                columns.push(Arc::new(StringArray::from(vec!["AGG"])) as ArrayRef);
+            }
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let transformed =
+            transform_variation_tier_batch(batch, "ensembl", &BTreeSet::from([10]), 0).unwrap();
+        let schema = transformed.schema();
+        let field = schema.field_with_name("clin_sig_ref_allele").unwrap();
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert!(field.is_nullable());
+        let values = transformed
+            .column(schema.index_of("clin_sig_ref_allele").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.value(0), "AGG");
+    }
+
+    #[test]
     fn assign_transcript_uids_is_dense_and_unique() {
         let mut ids = vec![
             "ENST2".to_string(),
@@ -1257,7 +1336,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let out = attach_transcript_uid_batch(batch, "ensembl", &uid_map).unwrap();
+        let out = attach_transcript_uid_batch(batch, "ensembl", "115", &uid_map).unwrap();
         let out_schema = out.schema();
         let uid_idx = out_schema.index_of("transcript_uid").unwrap();
         assert_eq!(out_schema.field(uid_idx).data_type(), &DataType::UInt32);
@@ -1274,6 +1353,12 @@ mod tests {
                 .get(crate::cache_source::CACHE_SOURCE_METADATA_KEY),
             Some(&"ensembl".to_string())
         );
+        assert_eq!(
+            out_schema
+                .metadata()
+                .get(crate::cache_identity::CACHE_VERSION_METADATA_KEY),
+            Some(&"115".to_string())
+        );
 
         // An id absent from the map is a hard error (consistency guard).
         let orphan = RecordBatch::try_new(
@@ -1284,7 +1369,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(attach_transcript_uid_batch(orphan, "ensembl", &uid_map).is_err());
+        assert!(attach_transcript_uid_batch(orphan, "ensembl", "115", &uid_map).is_err());
     }
 
     #[test]
@@ -1433,7 +1518,7 @@ mod tests {
         assert_eq!(p2.polyphen[0].prediction, 4);
 
         // Schema is key/sift/poly.
-        let schema = compact_translation_sift_position_schema("ensembl");
+        let schema = compact_translation_sift_position_schema("ensembl", "115");
         assert_eq!(schema.field(0).name(), "key");
         assert_eq!(schema.field(0).data_type(), &DataType::UInt64);
         assert_eq!(schema.field(1).name(), "sift");
@@ -1488,7 +1573,7 @@ mod tests {
 
     #[test]
     fn sift_position_schema_carries_v2_flag() {
-        let schema = compact_translation_sift_position_schema("ensembl");
+        let schema = compact_translation_sift_position_schema("ensembl", "115");
         assert_eq!(
             schema
                 .metadata()

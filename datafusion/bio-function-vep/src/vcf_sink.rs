@@ -400,6 +400,8 @@ pub struct AnnotateVcfConfig {
     pub pick_order: Option<String>,
     /// Use interval-overlap fallback for shifted indels.
     pub extended_probes: bool,
+    /// Optional assertion against embedded per-shard cache version metadata.
+    pub expected_cache_version: Option<String>,
     /// Path to indexed reference FASTA (required for `everything` / `hgvs`).
     pub reference_fasta_path: Option<String>,
     /// Enable HGVS notation.
@@ -466,6 +468,7 @@ impl Default for AnnotateVcfConfig {
             flag_pick_allele_gene: false,
             pick_order: None,
             extended_probes: false,
+            expected_cache_version: None,
             reference_fasta_path: None,
             hgvs: false,
             hgvsc: false,
@@ -535,6 +538,12 @@ impl AnnotateVcfConfig {
         }
         if self.extended_probes {
             opts.insert("extended_probes".into(), serde_json::Value::Bool(true));
+        }
+        if let Some(ref expected_cache_version) = self.expected_cache_version {
+            opts.insert(
+                "expected_cache_version".into(),
+                serde_json::Value::String(expected_cache_version.clone()),
+            );
         }
         if let Some(ref fasta) = self.reference_fasta_path {
             opts.insert(

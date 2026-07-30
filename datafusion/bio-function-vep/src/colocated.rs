@@ -110,6 +110,7 @@ pub struct ColocatedCacheEntry {
     pub pheno: i64,
     pub clin_sig: Option<String>,
     pub clin_sig_allele: Option<String>,
+    pub clin_sig_ref_allele: Option<String>,
     pub pubmed: Option<String>,
     /// Zero-copy AF columns shared across all entries from the same cache batch.
     /// Indexed same as `AF_COL_NAMES`; read this row's value via [`Self::af_value`].

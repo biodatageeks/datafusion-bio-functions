@@ -130,9 +130,12 @@ pub fn trim_sequences_ensembl(
 /// - Ensembl Variation `get_matched_variant_alleles()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258>
 ///
-/// Upstream matched-allele comparison reverse-complements parser alleles when
-/// the compared features are on opposite strands before sequence trimming.
-fn reverse_complement_ascii(seq: &str) -> Option<String> {
+/// Reverse-complement a VEP allele, preserving the `-` empty-allele sentinel.
+///
+/// Ensembl's `reverse_comp()` accepts the standard IUPAC ambiguity symbols in
+/// addition to A/C/G/T/N. Returning uppercase also mirrors the cache and VCF
+/// allele representation used by VEP's clinical-significance matcher.
+pub(crate) fn reverse_complement_allele(seq: &str) -> Option<String> {
     let mut out = String::with_capacity(seq.len());
     for b in seq.as_bytes().iter().rev() {
         out.push(match b.to_ascii_uppercase() {
@@ -140,6 +143,16 @@ fn reverse_complement_ascii(seq: &str) -> Option<String> {
             b'C' => 'G',
             b'G' => 'C',
             b'T' => 'A',
+            b'R' => 'Y',
+            b'Y' => 'R',
+            b'M' => 'K',
+            b'K' => 'M',
+            b'S' => 'S',
+            b'W' => 'W',
+            b'B' => 'V',
+            b'V' => 'B',
+            b'D' => 'H',
+            b'H' => 'D',
             b'N' => 'N',
             b'-' => '-',
             _ => return None,
@@ -203,7 +216,7 @@ pub fn get_matched_variant_alleles(
 
     let mut a_ref = a_ref_raw.to_string();
     if a.strand != b.strand {
-        let Some(reverse_ref) = reverse_complement_ascii(&a_ref) else {
+        let Some(reverse_ref) = reverse_complement_allele(&a_ref) else {
             return Vec::new();
         };
         a_ref = reverse_ref;
@@ -213,7 +226,7 @@ pub fn get_matched_variant_alleles(
     for (a_index, orig_a_alt) in a_alts_raw.iter().enumerate() {
         let mut a_alt = (*orig_a_alt).to_string();
         if a.strand != b.strand {
-            let Some(reverse_alt) = reverse_complement_ascii(&a_alt) else {
+            let Some(reverse_alt) = reverse_complement_allele(&a_alt) else {
                 return Vec::new();
             };
             a_alt = reverse_alt;
@@ -866,6 +879,20 @@ fn vep_norm_coord_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reverse_complement_allele_supports_vep_iupac_and_gap() {
+        assert_eq!(
+            reverse_complement_allele("ACGTRYMKSWBDHVN-"),
+            Some("-NBDHVWSMKRYACGT".to_string())
+        );
+        assert_eq!(
+            reverse_complement_allele("ggagga"),
+            Some("TCCTCC".to_string())
+        );
+        assert_eq!(reverse_complement_allele(""), Some(String::new()));
+        assert_eq!(reverse_complement_allele("X"), None);
+    }
 
     #[test]
     fn test_snv_conversion() {

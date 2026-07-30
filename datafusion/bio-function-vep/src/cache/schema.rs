@@ -3,13 +3,16 @@ use std::collections::{HashMap, HashSet};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DataFusionError, Result};
 
+use crate::cache_identity::CACHE_VERSION_METADATA_KEY;
 use crate::cache_source::CACHE_SOURCE_METADATA_KEY;
 
 /// Project a source variation Arrow schema to the cache's variation output
-/// schema: keep [`VARIATION_REQUIRED_COLUMNS`] (dropping [`VARIATION_FORBIDDEN_COLUMNS`]),
-/// widen `start`/`end` to `UInt32`, and append the derived `tier` column. Used by
-/// both the Parquet shard writer and the build driver, so it lives here (under
-/// the read-runtime `parquet-cache` feature) rather than in the builder module.
+/// schema: keep [`VARIATION_REQUIRED_COLUMNS`] plus any present
+/// [`VARIATION_OPTIONAL_COLUMNS`] (dropping [`VARIATION_FORBIDDEN_COLUMNS`]),
+/// widen `start`/`end` to `UInt32`, and append the derived `tier` column. Used
+/// by both the Parquet shard writer and the build driver, so it lives here
+/// (under the read-runtime `parquet-cache` feature) rather than in the builder
+/// module.
 pub(crate) fn variation_projected_schema(
     source_schema: &Schema,
     source_type: &str,
@@ -32,13 +35,27 @@ pub(crate) fn variation_projected_schema(
         } else {
             fields.push(field.as_ref().clone());
         }
+        if *name == "clin_sig_allele" {
+            for optional_name in VARIATION_OPTIONAL_COLUMNS {
+                if let Some((_, optional_field)) = source_schema.column_with_name(optional_name) {
+                    if optional_field.data_type() != &DataType::Utf8 {
+                        return Err(DataFusionError::Execution(format!(
+                            "optional variation field {optional_name} must be Utf8, got {:?}",
+                            optional_field.data_type()
+                        )));
+                    }
+                    fields.push(Field::new(*optional_name, DataType::Utf8, true));
+                }
+            }
+        }
     }
 
     // Derived warm/cold tier column (0 = warm/common, 1 = cold/rare). Appended
     // here rather than read from the source table.
     fields.push(Field::new("tier", DataType::Int8, false));
 
-    let target_schema = with_cache_source_metadata(&Schema::new(fields), source_type);
+    let projected = Schema::new_with_metadata(fields, source_schema.metadata().clone());
+    let target_schema = with_cache_source_metadata(&projected, source_type);
     validate_variation_schema(&target_schema)?;
     Ok(target_schema)
 }
@@ -100,6 +117,11 @@ pub const VARIATION_REQUIRED_COLUMNS: &[&str] = &[
     "dbsnp_ids",
 ];
 
+/// Release-specific variation fields that are preserved when present but are
+/// not required. VEP cache 116 added `clin_sig_ref_allele`; cache 115 does not
+/// contain it and must retain its existing physical schema and behavior.
+pub const VARIATION_OPTIONAL_COLUMNS: &[&str] = &["clin_sig_ref_allele"];
+
 pub fn validate_variation_schema(schema: &Schema) -> Result<()> {
     for name in VARIATION_FORBIDDEN_COLUMNS {
         if schema.index_of(name).is_ok() {
@@ -145,6 +167,20 @@ pub fn with_cache_source_metadata(schema: &Schema, source_type: &str) -> Schema 
     Schema::new_with_metadata(schema.fields().clone(), metadata)
 }
 
+pub fn with_cache_identity_metadata(
+    schema: &Schema,
+    source_type: &str,
+    cache_version: &str,
+) -> Schema {
+    let schema = with_cache_source_metadata(schema, source_type);
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(
+        CACHE_VERSION_METADATA_KEY.to_string(),
+        cache_version.to_string(),
+    );
+    Schema::new_with_metadata(schema.fields().clone(), metadata)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +194,8 @@ mod tests {
         assert!(!VARIATION_REQUIRED_COLUMNS.contains(&"position_key"));
         assert!(!VARIATION_REQUIRED_COLUMNS.contains(&"variant_keys"));
         assert!(!VARIATION_REQUIRED_COLUMNS.contains(&"tier"));
+        assert!(!VARIATION_REQUIRED_COLUMNS.contains(&"clin_sig_ref_allele"));
+        assert_eq!(VARIATION_OPTIONAL_COLUMNS, &["clin_sig_ref_allele"]);
     }
 
     #[test]

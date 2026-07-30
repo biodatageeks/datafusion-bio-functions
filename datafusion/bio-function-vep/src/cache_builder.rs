@@ -3,12 +3,17 @@
 //! this module provides the public [`CacheBuilder`] entry point and entity
 //! dispatch. Parquet is the only supported output format.
 
+use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result};
 use log::info;
 
 use datafusion_bio_format_ensembl_cache::{
-    CacheSourceType as BioFormatsCacheSourceType, EnsemblEntityKind,
+    CacheSourceType as BioFormatsCacheSourceType, EnsemblCacheOptions, EnsemblCacheTableProvider,
+    EnsemblEntityKind,
 };
+
+use crate::cache_identity::CACHE_VERSION_METADATA_KEY as VEP_CACHE_VERSION_METADATA_KEY;
+use crate::vep_semantics::target_for_cache_version;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheFormat {
@@ -53,6 +58,7 @@ pub struct CacheBuilder {
     cache_format: CacheFormat,
     overwrite: bool,
     cache_source_type: BioFormatsCacheSourceType,
+    expected_cache_version: Option<String>,
     chrom_filter: Option<Vec<String>>,
 }
 
@@ -65,6 +71,7 @@ impl CacheBuilder {
             cache_format: CacheFormat::default(),
             overwrite: false,
             cache_source_type: BioFormatsCacheSourceType::Ensembl,
+            expected_cache_version: None,
             chrom_filter: None,
         }
     }
@@ -99,6 +106,16 @@ impl CacheBuilder {
 
     pub fn with_cache_source_type(mut self, cache_source_type: BioFormatsCacheSourceType) -> Self {
         self.cache_source_type = cache_source_type;
+        self
+    }
+
+    /// Assert the release detected independently from the raw cache metadata.
+    ///
+    /// The assertion cannot label an unknown raw cache. When omitted, the raw
+    /// cache must still provide a supported release and that detected value is
+    /// embedded in every generated Parquet shard.
+    pub fn with_expected_cache_version(mut self, cache_version: impl Into<String>) -> Self {
+        self.expected_cache_version = Some(cache_version.into());
         self
     }
 
@@ -142,11 +159,13 @@ impl CacheBuilder {
 
         #[cfg(feature = "parquet-cache")]
         {
+            let cache_version = self.validate_raw_cache_identity(kind)?;
             let options = crate::cache::build::CacheBuildOptions {
                 cache_root: self.cache_root.clone(),
                 output_dir: self.output_dir.clone(),
                 partitions: self.partitions,
                 cache_source_type: self.cache_source_type,
+                cache_version,
                 overwrite: self.overwrite,
                 chrom_filter: self.chrom_filter.clone(),
             };
@@ -160,6 +179,53 @@ impl CacheBuilder {
                 "cache builder requires the parquet-cache feature".to_string(),
             ))
         }
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    fn validate_raw_cache_identity(&self, kind: EnsemblEntityKind) -> Result<String> {
+        let mut options = EnsemblCacheOptions::new(&self.cache_root)
+            .with_cache_source_type(self.cache_source_type);
+        if let Some(expected) = self.expected_cache_version.as_deref() {
+            options = options.with_expected_cache_version(expected);
+        }
+        let provider = EnsemblCacheTableProvider::for_entity(kind, options)?;
+        let schema = provider.schema();
+        let detected = schema
+            .metadata()
+            .get(VEP_CACHE_VERSION_METADATA_KEY)
+            .filter(|value| !value.is_empty() && value.as_str() != "unknown")
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "cache build refused before writing output: raw cache '{}' has no usable \
+                     {VEP_CACHE_VERSION_METADATA_KEY}; add cache_version/version to info.txt or \
+                     use a canonical raw VEP cache-root basename",
+                    self.cache_root
+                ))
+            })?
+            .to_string();
+        target_for_cache_version(&detected).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "cache build refused before writing output: raw cache '{}' declares {error}",
+                self.cache_root
+            ))
+        })?;
+
+        if let Some(expected) = self.expected_cache_version.as_deref() {
+            target_for_cache_version(expected).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "cache build refused before writing output: invalid expected cache release: \
+                     {error}"
+                ))
+            })?;
+            if detected != expected {
+                return Err(DataFusionError::Execution(format!(
+                    "cache build refused before writing output: raw cache '{}' declares \
+                     {VEP_CACHE_VERSION_METADATA_KEY}={detected}, requested release is {expected}",
+                    self.cache_root
+                )));
+            }
+        }
+        Ok(detected)
     }
 }
 
@@ -231,6 +297,7 @@ mod tests {
         assert_eq!(builder.cache_format, CacheFormat::Parquet);
         assert_eq!(builder.partitions, 8);
         assert!(!builder.overwrite);
+        assert!(builder.expected_cache_version.is_none());
         assert!(builder.chrom_filter.is_none());
     }
 
@@ -240,10 +307,12 @@ mod tests {
             .with_partitions(4)
             .with_cache_format(CacheFormat::Parquet)
             .with_overwrite(true)
+            .with_expected_cache_version("116")
             .with_chrom_filter(["chr1", "chr2"]);
         assert_eq!(builder.partitions, 4);
         assert_eq!(builder.cache_format, CacheFormat::Parquet);
         assert!(builder.overwrite);
+        assert_eq!(builder.expected_cache_version.as_deref(), Some("116"));
         assert_eq!(
             builder.chrom_filter.as_deref(),
             Some(["chr1".to_string(), "chr2".to_string()].as_slice())

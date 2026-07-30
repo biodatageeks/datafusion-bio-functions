@@ -9,7 +9,8 @@
 //!     --example build_parquet_translation_sift_chrom -- \
 //!     --cache-root /path/to/homo_sapiens_merged/115_GRCh38 \
 //!     --output-dir /path/to/115_GRCh38_merged \
-//!     --chrom chr1 --cache-source-type merged --partitions 8 --overwrite
+//!     --chrom chr1 --cache-source-type merged --cache-version 115 \
+//!     --partitions 8 --overwrite
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -23,6 +24,7 @@ use datafusion_bio_function_vep::cache::build::{
 use datafusion_bio_function_vep::cache::manifest::{
     CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest,
 };
+use datafusion_bio_function_vep::vep_semantics::target_for_cache_version;
 
 /// Parquet entity directory name (mirrors `parquet_cache::detect`).
 const PARQUET_SIFT_DIR: &str = "translation_sift";
@@ -33,6 +35,7 @@ struct Args {
     output_dir: PathBuf,
     chrom: String,
     cache_source_type: CacheSourceType,
+    cache_version: String,
     partitions: usize,
     overwrite: bool,
 }
@@ -47,6 +50,7 @@ async fn main() -> Result<()> {
         output_dir: args.output_dir.to_string_lossy().to_string(),
         partitions: args.partitions,
         cache_source_type: args.cache_source_type,
+        cache_version: args.cache_version.clone(),
         overwrite: args.overwrite,
         chrom_filter: None,
     };
@@ -55,6 +59,7 @@ async fn main() -> Result<()> {
     eprintln!("output_dir={}", args.output_dir.display());
     eprintln!("chrom={}", args.chrom);
     eprintln!("cache_source_type={}", args.cache_source_type);
+    eprintln!("cache_version={}", args.cache_version);
     eprintln!("partitions={}", args.partitions);
     eprintln!("overwrite={}", args.overwrite);
 
@@ -84,6 +89,7 @@ fn parse_args() -> Result<Args> {
     let mut output_dir = None;
     let mut chrom = None;
     let mut cache_source_type = CacheSourceType::Ensembl;
+    let mut cache_version = None;
     let mut partitions = 8usize;
     let mut overwrite = false;
 
@@ -101,6 +107,7 @@ fn parse_args() -> Result<Args> {
                     ))
                 })?;
             }
+            "--cache-version" => cache_version = Some(require_value(&mut args, &arg)?),
             "--partitions" => partitions = parse_usize(require_value(&mut args, &arg)?)?,
             "--overwrite" => overwrite = true,
             "--help" | "-h" => {
@@ -115,6 +122,10 @@ fn parse_args() -> Result<Args> {
         }
     }
 
+    let cache_version = cache_version
+        .ok_or_else(|| DataFusionError::Execution("--cache-version is required".into()))?;
+    target_for_cache_version(&cache_version)?;
+
     Ok(Args {
         cache_root: cache_root
             .ok_or_else(|| DataFusionError::Execution("--cache-root is required".into()))?,
@@ -122,6 +133,7 @@ fn parse_args() -> Result<Args> {
             .ok_or_else(|| DataFusionError::Execution("--output-dir is required".into()))?,
         chrom: chrom.ok_or_else(|| DataFusionError::Execution("--chrom is required".into()))?,
         cache_source_type,
+        cache_version,
         partitions: partitions.max(1),
         overwrite,
     })
@@ -160,6 +172,6 @@ fn print_usage() {
     eprintln!(
         "Usage: build_parquet_translation_sift_chrom --cache-root /path/to/homo_sapiens_merged/115_GRCh38 \
          --output-dir /path/to/115_GRCh38_merged --chrom chr1 \
-         [--cache-source-type merged] [--partitions 8] [--overwrite]"
+         --cache-version 115 [--cache-source-type merged] [--partitions 8] [--overwrite]"
     );
 }
