@@ -10553,6 +10553,19 @@ struct ContigAnnotationStream {
     /// worker-minor) for the `threads>1` sharded-output path. Monotonic across
     /// contigs so `vcf_sink` concatenates shards in ascending = position order.
     next_global_shard_id: usize,
+    /// The next contig's `prepare_contig_context`, started while the current
+    /// contig annotates so its context load does not sit on the critical path.
+    ///
+    /// Safe to run ahead: `prepare_contig_context` depends only on its own
+    /// contig's data plus the session, builds read-only state, and emits no
+    /// rows. Shard ids are still assigned in stream order when a prepared
+    /// contig transitions to `AnnotatingParallel`, so output order is
+    /// unaffected. The contig is popped from `contigs` when the prefetch
+    /// starts, and carried here so the pairing cannot drift.
+    prefetched_prepare: Option<(
+        String,
+        tokio::task::JoinHandle<Result<Option<ContigReadyState>>>,
+    )>,
 }
 
 impl ContigAnnotationStream {
@@ -10574,10 +10587,51 @@ impl ContigAnnotationStream {
             state: StreamState::StartContig,
             rows_emitted: 0,
             next_global_shard_id: 0,
+            prefetched_prepare: None,
         }
     }
 
+    /// Begin building the next contig's context in the background. Called when
+    /// the current contig starts annotating, so the two overlap. No-op when the
+    /// queue is empty or a prefetch is already in flight (depth stays at one:
+    /// one extra contig context resident, and one prelude is all there is to
+    /// hide behind an annotation phase).
+    fn start_prefetch_next_contig(&mut self) {
+        if self.prefetched_prepare.is_some() {
+            return;
+        }
+        let Some(chrom) = self.contigs.pop_front() else {
+            return;
+        };
+        let session = Arc::clone(&self.session);
+        let cache = Arc::clone(&self.cache);
+        let config = self.config.clone();
+        let full_schema = self.full_schema.clone();
+        let prefetch_chrom = chrom.clone();
+        let handle = tokio::spawn(async move {
+            prepare_contig_context(session, cache, prefetch_chrom, config, full_schema).await
+        });
+        self.prefetched_prepare = Some((chrom, handle));
+    }
+
+    /// Take the prefetched prepare for the contig that is next in order, if the
+    /// prefetch already covers it.
+    fn take_prefetched_prepare(&mut self) -> Option<PrepareFuture> {
+        let (_chrom, handle) = self.prefetched_prepare.take()?;
+        let fut: PrepareFuture = Box::pin(async move {
+            handle
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        });
+        Some(fut)
+    }
+
     fn cleanup_registered_tables_on_drop(&mut self) {
+        // An in-flight prefetch holds spawned lookup tasks for a contig that
+        // will now never be annotated; drop it so they stop.
+        if let Some((_, handle)) = self.prefetched_prepare.take() {
+            handle.abort();
+        }
         match &mut self.state {
             StreamState::AnnotatingContig(ann) => {
                 abort_annotation_lookup_partitions(ann);
@@ -11980,19 +12034,26 @@ impl Stream for ContigAnnotationStream {
                         self.state = StreamState::Done;
                         return Poll::Ready(None);
                     }
-                    let Some(chrom) = self.contigs.pop_front() else {
-                        // All contigs processed.
-                        self.state = StreamState::Done;
-                        return Poll::Ready(None);
-                    };
-                    let session = Arc::clone(&self.session);
-                    let cache = Arc::clone(&self.cache);
-                    let config = self.config.clone();
-                    let full_schema = self.full_schema.clone();
+                    // A prefetch already popped its contig, so check it before the
+                    // queue or the contig would be processed twice.
+                    let fut = if let Some(fut) = self.take_prefetched_prepare() {
+                        fut
+                    } else {
+                        let Some(chrom) = self.contigs.pop_front() else {
+                            // All contigs processed.
+                            self.state = StreamState::Done;
+                            return Poll::Ready(None);
+                        };
+                        let session = Arc::clone(&self.session);
+                        let cache = Arc::clone(&self.cache);
+                        let config = self.config.clone();
+                        let full_schema = self.full_schema.clone();
 
-                    let fut: PrepareFuture = Box::pin(async move {
-                        prepare_contig_context(session, cache, chrom, config, full_schema).await
-                    });
+                        let fut: PrepareFuture = Box::pin(async move {
+                            prepare_contig_context(session, cache, chrom, config, full_schema).await
+                        });
+                        fut
+                    };
                     self.state = StreamState::PreparingContig(fut);
                 }
 
@@ -12123,6 +12184,13 @@ impl Stream for ContigAnnotationStream {
                                 shared,
                             };
                             self.state = StreamState::AnnotatingParallel(state);
+                            // This contig now occupies the workers for seconds;
+                            // build the next one's context in that window instead
+                            // of after it. Only on the sharded path: at
+                            // workers==1 the prelude is a small share of a much
+                            // longer contig, and a second resident context is not
+                            // worth the memory.
+                            self.start_prefetch_next_contig();
                         } else {
                             let worker =
                                 match AnnotationWorkerState::new(Arc::clone(&ready.shared_context))
@@ -13006,6 +13074,19 @@ async fn prepare_contig_context(
         profile.prepare_total += t_contig.elapsed();
     });
     log_phase_rss(&chrom, "after_prepare");
+    // Marks the end of the prefetchable unit. Everything after this point
+    // (annotation-worker spawn, first window) needs the workers, so it cannot be
+    // moved off the critical path by prefetching. The gap between `context done`
+    // and this event is the provider-build + lookup-spawn tail, which is what a
+    // narrower prefetch would give back.
+    pipeline_trace::emit(
+        "prepare",
+        "done",
+        &[
+            ("chrom", TraceValue::Str(&chrom)),
+            ("elapsed", TraceValue::Duration(t_contig.elapsed())),
+        ],
+    );
 
     Ok(Some(ContigReadyState {
         lookup_partitions,
