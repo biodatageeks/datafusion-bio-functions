@@ -9122,19 +9122,6 @@ async fn load_contig_context(
             "transcript_uid",
         ],
     );
-    let ex_scan = spawn_context_scan(
-        cache,
-        "exon",
-        chrom,
-        &[
-            "transcript_id",
-            "stable_id",
-            "exon_number",
-            "start",
-            "\"end\"",
-            "chrom",
-        ],
-    );
     let tl_scan = spawn_context_scan(
         cache,
         "translation_core",
@@ -9158,41 +9145,16 @@ async fn load_contig_context(
             "protein_features",
         ],
     );
-    let rg_scan = spawn_context_scan(
-        cache,
-        "regulatory",
-        chrom,
-        &[
-            "stable_id",
-            "feature_id",
-            "feature_type",
-            "chrom",
-            "start",
-            "\"end\"",
-        ],
-    );
-    let mt_scan = spawn_context_scan(
-        cache,
-        "motif",
-        chrom,
-        &[
-            "motif_id",
-            "feature_id",
-            "chrom",
-            "start",
-            "\"end\"",
-            "binding_matrix",
-            "transcription_factors",
-            "strand",
-            "binding_matrix_length",
-            "binding_matrix_elements",
-            "binding_matrix_unit",
-            "motif_seq",
-        ],
-    );
-    // The `*_scan` counters below are now completion times measured from the start
-    // of the concurrent scan phase, not per-shard durations, so they no longer sum
-    // to the phase wall. They still identify which shard is the straggler.
+    // Only `transcript` (~0.40s) and `translation_core` (~0.18s) are worth
+    // overlapping. `exon`, `regulatory` and `motif` together take ~0.05s, so
+    // spawning them bought no measurable time while adding three more Parquet
+    // decoders — and their transient decode buffers, over shards carrying the
+    // large sequence columns, cost ~1.2 GB of peak RSS at `workers=1`. They stay
+    // sequential, below, at the point where their output is consumed.
+    //
+    // The transcript `*_scan` counter is a completion time measured from the start
+    // of the overlapped phase rather than a standalone duration, so it and
+    // `context_translations_scan` no longer sum to the phase wall.
     let tx_batches = join_context_scan(tx_scan).await?;
     record_contig_profile(profile, |profile| {
         profile.context_transcripts_scan += scan_started.elapsed();
@@ -9209,9 +9171,23 @@ async fn load_contig_context(
     });
     let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
 
-    let ex_batches = join_context_scan(ex_scan).await?;
+    let ex_scan_started = Instant::now();
+    let ex_batches = scan_context_entity(
+        cache,
+        "exon",
+        chrom,
+        &[
+            "transcript_id",
+            "stable_id",
+            "exon_number",
+            "start",
+            "\"end\"",
+            "chrom",
+        ],
+    )
+    .await?;
     record_contig_profile(profile, |profile| {
-        profile.context_exons_scan += scan_started.elapsed();
+        profile.context_exons_scan += ex_scan_started.elapsed();
     });
     let started = Instant::now();
     let ex: Vec<_> = AnnotateProvider::parse_exon_batches("exon", &ex_batches)?
@@ -9235,9 +9211,23 @@ async fn load_contig_context(
         profile.context_translations += started.elapsed();
     });
 
-    let rg_batches = join_context_scan(rg_scan).await?;
+    let rg_scan_started = Instant::now();
+    let rg_batches = scan_context_entity(
+        cache,
+        "regulatory",
+        chrom,
+        &[
+            "stable_id",
+            "feature_id",
+            "feature_type",
+            "chrom",
+            "start",
+            "\"end\"",
+        ],
+    )
+    .await?;
     record_contig_profile(profile, |profile| {
-        profile.context_regulatory_scan += scan_started.elapsed();
+        profile.context_regulatory_scan += rg_scan_started.elapsed();
     });
     let started = Instant::now();
     let rg = AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)?;
@@ -9245,9 +9235,29 @@ async fn load_contig_context(
         profile.context_regulatory += started.elapsed();
     });
 
-    let mt_batches = join_context_scan(mt_scan).await?;
+    let mt_scan_started = Instant::now();
+    let mt_batches = scan_context_entity(
+        cache,
+        "motif",
+        chrom,
+        &[
+            "motif_id",
+            "feature_id",
+            "chrom",
+            "start",
+            "\"end\"",
+            "binding_matrix",
+            "transcription_factors",
+            "strand",
+            "binding_matrix_length",
+            "binding_matrix_elements",
+            "binding_matrix_unit",
+            "motif_seq",
+        ],
+    )
+    .await?;
     record_contig_profile(profile, |profile| {
-        profile.context_motifs_scan += scan_started.elapsed();
+        profile.context_motifs_scan += mt_scan_started.elapsed();
     });
     let started = Instant::now();
     let mt = AnnotateProvider::parse_motif_batches("motif", &mt_batches)?;
