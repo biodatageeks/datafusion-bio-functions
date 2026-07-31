@@ -101,6 +101,9 @@ pub struct LookupProvider {
     /// pre-existing behaviour, one load per exec).
     #[cfg(feature = "parquet-cache")]
     parquet_lookup_cell: Option<Arc<ParquetVariationLookupCell>>,
+    /// Pre-resolved answer to "does the input VCF use `chr`-prefixed contig
+    /// names". `None` means `scan` resolves it itself with a probe query.
+    vcf_has_chr: Option<bool>,
 }
 
 fn normalize_cache_output_type(data_type: &DataType) -> DataType {
@@ -172,7 +175,15 @@ impl LookupProvider {
             vcf_filter: None,
             #[cfg(feature = "parquet-cache")]
             parquet_lookup_cell: None,
+            vcf_has_chr: None,
         })
+    }
+
+    /// Supply the already-resolved `chr`-prefix answer for the input VCF, so
+    /// `scan` skips its `SELECT chrom ... LIMIT 1` probe. Resolve it once per
+    /// contig and pass it to every grid worker.
+    pub fn set_vcf_has_chr(&mut self, vcf_has_chr: bool) {
+        self.vcf_has_chr = Some(vcf_has_chr);
     }
 
     /// Share one per-contig Parquet variation lookup with the other providers of
@@ -221,7 +232,7 @@ impl LookupProvider {
 }
 
 /// Check whether the chrom column in the given table uses "chr" prefix (e.g. "chr1").
-async fn has_chr_prefix(session: &SessionContext, table: &str) -> Result<bool> {
+pub(crate) async fn has_chr_prefix(session: &SessionContext, table: &str) -> Result<bool> {
     let batches = session
         .sql(&format!("SELECT `chrom` FROM `{table}` LIMIT 1"))
         .await?
@@ -278,7 +289,13 @@ impl TableProvider for LookupProvider {
             use crate::cache::lookup_exec::{KvLookupExec, KvMatchMode};
 
             let _ = self.parquet_backend;
-            let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
+            // Callers that build one provider per grid worker resolve this once for
+            // the contig and pass it in; it is a property of the input VCF, so
+            // re-running the probe query per worker only repeats serial work.
+            let vcf_has_chr = match self.vcf_has_chr {
+                Some(known) => known,
+                None => has_chr_prefix(&self.session, &self.vcf_table).await?,
+            };
             let vcf_df = self.session.table(&self.vcf_table).await?;
             let vcf_df = if let Some(ref filter) = self.vcf_filter {
                 vcf_df.filter(filter.clone())?

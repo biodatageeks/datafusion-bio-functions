@@ -9057,8 +9057,15 @@ async fn load_contig_context(
     config: &ContigAnnotationConfig,
     profile: &Option<SharedContigPipelineProfile>,
 ) -> Result<LoadedContigContext> {
+    // The five context entities live in separate Parquet files, so their scans are
+    // independent and run concurrently. Only the *parses* have a dependency (exon
+    // and translation filter on the transcript ids), so those stay ordered below.
+    //
+    // Spawned rather than merely joined: each scan is a streaming read with zstd
+    // decode, i.e. synchronous CPU work between awaits, so futures polled on one
+    // task would interleave without using more than one core.
     let scan_started = Instant::now();
-    let tx_batches = scan_context_entity(
+    let tx_scan = spawn_context_scan(
         cache,
         "transcript",
         chrom,
@@ -9114,25 +9121,8 @@ async fn load_contig_context(
             "ncrna_structure",
             "transcript_uid",
         ],
-    )
-    .await?;
-    record_contig_profile(profile, |profile| {
-        profile.context_transcripts_scan += scan_started.elapsed();
-    });
-    let started = Instant::now();
-    let (tx, translateable_seq) =
-        AnnotateProvider::parse_transcript_batches("transcript", &tx_batches)?;
-    let tx_vec: Vec<_> = tx
-        .into_iter()
-        .filter(|t| passes_transcript_selection(t, config.transcript_selection))
-        .collect();
-    record_contig_profile(profile, |profile| {
-        profile.context_transcripts += started.elapsed();
-    });
-    let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
-
-    let scan_started = Instant::now();
-    let ex_batches = scan_context_entity(
+    );
+    let ex_scan = spawn_context_scan(
         cache,
         "exon",
         chrom,
@@ -9144,22 +9134,8 @@ async fn load_contig_context(
             "\"end\"",
             "chrom",
         ],
-    )
-    .await?;
-    record_contig_profile(profile, |profile| {
-        profile.context_exons_scan += scan_started.elapsed();
-    });
-    let started = Instant::now();
-    let ex: Vec<_> = AnnotateProvider::parse_exon_batches("exon", &ex_batches)?
-        .into_iter()
-        .filter(|exon| tx_ids.contains(&exon.transcript_id))
-        .collect();
-    record_contig_profile(profile, |profile| {
-        profile.context_exons += started.elapsed();
-    });
-
-    let scan_started = Instant::now();
-    let tl_batches = scan_context_entity(
+    );
+    let tl_scan = spawn_context_scan(
         cache,
         "translation_core",
         chrom,
@@ -9181,22 +9157,8 @@ async fn load_contig_context(
             "version",
             "protein_features",
         ],
-    )
-    .await?;
-    record_contig_profile(profile, |profile| {
-        profile.context_translations_scan += scan_started.elapsed();
-    });
-    let started = Instant::now();
-    let tl: Vec<_> = AnnotateProvider::parse_translation_batches("translation_core", &tl_batches)?
-        .into_iter()
-        .filter(|translation| tx_ids.contains(&translation.transcript_id))
-        .collect();
-    record_contig_profile(profile, |profile| {
-        profile.context_translations += started.elapsed();
-    });
-
-    let scan_started = Instant::now();
-    let rg_batches = scan_context_entity(
+    );
+    let rg_scan = spawn_context_scan(
         cache,
         "regulatory",
         chrom,
@@ -9208,19 +9170,8 @@ async fn load_contig_context(
             "start",
             "\"end\"",
         ],
-    )
-    .await?;
-    record_contig_profile(profile, |profile| {
-        profile.context_regulatory_scan += scan_started.elapsed();
-    });
-    let started = Instant::now();
-    let rg = AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)?;
-    record_contig_profile(profile, |profile| {
-        profile.context_regulatory += started.elapsed();
-    });
-
-    let scan_started = Instant::now();
-    let mt_batches = scan_context_entity(
+    );
+    let mt_scan = spawn_context_scan(
         cache,
         "motif",
         chrom,
@@ -9238,8 +9189,63 @@ async fn load_contig_context(
             "binding_matrix_unit",
             "motif_seq",
         ],
-    )
-    .await?;
+    );
+    // The `*_scan` counters below are now completion times measured from the start
+    // of the concurrent scan phase, not per-shard durations, so they no longer sum
+    // to the phase wall. They still identify which shard is the straggler.
+    let tx_batches = join_context_scan(tx_scan).await?;
+    record_contig_profile(profile, |profile| {
+        profile.context_transcripts_scan += scan_started.elapsed();
+    });
+    let started = Instant::now();
+    let (tx, translateable_seq) =
+        AnnotateProvider::parse_transcript_batches("transcript", &tx_batches)?;
+    let tx_vec: Vec<_> = tx
+        .into_iter()
+        .filter(|t| passes_transcript_selection(t, config.transcript_selection))
+        .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_transcripts += started.elapsed();
+    });
+    let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
+
+    let ex_batches = join_context_scan(ex_scan).await?;
+    record_contig_profile(profile, |profile| {
+        profile.context_exons_scan += scan_started.elapsed();
+    });
+    let started = Instant::now();
+    let ex: Vec<_> = AnnotateProvider::parse_exon_batches("exon", &ex_batches)?
+        .into_iter()
+        .filter(|exon| tx_ids.contains(&exon.transcript_id))
+        .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_exons += started.elapsed();
+    });
+
+    let tl_batches = join_context_scan(tl_scan).await?;
+    record_contig_profile(profile, |profile| {
+        profile.context_translations_scan += scan_started.elapsed();
+    });
+    let started = Instant::now();
+    let tl: Vec<_> = AnnotateProvider::parse_translation_batches("translation_core", &tl_batches)?
+        .into_iter()
+        .filter(|translation| tx_ids.contains(&translation.transcript_id))
+        .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_translations += started.elapsed();
+    });
+
+    let rg_batches = join_context_scan(rg_scan).await?;
+    record_contig_profile(profile, |profile| {
+        profile.context_regulatory_scan += scan_started.elapsed();
+    });
+    let started = Instant::now();
+    let rg = AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)?;
+    record_contig_profile(profile, |profile| {
+        profile.context_regulatory += started.elapsed();
+    });
+
+    let mt_batches = join_context_scan(mt_scan).await?;
     record_contig_profile(profile, |profile| {
         profile.context_motifs_scan += scan_started.elapsed();
     });
@@ -9268,6 +9274,37 @@ async fn scan_context_entity(
         return Ok(Vec::new());
     }
     crate::parquet_cache::scan::read_context_parquet(&path, columns).await
+}
+
+/// Spawn `scan_context_entity` onto the runtime so several context shards decode
+/// on different cores. Takes owned copies of the borrowed arguments because a
+/// spawned task must be `'static`; `PartitionedParquetCache` is a path plus the
+/// variation manifest, so the clone is cheap relative to reading a shard.
+#[cfg(feature = "parquet-cache")]
+fn spawn_context_scan(
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
+    entity: &str,
+    chrom: &str,
+    columns: &[&str],
+) -> tokio::task::JoinHandle<Result<Vec<RecordBatch>>> {
+    let cache = cache.clone();
+    let entity = entity.to_string();
+    let chrom = chrom.to_string();
+    let columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+    tokio::spawn(async move {
+        let column_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        scan_context_entity(&cache, &entity, &chrom, &column_refs).await
+    })
+}
+
+/// Await a spawned context scan, flattening the join error into a DataFusion one.
+#[cfg(feature = "parquet-cache")]
+async fn join_context_scan(
+    handle: tokio::task::JoinHandle<Result<Vec<RecordBatch>>>,
+) -> Result<Vec<RecordBatch>> {
+    handle
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
 }
 
 struct SharedContigAnnotationContext {
@@ -12462,6 +12499,7 @@ async fn count_contig_buffer_boundaries(
     chrom: &str,
     input_buffer_size: usize,
 ) -> Result<(Vec<GridBufferBoundary>, usize)> {
+    let count_started = Instant::now();
     let provider = session.table_provider(vcf_table).await?;
     let schema = provider.schema();
     let mut proj = vec![schema.index_of("start")?];
@@ -12481,13 +12519,51 @@ async fn count_contig_buffer_boundaries(
         .await?;
     let partition_count = plan.output_partitioning().partition_count().max(1);
     let task_ctx = session.task_ctx();
+    // Read the partitions concurrently, then concatenate them in partition order.
+    //
+    // Order is load-bearing: `accumulate_boundaries` is a sequential state machine
+    // over the row sequence (running `global_row`, position-tie runs, buffer fill),
+    // so the concatenation must reproduce the serial drain exactly. It does:
+    // the indexed VCF scan assigns contiguous ascending position ranges to
+    // partitions (linear-scan balancing over tabix regions), so partition order is
+    // position order, and each partition reads its own regions from its own file
+    // handle. Only row order matters — batch boundaries do not, since the state
+    // machine carries across batches and skips empty ones.
+    //
+    // These are spawned rather than merely joined: bgzf decode and VCF parsing are
+    // synchronous CPU work, so futures polled on a single task would interleave
+    // without using more than one core.
+    let partition_reads: Vec<_> = (0..partition_count)
+        .map(|partition_id| {
+            let plan = Arc::clone(&plan);
+            let task_ctx = Arc::clone(&task_ctx);
+            tokio::spawn(async move {
+                let mut stream = plan.execute(partition_id, task_ctx)?;
+                let mut partition_batches = Vec::new();
+                while let Some(batch) = stream.next().await {
+                    partition_batches.push(batch?);
+                }
+                Ok::<Vec<RecordBatch>, DataFusionError>(partition_batches)
+            })
+        })
+        .collect();
     let mut batches = Vec::new();
-    for partition_id in 0..partition_count {
-        let mut stream = plan.execute(partition_id, Arc::clone(&task_ctx))?;
-        while let Some(batch) = stream.next().await {
-            batches.push(batch?);
-        }
+    for read in partition_reads {
+        let partition_batches = read
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))??;
+        batches.extend(partition_batches);
     }
+    pipeline_trace::emit(
+        "grid_count",
+        "done",
+        &[
+            ("chrom", TraceValue::Str(chrom)),
+            ("partitions", TraceValue::Usize(partition_count)),
+            ("batches", TraceValue::Usize(batches.len())),
+            ("elapsed", TraceValue::Duration(count_started.elapsed())),
+        ],
+    );
     accumulate_boundaries(&batches, input_buffer_size)
 }
 
@@ -12813,6 +12889,13 @@ async fn prepare_contig_context(
         // this contig: it is rebuilt on the next `prepare_contig_context`.
         #[cfg(feature = "parquet-cache")]
         let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
+        // Whether the input VCF uses `chr`-prefixed names is a property of the
+        // file, not of a worker's range, so resolve it once for the contig. Each
+        // resolution plans and executes a `SELECT chrom ... LIMIT 1` against a
+        // target_partitions-wide scan, and the per-worker loop is serial, so doing
+        // it per worker put N of those probes on the critical path.
+        let vcf_has_chr =
+            crate::lookup_provider::has_chr_prefix(&session, &config.vcf_table).await?;
         for (i, slice) in slices.iter().enumerate() {
             let mut wprovider = LookupProvider::new(
                 Arc::clone(&session),
@@ -12837,6 +12920,7 @@ async fn prepare_contig_context(
             }
             wprovider.set_vcf_filter(Some(filter));
             wprovider.set_target_partitions(config.target_partitions);
+            wprovider.set_vcf_has_chr(vcf_has_chr);
             #[cfg(feature = "parquet-cache")]
             if let Some(root) = &config.cache_root {
                 wprovider.set_cache_root(root.clone());
