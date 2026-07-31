@@ -17,6 +17,8 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 
+#[cfg(feature = "parquet-cache")]
+use crate::cache::lookup_exec::ParquetVariationLookupCell;
 use crate::colocated::ColocatedSink;
 use crate::coordinate::CoordinateNormalizer;
 use crate::schema_contract::validate_variation_schema;
@@ -93,6 +95,12 @@ pub struct LookupProvider {
     /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
     /// for per-contig partitioned annotation).
     vcf_filter: Option<Expr>,
+    /// Single-flight cell for the per-contig Parquet variation lookup, supplied
+    /// by the caller so that the grid workers of one contig share a single shard
+    /// footer + page index. `None` means this provider owns its own cell (the
+    /// pre-existing behaviour, one load per exec).
+    #[cfg(feature = "parquet-cache")]
+    parquet_lookup_cell: Option<Arc<ParquetVariationLookupCell>>,
 }
 
 fn normalize_cache_output_type(data_type: &DataType) -> DataType {
@@ -162,7 +170,18 @@ impl LookupProvider {
             parquet_backend: false,
             target_partitions: 1,
             vcf_filter: None,
+            #[cfg(feature = "parquet-cache")]
+            parquet_lookup_cell: None,
         })
+    }
+
+    /// Share one per-contig Parquet variation lookup with the other providers of
+    /// the same contig. Pass the same `Arc` to every grid worker so the shard
+    /// footer and page index are loaded once per contig instead of once per
+    /// worker. The cell must not be reused across contigs.
+    #[cfg(feature = "parquet-cache")]
+    pub fn set_parquet_lookup_cell(&mut self, cell: Arc<ParquetVariationLookupCell>) {
+        self.parquet_lookup_cell = Some(cell);
     }
 
     /// Set the co-located data sink for piggybacked collection during probe.
@@ -287,6 +306,9 @@ impl TableProvider for LookupProvider {
             }
             if let Some(ref sinks) = self.partition_colocated_sinks {
                 exec = exec.with_colocated_partition_sinks(sinks.clone());
+            }
+            if let Some(ref cell) = self.parquet_lookup_cell {
+                exec = exec.with_parquet_lookup_cell(Arc::clone(cell));
             }
             let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
             return wrap_with_projection(plan, projection);

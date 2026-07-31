@@ -123,8 +123,19 @@ pub struct KvLookupExec {
     /// once and shared across all per-partition streams via the Arc. Single-flight
     /// via OnceCell so simultaneous fan-out probes build it exactly once.
     #[cfg(feature = "parquet-cache")]
-    parquet_lookup_cell: Arc<OnceCell<Arc<SinglePathParquetVariationLookup>>>,
+    parquet_lookup_cell: Arc<ParquetVariationLookupCell>,
 }
+
+/// Single-flight cell holding one contig's Parquet variation lookup together
+/// with the contig it was opened for.
+///
+/// The contig key is stored rather than derived from the shard path: the shard
+/// file is `variation/{prefixed_chrom}.parquet` while the engine probes with the
+/// normalized contig name (`21`, not `chr21`), so the two are not comparable.
+/// Keeping the probe-side key makes the "one cell per contig" invariant checkable
+/// without re-reading the cache manifest.
+#[cfg(feature = "parquet-cache")]
+pub type ParquetVariationLookupCell = OnceCell<(String, Arc<SinglePathParquetVariationLookup>)>;
 
 #[derive(Debug, Clone)]
 struct VariationLookupStorage {
@@ -216,6 +227,20 @@ impl KvLookupExec {
 
     pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
         self.target_partitions = target_partitions.max(1);
+        self
+    }
+
+    /// Adopt a caller-owned single-flight cell for the per-contig Parquet
+    /// variation lookup, so several independently built execs (one per grid
+    /// worker) load the shard footer + page index exactly once between them
+    /// instead of once each.
+    ///
+    /// The cell holds one contig's shard, so it MUST NOT outlive the contig that
+    /// created it — `ensure_parquet_lookup` checks the cached contig key against
+    /// the contig being probed rather than trusting the caller.
+    #[cfg(feature = "parquet-cache")]
+    pub fn with_parquet_lookup_cell(mut self, cell: Arc<ParquetVariationLookupCell>) -> Self {
+        self.parquet_lookup_cell = cell;
         self
     }
 
@@ -375,7 +400,7 @@ struct KvLookupStream {
     /// Shared (Arc-cloned from the exec) per-contig Parquet variation lookup,
     /// built once.
     #[cfg(feature = "parquet-cache")]
-    parquet_lookup_cell: Arc<OnceCell<Arc<SinglePathParquetVariationLookup>>>,
+    parquet_lookup_cell: Arc<ParquetVariationLookupCell>,
     warm_cold_backend: WarmColdVariationBackend,
     warm_cold_index_mode: WarmColdVariationIndexMode,
     profile_enabled: bool,
@@ -1365,6 +1390,17 @@ impl KvLookupStream {
         collect_colocated: bool,
     ) -> Result<()> {
         let cache_root = self.variation_storage.cache_root.clone();
+        // A cell shared across grid workers is scoped to one contig. If an
+        // already-built cell holds another contig's shard, every probe from here
+        // on would silently read the wrong variants, so fail loudly instead.
+        if let Some((cached_chrom, _)) = self.parquet_lookup_cell.get() {
+            if cached_chrom != chrom {
+                return Err(DataFusionError::Internal(format!(
+                    "parquet variation lookup cell holds shard for contig {cached_chrom} while \
+                     probing contig {chrom}; the shared cell must be scoped to a single contig"
+                )));
+            }
+        }
         if self.parquet_lookup_cell.get().is_none() {
             let cache = crate::parquet_cache::detect::PartitionedParquetCache::detect(
                 cache_root.to_string_lossy().as_ref(),
@@ -1388,7 +1424,7 @@ impl KvLookupStream {
                 cell.get_or_try_init(|| async {
                     SinglePathParquetVariationLookup::open(&path, projection)
                         .await
-                        .map(Arc::new)
+                        .map(|lookup| (chrom.to_string(), Arc::new(lookup)))
                 })
                 .await
                 .cloned()
@@ -1671,7 +1707,7 @@ impl KvLookupStream {
                 starts.dedup();
                 let take_started = self.profile_enabled.then(Instant::now);
                 let taken = {
-                    let lookup = self.parquet_lookup_cell.get().ok_or_else(|| {
+                    let (_, lookup) = self.parquet_lookup_cell.get().ok_or_else(|| {
                         DataFusionError::Execution(format!(
                             "parquet variation lookup not built for {chrom}"
                         ))

@@ -12804,6 +12804,15 @@ async fn prepare_contig_context(
         let slices = plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp);
         let _ = _total_rows;
         let task_ctx = session.task_ctx();
+        // All workers of this contig probe the same variation shard, and the
+        // lookup is immutable once opened (its per-partition cursor is a
+        // stateless placeholder, and each probe opens its own file handle). Share
+        // one single-flight cell so the shard footer + page index are decoded
+        // once per contig rather than once per worker — the page index alone is
+        // ~0.5 GB for chr1, so per-worker loads dominated peak RSS. Scoped to
+        // this contig: it is rebuilt on the next `prepare_contig_context`.
+        #[cfg(feature = "parquet-cache")]
+        let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
         for (i, slice) in slices.iter().enumerate() {
             let mut wprovider = LookupProvider::new(
                 Arc::clone(&session),
@@ -12834,6 +12843,7 @@ async fn prepare_contig_context(
                 if config.parquet_backend {
                     wprovider.set_parquet_backend(true);
                 }
+                wprovider.set_parquet_lookup_cell(Arc::clone(&shared_parquet_lookup_cell));
             }
             let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
             if config.flags.check_existing {
