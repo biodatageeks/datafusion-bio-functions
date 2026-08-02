@@ -9902,13 +9902,15 @@ fn accumulate_boundaries(
 /// The prefetchable half of a contig's preparation: everything that reads data
 /// or builds read-only state, with no lookup worker spawned yet. Produced by
 /// `prepare_contig_data()` and consumed by `finish_contig_prepare()`, which
-/// builds the N per-worker `LookupProvider`s and spawns their workers.
+/// builds the per-worker `LookupProvider`s and spawns their workers — for both
+/// the grid path and the byte-budget path.
 ///
 /// The split is what makes prefetching cheap. `prepare_contig_data` costs one
 /// resident contig context (~1.7 GB on WGS, independent of worker count);
-/// `finish_contig_prepare` costs ~0.3 GB per worker. Running only the first
-/// half ahead of time keeps the prelude off the critical path without paying
-/// the per-worker startup footprint twice.
+/// `finish_contig_prepare` is what scales with worker count. Running only the
+/// first half ahead of time keeps the prelude off the critical path without
+/// paying the per-worker startup footprint twice: measured at 1.4-2.0 GB of
+/// peak RSS on a merged cache and 2.39 GB on an Ensembl cache at w=8.
 struct ContigPreparedData {
     session: Arc<SessionContext>,
     config: ContigAnnotationConfig,
@@ -9919,9 +9921,10 @@ struct ContigPreparedData {
     /// Schemas for the per-worker `LookupProvider`s built in the deferred half.
     grid_vcf_schema: Schema,
     grid_cache_schema: Schema,
-    /// True when the deferred half must build grid-aligned per-worker lookups
-    /// (stateful Merged/RefSeq at workers>1). Otherwise `lookup_partitions` is
-    /// already populated and the deferred half is a no-op.
+    /// Selects which lookup the deferred half builds: grid-aligned per-worker
+    /// scans (stateful Merged/RefSeq at workers>1) when true, otherwise the
+    /// byte-budget scan from `byte_budget_provider`. Either way the spawn
+    /// happens in `finish_contig_prepare`, never here.
     stateful_parallel: bool,
     /// Grid-aligned per-worker slices. Empty unless `stateful_parallel`.
     slices: Vec<WorkerGridSlice>,
@@ -9934,9 +9937,18 @@ struct ContigPreparedData {
     /// decoded until a worker first probes) and must not outlive the contig.
     #[cfg(feature = "parquet-cache")]
     shared_parquet_lookup_cell: Arc<crate::cache::lookup_exec::ParquetVariationLookupCell>,
-    /// Lookup workers already spawned by the non-grid paths. Empty when
-    /// `stateful_parallel`; the deferred half fills it.
+    /// Always empty here — `finish_contig_prepare` fills it for whichever path
+    /// applies. Kept in the struct so the deferred half has somewhere to push
+    /// without allocating a second deque.
     lookup_partitions: VecDeque<LookupPartitionHandle>,
+    /// Byte-budget lookup provider, carried so the non-grid paths spawn their
+    /// workers in the deferred half too. `None` only if the deferred half has
+    /// already consumed it.
+    byte_budget_provider: Option<LookupProvider>,
+    /// Colocated sink for the single-stream (non-partitioned) lookup path.
+    byte_budget_fallback_sink: ColocatedSink,
+    /// Whether the byte-budget path partitions its lookup scan.
+    byte_budget_parallel_lookup: bool,
     shared_context: Arc<SharedContigAnnotationContext>,
     ephemeral_tables: Vec<String>,
     /// Clone of the pipeline profile handle; the original was moved into
@@ -12715,8 +12727,8 @@ async fn count_contig_buffer_boundaries(
 /// Prefetchable half of contig preparation: validate identity, read schemas,
 /// load the contig context concurrently with the grid count pass, load SIFT,
 /// build the shared indexes, and plan the per-worker grid slices — but spawn no
-/// grid lookup worker. `finish_contig_prepare()` does that when the contig
-/// actually starts.
+/// lookup worker at all, on any path. `finish_contig_prepare()` does that when
+/// the contig actually starts.
 async fn prepare_contig_data(
     session: Arc<SessionContext>,
     cache: Arc<PartitionedAnnotationCache>,
@@ -12829,68 +12841,17 @@ async fn prepare_contig_data(
         }
     }
     let parallel_lookup = cache_enabled;
-    let mut lookup_partitions = if stateful_parallel {
-        // Deferred: grid-aligned per-worker lookup scans are spawned after the
-        // context load below (once overlap_width_bp is known). The `provider`
-        // built above is unused on this path.
-        VecDeque::new()
-    } else if parallel_lookup {
-        let session_state = session.state();
-        let mut plan = provider.scan(&session_state, None, &[], None).await?;
-        let mut partition_count = plan.output_partitioning().partition_count().max(1);
-        let partition_coloc_sinks: Vec<ColocatedSink> = if config.flags.check_existing {
-            let sinks = (0..partition_count)
-                .map(|_| Arc::new(Mutex::new(HashMap::new())) as ColocatedSink)
-                .collect::<Vec<_>>();
-            provider.set_partition_colocated_sinks(sinks.clone());
-            plan = provider.scan(&session_state, None, &[], None).await?;
-            partition_count = plan.output_partitioning().partition_count().max(1);
-            if partition_count > sinks.len() {
-                return Err(DataFusionError::Execution(format!(
-                    "lookup plan produced {partition_count} partitions but only {} colocated sinks were configured",
-                    sinks.len()
-                )));
-            }
-            sinks
-        } else {
-            Vec::new()
-        };
-
-        let task_ctx = session.task_ctx();
-        let mut handles = VecDeque::with_capacity(partition_count);
-        for partition_id in 0..partition_count {
-            let sink = partition_coloc_sinks
-                .get(partition_id)
-                .cloned()
-                .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
-            handles.push_back(spawn_lookup_partition_worker(
-                Arc::clone(&plan),
-                Arc::clone(&task_ctx),
-                partition_id,
-                partition_id,
-                chrom.to_string(),
-                sink,
-                LOOKUP_PARTITION_QUEUE_BATCHES,
-                pipeline_profile.clone(),
-            ));
-        }
-        handles
-    } else {
-        if config.flags.check_existing {
-            provider.set_colocated_sink(Arc::clone(&fallback_coloc_sink));
-        }
-        let session_state = session.state();
-        let plan = provider.scan(&session_state, None, &[], None).await?;
-        let lookup_stream = plan.execute(0, session.task_ctx())?;
-        VecDeque::from([spawn_lookup_stream_worker(
-            lookup_stream,
-            plan.schema(),
-            chrom.to_string(),
-            fallback_coloc_sink,
-            LOOKUP_PARTITION_QUEUE_BATCHES,
-            pipeline_profile.clone(),
-        )])
-    };
+    // No lookup worker is spawned here. Both the grid path and the byte-budget
+    // path spawn in `finish_contig_prepare`, so a prefetched contig carries no
+    // lookup workers whatever the cache source type.
+    //
+    // The byte-budget spawn used to sit here, before the context load, so that
+    // each worker's build+probe (which happens on first poll) overlapped it.
+    // Measured on an Ensembl cache at w=8 (n=3), giving that overlap up costs
+    // +3.55s wall (+7.0%) and buys back 2.39 GB of peak RSS (-24.2%) — the same
+    // trade the grid path already makes, at a better memory ratio. CPU *falls*
+    // 4.4%, so the extra wall time is idle wait, not extra work.
+    let mut lookup_partitions: VecDeque<LookupPartitionHandle> = VecDeque::new();
     record_contig_profile(&pipeline_profile, |profile| {
         profile.lookup_partitions = lookup_partitions.len();
     });
@@ -13122,6 +13083,9 @@ async fn prepare_contig_data(
         #[cfg(feature = "parquet-cache")]
         shared_parquet_lookup_cell,
         lookup_partitions,
+        byte_budget_provider: Some(provider),
+        byte_budget_fallback_sink: fallback_coloc_sink,
+        byte_budget_parallel_lookup: parallel_lookup,
         shared_context,
         ephemeral_tables,
         profile_handle,
@@ -13129,14 +13093,18 @@ async fn prepare_contig_data(
     }))
 }
 
-/// Deferred half of contig preparation: build the grid-aligned per-worker
-/// `LookupProvider`s and spawn their lookup workers. Split out of
-/// `prepare_contig_data` because this is where the ~0.3 GB-per-worker startup
-/// footprint is paid — running it only when the contig actually starts keeps a
-/// prefetched contig down to one resident context.
+/// Deferred half of contig preparation: build the per-worker `LookupProvider`s
+/// and spawn their lookup workers. Split out of `prepare_contig_data` because
+/// this is where the per-worker startup footprint is paid — running it only when
+/// the contig actually starts keeps a prefetched contig down to one resident
+/// context.
 ///
-/// A no-op for the non-grid paths, whose workers were already spawned (and
-/// deliberately left overlapping the context load) in `prepare_contig_data`.
+/// Handles both lookup strategies: grid-aligned per-worker scans when
+/// `stateful_parallel`, otherwise the byte-budget scan. The byte-budget spawn
+/// used to run before the context load so its build+probe overlapped it; giving
+/// that overlap up costs ~7% wall on an Ensembl cache at w=8 and returns 2.39 GB
+/// of peak RSS, so prefetch now carries no lookup workers whatever the cache
+/// source type.
 async fn finish_contig_prepare(data: ContigPreparedData) -> Result<Option<ContigReadyState>> {
     let ContigPreparedData {
         session,
@@ -13151,6 +13119,9 @@ async fn finish_contig_prepare(data: ContigPreparedData) -> Result<Option<Contig
         #[cfg(feature = "parquet-cache")]
         shared_parquet_lookup_cell,
         mut lookup_partitions,
+        byte_budget_provider,
+        byte_budget_fallback_sink,
+        byte_budget_parallel_lookup,
         shared_context,
         ephemeral_tables,
         profile_handle,
@@ -13210,6 +13181,65 @@ async fn finish_contig_prepare(data: ContigPreparedData) -> Result<Option<Contig
             ));
         }
         grid_slices = slices;
+        record_contig_profile(&profile_handle, |profile| {
+            profile.lookup_partitions = lookup_partitions.len();
+        });
+    } else if let Some(mut provider) = byte_budget_provider {
+        // Byte-budget path (Ensembl source, or any source at workers==1).
+        if byte_budget_parallel_lookup {
+            let session_state = session.state();
+            let mut plan = provider.scan(&session_state, None, &[], None).await?;
+            let mut partition_count = plan.output_partitioning().partition_count().max(1);
+            let partition_coloc_sinks: Vec<ColocatedSink> = if config.flags.check_existing {
+                let sinks = (0..partition_count)
+                    .map(|_| Arc::new(Mutex::new(HashMap::new())) as ColocatedSink)
+                    .collect::<Vec<_>>();
+                provider.set_partition_colocated_sinks(sinks.clone());
+                plan = provider.scan(&session_state, None, &[], None).await?;
+                partition_count = plan.output_partitioning().partition_count().max(1);
+                if partition_count > sinks.len() {
+                    return Err(DataFusionError::Execution(format!(
+                        "lookup plan produced {partition_count} partitions but only {} colocated sinks were configured",
+                        sinks.len()
+                    )));
+                }
+                sinks
+            } else {
+                Vec::new()
+            };
+            let task_ctx = session.task_ctx();
+            for partition_id in 0..partition_count {
+                let sink = partition_coloc_sinks
+                    .get(partition_id)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+                lookup_partitions.push_back(spawn_lookup_partition_worker(
+                    Arc::clone(&plan),
+                    Arc::clone(&task_ctx),
+                    partition_id,
+                    partition_id,
+                    chrom.to_string(),
+                    sink,
+                    LOOKUP_PARTITION_QUEUE_BATCHES,
+                    profile_handle.clone(),
+                ));
+            }
+        } else {
+            if config.flags.check_existing {
+                provider.set_colocated_sink(Arc::clone(&byte_budget_fallback_sink));
+            }
+            let session_state = session.state();
+            let plan = provider.scan(&session_state, None, &[], None).await?;
+            let lookup_stream = plan.execute(0, session.task_ctx())?;
+            lookup_partitions.push_back(spawn_lookup_stream_worker(
+                lookup_stream,
+                plan.schema(),
+                chrom.to_string(),
+                byte_budget_fallback_sink,
+                LOOKUP_PARTITION_QUEUE_BATCHES,
+                profile_handle.clone(),
+            ));
+        }
         record_contig_profile(&profile_handle, |profile| {
             profile.lookup_partitions = lookup_partitions.len();
         });
