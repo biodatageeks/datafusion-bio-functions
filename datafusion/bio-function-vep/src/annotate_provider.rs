@@ -9902,13 +9902,15 @@ fn accumulate_boundaries(
 /// The prefetchable half of a contig's preparation: everything that reads data
 /// or builds read-only state, with no lookup worker spawned yet. Produced by
 /// `prepare_contig_data()` and consumed by `finish_contig_prepare()`, which
-/// builds the N per-worker `LookupProvider`s and spawns their workers.
+/// builds the per-worker `LookupProvider`s and spawns their workers — for both
+/// the grid path and the byte-budget path.
 ///
 /// The split is what makes prefetching cheap. `prepare_contig_data` costs one
 /// resident contig context (~1.7 GB on WGS, independent of worker count);
-/// `finish_contig_prepare` costs ~0.3 GB per worker. Running only the first
-/// half ahead of time keeps the prelude off the critical path without paying
-/// the per-worker startup footprint twice.
+/// `finish_contig_prepare` is what scales with worker count. Running only the
+/// first half ahead of time keeps the prelude off the critical path without
+/// paying the per-worker startup footprint twice: measured at 1.4-2.0 GB of
+/// peak RSS on a merged cache and 2.39 GB on an Ensembl cache at w=8.
 struct ContigPreparedData {
     session: Arc<SessionContext>,
     config: ContigAnnotationConfig,
@@ -9919,9 +9921,10 @@ struct ContigPreparedData {
     /// Schemas for the per-worker `LookupProvider`s built in the deferred half.
     grid_vcf_schema: Schema,
     grid_cache_schema: Schema,
-    /// True when the deferred half must build grid-aligned per-worker lookups
-    /// (stateful Merged/RefSeq at workers>1). Otherwise `lookup_partitions` is
-    /// already populated and the deferred half is a no-op.
+    /// Selects which lookup the deferred half builds: grid-aligned per-worker
+    /// scans (stateful Merged/RefSeq at workers>1) when true, otherwise the
+    /// byte-budget scan from `byte_budget_provider`. Either way the spawn
+    /// happens in `finish_contig_prepare`, never here.
     stateful_parallel: bool,
     /// Grid-aligned per-worker slices. Empty unless `stateful_parallel`.
     slices: Vec<WorkerGridSlice>,
@@ -9934,8 +9937,9 @@ struct ContigPreparedData {
     /// decoded until a worker first probes) and must not outlive the contig.
     #[cfg(feature = "parquet-cache")]
     shared_parquet_lookup_cell: Arc<crate::cache::lookup_exec::ParquetVariationLookupCell>,
-    /// Lookup workers already spawned by the non-grid paths. Empty when
-    /// `stateful_parallel`; the deferred half fills it.
+    /// Always empty here — `finish_contig_prepare` fills it for whichever path
+    /// applies. Kept in the struct so the deferred half has somewhere to push
+    /// without allocating a second deque.
     lookup_partitions: VecDeque<LookupPartitionHandle>,
     /// Byte-budget lookup provider, carried so the non-grid paths spawn their
     /// workers in the deferred half too. `None` only if the deferred half has
@@ -12723,8 +12727,8 @@ async fn count_contig_buffer_boundaries(
 /// Prefetchable half of contig preparation: validate identity, read schemas,
 /// load the contig context concurrently with the grid count pass, load SIFT,
 /// build the shared indexes, and plan the per-worker grid slices — but spawn no
-/// grid lookup worker. `finish_contig_prepare()` does that when the contig
-/// actually starts.
+/// lookup worker at all, on any path. `finish_contig_prepare()` does that when
+/// the contig actually starts.
 async fn prepare_contig_data(
     session: Arc<SessionContext>,
     cache: Arc<PartitionedAnnotationCache>,
@@ -13089,14 +13093,18 @@ async fn prepare_contig_data(
     }))
 }
 
-/// Deferred half of contig preparation: build the grid-aligned per-worker
-/// `LookupProvider`s and spawn their lookup workers. Split out of
-/// `prepare_contig_data` because this is where the ~0.3 GB-per-worker startup
-/// footprint is paid — running it only when the contig actually starts keeps a
-/// prefetched contig down to one resident context.
+/// Deferred half of contig preparation: build the per-worker `LookupProvider`s
+/// and spawn their lookup workers. Split out of `prepare_contig_data` because
+/// this is where the per-worker startup footprint is paid — running it only when
+/// the contig actually starts keeps a prefetched contig down to one resident
+/// context.
 ///
-/// A no-op for the non-grid paths, whose workers were already spawned (and
-/// deliberately left overlapping the context load) in `prepare_contig_data`.
+/// Handles both lookup strategies: grid-aligned per-worker scans when
+/// `stateful_parallel`, otherwise the byte-budget scan. The byte-budget spawn
+/// used to run before the context load so its build+probe overlapped it; giving
+/// that overlap up costs ~7% wall on an Ensembl cache at w=8 and returns 2.39 GB
+/// of peak RSS, so prefetch now carries no lookup workers whatever the cache
+/// source type.
 async fn finish_contig_prepare(data: ContigPreparedData) -> Result<Option<ContigReadyState>> {
     let ContigPreparedData {
         session,
