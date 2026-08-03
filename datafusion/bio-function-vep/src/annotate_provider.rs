@@ -5257,7 +5257,7 @@ impl AnnotateProvider {
             target_partitions
         };
         // Stateful Merged/RefSeq now runs N grid-aligned sharded workers with
-        // bounded-overlap warm-up (design 2026-06-25 §5/§7): prepare_contig_context
+        // bounded-overlap warm-up (design 2026-06-25 §5/§7): contig preparation
         // re-partitions each contig on the global 5000-unit buffer grid and each
         // worker warm-starts its carried HGNC state before its seam, so the old
         // single-ordered-worker fallback is no longer needed. Fails closed via the
@@ -8898,7 +8898,8 @@ type SharedContigPipelineProfile = Arc<Mutex<ContigPipelineProfile>>;
 #[derive(Debug, Default)]
 struct ContigPipelineProfile {
     context_load: Duration,
-    /// Total wall of prepare_contig_context (everything before workers start).
+    /// Total wall of contig preparation, both halves (everything before workers
+    /// start). Includes any time the data half spent waiting as a prefetch.
     prepare_total: Duration,
     /// Prepare phase before context load: schema reads + lookup plan build + worker spawn.
     prepare_setup: Duration,
@@ -9898,8 +9899,66 @@ fn accumulate_boundaries(
     Ok((boundaries, global_row))
 }
 
+/// The prefetchable half of a contig's preparation: everything that reads data
+/// or builds read-only state, with no lookup worker spawned yet. Produced by
+/// `prepare_contig_data()` and consumed by `finish_contig_prepare()`, which
+/// builds the per-worker `LookupProvider`s and spawns their workers — for both
+/// the grid path and the byte-budget path.
+///
+/// The split is what makes prefetching cheap. `prepare_contig_data` costs one
+/// resident contig context (~1.7 GB on WGS, independent of worker count);
+/// `finish_contig_prepare` is what scales with worker count. Running only the
+/// first half ahead of time keeps the prelude off the critical path without
+/// paying the per-worker startup footprint twice: measured at 1.4-2.0 GB of
+/// peak RSS on a merged cache and 2.39 GB on an Ensembl cache at w=8.
+struct ContigPreparedData {
+    session: Arc<SessionContext>,
+    config: ContigAnnotationConfig,
+    chrom: String,
+    /// Placeholder variation table name; the KvLookupExec resolves the real
+    /// dataset via the cache root.
+    var_table: String,
+    /// Schemas for the per-worker `LookupProvider`s built in the deferred half.
+    grid_vcf_schema: Schema,
+    grid_cache_schema: Schema,
+    /// Selects which lookup the deferred half builds: grid-aligned per-worker
+    /// scans (stateful Merged/RefSeq at workers>1) when true, otherwise the
+    /// byte-budget scan from `byte_budget_provider`. Either way the spawn
+    /// happens in `finish_contig_prepare`, never here.
+    stateful_parallel: bool,
+    /// Grid-aligned per-worker slices. Empty unless `stateful_parallel`.
+    slices: Vec<WorkerGridSlice>,
+    /// Whether the input VCF uses `chr`-prefixed names — a property of the file,
+    /// so resolved once per contig here rather than once per worker. Only
+    /// meaningful when `stateful_parallel`.
+    vcf_has_chr: bool,
+    /// Single-flight cell so every worker of this contig shares one decoded
+    /// variation shard footer + page index. Created empty here (nothing is
+    /// decoded until a worker first probes) and must not outlive the contig.
+    #[cfg(feature = "parquet-cache")]
+    shared_parquet_lookup_cell: Arc<crate::cache::lookup_exec::ParquetVariationLookupCell>,
+    /// Always empty here — `finish_contig_prepare` fills it for whichever path
+    /// applies. Kept in the struct so the deferred half has somewhere to push
+    /// without allocating a second deque.
+    lookup_partitions: VecDeque<LookupPartitionHandle>,
+    /// Byte-budget lookup provider, carried so the non-grid paths spawn their
+    /// workers in the deferred half too. `None` only if the deferred half has
+    /// already consumed it.
+    byte_budget_provider: Option<LookupProvider>,
+    /// Colocated sink for the single-stream (non-partitioned) lookup path.
+    byte_budget_fallback_sink: ColocatedSink,
+    /// Whether the byte-budget path partitions its lookup scan.
+    byte_budget_parallel_lookup: bool,
+    shared_context: Arc<SharedContigAnnotationContext>,
+    ephemeral_tables: Vec<String>,
+    /// Clone of the pipeline profile handle; the original was moved into
+    /// `shared_context`, and the deferred half still records into it.
+    profile_handle: Option<SharedContigPipelineProfile>,
+    t_contig: Instant,
+}
+
 /// Everything needed to start streaming annotation for a contig.
-/// Produced by `prepare_contig_context()`.
+/// Produced by `finish_contig_prepare()`.
 struct ContigReadyState {
     lookup_partitions: VecDeque<LookupPartitionHandle>,
     /// Grid-aligned per-worker slices, indexed by lookup-partition id. Empty for
@@ -10553,18 +10612,21 @@ struct ContigAnnotationStream {
     /// worker-minor) for the `threads>1` sharded-output path. Monotonic across
     /// contigs so `vcf_sink` concatenates shards in ascending = position order.
     next_global_shard_id: usize,
-    /// The next contig's `prepare_contig_context`, started while the current
-    /// contig annotates so its context load does not sit on the critical path.
+    /// The next contig's `prepare_contig_data`, started while the current contig
+    /// annotates so its context load does not sit on the critical path. Only the
+    /// data half runs ahead — `finish_contig_prepare` spawns the lookup workers
+    /// when the contig starts, so the prefetch adds one resident context and no
+    /// per-worker memory.
     ///
-    /// Safe to run ahead: `prepare_contig_context` depends only on its own
-    /// contig's data plus the session, builds read-only state, and emits no
-    /// rows. Shard ids are still assigned in stream order when a prepared
-    /// contig transitions to `AnnotatingParallel`, so output order is
-    /// unaffected. The contig is popped from `contigs` when the prefetch
-    /// starts, and carried here so the pairing cannot drift.
+    /// Safe to run ahead: `prepare_contig_data` depends only on its own contig's
+    /// data plus the session, builds read-only state, and emits no rows. Shard
+    /// ids are still assigned in stream order when a prepared contig transitions
+    /// to `AnnotatingParallel`, so output order is unaffected. The contig is
+    /// popped from `contigs` when the prefetch starts, and carried here so the
+    /// pairing cannot drift.
     prefetched_prepare: Option<(
         String,
-        tokio::task::JoinHandle<Result<Option<ContigReadyState>>>,
+        tokio::task::JoinHandle<Result<Option<ContigPreparedData>>>,
     )>,
 }
 
@@ -10608,27 +10670,38 @@ impl ContigAnnotationStream {
         let config = self.config.clone();
         let full_schema = self.full_schema.clone();
         let prefetch_chrom = chrom.clone();
+        // Only the data half runs ahead: the lookup workers are spawned by
+        // `finish_contig_prepare` when this contig actually starts, so the
+        // prefetch costs one resident context and no per-worker memory.
         let handle = tokio::spawn(async move {
-            prepare_contig_context(session, cache, prefetch_chrom, config, full_schema).await
+            prepare_contig_data(session, cache, prefetch_chrom, config, full_schema).await
         });
         self.prefetched_prepare = Some((chrom, handle));
     }
 
     /// Take the prefetched prepare for the contig that is next in order, if the
-    /// prefetch already covers it.
+    /// prefetch already covers it. Finishing the deferred half is part of the
+    /// returned future, so the caller sees the same `ContigReadyState` as on the
+    /// cold path.
     fn take_prefetched_prepare(&mut self) -> Option<PrepareFuture> {
         let (_chrom, handle) = self.prefetched_prepare.take()?;
         let fut: PrepareFuture = Box::pin(async move {
-            handle
+            let data = handle
                 .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
+                .map_err(|e| DataFusionError::External(Box::new(e)))??;
+            match data {
+                Some(data) => finish_contig_prepare(data).await,
+                None => Ok(None),
+            }
         });
         Some(fut)
     }
 
     fn cleanup_registered_tables_on_drop(&mut self) {
-        // An in-flight prefetch holds spawned lookup tasks for a contig that
-        // will now never be annotated; drop it so they stop.
+        // An in-flight prefetch is loading context for a contig that will now
+        // never be annotated. It spawns no lookup workers of its own (those are
+        // deferred to `finish_contig_prepare`), but aborting still stops the
+        // in-flight context/count scans.
         if let Some((_, handle)) = self.prefetched_prepare.take() {
             handle.abort();
         }
@@ -12050,7 +12123,13 @@ impl Stream for ContigAnnotationStream {
                         let full_schema = self.full_schema.clone();
 
                         let fut: PrepareFuture = Box::pin(async move {
-                            prepare_contig_context(session, cache, chrom, config, full_schema).await
+                            let data =
+                                prepare_contig_data(session, cache, chrom, config, full_schema)
+                                    .await?;
+                            match data {
+                                Some(data) => finish_contig_prepare(data).await,
+                                None => Ok(None),
+                            }
                         });
                         fut
                     };
@@ -12645,13 +12724,18 @@ async fn count_contig_buffer_boundaries(
     accumulate_boundaries(&batches, input_buffer_size)
 }
 
-async fn prepare_contig_context(
+/// Prefetchable half of contig preparation: validate identity, read schemas,
+/// load the contig context concurrently with the grid count pass, load SIFT,
+/// build the shared indexes, and plan the per-worker grid slices — but spawn no
+/// lookup worker at all, on any path. `finish_contig_prepare()` does that when
+/// the contig actually starts.
+async fn prepare_contig_data(
     session: Arc<SessionContext>,
     cache: Arc<PartitionedAnnotationCache>,
     chrom: String,
     mut config: ContigAnnotationConfig,
     full_schema: SchemaRef,
-) -> Result<Option<ContigReadyState>> {
+) -> Result<Option<ContigPreparedData>> {
     let t_contig = profile_start!();
     let pipeline_profile =
         profiling_enabled().then(|| Arc::new(Mutex::new(ContigPipelineProfile::default())));
@@ -12735,7 +12819,6 @@ async fn prepare_contig_context(
             config.cache_source_type,
             CacheSourceType::Merged | CacheSourceType::RefSeq
         );
-    let mut grid_slices: Vec<WorkerGridSlice> = Vec::new();
     let grid_vcf_schema = vcf_schema.clone();
     let grid_cache_schema = cache_schema.clone();
     let mut provider = LookupProvider::new(
@@ -12758,68 +12841,17 @@ async fn prepare_contig_context(
         }
     }
     let parallel_lookup = cache_enabled;
-    let mut lookup_partitions = if stateful_parallel {
-        // Deferred: grid-aligned per-worker lookup scans are spawned after the
-        // context load below (once overlap_width_bp is known). The `provider`
-        // built above is unused on this path.
-        VecDeque::new()
-    } else if parallel_lookup {
-        let session_state = session.state();
-        let mut plan = provider.scan(&session_state, None, &[], None).await?;
-        let mut partition_count = plan.output_partitioning().partition_count().max(1);
-        let partition_coloc_sinks: Vec<ColocatedSink> = if config.flags.check_existing {
-            let sinks = (0..partition_count)
-                .map(|_| Arc::new(Mutex::new(HashMap::new())) as ColocatedSink)
-                .collect::<Vec<_>>();
-            provider.set_partition_colocated_sinks(sinks.clone());
-            plan = provider.scan(&session_state, None, &[], None).await?;
-            partition_count = plan.output_partitioning().partition_count().max(1);
-            if partition_count > sinks.len() {
-                return Err(DataFusionError::Execution(format!(
-                    "lookup plan produced {partition_count} partitions but only {} colocated sinks were configured",
-                    sinks.len()
-                )));
-            }
-            sinks
-        } else {
-            Vec::new()
-        };
-
-        let task_ctx = session.task_ctx();
-        let mut handles = VecDeque::with_capacity(partition_count);
-        for partition_id in 0..partition_count {
-            let sink = partition_coloc_sinks
-                .get(partition_id)
-                .cloned()
-                .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
-            handles.push_back(spawn_lookup_partition_worker(
-                Arc::clone(&plan),
-                Arc::clone(&task_ctx),
-                partition_id,
-                partition_id,
-                chrom.to_string(),
-                sink,
-                LOOKUP_PARTITION_QUEUE_BATCHES,
-                pipeline_profile.clone(),
-            ));
-        }
-        handles
-    } else {
-        if config.flags.check_existing {
-            provider.set_colocated_sink(Arc::clone(&fallback_coloc_sink));
-        }
-        let session_state = session.state();
-        let plan = provider.scan(&session_state, None, &[], None).await?;
-        let lookup_stream = plan.execute(0, session.task_ctx())?;
-        VecDeque::from([spawn_lookup_stream_worker(
-            lookup_stream,
-            plan.schema(),
-            chrom.to_string(),
-            fallback_coloc_sink,
-            LOOKUP_PARTITION_QUEUE_BATCHES,
-            pipeline_profile.clone(),
-        )])
-    };
+    // No lookup worker is spawned here. Both the grid path and the byte-budget
+    // path spawn in `finish_contig_prepare`, so a prefetched contig carries no
+    // lookup workers whatever the cache source type.
+    //
+    // The byte-budget spawn used to sit here, before the context load, so that
+    // each worker's build+probe (which happens on first poll) overlapped it.
+    // Measured on an Ensembl cache at w=8 (n=3), giving that overlap up costs
+    // +3.55s wall (+7.0%) and buys back 2.39 GB of peak RSS (-24.2%) — the same
+    // trade the grid path already makes, at a better memory ratio. CPU *falls*
+    // 4.4%, so the extra wall time is idle wait, not extra work.
+    let mut lookup_partitions: VecDeque<LookupPartitionHandle> = VecDeque::new();
     record_contig_profile(&pipeline_profile, |profile| {
         profile.lookup_partitions = lookup_partitions.len();
     });
@@ -12952,28 +12984,153 @@ async fn prepare_contig_context(
     // pass finds the global 5000-unit buffer boundaries; each worker gets a
     // whole-buffer rank range with a bounded-overlap warm-up start, and a lookup
     // scan filtered to its `[scan_lo_pos, scan_hi_pos)` position window.
+    // Only the *planning* happens here. Building the N providers and spawning
+    // their workers is `finish_contig_prepare`'s job, so a prefetched contig
+    // never holds a second set of lookup workers resident.
+    let mut slices: Vec<WorkerGridSlice> = Vec::new();
+    let mut vcf_has_chr = false;
     if stateful_parallel {
         let (boundaries, _total_rows) =
             grid_count.expect("stateful_parallel implies the count future ran")?;
-        let slices = plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp);
+        slices = plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp);
         let _ = _total_rows;
-        let task_ctx = session.task_ctx();
-        // All workers of this contig probe the same variation shard, and the
-        // lookup is immutable once opened (its per-partition cursor is a
-        // stateless placeholder, and each probe opens its own file handle). Share
-        // one single-flight cell so the shard footer + page index are decoded
-        // once per contig rather than once per worker — the page index alone is
-        // ~0.5 GB for chr1, so per-worker loads dominated peak RSS. Scoped to
-        // this contig: it is rebuilt on the next `prepare_contig_context`.
-        #[cfg(feature = "parquet-cache")]
-        let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
         // Whether the input VCF uses `chr`-prefixed names is a property of the
         // file, not of a worker's range, so resolve it once for the contig. Each
         // resolution plans and executes a `SELECT chrom ... LIMIT 1` against a
         // target_partitions-wide scan, and the per-worker loop is serial, so doing
         // it per worker put N of those probes on the critical path.
-        let vcf_has_chr =
-            crate::lookup_provider::has_chr_prefix(&session, &config.vcf_table).await?;
+        vcf_has_chr = crate::lookup_provider::has_chr_prefix(&session, &config.vcf_table).await?;
+    }
+    // All workers of this contig probe the same variation shard, and the lookup
+    // is immutable once opened (its per-partition cursor is a stateless
+    // placeholder, and each probe opens its own file handle). Share one
+    // single-flight cell so the shard footer + page index are decoded once per
+    // contig rather than once per worker — the page index alone is ~0.5 GB for
+    // chr1, so per-worker loads dominated peak RSS. Created empty (nothing is
+    // decoded until a worker first probes) and scoped to this contig: it is
+    // rebuilt on the next `prepare_contig_data`.
+    #[cfg(feature = "parquet-cache")]
+    let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
+
+    // Open the per-contig custom-plugin registry when enabled and non-empty.
+    #[cfg(feature = "parquet-cache")]
+    let plugin_registry = match &config.plugin_cache_root {
+        Some(root) => {
+            let reg = crate::plugin_cache::registry::PluginRegistry::open(root, &chrom).await?;
+            if reg.is_empty() {
+                None
+            } else {
+                Some(Arc::new(reg))
+            }
+        }
+        None => None,
+    };
+
+    let shared_context = Arc::new(SharedContigAnnotationContext {
+        config: config.clone(),
+        profile: pipeline_profile,
+        base_transcripts,
+        overlap_width_bp,
+        base_translations: Arc::new(tl),
+        exons: Arc::new(ex),
+        indexes,
+        regulatory: Arc::new(rg),
+        motifs: Arc::new(mt),
+        // TODO: miRNA and structural features are not yet partitioned —
+        // these are rare and handled by the monolithic path only.
+        mirnas: Arc::new(Vec::new()),
+        structural: Arc::new(Vec::new()),
+        translateable_seq_by_tx: Arc::new(translateable_seq),
+        transcript_cache_regions,
+        tmp_provider: Arc::new(tmp_provider),
+        engine: Arc::new(engine),
+        #[cfg(feature = "parquet-cache")]
+        sift_prediction_store,
+        #[cfg(feature = "parquet-cache")]
+        plugin_registry,
+    });
+
+    // `pipeline_profile` was moved into the shared context above; use the cloned
+    // handle to record the shared-context build cost.
+    record_contig_profile(&profile_handle, |profile| {
+        profile.prepare_shared_ctx += shared_ctx_started.elapsed();
+    });
+    log_phase_rss(&chrom, "after_prepare_data");
+    // Marks the end of the *prefetchable* unit. What remains — the N provider
+    // builds and lookup-worker spawns in `finish_contig_prepare` — is
+    // deliberately left on the critical path so its per-worker footprint is only
+    // resident for the contig actually being annotated. The gap between this
+    // event and `prepare done` is the cost of that choice.
+    pipeline_trace::emit(
+        "prepare_data",
+        "done",
+        &[
+            ("chrom", TraceValue::Str(&chrom)),
+            ("elapsed", TraceValue::Duration(t_contig.elapsed())),
+        ],
+    );
+
+    Ok(Some(ContigPreparedData {
+        session,
+        config,
+        chrom,
+        var_table,
+        grid_vcf_schema,
+        grid_cache_schema,
+        stateful_parallel,
+        slices,
+        vcf_has_chr,
+        #[cfg(feature = "parquet-cache")]
+        shared_parquet_lookup_cell,
+        lookup_partitions,
+        byte_budget_provider: Some(provider),
+        byte_budget_fallback_sink: fallback_coloc_sink,
+        byte_budget_parallel_lookup: parallel_lookup,
+        shared_context,
+        ephemeral_tables,
+        profile_handle,
+        t_contig,
+    }))
+}
+
+/// Deferred half of contig preparation: build the per-worker `LookupProvider`s
+/// and spawn their lookup workers. Split out of `prepare_contig_data` because
+/// this is where the per-worker startup footprint is paid — running it only when
+/// the contig actually starts keeps a prefetched contig down to one resident
+/// context.
+///
+/// Handles both lookup strategies: grid-aligned per-worker scans when
+/// `stateful_parallel`, otherwise the byte-budget scan. The byte-budget spawn
+/// used to run before the context load so its build+probe overlapped it; giving
+/// that overlap up costs ~7% wall on an Ensembl cache at w=8 and returns 2.39 GB
+/// of peak RSS, so prefetch now carries no lookup workers whatever the cache
+/// source type.
+async fn finish_contig_prepare(data: ContigPreparedData) -> Result<Option<ContigReadyState>> {
+    let ContigPreparedData {
+        session,
+        config,
+        chrom,
+        var_table,
+        grid_vcf_schema,
+        grid_cache_schema,
+        stateful_parallel,
+        slices,
+        vcf_has_chr,
+        #[cfg(feature = "parquet-cache")]
+        shared_parquet_lookup_cell,
+        mut lookup_partitions,
+        byte_budget_provider,
+        byte_budget_fallback_sink,
+        byte_budget_parallel_lookup,
+        shared_context,
+        ephemeral_tables,
+        profile_handle,
+        t_contig,
+    } = data;
+
+    let mut grid_slices: Vec<WorkerGridSlice> = Vec::new();
+    if stateful_parallel {
+        let task_ctx = session.task_ctx();
         for (i, slice) in slices.iter().enumerate() {
             let mut wprovider = LookupProvider::new(
                 Arc::clone(&session),
@@ -13020,65 +13177,80 @@ async fn prepare_contig_context(
                 chrom.to_string(),
                 sink,
                 LOOKUP_PARTITION_QUEUE_BATCHES,
-                pipeline_profile.clone(),
+                profile_handle.clone(),
             ));
         }
         grid_slices = slices;
-        record_contig_profile(&pipeline_profile, |profile| {
+        record_contig_profile(&profile_handle, |profile| {
+            profile.lookup_partitions = lookup_partitions.len();
+        });
+    } else if let Some(mut provider) = byte_budget_provider {
+        // Byte-budget path (Ensembl source, or any source at workers==1).
+        if byte_budget_parallel_lookup {
+            let session_state = session.state();
+            let mut plan = provider.scan(&session_state, None, &[], None).await?;
+            let mut partition_count = plan.output_partitioning().partition_count().max(1);
+            let partition_coloc_sinks: Vec<ColocatedSink> = if config.flags.check_existing {
+                let sinks = (0..partition_count)
+                    .map(|_| Arc::new(Mutex::new(HashMap::new())) as ColocatedSink)
+                    .collect::<Vec<_>>();
+                provider.set_partition_colocated_sinks(sinks.clone());
+                plan = provider.scan(&session_state, None, &[], None).await?;
+                partition_count = plan.output_partitioning().partition_count().max(1);
+                if partition_count > sinks.len() {
+                    return Err(DataFusionError::Execution(format!(
+                        "lookup plan produced {partition_count} partitions but only {} colocated sinks were configured",
+                        sinks.len()
+                    )));
+                }
+                sinks
+            } else {
+                Vec::new()
+            };
+            let task_ctx = session.task_ctx();
+            for partition_id in 0..partition_count {
+                let sink = partition_coloc_sinks
+                    .get(partition_id)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+                lookup_partitions.push_back(spawn_lookup_partition_worker(
+                    Arc::clone(&plan),
+                    Arc::clone(&task_ctx),
+                    partition_id,
+                    partition_id,
+                    chrom.to_string(),
+                    sink,
+                    LOOKUP_PARTITION_QUEUE_BATCHES,
+                    profile_handle.clone(),
+                ));
+            }
+        } else {
+            if config.flags.check_existing {
+                provider.set_colocated_sink(Arc::clone(&byte_budget_fallback_sink));
+            }
+            let session_state = session.state();
+            let plan = provider.scan(&session_state, None, &[], None).await?;
+            let lookup_stream = plan.execute(0, session.task_ctx())?;
+            lookup_partitions.push_back(spawn_lookup_stream_worker(
+                lookup_stream,
+                plan.schema(),
+                chrom.to_string(),
+                byte_budget_fallback_sink,
+                LOOKUP_PARTITION_QUEUE_BATCHES,
+                profile_handle.clone(),
+            ));
+        }
+        record_contig_profile(&profile_handle, |profile| {
             profile.lookup_partitions = lookup_partitions.len();
         });
     }
 
-    // Open the per-contig custom-plugin registry when enabled and non-empty.
-    #[cfg(feature = "parquet-cache")]
-    let plugin_registry = match &config.plugin_cache_root {
-        Some(root) => {
-            let reg = crate::plugin_cache::registry::PluginRegistry::open(root, &chrom).await?;
-            if reg.is_empty() {
-                None
-            } else {
-                Some(Arc::new(reg))
-            }
-        }
-        None => None,
-    };
-
-    let shared_context = Arc::new(SharedContigAnnotationContext {
-        config: config.clone(),
-        profile: pipeline_profile,
-        base_transcripts,
-        overlap_width_bp,
-        base_translations: Arc::new(tl),
-        exons: Arc::new(ex),
-        indexes,
-        regulatory: Arc::new(rg),
-        motifs: Arc::new(mt),
-        // TODO: miRNA and structural features are not yet partitioned —
-        // these are rare and handled by the monolithic path only.
-        mirnas: Arc::new(Vec::new()),
-        structural: Arc::new(Vec::new()),
-        translateable_seq_by_tx: Arc::new(translateable_seq),
-        transcript_cache_regions,
-        tmp_provider: Arc::new(tmp_provider),
-        engine: Arc::new(engine),
-        #[cfg(feature = "parquet-cache")]
-        sift_prediction_store,
-        #[cfg(feature = "parquet-cache")]
-        plugin_registry,
-    });
-
-    // `pipeline_profile` was moved into the shared context above; use the cloned
-    // handle to record the shared-context build cost and the total prepare wall.
     record_contig_profile(&profile_handle, |profile| {
-        profile.prepare_shared_ctx += shared_ctx_started.elapsed();
         profile.prepare_total += t_contig.elapsed();
     });
     log_phase_rss(&chrom, "after_prepare");
-    // Marks the end of the prefetchable unit. Everything after this point
-    // (annotation-worker spawn, first window) needs the workers, so it cannot be
-    // moved off the critical path by prefetching. The gap between `context done`
-    // and this event is the provider-build + lookup-spawn tail, which is what a
-    // narrower prefetch would give back.
+    // Marks the end of contig preparation. Everything after this point
+    // (annotation-worker spawn, first window) belongs to annotation proper.
     pipeline_trace::emit(
         "prepare",
         "done",
