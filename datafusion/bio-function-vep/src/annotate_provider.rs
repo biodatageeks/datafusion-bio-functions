@@ -9051,71 +9051,222 @@ fn emit_contig_pipeline_profile(profile: &Option<SharedContigPipelineProfile>, c
 }
 
 #[cfg(feature = "parquet-cache")]
+const TRANSCRIPT_CONTEXT_COLUMNS: &[&str] = &[
+    "transcript_id",
+    "stable_id",
+    "chrom",
+    "start",
+    "\"end\"",
+    "strand",
+    "biotype",
+    "cds_start",
+    "cds_end",
+    "cdna_coding_start",
+    "cdna_coding_end",
+    "gene_stable_id",
+    "gene_symbol",
+    "gene_symbol_source",
+    "gene_hgnc_id_native",
+    "gene_hgnc_id",
+    "source",
+    "source_cache",
+    "display_xref_id",
+    "version",
+    "cds_start_nf",
+    "cds_end_nf",
+    "mature_mirna_regions",
+    "cdna_seq",
+    "bam_edit_status",
+    "has_non_polya_rna_edit",
+    "spliced_seq",
+    "five_prime_utr_seq",
+    "three_prime_utr_seq",
+    "translateable_seq",
+    "flags_str",
+    "refseq_match",
+    "refseq_edits",
+    "is_gencode_basic",
+    "is_gencode_primary",
+    "cdna_mapper_segments",
+    "is_canonical",
+    "tsl",
+    "mane_select",
+    "mane_plus_clinical",
+    "translation_stable_id",
+    "gene_phenotype",
+    "ccds",
+    "swissprot",
+    "trembl",
+    "uniparc",
+    "uniprot_isoform",
+    "appris",
+    "ncrna_structure",
+    "transcript_uid",
+];
+
+const EXON_CONTEXT_COLUMNS: &[&str] = &[
+    "transcript_id",
+    "stable_id",
+    "exon_number",
+    "start",
+    "\"end\"",
+    "chrom",
+];
+
+const TRANSLATION_CONTEXT_COLUMNS: &[&str] = &[
+    "transcript_id",
+    "stable_id",
+    "chrom",
+    "start",
+    "\"end\"",
+    "cds_len",
+    "cds_length",
+    "protein_len",
+    "translation_seq",
+    "cds_sequence",
+    "cds_seq",
+    "coding_sequence",
+    "translation_seq_canonical",
+    "cds_sequence_canonical",
+    "version",
+    "protein_features",
+];
+
+const REGULATORY_CONTEXT_COLUMNS: &[&str] = &[
+    "stable_id",
+    "feature_id",
+    "feature_type",
+    "chrom",
+    "start",
+    "\"end\"",
+];
+
+const MOTIF_CONTEXT_COLUMNS: &[&str] = &[
+    "motif_id",
+    "feature_id",
+    "chrom",
+    "start",
+    "\"end\"",
+    "binding_matrix",
+    "transcription_factors",
+    "strand",
+    "binding_matrix_length",
+    "binding_matrix_elements",
+    "binding_matrix_unit",
+    "motif_seq",
+];
+
+/// Load the five per-contig context entities.
+///
+/// The five Parquet scans are mutually independent, and only the *filters* on
+/// exon/translation depend on the transcript ids. Serially this costs the sum of
+/// all ten steps; concurrently it costs the slowest scan plus the slowest parse.
+/// Opt in with `VEP_CTX_PARALLEL` so the two can be A/B'd on one binary.
 async fn load_contig_context(
     cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     chrom: &str,
     config: &ContigAnnotationConfig,
     profile: &Option<SharedContigPipelineProfile>,
 ) -> Result<LoadedContigContext> {
+    if pipeline_trace::enabled_from_env_value(std::env::var("VEP_CTX_PARALLEL").ok().as_deref()) {
+        load_contig_context_concurrent(cache, chrom, config, profile).await
+    } else {
+        load_contig_context_serial(cache, chrom, config, profile).await
+    }
+}
+
+/// Concurrent context load: all five scans in flight at once, then the four
+/// non-transcript parses on blocking threads while the transcript parse (whose
+/// ids the exon/translation filters need) runs here.
+async fn load_contig_context_concurrent(
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
+    chrom: &str,
+    config: &ContigAnnotationConfig,
+    profile: &Option<SharedContigPipelineProfile>,
+) -> Result<LoadedContigContext> {
     let scan_started = Instant::now();
-    let tx_batches = scan_context_entity(
-        cache,
-        "transcript",
-        chrom,
-        &[
-            "transcript_id",
-            "stable_id",
-            "chrom",
-            "start",
-            "\"end\"",
-            "strand",
-            "biotype",
-            "cds_start",
-            "cds_end",
-            "cdna_coding_start",
-            "cdna_coding_end",
-            "gene_stable_id",
-            "gene_symbol",
-            "gene_symbol_source",
-            "gene_hgnc_id_native",
-            "gene_hgnc_id",
-            "source",
-            "source_cache",
-            "display_xref_id",
-            "version",
-            "cds_start_nf",
-            "cds_end_nf",
-            "mature_mirna_regions",
-            "cdna_seq",
-            "bam_edit_status",
-            "has_non_polya_rna_edit",
-            "spliced_seq",
-            "five_prime_utr_seq",
-            "three_prime_utr_seq",
-            "translateable_seq",
-            "flags_str",
-            "refseq_match",
-            "refseq_edits",
-            "is_gencode_basic",
-            "is_gencode_primary",
-            "cdna_mapper_segments",
-            "is_canonical",
-            "tsl",
-            "mane_select",
-            "mane_plus_clinical",
-            "translation_stable_id",
-            "gene_phenotype",
-            "ccds",
-            "swissprot",
-            "trembl",
-            "uniparc",
-            "uniprot_isoform",
-            "appris",
-            "ncrna_structure",
-            "transcript_uid",
-        ],
-    )
-    .await?;
+    let (tx_batches, ex_batches, tl_batches, rg_batches, mt_batches) = tokio::try_join!(
+        scan_context_entity(cache, "transcript", chrom, TRANSCRIPT_CONTEXT_COLUMNS),
+        scan_context_entity(cache, "exon", chrom, EXON_CONTEXT_COLUMNS),
+        scan_context_entity(
+            cache,
+            "translation_core",
+            chrom,
+            TRANSLATION_CONTEXT_COLUMNS
+        ),
+        scan_context_entity(cache, "regulatory", chrom, REGULATORY_CONTEXT_COLUMNS),
+        scan_context_entity(cache, "motif", chrom, MOTIF_CONTEXT_COLUMNS),
+    )?;
+    // The scans overlap, so the wall cost is booked once against the transcript
+    // scan rather than split into five figures that would sum to more than it.
+    record_contig_profile(profile, |profile| {
+        profile.context_transcripts_scan += scan_started.elapsed();
+    });
+
+    let ex_handle = tokio::task::spawn_blocking(move || {
+        AnnotateProvider::parse_exon_batches("exon", &ex_batches)
+    });
+    let tl_handle = tokio::task::spawn_blocking(move || {
+        AnnotateProvider::parse_translation_batches("translation_core", &tl_batches)
+    });
+    let rg_handle = tokio::task::spawn_blocking(move || {
+        AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)
+    });
+    let mt_handle = tokio::task::spawn_blocking(move || {
+        AnnotateProvider::parse_motif_batches("motif", &mt_batches)
+    });
+
+    let started = Instant::now();
+    let (tx, translateable_seq) =
+        AnnotateProvider::parse_transcript_batches("transcript", &tx_batches)?;
+    let tx_vec: Vec<_> = tx
+        .into_iter()
+        .filter(|t| passes_transcript_selection(t, config.transcript_selection))
+        .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_transcripts += started.elapsed();
+    });
+    let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
+
+    let started = Instant::now();
+    let ex: Vec<_> = join_parse(ex_handle)
+        .await?
+        .into_iter()
+        .filter(|exon| tx_ids.contains(&exon.transcript_id))
+        .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_exons += started.elapsed();
+    });
+    let started = Instant::now();
+    let tl: Vec<_> = join_parse(tl_handle)
+        .await?
+        .into_iter()
+        .filter(|translation| tx_ids.contains(&translation.transcript_id))
+        .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_translations += started.elapsed();
+    });
+    let rg = join_parse(rg_handle).await?;
+    let mt = join_parse(mt_handle).await?;
+
+    Ok((tx_vec, translateable_seq, ex, tl, rg, mt))
+}
+
+async fn join_parse<T: Send + 'static>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
+    handle
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("context parse task failed: {e}")))?
+}
+
+async fn load_contig_context_serial(
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
+    chrom: &str,
+    config: &ContigAnnotationConfig,
+    profile: &Option<SharedContigPipelineProfile>,
+) -> Result<LoadedContigContext> {
+    let scan_started = Instant::now();
+    let tx_batches =
+        scan_context_entity(cache, "transcript", chrom, TRANSCRIPT_CONTEXT_COLUMNS).await?;
     record_contig_profile(profile, |profile| {
         profile.context_transcripts_scan += scan_started.elapsed();
     });
@@ -9132,20 +9283,7 @@ async fn load_contig_context(
     let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
 
     let scan_started = Instant::now();
-    let ex_batches = scan_context_entity(
-        cache,
-        "exon",
-        chrom,
-        &[
-            "transcript_id",
-            "stable_id",
-            "exon_number",
-            "start",
-            "\"end\"",
-            "chrom",
-        ],
-    )
-    .await?;
+    let ex_batches = scan_context_entity(cache, "exon", chrom, EXON_CONTEXT_COLUMNS).await?;
     record_contig_profile(profile, |profile| {
         profile.context_exons_scan += scan_started.elapsed();
     });
@@ -9163,24 +9301,7 @@ async fn load_contig_context(
         cache,
         "translation_core",
         chrom,
-        &[
-            "transcript_id",
-            "stable_id",
-            "chrom",
-            "start",
-            "\"end\"",
-            "cds_len",
-            "cds_length",
-            "protein_len",
-            "translation_seq",
-            "cds_sequence",
-            "cds_seq",
-            "coding_sequence",
-            "translation_seq_canonical",
-            "cds_sequence_canonical",
-            "version",
-            "protein_features",
-        ],
+        TRANSLATION_CONTEXT_COLUMNS,
     )
     .await?;
     record_contig_profile(profile, |profile| {
@@ -9196,20 +9317,8 @@ async fn load_contig_context(
     });
 
     let scan_started = Instant::now();
-    let rg_batches = scan_context_entity(
-        cache,
-        "regulatory",
-        chrom,
-        &[
-            "stable_id",
-            "feature_id",
-            "feature_type",
-            "chrom",
-            "start",
-            "\"end\"",
-        ],
-    )
-    .await?;
+    let rg_batches =
+        scan_context_entity(cache, "regulatory", chrom, REGULATORY_CONTEXT_COLUMNS).await?;
     record_contig_profile(profile, |profile| {
         profile.context_regulatory_scan += scan_started.elapsed();
     });
@@ -9220,26 +9329,7 @@ async fn load_contig_context(
     });
 
     let scan_started = Instant::now();
-    let mt_batches = scan_context_entity(
-        cache,
-        "motif",
-        chrom,
-        &[
-            "motif_id",
-            "feature_id",
-            "chrom",
-            "start",
-            "\"end\"",
-            "binding_matrix",
-            "transcription_factors",
-            "strand",
-            "binding_matrix_length",
-            "binding_matrix_elements",
-            "binding_matrix_unit",
-            "motif_seq",
-        ],
-    )
-    .await?;
+    let mt_batches = scan_context_entity(cache, "motif", chrom, MOTIF_CONTEXT_COLUMNS).await?;
     record_contig_profile(profile, |profile| {
         profile.context_motifs_scan += scan_started.elapsed();
     });
