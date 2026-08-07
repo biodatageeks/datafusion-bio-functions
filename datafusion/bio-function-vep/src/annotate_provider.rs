@@ -9755,10 +9755,27 @@ fn plan_grid_partitions(
     }
     let b = boundaries.len() - 1; // whole buffer count
     let round_div = |k: usize| -> usize { (k * b + workers / 2) / workers };
-    let mut slices = Vec::with_capacity(workers);
-    for k in 0..workers {
-        let bk = round_div(k);
-        let bk1 = round_div(k + 1);
+    let cuts: Vec<usize> = (0..=workers).map(round_div).collect();
+    build_grid_slices(boundaries, &cuts, overlap_width_bp)
+}
+
+/// Turn `workers + 1` ascending buffer-index cut points into worker slices. The
+/// cut policy (equal buffer count, or cost-weighted) lives in the caller; this
+/// only materialises the row marks, the bounded-overlap warm-up start and the
+/// lookup scan window, so every policy shares one implementation.
+fn build_grid_slices(
+    boundaries: &[GridBufferBoundary],
+    cuts: &[usize],
+    overlap_width_bp: i64,
+) -> Vec<WorkerGridSlice> {
+    if boundaries.len() < 2 || cuts.len() < 2 {
+        return Vec::new();
+    }
+    let b = boundaries.len() - 1;
+    let mut slices = Vec::with_capacity(cuts.len() - 1);
+    for k in 0..cuts.len() - 1 {
+        let bk = cuts[k].min(b);
+        let bk1 = cuts[k + 1].min(b);
         if bk >= bk1 {
             continue; // empty range (more workers than buffers)
         }
@@ -9791,6 +9808,111 @@ fn plan_grid_partitions(
     slices
 }
 
+/// Per-buffer cost weight used by the balanced grid split: how many contig
+/// transcripts overlap the buffer's position span, plus a constant for the fixed
+/// per-buffer cost that is paid even in gene deserts.
+///
+/// Buffers already hold a fixed number of VEP input units, so *variants* per
+/// buffer are equalised by construction. What is not equalised is how many
+/// transcripts each variant is evaluated against — that is why gene-dense slices
+/// become the stragglers under the equal-buffer-count split.
+fn buffer_transcript_weights(
+    boundaries: &[GridBufferBoundary],
+    positions: &[i64],
+    spans: impl IntoIterator<Item = (i64, i64)>,
+) -> Vec<u64> {
+    if boundaries.len() < 2 || positions.is_empty() {
+        return Vec::new();
+    }
+    let b = boundaries.len() - 1;
+    // Transcript coverage depth at a position = (#starts <= p) - (#ends < p),
+    // read off two sorted endpoint arrays.
+    let mut starts: Vec<i64> = Vec::new();
+    let mut ends: Vec<i64> = Vec::new();
+    for (s, e) in spans {
+        let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+        starts.push(lo);
+        ends.push(hi);
+    }
+    starts.sort_unstable();
+    ends.sort_unstable();
+
+    let mut weights = vec![0u64; b];
+    for (i, w) in weights.iter_mut().enumerate() {
+        let from = boundaries[i].global_row.min(positions.len());
+        let to = boundaries[i + 1].global_row.min(positions.len());
+        let mut sum = 0u64;
+        for &p in &positions[from..to] {
+            let covering = starts.partition_point(|&s| s <= p) - ends.partition_point(|&e| e < p);
+            sum += covering as u64;
+        }
+        *w = sum;
+    }
+    // Fixed per-buffer term. Measured on chr1: the buffer-invariant cost
+    // (buffer-local transcript selection scans every contig transcript) is ~12%
+    // of per-buffer CPU, so bias by an eighth of the mean. Without it a buffer
+    // in a gene desert looks free and they all pile onto one worker.
+    let total: u64 = weights.iter().sum();
+    let fixed = (total / (b as u64).max(1)) / 8;
+    for w in weights.iter_mut() {
+        *w += fixed + 1;
+    }
+    weights
+}
+
+/// Cost-weighted variant of [`plan_grid_partitions`]: cut the buffer grid so
+/// each worker receives an approximately equal share of total weight rather than
+/// an equal count of buffers. Falls back to the uniform split when the weights
+/// do not describe this grid.
+fn plan_grid_partitions_balanced(
+    boundaries: &[GridBufferBoundary],
+    workers: usize,
+    overlap_width_bp: i64,
+    weights: &[u64],
+) -> Vec<WorkerGridSlice> {
+    let workers = workers.max(1);
+    if boundaries.len() < 2 {
+        return Vec::new();
+    }
+    let b = boundaries.len() - 1;
+    if weights.len() != b {
+        return plan_grid_partitions(boundaries, workers, overlap_width_bp);
+    }
+    let mut prefix = Vec::with_capacity(b + 1);
+    prefix.push(0u64);
+    for w in weights {
+        prefix.push(prefix[prefix.len() - 1].saturating_add(*w));
+    }
+    let total = prefix[b];
+    if total == 0 {
+        return plan_grid_partitions(boundaries, workers, overlap_width_bp);
+    }
+    let mut cuts = Vec::with_capacity(workers + 1);
+    for k in 0..=workers {
+        let cut = if k == 0 {
+            0
+        } else if k >= workers {
+            b
+        } else {
+            let target = (total as u128 * k as u128 / workers as u128) as u64;
+            // prefix is ascending, so this is monotonic in k.
+            prefix.partition_point(|&p| p < target).min(b)
+        };
+        cuts.push(cut);
+    }
+    // Buffers are atomic, so a heavily skewed contig can drive several weighted
+    // cuts onto the same buffer index and silently hand the whole contig to one
+    // worker. When the grid has room, force every worker to keep at least one
+    // buffer: losing parallelism is always worse than an imperfect split.
+    if b >= workers {
+        for k in 1..=workers {
+            let hi = b - (workers - k);
+            cuts[k] = cuts[k].max(cuts[k - 1] + 1).min(hi);
+        }
+    }
+    build_grid_slices(boundaries, &cuts, overlap_width_bp)
+}
+
 /// Replay the EXACT serial buffer-cut logic (`count_ready_input_buffers`) over a
 /// position-ordered stream of `start`(+`alt`) batches and record each global VEP
 /// input-buffer boundary as `(global_row, pos, rows_before_pos)`. Returns the
@@ -9802,6 +9924,22 @@ fn accumulate_boundaries(
     batches: &[RecordBatch],
     input_buffer_size: usize,
 ) -> Result<(Vec<GridBufferBoundary>, usize)> {
+    let (boundaries, rows, _) = accumulate_boundaries_inner(batches, input_buffer_size, false)?;
+    Ok((boundaries, rows))
+}
+
+/// As [`accumulate_boundaries`], but optionally also returns every row's
+/// position in row order. The positions feed the cost-weighted grid split, which
+/// needs to know how many transcripts cover each *variant* — a buffer's span
+/// alone cannot tell it that, because buffers hold a fixed number of variants
+/// and therefore span far more base pairs in gene deserts than in dense regions.
+/// Collection is opt-in so the default path allocates nothing extra.
+fn accumulate_boundaries_inner(
+    batches: &[RecordBatch],
+    input_buffer_size: usize,
+    collect_positions: bool,
+) -> Result<(Vec<GridBufferBoundary>, usize, Vec<i64>)> {
+    let mut positions: Vec<i64> = Vec::new();
     let limit = input_buffer_size.max(1);
     let mut boundaries: Vec<GridBufferBoundary> = Vec::new();
     let mut global_row = 0usize;
@@ -9835,6 +9973,9 @@ fn accumulate_boundaries(
                 last_pos = Some(pos);
                 run = 1;
             }
+            if collect_positions {
+                positions.push(pos);
+            }
             units += alts.as_ref().map_or(1, |a| a.input_units_at(row));
             global_row += 1;
             if units >= limit {
@@ -9848,7 +9989,7 @@ fn accumulate_boundaries(
         pos: i64::MAX,
         rows_before_pos: 0,
     });
-    Ok((boundaries, global_row))
+    Ok((boundaries, global_row, positions))
 }
 
 /// Everything needed to start streaming annotation for a contig.
@@ -12461,7 +12602,8 @@ async fn count_contig_buffer_boundaries(
     vcf_table: &str,
     chrom: &str,
     input_buffer_size: usize,
-) -> Result<(Vec<GridBufferBoundary>, usize)> {
+    collect_positions: bool,
+) -> Result<(Vec<GridBufferBoundary>, usize, Vec<i64>)> {
     let provider = session.table_provider(vcf_table).await?;
     let schema = provider.schema();
     let mut proj = vec![schema.index_of("start")?];
@@ -12488,7 +12630,7 @@ async fn count_contig_buffer_boundaries(
             batches.push(batch?);
         }
     }
-    accumulate_boundaries(&batches, input_buffer_size)
+    accumulate_boundaries_inner(&batches, input_buffer_size, collect_positions)
 }
 
 async fn prepare_contig_context(
@@ -12716,6 +12858,12 @@ async fn prepare_contig_context(
             unreachable!("parquet-cache feature is required")
         }
     };
+    // Cost-weighted grid split (opt-in). Resolved before the count pass because
+    // the weights need every row's position, which only that pass sees.
+    let grid_balance_enabled = stateful_parallel
+        && pipeline_trace::enabled_from_env_value(
+            std::env::var("VEP_GRID_BALANCE").ok().as_deref(),
+        );
     // Run the grid count pass (VCF positions only) CONCURRENTLY with the context
     // load (Parquet transcripts/exons) — independent IO, so the count is hidden
     // behind context load instead of running as a serial prelude before workers.
@@ -12727,6 +12875,7 @@ async fn prepare_contig_context(
                     &config.vcf_table,
                     &chrom,
                     config.input_buffer_size,
+                    grid_balance_enabled,
                 )
                 .await,
             )
@@ -12799,9 +12948,64 @@ async fn prepare_contig_context(
     // whole-buffer rank range with a bounded-overlap warm-up start, and a lookup
     // scan filtered to its `[scan_lo_pos, scan_hi_pos)` position window.
     if stateful_parallel {
-        let (boundaries, _total_rows) =
+        let (boundaries, _total_rows, grid_positions) =
             grid_count.expect("stateful_parallel implies the count future ran")?;
-        let slices = plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp);
+        // Cost-weighted grid split (opt-in via VEP_GRID_BALANCE). The default
+        // equal-buffer-count split equalises variants per worker, not work, so
+        // gene-dense slices straggle; weighting by transcript overlap equalises
+        // the thing that actually costs. Slice boundaries do not affect output
+        // (every worker count already yields byte-identical VCFs), so this is a
+        // scheduling change only.
+        let slices = if grid_balance_enabled {
+            let t_w = Instant::now();
+            let weights = buffer_transcript_weights(
+                &boundaries,
+                &grid_positions,
+                base_transcripts.iter().map(|tx| (tx.start, tx.end)),
+            );
+            let planned = plan_grid_partitions_balanced(
+                &boundaries,
+                config.annotation_workers,
+                overlap_width_bp,
+                &weights,
+            );
+            pipeline_trace::emit(
+                "grid_balance",
+                "done",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("buffers", TraceValue::Usize(weights.len())),
+                    ("slices", TraceValue::Usize(planned.len())),
+                    ("elapsed", TraceValue::Duration(t_w.elapsed())),
+                ],
+            );
+            for s in &planned {
+                let w: u64 = weights
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        boundaries[*i].global_row >= s.emit_start_row
+                            && boundaries[*i].global_row < s.emit_end_row
+                    })
+                    .map(|(_, w)| *w)
+                    .sum();
+                pipeline_trace::emit(
+                    "grid_balance",
+                    "slice",
+                    &[
+                        ("worker_id", TraceValue::Usize(s.worker_id)),
+                        (
+                            "emit_rows",
+                            TraceValue::Usize(s.emit_end_row - s.emit_start_row),
+                        ),
+                        ("weight", TraceValue::Usize(w as usize)),
+                    ],
+                );
+            }
+            planned
+        } else {
+            plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp)
+        };
         let _ = _total_rows;
         let task_ctx = session.task_ctx();
         for (i, slice) in slices.iter().enumerate() {
@@ -14908,6 +15112,104 @@ mod tests {
             global_row: row,
             pos,
             rows_before_pos: 0,
+        }
+    }
+
+    #[test]
+    fn weights_count_transcripts_overlapping_each_buffer() {
+        // 4 buffers of one row each; the row's position decides its cost.
+        let bs = vec![
+            gb(0, 0),
+            gb(1, 100),
+            gb(2, 200),
+            gb(3, 300),
+            gb(4, i64::MAX),
+        ];
+        let positions = vec![0i64, 100, 200, 300];
+        // One short transcript over [10,50] (covers no variant), two long ones
+        // spanning [250,350] / [260,340] which both cover the variant at 300.
+        let spans = vec![(10, 50), (250, 350), (260, 340)];
+        let w = buffer_transcript_weights(&bs, &positions, spans);
+        assert_eq!(w.len(), 4);
+        // The fixed term is identical across buffers, so compare relative to a
+        // buffer whose variant is covered by nothing.
+        let base = w[1];
+        assert_eq!(w[0], base, "variant at 0 is outside the [10,50] transcript");
+        assert_eq!(w[2], base, "variant at 200 is covered by nothing");
+        assert_eq!(
+            w[3],
+            base + 2,
+            "variant at 300 is covered by both long ones"
+        );
+        assert!(
+            w.iter().all(|&x| x > 0),
+            "every buffer keeps a nonzero weight"
+        );
+    }
+
+    #[test]
+    fn balanced_split_gives_the_dense_worker_fewer_buffers() {
+        // 4 buffers; all transcript mass sits in the last one.
+        let bs = vec![
+            gb(0, 0),
+            gb(5000, 100),
+            gb(10000, 200),
+            gb(15000, 300),
+            gb(20000, i64::MAX),
+        ];
+        let positions: Vec<i64> = (0..20000)
+            .map(|r: i64| if r < 15000 { r / 150 } else { 300 })
+            .collect();
+        let spans: Vec<(i64, i64)> = (0..40).map(|_| (300, 400)).collect();
+        let w = buffer_transcript_weights(&bs, &positions, spans);
+        let slices = plan_grid_partitions_balanced(&bs, 2, 0, &w);
+        assert_eq!(slices.len(), 2);
+        // Uniform split would cut 2/2; weighting must push the seam later so the
+        // heavy trailing buffer is not paired with an equal share of the rest.
+        let uniform = plan_grid_partitions(&bs, 2, 0);
+        assert_eq!(uniform[0].emit_end_row, 10000);
+        assert!(
+            slices[0].emit_end_row > uniform[0].emit_end_row,
+            "balanced seam {} should fall later than uniform seam {}",
+            slices[0].emit_end_row,
+            uniform[0].emit_end_row
+        );
+        // Slices must still tile the contig exactly.
+        assert_eq!(slices[0].emit_start_row, 0);
+        assert_eq!(slices[slices.len() - 1].emit_end_row, 20000);
+        for pair in slices.windows(2) {
+            assert_eq!(pair[0].emit_end_row, pair[1].emit_start_row);
+        }
+    }
+
+    #[test]
+    fn balanced_split_falls_back_when_weights_do_not_match_grid() {
+        let bs = vec![gb(0, 0), gb(5000, 100), gb(10000, i64::MAX)];
+        let slices = plan_grid_partitions_balanced(&bs, 2, 0, &[1]); // wrong length
+        assert_eq!(slices, plan_grid_partitions(&bs, 2, 0));
+    }
+
+    #[test]
+    fn balanced_split_tiles_contig_for_many_worker_counts() {
+        let bs: Vec<GridBufferBoundary> = (0..=20)
+            .map(|i| gb(i * 5000, if i == 20 { i64::MAX } else { (i as i64) * 100 }))
+            .collect();
+        let positions: Vec<i64> = (0..100_000).map(|r: i64| r / 500).collect();
+        let spans: Vec<(i64, i64)> = (0..200).map(|i| (i * 7, i * 7 + 250)).collect();
+        let w = buffer_transcript_weights(&bs, &positions, spans);
+        for workers in [1usize, 2, 3, 5, 8, 16, 32] {
+            let slices = plan_grid_partitions_balanced(&bs, workers, 0, &w);
+            assert!(!slices.is_empty(), "workers={workers}");
+            assert_eq!(slices[0].emit_start_row, 0, "workers={workers}");
+            assert_eq!(
+                slices[slices.len() - 1].emit_end_row,
+                100_000,
+                "workers={workers}"
+            );
+            for pair in slices.windows(2) {
+                assert_eq!(pair[0].emit_end_row, pair[1].emit_start_row);
+                assert!(pair[0].emit_start_row < pair[0].emit_end_row);
+            }
         }
     }
 
