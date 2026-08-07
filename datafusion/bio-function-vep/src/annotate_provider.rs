@@ -13223,6 +13223,10 @@ async fn prepare_contig_context(
             // this contig: it is rebuilt on the next `prepare_contig_context`.
             #[cfg(feature = "parquet-cache")]
             let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
+            // `session.state()` was cloned once per worker inside the loop.
+            let session_state = session.state();
+            let mut prepared: Vec<(usize, LookupProvider, ColocatedSink)> =
+                Vec::with_capacity(slices.len());
             for (i, slice) in slices.iter().enumerate() {
                 let mut wprovider = LookupProvider::new(
                     Arc::clone(&session),
@@ -13270,8 +13274,44 @@ async fn prepare_contig_context(
                 if config.flags.check_existing {
                     wprovider.set_colocated_sink(Arc::clone(&sink));
                 }
-                let session_state = session.state();
-                let plan = wprovider.scan(&session_state, None, &[], None).await?;
+                prepared.push((i, wprovider, sink));
+            }
+            // Each worker's physical plan is independent of the others, but they
+            // were built one after another, so this grew linearly with worker
+            // count and sat directly on the prelude's critical path.
+            let t_plans = Instant::now();
+            let concurrent_plans = std::env::var("VEP_CONCURRENT_PLANS")
+                .ok()
+                .as_deref()
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            let built: Vec<(usize, Arc<dyn ExecutionPlan>, ColocatedSink)> = if concurrent_plans {
+                futures::future::try_join_all(prepared.into_iter().map(|(i, wp, sink)| {
+                    let session_state = &session_state;
+                    async move {
+                        let plan = wp.scan(session_state, None, &[], None).await?;
+                        Ok::<_, DataFusionError>((i, plan, sink))
+                    }
+                }))
+                .await?
+            } else {
+                let mut out = Vec::with_capacity(prepared.len());
+                for (i, wp, sink) in prepared {
+                    let plan = wp.scan(&session_state, None, &[], None).await?;
+                    out.push((i, plan, sink));
+                }
+                out
+            };
+            pipeline_trace::emit(
+                "grid_plans",
+                "done",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("workers", TraceValue::Usize(built.len())),
+                    ("elapsed", TraceValue::Duration(t_plans.elapsed())),
+                ],
+            );
+            for (i, plan, sink) in built {
                 lookup_partitions.push_back(spawn_lookup_full_contig_worker(
                     Arc::clone(&plan),
                     Arc::clone(&task_ctx),
