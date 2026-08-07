@@ -9821,6 +9821,8 @@ struct GridBufferBoundary {
 struct WorkerGridSlice {
     worker_id: usize,
     scan_lo_pos: i64,
+    /// Position of the worker's seam. Rows below it are warm-up only.
+    emit_start_pos: i64,
     scan_hi_pos: i64,
     skip_leading_rows: usize,
     warm_up_start_row: usize,
@@ -9888,6 +9890,7 @@ fn build_grid_slices(
         slices.push(WorkerGridSlice {
             worker_id: k,
             scan_lo_pos: boundaries[wk].pos,
+            emit_start_pos: boundaries[bk].pos,
             scan_hi_pos,
             skip_leading_rows: boundaries[wk].rows_before_pos,
             warm_up_start_row: boundaries[wk].global_row,
@@ -13131,6 +13134,17 @@ async fn prepare_contig_context(
             }
             wprovider.set_vcf_filter(Some(filter));
             wprovider.set_target_partitions(config.target_partitions);
+            // Warm-up rows (strictly before this worker's seam) are read only to
+            // replay buffer state and are then discarded, so skip their variation
+            // probe. Worker 0 has no warm-up. Opt out with VEP_SKIP_WARMUP_LOOKUP=0.
+            let skip_warm_up_lookup = std::env::var("VEP_SKIP_WARMUP_LOOKUP")
+                .ok()
+                .as_deref()
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            if skip_warm_up_lookup && slice.scan_lo_pos < slice.emit_start_pos {
+                wprovider.set_probe_floor_pos(Some(slice.emit_start_pos));
+            }
             #[cfg(feature = "parquet-cache")]
             if let Some(root) = &config.cache_root {
                 wprovider.set_cache_root(root.clone());

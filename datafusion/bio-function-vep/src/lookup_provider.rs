@@ -92,6 +92,7 @@ pub struct LookupProvider {
     parquet_backend: bool,
     /// Maximum number of independent cold readers used by lookup.
     target_partitions: usize,
+    probe_floor_pos: Option<i64>,
     /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
     /// for per-contig partitioned annotation).
     vcf_filter: Option<Expr>,
@@ -169,6 +170,7 @@ impl LookupProvider {
             #[cfg(feature = "parquet-cache")]
             parquet_backend: false,
             target_partitions: 1,
+            probe_floor_pos: None,
             vcf_filter: None,
             #[cfg(feature = "parquet-cache")]
             parquet_lookup_cell: None,
@@ -208,6 +210,11 @@ impl LookupProvider {
 
     pub fn set_target_partitions(&mut self, target_partitions: usize) {
         self.target_partitions = target_partitions.max(1);
+    }
+
+    /// Skip the variation probe for rows below this position (warm-up rows).
+    pub fn set_probe_floor_pos(&mut self, pos: Option<i64>) {
+        self.probe_floor_pos = pos;
     }
 
     /// Set an optional filter to apply to VCF input before lookup.
@@ -301,6 +308,7 @@ impl TableProvider for LookupProvider {
                 self.allowed_failed,
             )?;
             exec = exec.with_target_partitions(self.target_partitions);
+            exec = exec.with_probe_floor_pos(self.probe_floor_pos);
             if let Some(ref sink) = self.colocated_sink {
                 exec = exec.with_colocated_sink(Arc::clone(sink));
             }
