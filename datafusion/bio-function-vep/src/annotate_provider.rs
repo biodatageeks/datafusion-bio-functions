@@ -12900,6 +12900,13 @@ async fn prepare_contig_context(
                     ("elapsed", TraceValue::Duration(context_elapsed)),
                 ],
             );
+            // context_load must cover ALL five entities. The transcripts are
+            // loaded here and the other four in load_contig_context_rest, and
+            // the two phases are strictly sequential (the grid plan needs the
+            // transcripts), so the total is their sum.
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_load += context_elapsed;
+            });
             Ok(loaded)
         }
         #[cfg(not(feature = "parquet-cache"))]
