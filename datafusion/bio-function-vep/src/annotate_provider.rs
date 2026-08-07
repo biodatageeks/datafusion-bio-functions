@@ -8836,6 +8836,11 @@ type PersistedBufferTranscripts =
 /// Everything the contig context holds except the transcripts, which are loaded
 /// first so the grid slices (and therefore the lookup workers) can be planned
 /// while the rest is still loading.
+/// Buffer-grid boundaries, total input rows, and per-row `(position, input
+/// units)` used by the cost-weighted split. Units matter because the grid counts
+/// every ALT, so a multi-allelic row is several units.
+type ContigBufferGrid = (Vec<GridBufferBoundary>, usize, Vec<(i64, u32)>);
+
 type ContigContextRest = (
     Vec<ExonFeature>,
     Vec<TranslationFeature>,
@@ -9293,21 +9298,27 @@ async fn load_contig_context_rest(
         let mt_d = t.elapsed();
         (ex_raw, ex_d, tl_raw, tl_d, rg, rg_d, mt, mt_d)
     };
-    record_contig_profile(profile, |profile| {
-        profile.context_exons += ex_d;
-        profile.context_translations += tl_d;
-        profile.context_regulatory += rg_d;
-        profile.context_motifs += mt_d;
-    });
-
+    // Filtering is part of an entity's cost -- it was timed together with the
+    // parse before the split, and on transcript-restricted profiles the hash
+    // lookups are material -- so fold it into the same fields.
+    let t = Instant::now();
     let ex: Vec<_> = ex_raw
         .into_iter()
         .filter(|exon| tx_ids.contains(&exon.transcript_id))
         .collect();
+    let ex_filter = t.elapsed();
+    let t = Instant::now();
     let tl: Vec<_> = tl_raw
         .into_iter()
         .filter(|translation| tx_ids.contains(&translation.transcript_id))
         .collect();
+    let tl_filter = t.elapsed();
+    record_contig_profile(profile, |profile| {
+        profile.context_exons += ex_d + ex_filter;
+        profile.context_translations += tl_d + tl_filter;
+        profile.context_regulatory += rg_d;
+        profile.context_motifs += mt_d;
+    });
     Ok((ex, tl, rg, mt))
 }
 
@@ -9880,7 +9891,7 @@ fn build_grid_slices(
 /// become the stragglers under the equal-buffer-count split.
 fn buffer_transcript_weights(
     boundaries: &[GridBufferBoundary],
-    positions: &[i64],
+    positions: &[(i64, u32)],
     spans: impl IntoIterator<Item = (i64, i64)>,
 ) -> Vec<u64> {
     if boundaries.len() < 2 || positions.is_empty() {
@@ -9904,9 +9915,12 @@ fn buffer_transcript_weights(
         let from = boundaries[i].global_row.min(positions.len());
         let to = boundaries[i + 1].global_row.min(positions.len());
         let mut sum = 0u64;
-        for &p in &positions[from..to] {
+        for &(p, row_units) in &positions[from..to] {
             let covering = starts.partition_point(|&s| s <= p) - ends.partition_point(|&e| e < p);
-            sum += covering as u64;
+            // Scale by input units: the buffer grid and the annotation workload
+            // both count each ALT separately, so a 10-ALT row is ~10x the work
+            // of a single-ALT row at the same transcript depth.
+            sum += covering as u64 * row_units.max(1) as u64;
         }
         *w = sum;
     }
@@ -10000,8 +10014,8 @@ fn accumulate_boundaries_inner(
     batches: &[RecordBatch],
     input_buffer_size: usize,
     collect_positions: bool,
-) -> Result<(Vec<GridBufferBoundary>, usize, Vec<i64>)> {
-    let mut positions: Vec<i64> = Vec::new();
+) -> Result<ContigBufferGrid> {
+    let mut positions: Vec<(i64, u32)> = Vec::new();
     let limit = input_buffer_size.max(1);
     let mut boundaries: Vec<GridBufferBoundary> = Vec::new();
     let mut global_row = 0usize;
@@ -10035,10 +10049,13 @@ fn accumulate_boundaries_inner(
                 last_pos = Some(pos);
                 run = 1;
             }
+            let row_units = alts.as_ref().map_or(1, |a| a.input_units_at(row));
             if collect_positions {
-                positions.push(pos);
+                // (position, VEP input units). The grid counts every ALT as a
+                // unit, so a multi-allelic row must carry that much weight too.
+                positions.push((pos, row_units as u32));
             }
-            units += alts.as_ref().map_or(1, |a| a.input_units_at(row));
+            units += row_units;
             global_row += 1;
             if units >= limit {
                 units = 0;
@@ -12665,7 +12682,7 @@ async fn count_contig_buffer_boundaries(
     chrom: &str,
     input_buffer_size: usize,
     collect_positions: bool,
-) -> Result<(Vec<GridBufferBoundary>, usize, Vec<i64>)> {
+) -> Result<ContigBufferGrid> {
     let provider = session.table_provider(vcf_table).await?;
     let schema = provider.schema();
     let mut proj = vec![schema.index_of("start")?];
@@ -15289,7 +15306,7 @@ mod tests {
             gb(3, 300),
             gb(4, i64::MAX),
         ];
-        let positions = vec![0i64, 100, 200, 300];
+        let positions = vec![(0i64, 1u32), (100, 1), (200, 1), (300, 1)];
         // One short transcript over [10,50] (covers no variant), two long ones
         // spanning [250,350] / [260,340] which both cover the variant at 300.
         let spans = vec![(10, 50), (250, 350), (260, 340)];
@@ -15312,6 +15329,26 @@ mod tests {
     }
 
     #[test]
+    fn weights_scale_with_input_units_not_arrow_rows() {
+        // Two buffers, one variant each, both covered by the same transcript.
+        // The second row is 10-ALT, so it is 10 VEP input units and must carry
+        // ~10x the weight of the single-ALT row.
+        let bs = vec![gb(0, 0), gb(1, 100), gb(2, i64::MAX)];
+        let spans = vec![(0, 1_000)];
+        let single = buffer_transcript_weights(&bs, &[(0i64, 1u32), (100, 1)], spans.clone());
+        let multi = buffer_transcript_weights(&bs, &[(0i64, 1u32), (100, 10)], spans);
+        assert_eq!(single[0], multi[0], "the single-ALT buffer is unchanged");
+        assert!(
+            multi[1] > single[1],
+            "10-ALT buffer must outweigh the 1-ALT buffer ({} vs {})",
+            multi[1],
+            single[1]
+        );
+        // depth 1 x 10 units vs depth 1 x 1 unit, before the shared fixed term
+        assert_eq!(multi[1] - single[1], 9);
+    }
+
+    #[test]
     fn balanced_split_gives_the_dense_worker_fewer_buffers() {
         // 4 buffers; all transcript mass sits in the last one.
         let bs = vec![
@@ -15321,8 +15358,8 @@ mod tests {
             gb(15000, 300),
             gb(20000, i64::MAX),
         ];
-        let positions: Vec<i64> = (0..20000)
-            .map(|r: i64| if r < 15000 { r / 150 } else { 300 })
+        let positions: Vec<(i64, u32)> = (0..20000)
+            .map(|r: i64| (if r < 15000 { r / 150 } else { 300 }, 1u32))
             .collect();
         let spans: Vec<(i64, i64)> = (0..40).map(|_| (300, 400)).collect();
         let w = buffer_transcript_weights(&bs, &positions, spans);
@@ -15358,7 +15395,7 @@ mod tests {
         let bs: Vec<GridBufferBoundary> = (0..=20)
             .map(|i| gb(i * 5000, if i == 20 { i64::MAX } else { (i as i64) * 100 }))
             .collect();
-        let positions: Vec<i64> = (0..100_000).map(|r: i64| r / 500).collect();
+        let positions: Vec<(i64, u32)> = (0..100_000).map(|r: i64| (r / 500, 1u32)).collect();
         let spans: Vec<(i64, i64)> = (0..200).map(|i| (i * 7, i * 7 + 250)).collect();
         let w = buffer_transcript_weights(&bs, &positions, spans);
         for workers in [1usize, 2, 3, 5, 8, 16, 32] {
