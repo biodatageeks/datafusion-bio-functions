@@ -8833,9 +8833,15 @@ struct TranscriptCacheRegion {
 
 type PersistedBufferTranscripts =
     HashMap<TranscriptCacheRegion, HashMap<String, TranscriptFeature>>;
-type LoadedContigContext = (
-    Vec<TranscriptFeature>,
-    HashMap<String, String>,
+/// Everything the contig context holds except the transcripts, which are loaded
+/// first so the grid slices (and therefore the lookup workers) can be planned
+/// while the rest is still loading.
+/// Buffer-grid boundaries, total input rows, and per-row `(position, input
+/// units)` used by the cost-weighted split. Units matter because the grid counts
+/// every ALT, so a multi-allelic row is several units.
+type ContigBufferGrid = (Vec<GridBufferBoundary>, usize, Vec<(i64, u32)>);
+
+type ContigContextRest = (
     Vec<ExonFeature>,
     Vec<TranslationFeature>,
     Vec<RegulatoryFeature>,
@@ -9051,71 +9057,130 @@ fn emit_contig_pipeline_profile(profile: &Option<SharedContigPipelineProfile>, c
 }
 
 #[cfg(feature = "parquet-cache")]
-async fn load_contig_context(
+const TRANSCRIPT_CONTEXT_COLUMNS: &[&str] = &[
+    "transcript_id",
+    "stable_id",
+    "chrom",
+    "start",
+    "\"end\"",
+    "strand",
+    "biotype",
+    "cds_start",
+    "cds_end",
+    "cdna_coding_start",
+    "cdna_coding_end",
+    "gene_stable_id",
+    "gene_symbol",
+    "gene_symbol_source",
+    "gene_hgnc_id_native",
+    "gene_hgnc_id",
+    "source",
+    "source_cache",
+    "display_xref_id",
+    "version",
+    "cds_start_nf",
+    "cds_end_nf",
+    "mature_mirna_regions",
+    "cdna_seq",
+    "bam_edit_status",
+    "has_non_polya_rna_edit",
+    "spliced_seq",
+    "five_prime_utr_seq",
+    "three_prime_utr_seq",
+    "translateable_seq",
+    "flags_str",
+    "refseq_match",
+    "refseq_edits",
+    "is_gencode_basic",
+    "is_gencode_primary",
+    "cdna_mapper_segments",
+    "is_canonical",
+    "tsl",
+    "mane_select",
+    "mane_plus_clinical",
+    "translation_stable_id",
+    "gene_phenotype",
+    "ccds",
+    "swissprot",
+    "trembl",
+    "uniparc",
+    "uniprot_isoform",
+    "appris",
+    "ncrna_structure",
+    "transcript_uid",
+];
+
+const EXON_CONTEXT_COLUMNS: &[&str] = &[
+    "transcript_id",
+    "stable_id",
+    "exon_number",
+    "start",
+    "\"end\"",
+    "chrom",
+];
+
+const TRANSLATION_CONTEXT_COLUMNS: &[&str] = &[
+    "transcript_id",
+    "stable_id",
+    "chrom",
+    "start",
+    "\"end\"",
+    "cds_len",
+    "cds_length",
+    "protein_len",
+    "translation_seq",
+    "cds_sequence",
+    "cds_seq",
+    "coding_sequence",
+    "translation_seq_canonical",
+    "cds_sequence_canonical",
+    "version",
+    "protein_features",
+];
+
+const REGULATORY_CONTEXT_COLUMNS: &[&str] = &[
+    "stable_id",
+    "feature_id",
+    "feature_type",
+    "chrom",
+    "start",
+    "\"end\"",
+];
+
+const MOTIF_CONTEXT_COLUMNS: &[&str] = &[
+    "motif_id",
+    "feature_id",
+    "chrom",
+    "start",
+    "\"end\"",
+    "binding_matrix",
+    "transcription_factors",
+    "strand",
+    "binding_matrix_length",
+    "binding_matrix_elements",
+    "binding_matrix_unit",
+    "motif_seq",
+];
+
+async fn join_parse<T: Send + 'static>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
+    handle
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("context parse task failed: {e}")))?
+}
+
+/// Load only the transcripts. `compute_overlap_width_bp` needs nothing else, so
+/// this is the whole dependency of the grid slice plan -- returning it early
+/// lets the lookup workers start reading VCF while the remaining four context
+/// entities are still loading.
+async fn load_contig_transcripts(
     cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     chrom: &str,
     config: &ContigAnnotationConfig,
     profile: &Option<SharedContigPipelineProfile>,
-) -> Result<LoadedContigContext> {
+) -> Result<(Vec<TranscriptFeature>, HashMap<String, String>)> {
     let scan_started = Instant::now();
-    let tx_batches = scan_context_entity(
-        cache,
-        "transcript",
-        chrom,
-        &[
-            "transcript_id",
-            "stable_id",
-            "chrom",
-            "start",
-            "\"end\"",
-            "strand",
-            "biotype",
-            "cds_start",
-            "cds_end",
-            "cdna_coding_start",
-            "cdna_coding_end",
-            "gene_stable_id",
-            "gene_symbol",
-            "gene_symbol_source",
-            "gene_hgnc_id_native",
-            "gene_hgnc_id",
-            "source",
-            "source_cache",
-            "display_xref_id",
-            "version",
-            "cds_start_nf",
-            "cds_end_nf",
-            "mature_mirna_regions",
-            "cdna_seq",
-            "bam_edit_status",
-            "has_non_polya_rna_edit",
-            "spliced_seq",
-            "five_prime_utr_seq",
-            "three_prime_utr_seq",
-            "translateable_seq",
-            "flags_str",
-            "refseq_match",
-            "refseq_edits",
-            "is_gencode_basic",
-            "is_gencode_primary",
-            "cdna_mapper_segments",
-            "is_canonical",
-            "tsl",
-            "mane_select",
-            "mane_plus_clinical",
-            "translation_stable_id",
-            "gene_phenotype",
-            "ccds",
-            "swissprot",
-            "trembl",
-            "uniparc",
-            "uniprot_isoform",
-            "appris",
-            "ncrna_structure",
-            "transcript_uid",
-        ],
-    )
-    .await?;
+    let tx_batches =
+        scan_context_entity(cache, "transcript", chrom, TRANSCRIPT_CONTEXT_COLUMNS).await?;
     record_contig_profile(profile, |profile| {
         profile.context_transcripts_scan += scan_started.elapsed();
     });
@@ -9129,127 +9194,132 @@ async fn load_contig_context(
     record_contig_profile(profile, |profile| {
         profile.context_transcripts += started.elapsed();
     });
-    let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
+    Ok((tx_vec, translateable_seq))
+}
 
-    let scan_started = Instant::now();
-    let ex_batches = scan_context_entity(
-        cache,
-        "exon",
-        chrom,
-        &[
-            "transcript_id",
-            "stable_id",
-            "exon_number",
-            "start",
-            "\"end\"",
-            "chrom",
-        ],
-    )
-    .await?;
+/// Load the four non-transcript context entities, filtering exon/translation to
+/// `tx_ids`. Scans run concurrently; the parses run on blocking threads.
+async fn load_contig_context_rest(
+    cache: &crate::parquet_cache::detect::PartitionedParquetCache,
+    chrom: &str,
+    profile: &Option<SharedContigPipelineProfile>,
+    tx_ids: &HashSet<String>,
+) -> Result<ContigContextRest> {
+    // The four scans are mutually independent and the parses are CPU-bound, so
+    // by default they run concurrently. VEP_CTX_PARALLEL=0 forces the original
+    // strictly serial order, which keeps the A/B honest and gives an opt-out
+    // when the extra concurrency would contend with something else.
+    let concurrent =
+        pipeline_trace::enabled_from_env_value(std::env::var("VEP_CTX_PARALLEL").ok().as_deref());
+
+    async fn timed_scan(
+        cache: &crate::parquet_cache::detect::PartitionedParquetCache,
+        entity: &str,
+        chrom: &str,
+        columns: &[&str],
+    ) -> Result<(Vec<RecordBatch>, Duration)> {
+        let started = Instant::now();
+        let batches = scan_context_entity(cache, entity, chrom, columns).await?;
+        Ok((batches, started.elapsed()))
+    }
+
+    let (ex_s, tl_s, rg_s, mt_s) = if concurrent {
+        tokio::try_join!(
+            timed_scan(cache, "exon", chrom, EXON_CONTEXT_COLUMNS),
+            timed_scan(
+                cache,
+                "translation_core",
+                chrom,
+                TRANSLATION_CONTEXT_COLUMNS
+            ),
+            timed_scan(cache, "regulatory", chrom, REGULATORY_CONTEXT_COLUMNS),
+            timed_scan(cache, "motif", chrom, MOTIF_CONTEXT_COLUMNS),
+        )?
+    } else {
+        (
+            timed_scan(cache, "exon", chrom, EXON_CONTEXT_COLUMNS).await?,
+            timed_scan(
+                cache,
+                "translation_core",
+                chrom,
+                TRANSLATION_CONTEXT_COLUMNS,
+            )
+            .await?,
+            timed_scan(cache, "regulatory", chrom, REGULATORY_CONTEXT_COLUMNS).await?,
+            timed_scan(cache, "motif", chrom, MOTIF_CONTEXT_COLUMNS).await?,
+        )
+    };
+    // Per-entity, not lumped together: the vep-perf-profiling skill reads these
+    // individually to find which context entity dominates.
     record_contig_profile(profile, |profile| {
-        profile.context_exons_scan += scan_started.elapsed();
+        profile.context_exons_scan += ex_s.1;
+        profile.context_translations_scan += tl_s.1;
+        profile.context_regulatory_scan += rg_s.1;
+        profile.context_motifs_scan += mt_s.1;
     });
-    let started = Instant::now();
-    let ex: Vec<_> = AnnotateProvider::parse_exon_batches("exon", &ex_batches)?
+    let (ex_batches, tl_batches, rg_batches, mt_batches) = (ex_s.0, tl_s.0, rg_s.0, mt_s.0);
+
+    let (ex_raw, ex_d, tl_raw, tl_d, rg, rg_d, mt, mt_d) = if concurrent {
+        let ex_h = tokio::task::spawn_blocking(move || {
+            let t = Instant::now();
+            AnnotateProvider::parse_exon_batches("exon", &ex_batches).map(|v| (v, t.elapsed()))
+        });
+        let tl_h = tokio::task::spawn_blocking(move || {
+            let t = Instant::now();
+            AnnotateProvider::parse_translation_batches("translation_core", &tl_batches)
+                .map(|v| (v, t.elapsed()))
+        });
+        let rg_h = tokio::task::spawn_blocking(move || {
+            let t = Instant::now();
+            AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)
+                .map(|v| (v, t.elapsed()))
+        });
+        let mt_h = tokio::task::spawn_blocking(move || {
+            let t = Instant::now();
+            AnnotateProvider::parse_motif_batches("motif", &mt_batches).map(|v| (v, t.elapsed()))
+        });
+        let (ex_raw, ex_d) = join_parse(ex_h).await?;
+        let (tl_raw, tl_d) = join_parse(tl_h).await?;
+        let (rg, rg_d) = join_parse(rg_h).await?;
+        let (mt, mt_d) = join_parse(mt_h).await?;
+        (ex_raw, ex_d, tl_raw, tl_d, rg, rg_d, mt, mt_d)
+    } else {
+        let t = Instant::now();
+        let ex_raw = AnnotateProvider::parse_exon_batches("exon", &ex_batches)?;
+        let ex_d = t.elapsed();
+        let t = Instant::now();
+        let tl_raw = AnnotateProvider::parse_translation_batches("translation_core", &tl_batches)?;
+        let tl_d = t.elapsed();
+        let t = Instant::now();
+        let rg = AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)?;
+        let rg_d = t.elapsed();
+        let t = Instant::now();
+        let mt = AnnotateProvider::parse_motif_batches("motif", &mt_batches)?;
+        let mt_d = t.elapsed();
+        (ex_raw, ex_d, tl_raw, tl_d, rg, rg_d, mt, mt_d)
+    };
+    // Filtering is part of an entity's cost -- it was timed together with the
+    // parse before the split, and on transcript-restricted profiles the hash
+    // lookups are material -- so fold it into the same fields.
+    let t = Instant::now();
+    let ex: Vec<_> = ex_raw
         .into_iter()
         .filter(|exon| tx_ids.contains(&exon.transcript_id))
         .collect();
-    record_contig_profile(profile, |profile| {
-        profile.context_exons += started.elapsed();
-    });
-
-    let scan_started = Instant::now();
-    let tl_batches = scan_context_entity(
-        cache,
-        "translation_core",
-        chrom,
-        &[
-            "transcript_id",
-            "stable_id",
-            "chrom",
-            "start",
-            "\"end\"",
-            "cds_len",
-            "cds_length",
-            "protein_len",
-            "translation_seq",
-            "cds_sequence",
-            "cds_seq",
-            "coding_sequence",
-            "translation_seq_canonical",
-            "cds_sequence_canonical",
-            "version",
-            "protein_features",
-        ],
-    )
-    .await?;
-    record_contig_profile(profile, |profile| {
-        profile.context_translations_scan += scan_started.elapsed();
-    });
-    let started = Instant::now();
-    let tl: Vec<_> = AnnotateProvider::parse_translation_batches("translation_core", &tl_batches)?
+    let ex_filter = t.elapsed();
+    let t = Instant::now();
+    let tl: Vec<_> = tl_raw
         .into_iter()
         .filter(|translation| tx_ids.contains(&translation.transcript_id))
         .collect();
+    let tl_filter = t.elapsed();
     record_contig_profile(profile, |profile| {
-        profile.context_translations += started.elapsed();
+        profile.context_exons += ex_d + ex_filter;
+        profile.context_translations += tl_d + tl_filter;
+        profile.context_regulatory += rg_d;
+        profile.context_motifs += mt_d;
     });
-
-    let scan_started = Instant::now();
-    let rg_batches = scan_context_entity(
-        cache,
-        "regulatory",
-        chrom,
-        &[
-            "stable_id",
-            "feature_id",
-            "feature_type",
-            "chrom",
-            "start",
-            "\"end\"",
-        ],
-    )
-    .await?;
-    record_contig_profile(profile, |profile| {
-        profile.context_regulatory_scan += scan_started.elapsed();
-    });
-    let started = Instant::now();
-    let rg = AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)?;
-    record_contig_profile(profile, |profile| {
-        profile.context_regulatory += started.elapsed();
-    });
-
-    let scan_started = Instant::now();
-    let mt_batches = scan_context_entity(
-        cache,
-        "motif",
-        chrom,
-        &[
-            "motif_id",
-            "feature_id",
-            "chrom",
-            "start",
-            "\"end\"",
-            "binding_matrix",
-            "transcription_factors",
-            "strand",
-            "binding_matrix_length",
-            "binding_matrix_elements",
-            "binding_matrix_unit",
-            "motif_seq",
-        ],
-    )
-    .await?;
-    record_contig_profile(profile, |profile| {
-        profile.context_motifs_scan += scan_started.elapsed();
-    });
-    let started = Instant::now();
-    let mt = AnnotateProvider::parse_motif_batches("motif", &mt_batches)?;
-    record_contig_profile(profile, |profile| {
-        profile.context_motifs += started.elapsed();
-    });
-
-    Ok((tx_vec, translateable_seq, ex, tl, rg, mt))
+    Ok((ex, tl, rg, mt))
 }
 
 #[cfg(feature = "parquet-cache")]
@@ -9731,6 +9801,8 @@ struct GridBufferBoundary {
 struct WorkerGridSlice {
     worker_id: usize,
     scan_lo_pos: i64,
+    /// Position of the worker's seam. Rows below it are warm-up only.
+    emit_start_pos: i64,
     scan_hi_pos: i64,
     skip_leading_rows: usize,
     warm_up_start_row: usize,
@@ -9755,10 +9827,27 @@ fn plan_grid_partitions(
     }
     let b = boundaries.len() - 1; // whole buffer count
     let round_div = |k: usize| -> usize { (k * b + workers / 2) / workers };
-    let mut slices = Vec::with_capacity(workers);
-    for k in 0..workers {
-        let bk = round_div(k);
-        let bk1 = round_div(k + 1);
+    let cuts: Vec<usize> = (0..=workers).map(round_div).collect();
+    build_grid_slices(boundaries, &cuts, overlap_width_bp)
+}
+
+/// Turn `workers + 1` ascending buffer-index cut points into worker slices. The
+/// cut policy (equal buffer count, or cost-weighted) lives in the caller; this
+/// only materialises the row marks, the bounded-overlap warm-up start and the
+/// lookup scan window, so every policy shares one implementation.
+fn build_grid_slices(
+    boundaries: &[GridBufferBoundary],
+    cuts: &[usize],
+    overlap_width_bp: i64,
+) -> Vec<WorkerGridSlice> {
+    if boundaries.len() < 2 || cuts.len() < 2 {
+        return Vec::new();
+    }
+    let b = boundaries.len() - 1;
+    let mut slices = Vec::with_capacity(cuts.len() - 1);
+    for k in 0..cuts.len() - 1 {
+        let bk = cuts[k].min(b);
+        let bk1 = cuts[k + 1].min(b);
         if bk >= bk1 {
             continue; // empty range (more workers than buffers)
         }
@@ -9781,6 +9870,7 @@ fn plan_grid_partitions(
         slices.push(WorkerGridSlice {
             worker_id: k,
             scan_lo_pos: boundaries[wk].pos,
+            emit_start_pos: boundaries[bk].pos,
             scan_hi_pos,
             skip_leading_rows: boundaries[wk].rows_before_pos,
             warm_up_start_row: boundaries[wk].global_row,
@@ -9789,6 +9879,114 @@ fn plan_grid_partitions(
         });
     }
     slices
+}
+
+/// Per-buffer cost weight used by the balanced grid split: how many contig
+/// transcripts overlap the buffer's position span, plus a constant for the fixed
+/// per-buffer cost that is paid even in gene deserts.
+///
+/// Buffers already hold a fixed number of VEP input units, so *variants* per
+/// buffer are equalised by construction. What is not equalised is how many
+/// transcripts each variant is evaluated against — that is why gene-dense slices
+/// become the stragglers under the equal-buffer-count split.
+fn buffer_transcript_weights(
+    boundaries: &[GridBufferBoundary],
+    positions: &[(i64, u32)],
+    spans: impl IntoIterator<Item = (i64, i64)>,
+) -> Vec<u64> {
+    if boundaries.len() < 2 || positions.is_empty() {
+        return Vec::new();
+    }
+    let b = boundaries.len() - 1;
+    // Transcript coverage depth at a position = (#starts <= p) - (#ends < p),
+    // read off two sorted endpoint arrays.
+    let mut starts: Vec<i64> = Vec::new();
+    let mut ends: Vec<i64> = Vec::new();
+    for (s, e) in spans {
+        let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+        starts.push(lo);
+        ends.push(hi);
+    }
+    starts.sort_unstable();
+    ends.sort_unstable();
+
+    let mut weights = vec![0u64; b];
+    for (i, w) in weights.iter_mut().enumerate() {
+        let from = boundaries[i].global_row.min(positions.len());
+        let to = boundaries[i + 1].global_row.min(positions.len());
+        let mut sum = 0u64;
+        for &(p, row_units) in &positions[from..to] {
+            let covering = starts.partition_point(|&s| s <= p) - ends.partition_point(|&e| e < p);
+            // Scale by input units: the buffer grid and the annotation workload
+            // both count each ALT separately, so a 10-ALT row is ~10x the work
+            // of a single-ALT row at the same transcript depth.
+            sum += covering as u64 * row_units.max(1) as u64;
+        }
+        *w = sum;
+    }
+    // Fixed per-buffer term. Measured on chr1: the buffer-invariant cost
+    // (buffer-local transcript selection scans every contig transcript) is ~12%
+    // of per-buffer CPU, so bias by an eighth of the mean. Without it a buffer
+    // in a gene desert looks free and they all pile onto one worker.
+    let total: u64 = weights.iter().sum();
+    let fixed = (total / (b as u64).max(1)) / 8;
+    for w in weights.iter_mut() {
+        *w += fixed + 1;
+    }
+    weights
+}
+
+/// Cost-weighted variant of [`plan_grid_partitions`]: cut the buffer grid so
+/// each worker receives an approximately equal share of total weight rather than
+/// an equal count of buffers. Falls back to the uniform split when the weights
+/// do not describe this grid.
+fn plan_grid_partitions_balanced(
+    boundaries: &[GridBufferBoundary],
+    workers: usize,
+    overlap_width_bp: i64,
+    weights: &[u64],
+) -> Vec<WorkerGridSlice> {
+    let workers = workers.max(1);
+    if boundaries.len() < 2 {
+        return Vec::new();
+    }
+    let b = boundaries.len() - 1;
+    if weights.len() != b {
+        return plan_grid_partitions(boundaries, workers, overlap_width_bp);
+    }
+    let mut prefix = Vec::with_capacity(b + 1);
+    prefix.push(0u64);
+    for w in weights {
+        prefix.push(prefix[prefix.len() - 1].saturating_add(*w));
+    }
+    let total = prefix[b];
+    if total == 0 {
+        return plan_grid_partitions(boundaries, workers, overlap_width_bp);
+    }
+    let mut cuts = Vec::with_capacity(workers + 1);
+    for k in 0..=workers {
+        let cut = if k == 0 {
+            0
+        } else if k >= workers {
+            b
+        } else {
+            let target = (total as u128 * k as u128 / workers as u128) as u64;
+            // prefix is ascending, so this is monotonic in k.
+            prefix.partition_point(|&p| p < target).min(b)
+        };
+        cuts.push(cut);
+    }
+    // Buffers are atomic, so a heavily skewed contig can drive several weighted
+    // cuts onto the same buffer index and silently hand the whole contig to one
+    // worker. When the grid has room, force every worker to keep at least one
+    // buffer: losing parallelism is always worse than an imperfect split.
+    if b >= workers {
+        for k in 1..=workers {
+            let hi = b - (workers - k);
+            cuts[k] = cuts[k].max(cuts[k - 1] + 1).min(hi);
+        }
+    }
+    build_grid_slices(boundaries, &cuts, overlap_width_bp)
 }
 
 /// Replay the EXACT serial buffer-cut logic (`count_ready_input_buffers`) over a
@@ -9802,6 +10000,22 @@ fn accumulate_boundaries(
     batches: &[RecordBatch],
     input_buffer_size: usize,
 ) -> Result<(Vec<GridBufferBoundary>, usize)> {
+    let (boundaries, rows, _) = accumulate_boundaries_inner(batches, input_buffer_size, false)?;
+    Ok((boundaries, rows))
+}
+
+/// As [`accumulate_boundaries`], but optionally also returns every row's
+/// position in row order. The positions feed the cost-weighted grid split, which
+/// needs to know how many transcripts cover each *variant* — a buffer's span
+/// alone cannot tell it that, because buffers hold a fixed number of variants
+/// and therefore span far more base pairs in gene deserts than in dense regions.
+/// Collection is opt-in so the default path allocates nothing extra.
+fn accumulate_boundaries_inner(
+    batches: &[RecordBatch],
+    input_buffer_size: usize,
+    collect_positions: bool,
+) -> Result<ContigBufferGrid> {
+    let mut positions: Vec<(i64, u32)> = Vec::new();
     let limit = input_buffer_size.max(1);
     let mut boundaries: Vec<GridBufferBoundary> = Vec::new();
     let mut global_row = 0usize;
@@ -9835,7 +10049,13 @@ fn accumulate_boundaries(
                 last_pos = Some(pos);
                 run = 1;
             }
-            units += alts.as_ref().map_or(1, |a| a.input_units_at(row));
+            let row_units = alts.as_ref().map_or(1, |a| a.input_units_at(row));
+            if collect_positions {
+                // (position, VEP input units). The grid counts every ALT as a
+                // unit, so a multi-allelic row must carry that much weight too.
+                positions.push((pos, row_units as u32));
+            }
+            units += row_units;
             global_row += 1;
             if units >= limit {
                 units = 0;
@@ -9848,7 +10068,7 @@ fn accumulate_boundaries(
         pos: i64::MAX,
         rows_before_pos: 0,
     });
-    Ok((boundaries, global_row))
+    Ok((boundaries, global_row, positions))
 }
 
 /// Everything needed to start streaming annotation for a contig.
@@ -12461,7 +12681,8 @@ async fn count_contig_buffer_boundaries(
     vcf_table: &str,
     chrom: &str,
     input_buffer_size: usize,
-) -> Result<(Vec<GridBufferBoundary>, usize)> {
+    collect_positions: bool,
+) -> Result<ContigBufferGrid> {
     let provider = session.table_provider(vcf_table).await?;
     let schema = provider.schema();
     let mut proj = vec![schema.index_of("start")?];
@@ -12488,7 +12709,7 @@ async fn count_contig_buffer_boundaries(
             batches.push(batch?);
         }
     }
-    accumulate_boundaries(&batches, input_buffer_size)
+    accumulate_boundaries_inner(&batches, input_buffer_size, collect_positions)
 }
 
 async fn prepare_contig_context(
@@ -12547,7 +12768,7 @@ async fn prepare_contig_context(
 
     // 2. Create lookup stream + load context data. Parquet loads
     // transcript/exon/translation/regulatory/motif context via
-    // `load_contig_context`; no per-chrom parquet tables are registered.
+    // `load_contig_transcripts`; no per-chrom parquet tables are registered.
 
     // Lookup arm: build LookupProvider, create stream (cheap — build+probe
     // happens on first poll, NOT here).
@@ -12684,31 +12905,25 @@ async fn prepare_contig_context(
         #[cfg(feature = "parquet-cache")]
         {
             let loaded =
-                load_contig_context(cache.as_parquet(), &chrom, &config, &pipeline_profile).await?;
+                load_contig_transcripts(cache.as_parquet(), &chrom, &config, &pipeline_profile)
+                    .await?;
             let context_elapsed = t_ctx.elapsed();
             pipeline_trace::emit(
                 "context",
-                "done",
+                "transcripts_done",
                 &[
                     ("chrom", TraceValue::Str(&chrom)),
                     ("transcripts", TraceValue::Usize(loaded.0.len())),
-                    ("exons", TraceValue::Usize(loaded.2.len())),
-                    ("translations", TraceValue::Usize(loaded.3.len())),
-                    ("regulatory", TraceValue::Usize(loaded.4.len())),
-                    ("motifs", TraceValue::Usize(loaded.5.len())),
                     ("elapsed", TraceValue::Duration(context_elapsed)),
                 ],
             );
+            // context_load must cover ALL five entities. The transcripts are
+            // loaded here and the other four in load_contig_context_rest, and
+            // the two phases are strictly sequential (the grid plan needs the
+            // transcripts), so the total is their sum.
             record_contig_profile(&pipeline_profile, |profile| {
                 profile.context_load += context_elapsed;
             });
-            if profiling_enabled() {
-                eprintln!(
-                    "[VEP_PROFILE] {:.<50} {:>8.1}ms",
-                    format!("{chrom}: context_load"),
-                    context_elapsed.as_secs_f64() * 1000.0
-                );
-            }
             Ok(loaded)
         }
         #[cfg(not(feature = "parquet-cache"))]
@@ -12716,6 +12931,21 @@ async fn prepare_contig_context(
             unreachable!("parquet-cache feature is required")
         }
     };
+    // Cost-weighted grid split (opt-in). Resolved before the count pass because
+    // the weights need every row's position, which only that pass sees.
+    // Start the lookup workers as soon as the transcripts (the grid plan's only
+    // context dependency) are parsed, so they read VCF while the remaining four
+    // context entities still load. Opt out with VEP_EARLY_WORKERS=0.
+    let early_workers = stateful_parallel
+        && std::env::var("VEP_EARLY_WORKERS")
+            .ok()
+            .as_deref()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+    let grid_balance_enabled = stateful_parallel
+        && pipeline_trace::enabled_from_env_value(
+            std::env::var("VEP_GRID_BALANCE").ok().as_deref(),
+        );
     // Run the grid count pass (VCF positions only) CONCURRENTLY with the context
     // load (Parquet transcripts/exons) — independent IO, so the count is hidden
     // behind context load instead of running as a serial prelude before workers.
@@ -12727,6 +12957,7 @@ async fn prepare_contig_context(
                     &config.vcf_table,
                     &chrom,
                     config.input_buffer_size,
+                    grid_balance_enabled,
                 )
                 .await,
             )
@@ -12734,10 +12965,10 @@ async fn prepare_contig_context(
             None
         }
     };
-    let context_result: Result<LoadedContigContext>;
+    let context_result: Result<(Vec<TranscriptFeature>, HashMap<String, String>)>;
     let grid_count;
     (context_result, grid_count) = tokio::join!(context_fut, count_fut);
-    let (tx_vec, translateable_seq, ex, tl, rg, mt) = match context_result {
+    let (tx_vec, translateable_seq) = match context_result {
         Ok(context) => context,
         Err(e) => {
             abort_lookup_partitions(&mut lookup_partitions);
@@ -12791,71 +13022,225 @@ async fn prepare_contig_context(
             .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
             .collect(),
     );
-    let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
     let overlap_width_bp = compute_overlap_width_bp(&base_transcripts);
+    let tx_ids: HashSet<String> = base_transcripts
+        .iter()
+        .map(|tx| tx.transcript_id.clone())
+        .collect();
+    let t_rest = Instant::now();
+    let rest_fut = async {
+        let rest =
+            load_contig_context_rest(cache.as_parquet(), &chrom, &pipeline_profile, &tx_ids).await;
+        let rest_elapsed = t_rest.elapsed();
+        pipeline_trace::emit(
+            "context",
+            "done",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("elapsed", TraceValue::Duration(rest_elapsed)),
+            ],
+        );
+        record_contig_profile(&pipeline_profile, |profile| {
+            profile.context_load += rest_elapsed;
+        });
+        rest
+    };
 
     // Grid-aligned parallel lookup (stateful Merged/RefSeq, workers>1): a count
     // pass finds the global 5000-unit buffer boundaries; each worker gets a
     // whole-buffer rank range with a bounded-overlap warm-up start, and a lookup
     // scan filtered to its `[scan_lo_pos, scan_hi_pos)` position window.
-    if stateful_parallel {
-        let (boundaries, _total_rows) =
-            grid_count.expect("stateful_parallel implies the count future ran")?;
-        let slices = plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp);
-        let _ = _total_rows;
-        let task_ctx = session.task_ctx();
-        for (i, slice) in slices.iter().enumerate() {
-            let mut wprovider = LookupProvider::new(
-                Arc::clone(&session),
-                config.vcf_table.clone(),
-                var_table.clone(),
-                grid_vcf_schema.clone(),
-                grid_cache_schema.clone(),
-                config.cache_columns.clone(),
-                config.extended_probes,
-                config.allowed_failed,
-            )?;
-            // Restrict each worker to its [scan_lo_pos, scan_hi_pos) window so it
-            // reads ONLY its range's lookup (warm-up + emit) — no over-read. The
-            // full-contig worker below reads ALL partitions of this filtered plan
-            // (the earlier truncation was reading only partition 0, not a broken
-            // filter). The last worker has no upper bound (reads to contig end).
-            let mut filter = col("chrom")
-                .eq(lit(&*chrom))
-                .and(col("start").gt_eq(lit(slice.scan_lo_pos)));
-            if slice.scan_hi_pos != i64::MAX {
-                filter = filter.and(col("start").lt(lit(slice.scan_hi_pos)));
-            }
-            wprovider.set_vcf_filter(Some(filter));
-            wprovider.set_target_partitions(config.target_partitions);
-            #[cfg(feature = "parquet-cache")]
-            if let Some(root) = &config.cache_root {
-                wprovider.set_cache_root(root.clone());
-                if config.parquet_backend {
-                    wprovider.set_parquet_backend(true);
+    let grid_fut = async {
+        if stateful_parallel {
+            let (boundaries, _total_rows, grid_positions) =
+                grid_count.expect("stateful_parallel implies the count future ran")?;
+            // Cost-weighted grid split (opt-in via VEP_GRID_BALANCE). The default
+            // equal-buffer-count split equalises variants per worker, not work, so
+            // gene-dense slices straggle; weighting by transcript overlap equalises
+            // the thing that actually costs. Slice boundaries do not affect output
+            // (every worker count already yields byte-identical VCFs), so this is a
+            // scheduling change only.
+            let slices = if grid_balance_enabled {
+                let t_w = Instant::now();
+                let weights = buffer_transcript_weights(
+                    &boundaries,
+                    &grid_positions,
+                    base_transcripts.iter().map(|tx| (tx.start, tx.end)),
+                );
+                let planned = plan_grid_partitions_balanced(
+                    &boundaries,
+                    config.annotation_workers,
+                    overlap_width_bp,
+                    &weights,
+                );
+                pipeline_trace::emit(
+                    "grid_balance",
+                    "done",
+                    &[
+                        ("chrom", TraceValue::Str(&chrom)),
+                        ("buffers", TraceValue::Usize(weights.len())),
+                        ("slices", TraceValue::Usize(planned.len())),
+                        ("elapsed", TraceValue::Duration(t_w.elapsed())),
+                    ],
+                );
+                for s in &planned {
+                    let w: u64 = weights
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| {
+                            boundaries[*i].global_row >= s.emit_start_row
+                                && boundaries[*i].global_row < s.emit_end_row
+                        })
+                        .map(|(_, w)| *w)
+                        .sum();
+                    pipeline_trace::emit(
+                        "grid_balance",
+                        "slice",
+                        &[
+                            ("worker_id", TraceValue::Usize(s.worker_id)),
+                            (
+                                "emit_rows",
+                                TraceValue::Usize(s.emit_end_row - s.emit_start_row),
+                            ),
+                            ("weight", TraceValue::Usize(w as usize)),
+                        ],
+                    );
                 }
-            }
-            let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
-            if config.flags.check_existing {
-                wprovider.set_colocated_sink(Arc::clone(&sink));
-            }
+                planned
+            } else {
+                plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp)
+            };
+            let _ = _total_rows;
+            let task_ctx = session.task_ctx();
+            // All workers of this contig probe the same variation shard, and the
+            // lookup is immutable once opened (its per-partition cursor is a
+            // stateless placeholder, and each probe opens its own file handle). Share
+            // one single-flight cell so the shard footer + page index are decoded
+            // once per contig rather than once per worker — the page index alone is
+            // ~0.5 GB for chr1, so per-worker loads dominated peak RSS. Scoped to
+            // this contig: it is rebuilt on the next `prepare_contig_context`.
+            #[cfg(feature = "parquet-cache")]
+            let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
+            // `session.state()` was cloned once per worker inside the loop.
             let session_state = session.state();
-            let plan = wprovider.scan(&session_state, None, &[], None).await?;
-            lookup_partitions.push_back(spawn_lookup_full_contig_worker(
-                Arc::clone(&plan),
-                Arc::clone(&task_ctx),
-                i, // logical id = shard / output order
-                chrom.to_string(),
-                sink,
-                LOOKUP_PARTITION_QUEUE_BATCHES,
-                pipeline_profile.clone(),
-            ));
+            let mut prepared: Vec<(usize, LookupProvider, ColocatedSink)> =
+                Vec::with_capacity(slices.len());
+            for (i, slice) in slices.iter().enumerate() {
+                let mut wprovider = LookupProvider::new(
+                    Arc::clone(&session),
+                    config.vcf_table.clone(),
+                    var_table.clone(),
+                    grid_vcf_schema.clone(),
+                    grid_cache_schema.clone(),
+                    config.cache_columns.clone(),
+                    config.extended_probes,
+                    config.allowed_failed,
+                )?;
+                // Restrict each worker to its [scan_lo_pos, scan_hi_pos) window so it
+                // reads ONLY its range's lookup (warm-up + emit) — no over-read. The
+                // full-contig worker below reads ALL partitions of this filtered plan
+                // (the earlier truncation was reading only partition 0, not a broken
+                // filter). The last worker has no upper bound (reads to contig end).
+                let mut filter = col("chrom")
+                    .eq(lit(&*chrom))
+                    .and(col("start").gt_eq(lit(slice.scan_lo_pos)));
+                if slice.scan_hi_pos != i64::MAX {
+                    filter = filter.and(col("start").lt(lit(slice.scan_hi_pos)));
+                }
+                wprovider.set_vcf_filter(Some(filter));
+                wprovider.set_target_partitions(config.target_partitions);
+                // Warm-up rows (strictly before this worker's seam) are read only to
+                // replay buffer state and are then discarded, so skip their variation
+                // probe. Worker 0 has no warm-up. Opt out with VEP_SKIP_WARMUP_LOOKUP=0.
+                let skip_warm_up_lookup = std::env::var("VEP_SKIP_WARMUP_LOOKUP")
+                    .ok()
+                    .as_deref()
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true);
+                if skip_warm_up_lookup && slice.scan_lo_pos < slice.emit_start_pos {
+                    wprovider.set_probe_floor_pos(Some(slice.emit_start_pos));
+                }
+                #[cfg(feature = "parquet-cache")]
+                if let Some(root) = &config.cache_root {
+                    wprovider.set_cache_root(root.clone());
+                    if config.parquet_backend {
+                        wprovider.set_parquet_backend(true);
+                    }
+                    wprovider.set_parquet_lookup_cell(Arc::clone(&shared_parquet_lookup_cell));
+                }
+                let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+                if config.flags.check_existing {
+                    wprovider.set_colocated_sink(Arc::clone(&sink));
+                }
+                prepared.push((i, wprovider, sink));
+            }
+            // Each worker's physical plan is independent of the others, but they
+            // were built one after another, so this grew linearly with worker
+            // count and sat directly on the prelude's critical path.
+            let t_plans = Instant::now();
+            let concurrent_plans = std::env::var("VEP_CONCURRENT_PLANS")
+                .ok()
+                .as_deref()
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            let built: Vec<(usize, Arc<dyn ExecutionPlan>, ColocatedSink)> = if concurrent_plans {
+                futures::future::try_join_all(prepared.into_iter().map(|(i, wp, sink)| {
+                    let session_state = &session_state;
+                    async move {
+                        let plan = wp.scan(session_state, None, &[], None).await?;
+                        Ok::<_, DataFusionError>((i, plan, sink))
+                    }
+                }))
+                .await?
+            } else {
+                let mut out = Vec::with_capacity(prepared.len());
+                for (i, wp, sink) in prepared {
+                    let plan = wp.scan(&session_state, None, &[], None).await?;
+                    out.push((i, plan, sink));
+                }
+                out
+            };
+            pipeline_trace::emit(
+                "grid_plans",
+                "done",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("workers", TraceValue::Usize(built.len())),
+                    ("elapsed", TraceValue::Duration(t_plans.elapsed())),
+                ],
+            );
+            for (i, plan, sink) in built {
+                lookup_partitions.push_back(spawn_lookup_full_contig_worker(
+                    Arc::clone(&plan),
+                    Arc::clone(&task_ctx),
+                    i, // logical id = shard / output order
+                    chrom.to_string(),
+                    sink,
+                    LOOKUP_PARTITION_QUEUE_BATCHES,
+                    pipeline_profile.clone(),
+                ));
+            }
+            grid_slices = slices;
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.lookup_partitions = lookup_partitions.len();
+            });
         }
-        grid_slices = slices;
-        record_contig_profile(&pipeline_profile, |profile| {
-            profile.lookup_partitions = lookup_partitions.len();
-        });
-    }
+        Ok::<(), DataFusionError>(())
+    };
+
+    // Either start the workers while the rest of the context loads (default), or
+    // reproduce the original ordering where nothing is spawned until the whole
+    // context is resident.
+    let (rest_result, grid_result) = if early_workers {
+        tokio::join!(rest_fut, grid_fut)
+    } else {
+        let rest = rest_fut.await;
+        let grid = grid_fut.await;
+        (rest, grid)
+    };
+    grid_result?;
+    let (ex, tl, rg, mt) = rest_result?;
+    let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
 
     // Open the per-contig custom-plugin registry when enabled and non-empty.
     #[cfg(feature = "parquet-cache")]
@@ -14908,6 +15293,124 @@ mod tests {
             global_row: row,
             pos,
             rows_before_pos: 0,
+        }
+    }
+
+    #[test]
+    fn weights_count_transcripts_overlapping_each_buffer() {
+        // 4 buffers of one row each; the row's position decides its cost.
+        let bs = vec![
+            gb(0, 0),
+            gb(1, 100),
+            gb(2, 200),
+            gb(3, 300),
+            gb(4, i64::MAX),
+        ];
+        let positions = vec![(0i64, 1u32), (100, 1), (200, 1), (300, 1)];
+        // One short transcript over [10,50] (covers no variant), two long ones
+        // spanning [250,350] / [260,340] which both cover the variant at 300.
+        let spans = vec![(10, 50), (250, 350), (260, 340)];
+        let w = buffer_transcript_weights(&bs, &positions, spans);
+        assert_eq!(w.len(), 4);
+        // The fixed term is identical across buffers, so compare relative to a
+        // buffer whose variant is covered by nothing.
+        let base = w[1];
+        assert_eq!(w[0], base, "variant at 0 is outside the [10,50] transcript");
+        assert_eq!(w[2], base, "variant at 200 is covered by nothing");
+        assert_eq!(
+            w[3],
+            base + 2,
+            "variant at 300 is covered by both long ones"
+        );
+        assert!(
+            w.iter().all(|&x| x > 0),
+            "every buffer keeps a nonzero weight"
+        );
+    }
+
+    #[test]
+    fn weights_scale_with_input_units_not_arrow_rows() {
+        // Two buffers, one variant each, both covered by the same transcript.
+        // The second row is 10-ALT, so it is 10 VEP input units and must carry
+        // ~10x the weight of the single-ALT row.
+        let bs = vec![gb(0, 0), gb(1, 100), gb(2, i64::MAX)];
+        let spans = vec![(0, 1_000)];
+        let single = buffer_transcript_weights(&bs, &[(0i64, 1u32), (100, 1)], spans.clone());
+        let multi = buffer_transcript_weights(&bs, &[(0i64, 1u32), (100, 10)], spans);
+        assert_eq!(single[0], multi[0], "the single-ALT buffer is unchanged");
+        assert!(
+            multi[1] > single[1],
+            "10-ALT buffer must outweigh the 1-ALT buffer ({} vs {})",
+            multi[1],
+            single[1]
+        );
+        // depth 1 x 10 units vs depth 1 x 1 unit, before the shared fixed term
+        assert_eq!(multi[1] - single[1], 9);
+    }
+
+    #[test]
+    fn balanced_split_gives_the_dense_worker_fewer_buffers() {
+        // 4 buffers; all transcript mass sits in the last one.
+        let bs = vec![
+            gb(0, 0),
+            gb(5000, 100),
+            gb(10000, 200),
+            gb(15000, 300),
+            gb(20000, i64::MAX),
+        ];
+        let positions: Vec<(i64, u32)> = (0..20000)
+            .map(|r: i64| (if r < 15000 { r / 150 } else { 300 }, 1u32))
+            .collect();
+        let spans: Vec<(i64, i64)> = (0..40).map(|_| (300, 400)).collect();
+        let w = buffer_transcript_weights(&bs, &positions, spans);
+        let slices = plan_grid_partitions_balanced(&bs, 2, 0, &w);
+        assert_eq!(slices.len(), 2);
+        // Uniform split would cut 2/2; weighting must push the seam later so the
+        // heavy trailing buffer is not paired with an equal share of the rest.
+        let uniform = plan_grid_partitions(&bs, 2, 0);
+        assert_eq!(uniform[0].emit_end_row, 10000);
+        assert!(
+            slices[0].emit_end_row > uniform[0].emit_end_row,
+            "balanced seam {} should fall later than uniform seam {}",
+            slices[0].emit_end_row,
+            uniform[0].emit_end_row
+        );
+        // Slices must still tile the contig exactly.
+        assert_eq!(slices[0].emit_start_row, 0);
+        assert_eq!(slices[slices.len() - 1].emit_end_row, 20000);
+        for pair in slices.windows(2) {
+            assert_eq!(pair[0].emit_end_row, pair[1].emit_start_row);
+        }
+    }
+
+    #[test]
+    fn balanced_split_falls_back_when_weights_do_not_match_grid() {
+        let bs = vec![gb(0, 0), gb(5000, 100), gb(10000, i64::MAX)];
+        let slices = plan_grid_partitions_balanced(&bs, 2, 0, &[1]); // wrong length
+        assert_eq!(slices, plan_grid_partitions(&bs, 2, 0));
+    }
+
+    #[test]
+    fn balanced_split_tiles_contig_for_many_worker_counts() {
+        let bs: Vec<GridBufferBoundary> = (0..=20)
+            .map(|i| gb(i * 5000, if i == 20 { i64::MAX } else { (i as i64) * 100 }))
+            .collect();
+        let positions: Vec<(i64, u32)> = (0..100_000).map(|r: i64| (r / 500, 1u32)).collect();
+        let spans: Vec<(i64, i64)> = (0..200).map(|i| (i * 7, i * 7 + 250)).collect();
+        let w = buffer_transcript_weights(&bs, &positions, spans);
+        for workers in [1usize, 2, 3, 5, 8, 16, 32] {
+            let slices = plan_grid_partitions_balanced(&bs, workers, 0, &w);
+            assert!(!slices.is_empty(), "workers={workers}");
+            assert_eq!(slices[0].emit_start_row, 0, "workers={workers}");
+            assert_eq!(
+                slices[slices.len() - 1].emit_end_row,
+                100_000,
+                "workers={workers}"
+            );
+            for pair in slices.windows(2) {
+                assert_eq!(pair[0].emit_end_row, pair[1].emit_start_row);
+                assert!(pair[0].emit_start_row < pair[0].emit_end_row);
+            }
         }
     }
 

@@ -119,12 +119,29 @@ pub struct KvLookupExec {
     /// Optional partition-local sinks for co-located data collected during probe phase.
     colocated_partition_sinks: Option<Vec<ColocatedSink>>,
     target_partitions: usize,
+    /// Rows whose `start` is below this position are warm-up rows: the grid
+    /// worker reads them only to replay buffer state and then discards them, so
+    /// probing the variation cache for them is pure waste. They still have to be
+    /// emitted (1:1 with input rows, which the buffer-boundary arithmetic
+    /// depends on), just with null cache columns.
+    probe_floor_pos: Option<i64>,
     /// Per-contig Parquet variation lookup (shard + footer page directory), built
     /// once and shared across all per-partition streams via the Arc. Single-flight
     /// via OnceCell so simultaneous fan-out probes build it exactly once.
     #[cfg(feature = "parquet-cache")]
-    parquet_lookup_cell: Arc<OnceCell<Arc<SinglePathParquetVariationLookup>>>,
+    parquet_lookup_cell: Arc<ParquetVariationLookupCell>,
 }
+
+/// Single-flight cell holding one contig's Parquet variation lookup together
+/// with the contig it was opened for.
+///
+/// The contig key is stored rather than derived from the shard path: the shard
+/// file is `variation/{prefixed_chrom}.parquet` while the engine probes with the
+/// normalized contig name (`21`, not `chr21`), so the two are not comparable.
+/// Keeping the probe-side key makes the "one cell per contig" invariant checkable
+/// without re-reading the cache manifest.
+#[cfg(feature = "parquet-cache")]
+pub type ParquetVariationLookupCell = OnceCell<(String, Arc<SinglePathParquetVariationLookup>)>;
 
 #[derive(Debug, Clone)]
 struct VariationLookupStorage {
@@ -209,6 +226,7 @@ impl KvLookupExec {
             colocated_sink: None,
             colocated_partition_sinks: None,
             target_partitions: 1,
+            probe_floor_pos: None,
             #[cfg(feature = "parquet-cache")]
             parquet_lookup_cell: Arc::new(OnceCell::new()),
         })
@@ -216,6 +234,26 @@ impl KvLookupExec {
 
     pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
         self.target_partitions = target_partitions.max(1);
+        self
+    }
+
+    /// Skip the variation probe for rows below `pos` (see `probe_floor_pos`).
+    pub fn with_probe_floor_pos(mut self, pos: Option<i64>) -> Self {
+        self.probe_floor_pos = pos;
+        self
+    }
+
+    /// Adopt a caller-owned single-flight cell for the per-contig Parquet
+    /// variation lookup, so several independently built execs (one per grid
+    /// worker) load the shard footer + page index exactly once between them
+    /// instead of once each.
+    ///
+    /// The cell holds one contig's shard, so it MUST NOT outlive the contig that
+    /// created it — `ensure_parquet_lookup` checks the cached contig key against
+    /// the contig being probed rather than trusting the caller.
+    #[cfg(feature = "parquet-cache")]
+    pub fn with_parquet_lookup_cell(mut self, cell: Arc<ParquetVariationLookupCell>) -> Self {
+        self.parquet_lookup_cell = cell;
         self
     }
 
@@ -299,6 +337,7 @@ impl ExecutionPlan for KvLookupExec {
             exec = exec.with_colocated_partition_sinks(sinks.clone());
         }
         exec = exec.with_target_partitions(self.target_partitions);
+        exec = exec.with_probe_floor_pos(self.probe_floor_pos);
         // Carry the shared per-contig variation lookup forward across re-planning
         // instead of letting new_parquet reset it.
         #[cfg(feature = "parquet-cache")]
@@ -337,6 +376,7 @@ impl ExecutionPlan for KvLookupExec {
             self.output_col_positions.clone(),
             colocated_sink,
             self.target_partitions,
+            self.probe_floor_pos,
         );
 
         // Share the exec's single per-contig variation lookup with this stream;
@@ -357,6 +397,7 @@ impl ExecutionPlan for KvLookupExec {
 /// the colocated sink is fully populated before downstream consumers build
 /// the colocated map.
 struct KvLookupStream {
+    probe_floor_pos: Option<i64>,
     input: SendableRecordBatchStream,
     variation_storage: VariationLookupStorage,
     cache_schema: SchemaRef,
@@ -375,7 +416,7 @@ struct KvLookupStream {
     /// Shared (Arc-cloned from the exec) per-contig Parquet variation lookup,
     /// built once.
     #[cfg(feature = "parquet-cache")]
-    parquet_lookup_cell: Arc<OnceCell<Arc<SinglePathParquetVariationLookup>>>,
+    parquet_lookup_cell: Arc<ParquetVariationLookupCell>,
     warm_cold_backend: WarmColdVariationBackend,
     warm_cold_index_mode: WarmColdVariationIndexMode,
     profile_enabled: bool,
@@ -602,6 +643,7 @@ fn parquet_variation_path_for_chrom(
 struct LookupProfile {
     batches: u64,
     input_rows: u64,
+    warm_up_skipped_rows: u64,
     output_rows: u64,
     probes: u64,
     point_gets: u64,
@@ -900,9 +942,10 @@ impl LookupProfile {
             self.output_rows as f64 / total.as_secs_f64()
         };
         eprintln!(
-            "[vep-kv-profile] batches={} input_rows={} output_rows={} probes={} point_gets={} range_prefetch_batches={} range_prefetch_entries={} range_prefetch_bytes={} range_prefetch_skipped={} total_s={:.3} input_rows_per_s={:.1} output_rows_per_s={:.1}",
+            "[vep-kv-profile] batches={} input_rows={} warm_up_skipped_rows={} output_rows={} probes={} point_gets={} range_prefetch_batches={} range_prefetch_entries={} range_prefetch_bytes={} range_prefetch_skipped={} total_s={:.3} input_rows_per_s={:.1} output_rows_per_s={:.1}",
             self.batches,
             self.input_rows,
+            self.warm_up_skipped_rows,
             self.output_rows,
             self.probes,
             self.point_gets,
@@ -1268,6 +1311,7 @@ impl KvLookupStream {
         output_col_positions: Vec<usize>,
         colocated_sink: Option<ColocatedSink>,
         target_partitions: usize,
+        probe_floor_pos: Option<i64>,
     ) -> Self {
         let cache_root = &variation_storage.cache_root;
         let warm_cold_backend = WarmColdVariationBackend::Parquet;
@@ -1308,6 +1352,7 @@ impl KvLookupStream {
             output_col_positions,
             colocated_sink,
             target_partitions: target_partitions.max(1),
+            probe_floor_pos,
             // Placeholder; execute() overwrites with the exec's shared cell.
             #[cfg(feature = "parquet-cache")]
             parquet_lookup_cell: Arc::new(OnceCell::new()),
@@ -1365,6 +1410,17 @@ impl KvLookupStream {
         collect_colocated: bool,
     ) -> Result<()> {
         let cache_root = self.variation_storage.cache_root.clone();
+        // A cell shared across grid workers is scoped to one contig. If an
+        // already-built cell holds another contig's shard, every probe from here
+        // on would silently read the wrong variants, so fail loudly instead.
+        if let Some((cached_chrom, _)) = self.parquet_lookup_cell.get() {
+            if cached_chrom != chrom {
+                return Err(DataFusionError::Internal(format!(
+                    "parquet variation lookup cell holds shard for contig {cached_chrom} while \
+                     probing contig {chrom}; the shared cell must be scoped to a single contig"
+                )));
+            }
+        }
         if self.parquet_lookup_cell.get().is_none() {
             let cache = crate::parquet_cache::detect::PartitionedParquetCache::detect(
                 cache_root.to_string_lossy().as_ref(),
@@ -1388,7 +1444,7 @@ impl KvLookupStream {
                 cell.get_or_try_init(|| async {
                     SinglePathParquetVariationLookup::open(&path, projection)
                         .await
-                        .map(Arc::new)
+                        .map(|lookup| (chrom.to_string(), Arc::new(lookup)))
                 })
                 .await
                 .cloned()
@@ -1475,6 +1531,39 @@ impl KvLookupStream {
         let num_vcf_cols = vcf_schema.fields().len();
         let num_cache_cols = self.cache_columns.len();
         let num_rows = vcf_batch.num_rows();
+
+        // Warm-up fast path: a grid worker reads the rows before its seam only to
+        // replay buffer state, then throws them away, so probing the variation
+        // cache for them is wasted work (measured: +15.7% lookup rows at w=16).
+        // Batches arrive position-ordered, so warm-up rows form a whole-batch
+        // prefix; a batch straddling the seam just takes the normal path. Output
+        // stays 1:1 with input rows -- which the buffer-boundary arithmetic
+        // depends on -- with null cache columns.
+        if let Some(floor) = self.probe_floor_pos {
+            // `starts` is already a materialised Vec<i32> of this batch's positions.
+            let below_floor = num_rows > 0 && starts.iter().all(|&start| (start as i64) < floor);
+            if below_floor {
+                if self.profile_enabled {
+                    self.profile.batches += 1;
+                    self.profile.input_rows += num_rows as u64;
+                    self.profile.output_rows += num_rows as u64;
+                    self.profile.warm_up_skipped_rows += num_rows as u64;
+                }
+                let mut output_columns: Vec<ArrayRef> =
+                    Vec::with_capacity(num_vcf_cols + num_cache_cols);
+                for col_idx in 0..num_vcf_cols {
+                    output_columns.push(Arc::clone(vcf_batch.column(col_idx)));
+                }
+                for field in self.schema.fields().iter().skip(num_vcf_cols) {
+                    output_columns.push(datafusion::arrow::array::new_null_array(
+                        field.data_type(),
+                        num_rows,
+                    ));
+                }
+                return RecordBatch::try_new(self.schema.clone(), output_columns)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
+            }
+        }
         if self.profile_enabled {
             self.profile.batches += 1;
             self.profile.input_rows += num_rows as u64;
@@ -1671,7 +1760,7 @@ impl KvLookupStream {
                 starts.dedup();
                 let take_started = self.profile_enabled.then(Instant::now);
                 let taken = {
-                    let lookup = self.parquet_lookup_cell.get().ok_or_else(|| {
+                    let (_, lookup) = self.parquet_lookup_cell.get().ok_or_else(|| {
                         DataFusionError::Execution(format!(
                             "parquet variation lookup not built for {chrom}"
                         ))
