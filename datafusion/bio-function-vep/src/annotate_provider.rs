@@ -10773,21 +10773,56 @@ struct ContigAnnotationStream {
     next_global_shard_id: usize,
     /// In-flight prefetch of the NEXT contig's data phase (spawned when the
     /// current contig enters annotation; depth is always <= 1). The contig name
-    /// rides along so cleanup can log what was discarded. The task spawns no
-    /// lookup workers (data phase only), so aborting it leaks nothing.
+    /// rides along so cleanup can log what was discarded.
     ///
     /// The contig is popped off `contigs` at spawn time, so `StartContig` must
     /// consume this BEFORE it treats an empty queue as end-of-stream.
+    ///
+    /// Held through [`AbortOnDrop`] so the task cannot outlive the stream on
+    /// ANY path — including the window where the handle has been moved into the
+    /// `PreparingContig` future and the stream no longer owns it (dropping a
+    /// bare `JoinHandle` detaches the task instead of cancelling it).
+    ///
+    /// Cancellation caveats — abort is not synchronous and not total:
+    /// - `abort()` only lands at the task's next await point. The data phase
+    ///   does long inline CPU work between awaits (e.g. `parse_transcript_batches`
+    ///   inside `load_contig_transcripts`), so a cancelled prefetch can keep
+    ///   burning CPU until it reaches one.
+    /// - With `VEP_CTX_PARALLEL` enabled, `load_contig_context_rest` hands four
+    ///   parses to `spawn_blocking`; tokio cannot cancel blocking tasks, so
+    ///   those run to completion holding their `RecordBatch`es. That path is
+    ///   OFF by default (`enabled_from_env_value(None) == false`).
+    ///
+    /// The data phase registers no ephemeral session tables and spawns no
+    /// lookup workers, so an aborted prefetch leaves no dangling registration
+    /// or orphaned worker — only the transient work described above.
     ///
     /// Error semantics: a failed prefetch is not observed until its contig
     /// STARTS — the future built in `StartContig` awaits the handle and yields
     /// the error there. That preserves today's user-visible failure ordering:
     /// the current contig's annotation is never interrupted by a bad next
     /// contig.
-    prefetched_data: Option<(
-        String,
-        tokio::task::JoinHandle<Result<Option<ContigPreparedData>>>,
-    )>,
+    prefetched_data: Option<(String, AbortOnDrop)>,
+}
+
+/// Owns a spawned contig-prefetch task and aborts it when dropped.
+///
+/// A bare `tokio::task::JoinHandle` DETACHES its task on drop, which is the
+/// wrong default here: the prefetch holds an `Arc<SessionContext>` and an
+/// `Arc<PartitionedAnnotationCache>` and loads a whole contig context, so a
+/// detached one would keep running (GB-scale for chr1) after the query has been
+/// torn down. Teardown is routine — `LimitExec` drops its input once the LIMIT
+/// is satisfied, and any downstream/sibling error drops the plan.
+///
+/// Wrapping the handle makes cancellation follow ownership, so the guard also
+/// covers the window where the handle has been moved out of the stream and into
+/// the in-flight `PreparingContig` future: dropping that future drops the guard.
+struct AbortOnDrop(tokio::task::JoinHandle<Result<Option<ContigPreparedData>>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl ContigAnnotationStream {
@@ -10841,19 +10876,22 @@ impl ContigAnnotationStream {
         let config = self.config.clone();
         let full_schema = self.full_schema.clone();
         let prefetch_chrom = chrom.clone();
+        // Emitted BEFORE the spawn so the trace order holds on a multi-thread
+        // runtime: the task's own `data_start` must never precede `spawned`.
+        pipeline_trace::emit("prefetch", "spawned", &[("chrom", TraceValue::Str(&chrom))]);
         let handle = tokio::spawn(async move {
             prepare_contig_data(session, cache, prefetch_chrom, config, full_schema).await
         });
-        pipeline_trace::emit("prefetch", "spawned", &[("chrom", TraceValue::Str(&chrom))]);
-        self.prefetched_data = Some((chrom, handle));
+        self.prefetched_data = Some((chrom, AbortOnDrop(handle)));
     }
 
     /// Drop an in-flight prefetch. Used by every path that abandons the stream
     /// (drop, error teardown, `Done`) so the spawned data phase cannot outlive
     /// the stream. Idempotent.
     fn abort_prefetch(&mut self) {
-        if let Some((chrom, handle)) = self.prefetched_data.take() {
-            handle.abort();
+        if let Some((chrom, guard)) = self.prefetched_data.take() {
+            // `AbortOnDrop::drop` does the abort; explicit for readability.
+            drop(guard);
             pipeline_trace::emit("prefetch", "aborted", &[("chrom", TraceValue::Str(&chrom))]);
         }
     }
@@ -12271,7 +12309,7 @@ impl Stream for ContigAnnotationStream {
                     // the LAST contig is prefetched the queue is empty while
                     // the work is still pending, and treating that as
                     // end-of-stream would silently drop a contig.
-                    let fut: PrepareFuture = if let Some((chrom, handle)) =
+                    let fut: PrepareFuture = if let Some((chrom, mut guard)) =
                         self.prefetched_data.take()
                     {
                         pipeline_trace::emit(
@@ -12280,8 +12318,12 @@ impl Stream for ContigAnnotationStream {
                             &[("chrom", TraceValue::Str(&chrom))],
                         );
                         let session = Arc::clone(&self.session);
+                        // `guard` is moved into the future, so cancellation
+                        // keeps following ownership: dropping this future
+                        // (stream torn down while PreparingContig) aborts the
+                        // task instead of detaching it.
                         Box::pin(async move {
-                            let data = handle.await.map_err(|e| {
+                            let data = Pin::new(&mut guard.0).await.map_err(|e| {
                                 DataFusionError::Execution(format!(
                                     "contig prefetch task failed: {e}"
                                 ))
@@ -13764,6 +13806,52 @@ mod tests {
         // "1"/"true": on even for workers=1 (experiment override)
         assert!(contig_prefetch_enabled(1, Some("1")));
         assert!(contig_prefetch_enabled(1, Some("true")));
+    }
+
+    /// The prefetch guard must CANCEL its task on drop, not detach it. A bare
+    /// `JoinHandle` detaches, which would let a contig data phase keep loading
+    /// GBs after the query was torn down (`LimitExec` dropping its input, or a
+    /// sibling-partition error). The task body below only sets the flag after
+    /// several await points, so a still-running task would set it.
+    #[tokio::test]
+    async fn abort_on_drop_cancels_the_prefetch_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ran_to_completion = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran_to_completion);
+        let guard = AbortOnDrop(tokio::spawn(async move {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            flag.store(true, Ordering::SeqCst);
+            Ok(None)
+        }));
+
+        drop(guard);
+        // Give the runtime ample opportunity to schedule the task; an aborted
+        // task is never polled again, a detached one would finish here.
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !ran_to_completion.load(Ordering::SeqCst),
+            "dropping AbortOnDrop must cancel the spawned prefetch, not detach it"
+        );
+    }
+
+    /// The guard must not interfere with the normal path: when the future
+    /// awaits the handle to completion, the prefetch result comes through.
+    #[tokio::test]
+    async fn abort_on_drop_still_yields_the_result_when_awaited() {
+        let mut guard = AbortOnDrop(tokio::spawn(async {
+            tokio::task::yield_now().await;
+            Ok(None)
+        }));
+        let joined = Pin::new(&mut guard.0)
+            .await
+            .expect("task must not be aborted");
+        assert!(joined.expect("prefetch must succeed").is_none());
     }
 
     /// `colocated::AF_COL_NAMES` is maintained by hand alongside `AF_COLUMNS`
