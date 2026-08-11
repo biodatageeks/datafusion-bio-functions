@@ -13579,6 +13579,18 @@ impl TableProvider for AnnotateProvider {
     }
 }
 
+/// VEP_CONTIG_PREFETCH gate: prefetch the next contig's data phase during the
+/// current contig's annotation. Default ON for parallel annotation (workers>1),
+/// where the idle prelude is on the critical path; "1"/"true" forces it on for
+/// workers=1 experiments, "0"/"false" disables it everywhere.
+fn contig_prefetch_enabled(annotation_workers: usize, env: Option<&str>) -> bool {
+    match env {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        _ => annotation_workers > 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13625,6 +13637,20 @@ mod tests {
             select_cache_backed_contigs(&["chr2".to_string()], &cache_chroms, Path::new("/cache"))
                 .unwrap_err();
         assert!(error.to_string().contains("none of the VCF"));
+    }
+
+    #[test]
+    fn contig_prefetch_gate_decision_table() {
+        // unset: on only for workers>1
+        assert!(!contig_prefetch_enabled(1, None));
+        assert!(contig_prefetch_enabled(2, None));
+        assert!(contig_prefetch_enabled(16, None));
+        // "0"/"false": always off
+        assert!(!contig_prefetch_enabled(8, Some("0")));
+        assert!(!contig_prefetch_enabled(8, Some("false")));
+        // "1"/"true": on even for workers=1 (experiment override)
+        assert!(contig_prefetch_enabled(1, Some("1")));
+        assert!(contig_prefetch_enabled(1, Some("true")));
     }
 
     /// `colocated::AF_COL_NAMES` is maintained by hand alongside `AF_COLUMNS`
