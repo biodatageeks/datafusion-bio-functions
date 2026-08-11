@@ -10111,9 +10111,6 @@ struct ContigPreparedData {
     cache_schema: Schema,
     /// Colocated sink used by the serial (single-partition) lookup arm.
     fallback_coloc_sink: ColocatedSink,
-    /// Contig wall-clock start, carried through to `ContigReadyState` for the
-    /// downstream contig END timing.
-    t_contig: Instant,
 }
 
 /// Everything needed to start streaming annotation for a contig.
@@ -10127,7 +10124,13 @@ struct ContigReadyState {
     shared_context: Arc<SharedContigAnnotationContext>,
     ephemeral_tables: Vec<String>,
     chrom: String,
-    t_contig: Instant,
+    /// Origin of this contig's OWN wall clock, started in
+    /// `activate_contig_lookups`. Deliberately not started in
+    /// `prepare_contig_data`: under `VEP_CONTIG_PREFETCH` the data half runs
+    /// during the PREVIOUS contig's annotation, so a data-phase instant would
+    /// fold that window into this contig's `TOTAL` / `variation_lookup` spans
+    /// and make per-contig totals sum to far more than the run's wall time.
+    t_contig_active: Instant,
 }
 
 /// Mutable annotation state for window-based streaming within a single contig.
@@ -10139,7 +10142,9 @@ struct ContigAnnotationState {
     chrom: String,
     config: ContigAnnotationConfig,
     session: Arc<SessionContext>,
-    t_contig: Instant,
+    /// See `ContigReadyState::t_contig_active`: activation-origin instant, so
+    /// the `TOTAL` / `variation_lookup` spans exclude the prefetch overlap.
+    t_contig_active: Instant,
     contig_rows: usize,
     lookup_wait_started: Option<Instant>,
     ordered_lookup_wait_started: Option<Instant>,
@@ -10178,7 +10183,9 @@ struct ParallelContigState {
     chrom: String,
     config: ContigAnnotationConfig,
     session: Arc<SessionContext>,
-    t_contig: Instant,
+    /// See `ContigReadyState::t_contig_active`: activation-origin instant, so
+    /// the `TOTAL` span excludes the prefetch overlap.
+    t_contig_active: Instant,
     shared: Arc<SharedContigAnnotationContext>,
 }
 
@@ -10801,7 +10808,16 @@ struct ContigAnnotationStream {
     /// STARTS — the future built in `StartContig` awaits the handle and yields
     /// the error there. That preserves today's user-visible failure ordering:
     /// the current contig's annotation is never interrupted by a bad next
-    /// contig.
+    /// contig. Failure ORDERING is preserved; failure KIND is not: a panic
+    /// inside a prefetched data phase comes back as a `JoinError` and is
+    /// reported as `DataFusionError::Execution("contig prefetch task failed:
+    /// …")`, whereas on the gate-OFF path the same panic unwinds through the
+    /// caller as a panic.
+    ///
+    /// `VEP_CONTIG_PREFETCH=0` is a kill switch for the prefetch, NOT a
+    /// rollback to master: the data/activate split also removed the
+    /// `VEP_EARLY_WORKERS` interleave, and turning the gate off does not
+    /// reinstate it (see `contig_prefetch_enabled`).
     prefetched_data: Option<(String, AbortOnDrop)>,
 }
 
@@ -10859,6 +10875,15 @@ impl ContigAnnotationStream {
     fn start_prefetch_next_contig(&mut self) {
         if self.prefetched_data.is_some() {
             // Depth stays at one.
+            return;
+        }
+        if self.config.fetch_limit.is_some() {
+            // LIMIT queries usually finish inside the current contig, and
+            // `StartContig` throws an un-consumed prefetch away once the limit
+            // is satisfied. Loading a whole next-contig context speculatively
+            // would just burn IO against the query it is meant to accelerate.
+            // Deliberately not a remaining-rows estimate: rows-per-contig is
+            // unknown here, so `is_some()` is the honest test.
             return;
         }
         if !contig_prefetch_enabled(
@@ -12272,7 +12297,7 @@ fn poll_lookup_partitions(
                 ann.worker.lookup_done = true;
                 profile_end!(
                     &format!("{}: 1. variation_lookup", ann.chrom),
-                    ann.t_contig,
+                    ann.t_contig_active,
                     format!("{} rows", ann.contig_rows)
                 );
                 return Poll::Ready(Ok(()));
@@ -12354,6 +12379,13 @@ impl Stream for ContigAnnotationStream {
                 StreamState::PreparingContig(fut) => match fut.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => {
+                        // No prefetch can be in flight anywhere in this state:
+                        // `StartContig` moved any pending one into `fut`, and
+                        // the next spawn only happens once this contig reaches
+                        // annotation. The `abort_prefetch()` calls in this arm
+                        // and in the activation arms below are therefore
+                        // defensive no-ops — kept because they are idempotent
+                        // and make every teardown path uniformly safe.
                         self.abort_prefetch();
                         self.state = StreamState::Done;
                         return Poll::Ready(Some(Err(e)));
@@ -12477,7 +12509,7 @@ impl Stream for ContigAnnotationStream {
                                 chrom: ready.chrom,
                                 config,
                                 session,
-                                t_contig: ready.t_contig,
+                                t_contig_active: ready.t_contig_active,
                                 shared,
                             };
                             self.state = StreamState::AnnotatingParallel(state);
@@ -12506,7 +12538,7 @@ impl Stream for ContigAnnotationStream {
                                 chrom: ready.chrom,
                                 config,
                                 session,
-                                t_contig: ready.t_contig,
+                                t_contig_active: ready.t_contig_active,
                                 contig_rows: 0,
                                 lookup_wait_started: None,
                                 ordered_lookup_wait_started: None,
@@ -12556,7 +12588,7 @@ impl Stream for ContigAnnotationStream {
                             }
                             profile_end!(
                                 &format!("{}: TOTAL", state.chrom),
-                                state.t_contig,
+                                state.t_contig_active,
                                 format!("{contig_rows} rows")
                             );
                             emit_contig_pipeline_profile(&state.shared.profile, &state.chrom);
@@ -12706,7 +12738,7 @@ impl Stream for ContigAnnotationStream {
                     // Drop heavy state eagerly before the async cleanup future runs.
                     profile_end!(
                         &format!("{}: TOTAL", ann.chrom),
-                        ann.t_contig,
+                        ann.t_contig_active,
                         format!("{} rows", ann.contig_rows)
                     );
                     emit_contig_pipeline_profile(&ann.worker.shared.profile, &ann.chrom);
@@ -12947,11 +12979,12 @@ async fn prepare_contig_data(
     mut config: ContigAnnotationConfig,
     full_schema: SchemaRef,
 ) -> Result<Option<ContigPreparedData>> {
-    let t_contig = profile_start!();
-    // Dedicated span for this half. `t_contig` is carried through to
-    // `ContigReadyState` for the contig END timing, so it must not be used for
-    // the prepare accounting once the two halves can run apart.
-    let t_data = Instant::now();
+    // Span for this half ONLY. No contig-wide instant is started here: under
+    // `VEP_CONTIG_PREFETCH` this function runs during the PREVIOUS contig's
+    // annotation, so anything anchored here would fold that window into this
+    // contig's timings. The contig's own wall clock (`t_contig_active`) starts
+    // in `activate_contig_lookups`, where the contig genuinely begins.
+    let t_data = profile_start!();
     let pipeline_profile =
         profiling_enabled().then(|| Arc::new(Mutex::new(ContigPipelineProfile::default())));
     // Cloned handle so prepare_shared_ctx / prepare_total can still be recorded
@@ -13323,7 +13356,6 @@ async fn prepare_contig_data(
         vcf_schema,
         cache_schema,
         fallback_coloc_sink,
-        t_contig,
     }))
 }
 
@@ -13354,9 +13386,13 @@ async fn activate_contig_lookups(
         vcf_schema,
         cache_schema,
         fallback_coloc_sink,
-        t_contig,
     } = data;
+    // Two instants, one origin. Activation is the point where the contig
+    // genuinely begins, so it anchors BOTH the second-half prepare span and the
+    // contig's own wall clock. The data half cannot anchor either one: under
+    // `VEP_CONTIG_PREFETCH` it ran during the previous contig's annotation.
     let t_activate = Instant::now();
+    let t_contig_active = t_activate;
     if profiling_enabled() {
         eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
     }
@@ -13572,9 +13608,9 @@ async fn activate_contig_lookups(
         });
     }
 
-    // Second half of the prepare wall. Deliberately NOT `t_contig.elapsed()`:
-    // once the data half can run ahead, that span also covers the previous
-    // contig's annotation.
+    // Second half of the prepare wall. Deliberately anchored at activation, not
+    // at the data phase: once the data half can run ahead, a data-phase span
+    // also covers the previous contig's annotation.
     record_contig_profile(&profile_handle, |profile| {
         profile.prepare_total += t_activate.elapsed();
     });
@@ -13586,7 +13622,7 @@ async fn activate_contig_lookups(
         shared_context,
         ephemeral_tables,
         chrom,
-        t_contig,
+        t_contig_active,
     }))
 }
 
@@ -13738,6 +13774,14 @@ impl TableProvider for AnnotateProvider {
 /// current contig's annotation. Default ON for parallel annotation (workers>1),
 /// where the idle prelude is on the critical path; "1"/"true" forces it on for
 /// workers=1 experiments, "0"/"false" disables it everywhere.
+///
+/// Turning the gate OFF is not a like-for-like master baseline. Splitting
+/// prepare into data/activate also deleted the `VEP_EARLY_WORKERS` interleave
+/// (`tokio::join!(rest_fut, grid_fut)`), which on master overlapped the grid
+/// provider/plan build and worker spawn with `load_contig_context_rest` for
+/// workers>1 on Merged/RefSeq caches; `activate_contig_lookups` is strictly
+/// serial. The gate disables prefetching only — gate-OFF is master MINUS that
+/// removed overlap, so A/B numbers against it are not master numbers.
 fn contig_prefetch_enabled(annotation_workers: usize, env: Option<&str>) -> bool {
     match env {
         Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
@@ -14273,7 +14317,7 @@ mod tests {
             chrom: "chr1".to_string(),
             config,
             session: Arc::new(SessionContext::new()),
-            t_contig: Instant::now(),
+            t_contig_active: Instant::now(),
             contig_rows: 0,
             lookup_wait_started: None,
             ordered_lookup_wait_started: None,
