@@ -8904,9 +8904,13 @@ type SharedContigPipelineProfile = Arc<Mutex<ContigPipelineProfile>>;
 #[derive(Debug, Default)]
 struct ContigPipelineProfile {
     context_load: Duration,
-    /// Total wall of prepare_contig_context (everything before workers start).
+    /// Total wall of contig preparation, both halves (everything before workers
+    /// start): `prepare_contig_data` + `activate_contig_lookups`, recorded as
+    /// two spans so the halves stay attributable when they run apart.
     prepare_total: Duration,
-    /// Prepare phase before context load: schema reads + lookup plan build + worker spawn.
+    /// Data-phase prelude before the context load: identity validation + schema
+    /// reads. The lookup plan build and worker spawn moved to
+    /// `activate_contig_lookups` and are accounted in `prepare_total` only.
     prepare_setup: Duration,
     /// Building the shared annotation context (indexes, cache regions) after loads.
     prepare_shared_ctx: Duration,
@@ -10071,8 +10075,50 @@ fn accumulate_boundaries_inner(
     Ok((boundaries, global_row, positions))
 }
 
+/// The data half of a contig's preparation: everything that reads data or
+/// builds read-only state, with no lookup worker spawned yet. Produced by
+/// `prepare_contig_data()` and consumed by `activate_contig_lookups()`, which
+/// builds the `LookupProvider`s and spawns their workers.
+///
+/// The split exists so the data half can later be run ahead of the contig that
+/// needs it: it costs one resident contig context (independent of worker
+/// count), while activation costs a per-worker startup footprint that must only
+/// be resident for the contig actually being annotated.
+struct ContigPreparedData {
+    chrom: String,
+    /// Post identity-validation config (`vep_semantics` resolved from the
+    /// contig's cache shards).
+    config: ContigAnnotationConfig,
+    cache: Arc<PartitionedAnnotationCache>,
+    /// Profile handle passed to the spawned lookup workers. Same `Arc` as
+    /// `profile_handle`; kept separate so activation mirrors the pre-split code.
+    pipeline_profile: Option<SharedContigPipelineProfile>,
+    /// Clone of the pipeline profile handle; the original was moved into
+    /// `shared_context`, and activation still records into it.
+    profile_handle: Option<SharedContigPipelineProfile>,
+    ephemeral_tables: Vec<String>,
+    shared_context: Arc<SharedContigAnnotationContext>,
+    /// Grid-aligned per-worker slices, already planned. Empty unless
+    /// `stateful_parallel`.
+    grid_slices: Vec<WorkerGridSlice>,
+    /// True when activation must build grid-aligned per-worker lookups
+    /// (stateful Merged/RefSeq at workers>1) instead of the byte-budget path.
+    stateful_parallel: bool,
+    /// Placeholder variation table name; the KvLookupExec resolves the real
+    /// dataset via the cache root.
+    var_table: String,
+    /// Schemas for the `LookupProvider`s built during activation.
+    vcf_schema: Schema,
+    cache_schema: Schema,
+    /// Colocated sink used by the serial (single-partition) lookup arm.
+    fallback_coloc_sink: ColocatedSink,
+    /// Contig wall-clock start, carried through to `ContigReadyState` for the
+    /// downstream contig END timing.
+    t_contig: Instant,
+}
+
 /// Everything needed to start streaming annotation for a contig.
-/// Produced by `prepare_contig_context()`.
+/// Produced by `activate_contig_lookups()`.
 struct ContigReadyState {
     lookup_partitions: VecDeque<LookupPartitionHandle>,
     /// Grid-aligned per-worker slices, indexed by lookup-partition id. Empty for
@@ -12712,22 +12758,55 @@ async fn count_contig_buffer_boundaries(
     accumulate_boundaries_inner(&batches, input_buffer_size, collect_positions)
 }
 
+/// Prepare a contig for streaming annotation.
+///
+/// Composition of the two halves the preparation is split into:
+/// `prepare_contig_data` (reads data, builds read-only state, spawns nothing)
+/// and `activate_contig_lookups` (builds the lookup providers and spawns their
+/// workers). Callers see the same signature and the same result as before the
+/// split; the halves exist so the data half can later be run ahead of time.
 async fn prepare_contig_context(
+    session: Arc<SessionContext>,
+    cache: Arc<PartitionedAnnotationCache>,
+    chrom: String,
+    config: ContigAnnotationConfig,
+    full_schema: SchemaRef,
+) -> Result<Option<ContigReadyState>> {
+    match prepare_contig_data(Arc::clone(&session), cache, chrom, config, full_schema).await? {
+        None => Ok(None),
+        Some(data) => activate_contig_lookups(session, data).await,
+    }
+}
+
+/// Data half of contig preparation: validate identity, read schemas, load the
+/// contig context concurrently with the grid count pass, load SIFT, build the
+/// shared indexes and the shared annotation context, and plan the per-worker
+/// grid slices — but spawn no lookup worker and build no lookup provider.
+/// `activate_contig_lookups()` does that.
+async fn prepare_contig_data(
     session: Arc<SessionContext>,
     cache: Arc<PartitionedAnnotationCache>,
     chrom: String,
     mut config: ContigAnnotationConfig,
     full_schema: SchemaRef,
-) -> Result<Option<ContigReadyState>> {
+) -> Result<Option<ContigPreparedData>> {
     let t_contig = profile_start!();
+    // Dedicated span for this half. `t_contig` is carried through to
+    // `ContigReadyState` for the contig END timing, so it must not be used for
+    // the prepare accounting once the two halves can run apart.
+    let t_data = Instant::now();
     let pipeline_profile =
         profiling_enabled().then(|| Arc::new(Mutex::new(ContigPipelineProfile::default())));
     // Cloned handle so prepare_shared_ctx / prepare_total can still be recorded
     // after `pipeline_profile` is moved into the shared context below.
     let profile_handle = pipeline_profile.clone();
-    if profiling_enabled() {
-        eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
-    }
+    // The `contig START` banner belongs to the half that actually starts the
+    // contig, so it lives in `activate_contig_lookups`.
+    pipeline_trace::emit(
+        "prefetch",
+        "data_start",
+        &[("chrom", TraceValue::Str(&chrom))],
+    );
 
     // Identity is a contig-local precondition: validate every participating
     // shard footer before opening variation or context data for this contig.
@@ -12770,8 +12849,7 @@ async fn prepare_contig_context(
     // transcript/exon/translation/regulatory/motif context via
     // `load_contig_transcripts`; no per-chrom parquet tables are registered.
 
-    // Lookup arm: build LookupProvider, create stream (cheap — build+probe
-    // happens on first poll, NOT here).
+    // Schemas for the lookup providers built during activation.
     let fallback_coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
     let vcf_schema = session
         .table(&config.vcf_table)
@@ -12794,15 +12872,348 @@ async fn prepare_contig_context(
     #[cfg(not(feature = "parquet-cache"))]
     let cache_schema: Schema = unreachable!("parquet-cache feature is required");
     // Stateful Merged/RefSeq at workers>1 runs N grid-aligned per-worker lookup
-    // scans (built after the context load below, once overlap_width is known),
-    // not the byte-budget partitioning. Keep schema clones for those providers.
+    // scans (planned below, once overlap_width is known), not the byte-budget
+    // partitioning.
     let stateful_parallel = cache_enabled
         && config.annotation_workers > 1
         && matches!(
             config.cache_source_type,
             CacheSourceType::Merged | CacheSourceType::RefSeq
         );
+
+    // Context arm: load transcripts, exons, translations, etc. (Parquet only).
+    // Everything up to here (identity validation, schema reads) is setup that
+    // runs before any context data is loaded. The lookup plan build and worker
+    // spawn are in `activate_contig_lookups` and are accounted for there.
+    record_contig_profile(&pipeline_profile, |profile| {
+        profile.prepare_setup += t_contig.elapsed();
+    });
+
+    let context_fut = async {
+        let t_ctx = profile_start!();
+        pipeline_trace::emit("context", "start", &[("chrom", TraceValue::Str(&chrom))]);
+        let _ = cache_enabled;
+        #[cfg(feature = "parquet-cache")]
+        {
+            let loaded =
+                load_contig_transcripts(cache.as_parquet(), &chrom, &config, &pipeline_profile)
+                    .await?;
+            let context_elapsed = t_ctx.elapsed();
+            pipeline_trace::emit(
+                "context",
+                "transcripts_done",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("transcripts", TraceValue::Usize(loaded.0.len())),
+                    ("elapsed", TraceValue::Duration(context_elapsed)),
+                ],
+            );
+            // context_load must cover ALL five entities. The transcripts are
+            // loaded here and the other four in load_contig_context_rest, and
+            // the two phases are strictly sequential (the grid plan needs the
+            // transcripts), so the total is their sum.
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_load += context_elapsed;
+            });
+            Ok(loaded)
+        }
+        #[cfg(not(feature = "parquet-cache"))]
+        {
+            unreachable!("parquet-cache feature is required")
+        }
+    };
+    // Cost-weighted grid split (opt-in). Resolved before the count pass because
+    // the weights need every row's position, which only that pass sees.
+    let grid_balance_enabled = stateful_parallel
+        && pipeline_trace::enabled_from_env_value(
+            std::env::var("VEP_GRID_BALANCE").ok().as_deref(),
+        );
+    // Run the grid count pass (VCF positions only) CONCURRENTLY with the context
+    // load (Parquet transcripts/exons) — independent IO, so the count is hidden
+    // behind context load instead of running as a serial prelude before workers.
+    let count_fut = async {
+        if stateful_parallel {
+            Some(
+                count_contig_buffer_boundaries(
+                    &session,
+                    &config.vcf_table,
+                    &chrom,
+                    config.input_buffer_size,
+                    grid_balance_enabled,
+                )
+                .await,
+            )
+        } else {
+            None
+        }
+    };
+    let context_result: Result<(Vec<TranscriptFeature>, HashMap<String, String>)>;
+    let grid_count;
+    (context_result, grid_count) = tokio::join!(context_fut, count_fut);
+    // No lookup worker has been spawned yet on this path, so a context failure
+    // has nothing to abort (the pre-split code aborted the byte-budget workers
+    // it had already started here).
+    let (tx_vec, translateable_seq) = context_result?;
+    log_phase_rss(&chrom, "after_context_load");
+
+    let tmp_provider = AnnotateProvider::new(
+        Arc::clone(&session),
+        config.vcf_table.clone(),
+        String::new(),
+        AnnotationBackend::Parquet,
+        config.cache_source_type,
+        config.options_json.clone(),
+        vcf_only_schema,
+    )?;
+    let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+        config.upstream_distance,
+        config.downstream_distance,
+        config.hgvs_flags.shift_hgvs,
+        config.vep_semantics,
+    );
+
+    // SIFT source: a shared per-contig prediction store loaded from the Parquet
+    // translation_sift shard.
+    #[cfg(feature = "parquet-cache")]
+    let use_lookup_sift = config.cache_root.is_some();
+    #[cfg(not(feature = "parquet-cache"))]
+    let use_lookup_sift = false;
+
+    #[cfg(feature = "parquet-cache")]
+    let sift_prediction_store = if use_lookup_sift && config.flags.everything {
+        let sift_started = Instant::now();
+        let store =
+            load_parquet_sift_prediction_store_for_chrom(cache.as_parquet(), &chrom).await?;
+        record_contig_profile(&pipeline_profile, |profile| {
+            profile.sift_load += sift_started.elapsed();
+        });
+        store
+    } else {
+        None
+    };
+    log_phase_rss(&chrom, "after_sift_load");
+
+    let shared_ctx_started = Instant::now();
+    let base_transcripts = Arc::new(tx_vec);
+    let transcript_cache_regions = Arc::new(
+        base_transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect(),
+    );
+    let overlap_width_bp = compute_overlap_width_bp(&base_transcripts);
+    let tx_ids: HashSet<String> = base_transcripts
+        .iter()
+        .map(|tx| tx.transcript_id.clone())
+        .collect();
+    let t_rest = Instant::now();
+    let rest =
+        load_contig_context_rest(cache.as_parquet(), &chrom, &pipeline_profile, &tx_ids).await;
+    let rest_elapsed = t_rest.elapsed();
+    pipeline_trace::emit(
+        "context",
+        "done",
+        &[
+            ("chrom", TraceValue::Str(&chrom)),
+            ("elapsed", TraceValue::Duration(rest_elapsed)),
+        ],
+    );
+    record_contig_profile(&pipeline_profile, |profile| {
+        profile.context_load += rest_elapsed;
+    });
+    let (ex, tl, rg, mt) = rest?;
+
+    // Grid-aligned parallel lookup (stateful Merged/RefSeq, workers>1): a count
+    // pass finds the global 5000-unit buffer boundaries; each worker gets a
+    // whole-buffer rank range with a bounded-overlap warm-up start, and a lookup
+    // scan filtered to its `[scan_lo_pos, scan_hi_pos)` position window.
+    //
+    // Only the *planning* happens here. Building the providers and spawning the
+    // workers is `activate_contig_lookups`'s job, so this half never holds a set
+    // of lookup workers resident.
     let mut grid_slices: Vec<WorkerGridSlice> = Vec::new();
+    if stateful_parallel {
+        let (boundaries, _total_rows, grid_positions) =
+            grid_count.expect("stateful_parallel implies the count future ran")?;
+        // Cost-weighted grid split (opt-in via VEP_GRID_BALANCE). The default
+        // equal-buffer-count split equalises variants per worker, not work, so
+        // gene-dense slices straggle; weighting by transcript overlap equalises
+        // the thing that actually costs. Slice boundaries do not affect output
+        // (every worker count already yields byte-identical VCFs), so this is a
+        // scheduling change only.
+        let slices = if grid_balance_enabled {
+            let t_w = Instant::now();
+            let weights = buffer_transcript_weights(
+                &boundaries,
+                &grid_positions,
+                base_transcripts.iter().map(|tx| (tx.start, tx.end)),
+            );
+            let planned = plan_grid_partitions_balanced(
+                &boundaries,
+                config.annotation_workers,
+                overlap_width_bp,
+                &weights,
+            );
+            pipeline_trace::emit(
+                "grid_balance",
+                "done",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("buffers", TraceValue::Usize(weights.len())),
+                    ("slices", TraceValue::Usize(planned.len())),
+                    ("elapsed", TraceValue::Duration(t_w.elapsed())),
+                ],
+            );
+            for s in &planned {
+                let w: u64 = weights
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        boundaries[*i].global_row >= s.emit_start_row
+                            && boundaries[*i].global_row < s.emit_end_row
+                    })
+                    .map(|(_, w)| *w)
+                    .sum();
+                pipeline_trace::emit(
+                    "grid_balance",
+                    "slice",
+                    &[
+                        ("worker_id", TraceValue::Usize(s.worker_id)),
+                        (
+                            "emit_rows",
+                            TraceValue::Usize(s.emit_end_row - s.emit_start_row),
+                        ),
+                        ("weight", TraceValue::Usize(w as usize)),
+                    ],
+                );
+            }
+            planned
+        } else {
+            plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp)
+        };
+        let _ = _total_rows;
+        grid_slices = slices;
+    }
+
+    let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
+
+    // Open the per-contig custom-plugin registry when enabled and non-empty.
+    #[cfg(feature = "parquet-cache")]
+    let plugin_registry = match &config.plugin_cache_root {
+        Some(root) => {
+            let reg = crate::plugin_cache::registry::PluginRegistry::open(root, &chrom).await?;
+            if reg.is_empty() {
+                None
+            } else {
+                Some(Arc::new(reg))
+            }
+        }
+        None => None,
+    };
+
+    let shared_context = Arc::new(SharedContigAnnotationContext {
+        config: config.clone(),
+        profile: pipeline_profile.clone(),
+        base_transcripts,
+        overlap_width_bp,
+        base_translations: Arc::new(tl),
+        exons: Arc::new(ex),
+        indexes,
+        regulatory: Arc::new(rg),
+        motifs: Arc::new(mt),
+        // TODO: miRNA and structural features are not yet partitioned —
+        // these are rare and handled by the monolithic path only.
+        mirnas: Arc::new(Vec::new()),
+        structural: Arc::new(Vec::new()),
+        translateable_seq_by_tx: Arc::new(translateable_seq),
+        transcript_cache_regions,
+        tmp_provider: Arc::new(tmp_provider),
+        engine: Arc::new(engine),
+        #[cfg(feature = "parquet-cache")]
+        sift_prediction_store,
+        #[cfg(feature = "parquet-cache")]
+        plugin_registry,
+    });
+
+    // `pipeline_profile` is also held by the shared context now; use the cloned
+    // handle to record the shared-context build cost and this half's share of
+    // the prepare wall. The activation half records its own span.
+    let data_elapsed = t_data.elapsed();
+    record_contig_profile(&profile_handle, |profile| {
+        profile.prepare_shared_ctx += shared_ctx_started.elapsed();
+        profile.prepare_total += data_elapsed;
+    });
+    log_phase_rss(&chrom, "after_prepare_data");
+    pipeline_trace::emit(
+        "prefetch",
+        "data_done",
+        &[
+            ("chrom", TraceValue::Str(&chrom)),
+            ("elapsed", TraceValue::Duration(data_elapsed)),
+        ],
+    );
+
+    Ok(Some(ContigPreparedData {
+        chrom,
+        config,
+        cache,
+        pipeline_profile,
+        profile_handle,
+        ephemeral_tables,
+        shared_context,
+        grid_slices,
+        stateful_parallel,
+        var_table,
+        vcf_schema,
+        cache_schema,
+        fallback_coloc_sink,
+        t_contig,
+    }))
+}
+
+/// Activation half of contig preparation: build the `LookupProvider`s and spawn
+/// the lookup workers that feed the annotation workers.
+///
+/// Split out of `prepare_contig_data` because this is where the per-worker
+/// startup footprint is paid, and it must only be resident for the contig that
+/// is actually about to be annotated. Both the byte-budget/serial arms and the
+/// grid-aligned per-worker arm live here, so nothing is spawned by the data
+/// half. The consequence is that the byte-budget lookup build no longer
+/// overlaps the context load (the old `VEP_EARLY_WORKERS` interleave); that
+/// cost is paid back once the data half runs ahead of the contig.
+async fn activate_contig_lookups(
+    session: Arc<SessionContext>,
+    data: ContigPreparedData,
+) -> Result<Option<ContigReadyState>> {
+    let ContigPreparedData {
+        chrom,
+        config,
+        cache: _,
+        pipeline_profile,
+        profile_handle,
+        ephemeral_tables,
+        shared_context,
+        grid_slices,
+        stateful_parallel,
+        var_table,
+        vcf_schema,
+        cache_schema,
+        fallback_coloc_sink,
+        t_contig,
+    } = data;
+    let t_activate = Instant::now();
+    if profiling_enabled() {
+        eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    let cache_enabled = config.cache_root.is_some();
+    #[cfg(not(feature = "parquet-cache"))]
+    let cache_enabled = false;
+
+    // Lookup arm: build LookupProvider, create stream (cheap — build+probe
+    // happens on first poll, NOT here). Keep schema clones for the grid
+    // providers built further down.
     let grid_vcf_schema = vcf_schema.clone();
     let grid_cache_schema = cache_schema.clone();
     let mut provider = LookupProvider::new(
@@ -12826,9 +13237,9 @@ async fn prepare_contig_context(
     }
     let parallel_lookup = cache_enabled;
     let mut lookup_partitions = if stateful_parallel {
-        // Deferred: grid-aligned per-worker lookup scans are spawned after the
-        // context load below (once overlap_width_bp is known). The `provider`
-        // built above is unused on this path.
+        // The grid-aligned per-worker lookup scans are built below from the
+        // slices planned by the data half. The `provider` built above is unused
+        // on this path.
         VecDeque::new()
     } else if parallel_lookup {
         let session_state = session.state();
@@ -12891,400 +13302,126 @@ async fn prepare_contig_context(
         profile.lookup_partitions = lookup_partitions.len();
     });
 
-    // Context arm: load transcripts, exons, translations, etc. (Parquet only).
-    // Everything up to here (schema reads, lookup plan build, worker spawn) is
-    // setup that runs before any context data is loaded.
-    record_contig_profile(&pipeline_profile, |profile| {
-        profile.prepare_setup += t_contig.elapsed();
-    });
-
-    let context_fut = async {
-        let t_ctx = profile_start!();
-        pipeline_trace::emit("context", "start", &[("chrom", TraceValue::Str(&chrom))]);
-        let _ = cache_enabled;
+    if stateful_parallel {
+        let task_ctx = session.task_ctx();
+        // All workers of this contig probe the same variation shard, and the
+        // lookup is immutable once opened (its per-partition cursor is a
+        // stateless placeholder, and each probe opens its own file handle). Share
+        // one single-flight cell so the shard footer + page index are decoded
+        // once per contig rather than once per worker — the page index alone is
+        // ~0.5 GB for chr1, so per-worker loads dominated peak RSS. Scoped to
+        // this contig: it is rebuilt on the next activation.
         #[cfg(feature = "parquet-cache")]
-        {
-            let loaded =
-                load_contig_transcripts(cache.as_parquet(), &chrom, &config, &pipeline_profile)
-                    .await?;
-            let context_elapsed = t_ctx.elapsed();
-            pipeline_trace::emit(
-                "context",
-                "transcripts_done",
-                &[
-                    ("chrom", TraceValue::Str(&chrom)),
-                    ("transcripts", TraceValue::Usize(loaded.0.len())),
-                    ("elapsed", TraceValue::Duration(context_elapsed)),
-                ],
-            );
-            // context_load must cover ALL five entities. The transcripts are
-            // loaded here and the other four in load_contig_context_rest, and
-            // the two phases are strictly sequential (the grid plan needs the
-            // transcripts), so the total is their sum.
-            record_contig_profile(&pipeline_profile, |profile| {
-                profile.context_load += context_elapsed;
-            });
-            Ok(loaded)
-        }
-        #[cfg(not(feature = "parquet-cache"))]
-        {
-            unreachable!("parquet-cache feature is required")
-        }
-    };
-    // Cost-weighted grid split (opt-in). Resolved before the count pass because
-    // the weights need every row's position, which only that pass sees.
-    // Start the lookup workers as soon as the transcripts (the grid plan's only
-    // context dependency) are parsed, so they read VCF while the remaining four
-    // context entities still load. Opt out with VEP_EARLY_WORKERS=0.
-    let early_workers = stateful_parallel
-        && std::env::var("VEP_EARLY_WORKERS")
-            .ok()
-            .as_deref()
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
-    let grid_balance_enabled = stateful_parallel
-        && pipeline_trace::enabled_from_env_value(
-            std::env::var("VEP_GRID_BALANCE").ok().as_deref(),
-        );
-    // Run the grid count pass (VCF positions only) CONCURRENTLY with the context
-    // load (Parquet transcripts/exons) — independent IO, so the count is hidden
-    // behind context load instead of running as a serial prelude before workers.
-    let count_fut = async {
-        if stateful_parallel {
-            Some(
-                count_contig_buffer_boundaries(
-                    &session,
-                    &config.vcf_table,
-                    &chrom,
-                    config.input_buffer_size,
-                    grid_balance_enabled,
-                )
-                .await,
-            )
-        } else {
-            None
-        }
-    };
-    let context_result: Result<(Vec<TranscriptFeature>, HashMap<String, String>)>;
-    let grid_count;
-    (context_result, grid_count) = tokio::join!(context_fut, count_fut);
-    let (tx_vec, translateable_seq) = match context_result {
-        Ok(context) => context,
-        Err(e) => {
-            abort_lookup_partitions(&mut lookup_partitions);
-            return Err(e);
-        }
-    };
-    log_phase_rss(&chrom, "after_context_load");
-
-    let tmp_provider = AnnotateProvider::new(
-        Arc::clone(&session),
-        config.vcf_table.clone(),
-        String::new(),
-        AnnotationBackend::Parquet,
-        config.cache_source_type,
-        config.options_json.clone(),
-        vcf_only_schema,
-    )?;
-    let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
-        config.upstream_distance,
-        config.downstream_distance,
-        config.hgvs_flags.shift_hgvs,
-        config.vep_semantics,
-    );
-
-    // SIFT source: a shared per-contig prediction store loaded from the Parquet
-    // translation_sift shard.
-    #[cfg(feature = "parquet-cache")]
-    let use_lookup_sift = config.cache_root.is_some();
-    #[cfg(not(feature = "parquet-cache"))]
-    let use_lookup_sift = false;
-
-    #[cfg(feature = "parquet-cache")]
-    let sift_prediction_store = if use_lookup_sift && config.flags.everything {
-        let sift_started = Instant::now();
-        let store =
-            load_parquet_sift_prediction_store_for_chrom(cache.as_parquet(), &chrom).await?;
-        record_contig_profile(&pipeline_profile, |profile| {
-            profile.sift_load += sift_started.elapsed();
-        });
-        store
-    } else {
-        None
-    };
-    log_phase_rss(&chrom, "after_sift_load");
-
-    let shared_ctx_started = Instant::now();
-    let base_transcripts = Arc::new(tx_vec);
-    let transcript_cache_regions = Arc::new(
-        base_transcripts
-            .iter()
-            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
-            .collect(),
-    );
-    let overlap_width_bp = compute_overlap_width_bp(&base_transcripts);
-    let tx_ids: HashSet<String> = base_transcripts
-        .iter()
-        .map(|tx| tx.transcript_id.clone())
-        .collect();
-    let t_rest = Instant::now();
-    let rest_fut = async {
-        let rest =
-            load_contig_context_rest(cache.as_parquet(), &chrom, &pipeline_profile, &tx_ids).await;
-        let rest_elapsed = t_rest.elapsed();
-        pipeline_trace::emit(
-            "context",
-            "done",
-            &[
-                ("chrom", TraceValue::Str(&chrom)),
-                ("elapsed", TraceValue::Duration(rest_elapsed)),
-            ],
-        );
-        record_contig_profile(&pipeline_profile, |profile| {
-            profile.context_load += rest_elapsed;
-        });
-        rest
-    };
-
-    // Grid-aligned parallel lookup (stateful Merged/RefSeq, workers>1): a count
-    // pass finds the global 5000-unit buffer boundaries; each worker gets a
-    // whole-buffer rank range with a bounded-overlap warm-up start, and a lookup
-    // scan filtered to its `[scan_lo_pos, scan_hi_pos)` position window.
-    let grid_fut = async {
-        if stateful_parallel {
-            let (boundaries, _total_rows, grid_positions) =
-                grid_count.expect("stateful_parallel implies the count future ran")?;
-            // Cost-weighted grid split (opt-in via VEP_GRID_BALANCE). The default
-            // equal-buffer-count split equalises variants per worker, not work, so
-            // gene-dense slices straggle; weighting by transcript overlap equalises
-            // the thing that actually costs. Slice boundaries do not affect output
-            // (every worker count already yields byte-identical VCFs), so this is a
-            // scheduling change only.
-            let slices = if grid_balance_enabled {
-                let t_w = Instant::now();
-                let weights = buffer_transcript_weights(
-                    &boundaries,
-                    &grid_positions,
-                    base_transcripts.iter().map(|tx| (tx.start, tx.end)),
-                );
-                let planned = plan_grid_partitions_balanced(
-                    &boundaries,
-                    config.annotation_workers,
-                    overlap_width_bp,
-                    &weights,
-                );
-                pipeline_trace::emit(
-                    "grid_balance",
-                    "done",
-                    &[
-                        ("chrom", TraceValue::Str(&chrom)),
-                        ("buffers", TraceValue::Usize(weights.len())),
-                        ("slices", TraceValue::Usize(planned.len())),
-                        ("elapsed", TraceValue::Duration(t_w.elapsed())),
-                    ],
-                );
-                for s in &planned {
-                    let w: u64 = weights
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| {
-                            boundaries[*i].global_row >= s.emit_start_row
-                                && boundaries[*i].global_row < s.emit_end_row
-                        })
-                        .map(|(_, w)| *w)
-                        .sum();
-                    pipeline_trace::emit(
-                        "grid_balance",
-                        "slice",
-                        &[
-                            ("worker_id", TraceValue::Usize(s.worker_id)),
-                            (
-                                "emit_rows",
-                                TraceValue::Usize(s.emit_end_row - s.emit_start_row),
-                            ),
-                            ("weight", TraceValue::Usize(w as usize)),
-                        ],
-                    );
-                }
-                planned
-            } else {
-                plan_grid_partitions(&boundaries, config.annotation_workers, overlap_width_bp)
-            };
-            let _ = _total_rows;
-            let task_ctx = session.task_ctx();
-            // All workers of this contig probe the same variation shard, and the
-            // lookup is immutable once opened (its per-partition cursor is a
-            // stateless placeholder, and each probe opens its own file handle). Share
-            // one single-flight cell so the shard footer + page index are decoded
-            // once per contig rather than once per worker — the page index alone is
-            // ~0.5 GB for chr1, so per-worker loads dominated peak RSS. Scoped to
-            // this contig: it is rebuilt on the next `prepare_contig_context`.
-            #[cfg(feature = "parquet-cache")]
-            let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
-            // `session.state()` was cloned once per worker inside the loop.
-            let session_state = session.state();
-            let mut prepared: Vec<(usize, LookupProvider, ColocatedSink)> =
-                Vec::with_capacity(slices.len());
-            for (i, slice) in slices.iter().enumerate() {
-                let mut wprovider = LookupProvider::new(
-                    Arc::clone(&session),
-                    config.vcf_table.clone(),
-                    var_table.clone(),
-                    grid_vcf_schema.clone(),
-                    grid_cache_schema.clone(),
-                    config.cache_columns.clone(),
-                    config.extended_probes,
-                    config.allowed_failed,
-                )?;
-                // Restrict each worker to its [scan_lo_pos, scan_hi_pos) window so it
-                // reads ONLY its range's lookup (warm-up + emit) — no over-read. The
-                // full-contig worker below reads ALL partitions of this filtered plan
-                // (the earlier truncation was reading only partition 0, not a broken
-                // filter). The last worker has no upper bound (reads to contig end).
-                let mut filter = col("chrom")
-                    .eq(lit(&*chrom))
-                    .and(col("start").gt_eq(lit(slice.scan_lo_pos)));
-                if slice.scan_hi_pos != i64::MAX {
-                    filter = filter.and(col("start").lt(lit(slice.scan_hi_pos)));
-                }
-                wprovider.set_vcf_filter(Some(filter));
-                wprovider.set_target_partitions(config.target_partitions);
-                // Warm-up rows (strictly before this worker's seam) are read only to
-                // replay buffer state and are then discarded, so skip their variation
-                // probe. Worker 0 has no warm-up. Opt out with VEP_SKIP_WARMUP_LOOKUP=0.
-                let skip_warm_up_lookup = std::env::var("VEP_SKIP_WARMUP_LOOKUP")
-                    .ok()
-                    .as_deref()
-                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                    .unwrap_or(true);
-                if skip_warm_up_lookup && slice.scan_lo_pos < slice.emit_start_pos {
-                    wprovider.set_probe_floor_pos(Some(slice.emit_start_pos));
-                }
-                #[cfg(feature = "parquet-cache")]
-                if let Some(root) = &config.cache_root {
-                    wprovider.set_cache_root(root.clone());
-                    if config.parquet_backend {
-                        wprovider.set_parquet_backend(true);
-                    }
-                    wprovider.set_parquet_lookup_cell(Arc::clone(&shared_parquet_lookup_cell));
-                }
-                let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
-                if config.flags.check_existing {
-                    wprovider.set_colocated_sink(Arc::clone(&sink));
-                }
-                prepared.push((i, wprovider, sink));
+        let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
+        // `session.state()` was cloned once per worker inside the loop.
+        let session_state = session.state();
+        let mut prepared: Vec<(usize, LookupProvider, ColocatedSink)> =
+            Vec::with_capacity(grid_slices.len());
+        for (i, slice) in grid_slices.iter().enumerate() {
+            let mut wprovider = LookupProvider::new(
+                Arc::clone(&session),
+                config.vcf_table.clone(),
+                var_table.clone(),
+                grid_vcf_schema.clone(),
+                grid_cache_schema.clone(),
+                config.cache_columns.clone(),
+                config.extended_probes,
+                config.allowed_failed,
+            )?;
+            // Restrict each worker to its [scan_lo_pos, scan_hi_pos) window so it
+            // reads ONLY its range's lookup (warm-up + emit) — no over-read. The
+            // full-contig worker below reads ALL partitions of this filtered plan
+            // (the earlier truncation was reading only partition 0, not a broken
+            // filter). The last worker has no upper bound (reads to contig end).
+            let mut filter = col("chrom")
+                .eq(lit(&*chrom))
+                .and(col("start").gt_eq(lit(slice.scan_lo_pos)));
+            if slice.scan_hi_pos != i64::MAX {
+                filter = filter.and(col("start").lt(lit(slice.scan_hi_pos)));
             }
-            // Each worker's physical plan is independent of the others, but they
-            // were built one after another, so this grew linearly with worker
-            // count and sat directly on the prelude's critical path.
-            let t_plans = Instant::now();
-            let concurrent_plans = std::env::var("VEP_CONCURRENT_PLANS")
+            wprovider.set_vcf_filter(Some(filter));
+            wprovider.set_target_partitions(config.target_partitions);
+            // Warm-up rows (strictly before this worker's seam) are read only to
+            // replay buffer state and are then discarded, so skip their variation
+            // probe. Worker 0 has no warm-up. Opt out with VEP_SKIP_WARMUP_LOOKUP=0.
+            let skip_warm_up_lookup = std::env::var("VEP_SKIP_WARMUP_LOOKUP")
                 .ok()
                 .as_deref()
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true);
-            let built: Vec<(usize, Arc<dyn ExecutionPlan>, ColocatedSink)> = if concurrent_plans {
-                futures::future::try_join_all(prepared.into_iter().map(|(i, wp, sink)| {
-                    let session_state = &session_state;
-                    async move {
-                        let plan = wp.scan(session_state, None, &[], None).await?;
-                        Ok::<_, DataFusionError>((i, plan, sink))
-                    }
-                }))
-                .await?
-            } else {
-                let mut out = Vec::with_capacity(prepared.len());
-                for (i, wp, sink) in prepared {
-                    let plan = wp.scan(&session_state, None, &[], None).await?;
-                    out.push((i, plan, sink));
+            if skip_warm_up_lookup && slice.scan_lo_pos < slice.emit_start_pos {
+                wprovider.set_probe_floor_pos(Some(slice.emit_start_pos));
+            }
+            #[cfg(feature = "parquet-cache")]
+            if let Some(root) = &config.cache_root {
+                wprovider.set_cache_root(root.clone());
+                if config.parquet_backend {
+                    wprovider.set_parquet_backend(true);
                 }
-                out
-            };
-            pipeline_trace::emit(
-                "grid_plans",
-                "done",
-                &[
-                    ("chrom", TraceValue::Str(&chrom)),
-                    ("workers", TraceValue::Usize(built.len())),
-                    ("elapsed", TraceValue::Duration(t_plans.elapsed())),
-                ],
-            );
-            for (i, plan, sink) in built {
-                lookup_partitions.push_back(spawn_lookup_full_contig_worker(
-                    Arc::clone(&plan),
-                    Arc::clone(&task_ctx),
-                    i, // logical id = shard / output order
-                    chrom.to_string(),
-                    sink,
-                    LOOKUP_PARTITION_QUEUE_BATCHES,
-                    pipeline_profile.clone(),
-                ));
+                wprovider.set_parquet_lookup_cell(Arc::clone(&shared_parquet_lookup_cell));
             }
-            grid_slices = slices;
-            record_contig_profile(&pipeline_profile, |profile| {
-                profile.lookup_partitions = lookup_partitions.len();
-            });
-        }
-        Ok::<(), DataFusionError>(())
-    };
-
-    // Either start the workers while the rest of the context loads (default), or
-    // reproduce the original ordering where nothing is spawned until the whole
-    // context is resident.
-    let (rest_result, grid_result) = if early_workers {
-        tokio::join!(rest_fut, grid_fut)
-    } else {
-        let rest = rest_fut.await;
-        let grid = grid_fut.await;
-        (rest, grid)
-    };
-    grid_result?;
-    let (ex, tl, rg, mt) = rest_result?;
-    let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
-
-    // Open the per-contig custom-plugin registry when enabled and non-empty.
-    #[cfg(feature = "parquet-cache")]
-    let plugin_registry = match &config.plugin_cache_root {
-        Some(root) => {
-            let reg = crate::plugin_cache::registry::PluginRegistry::open(root, &chrom).await?;
-            if reg.is_empty() {
-                None
-            } else {
-                Some(Arc::new(reg))
+            let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+            if config.flags.check_existing {
+                wprovider.set_colocated_sink(Arc::clone(&sink));
             }
+            prepared.push((i, wprovider, sink));
         }
-        None => None,
-    };
+        // Each worker's physical plan is independent of the others, but they
+        // were built one after another, so this grew linearly with worker
+        // count and sat directly on the prelude's critical path.
+        let t_plans = Instant::now();
+        let concurrent_plans = std::env::var("VEP_CONCURRENT_PLANS")
+            .ok()
+            .as_deref()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let built: Vec<(usize, Arc<dyn ExecutionPlan>, ColocatedSink)> = if concurrent_plans {
+            futures::future::try_join_all(prepared.into_iter().map(|(i, wp, sink)| {
+                let session_state = &session_state;
+                async move {
+                    let plan = wp.scan(session_state, None, &[], None).await?;
+                    Ok::<_, DataFusionError>((i, plan, sink))
+                }
+            }))
+            .await?
+        } else {
+            let mut out = Vec::with_capacity(prepared.len());
+            for (i, wp, sink) in prepared {
+                let plan = wp.scan(&session_state, None, &[], None).await?;
+                out.push((i, plan, sink));
+            }
+            out
+        };
+        pipeline_trace::emit(
+            "grid_plans",
+            "done",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("workers", TraceValue::Usize(built.len())),
+                ("elapsed", TraceValue::Duration(t_plans.elapsed())),
+            ],
+        );
+        for (i, plan, sink) in built {
+            lookup_partitions.push_back(spawn_lookup_full_contig_worker(
+                Arc::clone(&plan),
+                Arc::clone(&task_ctx),
+                i, // logical id = shard / output order
+                chrom.to_string(),
+                sink,
+                LOOKUP_PARTITION_QUEUE_BATCHES,
+                pipeline_profile.clone(),
+            ));
+        }
+        record_contig_profile(&pipeline_profile, |profile| {
+            profile.lookup_partitions = lookup_partitions.len();
+        });
+    }
 
-    let shared_context = Arc::new(SharedContigAnnotationContext {
-        config: config.clone(),
-        profile: pipeline_profile,
-        base_transcripts,
-        overlap_width_bp,
-        base_translations: Arc::new(tl),
-        exons: Arc::new(ex),
-        indexes,
-        regulatory: Arc::new(rg),
-        motifs: Arc::new(mt),
-        // TODO: miRNA and structural features are not yet partitioned —
-        // these are rare and handled by the monolithic path only.
-        mirnas: Arc::new(Vec::new()),
-        structural: Arc::new(Vec::new()),
-        translateable_seq_by_tx: Arc::new(translateable_seq),
-        transcript_cache_regions,
-        tmp_provider: Arc::new(tmp_provider),
-        engine: Arc::new(engine),
-        #[cfg(feature = "parquet-cache")]
-        sift_prediction_store,
-        #[cfg(feature = "parquet-cache")]
-        plugin_registry,
-    });
-
-    // `pipeline_profile` was moved into the shared context above; use the cloned
-    // handle to record the shared-context build cost and the total prepare wall.
+    // Second half of the prepare wall. Deliberately NOT `t_contig.elapsed()`:
+    // once the data half can run ahead, that span also covers the previous
+    // contig's annotation.
     record_contig_profile(&profile_handle, |profile| {
-        profile.prepare_shared_ctx += shared_ctx_started.elapsed();
-        profile.prepare_total += t_contig.elapsed();
+        profile.prepare_total += t_activate.elapsed();
     });
     log_phase_rss(&chrom, "after_prepare");
 
