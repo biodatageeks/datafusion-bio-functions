@@ -9210,9 +9210,10 @@ async fn load_contig_context_rest(
     tx_ids: &HashSet<String>,
 ) -> Result<ContigContextRest> {
     // The four scans are mutually independent and the parses are CPU-bound, so
-    // by default they run concurrently. VEP_CTX_PARALLEL=0 forces the original
-    // strictly serial order, which keeps the A/B honest and gives an opt-out
-    // when the extra concurrency would contend with something else.
+    // they CAN run concurrently — but the default is the original strictly
+    // serial order: `enabled_from_env_value(None)` is false, so concurrency is
+    // opt-in via VEP_CTX_PARALLEL=1. Serial-by-default keeps the A/B honest and
+    // avoids contending with the rest of the pipeline unless asked.
     let concurrent =
         pipeline_trace::enabled_from_env_value(std::env::var("VEP_CTX_PARALLEL").ok().as_deref());
 
