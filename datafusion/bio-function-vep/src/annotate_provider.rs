@@ -12886,7 +12886,7 @@ async fn prepare_contig_data(
     // runs before any context data is loaded. The lookup plan build and worker
     // spawn are in `activate_contig_lookups` and are accounted for there.
     record_contig_profile(&pipeline_profile, |profile| {
-        profile.prepare_setup += t_contig.elapsed();
+        profile.prepare_setup += t_data.elapsed();
     });
 
     let context_fut = async {
@@ -13179,8 +13179,8 @@ async fn prepare_contig_data(
 /// is actually about to be annotated. Both the byte-budget/serial arms and the
 /// grid-aligned per-worker arm live here, so nothing is spawned by the data
 /// half. The consequence is that the byte-budget lookup build no longer
-/// overlaps the context load (the old `VEP_EARLY_WORKERS` interleave); that
-/// cost is paid back once the data half runs ahead of the contig.
+/// overlaps the context load (the removed early-worker interleave); that cost
+/// is paid back once the data half runs ahead of the contig.
 async fn activate_contig_lookups(
     session: Arc<SessionContext>,
     data: ContigPreparedData,
