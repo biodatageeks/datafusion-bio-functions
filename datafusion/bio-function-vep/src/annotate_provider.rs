@@ -10089,7 +10089,6 @@ struct ContigPreparedData {
     /// Post identity-validation config (`vep_semantics` resolved from the
     /// contig's cache shards).
     config: ContigAnnotationConfig,
-    cache: Arc<PartitionedAnnotationCache>,
     /// Profile handle passed to the spawned lookup workers. Same `Arc` as
     /// `profile_handle`; kept separate so activation mirrors the pre-split code.
     pipeline_profile: Option<SharedContigPipelineProfile>,
@@ -10772,6 +10771,23 @@ struct ContigAnnotationStream {
     /// worker-minor) for the `threads>1` sharded-output path. Monotonic across
     /// contigs so `vcf_sink` concatenates shards in ascending = position order.
     next_global_shard_id: usize,
+    /// In-flight prefetch of the NEXT contig's data phase (spawned when the
+    /// current contig enters annotation; depth is always <= 1). The contig name
+    /// rides along so cleanup can log what was discarded. The task spawns no
+    /// lookup workers (data phase only), so aborting it leaks nothing.
+    ///
+    /// The contig is popped off `contigs` at spawn time, so `StartContig` must
+    /// consume this BEFORE it treats an empty queue as end-of-stream.
+    ///
+    /// Error semantics: a failed prefetch is not observed until its contig
+    /// STARTS — the future built in `StartContig` awaits the handle and yields
+    /// the error there. That preserves today's user-visible failure ordering:
+    /// the current contig's annotation is never interrupted by a bad next
+    /// contig.
+    prefetched_data: Option<(
+        String,
+        tokio::task::JoinHandle<Result<Option<ContigPreparedData>>>,
+    )>,
 }
 
 impl ContigAnnotationStream {
@@ -10793,10 +10809,57 @@ impl ContigAnnotationStream {
             state: StreamState::StartContig,
             rows_emitted: 0,
             next_global_shard_id: 0,
+            prefetched_data: None,
+        }
+    }
+
+    /// Spawn the NEXT contig's data phase so it overlaps the current contig's
+    /// annotation. Called immediately after the stream commits to annotating a
+    /// contig (serial and sharded paths alike).
+    ///
+    /// The task is `tokio::spawn`ed rather than stored as a bare future on
+    /// purpose: the stream only makes progress when the consumer polls it, so
+    /// an unspawned future would not run until `StartContig` awaited it — i.e.
+    /// no prefetch at all.
+    fn start_prefetch_next_contig(&mut self) {
+        if self.prefetched_data.is_some() {
+            // Depth stays at one.
+            return;
+        }
+        if !contig_prefetch_enabled(
+            self.config.annotation_workers,
+            std::env::var("VEP_CONTIG_PREFETCH").ok().as_deref(),
+        ) {
+            return;
+        }
+        // Pop the contig NOW so `StartContig` cannot double-prepare it.
+        let Some(chrom) = self.contigs.pop_front() else {
+            return;
+        };
+        let session = Arc::clone(&self.session);
+        let cache = Arc::clone(&self.cache);
+        let config = self.config.clone();
+        let full_schema = self.full_schema.clone();
+        let prefetch_chrom = chrom.clone();
+        let handle = tokio::spawn(async move {
+            prepare_contig_data(session, cache, prefetch_chrom, config, full_schema).await
+        });
+        pipeline_trace::emit("prefetch", "spawned", &[("chrom", TraceValue::Str(&chrom))]);
+        self.prefetched_data = Some((chrom, handle));
+    }
+
+    /// Drop an in-flight prefetch. Used by every path that abandons the stream
+    /// (drop, error teardown, `Done`) so the spawned data phase cannot outlive
+    /// the stream. Idempotent.
+    fn abort_prefetch(&mut self) {
+        if let Some((chrom, handle)) = self.prefetched_data.take() {
+            handle.abort();
+            pipeline_trace::emit("prefetch", "aborted", &[("chrom", TraceValue::Str(&chrom))]);
         }
     }
 
     fn cleanup_registered_tables_on_drop(&mut self) {
+        self.abort_prefetch();
         match &mut self.state {
             StreamState::AnnotatingContig(ann) => {
                 abort_annotation_lookup_partitions(ann);
@@ -12195,29 +12258,61 @@ impl Stream for ContigAnnotationStream {
 
                 StreamState::StartContig => {
                     // LIMIT pushdown: stop processing contigs if limit reached.
+                    // Checked BEFORE the prefetch is consumed so a satisfied
+                    // LIMIT throws the prefetched contig away instead of paying
+                    // for its activation.
                     if fetch_limit.is_some_and(|limit| rows_emitted >= limit) {
+                        self.abort_prefetch();
                         self.state = StreamState::Done;
                         return Poll::Ready(None);
                     }
-                    let Some(chrom) = self.contigs.pop_front() else {
-                        // All contigs processed.
-                        self.state = StreamState::Done;
-                        return Poll::Ready(None);
-                    };
-                    let session = Arc::clone(&self.session);
-                    let cache = Arc::clone(&self.cache);
-                    let config = self.config.clone();
-                    let full_schema = self.full_schema.clone();
+                    // The prefetch already popped its contig off `contigs`, so
+                    // it must be consumed BEFORE the queue-empty check: after
+                    // the LAST contig is prefetched the queue is empty while
+                    // the work is still pending, and treating that as
+                    // end-of-stream would silently drop a contig.
+                    let fut: PrepareFuture = if let Some((chrom, handle)) =
+                        self.prefetched_data.take()
+                    {
+                        pipeline_trace::emit(
+                            "prefetch",
+                            "consumed",
+                            &[("chrom", TraceValue::Str(&chrom))],
+                        );
+                        let session = Arc::clone(&self.session);
+                        Box::pin(async move {
+                            let data = handle.await.map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "contig prefetch task failed: {e}"
+                                ))
+                            })??;
+                            match data {
+                                None => Ok(None),
+                                Some(data) => activate_contig_lookups(session, data).await,
+                            }
+                        })
+                    } else {
+                        let Some(chrom) = self.contigs.pop_front() else {
+                            // All contigs processed.
+                            self.state = StreamState::Done;
+                            return Poll::Ready(None);
+                        };
+                        let session = Arc::clone(&self.session);
+                        let cache = Arc::clone(&self.cache);
+                        let config = self.config.clone();
+                        let full_schema = self.full_schema.clone();
 
-                    let fut: PrepareFuture = Box::pin(async move {
-                        prepare_contig_context(session, cache, chrom, config, full_schema).await
-                    });
+                        Box::pin(async move {
+                            prepare_contig_context(session, cache, chrom, config, full_schema).await
+                        })
+                    };
                     self.state = StreamState::PreparingContig(fut);
                 }
 
                 StreamState::PreparingContig(fut) => match fut.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => {
+                        self.abort_prefetch();
                         self.state = StreamState::Done;
                         return Poll::Ready(Some(Err(e)));
                     }
@@ -12238,6 +12333,7 @@ impl Stream for ContigAnnotationStream {
                             // producer of the "threads" option), which sets
                             // vcf_shard_ctx.
                             let Some(shard_ctx) = config.vcf_shard_ctx.clone() else {
+                                self.abort_prefetch();
                                 self.state = StreamState::Done;
                                 return Poll::Ready(Some(Err(DataFusionError::Internal(
                                     "parallel annotation (threads>1) requires a VCF shard \
@@ -12298,6 +12394,7 @@ impl Stream for ContigAnnotationStream {
                                 for h in &lookup_join {
                                     h.abort();
                                 }
+                                self.abort_prefetch();
                                 self.state = StreamState::Done;
                                 return Poll::Ready(Some(Err(DataFusionError::Internal(
                                     "parallel annotation (threads>1) requires spawned lookup \
@@ -12342,6 +12439,9 @@ impl Stream for ContigAnnotationStream {
                                 shared,
                             };
                             self.state = StreamState::AnnotatingParallel(state);
+                            // Committed to annotating this contig: overlap the
+                            // NEXT contig's data phase with it.
+                            self.start_prefetch_next_contig();
                         } else {
                             let worker =
                                 match AnnotationWorkerState::new(Arc::clone(&ready.shared_context))
@@ -12349,6 +12449,7 @@ impl Stream for ContigAnnotationStream {
                                     Ok(worker) => worker,
                                     Err(e) => {
                                         abort_lookup_partitions(&mut ready.lookup_partitions);
+                                        self.abort_prefetch();
                                         self.state = StreamState::Done;
                                         return Poll::Ready(Some(Err(e)));
                                     }
@@ -12370,6 +12471,9 @@ impl Stream for ContigAnnotationStream {
                                 inflight: VecDeque::new(),
                             };
                             self.state = StreamState::AnnotatingContig(ann);
+                            // Committed to annotating this contig: overlap the
+                            // NEXT contig's data phase with it.
+                            self.start_prefetch_next_contig();
                         }
                     }
                 },
@@ -12428,6 +12532,9 @@ impl Stream for ContigAnnotationStream {
                                 std::mem::take(&mut state.ephemeral_tables),
                             );
                             self.state = StreamState::ErrorCleaningUp(fut, e);
+                            // The run ends with this error; the next contig
+                            // will never start, so drop its prefetch.
+                            self.abort_prefetch();
                             continue;
                         }
                     }
@@ -12483,6 +12590,7 @@ impl Stream for ContigAnnotationStream {
                                     make_cleanup_future(session, tables),
                                     e,
                                 );
+                                self.abort_prefetch();
                                 continue;
                             }
                         }
@@ -12609,6 +12717,7 @@ impl Stream for ContigAnnotationStream {
                                 std::mem::take(&mut ann.ephemeral_tables),
                             );
                             self.state = StreamState::ErrorCleaningUp(fut, e);
+                            self.abort_prefetch();
                             continue;
                         }
                         Poll::Ready(Err(join_err)) => {
@@ -12621,6 +12730,7 @@ impl Stream for ContigAnnotationStream {
                                 fut,
                                 DataFusionError::External(Box::new(join_err)),
                             );
+                            self.abort_prefetch();
                             continue;
                         }
                     }
@@ -12673,10 +12783,13 @@ impl Stream for ContigAnnotationStream {
                 StreamState::CleaningUp(fut) => match fut.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => {
+                        // Terminal: the prefetched contig will never start.
+                        self.abort_prefetch();
                         self.state = StreamState::Done;
                         return Poll::Ready(Some(Err(e)));
                     }
                     Poll::Ready(Ok(())) => {
+                        // The prefetch (if any) is consumed by `StartContig`.
                         self.state = StreamState::StartContig;
                     }
                 },
@@ -12690,6 +12803,7 @@ impl Stream for ContigAnnotationStream {
                         else {
                             unreachable!()
                         };
+                        self.abort_prefetch();
                         return Poll::Ready(Some(Err(original_err)));
                     }
                 },
@@ -12697,6 +12811,7 @@ impl Stream for ContigAnnotationStream {
                 StreamState::FinalCleanup(fut) => match fut.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(_) => {
+                        self.abort_prefetch();
                         self.state = StreamState::Done;
                         return Poll::Ready(None);
                     }
@@ -13156,7 +13271,6 @@ async fn prepare_contig_data(
     Ok(Some(ContigPreparedData {
         chrom,
         config,
-        cache,
         pipeline_profile,
         profile_handle,
         ephemeral_tables,
@@ -13188,7 +13302,6 @@ async fn activate_contig_lookups(
     let ContigPreparedData {
         chrom,
         config,
-        cache: _,
         pipeline_profile,
         profile_handle,
         ephemeral_tables,
