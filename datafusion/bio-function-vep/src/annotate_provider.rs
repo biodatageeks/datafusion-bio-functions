@@ -10093,8 +10093,9 @@ struct ContigPreparedData {
     /// Profile handle passed to the spawned lookup workers. Same `Arc` as
     /// `profile_handle`; kept separate so activation mirrors the pre-split code.
     pipeline_profile: Option<SharedContigPipelineProfile>,
-    /// Clone of the pipeline profile handle; the original was moved into
-    /// `shared_context`, and activation still records into it.
+    /// Second handle on the same `Arc` as `pipeline_profile` (the shared
+    /// context holds a clone of it too); activation records the prepare wall
+    /// into this one.
     profile_handle: Option<SharedContigPipelineProfile>,
     ephemeral_tables: Vec<String>,
     shared_context: Arc<SharedContigAnnotationContext>,
@@ -12349,7 +12350,7 @@ impl Stream for ContigAnnotationStream {
                         // (stream torn down while PreparingContig) aborts the
                         // task instead of detaching it.
                         Box::pin(async move {
-                            let data = Pin::new(&mut guard.0).await.map_err(|e| {
+                            let data = (&mut guard.0).await.map_err(|e| {
                                 DataFusionError::Execution(format!(
                                     "contig prefetch task failed: {e}"
                                 ))
@@ -12988,8 +12989,11 @@ async fn prepare_contig_data(
     let t_data = profile_start!();
     let pipeline_profile =
         profiling_enabled().then(|| Arc::new(Mutex::new(ContigPipelineProfile::default())));
-    // Cloned handle so prepare_shared_ctx / prepare_total can still be recorded
-    // after `pipeline_profile` is moved into the shared context below.
+    // Second handle on the same profile `Arc`. `pipeline_profile` is cloned --
+    // not moved -- into the shared context below and stays live for the rest of
+    // this half; the separate binding keeps the pre-split shape, where
+    // prepare_shared_ctx / prepare_total are recorded through `profile_handle`
+    // and it is what `activate_contig_lookups` records into.
     let profile_handle = pipeline_profile.clone();
     // The `contig START` banner belongs to the half that actually starts the
     // contig, so it lives in `activate_contig_lookups`.
@@ -13893,9 +13897,7 @@ mod tests {
             tokio::task::yield_now().await;
             Ok(None)
         }));
-        let joined = Pin::new(&mut guard.0)
-            .await
-            .expect("task must not be aborted");
+        let joined = (&mut guard.0).await.expect("task must not be aborted");
         assert!(joined.expect("prefetch must succeed").is_none());
     }
 
