@@ -4,7 +4,8 @@
 //! ```text
 //! cargo run --release -p datafusion-bio-function-vep --example annotate_vcf -- \
 //!   --input <in.vcf> --cache <parquet cache root> --out <out.vcf> \
-//!   --fasta <ref.fa> [--plugin-cache <plugin cache root>] [--everything] [--hgvs]
+//!   --fasta <ref.fa> [--plugin-cache <plugin cache root>] [--everything] [--hgvs] \\
+//!   [--preserve-record-layout]
 //! ```
 
 use datafusion::common::{DataFusionError, Result};
@@ -32,17 +33,19 @@ async fn main() -> Result<()> {
     let fasta = arg(&args, "--fasta");
     let plugin_cache = arg(&args, "--plugin-cache");
 
-    let config = AnnotateVcfConfig {
-        everything: flag(&args, "--everything"),
-        hgvs: flag(&args, "--hgvs"),
-        reference_fasta_path: fasta,
-        workers: arg(&args, "--workers")
-            .and_then(|w| w.parse().ok())
-            .unwrap_or(1),
-        target_partitions: 1,
-        plugin_cache_root: plugin_cache.map(std::path::PathBuf::from),
-        ..AnnotateVcfConfig::default()
-    };
+    // `AnnotateVcfConfig` is `#[non_exhaustive]`, so it is built by assignment
+    // rather than a struct literal: a field this crate adds then defaults here
+    // instead of breaking every caller's build.
+    let mut config = AnnotateVcfConfig::default();
+    config.everything = flag(&args, "--everything");
+    config.hgvs = flag(&args, "--hgvs");
+    config.reference_fasta_path = fasta;
+    config.workers = arg(&args, "--workers")
+        .and_then(|w| w.parse().ok())
+        .unwrap_or(1);
+    config.target_partitions = 1;
+    config.plugin_cache_root = plugin_cache.map(std::path::PathBuf::from);
+    config.preserve_record_layout = flag(&args, "--preserve-record-layout");
 
     eprintln!(
         "annotate: input={input} cache={cache} plugin_cache={:?} everything={} hgvs={}",

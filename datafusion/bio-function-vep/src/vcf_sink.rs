@@ -13,7 +13,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion_bio_format_core::metadata::VCF_HEADER_RAW_LINES_KEY;
+use datafusion_bio_format_core::metadata::{
+    VCF_FORMAT_KEYS_COLUMN, VCF_HEADER_RAW_LINES_KEY, VCF_INFO_KEYS_COLUMN,
+};
 use datafusion_bio_format_vcf::serializer::{VcfRecordLine, batch_to_vcf_lines};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
@@ -379,6 +381,7 @@ impl VcfBodyShardWriter {
 }
 
 /// Configuration for VCF annotation output.
+#[non_exhaustive]
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
     pub everything: bool,
@@ -461,6 +464,16 @@ pub struct AnnotateVcfConfig {
     /// Version recorded next to [`Self::provenance_tool_name`]. `None` records
     /// this engine's crate version.
     pub provenance_tool_version: Option<String>,
+    /// Reproduce each input record's own INFO key order and FORMAT key list in
+    /// the output, instead of the schema's.
+    ///
+    /// Both are per record and neither survives the typed columns, so without
+    /// this the output reorders INFO and drops any FORMAT key whose value is
+    /// missing in every sample. Ensembl VEP preserves both by copying the input
+    /// line and only appending to INFO, so byte-level agreement with it needs
+    /// this on. Costs two dictionary-encoded string columns through the
+    /// pipeline.
+    pub preserve_record_layout: bool,
 }
 
 impl Default for AnnotateVcfConfig {
@@ -502,6 +515,7 @@ impl Default for AnnotateVcfConfig {
             plugin_cache_root: None,
             provenance_tool_name: None,
             provenance_tool_version: None,
+            preserve_record_layout: false,
         }
     }
 }
@@ -1047,6 +1061,51 @@ fn run_assembler_thread_bgzf(
 }
 
 /// Drive the `threads>1` sharded-VCF-output path: build the annotation plan
+/// The columns the annotation output carries, in output order: the core VCF
+/// columns, the input's INFO fields, `CSQ`, the per-sample FORMAT columns, and
+/// — when the record layout is preserved — the two carried key-order columns.
+///
+/// Those two go last, matching where the VCF reader puts them, and they are not
+/// INFO fields: the writer reads them to order INFO and FORMAT, and never emits
+/// them on a line.
+fn annotation_output_columns(
+    core_vcf: &[&str],
+    info_fields: &[String],
+    format_fields: &[String],
+    preserve_record_layout: bool,
+) -> Vec<String> {
+    let layout: &[&str] = if preserve_record_layout {
+        &[VCF_INFO_KEYS_COLUMN, VCF_FORMAT_KEYS_COLUMN]
+    } else {
+        &[]
+    };
+    core_vcf
+        .iter()
+        .map(|name| (*name).to_string())
+        .chain(info_fields.iter().cloned())
+        .chain(std::iter::once("CSQ".to_string()))
+        .chain(format_fields.iter().cloned())
+        .chain(layout.iter().map(|name| (*name).to_string()))
+        .collect()
+}
+
+/// Renders [`annotation_output_columns`] as a SQL select list.
+fn annotation_select_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| {
+            // CSQ is the annotation function's own output column, not one of
+            // the input table's, and is quoted the way the function names it.
+            if name == "CSQ" {
+                format!("\"{name}\"")
+            } else {
+                format!("`{name}`")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// directly (bypassing SQL) with a [`VcfShardContext`] so each fused worker
 /// streams its own position-ordered VCF body shard into `shard_ctx.tempdir`,
 /// then concatenate the shards in ascending id (= position) order into `writer`.
@@ -1233,14 +1292,21 @@ pub async fn annotate_to_vcf(
     crate::register_vep_functions(&ctx);
 
     let vcf_path = input_vcf.to_string();
+    let carry_layout = config.preserve_record_layout;
+    let open_provider = move |path: String| -> Result<VcfTableProvider> {
+        let provider = VcfTableProvider::new(path, None, None, None, false)?;
+        if carry_layout {
+            provider.with_record_layout()
+        } else {
+            Ok(provider)
+        }
+    };
     let vcf_provider = if concurrency_plan.spawn_vcf_provider_open {
-        tokio::task::spawn_blocking(move || {
-            VcfTableProvider::new(vcf_path, None, None, None, false)
-        })
-        .await
-        .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??
+        tokio::task::spawn_blocking(move || open_provider(vcf_path))
+            .await
+            .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??
     } else {
-        VcfTableProvider::new(vcf_path, None, None, None, false)?
+        open_provider(vcf_path)?
     };
 
     let vcf_schema = vcf_provider.schema();
@@ -1341,18 +1407,17 @@ pub async fn annotate_to_vcf(
     };
 
     // 4. Build annotation SQL — only VCF-relevant columns + csq.
-    let mut select_cols: Vec<String> = Vec::new();
-    for name in &core_vcf {
-        select_cols.push(format!("`{name}`"));
-    }
-    for name in &info_fields {
-        select_cols.push(format!("`{name}`"));
-    }
-    select_cols.push("\"CSQ\"".to_string());
-    for name in &format_fields {
-        select_cols.push(format!("`{name}`"));
-    }
-    let select_list = select_cols.join(", ");
+    //
+    // The serial path SELECTs these columns and the sharded path projects the
+    // annotation plan by them. They must name the same columns in the same
+    // order, so both come from one list.
+    let projection_names = annotation_output_columns(
+        &core_vcf,
+        &info_fields,
+        &format_fields,
+        config.preserve_record_layout,
+    );
+    let select_list = annotation_select_list(&projection_names);
 
     let options_json = config.to_options_json_with_backend(backend);
     let opts_clause = format!(", '{}'", options_json.replace('\'', "''"));
@@ -1361,17 +1426,6 @@ pub async fn annotate_to_vcf(
         cache_source.replace('\'', "''"),
         backend.replace('\'', "''"),
     );
-
-    // Column set the formatter consumes (same as the serial SELECT list): core
-    // VCF columns + INFO fields + CSQ + per-sample FORMAT columns. Used by the
-    // threads>1 sharded path to project the annotation plan identically.
-    let projection_names: Vec<String> = core_vcf
-        .iter()
-        .map(|name| (*name).to_string())
-        .chain(info_fields.iter().cloned())
-        .chain(std::iter::once("CSQ".to_string()))
-        .chain(format_fields.iter().cloned())
-        .collect();
 
     let mut vcf_info_fields = info_fields;
     vcf_info_fields.push("CSQ".to_string());
@@ -2459,5 +2513,41 @@ mod tests {
             chunk,
             b"chr1\t1\t.\tA\tC\t.\t.\t.\nchr1\t2\t.\tG\tT\t.\t.\t.\n"
         );
+    }
+
+    /// The serial path SELECTs these columns and the sharded path projects the
+    /// annotation plan by them. Two lists that must agree, so they are one list.
+    #[test]
+    fn the_select_list_names_exactly_the_projected_columns() {
+        let names = annotation_output_columns(
+            &["chrom", "start"],
+            &["DP".to_string()],
+            &["SAMPLE1_GT".to_string()],
+            false,
+        );
+        assert_eq!(names, ["chrom", "start", "DP", "CSQ", "SAMPLE1_GT"]);
+        assert_eq!(
+            annotation_select_list(&names),
+            "`chrom`, `start`, `DP`, \"CSQ\", `SAMPLE1_GT`"
+        );
+    }
+
+    #[test]
+    fn preserving_the_record_layout_carries_its_two_columns() {
+        let names = annotation_output_columns(&["chrom"], &[], &[], true);
+        assert_eq!(
+            names,
+            ["chrom", "CSQ", VCF_INFO_KEYS_COLUMN, VCF_FORMAT_KEYS_COLUMN]
+        );
+        // Last, matching the reader's schema, and quoted like any other column.
+        assert!(annotation_select_list(&names).ends_with(&format!(
+            "`{VCF_INFO_KEYS_COLUMN}`, `{VCF_FORMAT_KEYS_COLUMN}`"
+        )));
+    }
+
+    #[test]
+    fn not_preserving_the_record_layout_carries_neither_column() {
+        let names = annotation_output_columns(&["chrom"], &[], &[], false);
+        assert_eq!(names, ["chrom", "CSQ"]);
     }
 }
