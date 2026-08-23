@@ -1280,8 +1280,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-format-core"
-version = "1.10.0"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=7c866e07540aa8ae12d46e4878487911f659e8b9#7c866e07540aa8ae12d46e4878487911f659e8b9"
+version = "1.11.0"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=80f3a6c043899f8ded44eaab204b42735f805272#80f3a6c043899f8ded44eaab204b42735f805272"
 dependencies = [
  "async-compression",
  "bytes",
@@ -1303,12 +1303,12 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-format-ensembl-cache"
-version = "1.10.0"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=7c866e07540aa8ae12d46e4878487911f659e8b9#7c866e07540aa8ae12d46e4878487911f659e8b9"
+version = "1.11.0"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=80f3a6c043899f8ded44eaab204b42735f805272#80f3a6c043899f8ded44eaab204b42735f805272"
 dependencies = [
  "async-trait",
  "datafusion",
- "datafusion-bio-format-core 1.10.0",
+ "datafusion-bio-format-core 1.11.0",
  "datafusion-execution",
  "flate2",
  "log",
@@ -1321,15 +1321,15 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-format-vcf"
-version = "1.10.0"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=7c866e07540aa8ae12d46e4878487911f659e8b9#7c866e07540aa8ae12d46e4878487911f659e8b9"
+version = "1.11.0"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=80f3a6c043899f8ded44eaab204b42735f805272#80f3a6c043899f8ded44eaab204b42735f805272"
 dependencies = [
  "async-compression",
  "async-stream",
  "async-trait",
  "bytes",
  "datafusion",
- "datafusion-bio-format-core 1.10.0",
+ "datafusion-bio-format-core 1.11.0",
  "datafusion-execution",
  "env_logger",
  "flate2",
@@ -1402,7 +1402,7 @@ dependencies = [
  "chrono",
  "coitrees",
  "datafusion",
- "datafusion-bio-format-core 1.10.0",
+ "datafusion-bio-format-core 1.11.0",
  "datafusion-bio-format-ensembl-cache",
  "datafusion-bio-format-vcf",
  "datafusion-bio-function-ranges",
