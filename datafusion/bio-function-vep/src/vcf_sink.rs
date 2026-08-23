@@ -1060,7 +1060,6 @@ fn run_assembler_thread_bgzf(
     })
 }
 
-/// Drive the `threads>1` sharded-VCF-output path: build the annotation plan
 /// The columns the annotation output carries, in output order: the core VCF
 /// columns, the input's INFO fields, `CSQ`, the per-sample FORMAT columns, and
 /// — when the record layout is preserved — the two carried key-order columns.
@@ -1106,6 +1105,7 @@ fn annotation_select_list(names: &[String]) -> String {
         .join(", ")
 }
 
+/// Drive the `threads>1` sharded-VCF-output path: build the annotation plan
 /// directly (bypassing SQL) with a [`VcfShardContext`] so each fused worker
 /// streams its own position-ordered VCF body shard into `shard_ctx.tempdir`,
 /// then concatenate the shards in ascending id (= position) order into `writer`.
