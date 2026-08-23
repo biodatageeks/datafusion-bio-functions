@@ -689,6 +689,72 @@ fn cache_source_type_from_cache_source_for_backend(
 const ENGINE_MARKER_ATTR: &str = concat!("engine=\"", env!("CARGO_PKG_NAME"), " ");
 const ENGINE_MARKER_JSON: &str = concat!("\"engine\":\"", env!("CARGO_PKG_NAME"), "\"");
 
+/// Header keys a provenance line must never take.
+///
+/// `VEP` would break the documented promise that this never claims Ensembl VEP
+/// produced the output. The structured kinds would make the stale-provenance
+/// filter delete real declarations with that key.
+const RESERVED_PROVENANCE_KEYS: [&str; 8] = [
+    "VEP",
+    "fileformat",
+    "fileDate",
+    "INFO",
+    "FORMAT",
+    "FILTER",
+    "contig",
+    "ALT",
+];
+
+/// The header key provenance lines are written under.
+///
+/// A configured name is used only when it is a usable VCF metadata key that is
+/// not reserved; anything else falls back to this engine's crate name rather
+/// than emitting an invalid or misleading key.
+fn provenance_key(configured: Option<&str>) -> &str {
+    match configured {
+        Some(name) if is_usable_provenance_key(name) => name,
+        _ => env!("CARGO_PKG_NAME"),
+    }
+}
+
+fn is_usable_provenance_key(name: &str) -> bool {
+    !name.is_empty()
+        && !name.ends_with("-command-line")
+        && !RESERVED_PROVENANCE_KEYS
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(name))
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Renders `value` so it stays inside one quoted attribute on one header line.
+///
+/// A VCF header line is a single physical line, so a value carrying a newline —
+/// legal in a Unix path — would otherwise write extra lines and let a path
+/// inject arbitrary metadata. Backslashes and quotes are escaped so the
+/// attribute boundary stays unambiguous; remaining control characters have no
+/// representation and are dropped.
+fn escape_header_attribute(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// True when `line` is provenance describing a `CSQ` field that is about to be
 /// replaced, and so must not be carried into the new header.
 ///
@@ -745,21 +811,22 @@ fn provenance_header_lines(
     config: &AnnotateVcfConfig,
     cache_source_type: CacheSourceType,
 ) -> Vec<String> {
-    let tool = config
-        .provenance_tool_name
-        .as_deref()
-        .unwrap_or(env!("CARGO_PKG_NAME"));
-    let version = config
-        .provenance_tool_version
-        .as_deref()
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    let tool = provenance_key(config.provenance_tool_name.as_deref());
+    let version = escape_header_attribute(
+        config
+            .provenance_tool_version
+            .as_deref()
+            .unwrap_or(env!("CARGO_PKG_VERSION")),
+    );
 
     let mut identity = format!(
-        "##{tool}=\"{version}\" engine=\"{} {}\" cache=\"{cache_source}\" \
-         cache_type=\"{}\" backend=\"{backend}\"",
+        "##{tool}=\"{version}\" engine=\"{} {}\" cache=\"{}\" \
+         cache_type=\"{}\" backend=\"{}\"",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
+        escape_header_attribute(cache_source),
         cache_source_type.as_str(),
+        escape_header_attribute(backend),
     );
 
     // The pinned VEP code/cache pair this run reproduces. Only stated when the
@@ -1399,10 +1466,7 @@ pub async fn annotate_to_vcf(
     if let Some(raw_json) = write_metadata.get(VCF_HEADER_RAW_LINES_KEY)
         && let Ok(existing) = serde_json::from_str::<Vec<String>>(raw_json)
     {
-        let tool = config
-            .provenance_tool_name
-            .as_deref()
-            .unwrap_or(env!("CARGO_PKG_NAME"));
+        let tool = provenance_key(config.provenance_tool_name.as_deref());
         let mut lines: Vec<String> = existing
             .into_iter()
             .filter(|line| !is_stale_provenance_line(line, tool))
@@ -2082,6 +2146,86 @@ mod tests {
         ] {
             assert!(!is_stale_provenance_line(line, "vepyr"), "{line}");
         }
+    }
+
+    fn provenance_with_cache(config: &AnnotateVcfConfig, cache: &str) -> Vec<String> {
+        provenance_header_lines(
+            "/in/sample.vcf.gz",
+            cache,
+            "parquet",
+            "/out/sample.annotated.vcf",
+            config,
+            CacheSourceType::Merged,
+        )
+    }
+
+    fn named(name: &str) -> AnnotateVcfConfig {
+        AnnotateVcfConfig {
+            provenance_tool_name: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn provenance_refuses_to_take_the_ensembl_vep_key() {
+        // The documented promise is that this never claims Ensembl VEP produced
+        // the output; a configured name must not be able to break it.
+        for line in provenance_for(&named("VEP")) {
+            assert!(!line.starts_with("##VEP="), "{line}");
+            assert!(!line.starts_with("##VEP-command-line="), "{line}");
+        }
+    }
+
+    #[test]
+    fn provenance_rejects_names_that_are_not_usable_metadata_keys() {
+        for name in [
+            "",
+            "   ",
+            "has space",
+            "with=equals",
+            "9leading",
+            "tab\there",
+        ] {
+            let lines = provenance_for(&named(name));
+            let engine = env!("CARGO_PKG_NAME");
+            assert!(
+                lines[0].starts_with(&format!("##{engine}=")),
+                "name {name:?} produced {}",
+                lines[0]
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_rejects_names_colliding_with_structured_header_keys() {
+        // `##contig=` provenance would make the stale filter delete real contigs.
+        for name in ["contig", "INFO", "FORMAT", "FILTER", "ALT", "fileformat"] {
+            let lines = provenance_for(&named(name));
+            assert!(
+                lines[0].starts_with(&format!("##{}=", env!("CARGO_PKG_NAME"))),
+                "name {name:?} produced {}",
+                lines[0]
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_never_emits_an_embedded_newline() {
+        // A newline is legal in a Unix path. Interpolated raw it would write an
+        // extra physical header line — arbitrary metadata injection.
+        let config = named("vepyr");
+        for line in provenance_with_cache(&config, "/caches/evil\n##FILTER=<ID=INJECTED>") {
+            assert!(!line.contains('\n'), "embedded newline: {line:?}");
+            assert!(!line.contains('\r'), "embedded carriage return: {line:?}");
+        }
+    }
+
+    #[test]
+    fn provenance_escapes_quotes_in_attribute_values() {
+        let config = named("vepyr");
+        let identity = &provenance_with_cache(&config, "/caches/a\"b")[0];
+        // The cache attribute must stay a single quoted value.
+        assert!(identity.contains("cache=\"/caches/a\\\"b\""), "{identity}");
     }
 
     fn provenance_for(config: &AnnotateVcfConfig) -> Vec<String> {
