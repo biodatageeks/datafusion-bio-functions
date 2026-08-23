@@ -676,7 +676,9 @@ fn csq_header_description(
             format_list.push_str(&name);
         }
     }
-    format!("Consequence annotations from annotate_vep. Format: {format_list}")
+    // Byte-identical to the line Ensembl VEP writes in OutputFactory/VCF.pm.
+    // Downstream tooling matches on this prefix, so it must not be reworded.
+    format!("Consequence annotations from Ensembl VEP. Format: {format_list}")
 }
 
 /// Canonical 28-byte BGZF end-of-file marker (an empty BGZF block, SAM spec).
@@ -1818,6 +1820,53 @@ mod tests {
         assert!(!json.contains("\"merged\""));
     }
 
+    /// Ensembl VEP writes this header line from `OutputFactory/VCF.pm`:
+    ///
+    ///   '##INFO=<ID=%s,Number=.,Type=String,Description="Consequence
+    ///    annotations from Ensembl VEP. Format: %s">'
+    ///
+    /// Byte parity with a VEP run requires the prefix to match exactly, so it is
+    /// pinned here rather than described loosely.
+    #[test]
+    fn test_csq_header_description_uses_the_ensembl_vep_prefix() {
+        let config = AnnotateVcfConfig {
+            everything: true,
+            ..Default::default()
+        };
+
+        let description = csq_header_description(&config, CacheSourceType::Ensembl);
+
+        assert!(
+            description.starts_with("Consequence annotations from Ensembl VEP. Format: "),
+            "CSQ description must match Ensembl VEP byte for byte, got: {description}"
+        );
+    }
+
+    /// The prefix is fixed regardless of cache source or PICK layout — only the
+    /// field list after `Format: ` varies.
+    #[test]
+    fn test_csq_header_description_prefix_is_stable_across_cache_sources() {
+        const PREFIX: &str = "Consequence annotations from Ensembl VEP. Format: ";
+        for source in [
+            CacheSourceType::Ensembl,
+            CacheSourceType::RefSeq,
+            CacheSourceType::Merged,
+        ] {
+            for flag_pick_allele_gene in [false, true] {
+                let config = AnnotateVcfConfig {
+                    everything: true,
+                    flag_pick_allele_gene,
+                    ..Default::default()
+                };
+                let description = csq_header_description(&config, source);
+                assert!(
+                    description.starts_with(PREFIX),
+                    "{source:?} (pick={flag_pick_allele_gene}) produced: {description}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_csq_header_description_matches_vep_pick_layout() {
         let config = AnnotateVcfConfig {
@@ -1827,7 +1876,7 @@ mod tests {
         };
 
         let description = csq_header_description(&config, CacheSourceType::Ensembl);
-        assert!(description.starts_with("Consequence annotations from annotate_vep. Format: "));
+        assert!(description.starts_with("Consequence annotations from Ensembl VEP. Format: "));
         assert!(description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
     }
 
