@@ -13,6 +13,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
+use datafusion_bio_format_core::metadata::VCF_HEADER_RAW_LINES_KEY;
 use datafusion_bio_format_vcf::serializer::{VcfRecordLine, batch_to_vcf_lines};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
@@ -453,6 +454,13 @@ pub struct AnnotateVcfConfig {
     /// `Some`, plugin CSQ fields are appended to output. `None` = disabled
     /// (byte-identical to no-plugin output).
     pub plugin_cache_root: Option<std::path::PathBuf>,
+    /// Tool name recorded in the output header's provenance lines, e.g.
+    /// `"vepyr"`. `None` records this engine's own crate name. The value only
+    /// labels provenance; it never claims the output came from Ensembl VEP.
+    pub provenance_tool_name: Option<String>,
+    /// Version recorded next to [`Self::provenance_tool_name`]. `None` records
+    /// this engine's crate version.
+    pub provenance_tool_version: Option<String>,
 }
 
 impl Default for AnnotateVcfConfig {
@@ -492,6 +500,8 @@ impl Default for AnnotateVcfConfig {
             show_progress: false,
             on_batch_written: None,
             plugin_cache_root: None,
+            provenance_tool_name: None,
+            provenance_tool_version: None,
         }
     }
 }
@@ -655,6 +665,159 @@ fn cache_source_type_from_cache_source_for_backend(
                 .to_string(),
         ))
     }
+}
+
+/// Header lines recording how this run was configured, so its output can be
+/// reproduced.
+///
+/// Deliberately excludes a wall-clock timestamp. Ensembl VEP writes one into
+/// its `##VEP=` line, which makes VEP's own output differ byte for byte between
+/// two identical runs; omitting it keeps annotation output byte-reproducible.
+///
+/// Deliberately does not write a `##VEP=` line. That would assert Ensembl VEP
+/// produced the file, at a time it did not run, from a path that may not exist
+/// — a false entry in an audit trail. It would not buy byte parity either,
+/// because VEP's timestamp differs every run.
+///
+/// The Ensembl cache's data-source versions (gnomAD, ClinVar, dbSNP, GENCODE,
+/// SIFT, PolyPhen …) determine what is inside `CSQ` and belong here, but are
+/// dropped when a raw cache is converted, so they are not yet available at
+/// annotation time. Tracked separately.
+/// Marks this engine's own identity inside a provenance line, independent of the
+/// configurable tool name, so a run can recognise provenance an earlier run wrote
+/// under a different label.
+const ENGINE_MARKER_ATTR: &str = concat!("engine=\"", env!("CARGO_PKG_NAME"), " ");
+const ENGINE_MARKER_JSON: &str = concat!("\"engine\":\"", env!("CARGO_PKG_NAME"), "\"");
+
+/// The fixed header key this module writes provenance under.
+///
+/// Deliberately not configurable. A configurable key cannot be recognised again
+/// on re-annotation except by inspecting line content, and every content-based
+/// rule tried here was either too loose (deleting unrelated source metadata that
+/// merely mentioned the engine) or too tight. A fixed key makes stripping an
+/// exact match, which is also how Ensembl VEP handles its own `##VEP` lines.
+///
+/// The caller's product name is recorded as a `tool` attribute instead, so it is
+/// still visible without being load-bearing.
+const PROVENANCE_KEY: &str = env!("CARGO_PKG_NAME");
+
+/// Renders `value` so it stays inside one quoted attribute on one header line.
+///
+/// A VCF header line is a single physical line, so a value carrying a newline —
+/// legal in a Unix path — would otherwise write extra lines and let a path
+/// inject arbitrary metadata. Backslashes and quotes are escaped so the
+/// attribute boundary stays unambiguous; remaining control characters have no
+/// representation and are dropped.
+fn escape_header_attribute(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// True when `line` is provenance describing a `CSQ` field that is about to be
+/// replaced, and so must not be carried into the new header.
+///
+/// Exact-key matching on both this module's fixed key and Ensembl VEP's, so no
+/// source metadata can be deleted by resembling provenance.
+fn is_stale_provenance_line(line: &str) -> bool {
+    [
+        format!("##{PROVENANCE_KEY}="),
+        format!("##{PROVENANCE_KEY}-command-line="),
+        "##VEP=".to_string(),
+        "##VEP-command-line=".to_string(),
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix.as_str()))
+}
+
+fn provenance_header_lines(
+    input_vcf: &str,
+    cache_source: &str,
+    backend: &str,
+    output_vcf: &str,
+    config: &AnnotateVcfConfig,
+    cache_source_type: CacheSourceType,
+) -> Vec<String> {
+    let mut identity = format!(
+        "##{PROVENANCE_KEY}=\"{}\" cache=\"{}\" cache_type=\"{}\" backend=\"{}\"",
+        env!("CARGO_PKG_VERSION"),
+        escape_header_attribute(cache_source),
+        cache_source_type.as_str(),
+        escape_header_attribute(backend),
+    );
+
+    // The caller's product name, recorded but not load-bearing.
+    if let Some(name) = config.provenance_tool_name.as_deref() {
+        let version = config
+            .provenance_tool_version
+            .as_deref()
+            .unwrap_or(env!("CARGO_PKG_VERSION"));
+        identity.push_str(&format!(
+            " tool=\"{} {}\"",
+            escape_header_attribute(name),
+            escape_header_attribute(version),
+        ));
+    }
+
+    // The pinned VEP code/cache pair this run reproduces. Only stated when the
+    // cache version is known up front; an unpinned run says nothing rather than
+    // guessing.
+    if let Some(cache_version) = config.expected_cache_version.as_deref()
+        && let Ok(target) = crate::vep_semantics::target_for_cache_version(cache_version)
+    {
+        identity.push_str(&format!(
+            " cache_version=\"{}\" vep_codebase=\"{}\" api=\"{}\" ensembl={}.{} \
+             ensembl-variation={}.{}",
+            target.cache_version,
+            target.vep_codebase_version,
+            target.api_version,
+            target.cache_version,
+            target.ensembl_core_revision,
+            target.cache_version,
+            target.ensembl_variation_revision,
+        ));
+    }
+
+    // `compression` selects the output writer but is sink-only, so it is absent
+    // from the options JSON; without it two runs producing different files would
+    // record identical provenance.
+    let compression = match config.compression {
+        VcfCompressionType::Plain => "plain",
+        VcfCompressionType::Gzip => "gzip",
+        VcfCompressionType::Bgzf => "bgzf",
+    };
+
+    let invocation = serde_json::json!({
+        "engine": env!("CARGO_PKG_NAME"),
+        "compression": compression,
+        "input": input_vcf,
+        "output": output_vcf,
+        "cache": cache_source,
+        "backend": backend,
+        "reference_fasta": config.reference_fasta_path,
+        "plugin_cache_root": config.plugin_cache_root
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        "options": serde_json::from_str::<serde_json::Value>(
+            &config.to_options_json_with_backend(backend),
+        )
+        .unwrap_or(serde_json::Value::Null),
+    });
+
+    vec![
+        identity,
+        format!("##{PROVENANCE_KEY}-command-line='{invocation}'"),
+    ]
 }
 
 fn csq_header_description(
@@ -1247,9 +1410,34 @@ pub async fn annotate_to_vcf(
         })
         .collect();
 
+    // Append this run's provenance to the captured source header, so the writer
+    // emits it verbatim after the input's own lines and before the CSQ
+    // declaration. Any provenance from an earlier annotation is stripped first:
+    // it describes a CSQ field that is being replaced. Ensembl VEP does the same
+    // with its own `##VEP` lines (OutputFactory/VCF.pm).
+    let mut write_metadata = vcf_schema.metadata().clone();
+    if let Some(raw_json) = write_metadata.get(VCF_HEADER_RAW_LINES_KEY)
+        && let Ok(existing) = serde_json::from_str::<Vec<String>>(raw_json)
+    {
+        let mut lines: Vec<String> = existing
+            .into_iter()
+            .filter(|line| !is_stale_provenance_line(line))
+            .collect();
+        lines.extend(provenance_header_lines(
+            input_vcf,
+            cache_source,
+            backend,
+            output_vcf,
+            config,
+            cache_source_type,
+        ));
+        if let Ok(json) = serde_json::to_string(&lines) {
+            write_metadata.insert(VCF_HEADER_RAW_LINES_KEY.to_string(), json);
+        }
+    }
+
     let write_schema = Arc::new(
-        datafusion::arrow::datatypes::Schema::new(output_fields)
-            .with_metadata(vcf_schema.metadata().clone()),
+        datafusion::arrow::datatypes::Schema::new(output_fields).with_metadata(write_metadata),
     );
 
     // 6. Stream annotated batches to VCF file.
@@ -1827,6 +2015,296 @@ mod tests {
     ///
     /// Byte parity with a VEP run requires the prefix to match exactly, so it is
     /// pinned here rather than described loosely.
+    #[test]
+    fn provenance_key_is_fixed_and_not_caller_controlled() {
+        // A configurable key cannot be recognised again on re-annotation except
+        // by inspecting content, and every content rule was either too loose or
+        // too tight. The caller's name is an attribute instead.
+        let lines = provenance_for(&named("vepyr"));
+        let key = env!("CARGO_PKG_NAME");
+        assert!(lines[0].starts_with(&format!("##{key}=")), "{}", lines[0]);
+        assert!(
+            lines[1].starts_with(&format!("##{key}-command-line=")),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[0].contains("tool=\"vepyr"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn provenance_key_cannot_be_hijacked_by_any_configured_name() {
+        // Names that previously produced a false or colliding key.
+        for name in [
+            "VEP",
+            "contig",
+            "INFO",
+            "SAMPLE",
+            "PEDIGREE",
+            "",
+            "has space",
+        ] {
+            let lines = provenance_for(&named(name));
+            let key = env!("CARGO_PKG_NAME");
+            for line in &lines {
+                assert!(line.starts_with(&format!("##{key}")), "{name:?}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn stale_filter_keeps_every_line_that_is_not_an_exact_provenance_key() {
+        for line in [
+            "##audit=reviewed",
+            r#"##audit="reviewed" engine="datafusion-bio-function-vep 1.0" status="approved""#,
+            r#"##audit={"engine":"datafusion-bio-function-vep"}"#,
+            "##SAMPLE=<ID=S1>",
+            "##PEDIGREE=<ID=child>",
+            "##VEPStatus=reviewed",
+            "##contig=<ID=chr1,length=100>",
+        ] {
+            assert!(!is_stale_provenance_line(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn stale_filter_removes_this_engines_own_provenance() {
+        for line in provenance_for(&named("vepyr")) {
+            assert!(is_stale_provenance_line(&line), "{line}");
+        }
+        // …including from a run that recorded a different product name.
+        for line in provenance_for(&AnnotateVcfConfig::default()) {
+            assert!(is_stale_provenance_line(&line), "{line}");
+        }
+    }
+
+    #[test]
+    fn stale_filter_removes_ensembl_vep_provenance() {
+        assert!(is_stale_provenance_line("##VEP=\"v116.0\" API=\"v116\""));
+        assert!(is_stale_provenance_line(
+            "##VEP-command-line='vep --everything'"
+        ));
+    }
+
+    #[test]
+    fn stale_filter_keeps_unrelated_keys_that_merely_start_with_vep() {
+        // Arbitrary meta-information keys are valid VCF. `##VEPStatus` is not
+        // Ensembl provenance and the source header must keep it.
+        for line in [
+            "##VEPStatus=reviewed",
+            "##VEPTools=custom",
+            "##VEP_NOTES=see methods",
+        ] {
+            assert!(!is_stale_provenance_line(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn stale_filter_removes_its_own_provenance_under_the_same_name() {
+        let config = AnnotateVcfConfig {
+            provenance_tool_name: Some("vepyr".to_string()),
+            ..Default::default()
+        };
+        for line in provenance_for(&config) {
+            assert!(is_stale_provenance_line(&line), "{line}");
+        }
+    }
+
+    #[test]
+    fn stale_filter_keeps_ordinary_header_lines() {
+        for line in [
+            "##fileformat=VCFv4.2",
+            "##fileDate=20160824",
+            "##contig=<ID=chr1,length=248956422,assembly=GRCh38>",
+            "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">",
+            "##bcftools_normVersion=1.21+htslib-1.21",
+        ] {
+            assert!(!is_stale_provenance_line(line), "{line}");
+        }
+    }
+
+    fn provenance_with_cache(config: &AnnotateVcfConfig, cache: &str) -> Vec<String> {
+        provenance_header_lines(
+            "/in/sample.vcf.gz",
+            cache,
+            "parquet",
+            "/out/sample.annotated.vcf",
+            config,
+            CacheSourceType::Merged,
+        )
+    }
+
+    fn named(name: &str) -> AnnotateVcfConfig {
+        AnnotateVcfConfig {
+            provenance_tool_name: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn provenance_never_emits_an_embedded_newline() {
+        // A newline is legal in a Unix path. Interpolated raw it would write an
+        // extra physical header line — arbitrary metadata injection.
+        let config = named("vepyr");
+        for line in provenance_with_cache(&config, "/caches/evil\n##FILTER=<ID=INJECTED>") {
+            assert!(!line.contains('\n'), "embedded newline: {line:?}");
+            assert!(!line.contains('\r'), "embedded carriage return: {line:?}");
+        }
+    }
+
+    #[test]
+    fn provenance_escapes_quotes_in_attribute_values() {
+        let config = named("vepyr");
+        let identity = &provenance_with_cache(&config, "/caches/a\"b")[0];
+        // The cache attribute must stay a single quoted value.
+        assert!(identity.contains("cache=\"/caches/a\\\"b\""), "{identity}");
+    }
+
+    fn provenance_for(config: &AnnotateVcfConfig) -> Vec<String> {
+        provenance_header_lines(
+            "/in/sample.vcf.gz",
+            "/caches/116_GRCh38_merged",
+            "parquet",
+            "/out/sample.annotated.vcf",
+            config,
+            CacheSourceType::Merged,
+        )
+    }
+
+    #[test]
+    fn provenance_records_tool_identity_and_cache() {
+        let lines = provenance_for(&named("vepyr"));
+        assert_eq!(lines.len(), 2);
+        let key = env!("CARGO_PKG_NAME");
+        assert!(lines[0].starts_with(&format!("##{key}=\"")), "{}", lines[0]);
+        assert!(
+            lines[0].contains("cache=\"/caches/116_GRCh38_merged\""),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("cache_type=\"merged\""), "{}", lines[0]);
+        assert!(lines[0].contains("backend=\"parquet\""), "{}", lines[0]);
+        assert!(
+            lines[1].starts_with(&format!("##{key}-command-line='")),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn provenance_tool_version_defaults_to_the_crate_version() {
+        // Setting only the name must not record `tool="vepyr unknown"`.
+        let identity = &provenance_for(&named("vepyr"))[0];
+        assert!(
+            identity.contains(&format!("tool=\"vepyr {}\"", env!("CARGO_PKG_VERSION"))),
+            "{identity}"
+        );
+        assert!(!identity.contains("unknown"), "{identity}");
+    }
+
+    #[test]
+    fn provenance_records_output_compression() {
+        // `compression` selects the writer, so two runs differing only in it
+        // produce different output and must not share provenance.
+        let plain = AnnotateVcfConfig {
+            compression: VcfCompressionType::Plain,
+            ..Default::default()
+        };
+        let bgzf = AnnotateVcfConfig {
+            compression: VcfCompressionType::Bgzf,
+            ..Default::default()
+        };
+        assert_ne!(provenance_for(&plain)[1], provenance_for(&bgzf)[1]);
+        assert!(
+            provenance_for(&bgzf)[1].contains("bgzf"),
+            "{}",
+            provenance_for(&bgzf)[1]
+        );
+    }
+
+    #[test]
+    fn provenance_never_records_a_timestamp() {
+        // A wall-clock stamp is what makes Ensembl VEP's own output differ
+        // between two identical runs. Omitting it keeps output byte-reproducible.
+        let config = AnnotateVcfConfig::default();
+        for line in provenance_for(&config) {
+            assert!(!line.contains("time="), "{line}");
+            for year in ["202", "203"] {
+                assert!(!line.contains(year), "looks like a date: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn provenance_is_identical_across_runs() {
+        let config = AnnotateVcfConfig::default();
+        assert_eq!(provenance_for(&config), provenance_for(&config));
+    }
+
+    #[test]
+    fn provenance_never_claims_to_be_ensembl_vep() {
+        // Writing a `##VEP=` line would assert Ensembl VEP produced the file.
+        let config = AnnotateVcfConfig {
+            provenance_tool_name: Some("vepyr".to_string()),
+            ..Default::default()
+        };
+        for line in provenance_for(&config) {
+            assert!(!line.starts_with("##VEP"), "{line}");
+        }
+    }
+
+    #[test]
+    fn provenance_states_the_pinned_vep_target_when_the_cache_version_is_known() {
+        let config = AnnotateVcfConfig {
+            provenance_tool_name: Some("vepyr".to_string()),
+            expected_cache_version: Some("116".to_string()),
+            ..Default::default()
+        };
+        let identity = &provenance_for(&config)[0];
+        assert!(identity.contains("cache_version=\"116\""), "{identity}");
+        assert!(identity.contains("vep_codebase=\"116.0\""), "{identity}");
+        assert!(identity.contains("api=\"116\""), "{identity}");
+        assert!(identity.contains("ensembl=116.c0cf13d"), "{identity}");
+        assert!(
+            identity.contains("ensembl-variation=116.2fb834b"),
+            "{identity}"
+        );
+    }
+
+    #[test]
+    fn provenance_omits_the_vep_target_when_the_cache_version_is_unknown() {
+        // An unpinned run says nothing rather than guessing.
+        let config = AnnotateVcfConfig::default();
+        let identity = &provenance_for(&config)[0];
+        assert!(!identity.contains("vep_codebase="), "{identity}");
+        assert!(!identity.contains("cache_version="), "{identity}");
+    }
+
+    #[test]
+    fn provenance_command_line_carries_paths_and_options() {
+        let config = AnnotateVcfConfig {
+            provenance_tool_name: Some("vepyr".to_string()),
+            everything: true,
+            hgvs: true,
+            merged: true,
+            reference_fasta_path: Some("/ref/GRCh38.fa".to_string()),
+            ..Default::default()
+        };
+        let command_line = &provenance_for(&config)[1];
+        for expected in [
+            "/in/sample.vcf.gz",
+            "/out/sample.annotated.vcf",
+            "/caches/116_GRCh38_merged",
+            "/ref/GRCh38.fa",
+            "\"everything\":true",
+            "\"hgvs\":true",
+        ] {
+            assert!(
+                command_line.contains(expected),
+                "missing {expected}: {command_line}"
+            );
+        }
+    }
+
     #[test]
     fn test_csq_header_description_uses_the_ensembl_vep_prefix() {
         let config = AnnotateVcfConfig {
