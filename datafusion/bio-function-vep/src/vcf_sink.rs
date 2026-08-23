@@ -763,25 +763,21 @@ fn escape_header_attribute(value: &str) -> String {
 /// - Ensembl VEP's own two lines, by exact key. `##VEP` as a bare prefix would
 ///   also swallow unrelated meta-information keys such as `##VEPStatus`, which
 ///   are valid VCF and belong to the source header.
-/// - Provenance written under the currently configured tool name.
-/// - Provenance written under *any* earlier tool name. A file annotated with the
-///   engine default and then re-annotated by a wrapper that sets
-///   `provenance_tool_name` would otherwise keep the first run's lines.
+/// - Provenance this engine wrote, under *any* tool name. Matching the
+///   configured key instead would delete unrelated source metadata that happens
+///   to share it — `provenance_tool_name = "audit"` must not remove an existing
+///   `##audit=reviewed` line — and is unnecessary, since every line this module
+///   emits carries the engine marker whatever it is labelled.
 ///
-/// The third case is recognised by the *shape* [`provenance_header_lines`]
+/// The second case is recognised by the *shape* [`provenance_header_lines`]
 /// emits, not by a bare substring search: an identity line is `##<key>="…"`
 /// whose value carries the engine attribute, and a command line is
 /// `##<key>-command-line='…'` whose JSON carries the engine field. An unrelated
 /// metadata line that merely mentions the engine — say
 /// `##audit={"engine":"…","status":"reviewed"}` — is valid source metadata and
 /// survives, because its value opens with `{` rather than a quote.
-fn is_stale_provenance_line(line: &str, tool: &str) -> bool {
+fn is_stale_provenance_line(line: &str) -> bool {
     if line.starts_with("##VEP=") || line.starts_with("##VEP-command-line=") {
-        return true;
-    }
-    if line.starts_with(&format!("##{tool}="))
-        || line.starts_with(&format!("##{tool}-command-line="))
-    {
         return true;
     }
 
@@ -1469,7 +1465,7 @@ pub async fn annotate_to_vcf(
         let tool = provenance_key(config.provenance_tool_name.as_deref());
         let mut lines: Vec<String> = existing
             .into_iter()
-            .filter(|line| !is_stale_provenance_line(line, tool))
+            .filter(|line| !is_stale_provenance_line(line))
             .collect();
         lines.extend(provenance_header_lines(
             input_vcf,
@@ -2065,13 +2061,9 @@ mod tests {
     /// pinned here rather than described loosely.
     #[test]
     fn stale_filter_removes_ensembl_vep_provenance() {
+        assert!(is_stale_provenance_line("##VEP=\"v116.0\" API=\"v116\""));
         assert!(is_stale_provenance_line(
-            "##VEP=\"v116.0\" API=\"v116\"",
-            "vepyr"
-        ));
-        assert!(is_stale_provenance_line(
-            "##VEP-command-line='vep --everything'",
-            "vepyr"
+            "##VEP-command-line='vep --everything'"
         ));
     }
 
@@ -2084,7 +2076,7 @@ mod tests {
             "##VEPTools=custom",
             "##VEP_NOTES=see methods",
         ] {
-            assert!(!is_stale_provenance_line(line, "vepyr"), "{line}");
+            assert!(!is_stale_provenance_line(line), "{line}");
         }
     }
 
@@ -2104,7 +2096,7 @@ mod tests {
         );
         for line in &engine_default {
             assert!(
-                is_stale_provenance_line(line, "vepyr"),
+                is_stale_provenance_line(line),
                 "not recognised under a new tool name: {line}"
             );
         }
@@ -2117,7 +2109,7 @@ mod tests {
             ..Default::default()
         };
         for line in provenance_for(&config) {
-            assert!(is_stale_provenance_line(&line, "vepyr"), "{line}");
+            assert!(is_stale_provenance_line(&line), "{line}");
         }
     }
 
@@ -2131,8 +2123,20 @@ mod tests {
             r#"##pipeline={"steps":[{"engine":"datafusion-bio-function-vep"}]}"#,
             "##INFO=<ID=X,Number=1,Type=String,Description=\"engine=\\\"datafusion-bio-function-vep 1.0\\\"\">",
         ] {
-            assert!(!is_stale_provenance_line(line, "vepyr"), "{line}");
+            assert!(!is_stale_provenance_line(line), "{line}");
         }
+    }
+
+    #[test]
+    fn stale_filter_keeps_source_metadata_sharing_the_configured_key() {
+        // Configuring `provenance_tool_name = "audit"` must not delete an
+        // unrelated `##audit=` line from the source header. Our own lines are
+        // recognised by the engine marker, so matching the key alone is both
+        // unnecessary and destructive.
+        assert!(!is_stale_provenance_line("##audit=reviewed"));
+        assert!(!is_stale_provenance_line(
+            "##audit=\"2024-01\" reviewer=\"me\""
+        ));
     }
 
     #[test]
@@ -2144,7 +2148,7 @@ mod tests {
             "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">",
             "##bcftools_normVersion=1.21+htslib-1.21",
         ] {
-            assert!(!is_stale_provenance_line(line, "vepyr"), "{line}");
+            assert!(!is_stale_provenance_line(line), "{line}");
         }
     }
 
