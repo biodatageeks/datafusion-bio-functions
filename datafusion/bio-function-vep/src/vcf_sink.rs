@@ -800,7 +800,6 @@ fn provenance_header_lines(
     let invocation = serde_json::json!({
         "engine": env!("CARGO_PKG_NAME"),
         "compression": compression,
-        "cache_format": cache_format_for_backend(backend),
         "input": input_vcf,
         "output": output_vcf,
         "cache": cache_source,
@@ -2230,6 +2229,14 @@ mod tests {
             );
             assert!(!line.contains("backend"), "{line}");
         }
+        // `to_options_json_with_backend` already resolves cache_format into the
+        // nested options object, so the invocation must not repeat it.
+        assert_eq!(
+            lines[1].matches("\"cache_format\"").count(),
+            1,
+            "cache_format duplicated in {}",
+            lines[1]
+        );
     }
 
     #[test]
