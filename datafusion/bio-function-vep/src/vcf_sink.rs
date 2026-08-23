@@ -689,11 +689,6 @@ fn cache_source_type_from_cache_source_for_backend(
 const ENGINE_MARKER_ATTR: &str = concat!("engine=\"", env!("CARGO_PKG_NAME"), " ");
 const ENGINE_MARKER_JSON: &str = concat!("\"engine\":\"", env!("CARGO_PKG_NAME"), "\"");
 
-/// Structured header kinds that carry free text and could quote a marker without
-/// being provenance.
-const STRUCTURED_HEADER_PREFIXES: [&str; 5] =
-    ["##INFO=", "##FORMAT=", "##FILTER=", "##contig=", "##ALT="];
-
 /// True when `line` is provenance describing a `CSQ` field that is about to be
 /// replaced, and so must not be carried into the new header.
 ///
@@ -703,13 +698,17 @@ const STRUCTURED_HEADER_PREFIXES: [&str; 5] =
 ///   also swallow unrelated meta-information keys such as `##VEPStatus`, which
 ///   are valid VCF and belong to the source header.
 /// - Provenance written under the currently configured tool name.
-/// - Provenance written under *any* earlier tool name, recognised by this
-///   engine's marker. A file annotated with the engine default and then
-///   re-annotated by a wrapper that sets `provenance_tool_name` would otherwise
-///   keep the first run's lines, which describe the CSQ being replaced.
+/// - Provenance written under *any* earlier tool name. A file annotated with the
+///   engine default and then re-annotated by a wrapper that sets
+///   `provenance_tool_name` would otherwise keep the first run's lines.
 ///
-/// Structured declarations are exempt from marker matching: their descriptions
-/// are free text and could quote a marker without being provenance.
+/// The third case is recognised by the *shape* [`provenance_header_lines`]
+/// emits, not by a bare substring search: an identity line is `##<key>="…"`
+/// whose value carries the engine attribute, and a command line is
+/// `##<key>-command-line='…'` whose JSON carries the engine field. An unrelated
+/// metadata line that merely mentions the engine — say
+/// `##audit={"engine":"…","status":"reviewed"}` — is valid source metadata and
+/// survives, because its value opens with `{` rather than a quote.
 fn is_stale_provenance_line(line: &str, tool: &str) -> bool {
     if line.starts_with("##VEP=") || line.starts_with("##VEP-command-line=") {
         return true;
@@ -719,13 +718,23 @@ fn is_stale_provenance_line(line: &str, tool: &str) -> bool {
     {
         return true;
     }
-    if STRUCTURED_HEADER_PREFIXES
-        .iter()
-        .any(|prefix| line.starts_with(prefix))
-    {
+
+    let Some((key, value)) = line
+        .strip_prefix("##")
+        .and_then(|rest| rest.split_once('='))
+    else {
+        return false;
+    };
+    if key.is_empty() || key.contains(char::is_whitespace) {
         return false;
     }
-    line.contains(ENGINE_MARKER_ATTR) || line.contains(ENGINE_MARKER_JSON)
+
+    match key.strip_suffix("-command-line") {
+        Some(name) => {
+            !name.is_empty() && value.starts_with('\'') && value.contains(ENGINE_MARKER_JSON)
+        }
+        None => value.starts_with('"') && value.contains(ENGINE_MARKER_ATTR),
+    }
 }
 
 fn provenance_header_lines(
@@ -2045,6 +2054,20 @@ mod tests {
         };
         for line in provenance_for(&config) {
             assert!(is_stale_provenance_line(&line, "vepyr"), "{line}");
+        }
+    }
+
+    #[test]
+    fn stale_filter_keeps_generic_metadata_that_merely_mentions_the_engine() {
+        // Recognition must key off the *shape* this module emits, not a bare
+        // substring. An unrelated metadata line that happens to name the engine
+        // is valid source metadata and must survive.
+        for line in [
+            r#"##audit={"engine":"datafusion-bio-function-vep","status":"reviewed"}"#,
+            r#"##pipeline={"steps":[{"engine":"datafusion-bio-function-vep"}]}"#,
+            "##INFO=<ID=X,Number=1,Type=String,Description=\"engine=\\\"datafusion-bio-function-vep 1.0\\\"\">",
+        ] {
+            assert!(!is_stale_provenance_line(line, "vepyr"), "{line}");
         }
     }
 
