@@ -683,6 +683,51 @@ fn cache_source_type_from_cache_source_for_backend(
 /// SIFT, PolyPhen …) determine what is inside `CSQ` and belong here, but are
 /// dropped when a raw cache is converted, so they are not yet available at
 /// annotation time. Tracked separately.
+/// Marks this engine's own identity inside a provenance line, independent of the
+/// configurable tool name, so a run can recognise provenance an earlier run wrote
+/// under a different label.
+const ENGINE_MARKER_ATTR: &str = concat!("engine=\"", env!("CARGO_PKG_NAME"), " ");
+const ENGINE_MARKER_JSON: &str = concat!("\"engine\":\"", env!("CARGO_PKG_NAME"), "\"");
+
+/// Structured header kinds that carry free text and could quote a marker without
+/// being provenance.
+const STRUCTURED_HEADER_PREFIXES: [&str; 5] =
+    ["##INFO=", "##FORMAT=", "##FILTER=", "##contig=", "##ALT="];
+
+/// True when `line` is provenance describing a `CSQ` field that is about to be
+/// replaced, and so must not be carried into the new header.
+///
+/// Matches three things:
+///
+/// - Ensembl VEP's own two lines, by exact key. `##VEP` as a bare prefix would
+///   also swallow unrelated meta-information keys such as `##VEPStatus`, which
+///   are valid VCF and belong to the source header.
+/// - Provenance written under the currently configured tool name.
+/// - Provenance written under *any* earlier tool name, recognised by this
+///   engine's marker. A file annotated with the engine default and then
+///   re-annotated by a wrapper that sets `provenance_tool_name` would otherwise
+///   keep the first run's lines, which describe the CSQ being replaced.
+///
+/// Structured declarations are exempt from marker matching: their descriptions
+/// are free text and could quote a marker without being provenance.
+fn is_stale_provenance_line(line: &str, tool: &str) -> bool {
+    if line.starts_with("##VEP=") || line.starts_with("##VEP-command-line=") {
+        return true;
+    }
+    if line.starts_with(&format!("##{tool}="))
+        || line.starts_with(&format!("##{tool}-command-line="))
+    {
+        return true;
+    }
+    if STRUCTURED_HEADER_PREFIXES
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+    {
+        return false;
+    }
+    line.contains(ENGINE_MARKER_ATTR) || line.contains(ENGINE_MARKER_JSON)
+}
+
 fn provenance_header_lines(
     input_vcf: &str,
     cache_source: &str,
@@ -728,6 +773,7 @@ fn provenance_header_lines(
     }
 
     let invocation = serde_json::json!({
+        "engine": env!("CARGO_PKG_NAME"),
         "input": input_vcf,
         "output": output_vcf,
         "cache": cache_source,
@@ -1348,14 +1394,9 @@ pub async fn annotate_to_vcf(
             .provenance_tool_name
             .as_deref()
             .unwrap_or(env!("CARGO_PKG_NAME"));
-        let stale = [
-            format!("##{tool}="),
-            format!("##{tool}-command-line="),
-            "##VEP".to_string(),
-        ];
         let mut lines: Vec<String> = existing
             .into_iter()
-            .filter(|line| !stale.iter().any(|prefix| line.starts_with(prefix.as_str())))
+            .filter(|line| !is_stale_provenance_line(line, tool))
             .collect();
         lines.extend(provenance_header_lines(
             input_vcf,
@@ -1949,6 +1990,77 @@ mod tests {
     ///
     /// Byte parity with a VEP run requires the prefix to match exactly, so it is
     /// pinned here rather than described loosely.
+    #[test]
+    fn stale_filter_removes_ensembl_vep_provenance() {
+        assert!(is_stale_provenance_line(
+            "##VEP=\"v116.0\" API=\"v116\"",
+            "vepyr"
+        ));
+        assert!(is_stale_provenance_line(
+            "##VEP-command-line='vep --everything'",
+            "vepyr"
+        ));
+    }
+
+    #[test]
+    fn stale_filter_keeps_unrelated_keys_that_merely_start_with_vep() {
+        // Arbitrary meta-information keys are valid VCF. `##VEPStatus` is not
+        // Ensembl provenance and the source header must keep it.
+        for line in [
+            "##VEPStatus=reviewed",
+            "##VEPTools=custom",
+            "##VEP_NOTES=see methods",
+        ] {
+            assert!(!is_stale_provenance_line(line, "vepyr"), "{line}");
+        }
+    }
+
+    #[test]
+    fn stale_filter_removes_provenance_written_under_another_tool_name() {
+        // A file annotated by an engine-default run and then re-annotated by a
+        // wrapper that sets `provenance_tool_name` must not keep the first run's
+        // lines: they describe the CSQ being replaced. Recognition keys off this
+        // engine's identity, which is present whatever the configured name.
+        let engine_default = provenance_header_lines(
+            "/in.vcf",
+            "/cache",
+            "parquet",
+            "/out.vcf",
+            &AnnotateVcfConfig::default(),
+            CacheSourceType::Ensembl,
+        );
+        for line in &engine_default {
+            assert!(
+                is_stale_provenance_line(line, "vepyr"),
+                "not recognised under a new tool name: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_filter_removes_its_own_provenance_under_the_same_name() {
+        let config = AnnotateVcfConfig {
+            provenance_tool_name: Some("vepyr".to_string()),
+            ..Default::default()
+        };
+        for line in provenance_for(&config) {
+            assert!(is_stale_provenance_line(&line, "vepyr"), "{line}");
+        }
+    }
+
+    #[test]
+    fn stale_filter_keeps_ordinary_header_lines() {
+        for line in [
+            "##fileformat=VCFv4.2",
+            "##fileDate=20160824",
+            "##contig=<ID=chr1,length=248956422,assembly=GRCh38>",
+            "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">",
+            "##bcftools_normVersion=1.21+htslib-1.21",
+        ] {
+            assert!(!is_stale_provenance_line(line, "vepyr"), "{line}");
+        }
+    }
+
     fn provenance_for(config: &AnnotateVcfConfig) -> Vec<String> {
         provenance_header_lines(
             "/in/sample.vcf.gz",
