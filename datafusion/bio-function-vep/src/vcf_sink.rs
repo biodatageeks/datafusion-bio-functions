@@ -761,7 +761,7 @@ fn provenance_header_lines(
         let version = config
             .provenance_tool_version
             .as_deref()
-            .unwrap_or("unknown");
+            .unwrap_or(env!("CARGO_PKG_VERSION"));
         identity.push_str(&format!(
             " tool=\"{} {}\"",
             escape_header_attribute(name),
@@ -788,8 +788,18 @@ fn provenance_header_lines(
         ));
     }
 
+    // `compression` selects the output writer but is sink-only, so it is absent
+    // from the options JSON; without it two runs producing different files would
+    // record identical provenance.
+    let compression = match config.compression {
+        VcfCompressionType::Plain => "plain",
+        VcfCompressionType::Gzip => "gzip",
+        VcfCompressionType::Bgzf => "bgzf",
+    };
+
     let invocation = serde_json::json!({
         "engine": env!("CARGO_PKG_NAME"),
+        "compression": compression,
         "input": input_vcf,
         "output": output_vcf,
         "cache": cache_source,
@@ -2177,6 +2187,37 @@ mod tests {
             lines[1].starts_with(&format!("##{key}-command-line='")),
             "{}",
             lines[1]
+        );
+    }
+
+    #[test]
+    fn provenance_tool_version_defaults_to_the_crate_version() {
+        // Setting only the name must not record `tool="vepyr unknown"`.
+        let identity = &provenance_for(&named("vepyr"))[0];
+        assert!(
+            identity.contains(&format!("tool=\"vepyr {}\"", env!("CARGO_PKG_VERSION"))),
+            "{identity}"
+        );
+        assert!(!identity.contains("unknown"), "{identity}");
+    }
+
+    #[test]
+    fn provenance_records_output_compression() {
+        // `compression` selects the writer, so two runs differing only in it
+        // produce different output and must not share provenance.
+        let plain = AnnotateVcfConfig {
+            compression: VcfCompressionType::Plain,
+            ..Default::default()
+        };
+        let bgzf = AnnotateVcfConfig {
+            compression: VcfCompressionType::Bgzf,
+            ..Default::default()
+        };
+        assert_ne!(provenance_for(&plain)[1], provenance_for(&bgzf)[1]);
+        assert!(
+            provenance_for(&bgzf)[1].contains("bgzf"),
+            "{}",
+            provenance_for(&bgzf)[1]
         );
     }
 
