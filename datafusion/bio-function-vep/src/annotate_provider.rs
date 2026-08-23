@@ -3414,16 +3414,20 @@ impl AnnotateProvider {
         let include_pick_output = pick_flags.include_pick_output();
         let annotation_column_defs =
             annotation_column_defs_for_selection(transcript_selection, include_pick_output);
-        // Output schema starts with all VCF columns and appends annotation fields.
+        // Output schema starts with all VCF columns and appends annotation
+        // fields. The input fields keep their metadata: it carries the VCF
+        // typing the writer needs (`bio.vcf.field.*`) and the marker that
+        // identifies a carried record-layout column, and rebuilding the fields
+        // bare made the sink reconstruct the first by name and lose the second
+        // entirely.
         let mut fields: Vec<Arc<Field>> = vcf_schema
             .fields()
             .iter()
             .map(|field| {
-                Arc::new(Field::new(
-                    field.name(),
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                ))
+                Arc::new(
+                    Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                        .with_metadata(field.metadata().clone()),
+                )
             })
             .collect();
 

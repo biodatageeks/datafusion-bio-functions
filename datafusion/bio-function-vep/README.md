@@ -120,19 +120,24 @@ The `annotate_to_vcf()` function wraps the annotation pipeline to produce a stan
 ```rust
 use datafusion_bio_function_vep::vcf_sink::{annotate_to_vcf, AnnotateVcfConfig};
 
+// `AnnotateVcfConfig` is `#[non_exhaustive]`: build it by assignment, so a
+// field added here later defaults in your build instead of breaking it.
+let mut config = AnnotateVcfConfig::default();
+config.everything = true;
+config.extended_probes = true;
+config.reference_fasta_path = Some("/path/to/reference.fa".into());
+config.compression = VcfCompressionType::Gzip;
+config.show_progress = true;
+// Reproduce each input record's own INFO and FORMAT key order in the output,
+// which is what byte-level agreement with Ensembl VEP requires.
+config.preserve_record_layout = true;
+
 let rows = annotate_to_vcf(
     "input.vcf.gz",
     "/path/to/cache",
     "parquet",
     "output.vcf",
-    &AnnotateVcfConfig {
-        everything: true,
-        extended_probes: true,
-        reference_fasta_path: Some("/path/to/reference.fa".into()),
-        compression: VcfCompressionType::Gzip,
-        show_progress: true,
-        ..Default::default()
-    },
+    &config,
 ).await?;
 ```
 
