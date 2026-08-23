@@ -749,11 +749,11 @@ fn provenance_header_lines(
     cache_source_type: CacheSourceType,
 ) -> Vec<String> {
     let mut identity = format!(
-        "##{PROVENANCE_KEY}=\"{}\" cache=\"{}\" cache_type=\"{}\" backend=\"{}\"",
+        "##{PROVENANCE_KEY}=\"{}\" cache=\"{}\" cache_type=\"{}\" cache_format=\"{}\"",
         env!("CARGO_PKG_VERSION"),
         escape_header_attribute(cache_source),
         cache_source_type.as_str(),
-        escape_header_attribute(backend),
+        escape_header_attribute(cache_format_for_backend(backend)),
     );
 
     // The caller's product name, recorded but not load-bearing.
@@ -803,7 +803,6 @@ fn provenance_header_lines(
         "input": input_vcf,
         "output": output_vcf,
         "cache": cache_source,
-        "backend": backend,
         "reference_fasta": config.reference_fasta_path,
         "plugin_cache_root": config.plugin_cache_root
             .as_ref()
@@ -2182,7 +2181,11 @@ mod tests {
             lines[0]
         );
         assert!(lines[0].contains("cache_type=\"merged\""), "{}", lines[0]);
-        assert!(lines[0].contains("backend=\"parquet\""), "{}", lines[0]);
+        assert!(
+            lines[0].contains("cache_format=\"parquet\""),
+            "{}",
+            lines[0]
+        );
         assert!(
             lines[1].starts_with(&format!("##{key}-command-line='")),
             "{}",
@@ -2199,6 +2202,41 @@ mod tests {
             "{identity}"
         );
         assert!(!identity.contains("unknown"), "{identity}");
+    }
+
+    #[test]
+    fn provenance_records_the_real_cache_format_not_the_backend_token() {
+        // `backend` is a vestigial identifier — callers pass "lance" while the
+        // storage is Parquet — so recording it would state something false in an
+        // audit trail. Record the resolved cache format instead.
+        let lines = provenance_header_lines(
+            "/in.vcf",
+            "/cache",
+            "lance",
+            "/out.vcf",
+            &AnnotateVcfConfig::default(),
+            CacheSourceType::Merged,
+        );
+        assert!(
+            lines[0].contains("cache_format=\"parquet\""),
+            "{}",
+            lines[0]
+        );
+        for line in &lines {
+            assert!(
+                !line.contains("lance"),
+                "vestigial backend token leaked: {line}"
+            );
+            assert!(!line.contains("backend"), "{line}");
+        }
+        // `to_options_json_with_backend` already resolves cache_format into the
+        // nested options object, so the invocation must not repeat it.
+        assert_eq!(
+            lines[1].matches("\"cache_format\"").count(),
+            1,
+            "cache_format duplicated in {}",
+            lines[1]
+        );
     }
 
     #[test]
