@@ -314,4 +314,71 @@ path = "{}"
              ingest_sql for correct multi-allelic splitting"
         );
     }
+
+    /// The BED branch hardcodes `BEDFields::BED4` on the claim that
+    /// `determine_schema` exposes exactly `chrom, start, end, name` whatever
+    /// the variant, so a source needing more than one extra field packs it
+    /// into `name` and splits it back out in `ingest_sql`. That claim is load
+    /// bearing for every BED manifest and was only ever checked by hand
+    /// against one bio-formats release. Pin it the way the VCF ALT shape above
+    /// is pinned: a bump that widens or renames the BED schema fails here
+    /// rather than silently producing an `ingest_sql` that selects the wrong
+    /// column.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bed_source_schema_is_pinned_to_chrom_start_end_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let bed = dir.path().join("packed.bed");
+        // BED is 0-based half-open; `name` carries the packed extra fields.
+        std::fs::write(&bed, "chr1\t99\t100\trs1|A/G|Pathogenic\n").unwrap();
+
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "0-based-half-open"
+ingest_sql = "SELECT 1"
+value_columns = []
+
+[[source]]
+provider = "bed"
+path = "{}"
+"##,
+            bed.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let ctx = SessionContext::new();
+        let _temps = register_sources(&ctx, &manifest).await.unwrap();
+
+        let schema = ctx
+            .table_provider("plugin_demo_src")
+            .await
+            .unwrap()
+            .schema();
+        let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            columns,
+            vec!["chrom", "start", "end", "name"],
+            "BED4 schema changed -- the `name`-packing trick every BED manifest \
+             relies on needs re-auditing, and the hardcoded BEDFields::BED4 in \
+             the ProviderKind::Bed branch may no longer be the right choice"
+        );
+
+        let rows = ctx
+            .sql("SELECT name FROM plugin_demo_src")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let name = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name is a plain string; packed extra fields are split in ingest_sql");
+        assert_eq!(
+            name.value(0),
+            "rs1|A/G|Pathogenic",
+            "BED `name` must arrive verbatim -- any splitting or trimming here \
+             would silently corrupt every packed BED manifest"
+        );
+    }
 }
