@@ -28,7 +28,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::MemTable;
-use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -40,6 +40,7 @@ use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
 use crate::plugin_cache::dedup::{check_assume_unique_sample, dedup_keep_first};
 use crate::plugin_cache::join::{tiered_stream, tiered_stream_sorted};
+use crate::plugin_cache::mem_trace;
 use crate::plugin_cache::normalize::{
     canonical_contig_str, canonical_contig_udf, wrap_normalization,
 };
@@ -438,10 +439,20 @@ pub async fn build_plugin_chrom(
                  ({read_rows} plugin rows this chrom) -- retrying with an explicit sort",
                 src.plugin_name
             );
+            // Wrap the pool when tracing is on: the exhaustion error names the
+            // consumer ("HashJoinInput") and this plan has two joins under that
+            // name, so only per-reservation tracking can say which one consumed
+            // the budget.
+            let base_pool: Arc<dyn MemoryPool> =
+                Arc::new(FairSpillPool::new(retry_sort_memory_limit_bytes()));
+            let tracer = mem_trace::tracing_enabled()
+                .then(|| Arc::new(mem_trace::TracingPool::new(Arc::clone(&base_pool))));
+            let pool: Arc<dyn MemoryPool> = match &tracer {
+                Some(t) => Arc::clone(t) as _,
+                None => Arc::clone(&base_pool),
+            };
             let sort_runtime = RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::new(
-                    FairSpillPool::new(retry_sort_memory_limit_bytes()),
-                ))
+                .with_memory_pool(pool)
                 .build_arc()
                 .map_err(|e| DataFusionError::Execution(format!("retry runtime env: {e}")))?;
             let sort_ctx = SessionContext::new_with_config_rt(
@@ -453,7 +464,7 @@ pub async fn build_plugin_chrom(
             sort_ctx.register_table(&dedup_view, Arc::new(sort_mem))?;
             let sorted_stream =
                 tiered_stream_sorted(&sort_ctx, &dedup_view, variation_shard).await?;
-            write_tiered_shard(
+            let written = write_tiered_shard(
                 sorted_stream,
                 &out_schema,
                 &warm_tmp,
@@ -461,7 +472,13 @@ pub async fn build_plugin_chrom(
                 chrom,
                 &src.plugin_name,
             )
-            .await?
+            .await;
+            // Report before propagating: the peak table is the whole point of
+            // tracing a build that ran out of memory.
+            if let Some(t) = &tracer {
+                t.report();
+            }
+            written?
         }
         Err(e) => return Err(e),
     };

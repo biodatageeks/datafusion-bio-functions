@@ -14,6 +14,7 @@ pub mod csq;
 pub mod dedup;
 pub mod join;
 pub mod lookup;
+pub mod mem_trace;
 pub mod normalize;
 pub mod provider;
 pub mod registry;
