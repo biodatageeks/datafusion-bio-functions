@@ -8,6 +8,7 @@ use std::path::Path;
 use datafusion::common::Result;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
+use log::info;
 
 /// SQL that LEFT-joins `normalized_view` to a registered `variation_probe`
 /// exposing `(chrom, start, allele_string, tier)` and inherits `tier`. The value
@@ -115,6 +116,17 @@ async fn tiered_stream_impl(
         tier_sql(normalized_view, "plugin_variation_probe")
     };
     let df = ctx.sql(&sql).await?;
+    // Opt-in plan dump. The tier join's memory behaviour depends on which side
+    // of each HashJoinExec the optimizer collects, and that is decided from
+    // statistics -- so it cannot be reasoned out from the SQL, it has to be
+    // read off the physical plan for the actual data. Costs nothing unset.
+    if std::env::var("VEPYR_EXPLAIN_TIER_JOIN").is_ok() {
+        let plan = df.clone().create_physical_plan().await?;
+        info!(
+            "plugin_cache: tier join physical plan (sorted={sorted}):\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+    }
     df.execute_stream().await
 }
 

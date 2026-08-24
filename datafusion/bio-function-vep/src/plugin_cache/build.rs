@@ -118,12 +118,36 @@ fn is_order_violation(e: &DataFusionError) -> bool {
     e.to_string().contains("is not position-ascending")
 }
 
-/// Memory budget for the sorted retry's `FairSpillPool`: generous for the
-/// sparse plugins this path exists for (ClinVar-scale, low hundreds of
-/// thousands of rows per chromosome), but bounded so a plugin that turns out
-/// far larger than expected spills to disk instead of raising the OOM risk
-/// the streaming write (the common/fast path) exists to avoid.
-const RETRY_SORT_MEMORY_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Default memory budget for the sorted retry's `FairSpillPool`, in MiB.
+///
+/// The pool bounds the retry's WHOLE plan, not just its sort -- and the plan's
+/// `HashJoinExec` cannot spill (DataFusion has no spill path for a hash join's
+/// build side), so for the join this budget is a hard ceiling rather than a
+/// spill threshold. Only the sort can actually honour it by spilling.
+///
+/// The previous 2 GiB default was too small for that reality: measured on
+/// chr21 (the smallest autosome, on a 64 GB machine), the join alone reserved
+/// 1557 MB for dbNSFP and 2034 MB for CADD, exhausting the pool before the
+/// sort reserved anything and failing both builds outright. 8 GiB clears both
+/// with room to spare while still bounding a runaway plan.
+const DEFAULT_RETRY_SORT_MEMORY_MIB: usize = 8 * 1024;
+
+/// Env override for [`DEFAULT_RETRY_SORT_MEMORY_MIB`], in MiB.
+///
+/// A fixed default cannot suit both a 16 GB laptop and a 512 GB node, and the
+/// right value depends on the plugin's row width as much as its row count --
+/// so make it tunable rather than guessing. Invalid or zero values fall back
+/// to the default rather than failing a long build on a typo'd env var.
+const RETRY_SORT_MEMORY_ENV: &str = "VEPYR_PLUGIN_RETRY_MEMORY_MIB";
+
+fn retry_sort_memory_limit_bytes() -> usize {
+    let mib = std::env::var(RETRY_SORT_MEMORY_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|mib| *mib > 0)
+        .unwrap_or(DEFAULT_RETRY_SORT_MEMORY_MIB);
+    mib * 1024 * 1024
+}
 
 /// Consume `stream`, split rows by `tier` into warm (0) / cold (1), and write
 /// each run through its own `PluginShardWriter`. Checks `start` is
@@ -407,7 +431,9 @@ pub async fn build_plugin_chrom(
                 src.plugin_name
             );
             let sort_runtime = RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::new(FairSpillPool::new(RETRY_SORT_MEMORY_LIMIT_BYTES)))
+                .with_memory_pool(Arc::new(
+                    FairSpillPool::new(retry_sort_memory_limit_bytes()),
+                ))
                 .build_arc()
                 .map_err(|e| DataFusionError::Execution(format!("retry runtime env: {e}")))?;
             let sort_ctx = SessionContext::new_with_config_rt(
@@ -766,6 +792,43 @@ type = "Float32"
     // (this is what `build_plugin_chrom` pattern-matches on via
     // `is_order_violation` to decide whether to retry with a sort), and it
     // must do so without finishing the writers on the failing tier.
+    #[test]
+    fn retry_memory_limit_defaults_and_honours_the_env_override() {
+        // Serial within one test: these mutate process-wide env.
+        unsafe { std::env::remove_var(RETRY_SORT_MEMORY_ENV) };
+        assert_eq!(
+            retry_sort_memory_limit_bytes(),
+            DEFAULT_RETRY_SORT_MEMORY_MIB * 1024 * 1024
+        );
+
+        unsafe { std::env::set_var(RETRY_SORT_MEMORY_ENV, "16384") };
+        assert_eq!(retry_sort_memory_limit_bytes(), 16384 * 1024 * 1024);
+
+        // A typo must not fail a multi-hour build, and 0 must not create a
+        // pool that rejects every allocation.
+        for bad in ["", "0", "lots", "-1", "8GiB"] {
+            unsafe { std::env::set_var(RETRY_SORT_MEMORY_ENV, bad) };
+            assert_eq!(
+                retry_sort_memory_limit_bytes(),
+                DEFAULT_RETRY_SORT_MEMORY_MIB * 1024 * 1024,
+                "{bad:?} should fall back to the default"
+            );
+        }
+        unsafe { std::env::remove_var(RETRY_SORT_MEMORY_ENV) };
+    }
+
+    #[test]
+    fn retry_memory_default_clears_the_measured_chr21_join_reservations() {
+        // chr21, the smallest autosome: the join alone reserved 1557 MB
+        // (dbNSFP) and 2034 MB (CADD) before the sort reserved anything, which
+        // the old 2 GiB default could not cover. Guard the regression.
+        let limit = DEFAULT_RETRY_SORT_MEMORY_MIB * 1024 * 1024;
+        assert!(
+            limit > 2034 * 1024 * 1024,
+            "must clear the measured CADD join"
+        );
+    }
+
     #[test]
     fn scratch_guard_removes_watched_files_unless_disarmed() {
         let dir = tempfile::tempdir().unwrap();
