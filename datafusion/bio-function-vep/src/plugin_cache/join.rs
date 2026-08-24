@@ -58,6 +58,66 @@ pub async fn tiered_stream_sorted(
     tiered_stream_impl(ctx, normalized_view, variation_shard, true).await
 }
 
+/// Rows per materialized probe batch. Each batch is built by its own `concat`,
+/// so it owns its buffers; the size is a balance between allocation count and
+/// keeping a single batch small enough to stay cheap to copy.
+const PROBE_BATCH_ROWS: usize = 1024 * 1024;
+
+/// Replace the `plugin_variation_probe` view with an equivalent table whose
+/// batches own their buffers.
+///
+/// The view is a `GROUP BY`, and `GroupedHashAggregateStream` emits its output
+/// as batches that SHARE underlying buffers. `HashJoinExec` reserves memory per
+/// build-side batch using `get_record_batch_memory_size`, which de-duplicates
+/// buffers only WITHIN one batch -- so a shared buffer is charged once per
+/// batch that references it. Measured on chr21's variation shard: the grouped
+/// output is 181.4 MB of distinct buffers but accounts as 5756.8 MB across its
+/// 1791 batches, a 31.7x over-count. The same scan WITHOUT the `GROUP BY`
+/// accounts at exactly 1.0x, so this is the aggregate's doing, not the scan's.
+///
+/// That over-count is what made CADD chr21 unbuildable: the tier join's build
+/// side is this probe (its plan swaps to `join_type=Right` because 120M plugin
+/// rows dwarf the 10.8M-row probe), so the join reserved ~6.8 GB for ~200 MB of
+/// data and exhausted any pool it was given.
+///
+/// Materializing with a `concat` per batch gives each batch fresh, unshared
+/// buffers, so the reservation matches reality. It also lifts the aggregate out
+/// of the join plan, so it runs once and the optimizer sees exact statistics
+/// for the side it is choosing.
+async fn materialize_probe(ctx: &SessionContext) -> Result<()> {
+    use datafusion::arrow::compute::concat_batches;
+
+    let df = ctx.sql("SELECT * FROM plugin_variation_probe").await?;
+    let schema: datafusion::arrow::datatypes::SchemaRef = df.schema().inner().clone();
+    let collected = df.collect().await?;
+
+    let mut batches = Vec::new();
+    let mut group = Vec::new();
+    let mut rows = 0usize;
+    for batch in collected {
+        rows += batch.num_rows();
+        group.push(batch);
+        if rows >= PROBE_BATCH_ROWS {
+            batches.push(concat_batches(&schema, &group)?);
+            group.clear();
+            rows = 0;
+        }
+    }
+    if !group.is_empty() {
+        batches.push(concat_batches(&schema, &group)?);
+    }
+
+    ctx.deregister_table("plugin_variation_probe")?;
+    ctx.register_table(
+        "plugin_variation_probe",
+        std::sync::Arc::new(datafusion::datasource::MemTable::try_new(
+            schema,
+            vec![batches],
+        )?),
+    )?;
+    Ok(())
+}
+
 async fn tiered_stream_impl(
     ctx: &SessionContext,
     normalized_view: &str,
@@ -110,6 +170,7 @@ async fn tiered_stream_impl(
          GROUP BY v.chrom, v.start, v.allele_string"
     ))
     .await?;
+    materialize_probe(ctx).await?;
     let sql = if sorted {
         tier_sql_sorted(normalized_view, "plugin_variation_probe")
     } else {
