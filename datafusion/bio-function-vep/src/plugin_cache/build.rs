@@ -19,7 +19,7 @@
 //! build. The sort only runs on the retry, so a normally-sorted source (every
 //! plugin shipped so far) pays nothing extra.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, BooleanArray, Int8Array, UInt32Array};
@@ -134,6 +134,41 @@ const RETRY_SORT_MEMORY_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// `PluginShardWriter::create` truncates its target path, so calling this
 /// twice at the same `warm_path`/`cold_path` (fast attempt, then sorted retry)
 /// is safe -- the first attempt's partial output is simply overwritten.
+/// Deletes the build's scratch shards unless the build reached the point of
+/// consuming them.
+///
+/// `PluginShardWriter::create` truncates, so a leftover `.tmp` is harmless to
+/// the *next* build -- but a build that dies partway (a full disk during
+/// `writer.write`, an order violation the retry also fails) would otherwise
+/// leave up to two chromosome-sized scratch files behind, on the same disk
+/// whose exhaustion caused the failure. Every early return from
+/// `build_plugin_chrom` past the point the paths are chosen runs this.
+struct ScratchGuard(Vec<PathBuf>);
+
+impl ScratchGuard {
+    fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self(paths.into_iter().collect())
+    }
+
+    fn watch(&mut self, path: PathBuf) {
+        self.0.push(path);
+    }
+
+    /// Stop watching: the scratch files have been consumed into the final
+    /// shard (or deliberately removed), so dropping must not delete anything.
+    fn disarm(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 async fn write_tiered_shard(
     mut stream: SendableRecordBatchStream,
     out_schema: &SchemaRef,
@@ -332,6 +367,7 @@ pub async fn build_plugin_chrom(
     let shard_path = plugin_dir.join(&file_name);
     let warm_tmp = plugin_dir.join(format!("{file_name}.warm.tmp"));
     let cold_tmp = plugin_dir.join(format!("{file_name}.cold.tmp"));
+    let mut scratch = ScratchGuard::new([warm_tmp.clone(), cold_tmp.clone()]);
 
     // Stream the tiered join output straight into two per-tier temp shards
     // (warm run, cold run) instead of collecting the whole chromosome into one
@@ -405,8 +441,6 @@ pub async fn build_plugin_chrom(
     // stale shard from a previous build so the manifest (rows: 0) matches disk
     // and the runtime never opens a leftover file for an empty chrom.
     if warm + cold == 0 {
-        let _ = std::fs::remove_file(&warm_tmp);
-        let _ = std::fs::remove_file(&cold_tmp);
         let _ = std::fs::remove_file(&shard_path);
         return Ok(ChromEntry {
             chrom: canonical_chrom_label(chrom),
@@ -430,6 +464,7 @@ pub async fn build_plugin_chrom(
     // overwrites it -- a rename is atomic on the same filesystem, so a crash
     // here instead leaves either the previous good shard (if any) or nothing.
     let merge_tmp = plugin_dir.join(format!("{file_name}.merge.tmp"));
+    scratch.watch(merge_tmp.clone());
     let mut writer = PluginShardWriter::create(&merge_tmp, Arc::clone(&out_schema))?;
     for tmp in [&warm_tmp, &cold_tmp] {
         let file = std::fs::File::open(tmp)
@@ -458,6 +493,7 @@ pub async fn build_plugin_chrom(
             ))
         })?;
     }
+    scratch.disarm();
     info!(
         "plugin_cache[{}/{chrom}]: done, rows={rows}, {:.1}s total",
         src.plugin_name,
@@ -730,6 +766,34 @@ type = "Float32"
     // (this is what `build_plugin_chrom` pattern-matches on via
     // `is_order_violation` to decide whether to retry with a sort), and it
     // must do so without finishing the writers on the failing tier.
+    #[test]
+    fn scratch_guard_removes_watched_files_unless_disarmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dropped, kept) = (dir.path().join("a.tmp"), dir.path().join("b.tmp"));
+        std::fs::write(&dropped, b"x").unwrap();
+        std::fs::write(&kept, b"x").unwrap();
+
+        drop(ScratchGuard::new([dropped.clone()]));
+        assert!(
+            !dropped.exists(),
+            "a failed build must not leave scratch behind"
+        );
+
+        ScratchGuard::new([kept.clone()]).disarm();
+        assert!(
+            kept.exists(),
+            "disarm must not delete a consumed scratch file"
+        );
+    }
+
+    #[test]
+    fn scratch_guard_tolerates_files_the_merge_already_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("already-removed.tmp");
+        drop(ScratchGuard::new([gone.clone()]));
+        assert!(!gone.exists());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn write_tiered_shard_flags_disordered_input_as_order_violation() {
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
