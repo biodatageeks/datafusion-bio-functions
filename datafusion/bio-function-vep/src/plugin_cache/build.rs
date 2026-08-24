@@ -167,6 +167,28 @@ fn retry_sort_memory_limit_bytes() -> usize {
 /// `PluginShardWriter::create` truncates its target path, so calling this
 /// twice at the same `warm_path`/`cold_path` (fast attempt, then sorted retry)
 /// is safe -- the first attempt's partial output is simply overwritten.
+/// Session config for the tier-join passes.
+///
+/// `schema_force_view_types` is DataFusion's default-on parquet behaviour of
+/// reading `Utf8` columns as `Utf8View`. It is off here for a specific reason:
+/// a `StringViewArray`'s views point into data buffers that are SHARED across
+/// the batches a scan emits, and `HashJoinExec` reserves memory per batch via
+/// `get_record_batch_memory_size`, which de-duplicates buffers only WITHIN one
+/// batch. So every batch re-counts the whole shared buffer, and the build-side
+/// reservation grows by (batch count) x (buffer size) while only one copy
+/// exists. Measured on CADD chr21: a ~600 MB build side reserved 6.95 GB at an
+/// 8 GiB pool and 23.15 GB at 24 GiB -- always the same 592.7 MB increment,
+/// once per batch -- while process RSS stayed flat near 16 GB. Reading plain
+/// `Utf8` gives each batch its own buffers, so the accounting matches reality.
+/// It also drops the `CAST(... AS Utf8View)` nodes the mismatch forced into
+/// the join keys.
+fn tier_join_config() -> SessionConfig {
+    SessionConfig::new().with_target_partitions(1).set_bool(
+        "datafusion.execution.parquet.schema_force_view_types",
+        false,
+    )
+}
+
 /// Deletes the build's scratch shards unless the build reached the point of
 /// consuming them.
 ///
@@ -386,7 +408,7 @@ pub async fn build_plugin_chrom(
     // not the underlying buffers, so holding a second copy here is cheap
     // regardless of chromosome size.
     let deduped_for_retry = deduped.clone();
-    let build_ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    let build_ctx = SessionContext::new_with_config(tier_join_config());
     let dedup_view = format!("plugin_{}_dedup", src.plugin_name);
     let mem = MemTable::try_new(norm_schema.clone(), vec![deduped])
         .map_err(|e| DataFusionError::Execution(format!("dedup memtable: {e}")))?;
@@ -455,10 +477,7 @@ pub async fn build_plugin_chrom(
                 .with_memory_pool(pool)
                 .build_arc()
                 .map_err(|e| DataFusionError::Execution(format!("retry runtime env: {e}")))?;
-            let sort_ctx = SessionContext::new_with_config_rt(
-                SessionConfig::new().with_target_partitions(1),
-                sort_runtime,
-            );
+            let sort_ctx = SessionContext::new_with_config_rt(tier_join_config(), sort_runtime);
             let sort_mem = MemTable::try_new(norm_schema, vec![deduped_for_retry])
                 .map_err(|e| DataFusionError::Execution(format!("retry dedup memtable: {e}")))?;
             sort_ctx.register_table(&dedup_view, Arc::new(sort_mem))?;
