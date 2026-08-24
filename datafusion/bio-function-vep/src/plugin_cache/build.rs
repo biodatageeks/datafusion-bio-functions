@@ -126,10 +126,18 @@ fn is_order_violation(e: &DataFusionError) -> bool {
 /// spill threshold. Only the sort can actually honour it by spilling.
 ///
 /// The previous 2 GiB default was too small for that reality: measured on
-/// chr21 (the smallest autosome, on a 64 GB machine), the join alone reserved
-/// 1557 MB for dbNSFP and 2034 MB for CADD, exhausting the pool before the
-/// sort reserved anything and failing both builds outright. 8 GiB clears both
-/// with room to spare while still bounding a runaway plan.
+/// chr21 (the smallest autosome, 64 GB machine), the join alone reserved
+/// 1557 MB for dbNSFP, exhausting the pool before the sort reserved anything
+/// and failing the build outright. 8 GiB clears it with room to spare (peak
+/// RSS 1.7 GB, builds in 0.2 min) while still bounding a runaway plan.
+///
+/// This does NOT fix CADD, and no pool size does. Its reservation grows to
+/// consume whatever budget it is given -- 2.03 GB at a 2 GiB pool, 6.4 GB at
+/// 8 GiB, 22.6 GB at 24 GiB -- and fails each time asking for the same
+/// 592.7 MB increment, while peak RSS plateaus around 17 GB. So the
+/// accounting outruns what is actually materialized, and raising the ceiling
+/// only moves the failure. See the tier-join analysis on PR #217; the fix
+/// there is structural, not a bigger number.
 const DEFAULT_RETRY_SORT_MEMORY_MIB: usize = 8 * 1024;
 
 /// Env override for [`DEFAULT_RETRY_SORT_MEMORY_MIB`], in MiB.
@@ -818,14 +826,16 @@ type = "Float32"
     }
 
     #[test]
-    fn retry_memory_default_clears_the_measured_chr21_join_reservations() {
-        // chr21, the smallest autosome: the join alone reserved 1557 MB
-        // (dbNSFP) and 2034 MB (CADD) before the sort reserved anything, which
-        // the old 2 GiB default could not cover. Guard the regression.
+    fn retry_memory_default_clears_the_measured_dbnsfp_join_reservation() {
+        // chr21, smallest autosome: the join alone reserved 1557 MB for dbNSFP
+        // before the sort reserved anything, which the old 2 GiB default could
+        // not cover once the rest of the plan is counted. Guard that
+        // regression. CADD is deliberately NOT covered -- its reservation
+        // scales with whatever pool it is given, so no constant satisfies it.
         let limit = DEFAULT_RETRY_SORT_MEMORY_MIB * 1024 * 1024;
         assert!(
-            limit > 2034 * 1024 * 1024,
-            "must clear the measured CADD join"
+            limit > 2 * 1557 * 1024 * 1024,
+            "must clear the measured dbNSFP join with headroom"
         );
     }
 
