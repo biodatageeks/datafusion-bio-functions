@@ -1,24 +1,46 @@
-# CADD tier-join reservation leak — deep-debug handover (2026-08-24)
+# CADD tier-join reservation leak — RESOLVED (2026-08-25)
 
-`build_plugin_chrom` cannot build CADD chr21. The tier join reserves **exactly
-whatever memory pool it is given** — 8.02 GB at an 8 GiB pool, 20.00 GB at
-20 GiB — to collect a build side that is **~180 MB**, while process RSS stays
-flat at 16.9 GB. The memory is reserved but never allocated, so no pool size
-works. Something calls `MemoryReservation::try_grow` without a matching
-`shrink`; it has not been located.
+> **Status: fixed in `92f55f9`.** All 5 plugins build chr21 and validate.
+> CADD: 121,809,062 rows in 2.1 min, `HashJoinInput` peak **0.70 GB** (was
+> 8.02 GB at an 8 GiB pool and 20.00 GB at 20 GiB). Kept as a record of the
+> mechanism and of what was ruled out — §5 in particular is worth reading
+> before touching this join again.
 
-Everything else works: **4 of 5 plugins build chr21 clean** (clinvar,
-alphamissense, spliceai, dbnsfp).
+## 0. What it was, and the piece that was missing
 
----
+The tier join reserved **exactly whatever memory pool it was given** to collect
+a build side of **~180 MB**, while RSS stayed flat — memory reserved but never
+allocated, so no pool size helped.
 
-## 0. The one test that kills a hypothesis
+The cause was `get_record_batch_memory_size` charging a *shared* Arrow buffer
+once per batch that references it (it de-duplicates only *within* one batch).
+Two layers of sharing had to be removed, and only finding both fixes it:
 
-The collected side is **~180 MB** (10.8M rows x 4 narrow columns, 11 batches).
-The reservation reaches **20 GB**. Any explanation must account for a **~110x
-gap that never appears in RSS**. Three plausible theories already died on that
-test — see §5. Measure before theorising; this bug has been unusually good at
-producing convincing wrong answers.
+1. **`GROUP BY` output batches share buffers** (2d6c01d). Measured 31.7x
+   over-count — see §4. Fixed by materializing the probe with a `concat` per
+   batch. This dropped the increment from 592.7 MB to 18.2 MB but did **not**
+   fix the build.
+2. **The MemTable scan re-splits oversized batches** (92f55f9). DataFusion 53
+   wraps a MemTable in `BatchSplitStream`, which slices any parent larger than
+   the execution batch size into **zero-copy children**. The materialized probe
+   was chunked at 1M rows, so its 11 owned parents became ~1300 slices that all
+   shared 11 buffers, and the over-count returned — that is precisely what the
+   18.2 MB increment was: one parent's buffer, charged per 8192-row slice.
+   Fixed by chunking to `ctx.copied_config().batch_size()` so the scan has
+   nothing left to split, plus forcing a real copy in
+   `concat_probe_parts_owned` (Arrow's single-input `concat_batches` is
+   zero-copy and would otherwise keep the sharing).
+
+The lesson worth keeping: **an over-count that shrinks but does not vanish means
+a second sharing layer, not a partial fix.** The 18.2 MB figure was measured
+and recorded a full round before anyone recognised it as "one parent per
+execution-sized slice".
+
+## 0b. The test that killed hypotheses
+
+Any explanation had to account for a large reservation/RSS gap. Three plausible
+theories died on it before the real one survived — see §5. Measure before
+theorising; this bug was unusually good at producing convincing wrong answers.
 
 ---
 
@@ -186,7 +208,7 @@ sharing.
 | It is a scale problem | SpliceAI retries at 31.7M rows and succeeds; dbNSFP fails at 836k |
 | A bigger pool fixes it | 2 / 8 / 20 GiB all fail; the reservation grows to match the pool exactly |
 | `Utf8View` width is the cause | Disabling view types halved the increment, pattern unchanged |
-| `GROUP BY` buffer sharing is the whole cause | Fixed in 2d6c01d; increment fell to 18.2 MB but the leak persists |
+| `GROUP BY` buffer sharing is the whole cause | Fixed in 2d6c01d; increment fell to 18.2 MB but the leak persisted — it was one of **two** sharing layers (§0) |
 | The semi-join (b561629) is the consumer | `HashJoinInput#0` is 0.95 GB and **stable** across pool sizes |
 
 ---
@@ -227,13 +249,17 @@ break on shifted-ness (unshifted first). See `vepyr-plugins` PR #4.
 **chr21, built and validated** (`(tier, start)` ascending per shard; SpliceAI's
 `assume_unique` checked exhaustively over all 31.7M keys):
 
-| plugin | rows | shard |
-|---|---:|---:|
-| clinvar | 49,937 | 1 MB |
-| alphamissense | 698,535 | 6 MB |
-| spliceai | 31,683,675 | 238 MB |
-| dbnsfp | 836,391 | — |
-| **cadd** | — | **blocked** |
+| plugin | rows | shard | notes |
+|---|---:|---:|---|
+| clinvar | 49,937 | 1 MB | |
+| alphamissense | 698,535 | 6 MB | |
+| spliceai | 31,683,675 | 238 MB | `assume_unique` exhaustively verified |
+| dbnsfp | 836,391 | 41 MB | |
+| cadd | 121,809,062 | 1040 MB | `assume_unique` exhaustively verified over all 121.8M keys |
+
+CADD chr21 post-fix: 124.8 s total (16.1 s read+normalize+dedup, 105.1 s
+tier-join+write including the sorted retry), peak RSS 17.0 GB. Reservation
+peaks: `ExternalSorter` 7.29 GB (real, spillable work), `HashJoinInput` 0.70 GB.
 
 Full-genome runs have not been attempted. `notebooks/build_plugin_caches.ipynb`
 in the vepyr branch drives the whole matrix; note it still downloads sources
