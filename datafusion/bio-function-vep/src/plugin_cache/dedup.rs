@@ -9,10 +9,11 @@
 //! `HashMap` keyed on the probe key, so a duplicate key silently keeps whichever
 //! row the shard emits *last* — the opposite of VEP.
 //!
-//! This pass collapses each key to its **first** occurrence in stream order. It
-//! MUST run over a single-partition, file-ordered stream (the builder sets
-//! `target_partitions = 1`) and BEFORE the tier LEFT-JOIN, which reorders rows and
-//! would otherwise destroy the file-order tiebreak.
+//! This pass collapses each key to its **first** occurrence in stream order. The
+//! builder parses physical source partitions concurrently, collects them while
+//! preserving partition identity, and replays them in source-range order before
+//! calling this pass. It MUST run before the tier LEFT-JOIN, which reorders rows
+//! and would otherwise destroy the file-order tiebreak.
 
 use std::collections::HashSet;
 
@@ -28,7 +29,7 @@ use futures::StreamExt;
 /// allele / amino-acid-change strings, so it can't collide two distinct keys.
 const KEY_SEP: char = '\u{1f}';
 
-/// Consume `stream` (single-partition, source-file order) and return its batches
+/// Consume `stream` (ordered source-partition replay) and return its batches
 /// with only the **first** row per `(start, allele_string, <match col values…>)`
 /// key retained — matching VEP's first-in-file rule. Later duplicates are dropped.
 ///

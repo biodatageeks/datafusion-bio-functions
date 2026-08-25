@@ -1,37 +1,46 @@
-//! Variation-tier inheritance: LEFT-joins the normalized plugin rows against the
-//! variation shard on `(chrom, start, allele_string)` and inherits the variation
-//! record's `tier` (`COALESCE(v.tier, 1)` — no match → cold). Variation columns
-//! drop; only the plugin's value columns plus `tier` survive.
+//! Variation-tier inheritance: within one validated chromosome, LEFT-joins the
+//! normalized plugin rows against the variation shard on `(start, allele_string)`
+//! and inherits the variation record's `tier` (`COALESCE(v.tier, 1)` — no match
+//! → cold). Variation columns drop; only the plugin's value columns plus `tier`
+//! survive.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::Result;
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::common::utils::memory::get_record_batch_memory_size;
+use datafusion::common::{DataFusionError, Result};
+use datafusion::datasource::MemTable;
+use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::physical_plan::{
+    ExecutionPlan, SendableRecordBatchStream, collect, displayable, execute_stream,
+};
 use datafusion::prelude::SessionContext;
 use log::info;
 
+use crate::plugin_cache::join_strategy::{
+    JoinAlgorithm, JoinDecision, choose_for_hash_plan, contains_sort_merge_join,
+};
+use crate::plugin_cache::mem_trace::TracingPool;
+
 /// SQL that LEFT-joins `normalized_view` to a registered `variation_probe`
-/// exposing `(chrom, start, allele_string, tier)` and inherits `tier`. The value
-/// columns of `normalized_view` pass through (`p.*`); variation columns drop.
+/// exposing `(start, allele_string, tier)` and inherits `tier`. Both inputs are
+/// already restricted to one chromosome, so carrying that constant string in
+/// the physical join key only increases memory. The value columns of
+/// `normalized_view` pass through (`p.*`); variation columns drop.
 pub fn tier_sql(normalized_view: &str, variation_probe: &str) -> String {
     format!(
         "SELECT p.*, CAST(COALESCE(v.tier, 1) AS TINYINT) AS tier \
          FROM {normalized_view} p \
          LEFT JOIN {variation_probe} v \
-         ON p.chrom = v.chrom AND p.start = v.start AND p.allele_string = v.allele_string"
+         ON p.start = v.start AND p.allele_string = v.allele_string"
     )
 }
 
 /// Same join, with an explicit `ORDER BY` so the output is position-ascending
-/// regardless of which side of the physical `HashJoinExec` the optimizer put
-/// the plugin on (see `build.rs`'s module doc). Used only as the retry path
-/// after the cheap, unsorted `tiered_stream` trips `assert_start_monotonic` --
-/// the sort is real work, so it's not paid by the common case (a whole-genome
-/// plugin bigger than the variation probe, which streams through unreordered
-/// already).
+/// regardless of the chosen join algorithm or execution partition count.
 pub fn tier_sql_sorted(normalized_view: &str, variation_probe: &str) -> String {
     format!(
         "{} ORDER BY p.start",
@@ -51,14 +60,101 @@ pub async fn tiered_stream(
 }
 
 /// Same as `tiered_stream`, but the output is guaranteed position-ascending on
-/// `start` (see `tier_sql_sorted`). Costs a real sort -- use only as the
-/// fallback once the unsorted stream has been shown to need it.
+/// `start` (see `tier_sql_sorted`).
 pub async fn tiered_stream_sorted(
     ctx: &SessionContext,
     normalized_view: &str,
     variation_shard: &Path,
 ) -> Result<SendableRecordBatchStream> {
     tiered_stream_impl(ctx, normalized_view, variation_shard, true).await
+}
+
+pub(crate) struct AdaptiveTieredStream {
+    pub stream: SendableRecordBatchStream,
+    pub algorithm: JoinAlgorithm,
+}
+
+fn is_hash_join_resources_exhausted(error: &DataFusionError) -> bool {
+    matches!(
+        error.find_root(),
+        DataFusionError::ResourcesExhausted(message) if message.contains("HashJoinInput")
+    )
+}
+
+pub(crate) fn should_retry_hash_join(
+    error: &DataFusionError,
+    algorithm: JoinAlgorithm,
+    pool: &TracingPool,
+) -> bool {
+    algorithm == JoinAlgorithm::Hash
+        && is_hash_join_resources_exhausted(error)
+        && pool.hash_join_failed()
+}
+
+async fn set_prefer_hash_join(ctx: &SessionContext, prefer: bool) -> Result<()> {
+    ctx.sql(&format!(
+        "SET datafusion.optimizer.prefer_hash_join = {prefer}"
+    ))
+    .await?;
+    Ok(())
+}
+
+fn log_decision(stage: &str, target_partitions: usize, decision: &JoinDecision) {
+    info!(
+        "plugin_cache: adaptive join stage={stage} target_partitions={target_partitions} algorithm={:?} reason={:?} \
+         build_rows={:?} build_data_bytes={:?} hash_build_bytes={:?} available_bytes={:?}",
+        decision.algorithm,
+        decision.reason,
+        decision.build_rows,
+        decision.build_data_bytes,
+        decision.hash_build_bytes,
+        decision.available_bytes,
+    );
+}
+
+fn log_plan(stage: &str, plan: &dyn ExecutionPlan) {
+    if std::env::var("VEPYR_EXPLAIN_TIER_JOIN").is_ok() {
+        info!(
+            "plugin_cache: adaptive join stage={stage} physical plan:\n{}",
+            displayable(plan).indent(true)
+        );
+    }
+}
+
+async fn sort_merge_plan(
+    ctx: &SessionContext,
+    sql: &str,
+    stage: &str,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    set_prefer_hash_join(ctx, false).await?;
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    if !contains_sort_merge_join(plan.as_ref()) {
+        return datafusion::common::exec_err!(
+            "adaptive join stage {stage} requested SortMergeJoin but DataFusion emitted:\n{}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+    Ok(plan)
+}
+
+async fn adaptive_plan(
+    ctx: &SessionContext,
+    sql: &str,
+    stage: &str,
+    pool: &dyn MemoryPool,
+) -> Result<(Arc<dyn ExecutionPlan>, JoinAlgorithm)> {
+    set_prefer_hash_join(ctx, true).await?;
+    let hash_plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let decision = choose_for_hash_plan(&hash_plan, pool)?;
+    log_decision(stage, ctx.copied_config().target_partitions(), &decision);
+    if decision.algorithm == JoinAlgorithm::Hash {
+        return Ok((hash_plan, JoinAlgorithm::Hash));
+    }
+
+    Ok((
+        sort_merge_plan(ctx, sql, stage).await?,
+        JoinAlgorithm::SortMerge,
+    ))
 }
 
 /// Concatenate `parts` into a batch that owns its buffers even when there is
@@ -122,6 +218,32 @@ fn rechunk_probe_owned(
     Ok(output)
 }
 
+/// Distribute already-owned batches across source partitions without copying
+/// their Arrow buffers. Greedy byte balancing avoids assigning all large
+/// batches to one worker while adapting naturally when a chromosome has only
+/// enough batches to occupy a subset of the configured workers.
+pub(crate) fn partition_batches(
+    batches: Vec<RecordBatch>,
+    target_partitions: usize,
+) -> Vec<Vec<RecordBatch>> {
+    let partition_count = target_partitions.max(1).min(batches.len().max(1));
+    let mut partitions = (0..partition_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut partition_bytes = vec![0usize; partition_count];
+
+    for batch in batches {
+        let partition = partition_bytes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, bytes)| **bytes)
+            .map(|(index, _)| index)
+            .expect("at least one batch partition");
+        partition_bytes[partition] =
+            partition_bytes[partition].saturating_add(get_record_batch_memory_size(&batch));
+        partitions[partition].push(batch);
+    }
+    partitions
+}
+
 /// Replace the `plugin_variation_probe` view with an equivalent table whose
 /// batches own their buffers.
 ///
@@ -146,29 +268,60 @@ fn rechunk_probe_owned(
 /// re-slicing large MemTable parents into zero-copy children. The reservation
 /// therefore matches reality. It also lifts the aggregate out of the join plan,
 /// so it runs once and the optimizer sees exact statistics for side selection.
-async fn materialize_probe(ctx: &SessionContext) -> Result<()> {
-    let df = ctx.sql("SELECT * FROM plugin_variation_probe").await?;
-    let schema: SchemaRef = df.schema().inner().clone();
-    let collected = df.collect().await?;
+fn replace_probe_table(
+    ctx: &SessionContext,
+    schema: SchemaRef,
+    collected: Vec<RecordBatch>,
+) -> Result<()> {
     let batches = rechunk_probe_owned(&schema, collected, ctx.copied_config().batch_size())?;
-
+    let partitions = partition_batches(batches, ctx.copied_config().target_partitions());
     ctx.deregister_table("plugin_variation_probe")?;
     ctx.register_table(
         "plugin_variation_probe",
-        std::sync::Arc::new(datafusion::datasource::MemTable::try_new(
-            schema,
-            vec![batches],
-        )?),
+        Arc::new(MemTable::try_new(schema, partitions)?),
     )?;
     Ok(())
 }
 
-async fn tiered_stream_impl(
+async fn materialize_probe(ctx: &SessionContext) -> Result<()> {
+    let df = ctx.sql("SELECT * FROM plugin_variation_probe").await?;
+    let schema: SchemaRef = df.schema().inner().clone();
+    let collected = df.collect().await?;
+    replace_probe_table(ctx, schema, collected)
+}
+
+async fn materialize_probe_adaptive(
+    ctx: &SessionContext,
+    pool: &dyn MemoryPool,
+    tracer: &TracingPool,
+) -> Result<()> {
+    const SQL: &str = "SELECT * FROM plugin_variation_probe";
+    let (hash_or_merge_plan, algorithm) = adaptive_plan(ctx, SQL, "probe", pool).await?;
+    let schema = hash_or_merge_plan.schema();
+    log_plan("probe", hash_or_merge_plan.as_ref());
+    tracer.clear_failures();
+
+    let collected = match collect(hash_or_merge_plan, ctx.task_ctx()).await {
+        Ok(batches) => batches,
+        Err(error) if should_retry_hash_join(&error, algorithm, tracer) => {
+            info!(
+                "plugin_cache: probe HashJoin exhausted its reservation; retrying with DataFusion SortMergeJoin"
+            );
+            let merge_plan = sort_merge_plan(ctx, SQL, "probe_runtime_fallback").await?;
+            log_plan("probe_runtime_fallback", merge_plan.as_ref());
+            tracer.clear_failures();
+            collect(merge_plan, ctx.task_ctx()).await?
+        }
+        Err(error) => return Err(error),
+    };
+    replace_probe_table(ctx, schema, collected)
+}
+
+async fn register_variation_probe_view(
     ctx: &SessionContext,
     normalized_view: &str,
     variation_shard: &Path,
-    sorted: bool,
-) -> Result<SendableRecordBatchStream> {
+) -> Result<()> {
     let shard = variation_shard.to_string_lossy();
     ctx.register_parquet(
         "plugin_variation_raw",
@@ -178,10 +331,11 @@ async fn tiered_stream_impl(
     .await?;
     ctx.sql(&format!(
         // GROUP BY (not DISTINCT): the variation shard can carry multiple
-        // source rows for the same (chrom, start, allele_string) (e.g.
+        // source rows for the same (start, allele_string) within this
+        // already-selected chromosome (e.g.
         // distinct dbSNP/COSMIC-origin entries for one variant). If those
         // duplicates ever disagree on `tier` (one warm, one cold), a plain
-        // `SELECT DISTINCT chrom, start, allele_string, tier` keeps BOTH rows
+        // `SELECT DISTINCT start, allele_string, tier` keeps BOTH rows
         // — the join key is then non-unique on the build side, so the tier
         // LEFT JOIN below fans out the plugin row once per surviving variant,
         // silently inflating the cache with duplicate rows for that key
@@ -195,26 +349,36 @@ async fn tiered_stream_impl(
         // removes entirely rather than merely reduces.
         //
         // The inner JOIN against a DISTINCT projection of the plugin's own
-        // keys is a semi-join emulation that restricts the aggregation to
-        // keys the plugin table actually has, computed BEFORE the `GROUP BY`
-        // rather than after: for a sparse plugin (far fewer rows than the
-        // chromosome's full variation shard), grouping the *entire* shard
+        // per-chromosome keys is a semi-join emulation that restricts the
+        // aggregation to keys the plugin table actually has, computed BEFORE
+        // the `GROUP BY` rather than after: for a sparse plugin (far fewer
+        // rows than the chromosome's full variation shard), grouping the
+        // *entire* shard
         // just to inherit tier for a handful of keys is wasted work the LEFT
         // JOIN below never uses (variation rows with no matching plugin key
         // can never survive a `p.*`-projected LEFT JOIN regardless).
         // Semantically a no-op — this narrows which rows get grouped, not
-        // which key wins ties or what a hit resolves to. The DISTINCT on the
-        // plugin side keeps this join's build side small and its own key
-        // unique, so it can't reintroduce the fan-out risk the GROUP BY
-        // above exists to remove.
+        // which key wins ties or what a hit resolves to. The DISTINCT makes
+        // the plugin-side key unique, preventing duplicate plugin keys from
+        // multiplying rows before the variation GROUP BY collapses them.
         "CREATE OR REPLACE VIEW plugin_variation_probe AS \
-         SELECT v.chrom, v.start, v.allele_string, MIN(v.tier) AS tier \
+         SELECT v.start, v.allele_string, MIN(v.tier) AS tier \
          FROM plugin_variation_raw v \
-         INNER JOIN (SELECT DISTINCT chrom, start, allele_string FROM {normalized_view}) p \
-         ON v.chrom = p.chrom AND v.start = p.start AND v.allele_string = p.allele_string \
-         GROUP BY v.chrom, v.start, v.allele_string"
+         INNER JOIN (SELECT DISTINCT start, allele_string FROM {normalized_view}) p \
+         ON v.start = p.start AND v.allele_string = p.allele_string \
+         GROUP BY v.start, v.allele_string"
     ))
     .await?;
+    Ok(())
+}
+
+async fn tiered_stream_impl(
+    ctx: &SessionContext,
+    normalized_view: &str,
+    variation_shard: &Path,
+    sorted: bool,
+) -> Result<SendableRecordBatchStream> {
+    register_variation_probe_view(ctx, normalized_view, variation_shard).await?;
     materialize_probe(ctx).await?;
     let sql = if sorted {
         tier_sql_sorted(normalized_view, "plugin_variation_probe")
@@ -236,16 +400,382 @@ async fn tiered_stream_impl(
     df.execute_stream().await
 }
 
+/// Build both joins with DataFusion, selecting HashJoin only when its actual
+/// optimized build-side statistics fit the active pool. The final SQL always
+/// carries an explicit ORDER BY because parallel joins do not preserve a
+/// globally useful source order.
+pub(crate) async fn tiered_stream_sorted_adaptive(
+    ctx: &SessionContext,
+    normalized_view: &str,
+    variation_shard: &Path,
+    pool: &dyn MemoryPool,
+    tracer: &TracingPool,
+) -> Result<AdaptiveTieredStream> {
+    register_variation_probe_view(ctx, normalized_view, variation_shard).await?;
+    materialize_probe_adaptive(ctx, pool, tracer).await?;
+
+    let sql = tier_sql_sorted(normalized_view, "plugin_variation_probe");
+    let (plan, algorithm) = adaptive_plan(ctx, &sql, "tier", pool).await?;
+    log_plan("tier", plan.as_ref());
+    tracer.clear_failures();
+    match execute_stream(plan, ctx.task_ctx()) {
+        Ok(stream) => Ok(AdaptiveTieredStream { stream, algorithm }),
+        Err(error) if should_retry_hash_join(&error, algorithm, tracer) => {
+            info!(
+                "plugin_cache: tier HashJoin exhausted its reservation before streaming; retrying with DataFusion SortMergeJoin"
+            );
+            Ok(AdaptiveTieredStream {
+                stream: tiered_stream_sorted_sort_merge(ctx, normalized_view, tracer).await?,
+                algorithm: JoinAlgorithm::SortMerge,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Re-plan only the already-materialized final join as SortMergeJoin. Used
+/// when a hash build passed the estimate but DataFusion rejected its runtime
+/// reservation while the output stream was being consumed.
+pub(crate) async fn tiered_stream_sorted_sort_merge(
+    ctx: &SessionContext,
+    normalized_view: &str,
+    tracer: &TracingPool,
+) -> Result<SendableRecordBatchStream> {
+    let sql = tier_sql_sorted(normalized_view, "plugin_variation_probe");
+    let plan = sort_merge_plan(ctx, &sql, "tier_runtime_fallback").await?;
+    log_plan("tier_runtime_fallback", plan.as_ref());
+    tracer.clear_failures();
+    execute_stream(plan, ctx.task_ctx())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::arrow::array::{Float32Array, Int8Array, StringArray, UInt32Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::prelude::col;
-    use futures::StreamExt;
+    use datafusion::execution::memory_pool::{
+        FairSpillPool, MemoryConsumer, MemoryLimit, MemoryReservation, UnboundedMemoryPool,
+    };
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::prelude::{SessionConfig, col};
+    use futures::{StreamExt, TryStreamExt};
     use parquet::arrow::ArrowWriter;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Reports a roomy limit to the preflight selector but rejects every hash
+    /// build reservation. Other consumers are unbounded so the forced SMJ can
+    /// complete; this models optimistic statistics deterministically.
+    #[derive(Debug, Default)]
+    struct RejectHashPool {
+        inner: UnboundedMemoryPool,
+        rejected_hash_grows: AtomicUsize,
+    }
+
+    impl MemoryPool for RejectHashPool {
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.inner.grow(reservation, additional);
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.inner.shrink(reservation, shrink);
+        }
+
+        fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
+            if reservation.consumer().name().starts_with("HashJoinInput") {
+                self.rejected_hash_grows.fetch_add(1, Ordering::Relaxed);
+                return Err(DataFusionError::ResourcesExhausted(format!(
+                    "Additional allocation failed for {}",
+                    reservation.consumer().name()
+                )));
+            }
+            self.inner.try_grow(reservation, additional)
+        }
+
+        fn reserved(&self) -> usize {
+            self.inner.reserved()
+        }
+
+        fn memory_limit(&self) -> MemoryLimit {
+            MemoryLimit::Finite(1024 * 1024)
+        }
+    }
+
+    fn rejecting_context() -> (SessionContext, Arc<RejectHashPool>, Arc<TracingPool>) {
+        let rejecting_pool = Arc::new(RejectHashPool::default());
+        let base_pool: Arc<dyn MemoryPool> = Arc::clone(&rejecting_pool) as _;
+        let tracer = Arc::new(TracingPool::new(base_pool));
+        let runtime_pool: Arc<dyn MemoryPool> = Arc::clone(&tracer) as _;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(runtime_pool)
+            .build_arc()
+            .unwrap();
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new()
+                .with_target_partitions(2)
+                .set_bool("datafusion.optimizer.prefer_hash_join", true)
+                .set_usize(
+                    "datafusion.optimizer.hash_join_single_partition_threshold",
+                    usize::MAX,
+                )
+                .set_usize(
+                    "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                    usize::MAX,
+                ),
+            runtime,
+        );
+        (ctx, rejecting_pool, tracer)
+    }
+
+    #[test]
+    fn owned_batches_are_distributed_across_available_workers() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::UInt32,
+            false,
+        )]));
+        let batches = (0..6u32)
+            .map(|value| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(UInt32Array::from(vec![value; 16]))],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let partitions = partition_batches(batches, 3);
+        assert_eq!(partitions.len(), 3);
+        assert!(partitions.iter().all(|partition| partition.len() == 2));
+        assert_eq!(
+            partitions
+                .iter()
+                .flatten()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            96
+        );
+    }
+
+    #[test]
+    fn hash_retry_requires_matching_error_and_pool_attribution() {
+        let tracer = Arc::new(TracingPool::new(Arc::new(FairSpillPool::new(1))));
+        let pool: Arc<dyn MemoryPool> = Arc::clone(&tracer) as _;
+        assert!(matches!(pool.memory_limit(), MemoryLimit::Finite(1)));
+        let hash_reservation = MemoryConsumer::new("HashJoinInput").register(&pool);
+        let hash_error = hash_reservation.try_grow(2).unwrap_err();
+
+        assert!(should_retry_hash_join(
+            &hash_error,
+            JoinAlgorithm::Hash,
+            tracer.as_ref()
+        ));
+        assert!(!should_retry_hash_join(
+            &hash_error,
+            JoinAlgorithm::SortMerge,
+            tracer.as_ref()
+        ));
+
+        tracer.clear_failures();
+        let sort_reservation = MemoryConsumer::new("ExternalSorter").register(&pool);
+        let sort_error = sort_reservation.try_grow(2).unwrap_err();
+        assert!(!should_retry_hash_join(
+            &sort_error,
+            JoinAlgorithm::Hash,
+            tracer.as_ref()
+        ));
+    }
+
+    #[tokio::test]
+    async fn adaptive_plan_replans_with_datafusion_sort_merge_join() {
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(2)
+                .set_usize(
+                    "datafusion.optimizer.hash_join_single_partition_threshold",
+                    usize::MAX,
+                )
+                .set_usize(
+                    "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                    usize::MAX,
+                ),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::UInt32,
+            false,
+        )]));
+        for (name, rows) in [("build", 128usize), ("probe", 4096usize)] {
+            ctx.register_batch(
+                name,
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(UInt32Array::from_iter_values(
+                        (0..rows).map(|value| value as u32),
+                    ))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let (plan, algorithm) = adaptive_plan(
+            &ctx,
+            "SELECT p.value FROM probe p INNER JOIN build b ON p.value = b.value",
+            "test",
+            &FairSpillPool::new(64),
+        )
+        .await
+        .unwrap();
+        assert_eq!(algorithm, JoinAlgorithm::SortMerge);
+        assert!(contains_sort_merge_join(plan.as_ref()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_runtime_hash_rejection_retries_with_sort_merge() {
+        let (ctx, rejecting_pool, tracer) = rejecting_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("tier", DataType::Int8, false),
+        ]));
+        for name in ["variation_side", "plugin_side"] {
+            ctx.register_batch(
+                name,
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(StringArray::from(vec!["1", "1"])),
+                        Arc::new(UInt32Array::from(vec![100u32, 200])),
+                        Arc::new(StringArray::from(vec!["A/G", "C/T"])),
+                        Arc::new(Int8Array::from(vec![0i8, 1])),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        ctx.sql(
+            "CREATE VIEW plugin_variation_probe AS \
+             SELECT v.start, v.allele_string, v.tier \
+             FROM variation_side v INNER JOIN plugin_side p \
+             ON v.start = p.start AND v.allele_string = p.allele_string",
+        )
+        .await
+        .unwrap();
+
+        materialize_probe_adaptive(&ctx, tracer.as_ref(), tracer.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            rejecting_pool.rejected_hash_grows.load(Ordering::Relaxed),
+            1
+        );
+        let probe = ctx
+            .sql("SELECT * FROM plugin_variation_probe")
+            .await
+            .unwrap();
+        assert_eq!(
+            probe
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["start", "allele_string", "tier"]
+        );
+        let rows = probe
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
+        assert_eq!(rows, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn final_runtime_hash_rejection_retries_with_sort_merge() {
+        let (ctx, rejecting_pool, tracer) = rejecting_context();
+
+        let dir = tempfile::tempdir().unwrap();
+        let variation_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("tier", DataType::Int8, false),
+        ]));
+        let variation = RecordBatch::try_new(
+            Arc::clone(&variation_schema),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(UInt32Array::from(vec![100u32, 200])),
+                Arc::new(StringArray::from(vec!["A/G", "C/T"])),
+                Arc::new(Int8Array::from(vec![0i8, 1])),
+            ],
+        )
+        .unwrap();
+        let variation_path = dir.path().join("variation.parquet");
+        let file = std::fs::File::create(&variation_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, variation_schema, None).unwrap();
+        writer.write(&variation).unwrap();
+        writer.close().unwrap();
+
+        let plugin = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("demo_score", DataType::Float32, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(UInt32Array::from(vec![100u32, 300])),
+                Arc::new(UInt32Array::from(vec![100u32, 300])),
+                Arc::new(StringArray::from(vec!["A/G", "G/A"])),
+                Arc::new(Float32Array::from(vec![Some(0.9f32), Some(0.7)])),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("plugin_demo_norm", plugin).unwrap();
+
+        let adaptive = tiered_stream_sorted_adaptive(
+            &ctx,
+            "plugin_demo_norm",
+            &variation_path,
+            tracer.as_ref(),
+            tracer.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(adaptive.algorithm, JoinAlgorithm::Hash);
+
+        let error = adaptive
+            .stream
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap_err();
+        assert!(should_retry_hash_join(
+            &error,
+            adaptive.algorithm,
+            tracer.as_ref()
+        ));
+        assert!(
+            rejecting_pool.rejected_hash_grows.load(Ordering::Relaxed) >= 1,
+            "the final tier HashJoin must reach the injected rejecting pool"
+        );
+
+        let batches = tiered_stream_sorted_sort_merge(&ctx, "plugin_demo_norm", tracer.as_ref())
+            .await
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    }
 
     // Codex review, PR #196: for a sparse plugin the pre-fix
     // `plugin_variation_probe` unconditionally grouped the ENTIRE variation
@@ -401,7 +931,6 @@ mod tests {
         use datafusion::execution::memory_pool::FairSpillPool;
         use datafusion::execution::runtime_env::RuntimeEnvBuilder;
         use datafusion::physical_plan::displayable;
-        use datafusion::prelude::SessionConfig;
 
         const EXECUTION_BATCH_ROWS: usize = 8192;
         const PARENT_ROWS: usize = 1024 * 1024;

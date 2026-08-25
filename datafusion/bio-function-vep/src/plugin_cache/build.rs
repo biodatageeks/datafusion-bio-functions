@@ -2,22 +2,13 @@
 //! normalization wrapper → variation-frequency join/tier → two-pass tiered
 //! shard write → cache-manifest chrom entry.
 //!
-//! The tiered join (`p LEFT JOIN v`) plans as `HashJoinExec` in `CollectLeft`
-//! mode: the plugin (`p`, the LEFT side) is collected into a hash table, and
-//! the variation probe (`v`) streams as the probe side. A row that MATCHES
-//! comes out in the probe's own scan order, which is fine -- a real variation
-//! shard is itself position-sorted. A row that MISSES gets appended
-//! afterward by iterating the plugin's own original row order. So this holds
-//! in position-ascending order for any plugin whose input already arrives
-//! globally sorted (true whenever the source is a single position-sorted
-//! file, or a `bcftools`/`tabix` query over one) -- but a source built by
-//! concatenating multiple files without a merge sort (the original CADD
-//! SNV+indel bug) surfaces here as soon as any of its rows miss the variation
-//! probe. `assert_start_monotonic` catches a real violation as it writes;
-//! `build_plugin_chrom` responds by re-running the join once with an explicit
-//! `ORDER BY` (see `join::tiered_stream_sorted`) rather than hard-failing the
-//! build. The sort only runs on the retry, so a normally-sorted source (every
-//! plugin shipped so far) pays nothing extra.
+//! Both joins run in a bounded, parallel DataFusion context. For each join we
+//! first inspect DataFusion's optimized HashJoin build side and use its actual
+//! statistics to decide whether the estimated reservation fits the active
+//! pool. If it does not, or the statistics are incomplete, only
+//! `prefer_hash_join` is changed and DataFusion plans its built-in
+//! SortMergeJoin. The final query always has an explicit `ORDER BY start`, so
+//! correctness does not depend on execution-partition or hash-table order.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,10 +18,11 @@ use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
 use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use log::info;
@@ -39,7 +31,10 @@ use std::time::Instant;
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
 use crate::plugin_cache::dedup::{check_assume_unique_sample, dedup_keep_first};
-use crate::plugin_cache::join::{tiered_stream, tiered_stream_sorted};
+use crate::plugin_cache::join::{
+    partition_batches, should_retry_hash_join, tiered_stream_sorted_adaptive,
+    tiered_stream_sorted_sort_merge,
+};
 use crate::plugin_cache::mem_trace;
 use crate::plugin_cache::normalize::{
     canonical_contig_str, canonical_contig_udf, wrap_normalization,
@@ -100,8 +95,8 @@ fn assert_start_monotonic(
                 "plugin_cache[{chrom}]: tier {tier} shard write is not position-ascending \
                  (start {v} follows {p}) -- the tier join did not preserve row order; the \
                  on-disk point-lookup directory requires a sorted shard, so refusing to \
-                 write a corrupt one from the fast path. The caller retries with an \
-                 explicit sort instead of trusting this shard."
+                 write a corrupt one. The adaptive plan's explicit ORDER BY contract was \
+                 violated."
             )));
         }
         prev = Some(v);
@@ -109,19 +104,9 @@ fn assert_start_monotonic(
     Ok(prev)
 }
 
-/// `assert_start_monotonic` reports a genuine reorder with this exact phrase;
-/// matching on it (rather than introducing a dedicated error variant threaded
-/// through every `Result<_, DataFusionError>` in this module) is enough to
-/// distinguish "the join lost row order, retry with a sort" from any other
-/// failure in the write pass (I/O, cast errors, tier-value corruption), which
-/// must still propagate as-is rather than trigger a pointless retry.
-fn is_order_violation(e: &DataFusionError) -> bool {
-    e.to_string().contains("is not position-ascending")
-}
-
-/// Default memory budget for the sorted retry's `FairSpillPool`, in MiB.
+/// Default memory budget for the adaptive tier plan's `FairSpillPool`, in MiB.
 ///
-/// The pool bounds the retry's WHOLE plan, not just its sort -- and the plan's
+/// The pool bounds the WHOLE plan, not just its sort -- and a selected
 /// `HashJoinExec` cannot spill (DataFusion has no spill path for a hash join's
 /// build side), so for the join this budget is a hard ceiling rather than a
 /// spill threshold. Only the sort can actually honour it by spilling.
@@ -138,13 +123,16 @@ fn is_order_violation(e: &DataFusionError) -> bool {
 /// ceiling while RSS stayed flat; raising this default only moved the failure.
 const DEFAULT_RETRY_SORT_MEMORY_MIB: usize = 8 * 1024;
 
-/// Env override for [`DEFAULT_RETRY_SORT_MEMORY_MIB`], in MiB.
+/// Env override for [`DEFAULT_RETRY_SORT_MEMORY_MIB`], in MiB. The existing
+/// variable name is retained for compatibility even though the bounded pool
+/// now covers every tier plan rather than only an order-recovery retry.
 ///
 /// A fixed default cannot suit both a 16 GB laptop and a 512 GB node, and the
 /// right value depends on the plugin's row width as much as its row count --
 /// so make it tunable rather than guessing. Invalid or zero values fall back
 /// to the default rather than failing a long build on a typo'd env var.
 const RETRY_SORT_MEMORY_ENV: &str = "VEPYR_PLUGIN_RETRY_MEMORY_MIB";
+const TARGET_PARTITIONS_ENV: &str = "VEPYR_PLUGIN_TARGET_PARTITIONS";
 
 fn retry_sort_memory_limit_bytes() -> usize {
     let mib = std::env::var(RETRY_SORT_MEMORY_ENV)
@@ -155,15 +143,12 @@ fn retry_sort_memory_limit_bytes() -> usize {
     mib * 1024 * 1024
 }
 
-/// Consume `stream`, split rows by `tier` into warm (0) / cold (1), and write
-/// each run through its own `PluginShardWriter`. Checks `start` is
-/// position-ascending within each tier as it writes (`assert_start_monotonic`)
-/// and returns that error immediately without finishing the writers -- the
-/// caller decides whether to retry with a sorted stream or propagate.
-///
-/// `PluginShardWriter::create` truncates its target path, so calling this
-/// twice at the same `warm_path`/`cold_path` (fast attempt, then sorted retry)
-/// is safe -- the first attempt's partial output is simply overwritten.
+fn target_partitions_from(raw: Option<&str>, runtime_default: usize) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|partitions| *partitions > 0)
+        .unwrap_or_else(|| runtime_default.max(2))
+}
+
 /// Session config for the tier-join passes.
 ///
 /// `schema_force_view_types` is DataFusion's default-on parquet behaviour of
@@ -180,10 +165,76 @@ fn retry_sort_memory_limit_bytes() -> usize {
 /// It also drops the `CAST(... AS Utf8View)` nodes the mismatch forced into
 /// the join keys.
 fn tier_join_config() -> SessionConfig {
-    SessionConfig::new().with_target_partitions(1).set_bool(
-        "datafusion.execution.parquet.schema_force_view_types",
-        false,
-    )
+    let config = SessionConfig::new();
+    // Production follows DataFusion's runtime default with a two-worker
+    // minimum. The override exists for controlled scaling measurements and
+    // operator debugging; invalid/zero values preserve the automatic default.
+    let target_partitions = target_partitions_from(
+        std::env::var(TARGET_PARTITIONS_ENV).ok().as_deref(),
+        config.target_partitions(),
+    );
+    config
+        .with_target_partitions(target_partitions)
+        .set_bool(
+            "datafusion.execution.parquet.schema_force_view_types",
+            false,
+        )
+        // Build a CollectLeft HashJoin candidate so the adaptive layer can
+        // inspect the exact build side DataFusion selected. It later flips
+        // only `prefer_hash_join` when that candidate does not fit, leaving
+        // repartitioning, sorting, spilling, and join execution to DataFusion.
+        .set_bool("datafusion.optimizer.prefer_hash_join", true)
+        .set_usize(
+            "datafusion.optimizer.hash_join_single_partition_threshold",
+            usize::MAX,
+        )
+        .set_usize(
+            "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+            usize::MAX,
+        )
+}
+
+/// Source-ingest configuration with the same automatic/user-selected
+/// parallelism as the downstream joins.
+///
+/// File-scan repartitioning is left enabled so plain CSV/TSV and Parquet can
+/// split large files into ordered byte/row-group ranges. Round-robin
+/// repartitioning is disabled because it destroys source order, which the
+/// keep-first dedup contract needs. Providers that cannot split an input (for
+/// example an unindexed VCF or the current BED provider) still correctly
+/// expose one physical partition; no caller-side `target_partitions = 1`
+/// restriction is imposed on providers that can parallelize.
+fn source_read_config(target_partitions: usize) -> SessionConfig {
+    SessionConfig::new()
+        .with_target_partitions(target_partitions)
+        .with_repartition_file_scans(true)
+        .set_bool("datafusion.optimizer.enable_round_robin_repartition", false)
+}
+
+/// Execute all normalized source partitions concurrently, then replay their
+/// batches in physical partition order.
+///
+/// `DataFrame::execute_stream()` inserts `CoalescePartitionsExec`, which emits
+/// whichever partition produces a batch first and therefore loses source-file
+/// order. `collect_partitioned()` also runs every partition concurrently, but
+/// DataFusion explicitly sorts the completed results by partition index. File
+/// scans and the indexed genomic partition balancer assign ranges in source
+/// order, so flattening that outer vector restores the deterministic order
+/// required by `dedup_keep_first` without serializing parsing.
+async fn ordered_parallel_source_stream(
+    df: DataFrame,
+) -> Result<(SendableRecordBatchStream, usize)> {
+    let schema: SchemaRef = df.schema().inner().clone();
+    let partitions = df.collect_partitioned().await?;
+    let partition_count = partitions.len();
+    let batches = partitions.into_iter().flatten().map(Ok);
+    Ok((
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        )),
+        partition_count,
+    ))
 }
 
 /// Deletes the build's scratch shards unless the build reached the point of
@@ -191,7 +242,7 @@ fn tier_join_config() -> SessionConfig {
 ///
 /// `PluginShardWriter::create` truncates, so a leftover `.tmp` is harmless to
 /// the *next* build -- but a build that dies partway (a full disk during
-/// `writer.write`, an order violation the retry also fails) would otherwise
+/// `writer.write`, or a failed Hash-to-SMJ retry) would otherwise
 /// leave up to two chromosome-sized scratch files behind, on the same disk
 /// whose exhaustion caused the failure. Every early return from
 /// `build_plugin_chrom` past the point the paths are chosen runs this.
@@ -221,6 +272,12 @@ impl Drop for ScratchGuard {
     }
 }
 
+/// Consume `stream`, split rows by `tier` into warm (0) / cold (1), and write
+/// each run through its own `PluginShardWriter`. The monotonicity check is a
+/// final assertion of the adaptive plan's explicit sorted-output contract.
+///
+/// `PluginShardWriter::create` truncates its target path, so a runtime
+/// Hash-to-SMJ fallback safely overwrites any partial first attempt.
 async fn write_tiered_shard(
     mut stream: SendableRecordBatchStream,
     out_schema: &SchemaRef,
@@ -301,16 +358,13 @@ pub async fn build_plugin_chrom(
     // chr6's multi-hour "is it stuck?" investigation (no visibility into
     // which stage was running) into a 30-second log check.
     let t_start = Instant::now();
-    // Read context: single partition ONLY for the source scan → normalize →
-    // dedup leg, so the CSV scan yields rows in source-file order (a
-    // multi-partition scan reads byte ranges concurrently and coalescing does not
-    // restore file order). The dedup needs that order to keep VEP's first-in-file
-    // record for a duplicate probe key (see `dedup::dedup_keep_first`). The
-    // downstream tier join + write run in a separate, default-parallel context
-    // (`build_ctx` below) since post-dedup there is one row per key and order no
-    // longer matters — so only this cheap read leg is serialized, not the join
-    // over the (multi-GB) variation shard.
-    let read_ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    let build_config = tier_join_config();
+    // Source parsing uses the same adaptive/user-selected parallelism as the
+    // downstream joins. Batches are collected concurrently per physical
+    // partition and replayed in source-range order below, preserving VEP's
+    // first-in-file duplicate semantics without a blanket serial scan.
+    let read_ctx =
+        SessionContext::new_with_config(source_read_config(build_config.target_partitions()));
     read_ctx.register_udf(canonical_contig_udf());
     // Held until this chrom's stream is fully materialized (dedup) below, then
     // dropped (deleting the decompressed temp) — so build_all keeps at most one temp.
@@ -359,13 +413,11 @@ pub async fn build_plugin_chrom(
     // the tier join (which reorders rows and would destroy the file-order
     // tiebreak). Two overlapping genes can map the same genomic variant + aa-change
     // to different scores; VEP takes the first-in-file record, so we must too. This
-    // reads the (single-partition, file-ordered) normalized stream and keeps the
-    // first row per `(start, allele_string, <match cols>)`.
-    let norm_stream = read_ctx
-        .sql(&format!("SELECT * FROM {norm_view}"))
-        .await?
-        .execute_stream()
-        .await?;
+    // executes the source partitions concurrently, restores physical
+    // partition order, and keeps the first row per
+    // `(start, allele_string, <match cols>)`.
+    let norm_df = read_ctx.sql(&format!("SELECT * FROM {norm_view}")).await?;
+    let (norm_stream, source_partitions) = ordered_parallel_source_stream(norm_df).await?;
     let norm_schema = norm_stream.schema();
     // `assume_unique` sources are claimed to never repeat a probe key, so the
     // exhaustive keep-first pass (a HashSet<String> with one entry per row —
@@ -383,31 +435,31 @@ pub async fn build_plugin_chrom(
     drop(src_temps);
     let read_rows: usize = deduped.iter().map(|b| b.num_rows()).sum();
     info!(
-        "plugin_cache[{}/{chrom}]: read+normalize+dedup done, {read_rows} rows, {:.1}s elapsed",
+        "plugin_cache[{}/{chrom}]: read+normalize+dedup done, {read_rows} rows, \
+         source_partitions={source_partitions}, {:.1}s elapsed",
         src.plugin_name,
         t_start.elapsed().as_secs_f64()
     );
 
-    // Build context: single partition, same reasoning as `read_ctx` above — the
-    // streaming write below (see `tiered_stream` consumption) relies on the join
-    // emitting rows in the same position-ascending order the dedup pass fed it,
-    // so it never has to buffer more than one batch. With `target_partitions=1`
-    // there is exactly one task for the whole join, so HashJoinExec has no
-    // opportunity to reorder rows across partitions. The join's build side
-    // (`plugin_variation_probe`, DISTINCT-projected and typically far smaller
-    // than the plugin's own per-chrom row count for whole-genome plugins like
-    // CADD/SpliceAI) is unaffected by this — it's still a single hash-table
-    // build regardless of partition count. The deduped survivors are
-    // re-registered here as a MemTable the join consumes in place of the raw
-    // normalized view.
-    // Kept for the sorted retry below (see the fast/retry split further down):
-    // cloning a `Vec<RecordBatch>` only clones the `Arc`-backed column data,
-    // not the underlying buffers, so holding a second copy here is cheap
-    // regardless of chromosome size.
-    let deduped_for_retry = deduped.clone();
-    let build_ctx = SessionContext::new_with_config(tier_join_config());
+    // The join and ORDER BY share one bounded spill pool. TracingPool is always
+    // installed because it also attributes a rejected reservation to the
+    // operator that requested it; detailed peak logging remains opt-in.
+    mem_trace::describe_batches(
+        "plugin dedup output (join build side when not swapped)",
+        &deduped,
+    );
+    let base_pool: Arc<dyn MemoryPool> =
+        Arc::new(FairSpillPool::new(retry_sort_memory_limit_bytes()));
+    let tracer = Arc::new(mem_trace::TracingPool::new(Arc::clone(&base_pool)));
+    let pool: Arc<dyn MemoryPool> = Arc::clone(&tracer) as _;
+    let build_runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()
+        .map_err(|e| DataFusionError::Execution(format!("tier runtime env: {e}")))?;
+    let deduped = partition_batches(deduped, build_config.target_partitions());
+    let build_ctx = SessionContext::new_with_config_rt(build_config, build_runtime);
     let dedup_view = format!("plugin_{}_dedup", src.plugin_name);
-    let mem = MemTable::try_new(norm_schema.clone(), vec![deduped])
+    let mem = MemTable::try_new(norm_schema.clone(), deduped)
         .map_err(|e| DataFusionError::Execution(format!("dedup memtable: {e}")))?;
     build_ctx.register_table(&dedup_view, Arc::new(mem))?;
 
@@ -421,83 +473,59 @@ pub async fn build_plugin_chrom(
     let cold_tmp = plugin_dir.join(format!("{file_name}.cold.tmp"));
     let mut scratch = ScratchGuard::new([warm_tmp.clone(), cold_tmp.clone()]);
 
-    // Stream the tiered join output straight into two per-tier temp shards
-    // (warm run, cold run) instead of collecting the whole chromosome into one
-    // Vec<RecordBatch>, concat_batches-ing it into a single allocation, and
-    // sorting it in memory. That collect+concat+sort was the dominant remaining
-    // memory cost after `assume_unique` removed the dedup HashSet, and still
-    // OOM'd on the largest chromosomes (chr7, chr8, chrX for CADD). This keeps
-    // peak memory at O(one batch) instead of O(whole chromosome) -- this is
-    // the fast path, and it's correct as long as the plugin's own input
-    // already arrives position-ascending (see the module doc for why that's
-    // enough, regardless of the plugin's size relative to the variation
-    // shard). `write_tiered_shard`'s `assert_start_monotonic` check catches it
-    // directly if that assumption doesn't hold, and the fallback below
-    // re-runs the join with an explicit sort instead of failing.
-    let fast_stream = tiered_stream(&build_ctx, &dedup_view, variation_shard).await?;
-    let (warm, cold) = match write_tiered_shard(
-        fast_stream,
+    // Execute the explicitly sorted parallel plan and stream it into two
+    // per-tier temp shards. If a HashJoin estimate was optimistic, retry only
+    // when the root error is ResourcesExhausted and the pool attributes the
+    // rejected reservation to HashJoinInput. Other failures propagate as-is.
+    let adaptive = match tiered_stream_sorted_adaptive(
+        &build_ctx,
+        &dedup_view,
+        variation_shard,
+        pool.as_ref(),
+        tracer.as_ref(),
+    )
+    .await
+    {
+        Ok(adaptive) => adaptive,
+        Err(error) => {
+            tracer.report();
+            return Err(error);
+        }
+    };
+    let algorithm = adaptive.algorithm;
+    let written = write_tiered_shard(
+        adaptive.stream,
         &out_schema,
         &warm_tmp,
         &cold_tmp,
         chrom,
         &src.plugin_name,
     )
-    .await
-    {
-        Ok(counts) => counts,
-        Err(e) if is_order_violation(&e) => {
-            // The plugin's input wasn't globally position-ascending by the
-            // time it reached the join (see the module doc), so a miss row
-            // surfaced out of order. Re-run with `ORDER BY` on a session
-            // whose memory pool can spill to disk -- this is the exception,
-            // not the common case the O(1)-memory streaming write above is
-            // optimized for.
+    .await;
+    let written = match written {
+        Err(error) if should_retry_hash_join(&error, algorithm, tracer.as_ref()) => {
             info!(
-                "plugin_cache[{}/{chrom}]: tier join did not preserve row order \
-                 ({read_rows} plugin rows this chrom) -- retrying with an explicit sort",
+                "plugin_cache[{}/{chrom}]: tier HashJoin exhausted its reservation \
+                 ({read_rows} plugin rows this chrom) -- retrying with DataFusion SortMergeJoin",
                 src.plugin_name
             );
-            // Wrap the pool when tracing is on: the exhaustion error names the
-            // consumer ("HashJoinInput") and this plan has two joins under that
-            // name, so only per-reservation tracking can say which one consumed
-            // the budget.
-            let base_pool: Arc<dyn MemoryPool> =
-                Arc::new(FairSpillPool::new(retry_sort_memory_limit_bytes()));
-            let tracer = mem_trace::tracing_enabled()
-                .then(|| Arc::new(mem_trace::TracingPool::new(Arc::clone(&base_pool))));
-            let pool: Arc<dyn MemoryPool> = match &tracer {
-                Some(t) => Arc::clone(t) as _,
-                None => Arc::clone(&base_pool),
-            };
-            let sort_runtime = RuntimeEnvBuilder::new()
-                .with_memory_pool(pool)
-                .build_arc()
-                .map_err(|e| DataFusionError::Execution(format!("retry runtime env: {e}")))?;
-            let sort_ctx = SessionContext::new_with_config_rt(tier_join_config(), sort_runtime);
-            let sort_mem = MemTable::try_new(norm_schema, vec![deduped_for_retry])
-                .map_err(|e| DataFusionError::Execution(format!("retry dedup memtable: {e}")))?;
-            sort_ctx.register_table(&dedup_view, Arc::new(sort_mem))?;
-            let sorted_stream =
-                tiered_stream_sorted(&sort_ctx, &dedup_view, variation_shard).await?;
-            let written = write_tiered_shard(
-                sorted_stream,
+            let merge_stream =
+                tiered_stream_sorted_sort_merge(&build_ctx, &dedup_view, tracer.as_ref()).await?;
+            write_tiered_shard(
+                merge_stream,
                 &out_schema,
                 &warm_tmp,
                 &cold_tmp,
                 chrom,
                 &src.plugin_name,
             )
-            .await;
-            // Report before propagating: the peak table is the whole point of
-            // tracing a build that ran out of memory.
-            if let Some(t) = &tracer {
-                t.report();
-            }
-            written?
+            .await
         }
-        Err(e) => return Err(e),
+        result => result,
     };
+    // Report before propagating: the peak table is most useful on failure.
+    tracer.report();
+    let (warm, cold) = written?;
     info!(
         "plugin_cache[{}/{chrom}]: tier-join+write done, warm={warm} cold={cold}, {:.1}s elapsed",
         src.plugin_name,
@@ -579,7 +607,7 @@ pub async fn build_plugin_chrom(
 mod tests {
     use super::*;
     use crate::plugin_cache::source_manifest::SourceManifest;
-    use datafusion::arrow::array::{Int8Array, StringArray, UInt32Array};
+    use datafusion::arrow::array::{Float32Array, Int8Array, Int64Array, StringArray, UInt32Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use std::io::Write;
@@ -830,9 +858,8 @@ type = "Float32"
 
     // `write_tiered_shard` must surface a genuine reorder as the same
     // "not position-ascending" error `assert_start_monotonic` raises directly
-    // (this is what `build_plugin_chrom` pattern-matches on via
-    // `is_order_violation` to decide whether to retry with a sort), and it
-    // must do so without finishing the writers on the failing tier.
+    // The writer must still reject a broken sorted-output contract rather than
+    // silently creating a page directory whose lookups can miss rows.
     #[test]
     fn retry_memory_limit_defaults_and_honours_the_env_override() {
         // Serial within one test: these mutate process-wide env.
@@ -870,6 +897,79 @@ type = "Float32"
             limit > 2 * 1557 * 1024 * 1024,
             "must clear the measured dbNSFP join with headroom"
         );
+    }
+
+    #[test]
+    fn target_partitions_default_and_benchmark_override() {
+        assert_eq!(target_partitions_from(None, 1), 2);
+        assert_eq!(target_partitions_from(None, 16), 16);
+        for partitions in [1usize, 2, 4, 8] {
+            let raw = partitions.to_string();
+            assert_eq!(target_partitions_from(Some(&raw), 16), partitions);
+        }
+        assert_eq!(target_partitions_from(Some("0"), 16), 16);
+        assert_eq!(target_partitions_from(Some("invalid"), 16), 16);
+    }
+
+    #[test]
+    fn source_reads_use_requested_parallelism_without_round_robin_reordering() {
+        let config = source_read_config(8);
+        assert_eq!(config.target_partitions(), 8);
+        assert!(config.options().optimizer.repartition_file_scans);
+        assert!(!config.options().optimizer.enable_round_robin_repartition);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ordered_parallel_source_replay_preserves_keep_first_across_partitions() {
+        fn normalized_batch(score: f32) -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("chrom", DataType::Utf8, false),
+                    Field::new("start", DataType::Int64, false),
+                    Field::new("end", DataType::Int64, false),
+                    Field::new("allele_string", DataType::Utf8, false),
+                    Field::new("protein_variant", DataType::Utf8, false),
+                    Field::new("am_pathogenicity", DataType::Float32, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec!["1"])),
+                    Arc::new(Int64Array::from(vec![100i64])),
+                    Arc::new(Int64Array::from(vec![100i64])),
+                    Arc::new(StringArray::from(vec!["A/G"])),
+                    Arc::new(StringArray::from(vec!["K1R"])),
+                    Arc::new(Float32Array::from(vec![score])),
+                ],
+            )
+            .unwrap()
+        }
+
+        let first = normalized_batch(0.1);
+        let later = normalized_batch(0.9);
+        let schema = first.schema();
+        let ctx = SessionContext::new_with_config(source_read_config(2));
+        ctx.register_table(
+            "normalized",
+            Arc::new(
+                MemTable::try_new(schema, vec![vec![first], vec![later]])
+                    .expect("two source partitions"),
+            ),
+        )
+        .unwrap();
+
+        let df = ctx.table("normalized").await.unwrap();
+        let (stream, source_partitions) = ordered_parallel_source_stream(df).await.unwrap();
+        assert_eq!(source_partitions, 2);
+        let deduped = dedup_keep_first(stream, &["protein_variant".into()])
+            .await
+            .unwrap();
+        assert_eq!(deduped.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let score = deduped[0]
+            .column(deduped[0].schema().index_of("am_pathogenicity").unwrap())
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(score, 0.1, "partition zero's source row must win");
     }
 
     #[test]
@@ -941,7 +1041,10 @@ type = "Float32"
         let err = write_tiered_shard(stream, &schema, &warm, &cold, "1", "demo")
             .await
             .unwrap_err();
-        assert!(is_order_violation(&err), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("is not position-ascending"),
+            "unexpected error: {err}"
+        );
     }
 
     // C1 regression, end-to-end: `HashJoinExec`'s `CollectLeft` mode collects
@@ -957,7 +1060,7 @@ type = "Float32"
     // just asserted) via a temporary EXPLAIN probe against this exact
     // mechanism before writing this test.
     //
-    // `build_plugin_chrom` must recover from that with a sort, not hard-fail.
+    // `build_plugin_chrom` must make the parallel result globally sorted.
     #[tokio::test(flavor = "multi_thread")]
     async fn sparse_plugin_with_disordered_source_still_builds_sorted() {
         let dir = tempfile::tempdir().unwrap();
@@ -973,11 +1076,11 @@ type = "Float32"
         write_gz(&tsv, &tsv_body);
 
         // Variation shard: none of the plugin's positions have an entry, so
-        // every plugin row misses (tier=1/cold) -- cold-row emission order
-        // follows the plugin's own (here: descending) row order, reproducing
-        // a genuine `assert_start_monotonic` violation. The other 5000 rows
-        // are unrelated positions, matching production's scale (chr22's
-        // variation shard vs. ClinVar's row count is a ~157x skew).
+        // every plugin row misses (tier=1/cold). This made the old unsorted
+        // HashJoin path emit descending cold rows; the adaptive parallel path
+        // must satisfy its explicit ORDER BY contract. The other 5000 rows are
+        // unrelated positions, matching production's scale (chr22's variation
+        // shard vs. ClinVar's row count is a ~157x skew).
         let mut var_rows: Vec<(&str, u32, String, i8)> = Vec::new();
         for i in 0..5000u32 {
             var_rows.push(("1", 10_000_000 + i, "C/T".to_string(), 1i8));

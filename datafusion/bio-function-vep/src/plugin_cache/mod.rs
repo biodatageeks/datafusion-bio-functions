@@ -13,6 +13,7 @@ pub mod cache_manifest;
 pub mod csq;
 pub mod dedup;
 pub mod join;
+mod join_strategy;
 pub mod lookup;
 pub mod mem_trace;
 pub mod normalize;
