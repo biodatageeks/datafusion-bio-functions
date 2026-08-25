@@ -5,6 +5,9 @@
 
 use std::path::Path;
 
+use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
@@ -58,10 +61,66 @@ pub async fn tiered_stream_sorted(
     tiered_stream_impl(ctx, normalized_view, variation_shard, true).await
 }
 
-/// Rows per materialized probe batch. Each batch is built by its own `concat`,
-/// so it owns its buffers; the size is a balance between allocation count and
-/// keeping a single batch small enough to stay cheap to copy.
-const PROBE_BATCH_ROWS: usize = 1024 * 1024;
+/// Concatenate `parts` into a batch that owns its buffers even when there is
+/// only one part. Arrow's one-input `concat_batches` fast path is zero-copy, so
+/// split that input into two logical parts to force the normal copying path.
+fn concat_probe_parts_owned(schema: &SchemaRef, parts: &[RecordBatch]) -> Result<RecordBatch> {
+    debug_assert!(!parts.is_empty());
+    if parts.len() == 1 {
+        let batch = &parts[0];
+        let midpoint = batch.num_rows() / 2;
+        let first = batch.slice(0, midpoint);
+        let second = batch.slice(midpoint, batch.num_rows() - midpoint);
+        Ok(concat_batches(schema, [&first, &second])?)
+    } else {
+        Ok(concat_batches(schema, parts)?)
+    }
+}
+
+/// Copy input into independently allocated batches no larger than the
+/// execution batch size. DataFusion 53 wraps MemTables in `BatchSplitStream`;
+/// oversized parents would otherwise be split into zero-copy children and the
+/// hash join would reserve the full parent once per child.
+fn rechunk_probe_owned(
+    schema: &SchemaRef,
+    input: Vec<RecordBatch>,
+    target_rows: usize,
+) -> Result<Vec<RecordBatch>> {
+    if target_rows == 0 {
+        return datafusion::common::exec_err!("probe materialization batch size must be non-zero");
+    }
+
+    let total_rows: usize = input.iter().map(RecordBatch::num_rows).sum();
+    let mut output = Vec::with_capacity(total_rows.div_ceil(target_rows));
+    let mut parts = Vec::new();
+    let mut part_rows = 0usize;
+
+    for batch in input {
+        let mut offset = 0usize;
+        while offset < batch.num_rows() {
+            let take = (target_rows - part_rows).min(batch.num_rows() - offset);
+            parts.push(batch.slice(offset, take));
+            part_rows += take;
+            offset += take;
+
+            if part_rows == target_rows {
+                output.push(concat_probe_parts_owned(schema, &parts)?);
+                parts.clear();
+                part_rows = 0;
+            }
+        }
+    }
+
+    if part_rows != 0 {
+        output.push(concat_probe_parts_owned(schema, &parts)?);
+    }
+    debug_assert_eq!(
+        output.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        total_rows
+    );
+    debug_assert!(output.iter().all(|batch| batch.num_rows() <= target_rows));
+    Ok(output)
+}
 
 /// Replace the `plugin_variation_probe` view with an equivalent table whose
 /// batches own their buffers.
@@ -75,37 +134,23 @@ const PROBE_BATCH_ROWS: usize = 1024 * 1024;
 /// 1791 batches, a 31.7x over-count. The same scan WITHOUT the `GROUP BY`
 /// accounts at exactly 1.0x, so this is the aggregate's doing, not the scan's.
 ///
-/// That over-count is what made CADD chr21 unbuildable: the tier join's build
-/// side is this probe (its plan swaps to `join_type=Right` because 120M plugin
-/// rows dwarf the 10.8M-row probe), so the join reserved ~6.8 GB for ~200 MB of
-/// data and exhausted any pool it was given.
+/// CADD exposes this because the tier join's build side is this probe (its plan
+/// swaps to `join_type=Right` because 120M plugin rows dwarf the 10.8M-row
+/// probe). An earlier 1,048,576-row materialization removed the aggregate's
+/// sharing, but DataFusion's MemTable scan split each parent into 128 zero-copy
+/// 8,192-row slices and charged the full parent for every slice. The resulting
+/// reservation exceeded 20 GB for ~180 MB of distinct probe buffers.
 ///
-/// Materializing with a `concat` per batch gives each batch fresh, unshared
-/// buffers, so the reservation matches reality. It also lifts the aggregate out
-/// of the join plan, so it runs once and the optimizer sees exact statistics
-/// for the side it is choosing.
+/// Materializing into owned batches no larger than the execution batch size
+/// gives each batch fresh, unshared buffers and prevents DataFusion 53 from
+/// re-slicing large MemTable parents into zero-copy children. The reservation
+/// therefore matches reality. It also lifts the aggregate out of the join plan,
+/// so it runs once and the optimizer sees exact statistics for side selection.
 async fn materialize_probe(ctx: &SessionContext) -> Result<()> {
-    use datafusion::arrow::compute::concat_batches;
-
     let df = ctx.sql("SELECT * FROM plugin_variation_probe").await?;
-    let schema: datafusion::arrow::datatypes::SchemaRef = df.schema().inner().clone();
+    let schema: SchemaRef = df.schema().inner().clone();
     let collected = df.collect().await?;
-
-    let mut batches = Vec::new();
-    let mut group = Vec::new();
-    let mut rows = 0usize;
-    for batch in collected {
-        rows += batch.num_rows();
-        group.push(batch);
-        if rows >= PROBE_BATCH_ROWS {
-            batches.push(concat_batches(&schema, &group)?);
-            group.clear();
-            rows = 0;
-        }
-    }
-    if !group.is_empty() {
-        batches.push(concat_batches(&schema, &group)?);
-    }
+    let batches = rechunk_probe_owned(&schema, collected, ctx.copied_config().batch_size())?;
 
     ctx.deregister_table("plugin_variation_probe")?;
     ctx.register_table(
@@ -347,5 +392,132 @@ mod tests {
         // value column preserved, variation columns dropped
         assert!(b.schema().index_of("demo_score").is_ok());
         assert!(b.schema().index_of("tier").is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owned_probe_chunks_are_not_resplit_or_overcounted() {
+        use datafusion::common::utils::memory::get_record_batch_memory_size;
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::memory_pool::FairSpillPool;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::SessionConfig;
+
+        const EXECUTION_BATCH_ROWS: usize = 8192;
+        const PARENT_ROWS: usize = 1024 * 1024;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::UInt32,
+            false,
+        )]));
+        let parent = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(
+                (0..PARENT_ROWS).map(|value| value as u32),
+            ))],
+        )
+        .unwrap();
+        let parent_size = get_record_batch_memory_size(&parent);
+
+        // Model aggregate output: execution-sized zero-copy slices retaining
+        // one large parent. Rechunking must copy even though each output group
+        // consists of exactly one input slice.
+        let shared_chunks = (0..PARENT_ROWS)
+            .step_by(EXECUTION_BATCH_ROWS)
+            .map(|offset| parent.slice(offset, EXECUTION_BATCH_ROWS))
+            .collect();
+        let owned_chunks =
+            rechunk_probe_owned(&schema, shared_chunks, EXECUTION_BATCH_ROWS).unwrap();
+        assert_eq!(owned_chunks.len(), PARENT_ROWS / EXECUTION_BATCH_ROWS);
+        assert!(
+            owned_chunks
+                .iter()
+                .all(|batch| batch.num_rows() <= EXECUTION_BATCH_ROWS)
+        );
+        assert_eq!(
+            owned_chunks
+                .iter()
+                .map(get_record_batch_memory_size)
+                .sum::<usize>(),
+            parent_size
+        );
+
+        // DataSourceExec must emit the owned batches unchanged and retain 1x
+        // accounting, rather than turning large parents into shared slices.
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "owned_probe",
+            Arc::new(MemTable::try_new(schema.clone(), vec![owned_chunks.clone()]).unwrap()),
+        )
+        .unwrap();
+        let executed = ctx
+            .sql("SELECT * FROM owned_probe")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(executed.len(), PARENT_ROWS / EXECUTION_BATCH_ROWS);
+        assert_eq!(
+            executed
+                .iter()
+                .map(get_record_batch_memory_size)
+                .sum::<usize>(),
+            parent_size
+        );
+
+        // Confirm the exact CADD plan shape now fits a bounded pool far below
+        // the old 128x (512 MiB) reservation.
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(FairSpillPool::new(64 * 1024 * 1024)))
+            .build_arc()
+            .unwrap();
+        let bounded_ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new().with_target_partitions(1),
+            runtime,
+        );
+        bounded_ctx
+            .register_table(
+                "owned_probe",
+                Arc::new(MemTable::try_new(schema.clone(), vec![owned_chunks]).unwrap()),
+            )
+            .unwrap();
+        bounded_ctx
+            .register_batch(
+                "plugin",
+                RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(UInt32Array::from_iter_values(
+                        (0..(2 * PARENT_ROWS)).map(|value| value as u32),
+                    ))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let joined = bounded_ctx
+            .sql(
+                "SELECT p.value FROM plugin p \
+                 LEFT JOIN owned_probe o ON p.value = o.value",
+            )
+            .await
+            .unwrap();
+        let plan = joined.clone().create_physical_plan().await.unwrap();
+        assert!(
+            displayable(plan.as_ref())
+                .indent(true)
+                .to_string()
+                .contains("mode=CollectLeft, join_type=Right")
+        );
+        assert_eq!(
+            joined
+                .collect()
+                .await
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2 * PARENT_ROWS
+        );
     }
 }

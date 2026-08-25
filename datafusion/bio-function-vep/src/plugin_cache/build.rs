@@ -132,13 +132,10 @@ fn is_order_violation(e: &DataFusionError) -> bool {
 /// and failing the build outright. 8 GiB clears it with room to spare (peak
 /// RSS 1.7 GB, builds in 0.2 min) while still bounding a runaway plan.
 ///
-/// This does NOT fix CADD, and no pool size does. Its reservation grows to
-/// consume whatever budget it is given -- 2.03 GB at a 2 GiB pool, 6.4 GB at
-/// 8 GiB, 22.6 GB at 24 GiB -- and fails each time asking for the same
-/// 592.7 MB increment, while peak RSS plateaus around 17 GB. So the
-/// accounting outruns what is actually materialized, and raising the ceiling
-/// only moves the failure. See the tier-join analysis on PR #217; the fix
-/// there is structural, not a bigger number.
+/// CADD also fits this budget once `materialize_probe` copies its build input
+/// into execution-sized owned batches. Before that structural fix, DataFusion
+/// 53 repeatedly charged shared backing buffers and exhausted every tested
+/// ceiling while RSS stayed flat; raising this default only moved the failure.
 const DEFAULT_RETRY_SORT_MEMORY_MIB: usize = 8 * 1024;
 
 /// Env override for [`DEFAULT_RETRY_SORT_MEMORY_MIB`], in MiB.
