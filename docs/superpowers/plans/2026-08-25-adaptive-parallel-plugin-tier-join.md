@@ -89,7 +89,7 @@ Adaptive decision B: final LEFT tier join
         `-- SortMergeJoin context (parallel, bounded/spillable)
         |
         v
-explicit ORDER BY start -> warm/cold writers
+explicit ORDER BY tier, start -> direct atomic Parquet writer
 ```
 
 The two decisions are mandatory. Adapting only the final join leaves the probe

@@ -39,11 +39,13 @@ pub fn tier_sql(normalized_view: &str, variation_probe: &str) -> String {
     )
 }
 
-/// Same join, with an explicit `ORDER BY` so the output is position-ascending
-/// regardless of the chosen join algorithm or execution partition count.
+/// Same join, with the exact physical shard order: warm rows first, then cold,
+/// and position-ascending inside each tier. This lets the consumer write one
+/// Parquet file directly instead of encoding two tier files and decoding them
+/// again for a final merge.
 pub fn tier_sql_sorted(normalized_view: &str, variation_probe: &str) -> String {
     format!(
-        "{} ORDER BY p.start",
+        "SELECT * FROM ({}) tiered ORDER BY tier, start",
         tier_sql(normalized_view, variation_probe)
     )
 }
@@ -59,8 +61,8 @@ pub async fn tiered_stream(
     tiered_stream_impl(ctx, normalized_view, variation_shard, false).await
 }
 
-/// Same as `tiered_stream`, but the output is guaranteed position-ascending on
-/// `start` (see `tier_sql_sorted`).
+/// Same as `tiered_stream`, but output is guaranteed lexicographically sorted
+/// by `(tier, start)` (see `tier_sql_sorted`).
 pub async fn tiered_stream_sorted(
     ctx: &SessionContext,
     normalized_view: &str,
@@ -319,7 +321,7 @@ async fn materialize_probe_adaptive(
 
 async fn register_variation_probe_view(
     ctx: &SessionContext,
-    normalized_view: &str,
+    variation_key_view: &str,
     variation_shard: &Path,
 ) -> Result<()> {
     let shard = variation_shard.to_string_lossy();
@@ -348,9 +350,9 @@ async fn register_variation_probe_view(
         // fan out, which is a (data-dependent) join-skew risk this GROUP BY
         // removes entirely rather than merely reduces.
         //
-        // The inner JOIN against a DISTINCT projection of the plugin's own
-        // per-chromosome keys is a semi-join emulation that restricts the
-        // aggregation to keys the plugin table actually has, computed BEFORE
+        // The LEFT SEMI JOIN against the plugin's own per-chromosome keys
+        // restricts the aggregation to keys the plugin table actually has,
+        // computed BEFORE
         // the `GROUP BY` rather than after: for a sparse plugin (far fewer
         // rows than the chromosome's full variation shard), grouping the
         // *entire* shard
@@ -358,13 +360,14 @@ async fn register_variation_probe_view(
         // JOIN below never uses (variation rows with no matching plugin key
         // can never survive a `p.*`-projected LEFT JOIN regardless).
         // Semantically a no-op — this narrows which rows get grouped, not
-        // which key wins ties or what a hit resolves to. The DISTINCT makes
-        // the plugin-side key unique, preventing duplicate plugin keys from
-        // multiplying rows before the variation GROUP BY collapses them.
+        // which key wins ties or what a hit resolves to. A true semi join
+        // cannot multiply variation rows when a plugin key is duplicated, so
+        // it removes the DISTINCT aggregate and its shared-buffer output from
+        // directly below the join while preserving the previous semantics.
         "CREATE OR REPLACE VIEW plugin_variation_probe AS \
          SELECT v.start, v.allele_string, MIN(v.tier) AS tier \
          FROM plugin_variation_raw v \
-         INNER JOIN (SELECT DISTINCT start, allele_string FROM {normalized_view}) p \
+         LEFT SEMI JOIN {variation_key_view} p \
          ON v.start = p.start AND v.allele_string = p.allele_string \
          GROUP BY v.start, v.allele_string"
     ))
@@ -407,11 +410,12 @@ async fn tiered_stream_impl(
 pub(crate) async fn tiered_stream_sorted_adaptive(
     ctx: &SessionContext,
     normalized_view: &str,
+    variation_key_view: &str,
     variation_shard: &Path,
     pool: &dyn MemoryPool,
     tracer: &TracingPool,
 ) -> Result<AdaptiveTieredStream> {
-    register_variation_probe_view(ctx, normalized_view, variation_shard).await?;
+    register_variation_probe_view(ctx, variation_key_view, variation_shard).await?;
     materialize_probe_adaptive(ctx, pool, tracer).await?;
 
     let sql = tier_sql_sorted(normalized_view, "plugin_variation_probe");
@@ -745,6 +749,7 @@ mod tests {
         let adaptive = tiered_stream_sorted_adaptive(
             &ctx,
             "plugin_demo_norm",
+            "plugin_demo_norm",
             &variation_path,
             tracer.as_ref(),
             tracer.as_ref(),
@@ -859,6 +864,81 @@ mod tests {
         // absence from `plugin_variation_raw`'s post-semi-join scan is the
         // thing under test, not something directly observable in the output.
         assert_eq!(rows, vec![(100, 0), (300, 1)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn variation_probe_uses_true_semi_join_without_distinct_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let variation_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("tier", DataType::Int8, false),
+        ]));
+        let variation = RecordBatch::try_new(
+            variation_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1", "1"])),
+                Arc::new(UInt32Array::from(vec![100u32, 100, 999])),
+                Arc::new(StringArray::from(vec!["A/G", "A/G", "C/T"])),
+                Arc::new(Int8Array::from(vec![1i8, 0, 0])),
+            ],
+        )
+        .unwrap();
+        let variation_path = dir.path().join("variation.parquet");
+        let file = std::fs::File::create(&variation_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, variation_schema, None).unwrap();
+        writer.write(&variation).unwrap();
+        writer.close().unwrap();
+
+        // Duplicate right-side keys must not multiply the variation rows.
+        let key_schema = Arc::new(Schema::new(vec![
+            Field::new("start", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+        ]));
+        let keys = RecordBatch::try_new(
+            key_schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![100u32, 100])),
+                Arc::new(StringArray::from(vec!["A/G", "A/G"])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_batch("plugin_keys", keys).unwrap();
+        register_variation_probe_view(&ctx, "plugin_keys", &variation_path)
+            .await
+            .unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM plugin_variation_probe")
+            .await
+            .unwrap();
+        let logical = df.logical_plan().display_indent().to_string();
+        assert!(
+            logical.contains("LeftSemi Join"),
+            "unexpected plan:\n{logical}"
+        );
+        assert_eq!(
+            logical.matches("Aggregate:").count(),
+            1,
+            "the MIN(tier) aggregation should be the only aggregate:\n{logical}"
+        );
+
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let batch = &batches[0];
+        let starts = batch
+            .column(batch.schema().index_of("start").unwrap())
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let tiers = batch
+            .column(batch.schema().index_of("tier").unwrap())
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap();
+        assert_eq!((starts.value(0), tiers.value(0)), (100, 0));
     }
 
     #[tokio::test(flavor = "multi_thread")]

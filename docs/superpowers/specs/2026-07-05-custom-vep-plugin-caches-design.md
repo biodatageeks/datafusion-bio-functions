@@ -304,18 +304,18 @@ verbatim. Concrete parameters:
 
 **Sort-key contract.** The PageDir search key is `start` within a tier run —
 **identical to variation's `(tier, start)`**. `allele_string` is **not** a PageDir
-search key: rows sharing a `start` are additionally ordered by `allele_string` for
-deterministic, byte-stable output, but allele disambiguation happens in the
-`scan` decode step (probe filters the candidate rows by `allele_string`), exactly
-as the variation lookup filters alleles after resolving position. Only `tier` and
-`start` are declared as `SortingColumn`s. All sort keys are top-level primitives,
-so leaf index == field index (the `point_lookup_writer_properties` assumption
-holds).
+search key: rows sharing a `start` need no additional physical ordering because
+allele disambiguation happens in the `scan` decode step (the probe filters
+candidate rows by `allele_string`), exactly as the variation lookup filters
+alleles after resolving position. Only `tier` and `start` are declared as
+`SortingColumn`s. All sort keys are top-level primitives, so leaf index == field
+index (the `point_lookup_writer_properties` assumption holds).
 
-The physical shape mirrors variation's two-pass write: warm run (tier 0) first,
-cold run (tier 1) second, each written in `start`-ascending order by the source
-`ORDER BY` — the writer never re-sorts across the run boundary, which is what
-gives the PageDir its two monotonic segments.
+The tier query emits the final physical order directly with
+`ORDER BY tier, start`: warm run (tier 0) first, cold run (tier 1) second, and
+`start` ascending within each run. The result is streamed once into a sibling
+`.build.tmp` Parquet file and atomically renamed after its footer is flushed.
+There are no per-tier Parquet intermediates and no decode/re-encode merge pass.
 
 ## 5. Runtime lookup & CSQ injection
 

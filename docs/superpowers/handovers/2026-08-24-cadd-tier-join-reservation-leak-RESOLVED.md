@@ -264,3 +264,52 @@ peaks: `ExternalSorter` 7.29 GB (real, spillable work), `HashJoinInput` 0.70 GB.
 Full-genome runs have not been attempted. `notebooks/build_plugin_caches.ipynb`
 in the vepyr branch drives the whole matrix; note it still downloads sources
 rather than using the `rclone serve http` trick in §2.1, which is worth porting.
+
+---
+
+## 8. 2026-08-25 follow-up: remove the false HashJoin input and final merge
+
+Two independent costs remained in the chr1 partition matrix:
+
+1. The probe filter used an inner join against
+   `SELECT DISTINCT start, allele_string FROM plugin`. The distinct aggregate
+   emitted shared-buffer batches immediately below `HashJoinExec`, so its exact
+   0.25 GiB AlphaMissense estimate became a 7.9 GiB runtime reservation and an
+   inevitable Hash-to-SortMerge retry.
+2. The final `(tier, start)` shard was encoded as warm and cold temporary
+   Parquet files, then both files were decoded and encoded again into the final
+   shard. That serial tail cost about 129 seconds for SpliceAI and 142 seconds
+   for CADD at `target_partitions=4`.
+
+The production path now registers a narrow `(start, allele_string)` plugin-key
+MemTable and filters variation with a true `LEFT SEMI JOIN`. A semi join cannot
+fan out variation rows when plugin keys repeat, so the distinct aggregate is
+unnecessary. DataFusion still selects Hash or SortMerge from actual plan
+statistics; no plugin, chromosome, partition-count, or join-strategy threshold
+was added.
+
+The final query now uses `ORDER BY tier, start` and streams directly into one
+atomic `.build.tmp` shard. The storage-boundary check validates every emitted
+key lexicographically before the batch is written. This removes the two tier
+filters, two intermediate encodes, two intermediate decodes, and final
+re-encode.
+
+Release + `target-cpu=native`, chr1, `target_partitions=4`:
+
+| plugin | before | after | wall delta | RSS before → after |
+|---|---:|---:|---:|---:|
+| ClinVar | 4.26 s | 4.08 s | -4.2% | 1.98 → 1.95 GiB |
+| AlphaMissense | 15.35 s | 8.08 s | -47.4% | 5.71 → 3.01 GiB |
+| dbNSFP | 75.29 s | 57.84 s | -23.2% | 11.83 → 11.81 GiB |
+| SpliceAI | 357.38 s | 230.27 s | -35.6% | 31.75 → 27.09 GiB |
+| CADD | 382.34 s | 221.89 s | -42.0% | 29.12 → 28.90 GiB |
+
+AlphaMissense's probe HashJoin now reserves 0.23 GiB and completes on the first
+plan. dbNSFP likewise completes its first HashJoin at 0.39 GiB. SpliceAI and
+CADD report missing projected byte statistics and select SortMerge before
+execution, so neither wastes time on a doomed HashJoin.
+
+All five new shards match the previous p4 shards on row count plus both XOR and
+sum aggregates of DuckDB whole-row hashes. Warm/cold manifest counts also match
+exactly. Logs and outputs are under
+`/Users/mwiewior/workspace/data_vepyr/plugin_partition_bench_direct_p4`.

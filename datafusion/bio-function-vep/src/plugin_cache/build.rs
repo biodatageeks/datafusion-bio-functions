@@ -1,5 +1,5 @@
 //! End-to-end per-chrom plugin cache build: register sources → ingest view →
-//! normalization wrapper → variation-frequency join/tier → two-pass tiered
+//! normalization wrapper → variation-frequency join/tier → direct tiered
 //! shard write → cache-manifest chrom entry.
 //!
 //! Both joins run in a bounded, parallel DataFusion context. For each join we
@@ -7,14 +7,16 @@
 //! statistics to decide whether the estimated reservation fits the active
 //! pool. If it does not, or the statistics are incomplete, only
 //! `prefer_hash_join` is changed and DataFusion plans its built-in
-//! SortMergeJoin. The final query always has an explicit `ORDER BY start`, so
-//! correctness does not depend on execution-partition or hash-table order.
+//! SortMergeJoin. The final query always has an explicit
+//! `ORDER BY tier, start`, so correctness does not depend on execution-
+//! partition or hash-table order and the result can be written directly in
+//! the point-lookup shard's physical order.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, BooleanArray, Int8Array, UInt32Array};
-use datafusion::arrow::compute::{cast, filter_record_batch};
+use datafusion::arrow::array::{Array, Int8Array, UInt32Array};
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
@@ -59,49 +61,77 @@ fn reproject_cast(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch
         .map_err(|e| DataFusionError::Execution(format!("reproject: {e}")))
 }
 
-/// Verify `start` is non-decreasing within `batch` and against `last_seen` (the
-/// previous batch's final `start` for this tier), returning the batch's own
-/// final `start` on success.
+#[derive(Debug, PartialEq, Eq)]
+struct TierOrderSummary {
+    last_key: Option<(i8, u32)>,
+    warm: usize,
+    cold: usize,
+}
+
+/// Verify `(tier, start)` is lexicographically non-decreasing within `batch`
+/// and against the previous batch's final key. Return the batch's final key
+/// and its warm/cold row counts.
 ///
-/// The streaming shard write below relies on the tiered join emitting rows in
-/// position-ascending order per tier; that holds whenever the plugin's own
-/// input already arrives globally sorted (see the module doc for why), but a
-/// source that isn't -- multiple files concatenated without a merge sort,
-/// say -- can surface a genuine regression here. Rather than trust the
-/// assumption silently, check it: a real violation aborts the fast write
-/// immediately (no shard is written) instead of producing a page directory
-/// whose binary-search lookup can silently miss rows that are actually
-/// present (`PageDir::resolve_ranges` assumes a genuinely sorted run);
-/// `build_plugin_chrom` catches this and retries with an explicit sort.
-fn assert_start_monotonic(
+/// The query's explicit `ORDER BY tier, start` provides this contract. Check
+/// it at the storage boundary anyway: a planner/executor regression must abort
+/// the write instead of producing a page directory whose binary-search lookup
+/// can silently miss rows (`PageDir::resolve_ranges` assumes a sorted run).
+fn inspect_tier_start_order(
     batch: &RecordBatch,
     start_idx: usize,
-    tier: i8,
+    tier_idx: usize,
     chrom: &str,
-    last_seen: Option<u32>,
-) -> Result<Option<u32>> {
+    plugin_name: &str,
+    last_seen: Option<(i8, u32)>,
+) -> Result<TierOrderSummary> {
     let starts = batch
         .column(start_idx)
         .as_any()
         .downcast_ref::<UInt32Array>()
         .ok_or_else(|| DataFusionError::Execution("start column not UInt32".into()))?;
+    let tiers = batch
+        .column(tier_idx)
+        .as_any()
+        .downcast_ref::<Int8Array>()
+        .ok_or_else(|| DataFusionError::Execution("tier column not Int8".into()))?;
     let mut prev = last_seen;
+    let (mut warm, mut cold) = (0usize, 0usize);
     for i in 0..starts.len() {
-        let v = starts.value(i);
-        if let Some(p) = prev
-            && v < p
-        {
+        if starts.is_null(i) || tiers.is_null(i) {
             return Err(DataFusionError::Execution(format!(
-                "plugin_cache[{chrom}]: tier {tier} shard write is not position-ascending \
-                 (start {v} follows {p}) -- the tier join did not preserve row order; the \
-                 on-disk point-lookup directory requires a sorted shard, so refusing to \
-                 write a corrupt one. The adaptive plan's explicit ORDER BY contract was \
-                 violated."
+                "plugin_cache[{plugin_name}/{chrom}]: NULL tier/start in final shard row"
             )));
         }
-        prev = Some(v);
+        let key = (tiers.value(i), starts.value(i));
+        match key.0 {
+            0 => warm += 1,
+            1 => cold += 1,
+            tier => {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin_cache[{plugin_name}/{chrom}]: invalid tier {tier}; expected 0 or 1"
+                )));
+            }
+        }
+        if let Some(previous) = prev
+            && key < previous
+        {
+            return Err(DataFusionError::Execution(format!(
+                "plugin_cache[{plugin_name}/{chrom}]: final shard write is not ordered by \
+                 (tier, start): ({}, {}) follows ({}, {}) -- the tier join did not preserve \
+                 row order; the \
+                 on-disk point-lookup directory requires a sorted shard, so refusing to \
+                 write a corrupt one. The adaptive plan's explicit ORDER BY contract was \
+                 violated.",
+                key.0, key.1, previous.0, previous.1
+            )));
+        }
+        prev = Some(key);
     }
-    Ok(prev)
+    Ok(TierOrderSummary {
+        last_key: prev,
+        warm,
+        cold,
+    })
 }
 
 /// Default memory budget for the adaptive tier plan's `FairSpillPool`, in MiB.
@@ -253,10 +283,6 @@ impl ScratchGuard {
         Self(paths.into_iter().collect())
     }
 
-    fn watch(&mut self, path: PathBuf) {
-        self.0.push(path);
-    }
-
     /// Stop watching: the scratch files have been consumed into the final
     /// shard (or deliberately removed), so dropping must not delete anything.
     fn disarm(mut self) {
@@ -272,25 +298,24 @@ impl Drop for ScratchGuard {
     }
 }
 
-/// Consume `stream`, split rows by `tier` into warm (0) / cold (1), and write
-/// each run through its own `PluginShardWriter`. The monotonicity check is a
-/// final assertion of the adaptive plan's explicit sorted-output contract.
+/// Consume the globally `(tier, start)`-sorted stream and write it directly to
+/// the final temporary shard. The monotonicity check is a final assertion of
+/// the adaptive plan's explicit sorted-output contract.
 ///
 /// `PluginShardWriter::create` truncates its target path, so a runtime
 /// Hash-to-SMJ fallback safely overwrites any partial first attempt.
 async fn write_tiered_shard(
     mut stream: SendableRecordBatchStream,
     out_schema: &SchemaRef,
-    warm_path: &Path,
-    cold_path: &Path,
+    path: &Path,
     chrom: &str,
     plugin_name: &str,
-) -> Result<(usize, usize)> {
-    let mut warm_writer = PluginShardWriter::create(warm_path, Arc::clone(out_schema))?;
-    let mut cold_writer = PluginShardWriter::create(cold_path, Arc::clone(out_schema))?;
+) -> Result<(usize, usize, usize)> {
+    let mut writer = PluginShardWriter::create(path, Arc::clone(out_schema))?;
     let (mut warm, mut cold) = (0usize, 0usize);
     let start_idx = out_schema.index_of("start")?;
-    let (mut warm_last_start, mut cold_last_start): (Option<u32>, Option<u32>) = (None, None);
+    let tier_idx = out_schema.index_of("tier")?;
+    let mut last_key: Option<(i8, u32)> = None;
 
     while let Some(b) = stream.next().await {
         let batch = b?;
@@ -298,51 +323,22 @@ async fn write_tiered_shard(
             continue;
         }
         let reordered = reproject_cast(&batch, out_schema)?;
-        let tier_col = reordered
-            .column(out_schema.index_of("tier")?)
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .ok_or_else(|| DataFusionError::Execution("tier column not Int8".into()))?
-            .clone();
-        let mut kept_this_batch = 0usize;
-        for keep in [0i8, 1i8] {
-            let mask: BooleanArray = (0..reordered.num_rows())
-                .map(|i| Some(tier_col.value(i) == keep))
-                .collect();
-            let filtered = filter_record_batch(&reordered, &mask)
-                .map_err(|e| DataFusionError::Execution(format!("filter tier {keep}: {e}")))?;
-            if filtered.num_rows() == 0 {
-                continue;
-            }
-            kept_this_batch += filtered.num_rows();
-            if keep == 0 {
-                warm_last_start =
-                    assert_start_monotonic(&filtered, start_idx, keep, chrom, warm_last_start)?;
-                warm += filtered.num_rows();
-                warm_writer.write(&filtered)?;
-            } else {
-                cold_last_start =
-                    assert_start_monotonic(&filtered, start_idx, keep, chrom, cold_last_start)?;
-                cold += filtered.num_rows();
-                cold_writer.write(&filtered)?;
-            }
-        }
-        // `tier` is derived as `COALESCE(v.tier, 1)` upstream, so it should
-        // never be anything but 0 or 1 -- but the `[0i8, 1i8]` split above
-        // would silently drop a row with any other value rather than error,
-        // so check explicitly instead of trusting that invariant blindly.
-        if kept_this_batch != reordered.num_rows() {
-            return Err(DataFusionError::Execution(format!(
-                "plugin_cache[{plugin_name}/{chrom}]: {} row(s) had a tier value outside {{0,1}} \
-                 and were dropped by the warm/cold split -- COALESCE(v.tier,1) should make this \
-                 impossible; investigate before trusting this shard",
-                reordered.num_rows() - kept_this_batch
-            )));
-        }
+        let summary = inspect_tier_start_order(
+            &reordered,
+            start_idx,
+            tier_idx,
+            chrom,
+            plugin_name,
+            last_key,
+        )?;
+        last_key = summary.last_key;
+        warm += summary.warm;
+        cold += summary.cold;
+        writer.write(&reordered)?;
     }
-    warm_writer.finish()?;
-    cold_writer.finish()?;
-    Ok((warm, cold))
+    let rows = writer.finish()?;
+    debug_assert_eq!(rows, warm + cold);
+    Ok((rows, warm, cold))
 }
 
 /// Build one chromosome's plugin shard. Returns the cache-manifest chrom entry.
@@ -456,12 +452,30 @@ pub async fn build_plugin_chrom(
         .with_memory_pool(Arc::clone(&pool))
         .build_arc()
         .map_err(|e| DataFusionError::Execution(format!("tier runtime env: {e}")))?;
+    // The variation-filter semi join needs only these two columns. Register a
+    // narrow zero-copy projection as its own MemTable so DataFusion sees exact
+    // key-only statistics and never considers the plugin's wide value columns
+    // when choosing the probe-filter join's build side.
+    let key_indices = [
+        norm_schema.index_of("start")?,
+        norm_schema.index_of("allele_string")?,
+    ];
+    let key_schema = Arc::new(norm_schema.project(&key_indices)?);
+    let key_batches = deduped
+        .iter()
+        .map(|batch| batch.project(&key_indices))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let deduped = partition_batches(deduped, build_config.target_partitions());
+    let key_batches = partition_batches(key_batches, build_config.target_partitions());
     let build_ctx = SessionContext::new_with_config_rt(build_config, build_runtime);
     let dedup_view = format!("plugin_{}_dedup", src.plugin_name);
+    let key_view = format!("plugin_{}_variation_keys", src.plugin_name);
     let mem = MemTable::try_new(norm_schema.clone(), deduped)
         .map_err(|e| DataFusionError::Execution(format!("dedup memtable: {e}")))?;
     build_ctx.register_table(&dedup_view, Arc::new(mem))?;
+    let key_mem = MemTable::try_new(key_schema, key_batches)
+        .map_err(|e| DataFusionError::Execution(format!("variation-key memtable: {e}")))?;
+    build_ctx.register_table(&key_view, Arc::new(key_mem))?;
 
     let out_schema = plugin_output_schema(&src.match_columns, &src.value_columns);
     let plugin_dir = output_cache_root.join("plugin").join(&src.plugin_name);
@@ -469,17 +483,20 @@ pub async fn build_plugin_chrom(
         .map_err(|e| DataFusionError::Execution(format!("mkdir {}: {e}", plugin_dir.display())))?;
     let file_name = format!("{}.parquet", canonical_chrom_label(chrom));
     let shard_path = plugin_dir.join(&file_name);
-    let warm_tmp = plugin_dir.join(format!("{file_name}.warm.tmp"));
-    let cold_tmp = plugin_dir.join(format!("{file_name}.cold.tmp"));
-    let mut scratch = ScratchGuard::new([warm_tmp.clone(), cold_tmp.clone()]);
+    // Write to a sibling temporary path and atomically rename only after the
+    // Parquet footer is flushed. A failed/retried hash plan can safely
+    // truncate this same path without exposing a partial runtime shard.
+    let build_tmp = plugin_dir.join(format!("{file_name}.build.tmp"));
+    let scratch = ScratchGuard::new([build_tmp.clone()]);
 
-    // Execute the explicitly sorted parallel plan and stream it into two
-    // per-tier temp shards. If a HashJoin estimate was optimistic, retry only
+    // Execute the explicitly sorted parallel plan and stream it directly into
+    // one final-order temp shard. If a HashJoin estimate was optimistic, retry only
     // when the root error is ResourcesExhausted and the pool attributes the
     // rejected reservation to HashJoinInput. Other failures propagate as-is.
     let adaptive = match tiered_stream_sorted_adaptive(
         &build_ctx,
         &dedup_view,
+        &key_view,
         variation_shard,
         pool.as_ref(),
         tracer.as_ref(),
@@ -496,8 +513,7 @@ pub async fn build_plugin_chrom(
     let written = write_tiered_shard(
         adaptive.stream,
         &out_schema,
-        &warm_tmp,
-        &cold_tmp,
+        &build_tmp,
         chrom,
         &src.plugin_name,
     )
@@ -514,8 +530,7 @@ pub async fn build_plugin_chrom(
             write_tiered_shard(
                 merge_stream,
                 &out_schema,
-                &warm_tmp,
-                &cold_tmp,
+                &build_tmp,
                 chrom,
                 &src.plugin_name,
             )
@@ -525,7 +540,7 @@ pub async fn build_plugin_chrom(
     };
     // Report before propagating: the peak table is most useful on failure.
     tracer.report();
-    let (warm, cold) = written?;
+    let (rows, warm, cold) = written?;
     info!(
         "plugin_cache[{}/{chrom}]: tier-join+write done, warm={warm} cold={cold}, {:.1}s elapsed",
         src.plugin_name,
@@ -536,6 +551,7 @@ pub async fn build_plugin_chrom(
     // stale shard from a previous build so the manifest (rows: 0) matches disk
     // and the runtime never opens a leftover file for an empty chrom.
     if warm + cold == 0 {
+        let _ = std::fs::remove_file(&build_tmp);
         let _ = std::fs::remove_file(&shard_path);
         return Ok(ChromEntry {
             chrom: canonical_chrom_label(chrom),
@@ -546,48 +562,13 @@ pub async fn build_plugin_chrom(
         });
     }
 
-    // Merge: final shard = warm run then cold run. Both temps are already
-    // start-sorted by construction (see above), so this is a plain streaming
-    // batch-by-batch copy into the final writer (which carries the point-lookup
-    // page-index properties) — no sort, O(one batch) memory.
-    //
-    // Written to a `.merge.tmp` path and renamed into place only once fully
-    // flushed, rather than directly to `shard_path`: a crash mid-merge already
-    // fails loudly on next open (a parquet file with no footer, not a silent
-    // half-written one), but writing in place still leaves a corrupt file
-    // *at the path the runtime looks up* until the next successful rebuild
-    // overwrites it -- a rename is atomic on the same filesystem, so a crash
-    // here instead leaves either the previous good shard (if any) or nothing.
-    let merge_tmp = plugin_dir.join(format!("{file_name}.merge.tmp"));
-    scratch.watch(merge_tmp.clone());
-    let mut writer = PluginShardWriter::create(&merge_tmp, Arc::clone(&out_schema))?;
-    for tmp in [&warm_tmp, &cold_tmp] {
-        let file = std::fs::File::open(tmp)
-            .map_err(|e| DataFusionError::Execution(format!("open temp {}: {e}", tmp.display())))?;
-        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| DataFusionError::Execution(format!("open temp reader: {e}")))?
-            .build()
-            .map_err(|e| DataFusionError::Execution(format!("build temp reader: {e}")))?;
-        for batch in reader {
-            let batch =
-                batch.map_err(|e| DataFusionError::Execution(format!("read temp batch: {e}")))?;
-            writer.write(&batch)?;
-        }
-        let _ = std::fs::remove_file(tmp);
-    }
-    let rows = writer.finish()?;
-    if rows == 0 {
-        let _ = std::fs::remove_file(&merge_tmp);
-        let _ = std::fs::remove_file(&shard_path);
-    } else {
-        std::fs::rename(&merge_tmp, &shard_path).map_err(|e| {
-            DataFusionError::Execution(format!(
-                "rename {} -> {}: {e}",
-                merge_tmp.display(),
-                shard_path.display()
-            ))
-        })?;
-    }
+    std::fs::rename(&build_tmp, &shard_path).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "rename {} -> {}: {e}",
+            build_tmp.display(),
+            shard_path.display()
+        ))
+    })?;
     scratch.disarm();
     info!(
         "plugin_cache[{}/{chrom}]: done, rows={rows}, {:.1}s total",
@@ -800,66 +781,50 @@ type = "Float32"
         }
     }
 
-    // C1 regression: a tiered join that does NOT preserve row order (e.g. the
-    // planner puts the plugin on the hash-build side for a small-plugin/
-    // large-probe query shape) must fail the build loudly rather than write a
-    // shard whose on-disk (tier, start) sort claim is false.
-    #[test]
-    fn assert_start_monotonic_catches_within_batch_disorder() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "start",
-            DataType::UInt32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(UInt32Array::from(vec![10u32, 20, 15]))],
+    fn tier_start_batch(tiers: Vec<i8>, starts: Vec<u32>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("start", DataType::UInt32, false),
+                Field::new("tier", DataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(UInt32Array::from(starts)),
+                Arc::new(Int8Array::from(tiers)),
+            ],
         )
-        .unwrap();
-        let err = assert_start_monotonic(&batch, 0, 1, "1", None).unwrap_err();
-        assert!(err.to_string().contains("not position-ascending"));
+        .unwrap()
     }
 
     #[test]
-    fn assert_start_monotonic_catches_cross_batch_regression() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "start",
-            DataType::UInt32,
-            false,
-        )]));
-        let first = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(UInt32Array::from(vec![100u32]))],
-        )
-        .unwrap();
-        let last_seen = assert_start_monotonic(&first, 0, 0, "1", None).unwrap();
-        assert_eq!(last_seen, Some(100));
-        let second =
-            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from(vec![50u32]))]).unwrap();
-        let err = assert_start_monotonic(&second, 0, 0, "1", last_seen).unwrap_err();
-        assert!(err.to_string().contains("not position-ascending"));
+    fn tier_start_order_catches_within_tier_disorder() {
+        let batch = tier_start_batch(vec![0, 0, 0], vec![10, 20, 15]);
+        let err = inspect_tier_start_order(&batch, 0, 1, "1", "demo", None).unwrap_err();
+        assert!(err.to_string().contains("not ordered by (tier, start)"));
     }
 
     #[test]
-    fn assert_start_monotonic_accepts_sorted_input() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "start",
-            DataType::UInt32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(UInt32Array::from(vec![10u32, 10, 20, 30]))],
-        )
-        .unwrap();
-        let last_seen = assert_start_monotonic(&batch, 0, 0, "1", None).unwrap();
-        assert_eq!(last_seen, Some(30));
+    fn tier_start_order_catches_cross_batch_tier_regression() {
+        let first = tier_start_batch(vec![1], vec![100]);
+        let summary = inspect_tier_start_order(&first, 0, 1, "1", "demo", None).unwrap();
+        let last_seen = summary.last_key;
+        assert_eq!(last_seen, Some((1, 100)));
+        let second = tier_start_batch(vec![0], vec![500]);
+        let err = inspect_tier_start_order(&second, 0, 1, "1", "demo", last_seen).unwrap_err();
+        assert!(err.to_string().contains("not ordered by (tier, start)"));
     }
 
-    // `write_tiered_shard` must surface a genuine reorder as the same
-    // "not position-ascending" error `assert_start_monotonic` raises directly
-    // The writer must still reject a broken sorted-output contract rather than
-    // silently creating a page directory whose lookups can miss rows.
+    #[test]
+    fn tier_start_order_accepts_start_reset_at_warm_to_cold_boundary() {
+        let batch = tier_start_batch(vec![0, 0, 1, 1], vec![10, 30, 5, 20]);
+        let summary = inspect_tier_start_order(&batch, 0, 1, "1", "demo", None).unwrap();
+        assert_eq!(summary.last_key, Some((1, 20)));
+        assert_eq!((summary.warm, summary.cold), (2, 2));
+    }
+
+    // `write_tiered_shard` must surface a genuine reorder as the same error
+    // `inspect_tier_start_order` raises directly. The writer must still reject
+    // a broken sorted-output contract rather than silently creating a page
+    // directory whose lookups can miss rows.
     #[test]
     fn retry_memory_limit_defaults_and_honours_the_env_override() {
         // Serial within one test: these mutate process-wide env.
@@ -993,7 +958,7 @@ type = "Float32"
     }
 
     #[test]
-    fn scratch_guard_tolerates_files_the_merge_already_consumed() {
+    fn scratch_guard_tolerates_files_already_consumed() {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("already-removed.tmp");
         drop(ScratchGuard::new([gone.clone()]));
@@ -1036,15 +1001,79 @@ type = "Float32"
             futures::stream::iter(batches),
         ));
         let dir = tempfile::tempdir().unwrap();
-        let warm = dir.path().join("warm.tmp");
-        let cold = dir.path().join("cold.tmp");
-        let err = write_tiered_shard(stream, &schema, &warm, &cold, "1", "demo")
+        let path = dir.path().join("build.tmp");
+        let err = write_tiered_shard(stream, &schema, &path, "1", "demo")
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("is not position-ascending"),
+            err.to_string().contains("not ordered by (tier, start)"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_tiered_shard_writes_final_order_directly() {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::UInt32, false),
+            Field::new("end", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("tier", DataType::Int8, false),
+        ]));
+        let make_batch = |tiers: Vec<i8>, starts: Vec<u32>| {
+            let n = starts.len();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["1"; n])),
+                    Arc::new(UInt32Array::from(starts.clone())),
+                    Arc::new(UInt32Array::from(starts)),
+                    Arc::new(StringArray::from(vec!["A/G"; n])),
+                    Arc::new(Int8Array::from(tiers)),
+                ],
+            )
+            .unwrap()
+        };
+        let batches: Vec<Result<RecordBatch>> = vec![
+            Ok(make_batch(vec![0, 0], vec![100, 300])),
+            Ok(make_batch(vec![1, 1], vec![50, 200])),
+        ];
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(batches),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("build.tmp");
+        assert_eq!(
+            write_tiered_shard(stream, &schema, &path, "1", "demo")
+                .await
+                .unwrap(),
+            (4, 2, 2)
+        );
+
+        let file = std::fs::File::open(path).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut keys = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let starts = batch
+                .column(batch.schema().index_of("start").unwrap())
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let tiers = batch
+                .column(batch.schema().index_of("tier").unwrap())
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap();
+            keys.extend((0..batch.num_rows()).map(|i| (tiers.value(i), starts.value(i))));
+        }
+        assert_eq!(keys, vec![(0, 100), (0, 300), (1, 50), (1, 200)]);
     }
 
     // C1 regression, end-to-end: `HashJoinExec`'s `CollectLeft` mode collects
