@@ -178,8 +178,8 @@ use std::borrow::Cow;
 use std::fmt::Write;
 
 use crate::allele::{
-    MatchedVariantAllele, reverse_complement_allele, vcf_to_vep_allele, vcf_to_vep_input_allele,
-    vep_norm_end, vep_norm_start,
+    MatchedVariantAllele, plugin_probe_allele, reverse_complement_allele, vcf_to_vep_allele,
+    vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::AnnotationBackend;
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
@@ -5468,14 +5468,24 @@ impl AnnotateProvider {
             // `vcf_to_vep_input_allele` shifts it, so the take must use the same
             // normalized start the probe uses or indel plugins would miss.
             let mut starts: Vec<u32> = (0..batch.num_rows())
-                .filter_map(|row| {
+                .flat_map(|row| {
                     let start_val = int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0);
                     let ref_al = string_at(batch.column(ref_idx).as_ref(), row).unwrap_or_default();
                     let alt_al = string_at(batch.column(alt_idx).as_ref(), row).unwrap_or_default();
-                    let (_ir, _ia, input_start) =
+                    let (input_ref, input_alt, input_start) =
                         vcf_to_vep_input_allele(start_val, &ref_al, &alt_al);
-                    u32::try_from(input_start).ok()
+                    // Both spellings the probe may ask for: the primary key and the
+                    // fully minimal fallback, whose start shifts when a shared
+                    // prefix is trimmed. Taking only the primary would leave the
+                    // fallback row outside the page range and defeat the retry.
+                    let (_mr, _ma, min_start) =
+                        plugin_probe_allele(input_start, &input_ref, &input_alt);
+                    [
+                        u32::try_from(input_start).ok(),
+                        u32::try_from(min_start).ok(),
+                    ]
                 })
+                .flatten()
                 .collect();
             starts.sort_unstable();
             starts.dedup();
@@ -6423,6 +6433,17 @@ impl AnnotateProvider {
                                 input_alt.as_str(),
                             );
                             let plugin_allele = format!("{input_ref}/{input_alt}");
+                            // Fully minimal spelling, used only when the primary
+                            // key misses (see `probe_all`).
+                            let (min_ref, min_alt, min_start) =
+                                plugin_probe_allele(input_start, &input_ref, &input_alt);
+                            let minimal_allele = format!("{min_ref}/{min_alt}");
+                            let fallback_key = (minimal_allele != plugin_allele).then(|| {
+                                (
+                                    u32::try_from(min_start).unwrap_or(0),
+                                    minimal_allele.as_str(),
+                                )
+                            });
                             let scalars = plugin_slices
                                 .as_ref()
                                 .map(|s| {
@@ -6431,6 +6452,7 @@ impl AnnotateProvider {
                                     s.probe_all(
                                         u32::try_from(input_start).unwrap_or(0),
                                         &plugin_allele,
+                                        fallback_key,
                                         &ns,
                                     )
                                 })
@@ -6471,12 +6493,22 @@ impl AnnotateProvider {
                             // `input_allele_string` was moved upstream; rebuild the
                             // `ref/alt` allele exactly as the transcript path does.
                             let plugin_allele = format!("{input_ref}/{input_alt}");
+                            let (min_ref, min_alt, min_start) =
+                                plugin_probe_allele(input_start, &input_ref, &input_alt);
+                            let minimal_allele = format!("{min_ref}/{min_alt}");
+                            let fallback_key = (minimal_allele != plugin_allele).then(|| {
+                                (
+                                    u32::try_from(min_start).unwrap_or(0),
+                                    minimal_allele.as_str(),
+                                )
+                            });
                             let scalars = plugin_slices
                                 .as_ref()
                                 .map(|s| {
                                     s.probe_all(
                                         u32::try_from(input_start).unwrap_or(0),
                                         &plugin_allele,
+                                        fallback_key,
                                         &[],
                                     )
                                 })

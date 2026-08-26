@@ -54,11 +54,13 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
             column: "am_pathogenicity".into(),
             csq_field: "am_pathogenicity".into(),
             ty: ValueType::Float32,
+            description: None,
         },
         ValueColumn {
             column: "am_class".into(),
             csq_field: "am_class".into(),
             ty: ValueType::Utf8,
+            description: None,
         },
     ];
     let schema = plugin_output_schema(&matches, &vals);
@@ -99,11 +101,13 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
                 column: "am_pathogenicity".into(),
                 csq_field: "am_pathogenicity".into(),
                 ty: "Float32".into(),
+                description: None,
             },
             ValueColumnRecord {
                 column: "am_class".into(),
                 csq_field: "am_class".into(),
                 ty: "Utf8".into(),
+                description: None,
             },
         ],
         chroms: vec![ChromEntry {
@@ -114,6 +118,9 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
             cold: 1,
         }],
         cache_source_version: None,
+        allele_match: Default::default(),
+        csq_rank: 0,
+        field_order: Default::default(),
     };
     manifest.write(&plugin_dir).unwrap();
 }
@@ -135,24 +142,24 @@ async fn plugin_csq_gates_per_transcript() {
 
     // Transcript line 1: missense C17W (Amino_acids "C/W", Protein_position "17").
     let ns_missense = ns_aa("C/W", "17");
-    let missense = slices.probe_all(22893742, "C/G", &ns_missense);
+    let missense = slices.probe_all(22893742, "C/G", None, &ns_missense);
     assert_eq!(field_suffix(&missense), "|0.4833|ambiguous");
 
     // Transcript line 2: intron (no amino-acid change) → gate → empty fields.
     let ns_intron = ns_aa("", "");
-    let intron = slices.probe_all(22893742, "C/G", &ns_intron);
+    let intron = slices.probe_all(22893742, "C/G", None, &ns_intron);
     assert_eq!(field_suffix(&intron), empty_suffix(n));
     assert_eq!(field_suffix(&intron), "||");
 
     // A different protein change at the same position (wrong isoform) → miss.
     let ns_wrong = ns_aa("C/Y", "17");
     assert_eq!(
-        field_suffix(&slices.probe_all(22893742, "C/G", &ns_wrong)),
+        field_suffix(&slices.probe_all(22893742, "C/G", None, &ns_wrong)),
         "||"
     );
 
     // A variant with no shard row (different position) → empty fields.
-    let none_here = slices.probe_all(99999999, "A/G", &ns_missense);
+    let none_here = slices.probe_all(99999999, "A/G", None, &ns_missense);
     assert_eq!(field_suffix(&none_here), "||");
 }
 
@@ -174,6 +181,7 @@ async fn indel_probe_uses_normalized_start() {
         column: "score".into(),
         csq_field: "SCORE".into(),
         ty: ValueType::Float32,
+        description: None,
     }];
     let schema = plugin_output_schema(&matches, &vals);
     // One row at the NORMALIZED coordinates: start 101, allele "-/TG".
@@ -207,6 +215,7 @@ async fn indel_probe_uses_normalized_start() {
             column: "score".into(),
             csq_field: "SCORE".into(),
             ty: "Float32".into(),
+            description: None,
         }],
         chroms: vec![ChromEntry {
             chrom: "chr1".into(),
@@ -216,6 +225,9 @@ async fn indel_probe_uses_normalized_start() {
             cold: 1,
         }],
         cache_source_version: None,
+        allele_match: Default::default(),
+        csq_rank: 0,
+        field_order: Default::default(),
     };
     manifest.write(&plugin_dir).unwrap();
 
@@ -223,11 +235,14 @@ async fn indel_probe_uses_normalized_start() {
 
     // Normalized start (101) hits.
     let hit = reg.take_buffer_all(&[101]).await.unwrap();
-    assert_eq!(field_suffix(&hit.probe_all(101, "-/TG", &[])), "|0.75");
+    assert_eq!(
+        field_suffix(&hit.probe_all(101, "-/TG", None, &[])),
+        "|0.75"
+    );
     // Raw VCF POS (100) misses — this is what the pre-fix code used.
     let miss = reg.take_buffer_all(&[100]).await.unwrap();
     assert_eq!(
-        field_suffix(&miss.probe_all(100, "-/TG", &[])),
+        field_suffix(&miss.probe_all(100, "-/TG", None, &[])),
         empty_suffix(1)
     );
 }

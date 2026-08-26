@@ -1476,6 +1476,16 @@ pub async fn annotate_to_vcf(
             .into_iter()
             .filter(|line| !is_stale_provenance_line(line))
             .collect();
+        // Ensembl VEP writes one `##<FIELD>=<description>` line per plugin field
+        // (from the plugin's `get_header_info()`), ahead of its provenance.
+        #[cfg(feature = "parquet-cache")]
+        if let Some(root) = &config.plugin_cache_root {
+            for (field, description) in
+                crate::plugin_cache::registry::PluginRegistry::field_descriptions(root)
+            {
+                lines.push(format!("##{field}={description}"));
+            }
+        }
         lines.extend(provenance_header_lines(
             input_vcf,
             cache_source,

@@ -92,6 +92,10 @@ pub struct ValueColumn {
     pub csq_field: String,
     #[serde(rename = "type")]
     pub ty: ValueType,
+    /// Text for this field's `##<CSQ_FIELD>=<description>` VCF header line,
+    /// mirroring what an Ensembl plugin returns from `get_header_info()`.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// A per-transcript match discriminator: an extra key column (produced by
@@ -119,6 +123,18 @@ pub struct SourceManifest {
     /// Optional per-transcript match discriminators (§3.4). Empty = per-variant.
     #[serde(default, rename = "match_column")]
     pub match_columns: Vec<MatchColumn>,
+    /// How this plugin's Ensembl implementation compares a variant to a data
+    /// row. Set `minimised` only for plugins that call
+    /// `get_matched_variant_alleles()` (CADD, AlphaMissense); the default
+    /// `exact` matches SpliceAI's and dbNSFP's verbatim comparison.
+    #[serde(default)]
+    pub allele_match: crate::plugin_cache::cache_manifest::AlleleMatch,
+    /// Position of this plugin's field block in the CSQ string (lower first).
+    #[serde(default = "crate::plugin_cache::cache_manifest::default_csq_rank_pub")]
+    pub csq_rank: u32,
+    /// Field order within this plugin's block.
+    #[serde(default)]
+    pub field_order: crate::plugin_cache::cache_manifest::FieldOrder,
     /// Skip the build-time keep-first dedup pass (`dedup::dedup_keep_first`)
     /// when the source is structurally guaranteed to never emit two rows
     /// sharing a runtime probe key `(start, allele_string, <match cols>)` —
