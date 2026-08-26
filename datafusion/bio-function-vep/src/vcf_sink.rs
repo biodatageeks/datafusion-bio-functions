@@ -3,7 +3,7 @@
 //! Provides [`annotate_to_vcf`] — a single-call function that reads a VCF,
 //! annotates it, and streams results to an output VCF file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -754,6 +754,45 @@ fn is_stale_provenance_line(line: &str) -> bool {
     .any(|prefix| line.starts_with(prefix.as_str()))
 }
 
+/// Replace metadata owned by this annotation run while preserving unrelated
+/// source header lines byte-for-byte and in their original order.
+///
+/// Plugin field headers use the non-structured `##<FIELD>=<description>` form,
+/// so an already annotated input can contain declarations for the fields this
+/// run is about to emit. Remove every exact emitted-field key first, including
+/// fields whose new manifest intentionally has no description, then append the
+/// current descriptions and provenance exactly once.
+fn merge_annotation_header_lines(
+    existing: Vec<String>,
+    plugin_field_names: &[String],
+    plugin_field_descriptions: &[(String, String)],
+    provenance: Vec<String>,
+) -> Vec<String> {
+    let emitted_fields: HashSet<&str> = plugin_field_names.iter().map(String::as_str).collect();
+    let mut lines: Vec<String> = existing
+        .into_iter()
+        .filter(|line| {
+            if is_stale_provenance_line(line) {
+                return false;
+            }
+            let Some((key, _)) = line
+                .strip_prefix("##")
+                .and_then(|line| line.split_once('='))
+            else {
+                return true;
+            };
+            !emitted_fields.contains(key)
+        })
+        .collect();
+    lines.extend(
+        plugin_field_descriptions
+            .iter()
+            .map(|(field, description)| format!("##{field}={description}")),
+    );
+    lines.extend(provenance);
+    lines
+}
+
 fn provenance_header_lines(
     input_vcf: &str,
     cache_source: &str,
@@ -1472,28 +1511,38 @@ pub async fn annotate_to_vcf(
     if let Some(raw_json) = write_metadata.get(VCF_HEADER_RAW_LINES_KEY)
         && let Ok(existing) = serde_json::from_str::<Vec<String>>(raw_json)
     {
-        let mut lines: Vec<String> = existing
-            .into_iter()
-            .filter(|line| !is_stale_provenance_line(line))
-            .collect();
         // Ensembl VEP writes one `##<FIELD>=<description>` line per plugin field
         // (from the plugin's `get_header_info()`), ahead of its provenance.
         #[cfg(feature = "parquet-cache")]
-        if let Some(root) = &config.plugin_cache_root {
-            for (field, description) in
-                crate::plugin_cache::registry::PluginRegistry::field_descriptions(root)
-            {
-                lines.push(format!("##{field}={description}"));
-            }
-        }
-        lines.extend(provenance_header_lines(
-            input_vcf,
-            cache_source,
-            backend,
-            output_vcf,
-            config,
-            cache_source_type,
-        ));
+        let (plugin_field_names, plugin_field_descriptions) = config
+            .plugin_cache_root
+            .as_ref()
+            .map(|root| {
+                (
+                    crate::plugin_cache::registry::PluginRegistry::field_names(root),
+                    crate::plugin_cache::registry::PluginRegistry::field_descriptions(root),
+                )
+            })
+            .unwrap_or_default();
+        #[cfg(not(feature = "parquet-cache"))]
+        let (plugin_field_names, plugin_field_descriptions): (
+            Vec<String>,
+            Vec<(String, String)>,
+        ) = Default::default();
+
+        let lines = merge_annotation_header_lines(
+            existing,
+            &plugin_field_names,
+            &plugin_field_descriptions,
+            provenance_header_lines(
+                input_vcf,
+                cache_source,
+                backend,
+                output_vcf,
+                config,
+                cache_source_type,
+            ),
+        );
         if let Ok(json) = serde_json::to_string(&lines) {
             write_metadata.insert(VCF_HEADER_RAW_LINES_KEY.to_string(), json);
         }
@@ -2183,6 +2232,57 @@ mod tests {
         ] {
             assert!(!is_stale_provenance_line(line), "{line}");
         }
+    }
+
+    #[test]
+    fn plugin_header_merge_replaces_stale_field_lines_exactly_once() {
+        let existing = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##CADD_RAW=stale description".to_string(),
+            "##CADD_RAW=duplicate stale description".to_string(),
+            "##NO_DESCRIPTION=stale description".to_string(),
+            "##CADD_RAW_EXTRA=unrelated prefix match".to_string(),
+            "##INFO=<ID=CADD_RAW,Number=1,Type=String,Description=\"ordinary INFO\">".to_string(),
+            "##VEP=stale provenance".to_string(),
+        ];
+        let fields = vec![
+            "CADD_RAW".to_string(),
+            "CADD_PHRED".to_string(),
+            "NO_DESCRIPTION".to_string(),
+        ];
+        let descriptions = vec![
+            ("CADD_PHRED".to_string(), "Current PHRED".to_string()),
+            ("CADD_RAW".to_string(), "Current raw score".to_string()),
+        ];
+        let provenance = vec!["##datafusion-bio-function-vep=current".to_string()];
+
+        let merged =
+            merge_annotation_header_lines(existing, &fields, &descriptions, provenance.clone());
+
+        assert_eq!(
+            merged,
+            vec![
+                "##fileformat=VCFv4.2",
+                "##CADD_RAW_EXTRA=unrelated prefix match",
+                "##INFO=<ID=CADD_RAW,Number=1,Type=String,Description=\"ordinary INFO\">",
+                "##CADD_PHRED=Current PHRED",
+                "##CADD_RAW=Current raw score",
+                provenance[0].as_str(),
+            ]
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|line| line.starts_with("##CADD_RAW="))
+                .count(),
+            1
+        );
+        assert!(
+            !merged
+                .iter()
+                .any(|line| line.starts_with("##NO_DESCRIPTION=")),
+            "a current field without a description must not retain a stale one"
+        );
     }
 
     fn provenance_with_cache(config: &AnnotateVcfConfig, cache: &str) -> Vec<String> {
