@@ -177,14 +177,16 @@ const RESERVED_VCF_META_KEYS: &[&str] = &[
 ];
 
 pub(crate) fn validate_csq_field_name(plugin_name: &str, field: &str) -> Result<()> {
-    if field.is_empty()
-        || field
-            .chars()
-            .any(|c| matches!(c, '|' | '=') || c.is_control())
-    {
+    let mut chars = field.chars();
+    let valid_first = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let valid_rest = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'));
+    if !valid_first || !valid_rest {
         return Err(DataFusionError::Execution(format!(
-            "plugin '{plugin_name}' has invalid CSQ field name {field:?}; field names must be \
-             non-empty and cannot contain '|', '=', or control characters"
+            "plugin '{plugin_name}' has invalid CSQ field name {field:?}; field names must start \
+             with an ASCII alphanumeric character or '_' and contain only ASCII alphanumeric \
+             characters, '_', '.', '+', or '-'"
         )));
     }
 
@@ -319,9 +321,22 @@ type = "Float32"
     }
 
     #[test]
-    fn rejects_empty_delimited_or_control_bearing_csq_field_names() {
+    fn enforces_vcf_safe_csq_field_identifiers() {
         let base: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
-        for unsafe_name in ["", "A|B", "A=B", "A\nB", "A\rB", "A\tB", "\u{1}SCORE"] {
+        for unsafe_name in [
+            "",
+            " ",
+            "CADD RAW",
+            "A|B",
+            "A=B",
+            "A\nB",
+            "A\rB",
+            "A\tB",
+            "\u{1}SCORE",
+            ".SCORE",
+            "SCORE/RAW",
+            "café",
+        ] {
             let mut manifest = base.clone();
             manifest.value_columns[0].csq_field = unsafe_name.to_string();
             let error = manifest.validate().unwrap_err().to_string();
@@ -330,6 +345,12 @@ type = "Float32"
                 !error.contains('\n'),
                 "unsafe name must be escaped: {error:?}"
             );
+        }
+
+        for safe_name in ["CADD_RAW", "GERP++_RS", "SCORE.1", "CUSTOM-FIELD", "1000G"] {
+            let mut manifest = base.clone();
+            manifest.value_columns[0].csq_field = safe_name.to_string();
+            manifest.validate().unwrap();
         }
     }
 
