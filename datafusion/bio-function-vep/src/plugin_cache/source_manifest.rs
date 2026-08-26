@@ -177,6 +177,17 @@ const RESERVED_VCF_META_KEYS: &[&str] = &[
 ];
 
 pub(crate) fn validate_csq_field_name(plugin_name: &str, field: &str) -> Result<()> {
+    if field.is_empty()
+        || field
+            .chars()
+            .any(|c| matches!(c, '|' | '=') || c.is_control())
+    {
+        return Err(DataFusionError::Execution(format!(
+            "plugin '{plugin_name}' has invalid CSQ field name {field:?}; field names must be \
+             non-empty and cannot contain '|', '=', or control characters"
+        )));
+    }
+
     let engine_key = env!("CARGO_PKG_NAME");
     if RESERVED_VCF_META_KEYS.contains(&field)
         || field == engine_key
@@ -305,6 +316,21 @@ type = "Float32"
         manifest.value_columns[0].csq_field = "SCORE".to_string();
         manifest.value_columns[0].description = Some("<threshold>".to_string());
         manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_delimited_or_control_bearing_csq_field_names() {
+        let base: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        for unsafe_name in ["", "A|B", "A=B", "A\nB", "A\rB", "A\tB", "\u{1}SCORE"] {
+            let mut manifest = base.clone();
+            manifest.value_columns[0].csq_field = unsafe_name.to_string();
+            let error = manifest.validate().unwrap_err().to_string();
+            assert!(error.contains("invalid CSQ field name"), "{error}");
+            assert!(
+                !error.contains('\n'),
+                "unsafe name must be escaped: {error:?}"
+            );
+        }
     }
 
     #[test]

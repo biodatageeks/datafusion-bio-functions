@@ -264,5 +264,14 @@ mod tests {
             error.contains("reserved VCF meta-information key"),
             "{error}"
         );
+
+        m.value_columns[0].csq_field = "SCORE\n##injected".into();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&m).unwrap(),
+        )
+        .unwrap();
+        let error = discover_plugins(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("invalid CSQ field name"), "{error}");
     }
 }
