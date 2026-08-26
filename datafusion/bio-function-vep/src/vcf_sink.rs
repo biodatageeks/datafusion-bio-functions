@@ -793,17 +793,18 @@ fn merge_annotation_header_lines(
             if is_stale_provenance_line(line) {
                 return false;
             }
-            let Some((key, value)) = line
+            let Some((key, _)) = line
                 .strip_prefix("##")
                 .and_then(|line| line.split_once('='))
             else {
                 return true;
             };
-            // Structured declarations such as `##INFO=<ID=...>` belong to the
-            // source VCF even when a plugin field happens to use the same
-            // meta-information key. This module only owns unstructured field
-            // description lines.
-            value.starts_with('<') || !emitted_fields.contains(key)
+            // Reserved VCF meta-information keys cannot be plugin CSQ field
+            // names (validated in both source and built-cache manifests), so
+            // every exact emitted-field key is plugin-owned. This remains true
+            // when a legitimate free-text description happens to begin with
+            // `<`, which is not by itself proof of a structured declaration.
+            !emitted_fields.contains(key)
         })
         .collect();
     lines.extend(
@@ -2270,16 +2271,15 @@ mod tests {
             "##NO_DESCRIPTION=stale description".to_string(),
             "##CADD_RAW_EXTRA=unrelated prefix match".to_string(),
             "##INFO=<ID=CADD_RAW,Number=1,Type=String,Description=\"ordinary INFO\">".to_string(),
-            "##INFO=stale plugin description".to_string(),
             "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">".to_string(),
+            "##ANGLE=<stale angle-leading description>".to_string(),
             "##VEP=stale provenance".to_string(),
         ];
         let fields = vec![
             "CADD_RAW".to_string(),
             "CADD_PHRED".to_string(),
             "NO_DESCRIPTION".to_string(),
-            "INFO".to_string(),
-            "FORMAT".to_string(),
+            "ANGLE".to_string(),
         ];
         let descriptions = vec![
             (
@@ -2287,7 +2287,10 @@ mod tests {
                 "Current PHRED\nsecond line\r\ttail\u{7}".to_string(),
             ),
             ("CADD_RAW".to_string(), "Current raw score".to_string()),
-            ("INFO".to_string(), "Current plugin INFO".to_string()),
+            (
+                "ANGLE".to_string(),
+                "<current angle-leading description>".to_string(),
+            ),
         ];
         let provenance = vec!["##datafusion-bio-function-vep=current".to_string()];
 
@@ -2303,7 +2306,7 @@ mod tests {
                 "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
                 "##CADD_PHRED=Current PHRED\\nsecond line\\r\\ttail",
                 "##CADD_RAW=Current raw score",
-                "##INFO=Current plugin INFO",
+                "##ANGLE=<current angle-leading description>",
                 provenance[0].as_str(),
             ]
         );
