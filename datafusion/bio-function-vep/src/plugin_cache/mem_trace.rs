@@ -68,15 +68,25 @@ impl TracingPool {
             .clear();
     }
 
-    /// True when a reservation rejected during the current stage belonged to
-    /// a hash join build. The error itself is also checked at the retry site,
-    /// so an unrelated concurrent rejection cannot cause a false retry.
-    pub fn hash_join_failed(&self) -> bool {
+    fn consumer_failed(&self, prefix: &str) -> bool {
         self.failed_consumers
             .lock()
             .expect("memory failure trace poisoned")
             .iter()
-            .any(|name| name.starts_with("HashJoinInput"))
+            .any(|name| name.starts_with(prefix))
+    }
+
+    /// True when a reservation rejected during the current stage belonged to
+    /// a hash join build. The error itself is also checked at the retry site,
+    /// so an unrelated concurrent rejection cannot cause a false retry.
+    pub fn hash_join_failed(&self) -> bool {
+        self.consumer_failed("HashJoinInput")
+    }
+
+    /// True when the final query's external sorter was the consumer whose
+    /// reservation failed while an unspillable hash build remained live.
+    pub fn external_sorter_failed(&self) -> bool {
+        self.consumer_failed("ExternalSorter")
     }
 
     /// Identity of the reservation's consumer. Two consumers sharing a name

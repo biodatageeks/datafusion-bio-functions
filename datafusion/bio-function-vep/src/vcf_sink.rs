@@ -739,15 +739,12 @@ fn escape_header_attribute(value: &str) -> String {
 }
 
 /// Renders an unstructured VCF meta-information value on exactly one physical
-/// line. A value beginning with `<` is quoted so it cannot be confused with an
-/// arbitrary structured `##KEY=<...>` declaration during re-annotation; quotes
-/// and backslashes are escaped in that quoted form. Otherwise they have no
-/// delimiter meaning and are preserved. Control characters are escaped (or,
-/// for other controls, removed) in both forms.
+/// line. If the sanitized value begins with `<`, it is quoted so it cannot be
+/// confused with an arbitrary structured `##KEY=<...>` declaration during
+/// re-annotation; quotes and backslashes are escaped in that quoted form.
+/// Otherwise they have no delimiter meaning and are preserved. Control
+/// characters are escaped (or, for other controls, removed) in both forms.
 fn sanitize_unstructured_header_value(value: &str) -> String {
-    if value.starts_with('<') {
-        return format!("\"{}\"", escape_header_attribute(value));
-    }
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
@@ -758,7 +755,11 @@ fn sanitize_unstructured_header_value(value: &str) -> String {
             c => out.push(c),
         }
     }
-    out
+    if out.starts_with('<') {
+        format!("\"{}\"", escape_header_attribute(value))
+    } else {
+        out
+    }
 }
 
 /// True when `line` is provenance describing a `CSQ` field that is about to be
@@ -2295,7 +2296,7 @@ mod tests {
             ("CADD_RAW".to_string(), "Current raw score".to_string()),
             (
                 "ANGLE".to_string(),
-                "<current angle-leading description>".to_string(),
+                "\u{7}<current angle-leading description>".to_string(),
             ),
         ];
         let provenance = vec!["##datafusion-bio-function-vep=current".to_string()];
@@ -2349,7 +2350,8 @@ mod tests {
 
     #[test]
     fn quoted_angle_leading_plugin_description_is_valid_vcf_metadata() {
-        let rendered = sanitize_unstructured_header_value("<threshold \"strict\" \\ calibrated>");
+        let rendered =
+            sanitize_unstructured_header_value("\u{1}<threshold \"strict\" \\ calibrated>");
         assert_eq!(rendered, "\"<threshold \\\"strict\\\" \\\\ calibrated>\"");
 
         let input = format!(

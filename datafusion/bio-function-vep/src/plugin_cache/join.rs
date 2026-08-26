@@ -76,10 +76,10 @@ pub(crate) struct AdaptiveTieredStream {
     pub algorithm: JoinAlgorithm,
 }
 
-fn is_hash_join_resources_exhausted(error: &DataFusionError) -> bool {
+fn is_consumer_resources_exhausted(error: &DataFusionError, consumer: &str) -> bool {
     matches!(
         error.find_root(),
-        DataFusionError::ResourcesExhausted(message) if message.contains("HashJoinInput")
+        DataFusionError::ResourcesExhausted(message) if message.contains(consumer)
     )
 }
 
@@ -89,8 +89,24 @@ pub(crate) fn should_retry_hash_join(
     pool: &TracingPool,
 ) -> bool {
     algorithm == JoinAlgorithm::Hash
-        && is_hash_join_resources_exhausted(error)
+        && is_consumer_resources_exhausted(error, "HashJoinInput")
         && pool.hash_join_failed()
+}
+
+/// Retry the final sorted query when either its unspillable hash build or the
+/// downstream external sorter exhausts the pool. The sorter case matters when
+/// the hash estimate technically fits but leaves too little working memory for
+/// `ORDER BY tier, start`; dropping the hash plan before replanning as SMJ frees
+/// that reservation without relying on a fixed headroom guess.
+pub(crate) fn should_retry_final_hash_plan(
+    error: &DataFusionError,
+    algorithm: JoinAlgorithm,
+    pool: &TracingPool,
+) -> bool {
+    should_retry_hash_join(error, algorithm, pool)
+        || (algorithm == JoinAlgorithm::Hash
+            && is_consumer_resources_exhausted(error, "ExternalSorter")
+            && pool.external_sorter_failed())
 }
 
 async fn set_prefer_hash_join(ctx: &SessionContext, prefer: bool) -> Result<()> {
@@ -424,9 +440,9 @@ pub(crate) async fn tiered_stream_sorted_adaptive(
     tracer.clear_failures();
     match execute_stream(plan, ctx.task_ctx()) {
         Ok(stream) => Ok(AdaptiveTieredStream { stream, algorithm }),
-        Err(error) if should_retry_hash_join(&error, algorithm, tracer) => {
+        Err(error) if should_retry_final_hash_plan(&error, algorithm, tracer) => {
             info!(
-                "plugin_cache: tier HashJoin exhausted its reservation before streaming; retrying with DataFusion SortMergeJoin"
+                "plugin_cache: final HashJoin plan exhausted the pool before streaming; retrying with DataFusion SortMergeJoin"
             );
             Ok(AdaptiveTieredStream {
                 stream: tiered_stream_sorted_sort_merge(ctx, normalized_view, tracer).await?,
@@ -589,6 +605,37 @@ mod tests {
             JoinAlgorithm::Hash,
             tracer.as_ref()
         ));
+        assert!(should_retry_final_hash_plan(
+            &sort_error,
+            JoinAlgorithm::Hash,
+            tracer.as_ref()
+        ));
+        assert!(!should_retry_final_hash_plan(
+            &sort_error,
+            JoinAlgorithm::SortMerge,
+            tracer.as_ref()
+        ));
+    }
+
+    #[test]
+    fn final_hash_plan_retries_when_live_hash_starves_external_sorter() {
+        let tracer = Arc::new(TracingPool::new(Arc::new(FairSpillPool::new(100))));
+        let pool: Arc<dyn MemoryPool> = Arc::clone(&tracer) as _;
+        let hash_reservation = MemoryConsumer::new("HashJoinInput").register(&pool);
+        hash_reservation.try_grow(90).unwrap();
+
+        let sort_reservation = MemoryConsumer::new("ExternalSorter").register(&pool);
+        let error = sort_reservation.try_grow(20).unwrap_err();
+        assert!(should_retry_final_hash_plan(
+            &error,
+            JoinAlgorithm::Hash,
+            tracer.as_ref()
+        ));
+
+        // Replanning drops the unspillable build, leaving the same bounded
+        // pool able to grant the sorter's working reservation.
+        drop(hash_reservation);
+        sort_reservation.try_grow(20).unwrap();
     }
 
     #[tokio::test]

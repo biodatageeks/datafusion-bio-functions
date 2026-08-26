@@ -34,7 +34,7 @@ use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::ChromEntry;
 use crate::plugin_cache::dedup::{check_assume_unique_sample, dedup_keep_first};
 use crate::plugin_cache::join::{
-    partition_batches, should_retry_hash_join, tiered_stream_sorted_adaptive,
+    partition_batches, should_retry_final_hash_plan, tiered_stream_sorted_adaptive,
     tiered_stream_sorted_sort_merge,
 };
 use crate::plugin_cache::mem_trace;
@@ -491,9 +491,10 @@ pub async fn build_plugin_chrom(
     let scratch = ScratchGuard::new([build_tmp.clone()]);
 
     // Execute the explicitly sorted parallel plan and stream it directly into
-    // one final-order temp shard. If a HashJoin estimate was optimistic, retry only
-    // when the root error is ResourcesExhausted and the pool attributes the
-    // rejected reservation to HashJoinInput. Other failures propagate as-is.
+    // one final-order temp shard. If a HashJoin estimate was optimistic, or it
+    // fit but starved the downstream external sorter, retry only when the root
+    // error and pool trace attribute exhaustion to that hash plan. Other
+    // failures propagate as-is.
     let adaptive = match tiered_stream_sorted_adaptive(
         &build_ctx,
         &dedup_view,
@@ -520,9 +521,9 @@ pub async fn build_plugin_chrom(
     )
     .await;
     let written = match written {
-        Err(error) if should_retry_hash_join(&error, algorithm, tracer.as_ref()) => {
+        Err(error) if should_retry_final_hash_plan(&error, algorithm, tracer.as_ref()) => {
             info!(
-                "plugin_cache[{}/{chrom}]: tier HashJoin exhausted its reservation \
+                "plugin_cache[{}/{chrom}]: final HashJoin plan exhausted the pool \
                  ({read_rows} plugin rows this chrom) -- retrying with DataFusion SortMergeJoin",
                 src.plugin_name
             );
