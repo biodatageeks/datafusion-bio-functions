@@ -8,7 +8,7 @@ use std::path::Path;
 use datafusion::common::{DataFusionError, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::plugin_cache::source_manifest::{SourceManifest, ValueType, validate_csq_field_name};
+use crate::plugin_cache::source_manifest::{SourceManifest, ValueType};
 
 /// Per-chromosome build result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,13 +117,6 @@ fn ty_str(t: ValueType) -> &'static str {
 }
 
 impl CacheManifest {
-    fn validate(&self) -> Result<()> {
-        for value in &self.value_columns {
-            validate_csq_field_name(&self.plugin_name, &value.csq_field)?;
-        }
-        Ok(())
-    }
-
     /// Seed a cache manifest from a source manifest (chroms filled in by the build).
     pub fn from_source(src: &SourceManifest, source_manifest_file: &str) -> Self {
         CacheManifest {
@@ -163,7 +156,6 @@ impl CacheManifest {
 
     /// Write `manifest.json` into `plugin_dir`.
     pub fn write(&self, plugin_dir: &Path) -> Result<()> {
-        self.validate()?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| DataFusionError::Execution(format!("serialize manifest: {e}")))?;
         std::fs::write(plugin_dir.join("manifest.json"), json)
@@ -190,10 +182,11 @@ pub fn discover_plugins(cache_root: &Path) -> Result<Vec<CacheManifest>> {
         if mf.exists() {
             let text = std::fs::read_to_string(&mf)
                 .map_err(|e| DataFusionError::Execution(format!("read {}: {e}", mf.display())))?;
-            let manifest: CacheManifest = serde_json::from_str(&text)
-                .map_err(|e| DataFusionError::Execution(format!("parse {}: {e}", mf.display())))?;
-            manifest.validate()?;
-            out.push(manifest);
+            out.push(
+                serde_json::from_str(&text).map_err(|e| {
+                    DataFusionError::Execution(format!("parse {}: {e}", mf.display()))
+                })?,
+            );
         }
     }
     out.sort_by(|a: &CacheManifest, b: &CacheManifest| {
@@ -211,7 +204,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("plugin").join("demo");
         std::fs::create_dir_all(&plugin_dir).unwrap();
-        let mut m = CacheManifest {
+        let m = CacheManifest {
             plugin_name: "demo".into(),
             source_manifest: "demo.source.toml".into(),
             key_columns: vec![
@@ -239,30 +232,5 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].plugin_name, "demo");
         assert_eq!(found[0].chroms[0].rows, 3);
-
-        m.value_columns = vec![ValueColumnRecord {
-            column: "score".into(),
-            csq_field: "INFO".into(),
-            ty: "Utf8".into(),
-            description: Some("reserved collision".into()),
-        }];
-        let error = m.write(&plugin_dir).unwrap_err().to_string();
-        assert!(
-            error.contains("reserved VCF meta-information key"),
-            "{error}"
-        );
-
-        // Runtime discovery validates older or externally-created manifests too,
-        // rather than trusting that every cache passed through `write`.
-        std::fs::write(
-            plugin_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&m).unwrap(),
-        )
-        .unwrap();
-        let error = discover_plugins(dir.path()).unwrap_err().to_string();
-        assert!(
-            error.contains("reserved VCF meta-information key"),
-            "{error}"
-        );
     }
 }

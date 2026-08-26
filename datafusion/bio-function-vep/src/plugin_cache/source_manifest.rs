@@ -151,57 +151,7 @@ pub struct SourceManifest {
     pub assume_unique: bool,
 }
 
-/// VCF meta-information keys whose declarations belong to the file itself,
-/// not to a plugin's unstructured `##FIELD=description` namespace.
-///
-/// Rejecting these names removes an otherwise irresolvable ambiguity on
-/// re-annotation: for example, `##INFO=<ID=...>` must never be mistaken for a
-/// stale plugin header merely because a plugin also chose `INFO` as a CSQ field.
-const RESERVED_VCF_META_KEYS: &[&str] = &[
-    "fileformat",
-    "fileDate",
-    "source",
-    "reference",
-    "phasing",
-    "assembly",
-    "pedigreeDB",
-    "INFO",
-    "FILTER",
-    "FORMAT",
-    "ALT",
-    "contig",
-    "SAMPLE",
-    "PEDIGREE",
-    "META",
-    "VEP",
-];
-
-pub(crate) fn validate_csq_field_name(plugin_name: &str, field: &str) -> Result<()> {
-    if RESERVED_VCF_META_KEYS.contains(&field)
-        || field == "VEP-command-line"
-        || field == env!("CARGO_PKG_NAME")
-        || field
-            .strip_suffix("-command-line")
-            .is_some_and(|prefix| prefix == env!("CARGO_PKG_NAME"))
-    {
-        return Err(DataFusionError::Execution(format!(
-            "plugin '{plugin_name}' CSQ field '{field}' collides with a reserved VCF \
-             meta-information key"
-        )));
-    }
-    Ok(())
-}
-
 impl SourceManifest {
-    /// Validate constraints that must hold both while building a cache and when
-    /// reading an already-built cache at annotation time.
-    pub fn validate(&self) -> Result<()> {
-        for value in &self.value_columns {
-            validate_csq_field_name(&self.plugin_name, &value.csq_field)?;
-        }
-        Ok(())
-    }
-
     /// Match-column names, in order (the discriminator part of the key).
     pub fn match_column_names(&self) -> Vec<String> {
         self.match_columns
@@ -217,11 +167,9 @@ impl SourceManifest {
         let text = std::fs::read_to_string(path).map_err(|e| {
             DataFusionError::Execution(format!("read source manifest '{}': {e}", path.display()))
         })?;
-        let manifest: Self = toml::from_str(&text).map_err(|e| {
+        toml::from_str(&text).map_err(|e| {
             DataFusionError::Execution(format!("parse source manifest '{}': {e}", path.display()))
-        })?;
-        manifest.validate()?;
-        Ok(manifest)
+        })
     }
 
     /// The ingest view name: `plugin_<name>_ingest`.
@@ -283,29 +231,6 @@ type = "Float32"
         assert_eq!(m.value_columns[0].csq_field, "DEMO_SCORE");
         assert_eq!(m.value_columns[0].ty, ValueType::Float32);
         assert_eq!(m.ingest_view_name(), "plugin_demo_ingest");
-    }
-
-    #[test]
-    fn rejects_csq_fields_that_collide_with_vcf_or_provenance_headers() {
-        let base: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
-        for reserved in RESERVED_VCF_META_KEYS.iter().copied().chain([
-            "VEP-command-line",
-            env!("CARGO_PKG_NAME"),
-            concat!(env!("CARGO_PKG_NAME"), "-command-line"),
-        ]) {
-            let mut manifest = base.clone();
-            manifest.value_columns[0].csq_field = reserved.to_string();
-            let error = manifest.validate().unwrap_err().to_string();
-            assert!(
-                error.contains("reserved VCF meta-information key"),
-                "{error}"
-            );
-        }
-
-        let mut manifest = base;
-        manifest.value_columns[0].csq_field = "SCORE".to_string();
-        manifest.value_columns[0].description = Some("<threshold>".to_string());
-        manifest.validate().unwrap();
     }
 
     #[test]
