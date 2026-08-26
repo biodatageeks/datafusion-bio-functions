@@ -1,10 +1,13 @@
 # CADD tier-join reservation leak — RESOLVED (2026-08-25)
 
-> **Status: fixed in `92f55f9`.** All 5 plugins build chr21 and validate.
-> CADD: 121,809,062 rows in 2.1 min, `HashJoinInput` peak **0.70 GB** (was
-> 8.02 GB at an 8 GiB pool and 20.00 GB at 20 GiB). Kept as a record of the
-> mechanism and of what was ruled out — §5 in particular is worth reading
-> before touching this join again.
+> **Status: original leak fixed in `92f55f9`; follow-up production
+> implementation completed in `490cb8f` and `80bb9b8`.** All 5 plugins build
+> and validate on chr21, and the final adaptive parallel path builds all 5 on
+> chr1 at both 4 and 8 target
+> partitions. CADD chr21: 121,809,062 rows in 2.1 min, `HashJoinInput` peak
+> **0.70 GB** (was 8.02 GB at an 8 GiB pool and 20.00 GB at 20 GiB). Kept as a
+> record of the mechanism, the ruled-out theories, and the follow-up production
+> fixes; see §§8–10 for the current implementation and validation.
 
 ## 0. What it was, and the piece that was missing
 
@@ -48,8 +51,9 @@ theorising; this bug was unusually good at producing convincing wrong answers.
 
 | Thing | Path / ref |
 |---|---|
-| Engine worktree (the bug lives here) | `datafusion-bio-functions`, branch `plugins-fixes`, PR #217, HEAD `2d6c01d` |
+| Engine worktree | `datafusion-bio-functions`, branch `plugins-fixes`, PR #217, validated HEAD `80bb9b8` |
 | Tier join | `datafusion/bio-function-vep/src/plugin_cache/join.rs` |
+| Adaptive selector | `datafusion/bio-function-vep/src/plugin_cache/join_strategy.rs` |
 | Build driver + retry | `datafusion/bio-function-vep/src/plugin_cache/build.rs` |
 | Memory tracer | `datafusion/bio-function-vep/src/plugin_cache/mem_trace.rs` |
 | vepyr (PyO3 consumer, pins the engine by rev) | `vepyr`, branch `plugin-cache-build-validation`, PR #49 |
@@ -93,7 +97,7 @@ tabix http://localhost:18080/cadd/gnomad.genomes.r4.0.indel.tsv.gz 21 > $S/cadd_
 
 ~3.5 GB + 58 MB, ~60 s total.
 
-### 2.3 Build (fails)
+### 2.3 Historical pre-fix reproduction (fails before `92f55f9`)
 
 ```bash
 cd <vepyr worktree>
@@ -122,7 +126,7 @@ VEPYR_EXPLAIN_TIER_JOIN=1             # physical plan (join.rs)
 
 ---
 
-## 3. Established, with evidence
+## 3. Original incident findings, with evidence
 
 **The retry path is where it fails, and the retry is not the cause.**
 `tiered_stream` and `tiered_stream_sorted` are the same `tiered_stream_impl`
@@ -213,7 +217,12 @@ sharing.
 
 ---
 
-## 6. Where to look next
+## 6. Historical investigation queue (closed by `92f55f9`)
+
+This was the next-step list while the incident was open. The
+`BatchSplitStream` zero-copy re-slicing described in §0 answered it; these are
+retained to show which paths were still untested at the handover point, not as
+current work items.
 
 `collect_left_input` (`datafusion-physical-plan-53.0.0/src/joins/hash_join/exec.rs`)
 grows the reservation once per build batch (`:1874`) and once for the hash map
@@ -244,7 +253,7 @@ break on shifted-ness (unshifted first). See `vepyr-plugins` PR #4.
 
 ---
 
-## 7. Working state
+## 7. Post-leak-fix chr21 state
 
 **chr21, built and validated** (`(tier, start)` ascending per shard; SpliceAI's
 `assume_unique` checked exhaustively over all 31.7M keys):
@@ -313,3 +322,128 @@ All five new shards match the previous p4 shards on row count plus both XOR and
 sum aggregates of DuckDB whole-row hashes. Warm/cold manifest counts also match
 exactly. Logs and outputs are under
 `/Users/mwiewior/workspace/data_vepyr/plugin_partition_bench_direct_p4`.
+
+Implemented in `80bb9b8` on top of the adaptive parallel work in `490cb8f`.
+
+---
+
+## 9. Implemented production architecture (`490cb8f`)
+
+The follow-up work did not replace DataFusion's join implementations. It added
+the small policy and data-layout layer that DataFusion 53 does not provide:
+
+1. **Ordered parallel source ingestion.** File-scan repartitioning remains
+   enabled. All physical source partitions are collected concurrently, then
+   replayed in partition/range order before keep-first dedup. This preserves
+   VEP's first-in-file duplicate semantics without forcing parsing through one
+   stream. Providers that cannot physically split an input still expose one
+   partition naturally; there is no caller-side `target_partitions=1`
+   restriction.
+2. **Partitioned owned MemTables.** Execution-sized, independently owned Arrow
+   batches are distributed greedily by bytes across the available partitions.
+   This prevents both the original shared-buffer accounting problem and a
+   single MemTable scan bottleneck.
+3. **Pool-aware join selection.** For both the variation-filter join and the
+   final tier join, the code first asks DataFusion to optimize a CollectLeft
+   HashJoin candidate. It inspects the *actual physical build child* selected
+   by DataFusion and reads its row and byte statistics. The estimate includes
+   input batches, DataFusion's real hash-map structure, and the outer-join
+   visited bitmap, then compares that total with currently available bytes in
+   the finite pool.
+4. **Conservative automatic fallback.** A fitting estimate executes the exact
+   HashJoin plan. Missing statistics, an unknown pool limit, an unexpected hash
+   mode, or an estimate larger than the available pool causes replanning with
+   only `prefer_hash_join=false`; DataFusion supplies the repartitioning,
+   sorting, spilling, and SortMergeJoin. If an estimated-safe HashJoin is still
+   rejected at runtime, retry occurs only when the root error is
+   `ResourcesExhausted` and the tracing pool attributes it to `HashJoinInput`.
+5. **Parallel-safe output contract.** Parallel joins do not preserve useful
+   global order, so the final query explicitly requests `ORDER BY tier, start`.
+   Every emitted key is checked at the storage boundary before writing the
+   atomic temporary shard.
+
+The selector contains **no plugin names, chromosome names/sizes, row-count
+cutoffs, partition-count thresholds, or forced join algorithm**. Production
+uses DataFusion's runtime partition default with a two-worker minimum; the
+`VEPYR_PLUGIN_TARGET_PARTITIONS` override is retained for controlled tests and
+operator tuning. The memory pool remains configurable through
+`VEPYR_PLUGIN_RETRY_MEMORY_MIB` (the legacy name now covers the whole adaptive
+plan).
+
+Because each build already operates on one chromosome file, `chrom` was also
+removed from both physical join keys. It is a constant within the build and
+cannot improve selectivity. Removing it saves one string comparison and one
+column's key/hash/sort footprint per row, though it is a secondary memory win,
+not the root-cause fix.
+
+The resulting current flow is:
+
+```text
+parallel ordered source scan -> normalize -> ordered keep-first dedup
+    -> narrow (start, allele_string) key MemTable
+    -> adaptive LEFT SEMI JOIN against variation
+    -> GROUP BY matched variation keys with MIN(tier)
+    -> owned execution-sized variation-probe MemTable
+    -> adaptive LEFT tier join on (start, allele_string)
+    -> ORDER BY (tier, start)
+    -> checked single Parquet encode -> atomic rename
+```
+
+---
+
+## 10. Final chr1 validation and scaling result
+
+All measurements used a release build with `target-cpu=native` and the same
+8 GiB adaptive-plan pool. The p4 and p8 runs both completed for all plugins:
+
+| plugin | rows | p4 wall | p8 wall | p4 → p8 | probe / tier strategy |
+|---|---:|---:|---:|---:|---|
+| ClinVar | 401,099 | 4.08 s | 2.15 s | -47.3% | Hash / Hash |
+| AlphaMissense | 7,151,767 | 8.08 s | 6.72 s | -16.8% | Hash / Hash |
+| dbNSFP | 8,788,707 | 57.84 s | 53.42 s | -7.6% | Hash / Hash |
+| SpliceAI | 300,634,726 | 230.27 s | 175.09 s | -24.0% | SortMerge / Hash |
+| CADD | 699,768,898 | 221.89 s | 194.05 s | -12.5% | SortMerge / Hash |
+
+For SpliceAI and CADD's probe stage, DataFusion reports a row estimate but no
+projected byte estimate for the physical build child. The policy therefore
+selects SortMerge before execution; neither plugin pays for a doomed HashJoin
+attempt. Their materialized final tier probes have exact statistics and fit the
+pool, so DataFusion's selected final HashJoin is retained. At p8 the estimated
+final hash builds were about 0.86 GiB for SpliceAI and 2.89 GiB for CADD.
+
+The p8 shards match the validated p4 results on row count, warm/cold counts,
+and XOR plus sum aggregates of DuckDB whole-row hashes. Logs and outputs are
+under `/Users/mwiewior/workspace/data_vepyr/plugin_partition_bench_direct_p8`.
+
+### Why dbNSFP scales poorly
+
+dbNSFP is no longer join-bound. At p8, both adaptive decisions choose HashJoin;
+the probe estimate is about 0.39 GiB and the final tier build about 27 MiB. The
+two joins therefore complete without a fallback. Most time is spent parsing and
+materializing its roughly 37.7 GB, 505-column TSV source, followed by the one
+ordered final Parquet writer:
+
+| run | read + normalize + dedup | remaining tier join + sort + write | wall |
+|---|---:|---:|---:|
+| p4 | 44.2 s | 13.2 s | 57.84 s |
+| p8 | 39.2 s | 13.7 s | 53.42 s |
+
+Repeat p8 diagnostics varied from 43.1 to 44.7 s total when comparing normal
+dedup with a temporary `assume_unique` manifest. The absence of a meaningful
+`assume_unique` advantage, together with the tiny measured join builds, rules
+out dedup and adaptive join selection as the primary scaling limit. The wide
+delimited decode/materialization and final single ordered writer dominate;
+additional join partitions cannot make those serial or bandwidth-bound parts
+scale linearly.
+
+### Verification at `80bb9b8`
+
+- 942 library tests passed, 1 ignored.
+- 6 plugin-cache integration tests passed.
+- `cargo fmt` and Clippy passed.
+- chr1 p4 and p8: all five plugins completed and produced logically identical
+  shards by row count, warm/cold counts, and two independent whole-row hash
+  aggregates.
+
+Full-genome validation is still outstanding; the evidence above covers chr21
+for the original reservation fix and chr1 for the final p4/p8 production path.
