@@ -738,6 +738,24 @@ fn escape_header_attribute(value: &str) -> String {
     out
 }
 
+/// Renders an unstructured VCF meta-information value on exactly one physical
+/// line. Unlike [`escape_header_attribute`], quotes and backslashes have no
+/// delimiter meaning here and are preserved; only control characters need an
+/// escaped representation (or, for other controls, removal).
+fn sanitize_unstructured_header_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// True when `line` is provenance describing a `CSQ` field that is about to be
 /// replaced, and so must not be carried into the new header.
 ///
@@ -775,19 +793,28 @@ fn merge_annotation_header_lines(
             if is_stale_provenance_line(line) {
                 return false;
             }
-            let Some((key, _)) = line
+            let Some((key, value)) = line
                 .strip_prefix("##")
                 .and_then(|line| line.split_once('='))
             else {
                 return true;
             };
-            !emitted_fields.contains(key)
+            // Structured declarations such as `##INFO=<ID=...>` belong to the
+            // source VCF even when a plugin field happens to use the same
+            // meta-information key. This module only owns unstructured field
+            // description lines.
+            value.starts_with('<') || !emitted_fields.contains(key)
         })
         .collect();
     lines.extend(
         plugin_field_descriptions
             .iter()
-            .map(|(field, description)| format!("##{field}={description}")),
+            .map(|(field, description)| {
+                format!(
+                    "##{field}={}",
+                    sanitize_unstructured_header_value(description)
+                )
+            }),
     );
     lines.extend(provenance);
     lines
@@ -2243,16 +2270,24 @@ mod tests {
             "##NO_DESCRIPTION=stale description".to_string(),
             "##CADD_RAW_EXTRA=unrelated prefix match".to_string(),
             "##INFO=<ID=CADD_RAW,Number=1,Type=String,Description=\"ordinary INFO\">".to_string(),
+            "##INFO=stale plugin description".to_string(),
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">".to_string(),
             "##VEP=stale provenance".to_string(),
         ];
         let fields = vec![
             "CADD_RAW".to_string(),
             "CADD_PHRED".to_string(),
             "NO_DESCRIPTION".to_string(),
+            "INFO".to_string(),
+            "FORMAT".to_string(),
         ];
         let descriptions = vec![
-            ("CADD_PHRED".to_string(), "Current PHRED".to_string()),
+            (
+                "CADD_PHRED".to_string(),
+                "Current PHRED\nsecond line\r\ttail\u{7}".to_string(),
+            ),
             ("CADD_RAW".to_string(), "Current raw score".to_string()),
+            ("INFO".to_string(), "Current plugin INFO".to_string()),
         ];
         let provenance = vec!["##datafusion-bio-function-vep=current".to_string()];
 
@@ -2265,10 +2300,17 @@ mod tests {
                 "##fileformat=VCFv4.2",
                 "##CADD_RAW_EXTRA=unrelated prefix match",
                 "##INFO=<ID=CADD_RAW,Number=1,Type=String,Description=\"ordinary INFO\">",
-                "##CADD_PHRED=Current PHRED",
+                "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                "##CADD_PHRED=Current PHRED\\nsecond line\\r\\ttail",
                 "##CADD_RAW=Current raw score",
+                "##INFO=Current plugin INFO",
                 provenance[0].as_str(),
             ]
+        );
+        assert!(
+            merged
+                .iter()
+                .all(|line| !line.chars().any(|c| matches!(c, '\n' | '\r' | '\t')))
         );
         assert_eq!(
             merged
