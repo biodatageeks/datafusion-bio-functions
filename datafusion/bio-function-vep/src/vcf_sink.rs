@@ -2276,7 +2276,6 @@ mod tests {
             "##NO_DESCRIPTION=stale description".to_string(),
             "##CADD_RAW_EXTRA=unrelated prefix match".to_string(),
             "##INFO=<ID=CADD_RAW,Number=1,Type=String,Description=\"ordinary INFO\">".to_string(),
-            "##INFO=stale plugin description".to_string(),
             "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">".to_string(),
             "##ANGLE=<ID=calibration,Description=\"custom structured metadata\">".to_string(),
             "##ANGLE=\"<stale angle-leading description>\"".to_string(),
@@ -2287,7 +2286,6 @@ mod tests {
             "CADD_PHRED".to_string(),
             "NO_DESCRIPTION".to_string(),
             "ANGLE".to_string(),
-            "INFO".to_string(),
         ];
         let descriptions = vec![
             (
@@ -2299,7 +2297,6 @@ mod tests {
                 "ANGLE".to_string(),
                 "<current angle-leading description>".to_string(),
             ),
-            ("INFO".to_string(), "Current plugin INFO".to_string()),
         ];
         let provenance = vec!["##datafusion-bio-function-vep=current".to_string()];
 
@@ -2317,7 +2314,6 @@ mod tests {
                 "##CADD_PHRED=Current PHRED\\nsecond line\\r\\ttail",
                 "##CADD_RAW=Current raw score",
                 "##ANGLE=\"<current angle-leading description>\"",
-                "##INFO=Current plugin INFO",
                 provenance[0].as_str(),
             ]
         );

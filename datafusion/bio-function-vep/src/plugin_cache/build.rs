@@ -349,6 +349,7 @@ pub async fn build_plugin_chrom(
     output_cache_root: &Path,
     chrom: &str,
 ) -> Result<ChromEntry> {
+    src.validate()?;
     // Coarse-grained stage timing at `info` level — cheap (a handful of
     // `Instant::now()` calls) and the only thing that would have turned CADD
     // chr6's multi-hour "is it stuck?" investigation (no visibility into
