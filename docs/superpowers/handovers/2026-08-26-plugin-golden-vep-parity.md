@@ -11,6 +11,60 @@ Narrative report: <https://claude.ai/code/artifact/28178c87-b954-40b0-adee-dfd29
 
 ---
 
+## Superseding full-autosome closure (later 2026-08-26)
+
+The earlier chr1/chr21-only state documented below has now been superseded by
+a complete VEP 116 autosome run. The fixed-CADD references and vepyr outputs
+cover 22 chromosomes, 4,096,123 VCF records, and 69,299,753 CSQ entries.
+
+The first full strict pass found exactly two additional mismatch classes:
+
+1. The generic plugin CSQ formatter did not encode `=` as `%3D`, unlike VEP.
+   This affected seven ClinVar records (six on chr13 and one on chr17), or 556
+   `ClinVar_CLNVI` CSQ entries, all containing a BIC `base_change=...` value.
+2. Typed VCF columns collapse an explicit `INFO_KEY=.` and an absent INFO key
+   to the same Arrow null. At `chr22:28800769 G>C`, VEP preserved the explicit
+   ClinVar `CLNDN=.` in 39 CSQ entries while vepyr emitted an empty field.
+
+The `=` class affected `chr13:32316435 G>A`, `32337751 A>G`, `32341273 CAATT>C`,
+`32355095 A>G`, `32362509 T>C`, `32379251 T>C`, and `chr17:43099914 G>A`.
+The uncapped pre-fix ledger hashes are respectively
+`dfdf65a4b7b32982cdebe78d6f48f775207841f2b736d61b5df6179ea056fe85`
+(135 rows) and
+`ffea4318ed5c1920d21bad1bd73eddf3260a2e4179ea3b51a70de488d1deb7ef`
+(421 rows). The chr22 difference was format-only and therefore had no semantic
+ledger row.
+
+Both are fixed without variant-specific or chromosome-specific hardcoding:
+
+- plugin strings now escape `=` generically;
+- VCF source manifests can opt into `record_layout`, exposing
+  `_vcf_info_keys` so a manifest can distinguish explicit missing markers from
+  absent keys;
+- the ClinVar manifest enables that layout and restores `.` only for selected
+  INFO keys that were actually present. A blanket null-to-dot conversion would
+  be wrong: chr22 contains 4,534 records with no `CLNDN` key and only two with
+  an explicit `CLNDN=.`. This manifest is versioned in `vepyr-plugins` commit
+  `4c92563adb49389ce1569a77681274f8f37c9fd8`.
+
+After release/native rebuilds of chr13, chr17, and chr22, both the targeted
+strict reruns and an independent 22-chromosome strict body-MD5 pass are green:
+
+- 22/22 strict exits are zero;
+- all 4,096,123 record bodies are byte-identical to VEP;
+- aggregate variant-set, CSQ-count, CSQ-set, CSQ-order, field-value,
+  field-format, and field-order mismatch counts are zero;
+- all mismatch ledgers are empty.
+
+Headers still intentionally differ in provenance, absolute paths, and custom
+field declaration text; they are outside the body parity target. Detailed
+baseline variants, ledger hashes, implementation notes, and post-fix evidence
+are in `vepyr/e2e-testing/reports/full_autosome_mismatch_catalog_116.md`.
+Everything below this section records the earlier investigative history and
+should not be read as the current parity status.
+
+---
+
 ## 1. Result
 
 All 38 plugin CSQ fields report **100.00%** on both contigs.

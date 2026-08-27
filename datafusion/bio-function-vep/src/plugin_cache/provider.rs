@@ -144,6 +144,15 @@ pub async fn register_sources(
                         .map_err(|e| {
                             DataFusionError::Execution(format!("open VCF source '{table}': {e}"))
                         })?;
+                let provider = if spec.record_layout {
+                    provider.with_record_layout().map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "carry VCF record layout for source '{table}': {e}"
+                        ))
+                    })?
+                } else {
+                    provider
+                };
                 ctx.register_table(&table, Arc::new(provider))?;
             }
             ProviderKind::Bed => {
@@ -176,7 +185,7 @@ pub async fn register_sources(
 mod tests {
     use super::*;
     use crate::plugin_cache::source_manifest::SourceManifest;
-    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::array::{Array, Int64Array, StringArray};
     use std::io::Write;
 
     fn write_gz(path: &std::path::Path, body: &str) {
@@ -247,6 +256,62 @@ threshold = 0.01
             .unwrap()
             .value(0);
         assert_eq!(c, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vcf_record_layout_distinguishes_explicit_null_from_absent_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vcf = dir.path().join("missing-info.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.3\n\
+             ##INFO=<ID=CLNDN,Number=.,Type=String,Description=\"Disease name\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             1\t100\t.\tG\tA\t.\t.\tCLNDN=.\n\
+             1\t101\t.\tG\tA\t.\t.\t.\n",
+        )
+        .unwrap();
+
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+value_columns = []
+
+[[source]]
+provider = "vcf"
+path = "{}"
+record_layout = true
+"##,
+            vcf.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let ctx = SessionContext::new();
+        let _temps = register_sources(&ctx, &manifest).await.unwrap();
+        let batches = ctx
+            .sql(
+                "SELECT start, \"CLNDN\", \"_vcf_info_keys\" \
+                 FROM plugin_demo_src ORDER BY start",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let clndn = batch.column(1);
+        assert!(clndn.is_null(0));
+        assert!(clndn.is_null(1));
+        let info_keys = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(info_keys.value(0), "CLNDN");
+        assert_eq!(info_keys.value(1), "");
     }
 
     // I4: document (and pin, so a `datafusion-bio-format-vcf` version bump that

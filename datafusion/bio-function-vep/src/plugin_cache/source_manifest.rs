@@ -70,6 +70,13 @@ pub struct SourceSpec {
     pub part: Option<String>,
     pub provider: ProviderKind,
     pub path: String,
+    /// For text VCF input, expose the record's INFO/FORMAT key lists as the
+    /// reader's `_vcf_info_keys` / `_vcf_format_keys` columns. Typed VCF values
+    /// alone cannot distinguish an explicit `KEY=.` from an absent key because
+    /// both become Arrow null. Off by default so sources that do not need that
+    /// distinction pay no layout-carry cost.
+    #[serde(default)]
+    pub record_layout: bool,
     #[serde(default)]
     pub csv: Option<CsvParams>,
 }
@@ -209,6 +216,15 @@ impl SourceManifest {
     /// Validate constraints shared by build-time source manifests and runtime
     /// built-cache manifests.
     pub fn validate(&self) -> Result<()> {
+        for source in &self.sources {
+            if source.record_layout && source.provider != ProviderKind::Vcf {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin '{}' requests record_layout for a {:?} source; record layout is \
+                     supported only for text VCF sources",
+                    self.plugin_name, source.provider
+                )));
+            }
+        }
         for value in &self.value_columns {
             validate_csq_field_name(&self.plugin_name, &value.csq_field)?;
         }
@@ -288,6 +304,7 @@ type = "Float32"
         assert_eq!(m.plugin_name, "demo");
         assert_eq!(m.coordinate_system, CoordinateSystem::OneBased);
         assert_eq!(m.sources.len(), 1);
+        assert!(!m.sources[0].record_layout);
         assert_eq!(
             m.sources[0].table_name(&m.plugin_name),
             "plugin_demo_src_snv"
@@ -355,11 +372,27 @@ type = "Float32"
     }
 
     #[test]
+    fn record_layout_is_supported_only_for_vcf_sources() {
+        let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        manifest.sources[0].record_layout = true;
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("record layout is supported only for text VCF sources"),
+            "{error}"
+        );
+
+        manifest.sources[0].provider = ProviderKind::Vcf;
+        manifest.sources[0].csv = None;
+        manifest.validate().unwrap();
+    }
+
+    #[test]
     fn single_source_table_name_has_no_part_suffix() {
         let src = SourceSpec {
             part: None,
             provider: ProviderKind::Csv,
             path: "x".into(),
+            record_layout: false,
             csv: None,
         };
         assert_eq!(src.table_name("cadd"), "plugin_cadd_src");
