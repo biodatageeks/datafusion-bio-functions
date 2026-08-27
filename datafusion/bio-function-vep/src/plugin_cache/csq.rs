@@ -8,16 +8,18 @@
 use crate::plugin_cache::lookup::PluginScalar;
 
 /// Escape a plugin string value for the CSQ payload, mirroring the engine's
-/// built-in `csq_escape`: `,`/`|` → `&`, `;` → `%3B`, whitespace → `_`. Without
-/// this a Utf8 plugin value containing a CSQ/INFO delimiter would corrupt field
-/// or entry boundaries. (The built-in `-`→empty convention is deliberately NOT
-/// applied to plugin values, so a legitimate `-` is preserved.)
+/// built-in `csq_escape`: `,`/`|` → `&`, `;` → `%3B`, `=` → `%3D`,
+/// whitespace → `_`. Without this a Utf8 plugin value containing a CSQ/INFO
+/// delimiter would corrupt field or entry boundaries. (The built-in
+/// `-`→empty convention is deliberately NOT applied to plugin values, so a
+/// legitimate `-` is preserved.)
 fn escape_csq_value(val: &str) -> String {
     let mut out = String::with_capacity(val.len());
     for ch in val.chars() {
         match ch {
             ',' | '|' => out.push('&'),
             ';' => out.push_str("%3B"),
+            '=' => out.push_str("%3D"),
             c if c.is_whitespace() => out.push('_'),
             c => out.push(c),
         }
@@ -66,6 +68,10 @@ mod tests {
             "a&b%3Bc_d"
         );
         assert_eq!(format_scalar(&PluginScalar::Str("x,y".into())), "x&y");
+        assert_eq!(
+            format_scalar(&PluginScalar::Str("base_change=G_to_A".into())),
+            "base_change%3DG_to_A"
+        );
         // AlphaMissense-style values contain none → unchanged (parity-safe)
         assert_eq!(
             format_scalar(&PluginScalar::Str("likely_benign".into())),

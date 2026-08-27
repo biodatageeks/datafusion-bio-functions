@@ -70,6 +70,13 @@ pub struct SourceSpec {
     pub part: Option<String>,
     pub provider: ProviderKind,
     pub path: String,
+    /// For text VCF input, expose the record's INFO/FORMAT key lists as the
+    /// reader's `_vcf_info_keys` / `_vcf_format_keys` columns. Typed VCF values
+    /// alone cannot distinguish an explicit `KEY=.` from an absent key because
+    /// both become Arrow null. Off by default so sources that do not need that
+    /// distinction pay no layout-carry cost.
+    #[serde(default)]
+    pub record_layout: bool,
     #[serde(default)]
     pub csv: Option<CsvParams>,
 }
@@ -92,6 +99,10 @@ pub struct ValueColumn {
     pub csq_field: String,
     #[serde(rename = "type")]
     pub ty: ValueType,
+    /// Text for this field's `##<CSQ_FIELD>=<description>` VCF header line,
+    /// mirroring what an Ensembl plugin returns from `get_header_info()`.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// A per-transcript match discriminator: an extra key column (produced by
@@ -119,9 +130,107 @@ pub struct SourceManifest {
     /// Optional per-transcript match discriminators (§3.4). Empty = per-variant.
     #[serde(default, rename = "match_column")]
     pub match_columns: Vec<MatchColumn>,
+    /// How this plugin's Ensembl implementation compares a variant to a data
+    /// row. Set `minimised` only for plugins that call
+    /// `get_matched_variant_alleles()` (CADD, AlphaMissense); the default
+    /// `exact` matches SpliceAI's and dbNSFP's verbatim comparison.
+    #[serde(default)]
+    pub allele_match: crate::plugin_cache::cache_manifest::AlleleMatch,
+    /// Position of this plugin's field block in the CSQ string (lower first).
+    #[serde(default = "crate::plugin_cache::cache_manifest::default_csq_rank_pub")]
+    pub csq_rank: u32,
+    /// Field order within this plugin's block.
+    #[serde(default)]
+    pub field_order: crate::plugin_cache::cache_manifest::FieldOrder,
+    /// Skip the build-time keep-first dedup pass (`dedup::dedup_keep_first`)
+    /// when the source is structurally guaranteed to never emit two rows
+    /// sharing a runtime probe key `(start, allele_string, <match cols>)` —
+    /// e.g. SpliceAI's masked release (one prediction per variant) or CADD's
+    /// SNV+indel files (disjoint allele-string shapes, so they can't collide
+    /// with each other or within themselves). Dedup's `HashSet<String>` costs
+    /// one heap-allocated key per row and is the dominant memory cost on the
+    /// largest chromosomes; skipping it for sources that provably have no
+    /// duplicates avoids that cost entirely. Do NOT set this for sources that
+    /// can legitimately repeat a key (e.g. AlphaMissense's overlapping
+    /// UniProt entries) — the manifest author must justify this per-plugin,
+    /// it is not a generic performance knob.
+    #[serde(default)]
+    pub assume_unique: bool,
+}
+
+/// Standard VCF meta-information keys and provenance keys owned by this sink.
+/// A plugin field using one would either produce an invalid declaration (for
+/// structured keys such as `INFO`) or replace file-owned scalar metadata (for
+/// keys such as the mandatory `fileformat`). Arbitrary custom keys are valid;
+/// their structured declarations are disambiguated in `vcf_sink` instead.
+const RESERVED_VCF_META_KEYS: &[&str] = &[
+    "fileformat",
+    "fileDate",
+    "source",
+    "reference",
+    "phasing",
+    "assembly",
+    "pedigreeDB",
+    "INFO",
+    "FILTER",
+    "FORMAT",
+    "ALT",
+    "contig",
+    "SAMPLE",
+    "PEDIGREE",
+    "META",
+    "VEP",
+    "VEP-command-line",
+];
+
+pub(crate) fn validate_csq_field_name(plugin_name: &str, field: &str) -> Result<()> {
+    let mut chars = field.chars();
+    let valid_first = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let valid_rest = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'));
+    if !valid_first || !valid_rest {
+        return Err(DataFusionError::Execution(format!(
+            "plugin '{plugin_name}' has invalid CSQ field name {field:?}; field names must start \
+             with an ASCII alphanumeric character or '_' and contain only ASCII alphanumeric \
+             characters, '_', '.', '+', or '-'"
+        )));
+    }
+
+    let engine_key = env!("CARGO_PKG_NAME");
+    if RESERVED_VCF_META_KEYS.contains(&field)
+        || field == engine_key
+        || field
+            .strip_suffix("-command-line")
+            .is_some_and(|prefix| prefix == engine_key)
+    {
+        return Err(DataFusionError::Execution(format!(
+            "plugin '{plugin_name}' CSQ field '{field}' collides with a reserved VCF \
+             meta-information key"
+        )));
+    }
+    Ok(())
 }
 
 impl SourceManifest {
+    /// Validate constraints shared by build-time source manifests and runtime
+    /// built-cache manifests.
+    pub fn validate(&self) -> Result<()> {
+        for source in &self.sources {
+            if source.record_layout && source.provider != ProviderKind::Vcf {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin '{}' requests record_layout for a {:?} source; record layout is \
+                     supported only for text VCF sources",
+                    self.plugin_name, source.provider
+                )));
+            }
+        }
+        for value in &self.value_columns {
+            validate_csq_field_name(&self.plugin_name, &value.csq_field)?;
+        }
+        Ok(())
+    }
+
     /// Match-column names, in order (the discriminator part of the key).
     pub fn match_column_names(&self) -> Vec<String> {
         self.match_columns
@@ -137,9 +246,11 @@ impl SourceManifest {
         let text = std::fs::read_to_string(path).map_err(|e| {
             DataFusionError::Execution(format!("read source manifest '{}': {e}", path.display()))
         })?;
-        toml::from_str(&text).map_err(|e| {
+        let manifest: Self = toml::from_str(&text).map_err(|e| {
             DataFusionError::Execution(format!("parse source manifest '{}': {e}", path.display()))
-        })
+        })?;
+        manifest.validate()?;
+        Ok(manifest)
     }
 
     /// The ingest view name: `plugin_<name>_ingest`.
@@ -193,6 +304,7 @@ type = "Float32"
         assert_eq!(m.plugin_name, "demo");
         assert_eq!(m.coordinate_system, CoordinateSystem::OneBased);
         assert_eq!(m.sources.len(), 1);
+        assert!(!m.sources[0].record_layout);
         assert_eq!(
             m.sources[0].table_name(&m.plugin_name),
             "plugin_demo_src_snv"
@@ -204,11 +316,83 @@ type = "Float32"
     }
 
     #[test]
+    fn rejects_reserved_vcf_keys_but_accepts_arbitrary_custom_fields() {
+        let base: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        for reserved in RESERVED_VCF_META_KEYS.iter().copied().chain([
+            env!("CARGO_PKG_NAME"),
+            concat!(env!("CARGO_PKG_NAME"), "-command-line"),
+        ]) {
+            let mut manifest = base.clone();
+            manifest.value_columns[0].csq_field = reserved.to_string();
+            let error = manifest.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("reserved VCF meta-information key"),
+                "{error}"
+            );
+        }
+
+        let mut manifest = base;
+        manifest.value_columns[0].csq_field = "SCORE".to_string();
+        manifest.value_columns[0].description = Some("<threshold>".to_string());
+        manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn enforces_vcf_safe_csq_field_identifiers() {
+        let base: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        for unsafe_name in [
+            "",
+            " ",
+            "CADD RAW",
+            "A|B",
+            "A=B",
+            "A\nB",
+            "A\rB",
+            "A\tB",
+            "\u{1}SCORE",
+            ".SCORE",
+            "SCORE/RAW",
+            "café",
+        ] {
+            let mut manifest = base.clone();
+            manifest.value_columns[0].csq_field = unsafe_name.to_string();
+            let error = manifest.validate().unwrap_err().to_string();
+            assert!(error.contains("invalid CSQ field name"), "{error}");
+            assert!(
+                !error.contains('\n'),
+                "unsafe name must be escaped: {error:?}"
+            );
+        }
+
+        for safe_name in ["CADD_RAW", "GERP++_RS", "SCORE.1", "CUSTOM-FIELD", "1000G"] {
+            let mut manifest = base.clone();
+            manifest.value_columns[0].csq_field = safe_name.to_string();
+            manifest.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn record_layout_is_supported_only_for_vcf_sources() {
+        let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        manifest.sources[0].record_layout = true;
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("record layout is supported only for text VCF sources"),
+            "{error}"
+        );
+
+        manifest.sources[0].provider = ProviderKind::Vcf;
+        manifest.sources[0].csv = None;
+        manifest.validate().unwrap();
+    }
+
+    #[test]
     fn single_source_table_name_has_no_part_suffix() {
         let src = SourceSpec {
             part: None,
             provider: ProviderKind::Csv,
             path: "x".into(),
+            record_layout: false,
             csv: None,
         };
         assert_eq!(src.table_name("cadd"), "plugin_cadd_src");

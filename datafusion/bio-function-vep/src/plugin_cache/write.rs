@@ -87,6 +87,7 @@ mod tests {
             column: "am_pathogenicity".into(),
             csq_field: "am_pathogenicity".into(),
             ty: ValueType::Float32,
+            description: None,
         }]
     }
 

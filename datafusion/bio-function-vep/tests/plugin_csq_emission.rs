@@ -11,7 +11,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Float32Array, Int8Array, StringArray, UInt32Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion_bio_function_vep::plugin_cache::cache_manifest::{
-    CacheManifest, ChromEntry, MatchColumnRecord, ValueColumnRecord,
+    AlleleMatch, CacheManifest, ChromEntry, FieldOrder, MatchColumnRecord, ValueColumnRecord,
 };
 use datafusion_bio_function_vep::plugin_cache::csq::{empty_suffix, field_suffix};
 use datafusion_bio_function_vep::plugin_cache::registry::PluginRegistry;
@@ -21,8 +21,9 @@ use datafusion_bio_function_vep::plugin_cache::source_manifest::{
 use datafusion_bio_function_vep::plugin_cache::template::build_attr_namespace;
 
 /// Namespace for a `C/G` variant with the given amino-acid change (rest empty).
-fn ns_aa<'a>(amino_acids: &'a str, protein_pos: &'a str) -> [Option<&'a str>; 16] {
+fn ns_aa<'a>(amino_acids: &'a str, protein_pos: &'a str) -> [Option<&'a str>; 17] {
     build_attr_namespace(
+        "",
         "",
         "",
         "",
@@ -53,11 +54,13 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
             column: "am_pathogenicity".into(),
             csq_field: "am_pathogenicity".into(),
             ty: ValueType::Float32,
+            description: None,
         },
         ValueColumn {
             column: "am_class".into(),
             csq_field: "am_class".into(),
             ty: ValueType::Utf8,
+            description: None,
         },
     ];
     let schema = plugin_output_schema(&matches, &vals);
@@ -98,11 +101,13 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
                 column: "am_pathogenicity".into(),
                 csq_field: "am_pathogenicity".into(),
                 ty: "Float32".into(),
+                description: None,
             },
             ValueColumnRecord {
                 column: "am_class".into(),
                 csq_field: "am_class".into(),
                 ty: "Utf8".into(),
+                description: None,
             },
         ],
         chroms: vec![ChromEntry {
@@ -113,6 +118,9 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
             cold: 1,
         }],
         cache_source_version: None,
+        allele_match: Default::default(),
+        csq_rank: 0,
+        field_order: Default::default(),
     };
     manifest.write(&plugin_dir).unwrap();
 }
@@ -134,24 +142,24 @@ async fn plugin_csq_gates_per_transcript() {
 
     // Transcript line 1: missense C17W (Amino_acids "C/W", Protein_position "17").
     let ns_missense = ns_aa("C/W", "17");
-    let missense = slices.probe_all(22893742, "C/G", &ns_missense);
+    let missense = slices.probe_all(22893742, "C/G", None, &ns_missense);
     assert_eq!(field_suffix(&missense), "|0.4833|ambiguous");
 
     // Transcript line 2: intron (no amino-acid change) → gate → empty fields.
     let ns_intron = ns_aa("", "");
-    let intron = slices.probe_all(22893742, "C/G", &ns_intron);
+    let intron = slices.probe_all(22893742, "C/G", None, &ns_intron);
     assert_eq!(field_suffix(&intron), empty_suffix(n));
     assert_eq!(field_suffix(&intron), "||");
 
     // A different protein change at the same position (wrong isoform) → miss.
     let ns_wrong = ns_aa("C/Y", "17");
     assert_eq!(
-        field_suffix(&slices.probe_all(22893742, "C/G", &ns_wrong)),
+        field_suffix(&slices.probe_all(22893742, "C/G", None, &ns_wrong)),
         "||"
     );
 
     // A variant with no shard row (different position) → empty fields.
-    let none_here = slices.probe_all(99999999, "A/G", &ns_missense);
+    let none_here = slices.probe_all(99999999, "A/G", None, &ns_missense);
     assert_eq!(field_suffix(&none_here), "||");
 }
 
@@ -173,6 +181,7 @@ async fn indel_probe_uses_normalized_start() {
         column: "score".into(),
         csq_field: "SCORE".into(),
         ty: ValueType::Float32,
+        description: None,
     }];
     let schema = plugin_output_schema(&matches, &vals);
     // One row at the NORMALIZED coordinates: start 101, allele "-/TG".
@@ -206,6 +215,7 @@ async fn indel_probe_uses_normalized_start() {
             column: "score".into(),
             csq_field: "SCORE".into(),
             ty: "Float32".into(),
+            description: None,
         }],
         chroms: vec![ChromEntry {
             chrom: "chr1".into(),
@@ -215,6 +225,9 @@ async fn indel_probe_uses_normalized_start() {
             cold: 1,
         }],
         cache_source_version: None,
+        allele_match: Default::default(),
+        csq_rank: 0,
+        field_order: Default::default(),
     };
     manifest.write(&plugin_dir).unwrap();
 
@@ -222,11 +235,118 @@ async fn indel_probe_uses_normalized_start() {
 
     // Normalized start (101) hits.
     let hit = reg.take_buffer_all(&[101]).await.unwrap();
-    assert_eq!(field_suffix(&hit.probe_all(101, "-/TG", &[])), "|0.75");
+    assert_eq!(
+        field_suffix(&hit.probe_all(101, "-/TG", None, &[])),
+        "|0.75"
+    );
     // Raw VCF POS (100) misses — this is what the pre-fix code used.
     let miss = reg.take_buffer_all(&[100]).await.unwrap();
     assert_eq!(
-        field_suffix(&miss.probe_all(100, "-/TG", &[])),
+        field_suffix(&miss.probe_all(100, "-/TG", None, &[])),
         empty_suffix(1)
+    );
+}
+
+/// Exercise both non-default manifest controls through the full Parquet lookup
+/// path. The primary unminimised key must miss, the minimised fallback must hit,
+/// and values must be permuted *after* projection so alphabetical CSQ field
+/// names remain paired with their physical shard values.
+#[tokio::test(flavor = "multi_thread")]
+async fn minimised_fallback_and_alphabetical_fields_preserve_name_value_pairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_root = dir.path();
+    let plugin_dir = cache_root.join("plugin").join("demo");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+
+    let vals = vec![
+        ValueColumn {
+            column: "z_value".into(),
+            csq_field: "Z_FIELD".into(),
+            ty: ValueType::Utf8,
+            description: Some("Z description".into()),
+        },
+        ValueColumn {
+            column: "a_value".into(),
+            csq_field: "A_FIELD".into(),
+            ty: ValueType::Utf8,
+            description: Some("A description".into()),
+        },
+    ];
+    let schema = plugin_output_schema(&[], &vals);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["1"])),
+            Arc::new(UInt32Array::from(vec![101u32])),
+            Arc::new(UInt32Array::from(vec![101u32])),
+            Arc::new(StringArray::from(vec!["A/G"])),
+            Arc::new(StringArray::from(vec!["z-value"])),
+            Arc::new(StringArray::from(vec!["a-value"])),
+            Arc::new(Int8Array::from(vec![1i8])),
+        ],
+    )
+    .unwrap();
+    let mut writer = PluginShardWriter::create(&plugin_dir.join("chr1.parquet"), schema).unwrap();
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+
+    let manifest = CacheManifest {
+        plugin_name: "demo".into(),
+        source_manifest: "demo.source.toml".into(),
+        key_columns: vec![
+            "chrom".into(),
+            "start".into(),
+            "end".into(),
+            "allele_string".into(),
+        ],
+        match_columns: vec![],
+        value_columns: vec![
+            ValueColumnRecord {
+                column: "z_value".into(),
+                csq_field: "Z_FIELD".into(),
+                ty: "Utf8".into(),
+                description: Some("Z description".into()),
+            },
+            ValueColumnRecord {
+                column: "a_value".into(),
+                csq_field: "A_FIELD".into(),
+                ty: "Utf8".into(),
+                description: Some("A description".into()),
+            },
+        ],
+        chroms: vec![ChromEntry {
+            chrom: "chr1".into(),
+            file: "chr1.parquet".into(),
+            rows: 1,
+            warm: 0,
+            cold: 1,
+        }],
+        cache_source_version: None,
+        allele_match: AlleleMatch::Minimised,
+        csq_rank: 0,
+        field_order: FieldOrder::Alphabetical,
+    };
+    manifest.write(&plugin_dir).unwrap();
+
+    let registry = PluginRegistry::open(cache_root, "1").await.unwrap();
+    assert_eq!(registry.csq_fields(), vec!["A_FIELD", "Z_FIELD"]);
+    assert_eq!(
+        PluginRegistry::field_descriptions(cache_root),
+        vec![
+            ("A_FIELD".to_string(), "A description".to_string()),
+            ("Z_FIELD".to_string(), "Z description".to_string()),
+        ]
+    );
+
+    let slices = registry.take_buffer_all(&[101]).await.unwrap();
+    assert_eq!(
+        field_suffix(&slices.probe_all(100, "AA/GA", None, &[])),
+        "||",
+        "the unreduced primary key must miss"
+    );
+    assert_eq!(
+        field_suffix(&slices.probe_all(100, "AA/GA", Some((101, "A/G")), &[])),
+        "|a-value|z-value",
+        "the minimised fallback must hit and preserve alphabetical name/value pairing"
     );
 }

@@ -6,6 +6,8 @@
 //!   --source-path /tmp/AlphaMissense_hg38.tsv.gz \
 //!   --variation-cache-dir <cache root containing variation/> \
 //!   --out /tmp/plugin_cache [--chrom 22]
+//!
+//! Multi-source manifests use one `--source-part <name>=<path>` per part.
 //! ```
 
 use std::path::PathBuf;
@@ -21,8 +23,17 @@ fn arg(args: &[String], key: &str) -> Option<String> {
         .cloned()
 }
 
+fn arg_values(args: &[String], key: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, value)| value.as_str() == key)
+        .filter_map(|(index, _)| args.get(index + 1).cloned())
+        .collect()
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    let _ = env_logger::try_init();
     let args: Vec<String> = std::env::args().collect();
     let manifest_path = arg(&args, "--manifest")
         .ok_or_else(|| DataFusionError::Execution("--manifest required".into()))?;
@@ -40,14 +51,34 @@ async fn main() -> Result<()> {
     {
         first.path = source_path;
     }
+    for source_part in arg_values(&args, "--source-part") {
+        let (part, path) = source_part.split_once('=').ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "--source-part expects <name>=<path>, got '{source_part}'"
+            ))
+        })?;
+        let source = manifest
+            .sources
+            .iter_mut()
+            .find(|source| source.part.as_deref() == Some(part))
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("manifest has no [[source]] with part='{part}'"))
+            })?;
+        source.path = path.to_string();
+    }
     let manifest_file = PathBuf::from(&manifest_path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| manifest_path.clone());
 
     println!(
-        "Building plugin '{}' from '{}'",
-        manifest.plugin_name, manifest.sources[0].path
+        "Building plugin '{}' from {:?}",
+        manifest.plugin_name,
+        manifest
+            .sources
+            .iter()
+            .map(|source| (&source.part, &source.path))
+            .collect::<Vec<_>>()
     );
     let mut builder =
         PluginCacheBuilder::new(&manifest, &manifest_file, &variation_cache_dir, &out);

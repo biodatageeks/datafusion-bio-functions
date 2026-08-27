@@ -345,6 +345,7 @@ mod tests {
             column: "am".into(),
             csq_field: "am".into(),
             ty: ValueType::Float32,
+            description: None,
         }];
         let schema = plugin_output_schema(&matches, &vals);
         let batch = RecordBatch::try_new(

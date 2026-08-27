@@ -8,7 +8,7 @@ use std::path::Path;
 use datafusion::common::{DataFusionError, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::plugin_cache::source_manifest::{SourceManifest, ValueType};
+use crate::plugin_cache::source_manifest::{SourceManifest, ValueType, validate_csq_field_name};
 
 /// Per-chromosome build result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +27,11 @@ pub struct ValueColumnRecord {
     pub csq_field: String,
     #[serde(rename = "type")]
     pub ty: String,
+    /// Free text for this field's `##<CSQ_FIELD>=<description>` VCF header
+    /// line. Ensembl plugins supply one via `get_header_info()`; absent here
+    /// means no header line is written for the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A per-transcript match discriminator binding, recorded so the runtime knows
@@ -48,6 +53,59 @@ pub struct CacheManifest {
     pub value_columns: Vec<ValueColumnRecord>,
     pub chroms: Vec<ChromEntry>,
     pub cache_source_version: Option<String>,
+    /// How Ensembl's own plugin matches a variant to a data row. Defaults to
+    /// [`AlleleMatch::Exact`], which is what most plugins do.
+    #[serde(default)]
+    pub allele_match: AlleleMatch,
+    /// Position of this plugin's field block in the CSQ string. Ensembl emits
+    /// `--plugin` blocks in the order the flags were given and appends
+    /// `--custom` blocks last, so the order is a convention rather than
+    /// something derivable from the cache; it is pinned here. Plugins sharing a
+    /// rank fall back to plugin-name order.
+    #[serde(default = "default_csq_rank")]
+    pub csq_rank: u32,
+    /// Field order *within* this plugin's block. Ensembl's plugin framework
+    /// emits a plugin's own fields sorted by name, while `--custom` fields keep
+    /// the order the user listed them in.
+    #[serde(default)]
+    pub field_order: FieldOrder,
+}
+
+fn default_csq_rank() -> u32 {
+    u32::MAX
+}
+
+/// Same default, reachable from the source manifest's serde attribute.
+pub fn default_csq_rank_pub() -> u32 {
+    default_csq_rank()
+}
+
+/// Field ordering within one plugin's CSQ block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldOrder {
+    /// Manifest declaration order — matches Ensembl `--custom` behaviour.
+    #[default]
+    Declared,
+    /// Sorted by CSQ field name — matches Ensembl's `--plugin` behaviour.
+    Alphabetical,
+}
+
+/// The allele-comparison rule a plugin's Ensembl implementation uses, which
+/// decides whether an equal-length substitution may be reduced before probing.
+///
+/// `Minimised` plugins call `get_matched_variant_alleles()`, which runs
+/// `trim_sequences()` over both the variant and the data row — so an untrimmed
+/// MNV such as `TTGTGTGTGTGTG/GTGTGTGTGTGTG` matches CADD's `T/G` row.
+/// `Exact` plugins compare `(start, ref, alt)` verbatim (SpliceAI, dbNSFP) and
+/// must never be probed with a reduced allele, or they gain hits Ensembl does
+/// not report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlleleMatch {
+    #[default]
+    Exact,
+    Minimised,
 }
 
 fn ty_str(t: ValueType) -> &'static str {
@@ -59,6 +117,13 @@ fn ty_str(t: ValueType) -> &'static str {
 }
 
 impl CacheManifest {
+    fn validate(&self) -> Result<()> {
+        for value in &self.value_columns {
+            validate_csq_field_name(&self.plugin_name, &value.csq_field)?;
+        }
+        Ok(())
+    }
+
     /// Seed a cache manifest from a source manifest (chroms filled in by the build).
     pub fn from_source(src: &SourceManifest, source_manifest_file: &str) -> Self {
         CacheManifest {
@@ -85,15 +150,20 @@ impl CacheManifest {
                     column: v.column.clone(),
                     csq_field: v.csq_field.clone(),
                     ty: ty_str(v.ty).into(),
+                    description: v.description.clone(),
                 })
                 .collect(),
             chroms: vec![],
             cache_source_version: None,
+            allele_match: src.allele_match,
+            csq_rank: src.csq_rank,
+            field_order: src.field_order,
         }
     }
 
     /// Write `manifest.json` into `plugin_dir`.
     pub fn write(&self, plugin_dir: &Path) -> Result<()> {
+        self.validate()?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| DataFusionError::Execution(format!("serialize manifest: {e}")))?;
         std::fs::write(plugin_dir.join("manifest.json"), json)
@@ -101,8 +171,9 @@ impl CacheManifest {
     }
 }
 
-/// Discover built plugins under `<cache_root>/plugin/*/manifest.json`, sorted by
-/// plugin name for deterministic CSQ field ordering.
+/// Discover built plugins under `<cache_root>/plugin/*/manifest.json`, ordered by
+/// `csq_rank` then plugin name so the emitted CSQ field blocks are deterministic
+/// and can be pinned to the order Ensembl VEP writes them in.
 pub fn discover_plugins(cache_root: &Path) -> Result<Vec<CacheManifest>> {
     let plugin_root = cache_root.join("plugin");
     let mut out = Vec::new();
@@ -119,14 +190,15 @@ pub fn discover_plugins(cache_root: &Path) -> Result<Vec<CacheManifest>> {
         if mf.exists() {
             let text = std::fs::read_to_string(&mf)
                 .map_err(|e| DataFusionError::Execution(format!("read {}: {e}", mf.display())))?;
-            out.push(
-                serde_json::from_str(&text).map_err(|e| {
-                    DataFusionError::Execution(format!("parse {}: {e}", mf.display()))
-                })?,
-            );
+            let manifest: CacheManifest = serde_json::from_str(&text)
+                .map_err(|e| DataFusionError::Execution(format!("parse {}: {e}", mf.display())))?;
+            manifest.validate()?;
+            out.push(manifest);
         }
     }
-    out.sort_by(|a: &CacheManifest, b: &CacheManifest| a.plugin_name.cmp(&b.plugin_name));
+    out.sort_by(|a: &CacheManifest, b: &CacheManifest| {
+        (a.csq_rank, &a.plugin_name).cmp(&(b.csq_rank, &b.plugin_name))
+    });
     Ok(out)
 }
 
@@ -139,7 +211,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("plugin").join("demo");
         std::fs::create_dir_all(&plugin_dir).unwrap();
-        let m = CacheManifest {
+        let mut m = CacheManifest {
             plugin_name: "demo".into(),
             source_manifest: "demo.source.toml".into(),
             key_columns: vec![
@@ -158,11 +230,48 @@ mod tests {
                 cold: 2,
             }],
             cache_source_version: None,
+            allele_match: Default::default(),
+            csq_rank: 0,
+            field_order: Default::default(),
         };
         m.write(&plugin_dir).unwrap();
         let found = discover_plugins(dir.path()).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].plugin_name, "demo");
         assert_eq!(found[0].chroms[0].rows, 3);
+
+        m.value_columns = vec![ValueColumnRecord {
+            column: "score".into(),
+            csq_field: "fileformat".into(),
+            ty: "Utf8".into(),
+            description: Some("must not replace VCFv4.2".into()),
+        }];
+        let error = m.write(&plugin_dir).unwrap_err().to_string();
+        assert!(
+            error.contains("reserved VCF meta-information key"),
+            "{error}"
+        );
+
+        // Runtime discovery also protects old or externally-created caches
+        // that did not pass through this version's `write` method.
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&m).unwrap(),
+        )
+        .unwrap();
+        let error = discover_plugins(dir.path()).unwrap_err().to_string();
+        assert!(
+            error.contains("reserved VCF meta-information key"),
+            "{error}"
+        );
+
+        m.value_columns[0].csq_field = "SCORE\n##injected".into();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&m).unwrap(),
+        )
+        .unwrap();
+        let error = discover_plugins(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("invalid CSQ field name"), "{error}");
     }
 }

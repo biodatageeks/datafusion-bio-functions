@@ -8,7 +8,9 @@ use std::path::Path;
 use datafusion::common::{DataFusionError, Result};
 
 use crate::cache::manifest::canonical_chrom_label;
-use crate::plugin_cache::cache_manifest::discover_plugins;
+use crate::plugin_cache::cache_manifest::{
+    AlleleMatch, CacheManifest, FieldOrder, discover_plugins,
+};
 use crate::plugin_cache::lookup::{PluginBufferSlice, PluginLookup, PluginScalar};
 use crate::plugin_cache::template::CompiledTemplate;
 
@@ -16,6 +18,10 @@ use crate::plugin_cache::template::CompiledTemplate;
 /// shard for the current chrom).
 struct PluginEntry {
     csq_fields: Vec<String>,
+    /// Indices into the shard's value columns, in emitted-field order.
+    emit_order: Vec<usize>,
+    /// Ensembl's comparison rule for this plugin; gates allele reduction.
+    allele_match: AlleleMatch,
     /// The compiled discriminator template for each match column, in order.
     match_templates: Vec<CompiledTemplate>,
     n_match: usize,
@@ -28,6 +34,21 @@ pub struct PluginRegistry {
     plugins: Vec<PluginEntry>,
 }
 
+/// Indices into a plugin's `value_columns`, in the order its CSQ fields are
+/// emitted: declaration order, or sorted by field name when the plugin's
+/// Ensembl counterpart sorts its own fields ([`FieldOrder::Alphabetical`]).
+fn emit_order(m: &CacheManifest) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..m.value_columns.len()).collect();
+    if m.field_order == FieldOrder::Alphabetical {
+        order.sort_by(|&a, &b| {
+            m.value_columns[a]
+                .csq_field
+                .cmp(&m.value_columns[b].csq_field)
+        });
+    }
+    order
+}
+
 impl PluginRegistry {
     /// Discover plugins under `cache_root` and open each one's shard for `chrom`.
     pub async fn open(cache_root: &Path, chrom: &str) -> Result<Self> {
@@ -35,10 +56,16 @@ impl PluginRegistry {
         let manifests = discover_plugins(cache_root)?;
         let mut plugins = Vec::with_capacity(manifests.len());
         for m in manifests {
-            let csq_fields: Vec<String> = m
-                .value_columns
+            // The emitted field names are permuted, but the shard projection is
+            // NOT: `ProjectionMask::leaves` yields columns in the file's physical
+            // order whatever order the leaves are listed in, so permuting the
+            // projection would move the names while leaving the values put, and
+            // silently pair each field with another field's value. The values are
+            // permuted after probing instead (see `probe_all`).
+            let order = emit_order(&m);
+            let csq_fields: Vec<String> = order
                 .iter()
-                .map(|v| v.csq_field.clone())
+                .map(|&i| m.value_columns[i].csq_field.clone())
                 .collect();
             let value_columns: Vec<String> =
                 m.value_columns.iter().map(|v| v.column.clone()).collect();
@@ -80,6 +107,8 @@ impl PluginRegistry {
             };
             plugins.push(PluginEntry {
                 csq_fields,
+                emit_order: order,
+                allele_match: m.allele_match,
                 match_templates,
                 n_match,
                 n_values,
@@ -102,7 +131,37 @@ impl PluginRegistry {
             .map(|manifests| {
                 manifests
                     .iter()
-                    .flat_map(|m| m.value_columns.iter().map(|v| v.csq_field.clone()))
+                    .flat_map(|m| {
+                        emit_order(m)
+                            .into_iter()
+                            .map(|i| m.value_columns[i].csq_field.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `(csq_field, description)` for every plugin field that declares one, in
+    /// emitted order — the `##<FIELD>=<description>` header lines Ensembl VEP
+    /// writes for its plugin fields. Same discovery path and ordering as
+    /// [`Self::field_names`], so the header cannot drift from the CSQ layout.
+    pub fn field_descriptions(cache_root: &Path) -> Vec<(String, String)> {
+        discover_plugins(cache_root)
+            .map(|manifests| {
+                manifests
+                    .iter()
+                    .flat_map(|m| {
+                        emit_order(m)
+                            .into_iter()
+                            .filter_map(|i| {
+                                let v = &m.value_columns[i];
+                                v.description
+                                    .as_ref()
+                                    .map(|d| (v.csq_field.clone(), d.clone()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -133,6 +192,8 @@ impl PluginRegistry {
             };
             entries.push(SliceEntry {
                 csq_fields_len: p.csq_fields.len(),
+                emit_order: p.emit_order.clone(),
+                allele_match: p.allele_match,
                 match_templates: p.match_templates.clone(),
                 slice,
             });
@@ -144,6 +205,8 @@ impl PluginRegistry {
 /// Per-plugin buffer slice plus the metadata `probe_all` needs.
 struct SliceEntry {
     csq_fields_len: usize,
+    emit_order: Vec<usize>,
+    allele_match: AlleleMatch,
     match_templates: Vec<CompiledTemplate>,
     slice: Option<PluginBufferSlice>,
 }
@@ -166,6 +229,7 @@ impl BufferSlices {
         &self,
         start: u32,
         allele_string: &str,
+        fallback_key: Option<(u32, &str)>,
         attrs: &[Option<&str>],
     ) -> Vec<PluginScalar> {
         let mut out = Vec::new();
@@ -175,9 +239,25 @@ impl BufferSlices {
             let hit = e
                 .slice
                 .as_ref()
-                .and_then(|s| s.probe(start, allele_string, &match_values));
+                .and_then(|s| s.probe(start, allele_string, &match_values))
+                .or_else(|| {
+                    // Sources differ in how they spell the same variant: most key
+                    // the parser-level (anchor-trimmed) allele, but a per-base
+                    // source such as CADD's whole-genome SNV file keys the fully
+                    // minimal one, so an untrimmed MNV misses on the primary key.
+                    // Only consulted on a miss, so no existing hit can change.
+                    if e.allele_match != AlleleMatch::Minimised {
+                        return None;
+                    }
+                    let (fb_start, fb_allele) = fallback_key?;
+                    e.slice
+                        .as_ref()
+                        .and_then(|s| s.probe(fb_start, fb_allele, &match_values))
+                });
             match hit {
-                Some(values) => out.extend(values),
+                // `values` arrive in shard-column order; emit them in the same
+                // order as this plugin's `csq_fields`.
+                Some(values) => out.extend(e.emit_order.iter().map(|&i| values[i].clone())),
                 None => out.extend(std::iter::repeat_n(PluginScalar::Null, e.csq_fields_len)),
             }
         }
@@ -214,6 +294,7 @@ mod tests {
             column: "am_pathogenicity".into(),
             csq_field: "am_pathogenicity".into(),
             ty: ValueType::Float32,
+            description: None,
         }];
         let schema = plugin_output_schema(&matches, &vals);
         let batch = RecordBatch::try_new(
@@ -250,6 +331,7 @@ mod tests {
                 column: "am_pathogenicity".into(),
                 csq_field: "am_pathogenicity".into(),
                 ty: "Float32".into(),
+                description: None,
             }],
             chroms: vec![ChromEntry {
                 chrom: "chr22".into(),
@@ -259,6 +341,9 @@ mod tests {
                 cold: 2,
             }],
             cache_source_version: None,
+            allele_match: Default::default(),
+            csq_rank: 0,
+            field_order: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 
@@ -277,13 +362,14 @@ mod tests {
             "",
             "",
             "",
+            "",
             "78",
             "R/G",
             "",
             "A",
             "G",
         );
-        let hit = slices.probe_all(100, "A/G", &ns_hit);
+        let hit = slices.probe_all(100, "A/G", None, &ns_hit);
         match hit[0] {
             PluginScalar::F32(v) => assert!((v - 0.0427).abs() < 1e-6),
             ref other => panic!("{other:?}"),
@@ -302,10 +388,11 @@ mod tests {
             "",
             "",
             "",
+            "",
             "A",
             "G",
         );
-        let none = slices.probe_all(100, "A/G", &ns_miss);
+        let none = slices.probe_all(100, "A/G", None, &ns_miss);
         assert_eq!(none, vec![PluginScalar::Null]);
     }
 
@@ -331,6 +418,7 @@ mod tests {
                 column: "score".into(),
                 csq_field: "SCORE".into(),
                 ty: "Float32".into(),
+                description: None,
             }],
             // chr22 present in the manifest with rows: 0 and NO file on disk.
             chroms: vec![ChromEntry {
@@ -341,6 +429,9 @@ mod tests {
                 cold: 0,
             }],
             cache_source_version: None,
+            allele_match: Default::default(),
+            csq_rank: 0,
+            field_order: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 
@@ -348,7 +439,10 @@ mod tests {
         assert_eq!(reg.csq_fields(), vec!["SCORE".to_string()]);
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
         // No shard → empty (Null) field, not an error.
-        assert_eq!(slices.probe_all(100, "A/G", &[]), vec![PluginScalar::Null]);
+        assert_eq!(
+            slices.probe_all(100, "A/G", None, &[]),
+            vec![PluginScalar::Null]
+        );
     }
 
     // A per-variant plugin (no match_column) is keyed only on (start,
@@ -367,6 +461,7 @@ mod tests {
             column: "score".into(),
             csq_field: "SCORE".into(),
             ty: ValueType::Float32,
+            description: None,
         }];
         let schema = plugin_output_schema(&[], &vals);
         let batch = RecordBatch::try_new(
@@ -399,6 +494,7 @@ mod tests {
                 column: "score".into(),
                 csq_field: "SCORE".into(),
                 ty: "Float32".into(),
+                description: None,
             }],
             chroms: vec![ChromEntry {
                 chrom: "chr22".into(),
@@ -408,18 +504,24 @@ mod tests {
                 cold: 1,
             }],
             cache_source_version: None,
+            allele_match: Default::default(),
+            csq_rank: 0,
+            field_order: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 
         let reg = PluginRegistry::open(cache_root, "22").await.unwrap();
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
         // Empty namespace (no transcript) still hits the per-variant row.
-        match slices.probe_all(100, "A/G", &[])[0] {
+        match slices.probe_all(100, "A/G", None, &[])[0] {
             PluginScalar::F32(v) => assert!((v - 0.5).abs() < 1e-6),
             ref other => panic!("{other:?}"),
         }
         // Wrong allele still misses.
-        assert_eq!(slices.probe_all(100, "C/T", &[]), vec![PluginScalar::Null]);
+        assert_eq!(
+            slices.probe_all(100, "C/T", None, &[]),
+            vec![PluginScalar::Null]
+        );
     }
 
     // A manifest advertising rows > 0 with no shard on disk is a partial/corrupt
@@ -444,6 +546,7 @@ mod tests {
                 column: "score".into(),
                 csq_field: "SCORE".into(),
                 ty: "Float32".into(),
+                description: None,
             }],
             // rows: 5 but NO chr22.parquet on disk → corrupt cache.
             chroms: vec![ChromEntry {
@@ -454,6 +557,9 @@ mod tests {
                 cold: 5,
             }],
             cache_source_version: None,
+            allele_match: Default::default(),
+            csq_rank: 0,
+            field_order: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 

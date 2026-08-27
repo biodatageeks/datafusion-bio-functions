@@ -381,6 +381,54 @@ pub fn vcf_to_vep_input_allele(
     (ref_allele.to_string(), alt_allele.to_string(), pos)
 }
 
+/// Reduce an allele pair to the minimal representation Ensembl probes a plugin
+/// data file with.
+///
+/// Replays `trim_sequences()` in its **left-first** order — shared prefix first,
+/// advancing the start, then shared suffix — which is the order Ensembl's VCF
+/// parser applies when building the `VariationFeature`, and therefore the
+/// `(ref, alt, pos)` that `get_matched_variant_alleles()` compares.
+///
+/// The direction is not a detail; it decides which row is found. `bcftools norm
+/// -m -both` splits multi-allelic records without re-trimming, so non-minimal
+/// pairs are routine, and the two orders disagree on where the variant sits:
+///
+/// | VCF (chr21) | left-first (Ensembl) | right-first |
+/// |---|---|---|
+/// | `CGTGTGT/CGTGT` | `GT/-` at 13836153 — no row, as VEP reports | `GT/-` at 13836149 — another variant's score |
+/// | `AAC/ACAC` | `-/C` at 26062231 — the row VEP reports | same |
+///
+/// Verified against Ensembl VEP 116.0 on chr21: left-first reproduces VEP's CADD
+/// output on every disputed variant, in both directions — found where VEP finds,
+/// empty where VEP is empty. Right-first invents matches VEP does not report.
+///
+/// Only consulted for plugins whose Ensembl implementation minimises at all; see
+/// [`crate::plugin_cache::cache_manifest::AlleleMatch`].
+pub fn plugin_probe_allele(pos: i64, ref_allele: &str, alt_allele: &str) -> (String, String, i64) {
+    let mut r = ref_allele.as_bytes();
+    let mut a = alt_allele.as_bytes();
+    let mut start = pos;
+
+    while !r.is_empty() && !a.is_empty() && r[0] == a[0] {
+        r = &r[1..];
+        a = &a[1..];
+        start += 1;
+    }
+    while !r.is_empty() && !a.is_empty() && r[r.len() - 1] == a[a.len() - 1] {
+        r = &r[..r.len() - 1];
+        a = &a[..a.len() - 1];
+    }
+
+    let to_allele = |b: &[u8]| {
+        if b.is_empty() {
+            "-".to_string()
+        } else {
+            String::from_utf8_lossy(b).into_owned()
+        }
+    };
+    (to_allele(r), to_allele(a), start)
+}
+
 /// Traceability:
 /// - Ensembl VEP `compare_existing()`
 ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206>
@@ -1197,5 +1245,105 @@ mod tests {
         // No suffix since alt_remaining=0. So: start=101, end=103
         assert_eq!(vep_norm_start(100, "TCAC", "T"), 101);
         assert_eq!(vep_norm_end(100, "TCAC", "T"), 103);
+    }
+
+    /// Equal-length MNVs left behind by `bcftools norm -m -both`. Each pair is a
+    /// real chr21 HG002 variant whose CADD score was present in the shard under
+    /// the minimal key but missed by an unreduced probe.
+    #[test]
+    fn plugin_probe_allele_reduces_untrimmed_mnvs() {
+        // chr21:13973877, 12 shared trailing bases -> a plain T>G substitution.
+        assert_eq!(
+            plugin_probe_allele(13973877, "TTGTGTGTGTGTG", "GTGTGTGTGTGTG"),
+            ("T".into(), "G".into(), 13973877)
+        );
+        assert_eq!(
+            plugin_probe_allele(26032805, "AAT", "TAT"),
+            ("A".into(), "T".into(), 26032805)
+        );
+        assert_eq!(
+            plugin_probe_allele(28149937, "CGT", "TGT"),
+            ("C".into(), "T".into(), 28149937)
+        );
+        assert_eq!(
+            plugin_probe_allele(39327921, "AAATG", "GAATG"),
+            ("A".into(), "G".into(), 39327921)
+        );
+        assert_eq!(
+            plugin_probe_allele(27136796, "CA", "AA"),
+            ("C".into(), "A".into(), 27136796)
+        );
+        assert_eq!(
+            plugin_probe_allele(18829623, "AATAT", "TATAT"),
+            ("A".into(), "T".into(), 18829623)
+        );
+    }
+
+    /// Indels reduce too, but the trim *order* decides which row is reached.
+    /// Every expectation below was checked against Ensembl VEP 116.0 + CADD on
+    /// chr21: left-first lands where VEP lands, in both directions.
+    #[test]
+    fn plugin_probe_allele_reduces_indels_left_first() {
+        // chr21:26062230 AAC>ACAC — left-first gives -/C at 26062231, the row
+        // VEP reports (raw -0.121737). Right-first would land elsewhere.
+        assert_eq!(
+            plugin_probe_allele(26062231, "AC", "CAC"),
+            ("-".into(), "C".into(), 26062231)
+        );
+        // chr21:13836148 CGTGTGT>CGTGT — left-first gives GT/- at 13836153,
+        // where no row exists, so we stay empty exactly as VEP does. Right-first
+        // would give 13836149 and steal the unrelated CGT>C score (-0.057515).
+        assert_eq!(
+            plugin_probe_allele(13836149, "GTGTGT", "GTGT"),
+            ("GT".into(), "-".into(), 13836153)
+        );
+        // chr21:14031159 TTG>TTGTGTGTG (insertion); VEP reports no CADD.
+        assert_eq!(
+            plugin_probe_allele(14031160, "TG", "TGTGTGTG"),
+            ("-".into(), "TGTGTG".into(), 14031162)
+        );
+        // chr21:26139879 AAAACAAAC>AAAAC; right-first regressed ClinVar here.
+        assert_eq!(
+            plugin_probe_allele(26139880, "AAACAAAC", "AAAC"),
+            ("AAAC".into(), "-".into(), 26139884)
+        );
+        // Pure deletion already in minimal form stays put (raw -0.076825).
+        assert_eq!(
+            plugin_probe_allele(13836149, "GTGTGT", "-"),
+            ("GTGTGT".into(), "-".into(), 13836149)
+        );
+    }
+
+    #[test]
+    fn plugin_probe_allele_leaves_minimal_pairs_alone() {
+        // Already-minimal SNV and MNV: untouched, start unshifted.
+        assert_eq!(
+            plugin_probe_allele(100, "A", "G"),
+            ("A".into(), "G".into(), 100)
+        );
+        assert_eq!(
+            plugin_probe_allele(100, "AC", "GT"),
+            ("AC".into(), "GT".into(), 100)
+        );
+        // Anchor-trimmed indels from vcf_to_vep_input_allele carry the `-`
+        // sentinel and must pass through untouched, or working insertion
+        // lookups (chr21:33549184 -/TTGT) would regress.
+        assert_eq!(
+            plugin_probe_allele(33549184, "-", "TTGT"),
+            ("-".into(), "TTGT".into(), 33549184)
+        );
+        assert_eq!(
+            plugin_probe_allele(100, "CGT", "-"),
+            ("CGT".into(), "-".into(), 100)
+        );
+    }
+
+    #[test]
+    fn plugin_probe_allele_trims_prefix_with_start_shift() {
+        // Shared prefix costs a start shift; shared suffix does not.
+        assert_eq!(
+            plugin_probe_allele(100, "ATCG", "AGCG"),
+            ("T".into(), "G".into(), 101)
+        );
     }
 }
