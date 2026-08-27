@@ -182,6 +182,11 @@ async fn register_sources_impl(
                 let schema = csv_schema(csv);
                 let delim = csv.delimiter.as_bytes().first().copied().unwrap_or(b'\t');
                 let gz = csv.compression.as_deref() == Some("gzip");
+                // A tabix query yields only indexed records, so its staged
+                // slice never contains the original source header. Keep the
+                // declared schema, but do not make DataFusion discard the
+                // slice's first data record as a header.
+                let has_header = csv.has_header && spec.index != Some(SourceIndex::Tabix);
                 let (plain_path, temp) = materialize_plain(&spec.path, gz, spec.index, chrom)?;
                 if let Some(t) = temp {
                     temps.push(t);
@@ -193,7 +198,7 @@ async fn register_sources_impl(
                     .unwrap_or_default();
                 let mut opts = CsvReadOptions::new()
                     .delimiter(delim)
-                    .has_header(csv.has_header)
+                    .has_header(has_header)
                     .schema(&schema)
                     .file_extension(&ext);
                 if let Some(c) = csv
@@ -312,10 +317,32 @@ mod tests {
     }
 
     fn write_bgzf_tabix_bed(path: &std::path::Path, rows: &[(&str, usize, usize, &str)]) {
+        write_bgzf_tabix_bed_impl(path, None, rows);
+    }
+
+    fn write_bgzf_tabix_bed_with_header(
+        path: &std::path::Path,
+        rows: &[(&str, usize, usize, &str)],
+    ) {
+        write_bgzf_tabix_bed_impl(path, Some("chrom\tstart\tend\tvalue"), rows);
+    }
+
+    fn write_bgzf_tabix_bed_impl(
+        path: &std::path::Path,
+        header: Option<&str>,
+        rows: &[(&str, usize, usize, &str)],
+    ) {
         let file = std::fs::File::create(path).unwrap();
         let mut writer = noodles_bgzf::io::Writer::new(file);
         let mut indexer = noodles_tabix::index::Indexer::default();
-        indexer.set_header(csi::binning_index::index::header::Builder::bed().build());
+        let mut index_header = csi::binning_index::index::header::Builder::bed();
+        if header.is_some() {
+            index_header = index_header.set_line_skip_count(1);
+        }
+        indexer.set_header(index_header.build());
+        if let Some(header) = header {
+            writeln!(writer, "{header}").unwrap();
+        }
         let mut chunk_start = writer.virtual_position();
 
         for &(chrom, start, end, value) in rows {
@@ -413,6 +440,43 @@ type = "Utf8"
         assert_eq!(chrom.value(1), "chr1");
         assert_eq!(value.value(0), "one-a");
         assert_eq!(value.value(1), "one-b");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tabix_source_with_declared_header_preserves_first_queried_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("whole.tsv.gz");
+        write_bgzf_tabix_bed_with_header(
+            &tsv,
+            &[
+                ("chr1", 99, 100, "one-a"),
+                ("chr1", 199, 200, "one-b"),
+                ("chr2", 299, 300, "two"),
+            ],
+        );
+        let mut manifest = indexed_bed_manifest(&tsv);
+        manifest.sources[0].csv.as_mut().unwrap().has_header = true;
+        let ctx = SessionContext::new();
+
+        let temps = register_sources_for_chrom(&ctx, &manifest, "1")
+            .await
+            .unwrap();
+        assert_eq!(temps.len(), 1);
+        let rows = ctx
+            .sql("SELECT value FROM plugin_demo_src ORDER BY CAST(start AS INT)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 2);
+        let values = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.value(0), "one-a");
+        assert_eq!(values.value(1), "one-b");
     }
 
     #[tokio::test(flavor = "multi_thread")]
