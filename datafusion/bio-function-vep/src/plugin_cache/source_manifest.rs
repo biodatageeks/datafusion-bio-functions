@@ -36,6 +36,19 @@ pub enum ValueType {
     Int32,
 }
 
+/// Optional random-access index for a source artifact.
+///
+/// This is explicit rather than inferred from a `.gz` suffix: ordinary gzip
+/// streams are not seekable, while tabix requires BGZF plus a sibling `.tbi`.
+/// The declaration belongs to [`SourceSpec`] because both delimited text and
+/// VCF sources can be tabix-indexed; provider-specific parsing options remain
+/// in [`CsvParams`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceIndex {
+    Tabix,
+}
+
 /// One field of an explicit input schema (headerless/typed TSV).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SchemaField {
@@ -70,6 +83,10 @@ pub struct SourceSpec {
     pub part: Option<String>,
     pub provider: ProviderKind,
     pub path: String,
+    /// Random-access index accompanying this source artifact. For tabix this
+    /// declares that `path` is BGZF and has a sibling `<path>.tbi`.
+    #[serde(default)]
+    pub index: Option<SourceIndex>,
     /// For text VCF input, expose the record's INFO/FORMAT key lists as the
     /// reader's `_vcf_info_keys` / `_vcf_format_keys` columns. Typed VCF values
     /// alone cannot distinguish an explicit `KEY=.` from an absent key because
@@ -224,6 +241,31 @@ impl SourceManifest {
                     self.plugin_name, source.provider
                 )));
             }
+            if source.index == Some(SourceIndex::Tabix) {
+                if !matches!(
+                    source.provider,
+                    ProviderKind::Csv | ProviderKind::Tsv | ProviderKind::Vcf
+                ) {
+                    return Err(DataFusionError::Execution(format!(
+                        "plugin '{}' declares a tabix index for a {:?} source; tabix indexes are \
+                         supported only for csv/tsv/vcf providers",
+                        self.plugin_name, source.provider
+                    )));
+                }
+                if matches!(source.provider, ProviderKind::Csv | ProviderKind::Tsv)
+                    && source
+                        .csv
+                        .as_ref()
+                        .and_then(|csv| csv.compression.as_deref())
+                        != Some("gzip")
+                {
+                    return Err(DataFusionError::Execution(format!(
+                        "plugin '{}' declares a tabix index for source '{}', but tabix-indexed \
+                         csv/tsv requires BGZF data declared with compression = \"gzip\"",
+                        self.plugin_name, source.path
+                    )));
+                }
+            }
         }
         for value in &self.value_columns {
             validate_csq_field_name(&self.plugin_name, &value.csq_field)?;
@@ -279,6 +321,7 @@ FROM plugin_demo_src_snv
 part = "snv"
 provider = "csv"
 path = "/tmp/snv.tsv.gz"
+index = "tabix"
   [source.csv]
   delimiter = "\t"
   has_header = false
@@ -310,6 +353,7 @@ type = "Float32"
             "plugin_demo_src_snv"
         );
         assert_eq!(m.sources[0].csv.as_ref().unwrap().schema.len(), 5);
+        assert_eq!(m.sources[0].index, Some(SourceIndex::Tabix));
         assert_eq!(m.value_columns[0].csq_field, "DEMO_SCORE");
         assert_eq!(m.value_columns[0].ty, ValueType::Float32);
         assert_eq!(m.ingest_view_name(), "plugin_demo_ingest");
@@ -387,11 +431,42 @@ type = "Float32"
     }
 
     #[test]
+    fn source_level_tabix_index_supports_vcf() {
+        let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        manifest.sources[0].provider = ProviderKind::Vcf;
+        manifest.sources[0].csv = None;
+        assert_eq!(manifest.sources[0].index, Some(SourceIndex::Tabix));
+        manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn tabix_index_requires_gzip_compression_for_delimited_text() {
+        let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        manifest.sources[0].csv.as_mut().unwrap().compression = None;
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("tabix-indexed csv/tsv requires BGZF"),
+            "{error}"
+        );
+        assert!(error.contains("compression = \"gzip\""), "{error}");
+    }
+
+    #[test]
+    fn tabix_index_rejects_non_tabular_non_vcf_sources() {
+        let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        manifest.sources[0].provider = ProviderKind::Parquet;
+        manifest.sources[0].csv = None;
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(error.contains("supported only for csv/tsv/vcf"), "{error}");
+    }
+
+    #[test]
     fn single_source_table_name_has_no_part_suffix() {
         let src = SourceSpec {
             part: None,
             provider: ProviderKind::Csv,
             path: "x".into(),
+            index: None,
             record_layout: false,
             csv: None,
         };

@@ -29,6 +29,11 @@ toml = "0.8"
 tempfile = "3"
 noodles-core = "0.16"
 noodles-fasta = "0.49"
+# Keep these on the same noodles revision already used by datafusion-bio-formats.
+# `noodles-core` is aliased because the FASTA path above still uses 0.16.
+noodles-core-tabix = { package = "noodles-core", git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
+noodles-csi = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
+noodles-tabix = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
 datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "80f3a6c043899f8ded44eaab204b42735f805272" }
 datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "80f3a6c043899f8ded44eaab204b42735f805272" }
@@ -43,6 +48,7 @@ libc = "0.2"
 
 [dev-dependencies]
 mimalloc = "0.1"
+noodles-bgzf = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
 noodles-vcf = { git = "https://github.com/biodatageeks/noodles.git", rev = "9b7b2c5b6531373918302d4c07410e583f1b5b5c" }

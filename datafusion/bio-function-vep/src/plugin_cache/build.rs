@@ -41,7 +41,7 @@ use crate::plugin_cache::mem_trace;
 use crate::plugin_cache::normalize::{
     canonical_contig_str, canonical_contig_udf, wrap_normalization,
 };
-use crate::plugin_cache::provider::register_sources;
+use crate::plugin_cache::provider::register_sources_for_chrom;
 use crate::plugin_cache::source_manifest::SourceManifest;
 use crate::plugin_cache::write::{PluginShardWriter, plugin_output_schema};
 
@@ -365,7 +365,7 @@ pub async fn build_plugin_chrom(
     read_ctx.register_udf(canonical_contig_udf());
     // Held until this chrom's stream is fully materialized (dedup) below, then
     // dropped (deleting the decompressed temp) — so build_all keeps at most one temp.
-    let src_temps = register_sources(&read_ctx, src).await?;
+    let src_temps = register_sources_for_chrom(&read_ctx, src, chrom).await?;
 
     // Ingest view (raw column mapping), then normalized view (contig + coords).
     read_ctx
