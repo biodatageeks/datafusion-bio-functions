@@ -260,11 +260,11 @@ FROM plugin_demo_src
 [[source]]
 provider = "csv"
 path = "{}"
+index = "tabix"
   [source.csv]
   delimiter = "\t"
   has_header = false
   compression = "gzip"
-  index = "tabix"
   schema = [
     {{ name = "chrom", type = "Utf8" }},
     {{ name = "start0", type = "Utf8" }},

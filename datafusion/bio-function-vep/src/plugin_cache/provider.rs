@@ -23,7 +23,7 @@ use noodles_csi::BinningIndex;
 
 use crate::plugin_cache::normalize::canonical_contig_str;
 use crate::plugin_cache::source_manifest::{
-    CoordinateSystem, CsvParams, ProviderKind, SourceManifest, TextIndex, ValueType,
+    CoordinateSystem, CsvParams, ProviderKind, SourceIndex, SourceManifest, ValueType,
 };
 
 fn arrow_type(ty: ValueType) -> DataType {
@@ -128,10 +128,10 @@ fn materialize_tabix_chrom(path: &str, chrom: &str) -> Result<(String, tempfile:
 fn materialize_plain(
     path: &str,
     gzip: bool,
-    index: Option<TextIndex>,
+    index: Option<SourceIndex>,
     chrom: Option<&str>,
 ) -> Result<(String, Option<tempfile::TempPath>)> {
-    if index == Some(TextIndex::Tabix) {
+    if index == Some(SourceIndex::Tabix) {
         let chrom = chrom.ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "BGZF/tabix source '{path}' requires a chromosome-scoped plugin-cache build"
@@ -182,7 +182,7 @@ async fn register_sources_impl(
                 let schema = csv_schema(csv);
                 let delim = csv.delimiter.as_bytes().first().copied().unwrap_or(b'\t');
                 let gz = csv.compression.as_deref() == Some("gzip");
-                let (plain_path, temp) = materialize_plain(&spec.path, gz, csv.index, chrom)?;
+                let (plain_path, temp) = materialize_plain(&spec.path, gz, spec.index, chrom)?;
                 if let Some(t) = temp {
                     temps.push(t);
                 }
@@ -210,6 +210,11 @@ async fn register_sources_impl(
                     .await?;
             }
             ProviderKind::Vcf => {
+                // `index` is source-level metadata because VCF and delimited
+                // text can both be tabix-indexed. VcfTableProvider already
+                // owns VCF index discovery/usage, so no extra plumbing is
+                // needed here yet; retaining the declaration keeps manifests
+                // accurate and gives future planning code an explicit signal.
                 // `coordinate_system` describes how the manifest's `ingest_sql`
                 // should interpret positions; the VCF provider's own
                 // `coordinate_system_zero_based` flag controls how IT reports
@@ -344,11 +349,11 @@ ingest_sql = "SELECT 1"
 [[source]]
 provider = "tsv"
 path = "{}"
+index = "tabix"
   [source.csv]
   delimiter = "\t"
   has_header = false
   compression = "gzip"
-  index = "tabix"
   schema = [
     {{ name = "chrom", type = "Utf8" }},
     {{ name = "start", type = "Utf8" }},
@@ -444,11 +449,11 @@ type = "Utf8"
 part = "{part}"
 provider = "csv"
 path = "{}"
+index = "tabix"
   [source.csv]
   delimiter = "\t"
   has_header = false
   compression = "gzip"
-  index = "tabix"
   schema = [
     {{ name = "chrom", type = "Utf8" }},
     {{ name = "start", type = "Utf8" }},
