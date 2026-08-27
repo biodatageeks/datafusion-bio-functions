@@ -156,6 +156,8 @@ mod tests {
     use datafusion::arrow::array::{Int8Array, StringArray, UInt32Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use noodles_core_tabix::Position;
+    use noodles_csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
     use parquet::arrow::ArrowWriter;
     use std::io::Write;
     use std::sync::Arc;
@@ -165,6 +167,36 @@ mod tests {
         let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
         enc.write_all(body.as_bytes()).unwrap();
         enc.finish().unwrap();
+    }
+
+    fn write_bgzf_tabix_bed(path: &Path, rows: &[(&str, usize, usize, &str, &str, &str)]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = noodles_bgzf::io::Writer::new(file);
+        let mut indexer = noodles_tabix::index::Indexer::default();
+        indexer.set_header(csi::binning_index::index::header::Builder::bed().build());
+        let mut chunk_start = writer.virtual_position();
+        for &(chrom, start, end, reference, alternate, score) in rows {
+            writeln!(
+                writer,
+                "{chrom}\t{start}\t{end}\t{reference}\t{alternate}\t{score}"
+            )
+            .unwrap();
+            let chunk_end = writer.virtual_position();
+            indexer
+                .add_record(
+                    chrom,
+                    Position::try_from(start + 1).unwrap(),
+                    Position::try_from(end).unwrap(),
+                    Chunk::new(chunk_start, chunk_end),
+                )
+                .unwrap();
+            chunk_start = chunk_end;
+        }
+        writer.finish().unwrap();
+        let index_file = std::fs::File::create(format!("{}.tbi", path.display())).unwrap();
+        noodles_tabix::io::Writer::new(index_file)
+            .write_index(&indexer.build())
+            .unwrap();
     }
 
     fn write_variation(path: &Path, rows: &[(&str, u32, &str, i8)]) {
@@ -202,8 +234,13 @@ mod tests {
     async fn builds_all_chroms_and_writes_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src.tsv.gz");
-        // chr1: pos 100 ; chr2: pos 200
-        write_gz(&src, "chr1\t100\tA\tG\t0.9\nchr2\t200\tC\tT\t0.5\n");
+        write_bgzf_tabix_bed(
+            &src,
+            &[
+                ("chr1", 99, 100, "A", "G", "0.9"),
+                ("chr2", 199, 200, "C", "T", "0.5"),
+            ],
+        );
 
         let var_dir = dir.path().join("cache").join("variation");
         std::fs::create_dir_all(&var_dir).unwrap();
@@ -213,9 +250,9 @@ mod tests {
         let toml = format!(
             r##"
 plugin_name = "demo"
-coordinate_system = "1-based"
+coordinate_system = "0-based-half-open"
 ingest_sql = """
-SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+SELECT chrom, CAST(start0 AS INT) AS start, CAST(end0 AS INT) AS end,
        concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
 FROM plugin_demo_src
 """
@@ -227,9 +264,11 @@ path = "{}"
   delimiter = "\t"
   has_header = false
   compression = "gzip"
+  index = "tabix"
   schema = [
     {{ name = "chrom", type = "Utf8" }},
-    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "start0", type = "Utf8" }},
+    {{ name = "end0",   type = "Utf8" }},
     {{ name = "ref",   type = "Utf8" }},
     {{ name = "alt",   type = "Utf8" }},
     {{ name = "score", type = "Utf8" }},

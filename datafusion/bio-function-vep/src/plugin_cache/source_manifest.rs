@@ -36,6 +36,16 @@ pub enum ValueType {
     Int32,
 }
 
+/// Optional random-access index for a compressed delimited-text source.
+///
+/// This is explicit rather than inferred from a `.gz` suffix: ordinary gzip
+/// streams are not seekable, while tabix requires BGZF plus a sibling `.tbi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextIndex {
+    Tabix,
+}
+
 /// One field of an explicit input schema (headerless/typed TSV).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SchemaField {
@@ -55,6 +65,8 @@ pub struct CsvParams {
     pub comment: Option<String>,
     #[serde(default)]
     pub compression: Option<String>,
+    #[serde(default)]
+    pub index: Option<TextIndex>,
     #[serde(default)]
     pub schema: Vec<SchemaField>,
 }
@@ -224,6 +236,25 @@ impl SourceManifest {
                     self.plugin_name, source.provider
                 )));
             }
+            if let Some(csv) = &source.csv {
+                if csv.index.is_some()
+                    && !matches!(source.provider, ProviderKind::Csv | ProviderKind::Tsv)
+                {
+                    return Err(DataFusionError::Execution(format!(
+                        "plugin '{}' declares a text index for a {:?} source; text indexes are \
+                         supported only for csv/tsv providers",
+                        self.plugin_name, source.provider
+                    )));
+                }
+                if csv.index == Some(TextIndex::Tabix) && csv.compression.as_deref() != Some("gzip")
+                {
+                    return Err(DataFusionError::Execution(format!(
+                        "plugin '{}' declares a tabix index for source '{}', but tabix requires \
+                         BGZF data declared with compression = \"gzip\"",
+                        self.plugin_name, source.path
+                    )));
+                }
+            }
         }
         for value in &self.value_columns {
             validate_csq_field_name(&self.plugin_name, &value.csq_field)?;
@@ -284,6 +315,7 @@ path = "/tmp/snv.tsv.gz"
   has_header = false
   comment = "#"
   compression = "gzip"
+  index = "tabix"
   schema = [
     { name = "chrom", type = "Utf8" },
     { name = "pos",   type = "Utf8" },
@@ -310,6 +342,10 @@ type = "Float32"
             "plugin_demo_src_snv"
         );
         assert_eq!(m.sources[0].csv.as_ref().unwrap().schema.len(), 5);
+        assert_eq!(
+            m.sources[0].csv.as_ref().unwrap().index,
+            Some(TextIndex::Tabix)
+        );
         assert_eq!(m.value_columns[0].csq_field, "DEMO_SCORE");
         assert_eq!(m.value_columns[0].ty, ValueType::Float32);
         assert_eq!(m.ingest_view_name(), "plugin_demo_ingest");
@@ -384,6 +420,15 @@ type = "Float32"
         manifest.sources[0].provider = ProviderKind::Vcf;
         manifest.sources[0].csv = None;
         manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn tabix_index_requires_gzip_compression() {
+        let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        manifest.sources[0].csv.as_mut().unwrap().compression = None;
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(error.contains("tabix requires BGZF"), "{error}");
+        assert!(error.contains("compression = \"gzip\""), "{error}");
     }
 
     #[test]

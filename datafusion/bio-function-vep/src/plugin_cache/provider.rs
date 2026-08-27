@@ -10,6 +10,7 @@
 //! it back out in `ingest_sql`, the same trick SpliceAI's flattened INFO tag
 //! uses.
 
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -17,9 +18,12 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
 use datafusion_bio_format_bed::table_provider::{BEDFields, BedTableProvider};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
+use noodles_core_tabix::Region;
+use noodles_csi::BinningIndex;
 
+use crate::plugin_cache::normalize::canonical_contig_str;
 use crate::plugin_cache::source_manifest::{
-    CoordinateSystem, CsvParams, ProviderKind, SourceManifest, ValueType,
+    CoordinateSystem, CsvParams, ProviderKind, SourceManifest, TextIndex, ValueType,
 };
 
 fn arrow_type(ty: ValueType) -> DataType {
@@ -39,18 +43,103 @@ fn csv_schema(csv: &CsvParams) -> Schema {
     )
 }
 
-/// Materialize a plain (uncompressed) CSV/TSV path DataFusion can read.
+/// Query one chromosome from a BGZF source through its sibling tabix index and
+/// materialize only those records to a plain file DataFusion can split-scan.
+fn materialize_tabix_chrom(path: &str, chrom: &str) -> Result<(String, tempfile::TempPath)> {
+    let mut reader = noodles_tabix::io::indexed_reader::Builder::default()
+        .build_from_path(path)
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "open BGZF/tabix source '{path}' (expected sibling '{path}.tbi'): {e}"
+            ))
+        })?;
+
+    let header = reader.index().header().ok_or_else(|| {
+        DataFusionError::Execution(format!("tabix index for '{path}' has no header"))
+    })?;
+    let canonical = canonical_contig_str(chrom);
+    let mut matching_names = Vec::new();
+    for name in header.reference_sequence_names() {
+        let raw = std::str::from_utf8(name.as_ref()).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "tabix index for '{path}' contains a non-UTF-8 contig name: {e}"
+            ))
+        })?;
+        if canonical_contig_str(raw) == canonical {
+            matching_names.push(raw.to_owned());
+        }
+    }
+    if matching_names.len() > 1 {
+        return Err(DataFusionError::Execution(format!(
+            "tabix index for '{path}' has multiple contigs equivalent to '{chrom}', including \
+             '{}' and '{}'",
+            matching_names[0], matching_names[1]
+        )));
+    }
+    let source_contig = matching_names.pop();
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix("plugin_src_")
+        .suffix(".tsv")
+        .tempfile()
+        .map_err(|e| DataFusionError::Execution(format!("create temp for '{path}': {e}")))?;
+
+    // A source can legitimately omit a chromosome. An empty explicit-schema
+    // CSV table produces a zero-row shard without scanning any other contig.
+    if let Some(source_contig) = source_contig {
+        let region = Region::new(source_contig.as_str(), ..);
+        let records = reader.query(&region).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "query BGZF/tabix source '{path}' for contig '{source_contig}': {e}"
+            ))
+        })?;
+        let mut writer = BufWriter::new(tmp.as_file_mut());
+        for result in records {
+            let record = result.map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "read BGZF/tabix source '{path}' for contig '{source_contig}': {e}"
+                ))
+            })?;
+            writeln!(writer, "{}", record.as_ref()).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "write tabix slice for '{path}' contig '{source_contig}': {e}"
+                ))
+            })?;
+        }
+        writer.flush().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "flush tabix slice for '{path}' contig '{source_contig}': {e}"
+            ))
+        })?;
+    }
+
+    let temp_path = tmp.into_temp_path();
+    let plain = temp_path.to_string_lossy().into_owned();
+    Ok((plain, temp_path))
+}
+
+/// Materialize a plain CSV/TSV path DataFusion can read.
 ///
-/// The workspace builds DataFusion with `default-features = false` and no
-/// `compression` feature (the `xz2`/liblzma link collision with noodles-cram —
-/// see the root `Cargo.toml`), so `register_csv` cannot decompress input files.
-/// For gzip sources we stream-decompress to a temp file and register that; plain
-/// sources pass through unchanged. Returns `(path, Some(temp_path))` for gzip:
-/// the caller must keep the `TempPath` alive for the duration of query execution
-/// and drop it afterwards, which deletes the temp — so a multi-chrom `build_all`
-/// keeps at most one decompressed copy on disk at a time (rather than leaking one
-/// per chromosome). Plain sources return `(path, None)`.
-fn materialize_plain(path: &str, gzip: bool) -> Result<(String, Option<tempfile::TempPath>)> {
+/// Tabix sources use indexed chromosome selection above. Non-indexed gzip
+/// remains supported for backwards compatibility and is decompressed in full.
+/// The workspace cannot enable DataFusion's generic compression feature because
+/// its `xz2` dependency collides with noodles-cram's liblzma linkage. Returned
+/// temp handles keep the staged file alive only until source parsing finishes.
+fn materialize_plain(
+    path: &str,
+    gzip: bool,
+    index: Option<TextIndex>,
+    chrom: Option<&str>,
+) -> Result<(String, Option<tempfile::TempPath>)> {
+    if index == Some(TextIndex::Tabix) {
+        let chrom = chrom.ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "BGZF/tabix source '{path}' requires a chromosome-scoped plugin-cache build"
+            ))
+        })?;
+        let (plain, temp) = materialize_tabix_chrom(path, chrom)?;
+        return Ok((plain, Some(temp)));
+    }
     if !gzip {
         return Ok((path.to_string(), None));
     }
@@ -75,12 +164,10 @@ fn materialize_plain(path: &str, gzip: bool) -> Result<(String, Option<tempfile:
     Ok((plain, Some(temp_path)))
 }
 
-/// Register every source in `manifest` as a DataFusion table. Returns any
-/// decompressed temp files the caller must keep alive for the duration of query
-/// execution (dropping them deletes the temp — see `materialize_plain`).
-pub async fn register_sources(
+async fn register_sources_impl(
     ctx: &SessionContext,
     manifest: &SourceManifest,
+    chrom: Option<&str>,
 ) -> Result<Vec<tempfile::TempPath>> {
     let mut temps: Vec<tempfile::TempPath> = Vec::new();
     for spec in &manifest.sources {
@@ -95,7 +182,7 @@ pub async fn register_sources(
                 let schema = csv_schema(csv);
                 let delim = csv.delimiter.as_bytes().first().copied().unwrap_or(b'\t');
                 let gz = csv.compression.as_deref() == Some("gzip");
-                let (plain_path, temp) = materialize_plain(&spec.path, gz)?;
+                let (plain_path, temp) = materialize_plain(&spec.path, gz, csv.index, chrom)?;
                 if let Some(t) = temp {
                     temps.push(t);
                 }
@@ -181,11 +268,35 @@ pub async fn register_sources(
     Ok(temps)
 }
 
+/// Register unscoped sources. Indexed text inputs deliberately fail here: use
+/// [`register_sources_for_chrom`] so a whole BGZF file is never scanned by
+/// accident.
+pub async fn register_sources(
+    ctx: &SessionContext,
+    manifest: &SourceManifest,
+) -> Result<Vec<tempfile::TempPath>> {
+    register_sources_impl(ctx, manifest, None).await
+}
+
+/// Register every source for one chromosome. Tabix-indexed text sources query
+/// only that contig; other providers retain their existing behavior. Returned
+/// temp handles keep staged records alive for query execution and delete them
+/// on drop.
+pub async fn register_sources_for_chrom(
+    ctx: &SessionContext,
+    manifest: &SourceManifest,
+    chrom: &str,
+) -> Result<Vec<tempfile::TempPath>> {
+    register_sources_impl(ctx, manifest, Some(chrom)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::plugin_cache::source_manifest::SourceManifest;
     use datafusion::arrow::array::{Array, Int64Array, StringArray};
+    use noodles_core_tabix::Position;
+    use noodles_csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
     use std::io::Write;
 
     fn write_gz(path: &std::path::Path, body: &str) {
@@ -193,6 +304,207 @@ mod tests {
         let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
         enc.write_all(body.as_bytes()).unwrap();
         enc.finish().unwrap();
+    }
+
+    fn write_bgzf_tabix_bed(path: &std::path::Path, rows: &[(&str, usize, usize, &str)]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = noodles_bgzf::io::Writer::new(file);
+        let mut indexer = noodles_tabix::index::Indexer::default();
+        indexer.set_header(csi::binning_index::index::header::Builder::bed().build());
+        let mut chunk_start = writer.virtual_position();
+
+        for &(chrom, start, end, value) in rows {
+            writeln!(writer, "{chrom}\t{start}\t{end}\t{value}").unwrap();
+            let chunk_end = writer.virtual_position();
+            indexer
+                .add_record(
+                    chrom,
+                    Position::try_from(start + 1).unwrap(),
+                    Position::try_from(end).unwrap(),
+                    Chunk::new(chunk_start, chunk_end),
+                )
+                .unwrap();
+            chunk_start = chunk_end;
+        }
+        writer.finish().unwrap();
+
+        let index_path = format!("{}.tbi", path.display());
+        let index_file = std::fs::File::create(index_path).unwrap();
+        let mut index_writer = noodles_tabix::io::Writer::new(index_file);
+        index_writer.write_index(&indexer.build()).unwrap();
+    }
+
+    fn indexed_bed_manifest(path: &std::path::Path) -> SourceManifest {
+        toml::from_str(&format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "0-based-half-open"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "tsv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  index = "tabix"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "start", type = "Utf8" }},
+    {{ name = "end",   type = "Utf8" }},
+    {{ name = "value", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "value"
+csq_field = "DEMO"
+type = "Utf8"
+"##,
+            path.display()
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tabix_source_materializes_only_requested_canonical_contig() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("whole.tsv.gz");
+        write_bgzf_tabix_bed(
+            &tsv,
+            &[
+                ("chr1", 99, 100, "one-a"),
+                ("chr1", 199, 200, "one-b"),
+                ("chr2", 299, 300, "two"),
+            ],
+        );
+        let manifest = indexed_bed_manifest(&tsv);
+        let ctx = SessionContext::new();
+
+        // The caller uses canonical "1" while the source index stores "chr1".
+        let temps = register_sources_for_chrom(&ctx, &manifest, "1")
+            .await
+            .unwrap();
+        assert_eq!(temps.len(), 1);
+        let rows = ctx
+            .sql("SELECT chrom, value FROM plugin_demo_src ORDER BY CAST(start AS INT)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        let chrom = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let value = rows[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(chrom.value(0), "chr1");
+        assert_eq!(chrom.value(1), "chr1");
+        assert_eq!(value.value(0), "one-a");
+        assert_eq!(value.value(1), "one-b");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tabix_source_requires_a_sibling_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("whole.tsv.gz");
+        let file = std::fs::File::create(&tsv).unwrap();
+        noodles_bgzf::io::Writer::new(file).finish().unwrap();
+        let manifest = indexed_bed_manifest(&tsv);
+        let ctx = SessionContext::new();
+
+        let error = register_sources_for_chrom(&ctx, &manifest, "1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected sibling"), "{error}");
+        assert!(error.contains(".tbi"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tabix_subsets_every_part_of_a_multi_source_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let snv = dir.path().join("snv.tsv.gz");
+        let indel = dir.path().join("indel.tsv.gz");
+        write_bgzf_tabix_bed(&snv, &[("1", 99, 100, "snv-1"), ("2", 199, 200, "snv-2")]);
+        write_bgzf_tabix_bed(
+            &indel,
+            &[("1", 299, 300, "indel-1"), ("2", 399, 400, "indel-2")],
+        );
+        let source = |part: &str, path: &std::path::Path| {
+            format!(
+                r##"
+[[source]]
+part = "{part}"
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  index = "tabix"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "start", type = "Utf8" }},
+    {{ name = "end",   type = "Utf8" }},
+    {{ name = "value", type = "Utf8" }},
+  ]
+"##,
+                path.display()
+            )
+        };
+        let manifest: SourceManifest = toml::from_str(&format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "0-based-half-open"
+ingest_sql = """
+SELECT * FROM plugin_demo_src_snv
+UNION ALL
+SELECT * FROM plugin_demo_src_indel
+"""
+{}
+{}
+[[value_columns]]
+column = "value"
+csq_field = "DEMO"
+type = "Utf8"
+"##,
+            source("snv", &snv),
+            source("indel", &indel)
+        ))
+        .unwrap();
+        let ctx = SessionContext::new();
+
+        let temps = register_sources_for_chrom(&ctx, &manifest, "1")
+            .await
+            .unwrap();
+        assert_eq!(temps.len(), 2);
+        let rows = ctx
+            .sql(
+                "SELECT value FROM (\
+                 SELECT value FROM plugin_demo_src_snv \
+                 UNION ALL \
+                 SELECT value FROM plugin_demo_src_indel) ORDER BY value",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let values = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values.value(0), "indel-1");
+        assert_eq!(values.value(1), "snv-1");
     }
 
     #[tokio::test(flavor = "multi_thread")]

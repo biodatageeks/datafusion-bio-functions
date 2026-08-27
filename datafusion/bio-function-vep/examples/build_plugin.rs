@@ -3,11 +3,13 @@
 //! ```text
 //! cargo run -p datafusion-bio-function-vep --example build_plugin -- \
 //!   --manifest <vepyr-plugins>/plugins/alphamissense/alphamissense.source.toml \
-//!   --source-path /tmp/AlphaMissense_hg38.tsv.gz \
+//!   --source-path /tmp/AlphaMissense_hg38.bgz.tsv.gz \
 //!   --variation-cache-dir <cache root containing variation/> \
 //!   --out /tmp/plugin_cache [--chrom 22]
 //!
 //! Multi-source manifests use one `--source-part <name>=<path>` per part.
+//! Indexed TSV manifests query the requested chromosome natively through the
+//! source's sibling `.tbi`; no external `tabix` process or pre-slice is needed.
 //! ```
 
 use std::path::PathBuf;
