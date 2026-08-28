@@ -4833,3 +4833,43 @@ async fn test_subtract_weak_mask_at_coordinate_limit() -> Result<()> {
     assert_batches_sorted_eq!(expected, &r);
     Ok(())
 }
+
+/// As above, on the extra-columns path. It carries its own copy of the cursor
+/// arithmetic, so the coordinate limit needs exercising there independently.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subtract_extra_columns_weak_mask_at_coordinate_limit() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE left_extra (contig TEXT, pos_start BIGINT, pos_end BIGINT, gene TEXT, score DOUBLE) AS VALUES
+        ('a', 10, 100, 'BRCA1', 0.95)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE right_mask (contig TEXT, pos_start BIGINT, pos_end BIGINT) AS VALUES
+        ('a', 50, 9223372036854775807)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM subtract('left_extra', 'right_mask') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------+-------+",
+        "| contig | pos_start | pos_end | gene  | score |",
+        "+--------+-----------+---------+-------+-------+",
+        "| a      | 10        | 49      | BRCA1 | 0.95  |",
+        "+--------+-----------+---------+-------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
