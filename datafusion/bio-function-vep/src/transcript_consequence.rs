@@ -5540,9 +5540,23 @@ fn shifted_tva_coords_from_mapper(
         // The mapped insertion interval is therefore the transcript-space gap
         // AFTER the left flank and BEFORE the right flank. Do not sort the two
         // flanks here; `translation_start/end` in VEP preserve mapper order.
-        let left = genomic_to_cdna_index_for_hgvsp(tx, tx_exons, shifted_variant.end)?;
-        let right = genomic_to_cdna_index_for_hgvsp(tx, tx_exons, shifted_variant.start)?;
-        (left.saturating_add(1), right.saturating_sub(1))
+        //
+        // `map_insert` keeps only the flanks that map to a
+        // `Bio::EnsEMBL::Mapper::Coordinate` and silently drops any that map
+        // to a `Gap`; it does not fail when one flank is unmapped. An
+        // insertion abutting a frameshift intron has one intronic flank, so
+        // requiring both to map would discard a window VEP still resolves.
+        let left = genomic_to_cdna_index_for_hgvsp(tx, tx_exons, shifted_variant.end);
+        let right = genomic_to_cdna_index_for_hgvsp(tx, tx_exons, shifted_variant.start);
+        match (left, right) {
+            (Some(left), Some(right)) => (left.saturating_add(1), right.saturating_sub(1)),
+            // Only the downstream flank mapped: VEP keeps that coordinate and
+            // decrements its end, leaving the zero-length window (r, r-1).
+            (None, Some(right)) => (right, right.saturating_sub(1)),
+            // Only the upstream flank mapped: VEP increments its start.
+            (Some(left), None) => (left.saturating_add(1), left),
+            (None, None) => return None,
+        }
     } else {
         let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
         let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
@@ -5600,8 +5614,17 @@ fn shifted_tva_coords_from_mapper(
         //   peptide coordinates.
         //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
         //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L510-L538>
-        let left = translateable_pos_1based(shifted_variant.end)?;
-        let right = translateable_pos_1based(shifted_variant.start)?;
+        let left = translateable_pos_1based(shifted_variant.end);
+        let right = translateable_pos_1based(shifted_variant.start);
+        // Same `map_insert` gap tolerance as the cDNA window above.
+        let (left, right) = match (left, right) {
+            (Some(left), Some(right)) => (left, right),
+            // A dropped Gap flank leaves one coordinate; genomic2pep then
+            // reads `int((start + 2) / 3)` and `int((end + 2) / 3)` off it.
+            (None, Some(right)) => (right.saturating_sub(1), right.saturating_sub(1)),
+            (Some(left), None) => (left, left),
+            (None, None) => return None,
+        };
         let pep_start = left.saturating_add(1).saturating_add(2) / 3;
         // Traceability:
         // - Ensembl core `Mapper::map_insert()` maps an insertion to the
@@ -16306,6 +16329,68 @@ mod tests {
     fn insertion_at_a_two_base_intron_boundary_is_intronic() {
         let v = var("X", 10_015_675, 10_015_675, "-", "C");
         assert!(variant_hits_intron_body(&v, 10_015_675, 10_015_676));
+    }
+
+    /// Ensembl's `Mapper::map_insert` keeps only the flanks that map to a
+    /// `Coordinate` and silently drops `Gap` flanks; it does not fail when one
+    /// flank is unmapped. An insertion abutting a 2 bp frameshift intron has
+    /// one intronic flank, so requiring both to map discarded a window VEP
+    /// still resolves -- the cause of the empty HGVSp on
+    /// chrX:10015674 / NM_015691.5.
+    ///
+    /// Geometry mirrors NM_015691.5: exon 1 ends at 10015673, exon 2 starts at
+    /// 10015676, so intron 1 is [10015674, 10015675]. The HGVS-shifted
+    /// insertion sits at 10015676 (first base of exon 2) with its upstream
+    /// flank at 10015675, inside the intron.
+    ///
+    /// Traceability:
+    /// - Ensembl core `Mapper::map_insert()`
+    ///   <https://github.com/Ensembl/ensembl/blob/release/116/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
+    #[test]
+    fn shifted_insertion_window_survives_one_intronic_flank() {
+        let mut t = tx(
+            "NM_TEST.1",
+            "X",
+            10_015_254,
+            10_015_858,
+            1,
+            "protein_coding",
+            Some(10_015_579),
+            Some(10_015_800),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(600);
+        let exons = vec![
+            exon("NM_TEST.1", 1, 10_015_254, 10_015_673),
+            exon("NM_TEST.1", 2, 10_015_676, 10_015_858),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let tl = translation(
+            "NM_TEST.1",
+            Some(600),
+            Some(200),
+            Some(&"M".repeat(200)),
+            Some(&"ATG".repeat(200)),
+        );
+        // Shifted insertion: start = 10015676 (exon 2), end = 10015675 (intron).
+        let shifted = var("X", 10_015_676, 10_015_675, "-", "C");
+
+        // Guard the premise: without a genuinely unmappable upstream flank the
+        // assertion below would pass even with both-flanks-required logic.
+        assert!(
+            genomic_to_cdna_index_for_hgvsp(&t, &refs, shifted.end).is_none(),
+            "upstream flank must be intronic for this test to mean anything"
+        );
+        assert!(
+            genomic_to_cdna_index_for_hgvsp(&t, &refs, shifted.start).is_some(),
+            "downstream flank must map"
+        );
+
+        let coords = shifted_tva_coords_from_mapper(&t, &refs, &tl, &shifted);
+        assert!(
+            coords.is_some(),
+            "a single intronic flank must not discard the window"
+        );
     }
 
     /// The minus-strand case: chrX:119605952 C>CG / NM_001417890.1, exon 2
