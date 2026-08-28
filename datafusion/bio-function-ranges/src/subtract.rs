@@ -420,19 +420,33 @@ impl Stream for SubtractStream {
                                     break;
                                 }
 
+                                // Under 1-based inclusive coordinates `rs` is
+                                // itself a removed base and `re` is the last
+                                // one, so the surviving run stops one earlier
+                                // and the cursor resumes one later than the
+                                // half-open arithmetic would give.
                                 if rs > cursor {
                                     this.contig_builder.append_value(contig);
                                     this.start_builder.append_value(cursor);
-                                    this.end_builder.append_value(rs);
+                                    this.end_builder.append_value(if this.strict {
+                                        rs
+                                    } else {
+                                        rs - 1
+                                    });
                                     this.pending_rows += 1;
                                 }
-                                if re > cursor {
-                                    cursor = re;
+                                let resume = if this.strict { re } else { re + 1 };
+                                if resume > cursor {
+                                    cursor = resume;
                                 }
                                 j += 1;
                             }
 
-                            if cursor < le {
+                            if if this.strict {
+                                cursor < le
+                            } else {
+                                cursor <= le
+                            } {
                                 this.contig_builder.append_value(contig);
                                 this.start_builder.append_value(cursor);
                                 this.end_builder.append_value(le);
@@ -612,16 +626,23 @@ impl Stream for SubtractStreamExtra {
                                     );
                                     this.output_row_indices.push(row_idx as u32);
                                     this.output_starts.push(cursor);
-                                    this.output_ends.push(rs);
+                                    // See the builder variant above: 1-based
+                                    // inclusive bounds consume `rs` and `re`.
+                                    this.output_ends.push(if this.strict { rs } else { rs - 1 });
                                     this.pending_rows += 1;
                                 }
-                                if re > cursor {
-                                    cursor = re;
+                                let resume = if this.strict { re } else { re + 1 };
+                                if resume > cursor {
+                                    cursor = resume;
                                 }
                                 j += 1;
                             }
 
-                            if cursor < le {
+                            if if this.strict {
+                                cursor < le
+                            } else {
+                                cursor <= le
+                            } {
                                 debug_assert!(
                                     row_idx <= u32::MAX as usize,
                                     "row index {row_idx} exceeds u32::MAX"

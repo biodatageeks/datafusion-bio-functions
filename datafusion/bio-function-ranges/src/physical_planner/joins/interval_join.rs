@@ -866,7 +866,7 @@ impl IntervalJoinAlgorithm {
             }
             IntervalJoinAlgorithm::CoitreesNearest(hashmap) => {
                 if let Some(index) = hashmap.get(&k)
-                    && let Some(position) = index.nearest_one(start, end, true)
+                    && let Some(position) = index.nearest_one_by_bounds(start, end, true)
                 {
                     f(position);
                 }

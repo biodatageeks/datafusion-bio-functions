@@ -38,13 +38,32 @@ impl CountOverlapIndex {
         Self { starts, ends }
     }
 
-    fn query_count(&self, start: i32, end: i32) -> i64 {
-        if end < start {
+    /// Count indexed intervals overlapping the query range.
+    ///
+    /// `start`/`end` are the caller's own bounds, deliberately *not* the
+    /// narrowed form the caller used to pass. Emptiness has to be judged on the
+    /// real range: a one-base half-open range narrows to an inverted pair, and
+    /// reading that as empty is how single-base 0-based features silently
+    /// counted zero overlaps.
+    ///
+    /// `half_open` is `true` for 0-based `[start, end)` (`FilterOp::Strict`)
+    /// and `false` for 1-based inclusive `[start, end]` (`FilterOp::Weak`).
+    fn query_count(&self, start: i32, end: i32, half_open: bool) -> i64 {
+        let is_empty = if half_open { end <= start } else { end < start };
+        if is_empty {
             return 0;
         }
 
-        let started = self.starts.partition_point(|&value| value <= end);
-        let ended_before = self.ends.partition_point(|&value| value < start);
+        // The stored bounds are raw, so narrow the query instead: a half-open
+        // [start, end) overlaps [first, last) exactly when first <= end - 1 and
+        // last >= start + 1.
+        let (lo, hi) = if half_open {
+            (start + 1, end - 1)
+        } else {
+            (start, end)
+        };
+        let started = self.starts.partition_point(|&value| value <= hi);
+        let ended_before = self.ends.partition_point(|&value| value < lo);
         (started - ended_before) as i64
     }
 }
@@ -271,12 +290,6 @@ pub fn get_count_stream(
             let mut cached_index: Option<&CountOverlapIndex> = None;
             for i in 0..num_rows {
                 let contig = contig.value(i);
-                let mut query_start = starts[i];
-                let mut query_end = ends[i];
-                if strict_filter {
-                    query_start += 1;
-                    query_end -= 1;
-                }
 
                 let index = if cached_contig == Some(contig) {
                     cached_index
@@ -285,7 +298,9 @@ pub fn get_count_stream(
                     cached_index = indexes.get(contig);
                     cached_index
                 };
-                let count = index.map_or(0, |index| index.query_count(query_start, query_end));
+                let count = index.map_or(0, |index| {
+                    index.query_count(starts[i], ends[i], strict_filter)
+                });
                 count_arr.push(count);
             }
             let count_arr = Arc::new(Int64Array::from(count_arr));
@@ -382,12 +397,12 @@ mod tests {
             Interval::new(30, 40, ()),
         ]);
 
-        assert_eq!(index.query_count(5, 9), 0);
-        assert_eq!(index.query_count(5, 10), 1);
-        assert_eq!(index.query_count(20, 30), 3);
-        assert_eq!(index.query_count(26, 29), 0);
-        assert_eq!(index.query_count(31, 35), 1);
-        assert_eq!(index.query_count(10, 9), 0);
+        assert_eq!(index.query_count(5, 9, false), 0);
+        assert_eq!(index.query_count(5, 10, false), 1);
+        assert_eq!(index.query_count(20, 30, false), 3);
+        assert_eq!(index.query_count(26, 29, false), 0);
+        assert_eq!(index.query_count(31, 35, false), 1);
+        assert_eq!(index.query_count(10, 9, false), 0);
     }
 
     // Bounds are passed raw, i.e. in the already-narrowed form get_stream
@@ -444,6 +459,37 @@ mod tests {
 
     fn tree_of(target: (i32, i32)) -> COITree<(), u32> {
         COITree::new(&[Interval::new(target.0, target.1, ())])
+    }
+
+    #[test]
+    fn test_query_count_half_open_one_base_interval() {
+        // A one-base 0-based query narrows to an inverted pair; reading that as
+        // an empty range is how single-base features counted zero overlaps.
+        let index = CountOverlapIndex::new(vec![Interval::new(9, 28, ())]);
+        assert_eq!(index.query_count(17, 18, true), 1);
+        assert_eq!(index.query_count(17, 19, true), 1);
+        assert_eq!(index.query_count(15, 20, true), 1);
+    }
+
+    #[test]
+    fn test_query_count_half_open_empty_interval() {
+        let index = CountOverlapIndex::new(vec![Interval::new(9, 28, ())]);
+        // [17,17) covers nothing, so it overlaps nothing.
+        assert_eq!(index.query_count(17, 17, true), 0);
+        // 1-based [17,17] is a real base and does overlap.
+        assert_eq!(index.query_count(17, 17, false), 1);
+    }
+
+    #[test]
+    fn test_query_count_half_open_boundaries() {
+        let index = CountOverlapIndex::new(vec![Interval::new(10, 20, ())]);
+        // Bookended half-open neighbours share no base.
+        assert_eq!(index.query_count(0, 10, true), 0);
+        assert_eq!(index.query_count(20, 30, true), 0);
+        assert_eq!(index.query_count(19, 30, true), 1);
+        // 1-based inclusive: both touch at a shared endpoint.
+        assert_eq!(index.query_count(0, 10, false), 1);
+        assert_eq!(index.query_count(20, 30, false), 1);
     }
 
     #[test]
