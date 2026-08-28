@@ -142,11 +142,34 @@ pub fn build_count_index_from_batches(
         .collect())
 }
 
-pub fn get_coverage(tree: &COITree<(), u32>, start: i32, end: i32) -> i32 {
+/// Sum the covered bases shared by a query range and a tree of *merged* targets.
+///
+/// `start`/`end` are the bounds as handed to [`COITree::query`], which means they
+/// arrive already narrowed by one base on each side when `half_open` is set --
+/// see the `strict_filter` branch in [`get_stream`]. That narrowing exists purely
+/// so coitrees' inclusive containment test implements half-open overlap; it must
+/// be undone before any length is measured, which is what `query_start` and
+/// `query_end` recover below.
+///
+/// `half_open` names the coordinate convention shared by the query and the tree:
+/// `true` for 0-based half-open `[start, end)` (`FilterOp::Strict`), where the
+/// length of a range is `end - start`; `false` for 1-based inclusive
+/// `[start, end]` (`FilterOp::Weak`), where both endpoints are covered bases and
+/// the length is therefore `end - start + 1`.
+pub fn get_coverage(tree: &COITree<(), u32>, start: i32, end: i32, half_open: bool) -> i32 {
+    let (query_start, query_end) = if half_open {
+        (start - 1, end + 1)
+    } else {
+        (start, end)
+    };
+    // A 1-based range covers both of its endpoints; a half-open one covers only
+    // its start.
+    let endpoint = i32::from(!half_open);
+
     let mut coverage = 0;
     tree.query(start, end, |node| {
-        let overlap = max(1, min(end + 1, node.last) - max(start - 1, node.first));
-        coverage += overlap;
+        let overlap = min(query_end, node.last) - max(query_start, node.first) + endpoint;
+        coverage += max(0, overlap);
     });
     coverage
 }
@@ -198,7 +221,7 @@ pub fn get_stream(
                     None => 0,
                     Some(tree) => {
                         if coverage {
-                            get_coverage(tree, query_start, query_end)
+                            get_coverage(tree, query_start, query_end, strict_filter)
                         } else {
                             tree.query_count(query_start, query_end) as i32
                         }
@@ -367,19 +390,25 @@ mod tests {
         assert_eq!(index.query_count(10, 9), 0);
     }
 
+    // Bounds are passed raw, i.e. in the already-narrowed form get_stream
+    // hands to get_coverage on the 0-based path; the constants are unchanged
+    // from before half_open was threaded through and guard that path.
     #[test]
     fn test_get_coverage_single_interval() {
         let intervals = vec![Interval::new(100, 200, ())];
         let tree = COITree::new(&intervals);
 
         // Query fully contained in interval
-        assert_eq!(get_coverage(&tree, 120, 150), 32);
+        assert_eq!(get_coverage(&tree, 120, 150, true), 32);
         // Query partially overlapping
-        assert_eq!(get_coverage(&tree, 50, 120), 21);
+        assert_eq!(get_coverage(&tree, 50, 120, true), 21);
         // Query with no overlap
-        assert_eq!(get_coverage(&tree, 300, 400), 0);
+        assert_eq!(get_coverage(&tree, 300, 400, true), 0);
     }
 
+    // Bounds are passed raw, i.e. in the already-narrowed form get_stream
+    // hands to get_coverage on the 0-based path; the constants are unchanged
+    // from before half_open was threaded through and guard that path.
     #[test]
     fn test_get_coverage_multiple_merged_intervals() {
         // Simulate the chr1 merged reads from the CSV test data
@@ -395,19 +424,126 @@ mod tests {
         let tree = COITree::new(&merged);
 
         // These match the expected coverage values from test_coverage_csv
-        assert_eq!(get_coverage(&tree, 100, 190), 41);
-        assert_eq!(get_coverage(&tree, 200, 290), 92);
-        assert_eq!(get_coverage(&tree, 400, 600), 202);
+        assert_eq!(get_coverage(&tree, 100, 190, true), 41);
+        assert_eq!(get_coverage(&tree, 200, 290, true), 92);
+        assert_eq!(get_coverage(&tree, 400, 600, true), 202);
+    }
+
+    /// Mirror what [`get_stream`] does to a query row before calling
+    /// [`get_coverage`]: under `FilterOp::Strict` (0-based, half-open) it narrows
+    /// the row by one base on each side so that coitrees' inclusive containment
+    /// test implements half-open overlap.
+    fn coverage_of(tree: &COITree<(), u32>, query: (i32, i32), half_open: bool) -> i32 {
+        let (start, end) = if half_open {
+            (query.0 + 1, query.1 - 1)
+        } else {
+            query
+        };
+        get_coverage(tree, start, end, half_open)
+    }
+
+    fn tree_of(target: (i32, i32)) -> COITree<(), u32> {
+        COITree::new(&[Interval::new(target.0, target.1, ())])
     }
 
     #[test]
-    fn test_get_coverage_point_interval() {
-        let intervals = vec![Interval::new(15000, 15000, ())];
-        let tree = COITree::new(&intervals);
+    fn test_get_coverage_point_interval_one_based() {
+        // 1-based inclusive: [15000, 15000] is a single covered base.
+        let tree = tree_of((15000, 15000));
+        assert_eq!(coverage_of(&tree, (10000, 20000), false), 1);
+        assert_eq!(coverage_of(&tree, (15000, 15000), false), 1);
+    }
 
-        // Query that contains the point
-        assert_eq!(get_coverage(&tree, 10000, 20000), 1);
-        // Query at exactly the point
-        assert_eq!(get_coverage(&tree, 15000, 15000), 1);
+    #[test]
+    fn test_get_coverage_point_interval_zero_based() {
+        // 0-based half-open: [15000, 15000) is empty and covers nothing.
+        let tree = tree_of((15000, 15000));
+        assert_eq!(coverage_of(&tree, (10000, 20000), true), 0);
+        assert_eq!(coverage_of(&tree, (15000, 15000), true), 0);
+    }
+
+    #[test]
+    fn test_get_coverage_zero_based_is_half_open_intersection() {
+        // Query [10, 20) -- 10 covered bases.
+        let query = (10, 20);
+        for (target, expected) in [
+            ((10, 20), 10), // identical to the query
+            ((5, 25), 10),  // strict superset
+            ((0, 100), 10), // much larger superset
+            ((9, 21), 10),  // overhangs both ends
+            ((12, 15), 3),  // contained
+            ((5, 15), 5),   // overhangs left
+            ((19, 30), 1),  // overhangs right
+            ((0, 10), 0),   // bookended, no shared base
+            ((20, 30), 0),  // bookended, no shared base
+            ((0, 5), 0),    // disjoint
+            ((25, 30), 0),  // disjoint
+        ] {
+            assert_eq!(
+                coverage_of(&tree_of(target), query, true),
+                expected,
+                "0-based query {query:?} against target {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_coverage_one_based_is_inclusive_intersection() {
+        // Query [10, 20] -- 11 covered bases, both endpoints included.
+        let query = (10, 20);
+        for (target, expected) in [
+            ((10, 20), 11), // identical to the query
+            ((5, 25), 11),  // strict superset
+            ((0, 100), 11), // much larger superset
+            ((9, 21), 11),  // overhangs both ends
+            ((12, 15), 4),  // contained
+            ((5, 15), 6),   // overhangs left
+            ((19, 30), 2),  // overhangs right
+            ((0, 10), 1),   // touches at base 10
+            ((20, 30), 1),  // touches at base 20
+            ((0, 9), 0),    // disjoint
+            ((21, 30), 0),  // disjoint
+        ] {
+            assert_eq!(
+                coverage_of(&tree_of(target), query, false),
+                expected,
+                "1-based query {query:?} against target {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_coverage_never_exceeds_query_length() {
+        // No target, however large, can cover more bases than the query has.
+        let query = (10, 20);
+        for half_open in [true, false] {
+            let query_len = if half_open {
+                query.1 - query.0
+            } else {
+                query.1 - query.0 + 1
+            };
+            for start in 0..30 {
+                for end in start..30 {
+                    let coverage = coverage_of(&tree_of((start, end)), query, half_open);
+                    assert!(
+                        (0..=query_len).contains(&coverage),
+                        "half_open={half_open} target=({start}, {end}) gave {coverage}, \
+                         outside 0..={query_len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_coverage_sums_disjoint_targets() {
+        let tree = COITree::new(&merge_intervals(vec![
+            Interval::new(12, 14, ()),
+            Interval::new(16, 18, ()),
+        ]));
+        // 0-based: [12,14) and [16,18) contribute 2 + 2.
+        assert_eq!(coverage_of(&tree, (10, 20), true), 4);
+        // 1-based: [12,14] and [16,18] contribute 3 + 3.
+        assert_eq!(coverage_of(&tree, (10, 20), false), 6);
     }
 }
