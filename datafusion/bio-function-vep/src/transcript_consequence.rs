@@ -8093,6 +8093,10 @@ fn which_exon_str(variant: &VariantInput, tx_exons: &[&ExonFeature]) -> Option<S
     }
     let is_ins = variant.ref_allele == "-";
     let total = tx_exons.len();
+    // Ensembl collects every overlapping exon, sorts the numbers, and emits
+    // `numbers[0]-numbers[-1]`; min/max is the same result without the sort.
+    let mut lo: Option<i32> = None;
+    let mut hi: Option<i32> = None;
     for exon in tx_exons {
         let hit = if is_ins {
             variant.start > exon.start && variant.start <= exon.end
@@ -8100,10 +8104,15 @@ fn which_exon_str(variant: &VariantInput, tx_exons: &[&ExonFeature]) -> Option<S
             overlaps(variant.start, variant.end, exon.start, exon.end)
         };
         if hit {
-            return Some(format!("{}/{}", exon.exon_number, total));
+            lo = Some(lo.map_or(exon.exon_number, |n| n.min(exon.exon_number)));
+            hi = Some(hi.map_or(exon.exon_number, |n| n.max(exon.exon_number)));
         }
     }
-    None
+    match (lo, hi) {
+        (Some(lo), Some(hi)) if lo == hi => Some(format!("{lo}/{total}")),
+        (Some(lo), Some(hi)) => Some(format!("{lo}-{hi}/{total}")),
+        _ => None,
+    }
 }
 
 /// Determine which intron (if any) the variant overlaps.
@@ -13277,6 +13286,55 @@ mod tests {
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 250, 250, "A", "G");
         assert_eq!(which_exon_str(&v, &refs), None);
+    }
+
+    /// A deletion spanning every exon reports the full range, not one exon.
+    /// Reproduces chrX:3886710 / ENST00000424415, where VEP emits `1-4/4`.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariation::exon_number()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L679-L713>
+    #[test]
+    fn which_exon_str_spanning_deletion_reports_a_range() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+            exon("tx1", 4, 700, 800),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 50, 900, "ACGT", "-");
+        assert_eq!(which_exon_str(&v, &refs), Some("1-4/4".to_string()));
+    }
+
+    /// A deletion covering a contiguous subset reports just that subset.
+    /// Reproduces chrX:3886710 / ENST00000648217, where VEP emits `1-4/13`.
+    #[test]
+    fn which_exon_str_partial_span_reports_the_covered_subset() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+            exon("tx1", 4, 700, 800),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 150, 550, "ACGT", "-");
+        assert_eq!(which_exon_str(&v, &refs), Some("1-3/4".to_string()));
+    }
+
+    /// Exon numbers, not slice indices: on a minus-strand transcript the
+    /// cache stores descending exon_number against ascending genomic start,
+    /// and Ensembl sorts the collected numbers numerically.
+    #[test]
+    fn which_exon_str_range_uses_min_max_of_exon_numbers() {
+        let exons = vec![
+            exon("tx1", 3, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 1, 500, 600),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 150, 550, "ACGT", "-");
+        assert_eq!(which_exon_str(&v, &refs), Some("1-3/3".to_string()));
     }
 
     #[test]
