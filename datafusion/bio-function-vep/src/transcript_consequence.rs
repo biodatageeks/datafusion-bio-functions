@@ -3816,6 +3816,17 @@ fn normalize_chrom(chrom: &str) -> &str {
     chrom.strip_prefix("chr").unwrap_or(chrom)
 }
 
+/// Ensembl's `overlap()` verbatim, without the range normalisation `overlaps`
+/// applies. Insertions carry inverted coordinates `(P, P-1)` and Ensembl
+/// relies on that inversion, so normalising would change the result.
+///
+/// Traceability:
+/// - Ensembl Variation `VariationEffect::overlap()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85>
+fn overlap_perl(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
+    a_start <= b_end && a_end >= b_start
+}
+
 fn overlaps(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
     let (a_start, a_end) = if a_start <= a_end {
         (a_start, a_end)
@@ -9742,27 +9753,44 @@ fn partial_coding_overlap_classification(
 /// VEP's `intronic` predicate excludes frameshift introns and does not use a
 /// simple full-intron overlap. Insertions are evaluated with `(P, P-1)`
 /// coordinates plus the explicit boundary cases at `intron_start+2` and
-/// `intron_end-2`, which reduces to `P in [intron_start+2, intron_end-1]`.
+/// `intron_end-2`, which for a well-formed intron reduces to
+/// `P in [intron_start+2, intron_end-1]`.
+///
+/// Ensembl also evaluates these clauses against the HGVS-shifted coordinates
+/// as well as the unshifted ones. `variant.start`/`variant.end` here are
+/// unshifted, so this implements the unshifted pair only.
 fn variant_hits_intron_body(variant: &VariantInput, intron_start: i64, intron_end: i64) -> bool {
     if intron_start > intron_end {
         return false;
     }
-    if (intron_end - intron_start).abs() <= 12 {
+
+    // Ensembl's (r_start, r_end): an insertion at P is (P, P-1).
+    let is_ins = variant.ref_allele == "-";
+    let (r_start, r_end) = if is_ins {
+        (variant.start, variant.start - 1)
+    } else {
+        (variant.start, variant.end)
+    };
+    let insertion = r_start == r_end + 1;
+
+    // A frameshift intron is skipped only when the variant actually overlaps
+    // it -- that sets within_frameshift_intron instead. A variant that merely
+    // abuts one falls through to the boundary clauses below.
+    if (intron_end - intron_start).abs() <= 12
+        && overlap_perl(r_start, r_end, intron_start, intron_end)
+    {
         return false;
     }
 
     let inner_start = intron_start + 2;
     let inner_end = intron_end - 2;
-    if inner_start > inner_end {
-        return false;
-    }
 
-    if variant.ref_allele == "-" {
-        let p = variant.start;
-        p >= inner_start && p <= inner_end + 1
-    } else {
-        overlaps(variant.start, variant.end, inner_start, inner_end)
-    }
+    // Three independent clauses. They collapse to the contiguous range
+    // [inner_start, inner_end + 1] only while inner_start <= inner_end; for a
+    // 2 bp intron the inner range inverts and the equality clauses still
+    // apply, which is the whole defect this restores.
+    overlap_perl(r_start, r_end, inner_start, inner_end)
+        || (insertion && (r_start == inner_start || r_end == inner_end))
 }
 
 fn normalize_allele_seq(allele: &str) -> String {
@@ -16262,6 +16290,59 @@ mod tests {
             100,
             120
         ));
+    }
+
+    /// An insertion at the first base of a 2 bp intron is intronic in VEP:
+    /// the frameshift-intron skip does not apply because the insertion's
+    /// (P, P-1) coordinates do not overlap the intron, and the standalone
+    /// `r_end == intron_end - 2` clause then matches.
+    /// Reproduces chrX:10015674 G>GC / ENST00000380861, exon 1 ending
+    /// 10015674 and exon 2 starting 10015677.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149>
+    #[test]
+    fn insertion_at_a_two_base_intron_boundary_is_intronic() {
+        let v = var("X", 10_015_675, 10_015_675, "-", "C");
+        assert!(variant_hits_intron_body(&v, 10_015_675, 10_015_676));
+    }
+
+    /// The minus-strand case: chrX:119605952 C>CG / NM_001417890.1, exon 2
+    /// ending 119605952 and exon 1 starting 119605955.
+    #[test]
+    fn insertion_at_a_two_base_intron_boundary_is_intronic_minus_strand() {
+        let v = var("X", 119_605_953, 119_605_953, "-", "G");
+        assert!(variant_hits_intron_body(&v, 119_605_953, 119_605_954));
+    }
+
+    /// An insertion that genuinely falls inside a frameshift intron is
+    /// within_frameshift_intron, not intronic -- Ensembl takes the `next`.
+    /// Reproduces chrX:10015674 G>GC / NM_015691.5, whose intron 1 is
+    /// [10015674, 10015675] and does contain the insertion.
+    #[test]
+    fn insertion_inside_a_frameshift_intron_is_not_intron_body() {
+        let v = var("X", 10_015_675, 10_015_675, "-", "C");
+        assert!(!variant_hits_intron_body(&v, 10_015_674, 10_015_675));
+    }
+
+    /// A substitution overlapping a short intron still takes the
+    /// frameshift-intron skip.
+    #[test]
+    fn substitution_inside_a_frameshift_intron_is_not_intron_body() {
+        let v = var("X", 10_015_675, 10_015_675, "A", "G");
+        assert!(!variant_hits_intron_body(&v, 10_015_674, 10_015_675));
+    }
+
+    /// A normal intron is unaffected: interior yes, splice-site bases no.
+    #[test]
+    fn normal_intron_body_bounds_are_unchanged() {
+        let v = var("22", 1_050, 1_050, "A", "G");
+        assert!(variant_hits_intron_body(&v, 1_000, 1_100));
+        let at_donor = var("22", 1_001, 1_001, "A", "G");
+        assert!(!variant_hits_intron_body(&at_donor, 1_000, 1_100));
+        let at_acceptor = var("22", 1_099, 1_099, "A", "G");
+        assert!(!variant_hits_intron_body(&at_acceptor, 1_000, 1_100));
     }
 
     #[test]
