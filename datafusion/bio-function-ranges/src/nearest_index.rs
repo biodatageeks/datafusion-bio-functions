@@ -123,8 +123,10 @@ impl NearestIntervalIndex {
         self.nearest_one_by_bounds(lo, hi, include_overlaps)
     }
 
-    /// [`Self::nearest_one`] for callers that already hold comparison bounds
-    /// (see [`Self::comparison_bounds`]) rather than raw interval coordinates.
+    /// [`Self::nearest_one`] for callers that already hold comparison bounds --
+    /// the query narrowed by one base on each side under half-open coordinates,
+    /// so that inclusive-style comparisons against raw bounds implement
+    /// half-open overlap -- rather than raw interval coordinates.
     pub fn nearest_one_by_bounds(
         &self,
         lo: i32,
