@@ -8128,6 +8128,12 @@ fn which_intron_str(
     let sorted = start_sorted(tx_exons);
     let total_introns = sorted.len() - 1;
 
+    // Ensembl collects every overlapping intron, sorts the numbers, and emits
+    // `numbers[0]-numbers[-1]`. On the minus strand the numbers descend as the
+    // window index ascends, so min/max is required rather than first/last.
+    let mut lo: Option<usize> = None;
+    let mut hi: Option<usize> = None;
+
     for (i, pair) in sorted.windows(2).enumerate() {
         let intron_start = pair[0].end + 1;
         let intron_end = pair[1].start - 1;
@@ -8160,10 +8166,16 @@ fn which_intron_str(
             } else {
                 total_introns - i
             };
-            return Some(format!("{intron_num}/{total_introns}"));
+            lo = Some(lo.map_or(intron_num, |n| n.min(intron_num)));
+            hi = Some(hi.map_or(intron_num, |n| n.max(intron_num)));
         }
     }
-    None
+
+    match (lo, hi) {
+        (Some(lo), Some(hi)) if lo == hi => Some(format!("{lo}/{total_introns}")),
+        (Some(lo), Some(hi)) => Some(format!("{lo}-{hi}/{total_introns}")),
+        _ => None,
+    }
 }
 
 /// Map a genomic position to 1-based cDNA index (counting all exonic bases).
@@ -13373,6 +13385,55 @@ mod tests {
         // On minus strand, this is intron 2/2 (reversed).
         let v = var("22", 250, 250, "A", "G");
         assert_eq!(which_intron_str(&v, &refs, -1), Some("2/2".to_string()));
+    }
+
+    /// A deletion spanning every intron reports the full range.
+    /// Reproduces chrX:3886710 / ENST00000424415, where VEP emits `1-3/3`.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariation::intron_number()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L727-L760>
+    #[test]
+    fn which_intron_str_spanning_deletion_reports_a_range() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+            exon("tx1", 4, 700, 800),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 50, 900, "ACGT", "-");
+        assert_eq!(which_intron_str(&v, &refs, 1), Some("1-3/3".to_string()));
+    }
+
+    /// On the minus strand the numbering runs opposite to genomic order, so
+    /// the range must be min-max of the numbers, not first-to-last hit.
+    #[test]
+    fn which_intron_str_minus_strand_range_is_min_max_not_first_last() {
+        let exons = vec![
+            exon("tx1", 4, 100, 200),
+            exon("tx1", 3, 300, 400),
+            exon("tx1", 2, 500, 600),
+            exon("tx1", 1, 700, 800),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Spans genomic introns 0 and 1, which are introns 3 and 2 on the
+        // minus strand. First hit is 3, last hit is 2 -- "3-2/3" would be wrong.
+        let v = var("22", 250, 550, "ACGT", "-");
+        assert_eq!(which_intron_str(&v, &refs, -1), Some("2-3/3".to_string()));
+    }
+
+    /// A variant inside a single intron keeps the plain "N/total" form.
+    #[test]
+    fn which_intron_str_single_intron_has_no_range() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 250, 260, "ACGTACGTAGC", "-");
+        assert_eq!(which_intron_str(&v, &refs, 1), Some("1/2".to_string()));
     }
 
     #[test]
