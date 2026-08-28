@@ -412,6 +412,7 @@ impl Stream for SubtractStream {
                             }
 
                             let mut cursor = ls;
+                            let mut reached_limit = false;
                             let mut j = this.right_cursor;
                             while j < right_intervals.len() {
                                 let (rs, re) = right_intervals[j];
@@ -435,18 +436,33 @@ impl Stream for SubtractStream {
                                     });
                                     this.pending_rows += 1;
                                 }
-                                let resume = if this.strict { re } else { re + 1 };
-                                if resume > cursor {
-                                    cursor = resume;
+                                match if this.strict {
+                                    Some(re)
+                                } else {
+                                    re.checked_add(1)
+                                } {
+                                    Some(resume) => {
+                                        if resume > cursor {
+                                            cursor = resume;
+                                        }
+                                    }
+                                    // A mask running to i64::MAX consumes the
+                                    // rest of the interval; nothing follows it.
+                                    None => {
+                                        reached_limit = true;
+                                        break;
+                                    }
                                 }
                                 j += 1;
                             }
 
-                            if if this.strict {
-                                cursor < le
-                            } else {
-                                cursor <= le
-                            } {
+                            let tail_remains = !reached_limit
+                                && if this.strict {
+                                    cursor < le
+                                } else {
+                                    cursor <= le
+                                };
+                            if tail_remains {
                                 this.contig_builder.append_value(contig);
                                 this.start_builder.append_value(cursor);
                                 this.end_builder.append_value(le);
@@ -611,6 +627,7 @@ impl Stream for SubtractStreamExtra {
                             }
 
                             let mut cursor = ls;
+                            let mut reached_limit = false;
                             let mut j = this.right_cursor;
                             while j < right_intervals.len() {
                                 let (rs, re) = right_intervals[j];
@@ -631,18 +648,33 @@ impl Stream for SubtractStreamExtra {
                                     this.output_ends.push(if this.strict { rs } else { rs - 1 });
                                     this.pending_rows += 1;
                                 }
-                                let resume = if this.strict { re } else { re + 1 };
-                                if resume > cursor {
-                                    cursor = resume;
+                                match if this.strict {
+                                    Some(re)
+                                } else {
+                                    re.checked_add(1)
+                                } {
+                                    Some(resume) => {
+                                        if resume > cursor {
+                                            cursor = resume;
+                                        }
+                                    }
+                                    // A mask running to i64::MAX consumes the
+                                    // rest of the interval; nothing follows it.
+                                    None => {
+                                        reached_limit = true;
+                                        break;
+                                    }
                                 }
                                 j += 1;
                             }
 
-                            if if this.strict {
-                                cursor < le
-                            } else {
-                                cursor <= le
-                            } {
+                            let tail_remains = !reached_limit
+                                && if this.strict {
+                                    cursor < le
+                                } else {
+                                    cursor <= le
+                                };
+                            if tail_remains {
                                 debug_assert!(
                                     row_idx <= u32::MAX as usize,
                                     "row index {row_idx} exceeds u32::MAX"

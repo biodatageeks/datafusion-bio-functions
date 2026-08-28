@@ -4787,3 +4787,49 @@ async fn bench_scaling_nearest() -> Result<()> {
     }
     Ok(())
 }
+// Under inclusive coordinates the cursor advances to one past the interval it
+// just consumed. An interval ending at i64::MAX has nothing past it, and no
+// cursor value that could say so -- complement's own no-view output uses
+// i64::MAX as its trailing bound, so feeding that back in reaches these.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_complement_weak_interval_at_coordinate_limit() -> Result<()> {
+    let ctx = create_bio_session();
+    ctx.sql("CREATE TABLE left_t (contig TEXT, pos_start BIGINT, pos_end BIGINT) AS VALUES ('a', 10, 9223372036854775807)").await?;
+    let r = ctx
+        .sql("SELECT * FROM complement('left_t') ORDER BY pos_start")
+        .await?
+        .collect()
+        .await?;
+    let expected = [
+        "+--------+-----------+---------+",
+        "| contig | pos_start | pos_end |",
+        "+--------+-----------+---------+",
+        "| a      | 0         | 9       |",
+        "+--------+-----------+---------+",
+    ];
+    assert_batches_sorted_eq!(expected, &r);
+    Ok(())
+}
+
+/// A mask reaching i64::MAX consumes the rest of the left interval; the tail
+/// must not be re-emitted, and the cursor must not wrap past the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subtract_weak_mask_at_coordinate_limit() -> Result<()> {
+    let ctx = create_bio_session();
+    ctx.sql("CREATE TABLE left_t (contig TEXT, pos_start BIGINT, pos_end BIGINT) AS VALUES ('a', 10, 100)").await?;
+    ctx.sql("CREATE TABLE right_t (contig TEXT, pos_start BIGINT, pos_end BIGINT) AS VALUES ('a', 50, 9223372036854775807)").await?;
+    let r = ctx
+        .sql("SELECT * FROM subtract('left_t', 'right_t') ORDER BY pos_start")
+        .await?
+        .collect()
+        .await?;
+    let expected = [
+        "+--------+-----------+---------+",
+        "| contig | pos_start | pos_end |",
+        "+--------+-----------+---------+",
+        "| a      | 10        | 49      |",
+        "+--------+-----------+---------+",
+    ];
+    assert_batches_sorted_eq!(expected, &r);
+    Ok(())
+}

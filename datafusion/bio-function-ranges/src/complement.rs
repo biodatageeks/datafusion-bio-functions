@@ -338,6 +338,9 @@ impl ComplementStream {
         let mut rows = 0;
         for &(view_start, view_end) in view_intervals {
             let mut cursor = view_start;
+            // Set when an interval runs to i64::MAX: nothing follows it, and no
+            // cursor value could represent the base after it.
+            let mut reached_limit = false;
             for &(ms, me) in merged_intervals {
                 if me <= view_start {
                     continue;
@@ -357,17 +360,25 @@ impl ComplementStream {
                     });
                     rows += 1;
                 }
-                cursor = if strict {
-                    interval_end
+                match if strict {
+                    Some(interval_end)
                 } else {
-                    interval_end + 1
-                };
+                    interval_end.checked_add(1)
+                } {
+                    Some(next) => cursor = next,
+                    None => {
+                        reached_limit = true;
+                        break;
+                    }
+                }
             }
-            if if strict {
-                cursor < view_end
-            } else {
-                cursor <= view_end
-            } {
+            let tail_remains = !reached_limit
+                && if strict {
+                    cursor < view_end
+                } else {
+                    cursor <= view_end
+                };
+            if tail_remains {
                 contig_builder.append_value(contig);
                 start_builder.append_value(cursor);
                 end_builder.append_value(view_end);
