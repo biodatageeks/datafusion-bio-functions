@@ -321,10 +321,16 @@ impl ComplementStream {
     }
 
     /// Compute complement of merged intervals against view intervals for a contig.
+    /// `strict` is true for 0-based half-open coordinates. Under 1-based
+    /// inclusive coordinates the covered interval owns both its endpoints, so a
+    /// gap runs from one past the previous interval to one before the next --
+    /// and two contiguous intervals leave no gap at all rather than a
+    /// zero-length one.
     fn emit_contig_complement(
         contig: &str,
         merged_intervals: &[(i64, i64)],
         view_intervals: &[(i64, i64)],
+        strict: bool,
         contig_builder: &mut StringBuilder,
         start_builder: &mut Int64Builder,
         end_builder: &mut Int64Builder,
@@ -332,11 +338,28 @@ impl ComplementStream {
         let mut rows = 0;
         for &(view_start, view_end) in view_intervals {
             let mut cursor = view_start;
+            // Set when an interval runs to i64::MAX: nothing follows it, and no
+            // cursor value could represent the base after it.
+            let mut reached_limit = false;
             for &(ms, me) in merged_intervals {
-                if me <= view_start {
+                // Clipping is a coordinate question too: under inclusive
+                // coordinates an interval ending exactly at `view_start` -- or
+                // starting exactly at `view_end` -- still covers one base
+                // inside the view and must not be skipped.
+                let ends_before_view = if strict {
+                    me <= view_start
+                } else {
+                    me < view_start
+                };
+                if ends_before_view {
                     continue;
                 }
-                if ms >= view_end {
+                let starts_after_view = if strict {
+                    ms >= view_end
+                } else {
+                    ms > view_end
+                };
+                if starts_after_view {
                     break;
                 }
                 let interval_start = ms.max(view_start);
@@ -344,12 +367,32 @@ impl ComplementStream {
                 if interval_start > cursor {
                     contig_builder.append_value(contig);
                     start_builder.append_value(cursor);
-                    end_builder.append_value(interval_start);
+                    end_builder.append_value(if strict {
+                        interval_start
+                    } else {
+                        interval_start - 1
+                    });
                     rows += 1;
                 }
-                cursor = interval_end;
+                match if strict {
+                    Some(interval_end)
+                } else {
+                    interval_end.checked_add(1)
+                } {
+                    Some(next) => cursor = next,
+                    None => {
+                        reached_limit = true;
+                        break;
+                    }
+                }
             }
-            if cursor < view_end {
+            let tail_remains = !reached_limit
+                && if strict {
+                    cursor < view_end
+                } else {
+                    cursor <= view_end
+                };
+            if tail_remains {
                 contig_builder.append_value(contig);
                 start_builder.append_value(cursor);
                 end_builder.append_value(view_end);
@@ -415,6 +458,7 @@ impl Stream for ComplementStream {
                             contig,
                             &merged,
                             view_intervals,
+                            this.strict,
                             &mut this.contig_builder,
                             &mut this.start_builder,
                             &mut this.end_builder,
