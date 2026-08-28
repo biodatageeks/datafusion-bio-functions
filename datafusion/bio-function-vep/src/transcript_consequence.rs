@@ -1294,7 +1294,7 @@ impl TranscriptConsequenceEngine {
                         profile.tx_overlap_candidates += 1;
                     }
                     let transcript_eval_started = profiling.then(Instant::now);
-                    let (terms, coding_class) = if let Some(profile) = profile.as_deref_mut() {
+                    let (mut terms, coding_class) = if let Some(profile) = profile.as_deref_mut() {
                         self.evaluate_transcript_overlap_profiled(
                             variant,
                             tx,
@@ -1533,6 +1533,18 @@ impl TranscriptConsequenceEngine {
                                 profile.transcript_hgvsp_outputs += 1;
                             }
                         }
+                        // VEP's tier-1 feature_ablation. Applied here, after
+                        // every field above has been derived from the
+                        // pre-gate term set, because Ensembl's tier gate
+                        // filters the consequence list only -- EXON/INTRON,
+                        // HGVSc and the position fields are produced by
+                        // OutputFactory and stay populated on an ablated
+                        // transcript.
+                        if transcript_is_ablated(variant, tx) {
+                            terms.push(SoTerm::TranscriptAblation);
+                            terms.sort_by_key(|t| t.rank());
+                        }
+                        apply_tier_gate(&mut terms);
                         let push_started = profiling.then(Instant::now);
                         out.push(TranscriptConsequence {
                             transcript_id: Some(tx.transcript_id.clone()),
@@ -3909,6 +3921,40 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 /// Traceability:
 /// - Ensembl Variation `BaseVariationFeatureOverlapAllele::_get_cons_term_rank()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749>
+/// VEP `feature_ablation` specialised to transcripts: the variant is a
+/// deletion whose span completely covers the transcript.
+///
+/// Traceability:
+/// - Ensembl Variation `VariationEffect::feature_ablation()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L323-L328>
+/// - Ensembl Variation `VariationEffect::complete_overlap_feature()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L169-L177>
+fn transcript_is_ablated(variant: &VariantInput, tx: &TranscriptFeature) -> bool {
+    let is_deletion = variant.ref_allele != "-"
+        && !variant.ref_allele.is_empty()
+        && (variant.alt_allele == "-" || variant.alt_allele.len() < variant.ref_allele.len());
+    is_deletion && variant.start <= tx.start && variant.end >= tx.end
+}
+
+/// Apply Ensembl's consequence tier gate to a finished term set.
+///
+/// Ensembl evaluates consequences in tier-ascending order and breaks out with
+/// `last if $assigned_tier && $oc->{tier} > $assigned_tier`, where
+/// `$assigned_tier` is only ever set by a match at tier 1 or 2. That reduces
+/// exactly to: let `T` be the smallest matched tier that is `<= 2`; if one
+/// exists, retain only terms with `tier <= T`. A tier-3 match never assigns a
+/// tier, so tier 3 does not gate tier 4.
+///
+/// Traceability:
+/// - Ensembl Variation `BaseVariationFeatureOverlapAllele::get_all_OverlapConsequences()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L243-L288>
+fn apply_tier_gate(terms: &mut Vec<SoTerm>) {
+    let Some(assigned) = terms.iter().map(|t| t.tier()).filter(|&t| t <= 2).min() else {
+        return;
+    };
+    terms.retain(|t| t.tier() <= assigned);
+}
+
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     // Specific coding children that strip both CodingSequenceVariant
     // and ProteinAlteringVariant as parents.
@@ -23730,6 +23776,114 @@ mod tests {
         assert_eq!(consequence.motif_pos, Some(21));
         assert_eq!(consequence.high_inf_pos, Some(true));
         assert_eq!(consequence.motif_score_change.as_deref(), Some("-0.058"));
+    }
+
+    /// A deletion whose span covers an entire transcript is a
+    /// transcript_ablation, and being tier 1 it suppresses every tier-3 term
+    /// the endpoints would otherwise produce.
+    /// Reproduces chrX:3886710 / ENST00000424415.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `VariationEffect::feature_ablation()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L323-L328>
+    #[test]
+    fn deletion_spanning_a_transcript_is_a_transcript_ablation() {
+        let engine = TranscriptConsequenceEngine::default();
+        let transcripts = vec![tx("tx1", "22", 1_000, 2_000, 1, "lncRNA", None, None)];
+        let exons = vec![exon("tx1", 1, 1_000, 1_200), exon("tx1", 2, 1_800, 2_000)];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 900, 2_100, "ACGT", "-"),
+            &transcripts,
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let c = out
+            .iter()
+            .find(|c| c.transcript_id.as_deref() == Some("tx1"))
+            .expect("transcript consequence");
+        assert_eq!(c.terms, vec![SoTerm::TranscriptAblation]);
+    }
+
+    /// A deletion that only clips the transcript is not an ablation, and the
+    /// ordinary tier-3 terms survive.
+    #[test]
+    fn partial_deletion_is_not_a_transcript_ablation() {
+        let engine = TranscriptConsequenceEngine::default();
+        let transcripts = vec![tx("tx1", "22", 1_000, 2_000, 1, "lncRNA", None, None)];
+        let exons = vec![exon("tx1", 1, 1_000, 1_200), exon("tx1", 2, 1_800, 2_000)];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 1_100, 1_150, "ACGT", "-"),
+            &transcripts,
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let c = out
+            .iter()
+            .find(|c| c.transcript_id.as_deref() == Some("tx1"))
+            .expect("transcript consequence");
+        assert!(!c.terms.contains(&SoTerm::TranscriptAblation));
+        assert!(!c.terms.is_empty());
+    }
+
+    /// An insertion spanning the same span is not a deletion, so no ablation.
+    #[test]
+    fn insertion_over_a_transcript_is_not_a_transcript_ablation() {
+        let engine = TranscriptConsequenceEngine::default();
+        let transcripts = vec![tx("tx1", "22", 1_000, 2_000, 1, "lncRNA", None, None)];
+        let exons = vec![exon("tx1", 1, 1_000, 1_200), exon("tx1", 2, 1_800, 2_000)];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 1_100, 1_099, "-", "ACGT"),
+            &transcripts,
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        if let Some(c) = out
+            .iter()
+            .find(|c| c.transcript_id.as_deref() == Some("tx1"))
+        {
+            assert!(!c.terms.contains(&SoTerm::TranscriptAblation));
+        }
+    }
+
+    /// The gate keeps every term at the assigned tier, drops only higher
+    /// tiers, and a tier-3 match does not gate tier 4.
+    #[test]
+    fn apply_tier_gate_keeps_the_assigned_tier_only() {
+        // tier 1 suppresses tier 3
+        let mut t = vec![SoTerm::TranscriptAblation, SoTerm::SpliceAcceptorVariant];
+        apply_tier_gate(&mut t);
+        assert_eq!(t, vec![SoTerm::TranscriptAblation]);
+
+        // tier 2 peers co-occur, and suppress tier 3
+        let mut t = vec![
+            SoTerm::TfbsAblation,
+            SoTerm::TfBindingSiteVariant,
+            SoTerm::IntronVariant,
+        ];
+        apply_tier_gate(&mut t);
+        assert_eq!(t, vec![SoTerm::TfbsAblation, SoTerm::TfBindingSiteVariant]);
+
+        // no tier <= 2 present: nothing is gated, tier 3 does not gate tier 4
+        let mut t = vec![SoTerm::IntronVariant, SoTerm::IntergenicVariant];
+        apply_tier_gate(&mut t);
+        assert_eq!(t, vec![SoTerm::IntronVariant, SoTerm::IntergenicVariant]);
+
+        // empty stays empty
+        let mut t: Vec<SoTerm> = vec![];
+        apply_tier_gate(&mut t);
+        assert!(t.is_empty());
     }
 
     /// Real chr22:48837364, a 22 bp deletion spanning ENSM00000589970 whole.
