@@ -342,10 +342,24 @@ impl ComplementStream {
             // cursor value could represent the base after it.
             let mut reached_limit = false;
             for &(ms, me) in merged_intervals {
-                if me <= view_start {
+                // Clipping is a coordinate question too: under inclusive
+                // coordinates an interval ending exactly at `view_start` -- or
+                // starting exactly at `view_end` -- still covers one base
+                // inside the view and must not be skipped.
+                let ends_before_view = if strict {
+                    me <= view_start
+                } else {
+                    me < view_start
+                };
+                if ends_before_view {
                     continue;
                 }
-                if ms >= view_end {
+                let starts_after_view = if strict {
+                    ms >= view_end
+                } else {
+                    ms > view_end
+                };
+                if starts_after_view {
                     break;
                 }
                 let interval_start = ms.max(view_start);

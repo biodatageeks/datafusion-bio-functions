@@ -4873,3 +4873,42 @@ async fn test_subtract_extra_columns_weak_mask_at_coordinate_limit() -> Result<(
     assert_batches_sorted_eq!(expected, &result);
     Ok(())
 }
+
+/// Under inclusive coordinates an interval ending exactly at the view start,
+/// or starting exactly at the view end, still covers one base inside the view.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_complement_weak_interval_touching_view_boundaries() -> Result<()> {
+    let ctx = create_bio_session();
+    ctx.sql(
+        r#"
+        CREATE TABLE left_t (contig TEXT, pos_start BIGINT, pos_end BIGINT) AS VALUES
+        ('a', 0, 10), ('b', 20, 30)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE view_t (contig TEXT, pos_start BIGINT, pos_end BIGINT) AS VALUES
+        ('a', 10, 20), ('b', 10, 20)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM complement('left_t', 'view_t') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+",
+        "| contig | pos_start | pos_end |",
+        "+--------+-----------+---------+",
+        "| a      | 11        | 20      |",
+        "| b      | 10        | 19      |",
+        "+--------+-----------+---------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
