@@ -16386,11 +16386,22 @@ mod tests {
             "downstream flank must map"
         );
 
-        let coords = shifted_tva_coords_from_mapper(&t, &refs, &tl, &shifted);
-        assert!(
-            coords.is_some(),
-            "a single intronic flank must not discard the window"
-        );
+        let coords = shifted_tva_coords_from_mapper(&t, &refs, &tl, &shifted)
+            .expect("a single intronic flank must not discard the window");
+
+        // Exon 1 spans 10015254-10015673 = 420 bases, so 10015676 (the first
+        // base of exon 2, the surviving downstream flank) is cDNA 421. With
+        // cdna_coding_start = 1 that is also CDS 421.
+        //
+        // The two windows deliberately use different arithmetic on the
+        // surviving flank, mirroring `map_insert`: the cDNA window keeps the
+        // coordinate and decrements its end, while genomic2pep reads
+        // int((pos + 2) / 3) off the already-decremented end. Assert both so a
+        // typo in either branch fails here rather than silently shifting HGVSp.
+        assert_eq!(coords.cds_start, 421, "cds_start");
+        assert_eq!(coords.cds_end, 420, "cds_end");
+        assert_eq!(coords.protein_start, 141, "protein_start");
+        assert_eq!(coords.protein_end, 141, "protein_end");
     }
 
     /// The minus-strand case: chrX:119605952 C>CG / NM_001417890.1, exon 2
@@ -20785,6 +20796,53 @@ mod tests {
             "Should NOT get non_coding_transcript_exon_variant inside miRNA: {:?}",
             terms
         );
+    }
+
+    /// `mature_miRNA_variant` is tier 2, so it must suppress tier-3 terms that
+    /// co-occur in the same entry. The other miRNA tests use single-exon
+    /// transcripts and therefore never produce a co-occurrence; this one puts
+    /// the mature region against a donor site so `add_intron_splice_terms`
+    /// would otherwise add `splice_region_variant` alongside it.
+    ///
+    /// Verified against Ensembl VEP 116 output: `mature_miRNA_variant` occurs
+    /// 44 times across chr1-22 and twice on chrX/chrY, always alone.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseVariationFeatureOverlapAllele::get_all_OverlapConsequences()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L243-L288>
+    #[test]
+    fn mature_mirna_tier_gate_suppresses_cooccurring_splice_terms() {
+        let engine = TranscriptConsequenceEngine::default();
+        let mut t = tx("ENST_MI2", "22", 1_000, 2_000, 1, "miRNA", None, None);
+        t.mature_mirna_regions = vec![(1_190, 1_210)];
+        let exons = vec![
+            exon("ENST_MI2", 1, 1_000, 1_200),
+            exon("ENST_MI2", 2, 1_800, 2_000),
+        ];
+
+        // 1199 and 1200 are the last two exon bases: inside the mature region
+        // and inside the splice region of the following intron.
+        for pos in [1_199i64, 1_200] {
+            let out = engine.evaluate_variant_with_context(
+                &var("22", pos, pos, "A", "G"),
+                &[t.clone()],
+                &exons,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            );
+            let c = out
+                .iter()
+                .find(|c| c.transcript_id.as_deref() == Some("ENST_MI2"))
+                .expect("transcript consequence");
+            assert_eq!(
+                c.terms,
+                vec![SoTerm::MatureMirnaVariant],
+                "tier 2 must suppress co-occurring tier-3 terms at {pos}"
+            );
+        }
     }
 
     #[test]
