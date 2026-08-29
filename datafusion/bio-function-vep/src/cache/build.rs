@@ -1166,13 +1166,42 @@ fn translation_source_region_preference_expr(start_col: &str, source_file_col: &
     )
 }
 
+/// Numeric start of the 1 Mb cache region a row was read from, parsed out of
+/// the `<start>-<end>.gz` source file name.
+///
+/// Lexicographic ordering on `source_file` is unsafe here: `10000001-11000000`
+/// sorts before `9000001-10000000` as text. `TRY_CAST` yields NULL when the
+/// name does not match, so a non-region source degrades to the fallback terms
+/// rather than erroring.
+fn translation_source_region_start_expr(source_file_col: &str) -> String {
+    format!(
+        "TRY_CAST(REGEXP_REPLACE({source_file_col}, '^.*/([0-9]+)-[0-9]+\\.gz$', '$1') AS BIGINT)"
+    )
+}
+
 fn build_translation_dedup_query_with_where_clause(table_name: &str, where_clause: &str) -> String {
+    // Ensembl VEP resolves a transcript duplicated across cache regions in
+    // `merge_features`, keeping the FIRST copy encountered over a feature list
+    // ordered by region, so for a whole-chromosome run the lowest region wins.
+    //
+    // Preferring the region that contains the transcript `start` instead picks
+    // the wrong copy whenever a transcript is also present in an earlier
+    // region, which changes `protein_features` order and hence the `DOMAINS`
+    // CSQ field. The start-region preference is retained as a fallback for
+    // rows whose source file name does not parse.
+    //
+    // Traceability:
+    // - Ensembl VEP `AnnotationType/Transcript.pm::merge_features()`
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/116/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L246-L280>
+    // - Ensembl VEP `AnnotationSource.pm::get_all_features_by_InputBuffer()`
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/116/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L109-L145>
+    let region_start = translation_source_region_start_expr("source_file");
     let source_pref = translation_source_region_preference_expr("start", "source_file");
     format!(
         "SELECT * FROM (\
             SELECT *, ROW_NUMBER() OVER (\
                 PARTITION BY chrom, transcript_id \
-                ORDER BY {source_pref}, cdna_coding_start NULLS LAST, source_file\
+                ORDER BY {region_start} NULLS LAST, {source_pref}, cdna_coding_start NULLS LAST, source_file\
             ) AS _rn \
             FROM {table_name}{where_clause}\
         ) WHERE _rn = 1"
@@ -1377,6 +1406,35 @@ mod tests {
         let query = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom = 'chr1'");
         assert!(query.contains("PARTITION BY chrom, transcript_id"));
         assert!(query.contains("WHERE chrom = 'chr1'"));
+    }
+
+    /// A transcript present in more than one cache region must resolve to the
+    /// copy from the LOWEST region, matching VEP's merge_features first-wins
+    /// over a region-ordered feature list. Preferring the region containing the
+    /// transcript start picks the later copy and reorders protein_features,
+    /// which surfaces as a DOMAINS mismatch (chrX ENST00000381077).
+    #[test]
+    fn translation_dedup_prefers_the_lowest_source_region() {
+        let query = build_translation_dedup_query_with_where_clause("tl", "");
+        let order = query
+            .split("ORDER BY ")
+            .nth(1)
+            .expect("ORDER BY present")
+            .to_string();
+        let region_term = order
+            .find("REGEXP_REPLACE")
+            .expect("region-start term present");
+        let start_pref = order
+            .find("CASE WHEN")
+            .expect("start-region fallback present");
+        assert!(
+            region_term < start_pref,
+            "lowest-region term must outrank the start-region preference: {order}"
+        );
+        assert!(
+            order.contains("TRY_CAST"),
+            "must degrade on unparsable names"
+        );
     }
 
     #[test]
