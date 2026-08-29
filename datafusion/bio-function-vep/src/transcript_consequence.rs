@@ -1294,7 +1294,7 @@ impl TranscriptConsequenceEngine {
                         profile.tx_overlap_candidates += 1;
                     }
                     let transcript_eval_started = profiling.then(Instant::now);
-                    let (terms, coding_class) = if let Some(profile) = profile.as_deref_mut() {
+                    let (mut terms, coding_class) = if let Some(profile) = profile.as_deref_mut() {
                         self.evaluate_transcript_overlap_profiled(
                             variant,
                             tx,
@@ -1533,6 +1533,18 @@ impl TranscriptConsequenceEngine {
                                 profile.transcript_hgvsp_outputs += 1;
                             }
                         }
+                        // VEP's tier-1 feature_ablation. Applied here, after
+                        // every field above has been derived from the
+                        // pre-gate term set, because Ensembl's tier gate
+                        // filters the consequence list only -- EXON/INTRON,
+                        // HGVSc and the position fields are produced by
+                        // OutputFactory and stay populated on an ablated
+                        // transcript.
+                        if transcript_is_ablated(variant, tx) {
+                            terms.push(SoTerm::TranscriptAblation);
+                            terms.sort_by_key(|t| t.rank());
+                        }
+                        apply_tier_gate(&mut terms);
                         let push_started = profiling.then(Instant::now);
                         out.push(TranscriptConsequence {
                             transcript_id: Some(tx.transcript_id.clone()),
@@ -3804,6 +3816,17 @@ fn normalize_chrom(chrom: &str) -> &str {
     chrom.strip_prefix("chr").unwrap_or(chrom)
 }
 
+/// Ensembl's `overlap()` verbatim, without the range normalisation `overlaps`
+/// applies. Insertions carry inverted coordinates `(P, P-1)` and Ensembl
+/// relies on that inversion, so normalising would change the result.
+///
+/// Traceability:
+/// - Ensembl Variation `VariationEffect::overlap()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85>
+fn overlap_perl(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
+    a_start <= b_end && a_end >= b_start
+}
+
 fn overlaps(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
     let (a_start, a_end) = if a_start <= a_end {
         (a_start, a_end)
@@ -3909,6 +3932,40 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 /// Traceability:
 /// - Ensembl Variation `BaseVariationFeatureOverlapAllele::_get_cons_term_rank()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749>
+/// VEP `feature_ablation` specialised to transcripts: the variant is a
+/// deletion whose span completely covers the transcript.
+///
+/// Traceability:
+/// - Ensembl Variation `VariationEffect::feature_ablation()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L323-L328>
+/// - Ensembl Variation `VariationEffect::complete_overlap_feature()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L169-L177>
+fn transcript_is_ablated(variant: &VariantInput, tx: &TranscriptFeature) -> bool {
+    let is_deletion = variant.ref_allele != "-"
+        && !variant.ref_allele.is_empty()
+        && (variant.alt_allele == "-" || variant.alt_allele.len() < variant.ref_allele.len());
+    is_deletion && variant.start <= tx.start && variant.end >= tx.end
+}
+
+/// Apply Ensembl's consequence tier gate to a finished term set.
+///
+/// Ensembl evaluates consequences in tier-ascending order and breaks out with
+/// `last if $assigned_tier && $oc->{tier} > $assigned_tier`, where
+/// `$assigned_tier` is only ever set by a match at tier 1 or 2. That reduces
+/// exactly to: let `T` be the smallest matched tier that is `<= 2`; if one
+/// exists, retain only terms with `tier <= T`. A tier-3 match never assigns a
+/// tier, so tier 3 does not gate tier 4.
+///
+/// Traceability:
+/// - Ensembl Variation `BaseVariationFeatureOverlapAllele::get_all_OverlapConsequences()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L243-L288>
+fn apply_tier_gate(terms: &mut Vec<SoTerm>) {
+    let Some(assigned) = terms.iter().map(|t| t.tier()).filter(|&t| t <= 2).min() else {
+        return;
+    };
+    terms.retain(|t| t.tier() <= assigned);
+}
+
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     // Specific coding children that strip both CodingSequenceVariant
     // and ProteinAlteringVariant as parents.
@@ -5483,9 +5540,23 @@ fn shifted_tva_coords_from_mapper(
         // The mapped insertion interval is therefore the transcript-space gap
         // AFTER the left flank and BEFORE the right flank. Do not sort the two
         // flanks here; `translation_start/end` in VEP preserve mapper order.
-        let left = genomic_to_cdna_index_for_hgvsp(tx, tx_exons, shifted_variant.end)?;
-        let right = genomic_to_cdna_index_for_hgvsp(tx, tx_exons, shifted_variant.start)?;
-        (left.saturating_add(1), right.saturating_sub(1))
+        //
+        // `map_insert` keeps only the flanks that map to a
+        // `Bio::EnsEMBL::Mapper::Coordinate` and silently drops any that map
+        // to a `Gap`; it does not fail when one flank is unmapped. An
+        // insertion abutting a frameshift intron has one intronic flank, so
+        // requiring both to map would discard a window VEP still resolves.
+        let left = genomic_to_cdna_index_for_hgvsp(tx, tx_exons, shifted_variant.end);
+        let right = genomic_to_cdna_index_for_hgvsp(tx, tx_exons, shifted_variant.start);
+        match (left, right) {
+            (Some(left), Some(right)) => (left.saturating_add(1), right.saturating_sub(1)),
+            // Only the downstream flank mapped: VEP keeps that coordinate and
+            // decrements its end, leaving the zero-length window (r, r-1).
+            (None, Some(right)) => (right, right.saturating_sub(1)),
+            // Only the upstream flank mapped: VEP increments its start.
+            (Some(left), None) => (left.saturating_add(1), left),
+            (None, None) => return None,
+        }
     } else {
         let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
         let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
@@ -5543,8 +5614,17 @@ fn shifted_tva_coords_from_mapper(
         //   peptide coordinates.
         //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
         //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L510-L538>
-        let left = translateable_pos_1based(shifted_variant.end)?;
-        let right = translateable_pos_1based(shifted_variant.start)?;
+        let left = translateable_pos_1based(shifted_variant.end);
+        let right = translateable_pos_1based(shifted_variant.start);
+        // Same `map_insert` gap tolerance as the cDNA window above.
+        let (left, right) = match (left, right) {
+            (Some(left), Some(right)) => (left, right),
+            // A dropped Gap flank leaves one coordinate; genomic2pep then
+            // reads `int((start + 2) / 3)` and `int((end + 2) / 3)` off it.
+            (None, Some(right)) => (right.saturating_sub(1), right.saturating_sub(1)),
+            (Some(left), None) => (left, left),
+            (None, None) => return None,
+        };
         let pep_start = left.saturating_add(1).saturating_add(2) / 3;
         // Traceability:
         // - Ensembl core `Mapper::map_insert()` maps an insertion to the
@@ -8093,6 +8173,10 @@ fn which_exon_str(variant: &VariantInput, tx_exons: &[&ExonFeature]) -> Option<S
     }
     let is_ins = variant.ref_allele == "-";
     let total = tx_exons.len();
+    // Ensembl collects every overlapping exon, sorts the numbers, and emits
+    // `numbers[0]-numbers[-1]`; min/max is the same result without the sort.
+    let mut lo: Option<i32> = None;
+    let mut hi: Option<i32> = None;
     for exon in tx_exons {
         let hit = if is_ins {
             variant.start > exon.start && variant.start <= exon.end
@@ -8100,10 +8184,15 @@ fn which_exon_str(variant: &VariantInput, tx_exons: &[&ExonFeature]) -> Option<S
             overlaps(variant.start, variant.end, exon.start, exon.end)
         };
         if hit {
-            return Some(format!("{}/{}", exon.exon_number, total));
+            lo = Some(lo.map_or(exon.exon_number, |n| n.min(exon.exon_number)));
+            hi = Some(hi.map_or(exon.exon_number, |n| n.max(exon.exon_number)));
         }
     }
-    None
+    match (lo, hi) {
+        (Some(lo), Some(hi)) if lo == hi => Some(format!("{lo}/{total}")),
+        (Some(lo), Some(hi)) => Some(format!("{lo}-{hi}/{total}")),
+        _ => None,
+    }
 }
 
 /// Determine which intron (if any) the variant overlaps.
@@ -8118,6 +8207,12 @@ fn which_intron_str(
     }
     let sorted = start_sorted(tx_exons);
     let total_introns = sorted.len() - 1;
+
+    // Ensembl collects every overlapping intron, sorts the numbers, and emits
+    // `numbers[0]-numbers[-1]`. On the minus strand the numbers descend as the
+    // window index ascends, so min/max is required rather than first/last.
+    let mut lo: Option<usize> = None;
+    let mut hi: Option<usize> = None;
 
     for (i, pair) in sorted.windows(2).enumerate() {
         let intron_start = pair[0].end + 1;
@@ -8151,10 +8246,16 @@ fn which_intron_str(
             } else {
                 total_introns - i
             };
-            return Some(format!("{intron_num}/{total_introns}"));
+            lo = Some(lo.map_or(intron_num, |n| n.min(intron_num)));
+            hi = Some(hi.map_or(intron_num, |n| n.max(intron_num)));
         }
     }
-    None
+
+    match (lo, hi) {
+        (Some(lo), Some(hi)) if lo == hi => Some(format!("{lo}/{total_introns}")),
+        (Some(lo), Some(hi)) => Some(format!("{lo}-{hi}/{total_introns}")),
+        _ => None,
+    }
 }
 
 /// Map a genomic position to 1-based cDNA index (counting all exonic bases).
@@ -9675,27 +9776,44 @@ fn partial_coding_overlap_classification(
 /// VEP's `intronic` predicate excludes frameshift introns and does not use a
 /// simple full-intron overlap. Insertions are evaluated with `(P, P-1)`
 /// coordinates plus the explicit boundary cases at `intron_start+2` and
-/// `intron_end-2`, which reduces to `P in [intron_start+2, intron_end-1]`.
+/// `intron_end-2`, which for a well-formed intron reduces to
+/// `P in [intron_start+2, intron_end-1]`.
+///
+/// Ensembl also evaluates these clauses against the HGVS-shifted coordinates
+/// as well as the unshifted ones. `variant.start`/`variant.end` here are
+/// unshifted, so this implements the unshifted pair only.
 fn variant_hits_intron_body(variant: &VariantInput, intron_start: i64, intron_end: i64) -> bool {
     if intron_start > intron_end {
         return false;
     }
-    if (intron_end - intron_start).abs() <= 12 {
+
+    // Ensembl's (r_start, r_end): an insertion at P is (P, P-1).
+    let is_ins = variant.ref_allele == "-";
+    let (r_start, r_end) = if is_ins {
+        (variant.start, variant.start - 1)
+    } else {
+        (variant.start, variant.end)
+    };
+    let insertion = r_start == r_end + 1;
+
+    // A frameshift intron is skipped only when the variant actually overlaps
+    // it -- that sets within_frameshift_intron instead. A variant that merely
+    // abuts one falls through to the boundary clauses below.
+    if (intron_end - intron_start).abs() <= 12
+        && overlap_perl(r_start, r_end, intron_start, intron_end)
+    {
         return false;
     }
 
     let inner_start = intron_start + 2;
     let inner_end = intron_end - 2;
-    if inner_start > inner_end {
-        return false;
-    }
 
-    if variant.ref_allele == "-" {
-        let p = variant.start;
-        p >= inner_start && p <= inner_end + 1
-    } else {
-        overlaps(variant.start, variant.end, inner_start, inner_end)
-    }
+    // Three independent clauses. They collapse to the contiguous range
+    // [inner_start, inner_end + 1] only while inner_start <= inner_end; for a
+    // 2 bp intron the inner range inverts and the equality clauses still
+    // apply, which is the whole defect this restores.
+    overlap_perl(r_start, r_end, inner_start, inner_end)
+        || (insertion && (r_start == inner_start || r_end == inner_end))
 }
 
 fn normalize_allele_seq(allele: &str) -> String {
@@ -13279,6 +13397,55 @@ mod tests {
         assert_eq!(which_exon_str(&v, &refs), None);
     }
 
+    /// A deletion spanning every exon reports the full range, not one exon.
+    /// Reproduces chrX:3886710 / ENST00000424415, where VEP emits `1-4/4`.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariation::exon_number()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L679-L713>
+    #[test]
+    fn which_exon_str_spanning_deletion_reports_a_range() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+            exon("tx1", 4, 700, 800),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 50, 900, "ACGT", "-");
+        assert_eq!(which_exon_str(&v, &refs), Some("1-4/4".to_string()));
+    }
+
+    /// A deletion covering a contiguous subset reports just that subset.
+    /// Reproduces chrX:3886710 / ENST00000648217, where VEP emits `1-4/13`.
+    #[test]
+    fn which_exon_str_partial_span_reports_the_covered_subset() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+            exon("tx1", 4, 700, 800),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 150, 550, "ACGT", "-");
+        assert_eq!(which_exon_str(&v, &refs), Some("1-3/4".to_string()));
+    }
+
+    /// Exon numbers, not slice indices: on a minus-strand transcript the
+    /// cache stores descending exon_number against ascending genomic start,
+    /// and Ensembl sorts the collected numbers numerically.
+    #[test]
+    fn which_exon_str_range_uses_min_max_of_exon_numbers() {
+        let exons = vec![
+            exon("tx1", 3, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 1, 500, 600),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 150, 550, "ACGT", "-");
+        assert_eq!(which_exon_str(&v, &refs), Some("1-3/3".to_string()));
+    }
+
     #[test]
     fn which_intron_str_between_exons_plus_strand() {
         let exons = vec![
@@ -13315,6 +13482,55 @@ mod tests {
         // On minus strand, this is intron 2/2 (reversed).
         let v = var("22", 250, 250, "A", "G");
         assert_eq!(which_intron_str(&v, &refs, -1), Some("2/2".to_string()));
+    }
+
+    /// A deletion spanning every intron reports the full range.
+    /// Reproduces chrX:3886710 / ENST00000424415, where VEP emits `1-3/3`.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariation::intron_number()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L727-L760>
+    #[test]
+    fn which_intron_str_spanning_deletion_reports_a_range() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+            exon("tx1", 4, 700, 800),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 50, 900, "ACGT", "-");
+        assert_eq!(which_intron_str(&v, &refs, 1), Some("1-3/3".to_string()));
+    }
+
+    /// On the minus strand the numbering runs opposite to genomic order, so
+    /// the range must be min-max of the numbers, not first-to-last hit.
+    #[test]
+    fn which_intron_str_minus_strand_range_is_min_max_not_first_last() {
+        let exons = vec![
+            exon("tx1", 4, 100, 200),
+            exon("tx1", 3, 300, 400),
+            exon("tx1", 2, 500, 600),
+            exon("tx1", 1, 700, 800),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Spans genomic introns 0 and 1, which are introns 3 and 2 on the
+        // minus strand. First hit is 3, last hit is 2 -- "3-2/3" would be wrong.
+        let v = var("22", 250, 550, "ACGT", "-");
+        assert_eq!(which_intron_str(&v, &refs, -1), Some("2-3/3".to_string()));
+    }
+
+    /// A variant inside a single intron keeps the plain "N/total" form.
+    #[test]
+    fn which_intron_str_single_intron_has_no_range() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 250, 260, "ACGTACGTAGC", "-");
+        assert_eq!(which_intron_str(&v, &refs, 1), Some("1/2".to_string()));
     }
 
     #[test]
@@ -16097,6 +16313,132 @@ mod tests {
             100,
             120
         ));
+    }
+
+    /// An insertion at the first base of a 2 bp intron is intronic in VEP:
+    /// the frameshift-intron skip does not apply because the insertion's
+    /// (P, P-1) coordinates do not overlap the intron, and the standalone
+    /// `r_end == intron_end - 2` clause then matches.
+    /// Reproduces chrX:10015674 G>GC / ENST00000380861, exon 1 ending
+    /// 10015674 and exon 2 starting 10015677.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149>
+    #[test]
+    fn insertion_at_a_two_base_intron_boundary_is_intronic() {
+        let v = var("X", 10_015_675, 10_015_675, "-", "C");
+        assert!(variant_hits_intron_body(&v, 10_015_675, 10_015_676));
+    }
+
+    /// Ensembl's `Mapper::map_insert` keeps only the flanks that map to a
+    /// `Coordinate` and silently drops `Gap` flanks; it does not fail when one
+    /// flank is unmapped. An insertion abutting a 2 bp frameshift intron has
+    /// one intronic flank, so requiring both to map discarded a window VEP
+    /// still resolves -- the cause of the empty HGVSp on
+    /// chrX:10015674 / NM_015691.5.
+    ///
+    /// Geometry mirrors NM_015691.5: exon 1 ends at 10015673, exon 2 starts at
+    /// 10015676, so intron 1 is [10015674, 10015675]. The HGVS-shifted
+    /// insertion sits at 10015676 (first base of exon 2) with its upstream
+    /// flank at 10015675, inside the intron.
+    ///
+    /// Traceability:
+    /// - Ensembl core `Mapper::map_insert()`
+    ///   <https://github.com/Ensembl/ensembl/blob/release/116/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
+    #[test]
+    fn shifted_insertion_window_survives_one_intronic_flank() {
+        let mut t = tx(
+            "NM_TEST.1",
+            "X",
+            10_015_254,
+            10_015_858,
+            1,
+            "protein_coding",
+            Some(10_015_579),
+            Some(10_015_800),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(600);
+        let exons = vec![
+            exon("NM_TEST.1", 1, 10_015_254, 10_015_673),
+            exon("NM_TEST.1", 2, 10_015_676, 10_015_858),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let tl = translation(
+            "NM_TEST.1",
+            Some(600),
+            Some(200),
+            Some(&"M".repeat(200)),
+            Some(&"ATG".repeat(200)),
+        );
+        // Shifted insertion: start = 10015676 (exon 2), end = 10015675 (intron).
+        let shifted = var("X", 10_015_676, 10_015_675, "-", "C");
+
+        // Guard the premise: without a genuinely unmappable upstream flank the
+        // assertion below would pass even with both-flanks-required logic.
+        assert!(
+            genomic_to_cdna_index_for_hgvsp(&t, &refs, shifted.end).is_none(),
+            "upstream flank must be intronic for this test to mean anything"
+        );
+        assert!(
+            genomic_to_cdna_index_for_hgvsp(&t, &refs, shifted.start).is_some(),
+            "downstream flank must map"
+        );
+
+        let coords = shifted_tva_coords_from_mapper(&t, &refs, &tl, &shifted)
+            .expect("a single intronic flank must not discard the window");
+
+        // Exon 1 spans 10015254-10015673 = 420 bases, so 10015676 (the first
+        // base of exon 2, the surviving downstream flank) is cDNA 421. With
+        // cdna_coding_start = 1 that is also CDS 421.
+        //
+        // The two windows deliberately use different arithmetic on the
+        // surviving flank, mirroring `map_insert`: the cDNA window keeps the
+        // coordinate and decrements its end, while genomic2pep reads
+        // int((pos + 2) / 3) off the already-decremented end. Assert both so a
+        // typo in either branch fails here rather than silently shifting HGVSp.
+        assert_eq!(coords.cds_start, 421, "cds_start");
+        assert_eq!(coords.cds_end, 420, "cds_end");
+        assert_eq!(coords.protein_start, 141, "protein_start");
+        assert_eq!(coords.protein_end, 141, "protein_end");
+    }
+
+    /// The minus-strand case: chrX:119605952 C>CG / NM_001417890.1, exon 2
+    /// ending 119605952 and exon 1 starting 119605955.
+    #[test]
+    fn insertion_at_a_two_base_intron_boundary_is_intronic_minus_strand() {
+        let v = var("X", 119_605_953, 119_605_953, "-", "G");
+        assert!(variant_hits_intron_body(&v, 119_605_953, 119_605_954));
+    }
+
+    /// An insertion that genuinely falls inside a frameshift intron is
+    /// within_frameshift_intron, not intronic -- Ensembl takes the `next`.
+    /// Reproduces chrX:10015674 G>GC / NM_015691.5, whose intron 1 is
+    /// [10015674, 10015675] and does contain the insertion.
+    #[test]
+    fn insertion_inside_a_frameshift_intron_is_not_intron_body() {
+        let v = var("X", 10_015_675, 10_015_675, "-", "C");
+        assert!(!variant_hits_intron_body(&v, 10_015_674, 10_015_675));
+    }
+
+    /// A substitution overlapping a short intron still takes the
+    /// frameshift-intron skip.
+    #[test]
+    fn substitution_inside_a_frameshift_intron_is_not_intron_body() {
+        let v = var("X", 10_015_675, 10_015_675, "A", "G");
+        assert!(!variant_hits_intron_body(&v, 10_015_674, 10_015_675));
+    }
+
+    /// A normal intron is unaffected: interior yes, splice-site bases no.
+    #[test]
+    fn normal_intron_body_bounds_are_unchanged() {
+        let v = var("22", 1_050, 1_050, "A", "G");
+        assert!(variant_hits_intron_body(&v, 1_000, 1_100));
+        let at_donor = var("22", 1_001, 1_001, "A", "G");
+        assert!(!variant_hits_intron_body(&at_donor, 1_000, 1_100));
+        let at_acceptor = var("22", 1_099, 1_099, "A", "G");
+        assert!(!variant_hits_intron_body(&at_acceptor, 1_000, 1_100));
     }
 
     #[test]
@@ -20456,6 +20798,53 @@ mod tests {
         );
     }
 
+    /// `mature_miRNA_variant` is tier 2, so it must suppress tier-3 terms that
+    /// co-occur in the same entry. The other miRNA tests use single-exon
+    /// transcripts and therefore never produce a co-occurrence; this one puts
+    /// the mature region against a donor site so `add_intron_splice_terms`
+    /// would otherwise add `splice_region_variant` alongside it.
+    ///
+    /// Verified against Ensembl VEP 116 output: `mature_miRNA_variant` occurs
+    /// 44 times across chr1-22 and twice on chrX/chrY, always alone.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseVariationFeatureOverlapAllele::get_all_OverlapConsequences()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L243-L288>
+    #[test]
+    fn mature_mirna_tier_gate_suppresses_cooccurring_splice_terms() {
+        let engine = TranscriptConsequenceEngine::default();
+        let mut t = tx("ENST_MI2", "22", 1_000, 2_000, 1, "miRNA", None, None);
+        t.mature_mirna_regions = vec![(1_190, 1_210)];
+        let exons = vec![
+            exon("ENST_MI2", 1, 1_000, 1_200),
+            exon("ENST_MI2", 2, 1_800, 2_000),
+        ];
+
+        // 1199 and 1200 are the last two exon bases: inside the mature region
+        // and inside the splice region of the following intron.
+        for pos in [1_199i64, 1_200] {
+            let out = engine.evaluate_variant_with_context(
+                &var("22", pos, pos, "A", "G"),
+                &[t.clone()],
+                &exons,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            );
+            let c = out
+                .iter()
+                .find(|c| c.transcript_id.as_deref() == Some("ENST_MI2"))
+                .expect("transcript consequence");
+            assert_eq!(
+                c.terms,
+                vec![SoTerm::MatureMirnaVariant],
+                "tier 2 must suppress co-occurring tier-3 terms at {pos}"
+            );
+        }
+    }
+
     #[test]
     fn snv_at_mirna_region_boundary_gets_mature_mirna_variant() {
         // SNVs (non-insertions) at the boundary should still match —
@@ -23611,6 +24000,114 @@ mod tests {
         assert_eq!(consequence.motif_pos, Some(21));
         assert_eq!(consequence.high_inf_pos, Some(true));
         assert_eq!(consequence.motif_score_change.as_deref(), Some("-0.058"));
+    }
+
+    /// A deletion whose span covers an entire transcript is a
+    /// transcript_ablation, and being tier 1 it suppresses every tier-3 term
+    /// the endpoints would otherwise produce.
+    /// Reproduces chrX:3886710 / ENST00000424415.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `VariationEffect::feature_ablation()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L323-L328>
+    #[test]
+    fn deletion_spanning_a_transcript_is_a_transcript_ablation() {
+        let engine = TranscriptConsequenceEngine::default();
+        let transcripts = vec![tx("tx1", "22", 1_000, 2_000, 1, "lncRNA", None, None)];
+        let exons = vec![exon("tx1", 1, 1_000, 1_200), exon("tx1", 2, 1_800, 2_000)];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 900, 2_100, "ACGT", "-"),
+            &transcripts,
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let c = out
+            .iter()
+            .find(|c| c.transcript_id.as_deref() == Some("tx1"))
+            .expect("transcript consequence");
+        assert_eq!(c.terms, vec![SoTerm::TranscriptAblation]);
+    }
+
+    /// A deletion that only clips the transcript is not an ablation, and the
+    /// ordinary tier-3 terms survive.
+    #[test]
+    fn partial_deletion_is_not_a_transcript_ablation() {
+        let engine = TranscriptConsequenceEngine::default();
+        let transcripts = vec![tx("tx1", "22", 1_000, 2_000, 1, "lncRNA", None, None)];
+        let exons = vec![exon("tx1", 1, 1_000, 1_200), exon("tx1", 2, 1_800, 2_000)];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 1_100, 1_150, "ACGT", "-"),
+            &transcripts,
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let c = out
+            .iter()
+            .find(|c| c.transcript_id.as_deref() == Some("tx1"))
+            .expect("transcript consequence");
+        assert!(!c.terms.contains(&SoTerm::TranscriptAblation));
+        assert!(!c.terms.is_empty());
+    }
+
+    /// An insertion spanning the same span is not a deletion, so no ablation.
+    #[test]
+    fn insertion_over_a_transcript_is_not_a_transcript_ablation() {
+        let engine = TranscriptConsequenceEngine::default();
+        let transcripts = vec![tx("tx1", "22", 1_000, 2_000, 1, "lncRNA", None, None)];
+        let exons = vec![exon("tx1", 1, 1_000, 1_200), exon("tx1", 2, 1_800, 2_000)];
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 1_100, 1_099, "-", "ACGT"),
+            &transcripts,
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        if let Some(c) = out
+            .iter()
+            .find(|c| c.transcript_id.as_deref() == Some("tx1"))
+        {
+            assert!(!c.terms.contains(&SoTerm::TranscriptAblation));
+        }
+    }
+
+    /// The gate keeps every term at the assigned tier, drops only higher
+    /// tiers, and a tier-3 match does not gate tier 4.
+    #[test]
+    fn apply_tier_gate_keeps_the_assigned_tier_only() {
+        // tier 1 suppresses tier 3
+        let mut t = vec![SoTerm::TranscriptAblation, SoTerm::SpliceAcceptorVariant];
+        apply_tier_gate(&mut t);
+        assert_eq!(t, vec![SoTerm::TranscriptAblation]);
+
+        // tier 2 peers co-occur, and suppress tier 3
+        let mut t = vec![
+            SoTerm::TfbsAblation,
+            SoTerm::TfBindingSiteVariant,
+            SoTerm::IntronVariant,
+        ];
+        apply_tier_gate(&mut t);
+        assert_eq!(t, vec![SoTerm::TfbsAblation, SoTerm::TfBindingSiteVariant]);
+
+        // no tier <= 2 present: nothing is gated, tier 3 does not gate tier 4
+        let mut t = vec![SoTerm::IntronVariant, SoTerm::IntergenicVariant];
+        apply_tier_gate(&mut t);
+        assert_eq!(t, vec![SoTerm::IntronVariant, SoTerm::IntergenicVariant]);
+
+        // empty stays empty
+        let mut t: Vec<SoTerm> = vec![];
+        apply_tier_gate(&mut t);
+        assert!(t.is_empty());
     }
 
     /// Real chr22:48837364, a 22 bp deletion spanning ENSM00000589970 whole.
