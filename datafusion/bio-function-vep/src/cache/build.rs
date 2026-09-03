@@ -1197,6 +1197,12 @@ fn build_translation_dedup_query_with_where_clause(table_name: &str, where_claus
     //   <https://github.com/Ensembl/ensembl-vep/blob/release/116/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L109-L145>
     let region_start = translation_source_region_start_expr("source_file");
     let source_pref = translation_source_region_preference_expr("start", "source_file");
+    // The outer ORDER BY is what makes the shard reproducible. Without it the
+    // plan ends in a CoalescePartitionsExec, which emits the per-partition
+    // window results in arrival order, so a build at target_partitions > 1
+    // writes the same rows in a thread-race order and two builds of the same
+    // raw cache differ byte for byte. Deduplication leaves exactly one row per
+    // (chrom, transcript_id), so this is a total order.
     format!(
         "SELECT * FROM (\
             SELECT *, ROW_NUMBER() OVER (\
@@ -1204,7 +1210,8 @@ fn build_translation_dedup_query_with_where_clause(table_name: &str, where_claus
                 ORDER BY {region_start} NULLS LAST, {source_pref}, cdna_coding_start NULLS LAST, source_file\
             ) AS _rn \
             FROM {table_name}{where_clause}\
-        ) WHERE _rn = 1"
+        ) WHERE _rn = 1 \
+        ORDER BY chrom, transcript_id"
     )
 }
 
@@ -1215,6 +1222,9 @@ fn sql_escape_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Transcripts synthesised for the dedup determinism tests.
+    const DEDUP_TEST_TRANSCRIPTS: usize = 400;
     use datafusion::arrow::array::{
         ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array, StringArray, UInt32Array,
     };
@@ -1399,6 +1409,149 @@ mod tests {
         )
         .unwrap();
         assert!(attach_transcript_uid_batch(orphan, "ensembl", "115", &uid_map).is_err());
+    }
+
+    /// The cache build streams this query through
+    /// [`datafusion::physical_plan::execute_stream`], which wraps a plan with
+    /// more than one output partition in a `CoalescePartitionsExec` — an
+    /// arrival-ordered merge. Without a total outer ORDER BY the shard's row
+    /// order is therefore a thread race, and two builds of the same raw cache
+    /// produce different bytes.
+    #[test]
+    fn translation_dedup_query_orders_its_output() {
+        let query = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom = '22'");
+        assert!(
+            query.trim_end().ends_with("ORDER BY chrom, transcript_id"),
+            "translation dedup must impose a total output order: {query}"
+        );
+    }
+
+    /// One row per (chrom, transcript_id) as it survives the dedup, split so the
+    /// duplicate copies of a boundary-straddling transcript sit in different
+    /// scan partitions.
+    fn translation_dedup_test_table(target_partitions: usize) -> datafusion::datasource::MemTable {
+        use datafusion::arrow::record_batch::RecordBatch;
+        const LOW_REGION: &str = "/cache/22/21000001-22000000.gz";
+        const HIGH_REGION: &str = "/cache/22/22000001-23000000.gz";
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("cdna_coding_start", DataType::Int64, true),
+            Field::new("source_file", DataType::Utf8, false),
+        ]));
+
+        let batch = |slot: usize, stride: usize, source_file: &str| {
+            let picked: Vec<usize> = (0..DEDUP_TEST_TRANSCRIPTS)
+                .filter(|t| t % stride == slot)
+                .collect();
+            let ids: Vec<String> = picked.iter().map(|t| format!("ENST{t:011}")).collect();
+            let starts: Vec<i64> = picked.iter().map(|t| 21_900_000 + *t as i64).collect();
+            let rows = ids.len();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["22"; rows])) as ArrayRef,
+                    Arc::new(Int64Array::from(starts)) as ArrayRef,
+                    Arc::new(StringArray::from(ids)) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![1i64; rows])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![source_file; rows])) as ArrayRef,
+                ],
+            )
+            .expect("translation batch")
+        };
+
+        let half = (target_partitions / 2).max(1);
+        let mut partitions = Vec::with_capacity(half * 2);
+        for source_file in [LOW_REGION, HIGH_REGION] {
+            for slot in 0..half {
+                partitions.push(vec![batch(slot, half, source_file)]);
+            }
+        }
+        datafusion::datasource::MemTable::try_new(schema, partitions).expect("mem table")
+    }
+
+    async fn run_translation_dedup(target_partitions: usize) -> Vec<String> {
+        let config = SessionConfig::new().with_target_partitions(target_partitions);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table(
+            "tl",
+            Arc::new(translation_dedup_test_table(target_partitions)),
+        )
+        .expect("register tl");
+
+        let query = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom = '22'");
+        let plan = ctx
+            .sql(&query)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        // Consumed exactly the way the cache build consumes it.
+        let mut stream =
+            datafusion::physical_plan::execute_stream(plan, ctx.task_ctx()).expect("stream");
+        let mut ids = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("batch");
+            let column = batch
+                .column_by_name("transcript_id")
+                .expect("transcript_id")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("transcript_id utf8");
+            for row in 0..batch.num_rows() {
+                ids.push(column.value(row).to_string());
+            }
+        }
+        ids
+    }
+
+    /// Report the first position where two runs disagree, rather than dumping
+    /// both id lists into the failure output.
+    fn first_divergence(left: &[String], right: &[String]) -> Option<String> {
+        if left.len() != right.len() {
+            return Some(format!(
+                "row counts differ: {} vs {}",
+                left.len(),
+                right.len()
+            ));
+        }
+        left.iter()
+            .zip(right)
+            .position(|(a, b)| a != b)
+            .map(|idx| format!("row {idx}: {} vs {}", left[idx], right[idx]))
+    }
+
+    /// The shard order must not depend on the worker count, and repeated builds
+    /// at the same worker count must agree. Regression guard for
+    /// `translation_core/<chrom>.parquet` differing between two identical builds
+    /// at `partitions=8` while `partitions=1` was reproducible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn translation_dedup_output_order_is_reproducible() {
+        let serial = run_translation_dedup(1).await;
+        assert_eq!(
+            serial.len(),
+            DEDUP_TEST_TRANSCRIPTS,
+            "dedup must keep exactly one row per transcript"
+        );
+        let mut sorted = serial.clone();
+        sorted.sort();
+        assert_eq!(
+            first_divergence(&serial, &sorted),
+            None,
+            "serial output must already be ordered"
+        );
+
+        for run in 0..8 {
+            let parallel = run_translation_dedup(8).await;
+            assert_eq!(
+                first_divergence(&parallel, &serial),
+                None,
+                "run {run} at target_partitions=8 disagrees with the serial order"
+            );
+        }
     }
 
     #[test]
