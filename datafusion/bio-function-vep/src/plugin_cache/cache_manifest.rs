@@ -8,7 +8,9 @@ use std::path::Path;
 use datafusion::common::{DataFusionError, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::plugin_cache::source_manifest::{SourceManifest, ValueType, validate_csq_field_name};
+use crate::plugin_cache::source_manifest::{
+    SourceManifest, SourceSpec, ValueType, validate_csq_field_name,
+};
 
 /// Per-chromosome build result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +44,55 @@ pub struct MatchColumnRecord {
     pub template: String,
 }
 
+/// Provenance of one build input, as recorded in the built cache so a shard
+/// can be traced to exact bytes without the source file.
+///
+/// `md5`/`url`/`path_md5` are copied from the source manifest; `verified_md5`
+/// is the digest the build actually computed over the resolved file (absent
+/// when verification was skipped or the manifest declared no digest), and
+/// `size`/`mtime` fingerprint that file so an incremental per-chromosome
+/// build can trust an earlier verification instead of re-hashing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
+    /// File name (not the full path) of the build input.
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_md5: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_md5: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Modification time of the hashed file, seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<i64>,
+}
+
+impl SourceRecord {
+    /// Provenance as declared, before any verification.
+    pub fn from_spec(spec: &SourceSpec) -> Self {
+        let file = Path::new(&spec.path)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| spec.path.clone());
+        SourceRecord {
+            part: spec.part.clone(),
+            file,
+            url: spec.url.clone(),
+            md5: spec.md5.clone(),
+            path_md5: spec.path_md5.clone(),
+            verified_md5: None,
+            size: None,
+            mtime: None,
+        }
+    }
+}
+
 /// The cache manifest written by the build and read at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheManifest {
@@ -52,6 +103,10 @@ pub struct CacheManifest {
     pub match_columns: Vec<MatchColumnRecord>,
     pub value_columns: Vec<ValueColumnRecord>,
     pub chroms: Vec<ChromEntry>,
+    /// Build-input provenance, one entry per `[[source]]`. Empty for caches
+    /// built before provenance was recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceRecord>,
     pub cache_source_version: Option<String>,
     /// How Ensembl's own plugin matches a variant to a data row. Defaults to
     /// [`AlleleMatch::Exact`], which is what most plugins do.
@@ -154,6 +209,7 @@ impl CacheManifest {
                 })
                 .collect(),
             chroms: vec![],
+            sources: src.sources.iter().map(SourceRecord::from_spec).collect(),
             cache_source_version: None,
             allele_match: src.allele_match,
             csq_rank: src.csq_rank,
@@ -229,6 +285,7 @@ mod tests {
                 warm: 1,
                 cold: 2,
             }],
+            sources: vec![],
             cache_source_version: None,
             allele_match: Default::default(),
             csq_rank: 0,

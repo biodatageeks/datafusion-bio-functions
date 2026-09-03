@@ -20,5 +20,6 @@ pub mod normalize;
 pub mod provider;
 pub mod registry;
 pub mod source_manifest;
+pub mod source_verify;
 pub mod template;
 pub mod write;

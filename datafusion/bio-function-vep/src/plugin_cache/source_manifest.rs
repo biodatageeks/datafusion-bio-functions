@@ -83,6 +83,20 @@ pub struct SourceSpec {
     pub part: Option<String>,
     pub provider: ProviderKind,
     pub path: String,
+    /// Provenance: the canonical upstream URL this raw file was downloaded
+    /// from. Recorded in the built cache's manifest; never fetched.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Provenance: MD5 (32 lowercase hex) of the file at `url`. When
+    /// `path_md5` is absent this is also the digest the build verifies the
+    /// resolved `path` against before ingesting anything.
+    #[serde(default)]
+    pub md5: Option<String>,
+    /// MD5 of the actual build input when it is a derived artifact of `url`
+    /// (e.g. a BGZF+tabix re-compression of a plain-gzip upstream file) and so
+    /// cannot share its digest. Takes precedence over `md5` for verification.
+    #[serde(default)]
+    pub path_md5: Option<String>,
     /// Random-access index accompanying this source artifact. For tabix this
     /// declares that `path` is BGZF and has a sibling `<path>.tbi`.
     #[serde(default)]
@@ -107,6 +121,34 @@ impl SourceSpec {
             None => format!("plugin_{plugin_name}_src"),
         }
     }
+
+    /// The digest the resolved `path` must hash to: `path_md5` when the build
+    /// input is a derived artifact, else `md5`. `None` means unverifiable.
+    pub fn expected_md5(&self) -> Option<&str> {
+        self.path_md5.as_deref().or(self.md5.as_deref())
+    }
+
+    /// Human-readable label for messages: the `part`, or the file name.
+    pub fn label(&self) -> String {
+        match &self.part {
+            Some(p) => format!("part '{p}'"),
+            None => format!(
+                "source '{}'",
+                std::path::Path::new(&self.path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| self.path.clone())
+            ),
+        }
+    }
+}
+
+/// True for a 32-character lowercase hexadecimal MD5 digest.
+pub(crate) fn is_md5_hex(digest: &str) -> bool {
+    digest.len() == 32
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// A value column produced by `ingest_sql`, mapped to a CSQ output field.
@@ -234,6 +276,18 @@ impl SourceManifest {
     /// built-cache manifests.
     pub fn validate(&self) -> Result<()> {
         for source in &self.sources {
+            for (key, digest) in [("md5", &source.md5), ("path_md5", &source.path_md5)] {
+                if let Some(digest) = digest
+                    && !is_md5_hex(digest)
+                {
+                    return Err(DataFusionError::Execution(format!(
+                        "plugin '{}' {} declares {key} = {digest:?}, but an MD5 digest must be \
+                         32 lowercase hex characters",
+                        self.plugin_name,
+                        source.label()
+                    )));
+                }
+            }
             if source.record_layout && source.provider != ProviderKind::Vcf {
                 return Err(DataFusionError::Execution(format!(
                     "plugin '{}' requests record_layout for a {:?} source; record layout is \
@@ -321,6 +375,8 @@ FROM plugin_demo_src_snv
 part = "snv"
 provider = "csv"
 path = "/tmp/snv.tsv.gz"
+url = "https://example.org/snv.tsv.gz"
+md5 = "88577a55f1cd519d44e0f415ba248eb9"
 index = "tabix"
   [source.csv]
   delimiter = "\t"
@@ -354,6 +410,19 @@ type = "Float32"
         );
         assert_eq!(m.sources[0].csv.as_ref().unwrap().schema.len(), 5);
         assert_eq!(m.sources[0].index, Some(SourceIndex::Tabix));
+        assert_eq!(
+            m.sources[0].url.as_deref(),
+            Some("https://example.org/snv.tsv.gz")
+        );
+        assert_eq!(
+            m.sources[0].md5.as_deref(),
+            Some("88577a55f1cd519d44e0f415ba248eb9")
+        );
+        assert_eq!(m.sources[0].path_md5, None);
+        assert_eq!(
+            m.sources[0].expected_md5(),
+            Some("88577a55f1cd519d44e0f415ba248eb9")
+        );
         assert_eq!(m.value_columns[0].csq_field, "DEMO_SCORE");
         assert_eq!(m.value_columns[0].ty, ValueType::Float32);
         assert_eq!(m.ingest_view_name(), "plugin_demo_ingest");
@@ -461,11 +530,61 @@ type = "Float32"
     }
 
     #[test]
+    fn provenance_keys_are_optional_for_third_party_manifests() {
+        let toml = CADD_LIKE
+            .replace("url = \"https://example.org/snv.tsv.gz\"\n", "")
+            .replace("md5 = \"88577a55f1cd519d44e0f415ba248eb9\"\n", "");
+        let m: SourceManifest = toml::from_str(&toml).unwrap();
+        m.validate().unwrap();
+        assert_eq!(m.sources[0].url, None);
+        assert_eq!(m.sources[0].expected_md5(), None);
+    }
+
+    #[test]
+    fn path_md5_describes_the_build_input_and_wins_over_md5() {
+        let toml = CADD_LIKE.replace(
+            "index = \"tabix\"\n",
+            "path_md5 = \"46d0028375cf95088bd014ff6855cffd\"\nindex = \"tabix\"\n",
+        );
+        let m: SourceManifest = toml::from_str(&toml).unwrap();
+        m.validate().unwrap();
+        assert_eq!(
+            m.sources[0].md5.as_deref(),
+            Some("88577a55f1cd519d44e0f415ba248eb9")
+        );
+        assert_eq!(
+            m.sources[0].expected_md5(),
+            Some("46d0028375cf95088bd014ff6855cffd")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_md5_digests() {
+        for (key, bad) in [
+            ("md5", "88577A55F1CD519D44E0F415BA248EB9"),
+            ("md5", "88577a55"),
+            ("path_md5", "not-a-digest-at-all-not-a-digest"),
+        ] {
+            let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+            match key {
+                "md5" => manifest.sources[0].md5 = Some(bad.into()),
+                _ => manifest.sources[0].path_md5 = Some(bad.into()),
+            }
+            let error = manifest.validate().unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+            assert!(error.contains("32 lowercase hex"), "{error}");
+        }
+    }
+
+    #[test]
     fn single_source_table_name_has_no_part_suffix() {
         let src = SourceSpec {
             part: None,
             provider: ProviderKind::Csv,
             path: "x".into(),
+            url: None,
+            md5: None,
+            path_md5: None,
             index: None,
             record_layout: false,
             csv: None,

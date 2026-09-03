@@ -12,6 +12,7 @@ use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::build::build_plugin_chrom;
 use crate::plugin_cache::cache_manifest::{CacheManifest, ChromEntry};
 use crate::plugin_cache::source_manifest::SourceManifest;
+use crate::plugin_cache::source_verify::{SourceVerification, verify_sources};
 
 /// Builds every requested chromosome's plugin shard against a variation cache.
 pub struct PluginCacheBuilder<'a> {
@@ -21,6 +22,7 @@ pub struct PluginCacheBuilder<'a> {
     out: PathBuf,
     chrom_filter: Option<Vec<String>>,
     overwrite: bool,
+    verification: SourceVerification,
 }
 
 impl<'a> PluginCacheBuilder<'a> {
@@ -37,6 +39,7 @@ impl<'a> PluginCacheBuilder<'a> {
             out: out.into(),
             chrom_filter: None,
             overwrite: false,
+            verification: SourceVerification::default(),
         }
     }
 
@@ -53,6 +56,14 @@ impl<'a> PluginCacheBuilder<'a> {
 
     pub fn with_overwrite(mut self, overwrite: bool) -> Self {
         self.overwrite = overwrite;
+        self
+    }
+
+    /// How to treat each source's declared `md5`/`path_md5` before building.
+    /// Defaults to [`SourceVerification::Strict`]; a manifest that declares no
+    /// digest is never hashed regardless of mode.
+    pub fn with_source_verification(mut self, verification: SourceVerification) -> Self {
+        self.verification = verification;
         self
     }
 
@@ -97,12 +108,20 @@ impl<'a> PluginCacheBuilder<'a> {
         // filtered rebuild after a value/match-column change must NOT keep old
         // shards under the new schema (that would misproject them / panic in
         // `from_batch`); in that case we drop the stale entries.
-        let mut chroms: Vec<ChromEntry> = std::fs::read_to_string(plugin_dir.join("manifest.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<CacheManifest>(&t).ok())
+        let prior: Option<CacheManifest> =
+            std::fs::read_to_string(plugin_dir.join("manifest.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<CacheManifest>(&t).ok());
+        let mut chroms: Vec<ChromEntry> = prior
+            .as_ref()
             .filter(|old| schema_matches(old, &cache))
-            .map(|m| m.chroms)
+            .map(|m| m.chroms.clone())
             .unwrap_or_default();
+        // Verify the inputs before ingesting anything — once per source part,
+        // not once per chromosome. An earlier build's records let an
+        // incremental per-chrom build skip re-hashing an unchanged file.
+        let prior_sources = prior.as_ref().map(|m| m.sources.as_slice()).unwrap_or(&[]);
+        cache.sources = verify_sources(self.manifest, self.verification, prior_sources)?;
         let _ = self.overwrite; // build_plugin_chrom overwrites the shard file per chrom.
         for chrom in self.resolve_chroms()? {
             let shard = self.variation_shard(&chrom);
@@ -314,6 +333,242 @@ type = "Float32"
         );
     }
 
+    /// A tabix-indexed BED-like source plus a manifest that declares a digest
+    /// for it; `md5` is substituted into the manifest text verbatim.
+    fn verified_fixture(dir: &Path, md5: &str) -> (SourceManifest, PathBuf, PathBuf) {
+        let src = dir.join("src.tsv.gz");
+        write_bgzf_tabix_bed(&src, &[("chr1", 99, 100, "A", "G", "0.9")]);
+        let var_dir = dir.join("cache").join("variation");
+        std::fs::create_dir_all(&var_dir).unwrap();
+        write_variation(&var_dir.join("chr1.parquet"), &[("1", 100, "A/G", 0)]);
+        write_variation(&var_dir.join("chr2.parquet"), &[("2", 200, "C/T", 1)]);
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "0-based-half-open"
+ingest_sql = """
+SELECT chrom, CAST(start0 AS INT) AS start, CAST(end0 AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src_scores
+"""
+
+[[source]]
+part = "scores"
+provider = "csv"
+path = "{}"
+url = "https://example.org/demo/scores.tsv.gz"
+md5 = "{md5}"
+index = "tabix"
+  [source.csv]
+  delimiter = "	"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "start0", type = "Utf8" }},
+    {{ name = "end0",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            src.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        (manifest, dir.join("cache"), dir.join("out"))
+    }
+
+    const WRONG_MD5: &str = "00000000000000000000000000000000";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn strict_verification_rejects_a_source_whose_md5_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), WRONG_MD5);
+        let (actual, _) =
+            crate::plugin_cache::source_verify::md5_file(Path::new(&manifest.sources[0].path))
+                .unwrap();
+        let error = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .build_all()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MD5 mismatch"), "{error}");
+        assert!(error.contains("part 'scores'"), "{error}");
+        assert!(error.contains(WRONG_MD5), "{error}");
+        assert!(error.contains(&actual), "{error}");
+        assert!(
+            error.contains("https://example.org/demo/scores.tsv.gz"),
+            "{error}"
+        );
+        // Nothing was ingested or written: the check runs before the first chrom.
+        assert!(!out.join("plugin").join("demo").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matching_md5_is_verified_and_recorded_in_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (probe, _, _) = verified_fixture(dir.path(), WRONG_MD5);
+        let src = PathBuf::from(&probe.sources[0].path);
+        let (actual, size) = crate::plugin_cache::source_verify::md5_file(&src).unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .build_all()
+            .await
+            .unwrap();
+        assert_eq!(cache.sources.len(), 1);
+        let record = &cache.sources[0];
+        assert_eq!(record.part.as_deref(), Some("scores"));
+        assert_eq!(record.file, "src.tsv.gz");
+        assert_eq!(
+            record.url.as_deref(),
+            Some("https://example.org/demo/scores.tsv.gz")
+        );
+        assert_eq!(record.md5.as_deref(), Some(actual.as_str()));
+        assert_eq!(record.path_md5, None);
+        assert_eq!(record.verified_md5.as_deref(), Some(actual.as_str()));
+        assert_eq!(record.size, Some(size));
+        assert!(record.mtime.is_some());
+
+        // The record survives the round trip through manifest.json.
+        let found = crate::plugin_cache::cache_manifest::discover_plugins(&out).unwrap();
+        assert_eq!(found[0].sources, cache.sources);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warn_mode_builds_and_records_the_digest_it_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), WRONG_MD5);
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .with_source_verification(SourceVerification::Warn)
+            .build_all()
+            .await
+            .unwrap();
+        let record = &cache.sources[0];
+        assert_eq!(record.md5.as_deref(), Some(WRONG_MD5));
+        let verified = record.verified_md5.as_deref().unwrap();
+        assert_ne!(verified, WRONG_MD5);
+        assert_eq!(verified.len(), 32);
+        assert_eq!(cache.chroms.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skip_mode_keeps_provenance_but_records_no_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), WRONG_MD5);
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .with_source_verification(SourceVerification::Skip)
+            .build_all()
+            .await
+            .unwrap();
+        let record = &cache.sources[0];
+        assert_eq!(
+            record.url.as_deref(),
+            Some("https://example.org/demo/scores.tsv.gz")
+        );
+        assert_eq!(record.md5.as_deref(), Some(WRONG_MD5));
+        assert_eq!(record.verified_md5, None);
+        assert_eq!(record.size, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn path_md5_is_checked_instead_of_the_upstream_md5() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manifest, cache_dir, out) = verified_fixture(dir.path(), WRONG_MD5);
+        let (actual, _) =
+            crate::plugin_cache::source_verify::md5_file(Path::new(&manifest.sources[0].path))
+                .unwrap();
+        manifest.sources[0].path_md5 = Some(actual.clone());
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .build_all()
+            .await
+            .unwrap();
+        let record = &cache.sources[0];
+        assert_eq!(record.md5.as_deref(), Some(WRONG_MD5));
+        assert_eq!(record.path_md5.as_deref(), Some(actual.as_str()));
+        assert_eq!(record.verified_md5.as_deref(), Some(actual.as_str()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_manifest_without_a_digest_is_not_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manifest, cache_dir, out) = verified_fixture(dir.path(), WRONG_MD5);
+        manifest.sources[0].md5 = None;
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .build_all()
+            .await
+            .unwrap();
+        let record = &cache.sources[0];
+        assert_eq!(record.md5, None);
+        assert_eq!(record.verified_md5, None);
+        assert!(record.url.is_some());
+    }
+
+    // A per-chromosome workflow calls the builder once per contig against the
+    // same 87 GB input; it must hash that input once, not once per call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn incremental_build_trusts_an_earlier_verification_of_an_unchanged_file() {
+        use crate::plugin_cache::cache_manifest::SourceRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), WRONG_MD5);
+        let src = Path::new(&manifest.sources[0].path);
+        let meta = std::fs::metadata(src).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // An earlier build's manifest claims to have verified the (wrong)
+        // digest over this exact size and mtime. A strict build now succeeds
+        // only if it trusts that record instead of re-hashing.
+        let plugin_dir = out.join("plugin").join("demo");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let mut earlier = CacheManifest::from_source(&manifest, "demo.source.toml");
+        earlier.sources = vec![SourceRecord {
+            verified_md5: Some(WRONG_MD5.into()),
+            size: Some(meta.len()),
+            mtime: Some(mtime),
+            ..SourceRecord::from_spec(&manifest.sources[0])
+        }];
+        earlier.write(&plugin_dir).unwrap();
+
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .build_all()
+            .await
+            .unwrap();
+        assert_eq!(cache.sources[0].verified_md5.as_deref(), Some(WRONG_MD5));
+
+        // Touching the file invalidates the fingerprint: the next strict build
+        // re-hashes and reports the mismatch.
+        let file = std::fs::File::options().write(true).open(src).unwrap();
+        file.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        )
+        .unwrap();
+        drop(file);
+        let error = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .build_all()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MD5 mismatch"), "{error}");
+    }
+
     // A filtered/incremental rebuild must UPSERT into the existing manifest, not
     // drop previously built chromosomes (PR #190 N1).
     #[tokio::test(flavor = "multi_thread")]
@@ -399,6 +654,7 @@ type = "Float32"
                 description: None,
             }],
             chroms: vec![],
+            sources: vec![],
             cache_source_version: None,
             allele_match: Default::default(),
             csq_rank: 0,
