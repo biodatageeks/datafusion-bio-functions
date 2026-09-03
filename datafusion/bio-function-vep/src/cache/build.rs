@@ -43,6 +43,25 @@ const DEFAULT_CHROMS: &[&str] = &[
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
     "18", "19", "20", "21", "22", "X", "Y", "MT",
 ];
+/// Columns produced by the export queries that the cache build must not persist.
+///
+/// `raw_object_json` is the row's Storable payload re-serialised as canonical
+/// JSON and `object_hash` is its digest. No reader projects either: neither name
+/// appears in `TRANSCRIPT_CONTEXT_COLUMNS`, `EXON_CONTEXT_COLUMNS`,
+/// `TRANSLATION_CONTEXT_COLUMNS`, `REGULATORY_CONTEXT_COLUMNS` or
+/// `MOTIF_CONTEXT_COLUMNS`, and nothing in the crate reads them by name. They
+/// are 57.8% of the transcript shard set, 40.1% of exon, 89.6% of regulatory and
+/// 69.2% of motif — 600 MB of a 34.8 GB release-116 ensembl cache.
+///
+/// `_rn` is the deduplication helper. The translation build already strips it
+/// per batch; the `SELECT *` context queries were carrying it into the shard.
+///
+/// Pruned on the logical plan before physical planning, above the query's own
+/// ORDER BY, so the shard's row order is untouched and DataFusion is free to
+/// push the pruning further down. Measured build time is unchanged either way
+/// (chr22, one run per entity): the win here is shard size, not build speed.
+const UNPERSISTED_BUILD_COLUMNS: &[&str] = &["raw_object_json", "object_hash", "_rn"];
+
 /// Warm/cold tier selection for the single-path variation layout. A genomic
 /// `start` is "warm" (tier 0) when its max global allele frequency across
 /// `minor_allele_freq`, `AF`, `gnomADg`, `gnomADe` is at least this threshold;
@@ -389,6 +408,34 @@ fn provider_output_schema(
     Ok(EnsemblCacheTableProvider::for_entity(kind, provider_options)?.schema())
 }
 
+/// Plan `query`, projected to every column it produces except `drop_columns`.
+///
+/// The projection is applied to the logical plan, above the query's own ORDER
+/// BY, so the shard's row order is unchanged while DataFusion's projection
+/// pushdown prunes the dropped columns all the way to the Ensembl scan.
+async fn plan_export_query(
+    ctx: &SessionContext,
+    query: &str,
+    drop_columns: &[&str],
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let frame = ctx.sql(query).await?;
+    let produced = frame.schema().fields().len();
+    let keep: Vec<String> = frame
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .filter(|name| !drop_columns.contains(&name.as_str()))
+        .collect();
+    let frame = if keep.len() == produced {
+        frame
+    } else {
+        let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
+        frame.select_columns(&keep)?
+    };
+    frame.create_physical_plan().await
+}
+
 /// Stream a source query to a dictionary-enabled context Parquet shard, applying
 /// `transform` to each batch. Preserves source (query) order — no explicit sort —
 /// so the shard matches the Parquet dataset row order. Returns the row count
@@ -397,13 +444,14 @@ async fn write_query_stream_to_parquet<F>(
     ctx: &SessionContext,
     query: &str,
     path: &Path,
+    drop_columns: &[&str],
     transform: F,
 ) -> Result<usize>
 where
     F: Fn(RecordBatch) -> Result<RecordBatch>,
 {
     use crate::parquet_cache::scan::ContextParquetShardWriter;
-    let plan = ctx.sql(query).await?.create_physical_plan().await?;
+    let plan = plan_export_query(ctx, query, drop_columns).await?;
     let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
     let mut writer: Option<ContextParquetShardWriter> = None;
     let mut rows = 0usize;
@@ -468,14 +516,22 @@ pub async fn build_parquet_context_entity_chrom(
 
     let rows = if kind == EnsemblEntityKind::Transcript {
         let uid_map = Arc::new(load_transcript_uid_map(options, source_chrom).await?);
-        write_query_stream_to_parquet(&ctx, &query, &shard_path, move |batch| {
-            attach_transcript_uid_batch(batch, &source_type, &cache_version, &uid_map)
-        })
+        write_query_stream_to_parquet(
+            &ctx,
+            &query,
+            &shard_path,
+            UNPERSISTED_BUILD_COLUMNS,
+            move |batch| attach_transcript_uid_batch(batch, &source_type, &cache_version, &uid_map),
+        )
         .await?
     } else {
-        write_query_stream_to_parquet(&ctx, &query, &shard_path, move |batch| {
-            attach_schema_metadata_to_batch(batch, &source_type, &cache_version)
-        })
+        write_query_stream_to_parquet(
+            &ctx,
+            &query,
+            &shard_path,
+            UNPERSISTED_BUILD_COLUMNS,
+            move |batch| attach_schema_metadata_to_batch(batch, &source_type, &cache_version),
+        )
         .await?
     };
     Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
@@ -512,11 +568,17 @@ pub async fn build_parquet_translation_core_chrom(
     let source_type = options.cache_source_type.as_str().to_string();
     let cache_version = options.cache_version.clone();
     let ctx = make_ctx_and_register(options, EnsemblEntityKind::Translation, "tl")?;
-    let rows = write_query_stream_to_parquet(&ctx, &query, &shard_path, move |batch| {
-        let batch = drop_row_number_batch(batch)?;
-        let batch = project_batch_to_schema(batch, Arc::clone(&target_schema))?;
-        attach_schema_metadata_to_batch(batch, &source_type, &cache_version)
-    })
+    let rows = write_query_stream_to_parquet(
+        &ctx,
+        &query,
+        &shard_path,
+        UNPERSISTED_BUILD_COLUMNS,
+        move |batch| {
+            let batch = drop_row_number_batch(batch)?;
+            let batch = project_batch_to_schema(batch, Arc::clone(&target_schema))?;
+            attach_schema_metadata_to_batch(batch, &source_type, &cache_version)
+        },
+    )
     .await?;
     Ok(ChromDatasetEntry::new(manifest_chrom, file_name, rows))
 }
@@ -1552,6 +1614,138 @@ mod tests {
                 "run {run} at target_partitions=8 disagrees with the serial order"
             );
         }
+    }
+
+    /// The context shards must not carry the raw Storable payload, its hash, or
+    /// the dedup helper — nothing projects them, and on a release-116 ensembl
+    /// cache they are 600 MB of dead bytes. Everything else must survive
+    /// unchanged, including a column whose name is a SQL keyword (`end`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_writer_drops_only_the_unpersisted_columns() {
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("stable_id", DataType::Utf8, true),
+            Field::new("raw_object_json", DataType::Utf8, false),
+            Field::new("object_hash", DataType::Utf8, false),
+            Field::new("_rn", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["22", "22", "22"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10i64, 20, 30])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![15i64, 25, 35])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["ENSE1", "ENSE2", "ENSE3"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "{\"a\":1}",
+                    "{\"a\":2}",
+                    "{\"a\":3}",
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["h1", "h2", "h3"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1i64, 1, 1])) as ArrayRef,
+            ],
+        )
+        .expect("source batch");
+
+        let ctx = SessionContext::new();
+        let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
+            .expect("mem table");
+        ctx.register_table("src", Arc::new(table))
+            .expect("register");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shard.parquet");
+        let rows = write_query_stream_to_parquet(
+            &ctx,
+            "SELECT * FROM src ORDER BY start",
+            &path,
+            UNPERSISTED_BUILD_COLUMNS,
+            Ok,
+        )
+        .await
+        .expect("write shard");
+        assert_eq!(rows, 3);
+
+        let file = std::fs::File::open(&path).expect("open shard");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).expect("parquet reader");
+        let written: Vec<String> = reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        for dropped in UNPERSISTED_BUILD_COLUMNS {
+            assert!(
+                !written.iter().any(|name| name == dropped),
+                "{dropped} must not be persisted, got {written:?}"
+            );
+        }
+        assert_eq!(written, vec!["chrom", "start", "end", "stable_id"]);
+
+        // An empty drop list must leave the output alone.
+        let path_all = dir.path().join("all.parquet");
+        write_query_stream_to_parquet(&ctx, "SELECT * FROM src ORDER BY start", &path_all, &[], Ok)
+            .await
+            .expect("write unpruned shard");
+        let file = std::fs::File::open(&path_all).expect("open unpruned shard");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).expect("parquet reader");
+        assert_eq!(reader.schema().fields().len(), 7);
+    }
+
+    /// Pruning happens above the query's ORDER BY, so the shard's row order is
+    /// the one the query asked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_writer_pruning_preserves_query_order() {
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("start", DataType::Int64, false),
+            Field::new("raw_object_json", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![30i64, 10, 20])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["c", "a", "b"])) as ArrayRef,
+            ],
+        )
+        .expect("source batch");
+
+        let ctx = SessionContext::new();
+        let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
+            .expect("mem table");
+        ctx.register_table("src", Arc::new(table))
+            .expect("register");
+
+        let plan = plan_export_query(
+            &ctx,
+            "SELECT * FROM src ORDER BY start",
+            UNPERSISTED_BUILD_COLUMNS,
+        )
+        .await
+        .expect("plan");
+        let mut stream =
+            datafusion::physical_plan::execute_stream(plan, ctx.task_ctx()).expect("stream");
+        let mut starts = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("batch");
+            assert!(batch.column_by_name("raw_object_json").is_none());
+            let column = batch
+                .column_by_name("start")
+                .expect("start")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("start i64");
+            for row in 0..batch.num_rows() {
+                starts.push(column.value(row));
+            }
+        }
+        assert_eq!(starts, vec![10, 20, 30]);
     }
 
     #[test]
