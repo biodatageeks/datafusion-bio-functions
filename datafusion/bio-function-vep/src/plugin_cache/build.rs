@@ -344,11 +344,38 @@ async fn write_tiered_shard(
 /// Build one chromosome's plugin shard. Returns the cache-manifest chrom entry.
 pub async fn build_plugin_chrom(
     src: &SourceManifest,
-    _source_manifest_file: &str,
+    source_manifest_file: &str,
     variation_shard: &Path,
     output_cache_root: &Path,
     chrom: &str,
 ) -> Result<ChromEntry> {
+    build_plugin_chrom_checked(
+        src,
+        source_manifest_file,
+        variation_shard,
+        output_cache_root,
+        chrom,
+        || Ok(()),
+    )
+    .await
+}
+
+/// [`build_plugin_chrom`] with a check run after the chromosome has been
+/// ingested and written to its staging file, but before the live shard is
+/// touched. An `Err` leaves the previous shard (and the previous manifest)
+/// exactly as they were; the builder uses it to make sure the source file is
+/// still the one whose digest it verified.
+pub async fn build_plugin_chrom_checked<F>(
+    src: &SourceManifest,
+    _source_manifest_file: &str,
+    variation_shard: &Path,
+    output_cache_root: &Path,
+    chrom: &str,
+    before_commit: F,
+) -> Result<ChromEntry>
+where
+    F: FnOnce() -> Result<()>,
+{
     src.validate()?;
     // Coarse-grained stage timing at `info` level — cheap (a handful of
     // `Instant::now()` calls) and the only thing that would have turned CADD
@@ -549,6 +576,11 @@ pub async fn build_plugin_chrom(
         t_start.elapsed().as_secs_f64()
     );
 
+    // Everything this chromosome needed from the source has been read; the
+    // caller's last word before the live shard is replaced or removed. On
+    // `Err` the staging file is dropped by `scratch` and the old shard stays.
+    before_commit()?;
+
     // Empty chrom → no shard (matches variation builder cleanup). Remove any
     // stale shard from a previous build so the manifest (rows: 0) matches disk
     // and the runtime never opens a leftover file for an empty chrom.
@@ -691,6 +723,74 @@ type = "Float32"
                 .join("chr1.parquet")
                 .exists()
         );
+    }
+
+    // A failing pre-commit check leaves the live shard untouched and no
+    // staging file behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_pre_commit_check_keeps_the_previous_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("src.tsv.gz");
+        write_gz(&tsv, "chr1\t100\tA\tG\t0.9\n");
+        let var = dir.path().join("var.parquet");
+        write_synthetic_variation(&var, &[("1", 100, "A/G", 0i8)]);
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = """
+SELECT chrom, CAST(pos AS INT) AS start, CAST(pos AS INT) AS end,
+       concat(ref, '/', alt) AS allele_string, CAST(score AS FLOAT) AS demo_score
+FROM plugin_demo_src
+"""
+
+[[source]]
+provider = "csv"
+path = "{}"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  compression = "gzip"
+  schema = [
+    {{ name = "chrom", type = "Utf8" }},
+    {{ name = "pos",   type = "Utf8" }},
+    {{ name = "ref",   type = "Utf8" }},
+    {{ name = "alt",   type = "Utf8" }},
+    {{ name = "score", type = "Utf8" }},
+  ]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO"
+type = "Float32"
+"##,
+            tsv.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let out = dir.path().join("out");
+        let plugin_dir = out.join("plugin").join("demo");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let shard = plugin_dir.join("chr1.parquet");
+        std::fs::write(&shard, b"previous shard").unwrap();
+
+        let error =
+            build_plugin_chrom_checked(&manifest, "demo.source.toml", &var, &out, "1", || {
+                Err(DataFusionError::Execution("source moved".into()))
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("source moved"), "{error}");
+        assert_eq!(std::fs::read(&shard).unwrap(), b"previous shard");
+        assert!(!plugin_dir.join("chr1.parquet.build.tmp").exists());
+
+        // The same build with a passing check commits normally.
+        let entry =
+            build_plugin_chrom_checked(&manifest, "demo.source.toml", &var, &out, "1", || Ok(()))
+                .await
+                .unwrap();
+        assert_eq!(entry.rows, 1);
+        assert_ne!(std::fs::read(&shard).unwrap(), b"previous shard");
     }
 
     // Two source rows sharing the runtime probe key

@@ -50,9 +50,11 @@ pub struct MatchColumnRecord {
 /// `md5`/`url`/`path_md5` are copied from the source manifest; `verified_md5`
 /// is the digest the build actually computed over the resolved file (absent
 /// when verification was skipped or the manifest declared no digest), and
-/// `file`/`size`/`mtime_ns` fingerprint that file so an incremental
-/// per-chromosome build can trust an earlier verification instead of
-/// re-hashing.
+/// `file`/`size`/`mtime_ns`/`ino`/`ctime_ns` fingerprint that file so an
+/// incremental per-chromosome build can trust an earlier verification instead
+/// of re-hashing. `ino` and `ctime_ns` are the replacement-sensitive part: a
+/// copy can preserve size and mtime, but a new inode and a fresh change time
+/// come with any replacement or rewrite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +74,14 @@ pub struct SourceRecord {
     /// Modification time of the hashed file, nanoseconds since the Unix epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtime_ns: Option<i64>,
+    /// Inode of the hashed file (Unix only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ino: Option<u64>,
+    /// Inode change time of the hashed file, nanoseconds since the Unix epoch
+    /// (Unix); creation time on Windows. Absent where the platform offers
+    /// neither, in which case the file is always re-hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctime_ns: Option<i64>,
 }
 
 impl SourceRecord {
@@ -90,6 +100,8 @@ impl SourceRecord {
             verified_md5: None,
             size: None,
             mtime_ns: None,
+            ino: None,
+            ctime_ns: None,
         }
     }
 

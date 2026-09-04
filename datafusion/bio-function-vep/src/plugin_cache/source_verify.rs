@@ -80,45 +80,117 @@ pub fn md5_file(path: &Path) -> Result<(String, u64)> {
     Ok((format!("{:x}", hasher.finalize()), size))
 }
 
-/// `(size, mtime_ns)` of a file: with the file name, the fingerprint an
-/// earlier verification is keyed by. Full mtime precision, so two writes
-/// within one second are not confused.
-fn fingerprint(path: &Path) -> Result<(u64, Option<i64>)> {
-    let meta = std::fs::metadata(path).map_err(|e| {
-        DataFusionError::Execution(format!("stat source '{}': {e}", path.display()))
-    })?;
-    let mtime_ns = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .and_then(|d| i64::try_from(d.as_nanos()).ok());
-    Ok((meta.len(), mtime_ns))
+/// What identifies a file between two looks at it without reading it: its
+/// size and mtime, plus the replacement-sensitive inode and change time —
+/// a copy can preserve size and mtime (`cp -p`), but an atomic replacement
+/// is a new inode and any rewrite or metadata restore bumps the ctime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fingerprint {
+    size: u64,
+    mtime_ns: Option<i64>,
+    ino: Option<u64>,
+    ctime_ns: Option<i64>,
+}
+
+impl Fingerprint {
+    fn of(path: &Path) -> Result<Self> {
+        let meta = std::fs::metadata(path).map_err(|e| {
+            DataFusionError::Execution(format!("stat source '{}': {e}", path.display()))
+        })?;
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_nanos()).ok());
+        #[cfg(unix)]
+        let (ino, ctime_ns) = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                Some(meta.ino()),
+                meta.ctime()
+                    .checked_mul(1_000_000_000)
+                    .and_then(|s| s.checked_add(meta.ctime_nsec())),
+            )
+        };
+        #[cfg(windows)]
+        let (ino, ctime_ns) = {
+            use std::os::windows::fs::MetadataExt;
+            // 100 ns intervals since 1601-01-01, as ns since the Unix epoch.
+            const EPOCH_DIFF_100NS: i64 = 116_444_736_000_000_000;
+            (
+                None,
+                i64::try_from(meta.creation_time())
+                    .ok()
+                    .and_then(|t| t.checked_sub(EPOCH_DIFF_100NS))
+                    .and_then(|t| t.checked_mul(100)),
+            )
+        };
+        #[cfg(not(any(unix, windows)))]
+        let (ino, ctime_ns) = (None, None);
+        Ok(Fingerprint {
+            size: meta.len(),
+            mtime_ns,
+            ino,
+            ctime_ns,
+        })
+    }
+
+    /// True when `record` was taken from a file with this exact identity. A
+    /// fingerprint without a change time can never match: without it, a
+    /// replacement could not be told apart, so the file is re-hashed.
+    fn matches(&self, record: &SourceRecord) -> bool {
+        self.ctime_ns.is_some()
+            && record.size == Some(self.size)
+            && record.mtime_ns == self.mtime_ns
+            && record.ino == self.ino
+            && record.ctime_ns == self.ctime_ns
+    }
+
+    fn stamp(&self, record: &mut SourceRecord) {
+        record.size = Some(self.size);
+        record.mtime_ns = self.mtime_ns;
+        record.ino = self.ino;
+        record.ctime_ns = self.ctime_ns;
+    }
+}
+
+/// Record `path`'s current identity on `record`, as a build would after
+/// hashing it. For tests and tools that construct provenance records by hand.
+pub fn stamp_fingerprint(path: &Path, record: &mut SourceRecord) -> Result<()> {
+    Fingerprint::of(path)?.stamp(record);
+    Ok(())
 }
 
 /// Check that no verified source changed since it was fingerprinted. The
 /// providers reopen each source path per chromosome, so a file replaced after
 /// the hash but before or during ingestion would be published under a digest
-/// it does not have; the build calls this after every chromosome and refuses
-/// to write the manifest if a size or mtime moved. A replacement with the
-/// same size and mtime is the same blind spot as the reuse rule's.
+/// it does not have; the build calls this after each chromosome is ingested
+/// and before its shard is committed, and refuses to go on if the identity
+/// moved (size, mtime, inode or change time).
 pub fn check_sources_unchanged(manifest: &SourceManifest, records: &[SourceRecord]) -> Result<()> {
     for record in records.iter().filter(|r| r.verified_md5.is_some()) {
         let Some(spec) = manifest.sources.iter().find(|s| s.part == record.part) else {
             continue;
         };
         let path = Path::new(&spec.path);
-        let (size, mtime_ns) = fingerprint(path)?;
-        if record.size != Some(size) || record.mtime_ns != mtime_ns {
+        let now = Fingerprint::of(path)?;
+        if !now.matches(record) {
             return Err(DataFusionError::Execution(format!(
-                "plugin '{}' {}: {} changed while it was being ingested (size {:?} -> {size}, \
-                 mtime_ns {:?} -> {mtime_ns:?}); the digest verified before the build no longer \
-                 describes the data read, so no manifest was written. Rebuild from the stable \
-                 file.",
+                "plugin '{}' {}: {} changed while it was being ingested (size {:?} -> {}, \
+                 mtime_ns {:?} -> {:?}, ino {:?} -> {:?}, ctime_ns {:?} -> {:?}); the digest \
+                 verified before the build no longer describes the data read, so the shard \
+                 was not committed and no manifest was written. Rebuild from the stable file.",
                 manifest.plugin_name,
                 spec.label(),
                 path.display(),
                 record.size,
+                now.size,
                 record.mtime_ns,
+                now.mtime_ns,
+                record.ino,
+                now.ino,
+                record.ctime_ns,
+                now.ctime_ns,
             )));
         }
     }
@@ -129,15 +201,16 @@ pub fn check_sources_unchanged(manifest: &SourceManifest, records: &[SourceRecor
 /// provenance records to write into the built cache's manifest.
 ///
 /// `prior` are the records of an earlier build into the same plugin directory.
-/// A source whose earlier record carries a digest for the same file name, size
-/// and mtime is not re-hashed: that digest is reused and compared as if it had
-/// just been computed, so a per-chromosome workflow that calls the builder once
-/// per contig hashes an 87 GB input once, not once per call — in `Warn` mode
-/// too, where the recorded digest deliberately differs from the declared one,
-/// and in `Strict` mode a known mismatch fails without re-reading the file.
-/// Like any mtime-keyed cache this cannot tell apart a replacement copied with
-/// its timestamps preserved and the same byte length; a different name, size
-/// or mtime always re-hashes.
+/// A source whose earlier record carries a digest for a file of the same name
+/// and identity (size, mtime, inode, change time) is not re-hashed: that
+/// digest is reused and compared as if it had just been computed, so a
+/// per-chromosome workflow that calls the builder once per contig hashes an
+/// 87 GB input once, not once per call — in `Warn` mode too, where the
+/// recorded digest deliberately differs from the declared one, and in `Strict`
+/// mode a known mismatch fails without re-reading the file. A replacement or
+/// rewrite is a new inode or a fresh change time and always re-hashes; only an
+/// in-place overwrite that also forges the change time could pass, which
+/// requires more than file ownership.
 pub fn verify_sources(
     manifest: &SourceManifest,
     mode: SourceVerification,
@@ -168,35 +241,41 @@ fn verify_source(
     }
 
     let path = Path::new(&spec.path);
-    let (size, mtime_ns) = fingerprint(path)?;
+    let now = Fingerprint::of(path)?;
     let earlier = prior.iter().find_map(|p| {
-        (p.part == spec.part
-            && p.file == record.file
-            && p.size == Some(size)
-            && mtime_ns.is_some()
-            && p.mtime_ns == mtime_ns)
+        (p.part == spec.part && p.file == record.file && now.matches(p))
             .then_some(p.verified_md5.as_deref())
             .flatten()
     });
-    let (actual, hashed) = match earlier {
+    let actual = match earlier {
         Some(digest) => {
             info!(
-                "plugin '{plugin_name}' {label}: md5 {digest} computed by an earlier build \
-                 (same file name, size and mtime), not re-hashing"
+                "plugin '{plugin_name}' {label}: md5 {digest} computed by an earlier build over \
+                 this same file (name, size, mtime, inode and ctime unchanged), not re-hashing"
             );
-            (digest.to_string(), size)
+            digest.to_string()
         }
         None => {
             info!(
-                "plugin '{plugin_name}' {label}: hashing {} ({size} bytes)",
-                path.display()
+                "plugin '{plugin_name}' {label}: hashing {} ({} bytes)",
+                path.display(),
+                now.size
             );
-            md5_file(path)?
+            let (digest, hashed) = md5_file(path)?;
+            if hashed != now.size {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin '{plugin_name}' {label}: {} changed while it was being hashed \
+                     ({} bytes at start, {hashed} read)",
+                    path.display(),
+                    now.size
+                )));
+            }
+            digest
         }
     };
+    let hashed = now.size;
     record.verified_md5 = Some(actual.clone());
-    record.size = Some(hashed);
-    record.mtime_ns = mtime_ns;
+    now.stamp(&mut record);
     if actual == expected {
         info!("plugin '{plugin_name}' {label}: md5 {actual} matches the manifest");
         return Ok(record);
@@ -285,14 +364,57 @@ type = "Utf8"
             path.display()
         );
         let manifest: SourceManifest = toml::from_str(&toml).unwrap();
-        let (size, mtime_ns) = fingerprint(path).unwrap();
-        let prior = vec![SourceRecord {
-            verified_md5: Some(earlier.into()),
-            size: Some(size),
-            mtime_ns,
-            ..SourceRecord::from_spec(&manifest.sources[0])
-        }];
-        (manifest, prior)
+        let mut record = SourceRecord::from_spec(&manifest.sources[0]);
+        record.verified_md5 = Some(earlier.into());
+        Fingerprint::of(path).unwrap().stamp(&mut record);
+        (manifest, vec![record])
+    }
+
+    /// Replace `path` atomically with `bytes`, preserving its mtime — the
+    /// replacement a size/mtime fingerprint cannot see.
+    fn replace_preserving_mtime(path: &Path, bytes: &[u8]) {
+        let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+        let tmp = path.with_extension("new");
+        std::fs::write(&tmp, bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn a_replacement_with_preserved_size_and_mtime_is_rehashed_and_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("demo.tsv");
+        std::fs::write(&src, b"abc").unwrap();
+        let abc = "900150983cd24fb0d6963f7d28e17f72";
+        let (manifest, prior) = reuse_fixture(&src, abc, abc);
+        // Sanity: the record is trusted for the untouched file.
+        let records = verify_sources(&manifest, SourceVerification::Strict, &prior).unwrap();
+        assert_eq!(records[0].verified_md5.as_deref(), Some(abc));
+
+        replace_preserving_mtime(&src, b"abd");
+        // Same size, same mtime: only the inode / ctime give it away.
+        let error = verify_sources(&manifest, SourceVerification::Strict, &prior)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MD5 mismatch"), "{error}");
+        assert!(
+            error.contains("4911e516e5aa21d327512e0c8b197616"),
+            "{error}"
+        );
+        // And a source replaced mid-build is caught before the shard commits.
+        let error = check_sources_unchanged(&manifest, &records)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("changed while it was being ingested"),
+            "{error}"
+        );
     }
 
     // The earlier build's digest is a property of the file, so it is reused

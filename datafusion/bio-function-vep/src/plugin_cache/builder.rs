@@ -10,7 +10,7 @@ use datafusion::common::{DataFusionError, Result};
 use log::info;
 
 use crate::cache::manifest::canonical_chrom_label;
-use crate::plugin_cache::build::build_plugin_chrom;
+use crate::plugin_cache::build::build_plugin_chrom_checked;
 use crate::plugin_cache::cache_manifest::{CacheManifest, ChromEntry, SourceRecord};
 use crate::plugin_cache::source_manifest::SourceManifest;
 use crate::plugin_cache::source_verify::{
@@ -185,18 +185,19 @@ impl<'a> PluginCacheBuilder<'a> {
                     shard.display()
                 )));
             }
-            let entry = build_plugin_chrom(
+            // The providers reopen the source for every chromosome; before the
+            // shard built from it replaces the live one, make sure it is still
+            // the file whose digest was verified. On failure the previous
+            // shard and manifest are left exactly as they were.
+            let entry = build_plugin_chrom_checked(
                 self.manifest,
                 &self.manifest_file,
                 &shard,
                 &self.out,
                 &chrom,
+                || check_sources_unchanged(self.manifest, &cache.sources),
             )
             .await?;
-            // The providers reopened the source for this chromosome; make sure
-            // it is still the file that was verified before publishing a
-            // digest for data that may not have been read.
-            check_sources_unchanged(self.manifest, &cache.sources)?;
             chroms.retain(|c| c.chrom != entry.chrom);
             chroms.push(entry);
         }
@@ -636,26 +637,19 @@ type = "Float32"
         let dir = tempfile::tempdir().unwrap();
         let (manifest, cache_dir, out) = verified_fixture(dir.path(), WRONG_MD5);
         let src = Path::new(&manifest.sources[0].path);
-        let meta = std::fs::metadata(src).unwrap();
-        let mtime_ns = meta
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
 
         // An earlier build's manifest claims to have verified the (wrong)
-        // digest over this exact file name, size and mtime. A strict build now
-        // succeeds only if it trusts that record instead of re-hashing.
+        // digest over this exact file (name, size, mtime, inode, ctime). A
+        // strict build now succeeds only if it trusts that record instead of
+        // re-hashing.
         let plugin_dir = out.join("plugin").join("demo");
         std::fs::create_dir_all(&plugin_dir).unwrap();
         let mut earlier = CacheManifest::from_source(&manifest, "demo.source.toml");
-        let trusted = SourceRecord {
+        let mut trusted = SourceRecord {
             verified_md5: Some(WRONG_MD5.into()),
-            size: Some(meta.len()),
-            mtime_ns: Some(mtime_ns),
             ..SourceRecord::from_spec(&manifest.sources[0])
         };
+        crate::plugin_cache::source_verify::stamp_fingerprint(src, &mut trusted).unwrap();
 
         // The record is bound to the file name: a record for another file
         // with the same size and mtime is not trusted, and the re-hash fails.
@@ -884,6 +878,8 @@ type = "Float32"
             verified_md5: verified.map(String::from),
             size: None,
             mtime_ns: None,
+            ino: None,
+            ctime_ns: None,
         };
         let dir = tempfile::tempdir().unwrap();
         let (manifest, _, _) = verified_fixture(dir.path(), WRONG_MD5);
