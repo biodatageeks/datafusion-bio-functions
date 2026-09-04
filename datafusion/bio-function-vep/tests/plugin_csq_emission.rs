@@ -120,7 +120,6 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
         sources: vec![],
         cache_source_version: None,
         allele_match: Default::default(),
-        csq_rank: 0,
         field_order: Default::default(),
     };
     manifest.write(&plugin_dir).unwrap();
@@ -134,7 +133,7 @@ async fn plugin_csq_gates_per_transcript() {
     let dir = tempfile::tempdir().unwrap();
     build_alphamissense_shard(dir.path());
 
-    let reg = PluginRegistry::open(dir.path(), "22").await.unwrap();
+    let reg = PluginRegistry::open(dir.path(), "22", None).await.unwrap();
     let n = reg.csq_fields().len();
     assert_eq!(reg.csq_fields(), vec!["am_pathogenicity", "am_class"]);
 
@@ -228,12 +227,11 @@ async fn indel_probe_uses_normalized_start() {
         sources: vec![],
         cache_source_version: None,
         allele_match: Default::default(),
-        csq_rank: 0,
         field_order: Default::default(),
     };
     manifest.write(&plugin_dir).unwrap();
 
-    let reg = PluginRegistry::open(cache_root, "1").await.unwrap();
+    let reg = PluginRegistry::open(cache_root, "1", None).await.unwrap();
 
     // Normalized start (101) hits.
     let hit = reg.take_buffer_all(&[101]).await.unwrap();
@@ -326,15 +324,14 @@ async fn minimised_fallback_and_alphabetical_fields_preserve_name_value_pairs() 
         sources: vec![],
         cache_source_version: None,
         allele_match: AlleleMatch::Minimised,
-        csq_rank: 0,
         field_order: FieldOrder::Alphabetical,
     };
     manifest.write(&plugin_dir).unwrap();
 
-    let registry = PluginRegistry::open(cache_root, "1").await.unwrap();
+    let registry = PluginRegistry::open(cache_root, "1", None).await.unwrap();
     assert_eq!(registry.csq_fields(), vec!["A_FIELD", "Z_FIELD"]);
     assert_eq!(
-        PluginRegistry::field_descriptions(cache_root),
+        PluginRegistry::field_descriptions(cache_root, None).unwrap(),
         vec![
             ("A_FIELD".to_string(), "A description".to_string()),
             ("Z_FIELD".to_string(), "Z description".to_string()),

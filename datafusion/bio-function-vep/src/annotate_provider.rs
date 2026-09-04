@@ -3394,6 +3394,10 @@ pub struct AnnotateProvider {
     /// Root of a custom-plugin cache (`<root>/plugin/*`). `None` = no plugins.
     #[cfg(feature = "parquet-cache")]
     plugin_cache_root: Option<std::path::PathBuf>,
+    /// Selected plugins in caller-supplied CSQ order. `None` means discover all
+    /// plugins alphabetically; `Some([])` disables every plugin.
+    #[cfg(feature = "parquet-cache")]
+    plugin_names: Option<Vec<String>>,
 }
 
 impl AnnotateProvider {
@@ -3414,6 +3418,9 @@ impl AnnotateProvider {
         let include_pick_output = pick_flags.include_pick_output();
         let annotation_column_defs =
             annotation_column_defs_for_selection(transcript_selection, include_pick_output);
+        #[cfg(feature = "parquet-cache")]
+        let plugin_names =
+            Self::parse_json_string_array_option(options_json.as_deref(), "plugins")?;
         // Output schema starts with all VCF columns and appends annotation
         // fields. The input fields keep their metadata: it carries the VCF
         // typing the writer needs (`bio.vcf.field.*`) and the marker that
@@ -3460,6 +3467,8 @@ impl AnnotateProvider {
             vcf_shard_ctx: None,
             #[cfg(feature = "parquet-cache")]
             plugin_cache_root: None,
+            #[cfg(feature = "parquet-cache")]
+            plugin_names,
         })
     }
 
@@ -3522,6 +3531,36 @@ impl AnnotateProvider {
             return None;
         }
         Some(value.to_string())
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    fn parse_json_string_array_option(
+        json: Option<&str>,
+        key: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|error| {
+            DataFusionError::Plan(format!("options_json must be valid JSON: {error}"))
+        })?;
+        let Some(selected) = value.get(key) else {
+            return Ok(None);
+        };
+        let values = selected.as_array().ok_or_else(|| {
+            DataFusionError::Plan(format!("options_json '{key}' must be an array of strings"))
+        })?;
+        values
+            .iter()
+            .map(|value| {
+                value.as_str().map(ToString::to_string).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "options_json '{key}' must be an array of strings"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     }
 
     fn parse_json_bool_option(json: &str, key: &str) -> Option<bool> {
@@ -5378,6 +5417,8 @@ impl AnnotateProvider {
             cache_root,
             #[cfg(feature = "parquet-cache")]
             plugin_cache_root: self.plugin_cache_root.clone(),
+            #[cfg(feature = "parquet-cache")]
+            plugin_names: self.plugin_names.clone(),
             #[cfg(feature = "parquet-cache")]
             parquet_backend,
             #[cfg(feature = "parquet-cache")]
@@ -8635,6 +8676,9 @@ struct ContigAnnotationConfig {
     /// Root of a custom-plugin cache (`<root>/plugin/*`); `None` = no plugins.
     #[cfg(feature = "parquet-cache")]
     plugin_cache_root: Option<std::path::PathBuf>,
+    /// Selected plugins in caller-supplied CSQ order; `None` discovers all.
+    #[cfg(feature = "parquet-cache")]
+    plugin_names: Option<Vec<String>>,
     /// When true, the variation lookup uses the Parquet backend (`new_parquet`)
     /// while context entities + SIFT still load from the co-located Parquet cache.
     #[cfg(feature = "parquet-cache")]
@@ -13333,7 +13377,12 @@ async fn prepare_contig_data(
     #[cfg(feature = "parquet-cache")]
     let plugin_registry = match &config.plugin_cache_root {
         Some(root) => {
-            let reg = crate::plugin_cache::registry::PluginRegistry::open(root, &chrom).await?;
+            let reg = crate::plugin_cache::registry::PluginRegistry::open(
+                root,
+                &chrom,
+                config.plugin_names.as_deref(),
+            )
+            .await?;
             if reg.is_empty() {
                 None
             } else {
@@ -14266,6 +14315,8 @@ mod tests {
             cache_root: None,
             #[cfg(feature = "parquet-cache")]
             plugin_cache_root: None,
+            #[cfg(feature = "parquet-cache")]
+            plugin_names: None,
             #[cfg(feature = "parquet-cache")]
             parquet_backend: false,
             #[cfg(feature = "parquet-cache")]

@@ -3,6 +3,7 @@
 //! [`PluginLookup::take_buffer`] per plugin per buffer, then synchronous
 //! per-transcript probes against the resulting [`PluginBufferSlice`]s.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use datafusion::common::{DataFusionError, Result};
@@ -29,7 +30,8 @@ struct PluginEntry {
     lookup: Option<PluginLookup>,
 }
 
-/// All enabled plugins for one chromosome, in plugin-name order.
+/// All enabled plugins for one chromosome, in requested order (or alphabetical
+/// plugin-name order when no selection was supplied).
 pub struct PluginRegistry {
     plugins: Vec<PluginEntry>,
 }
@@ -49,11 +51,57 @@ fn emit_order(m: &CacheManifest) -> Vec<usize> {
     order
 }
 
+/// Return manifests in caller order when a selection is supplied, otherwise in
+/// the deterministic alphabetical order returned by [`discover_plugins`].
+fn select_manifests(
+    cache_root: &Path,
+    plugin_names: Option<&[String]>,
+) -> Result<Vec<CacheManifest>> {
+    let manifests = discover_plugins(cache_root)?;
+    let Some(plugin_names) = plugin_names else {
+        return Ok(manifests);
+    };
+
+    let available = manifests
+        .iter()
+        .map(|manifest| manifest.plugin_name.clone())
+        .collect::<Vec<_>>();
+    let mut by_name = manifests
+        .into_iter()
+        .map(|manifest| (manifest.plugin_name.clone(), manifest))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::with_capacity(plugin_names.len());
+    let mut selected = Vec::with_capacity(plugin_names.len());
+    for name in plugin_names {
+        if !seen.insert(name.as_str()) {
+            return Err(DataFusionError::Execution(format!(
+                "duplicate plugin name in selection: '{name}'"
+            )));
+        }
+        let Some(manifest) = by_name.remove(name) else {
+            return Err(DataFusionError::Execution(format!(
+                "plugin '{name}' was requested but is not available; available plugins: {}",
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            )));
+        };
+        selected.push(manifest);
+    }
+    Ok(selected)
+}
+
 impl PluginRegistry {
     /// Discover plugins under `cache_root` and open each one's shard for `chrom`.
-    pub async fn open(cache_root: &Path, chrom: &str) -> Result<Self> {
+    pub async fn open(
+        cache_root: &Path,
+        chrom: &str,
+        plugin_names: Option<&[String]>,
+    ) -> Result<Self> {
         let want = canonical_chrom_label(chrom);
-        let manifests = discover_plugins(cache_root)?;
+        let manifests = select_manifests(cache_root, plugin_names)?;
         let mut plugins = Vec::with_capacity(manifests.len());
         for m in manifests {
             // The emitted field names are permuted, but the shard projection is
@@ -125,49 +173,44 @@ impl PluginRegistry {
 
     /// The concatenated CSQ field names for a plugin cache, read from manifests
     /// **without opening any shard** — cheap, contig-independent, for the VCF
-    /// header. Best-effort: unreadable/absent → empty.
-    pub fn field_names(cache_root: &Path) -> Vec<String> {
-        discover_plugins(cache_root)
-            .map(|manifests| {
-                manifests
-                    .iter()
-                    .flat_map(|m| {
-                        emit_order(m)
-                            .into_iter()
-                            .map(|i| m.value_columns[i].csq_field.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .collect()
+    /// header.
+    pub fn field_names(cache_root: &Path, plugin_names: Option<&[String]>) -> Result<Vec<String>> {
+        Ok(select_manifests(cache_root, plugin_names)?
+            .iter()
+            .flat_map(|m| {
+                emit_order(m)
+                    .into_iter()
+                    .map(|i| m.value_columns[i].csq_field.clone())
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
+            .collect())
     }
 
     /// `(csq_field, description)` for every plugin field that declares one, in
     /// emitted order — the `##<FIELD>=<description>` header lines Ensembl VEP
     /// writes for its plugin fields. Same discovery path and ordering as
     /// [`Self::field_names`], so the header cannot drift from the CSQ layout.
-    pub fn field_descriptions(cache_root: &Path) -> Vec<(String, String)> {
-        discover_plugins(cache_root)
-            .map(|manifests| {
-                manifests
-                    .iter()
-                    .flat_map(|m| {
-                        emit_order(m)
-                            .into_iter()
-                            .filter_map(|i| {
-                                let v = &m.value_columns[i];
-                                v.description
-                                    .as_ref()
-                                    .map(|d| (v.csq_field.clone(), d.clone()))
-                            })
-                            .collect::<Vec<_>>()
+    pub fn field_descriptions(
+        cache_root: &Path,
+        plugin_names: Option<&[String]>,
+    ) -> Result<Vec<(String, String)>> {
+        Ok(select_manifests(cache_root, plugin_names)?
+            .iter()
+            .flat_map(|m| {
+                emit_order(m)
+                    .into_iter()
+                    .filter_map(|i| {
+                        let v = &m.value_columns[i];
+                        v.description
+                            .as_ref()
+                            .map(|d| (v.csq_field.clone(), d.clone()))
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
+            .collect())
     }
 
-    /// Concatenated CSQ field names across all plugins, in plugin-name order.
+    /// Concatenated CSQ field names across all plugins, in emitted order.
     pub fn csq_fields(&self) -> Vec<String> {
         self.plugins
             .iter()
@@ -278,6 +321,72 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
+    fn write_empty_manifest(cache_root: &Path, plugin_name: &str, csq_field: &str) {
+        let plugin_dir = cache_root.join("plugin").join(plugin_name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        CacheManifest {
+            plugin_name: plugin_name.into(),
+            source_manifest: format!("{plugin_name}.source.toml"),
+            key_columns: vec![
+                "chrom".into(),
+                "start".into(),
+                "end".into(),
+                "allele_string".into(),
+            ],
+            match_columns: vec![],
+            value_columns: vec![ValueColumnRecord {
+                column: "score".into(),
+                csq_field: csq_field.into(),
+                ty: "Float32".into(),
+                description: Some(format!("{plugin_name} description")),
+            }],
+            chroms: vec![],
+            sources: vec![],
+            cache_source_version: None,
+            allele_match: Default::default(),
+            field_order: Default::default(),
+        }
+        .write(&plugin_dir)
+        .unwrap();
+    }
+
+    #[test]
+    fn selection_preserves_caller_order_and_validates_names() {
+        let dir = tempfile::tempdir().unwrap();
+        write_empty_manifest(dir.path(), "zeta", "ZETA");
+        write_empty_manifest(dir.path(), "alpha", "ALPHA");
+
+        assert_eq!(
+            PluginRegistry::field_names(dir.path(), None).unwrap(),
+            vec!["ALPHA", "ZETA"]
+        );
+
+        let requested = vec!["zeta".to_string(), "alpha".to_string()];
+        assert_eq!(
+            PluginRegistry::field_names(dir.path(), Some(&requested)).unwrap(),
+            vec!["ZETA", "ALPHA"]
+        );
+        assert_eq!(
+            PluginRegistry::field_descriptions(dir.path(), Some(&requested)).unwrap(),
+            vec![
+                ("ZETA".to_string(), "zeta description".to_string()),
+                ("ALPHA".to_string(), "alpha description".to_string()),
+            ]
+        );
+
+        let duplicate = vec!["alpha".to_string(), "alpha".to_string()];
+        let error = PluginRegistry::field_names(dir.path(), Some(&duplicate))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("duplicate plugin name"), "{error}");
+
+        let missing = vec!["missing".to_string()];
+        let error = PluginRegistry::field_names(dir.path(), Some(&missing))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("available plugins: alpha, zeta"), "{error}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn discovers_takes_and_probes() {
         let dir = tempfile::tempdir().unwrap();
@@ -343,12 +452,11 @@ mod tests {
             sources: vec![],
             cache_source_version: None,
             allele_match: Default::default(),
-            csq_rank: 0,
             field_order: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 
-        let reg = PluginRegistry::open(cache_root, "22").await.unwrap();
+        let reg = PluginRegistry::open(cache_root, "22", None).await.unwrap();
         assert_eq!(reg.csq_fields(), vec!["am_pathogenicity".to_string()]);
 
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
@@ -432,12 +540,11 @@ mod tests {
             sources: vec![],
             cache_source_version: None,
             allele_match: Default::default(),
-            csq_rank: 0,
             field_order: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 
-        let reg = PluginRegistry::open(cache_root, "22").await.unwrap();
+        let reg = PluginRegistry::open(cache_root, "22", None).await.unwrap();
         assert_eq!(reg.csq_fields(), vec!["SCORE".to_string()]);
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
         // No shard → empty (Null) field, not an error.
@@ -508,12 +615,11 @@ mod tests {
             sources: vec![],
             cache_source_version: None,
             allele_match: Default::default(),
-            csq_rank: 0,
             field_order: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 
-        let reg = PluginRegistry::open(cache_root, "22").await.unwrap();
+        let reg = PluginRegistry::open(cache_root, "22", None).await.unwrap();
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
         // Empty namespace (no transcript) still hits the per-variant row.
         match slices.probe_all(100, "A/G", None, &[])[0] {
@@ -562,12 +668,11 @@ mod tests {
             sources: vec![],
             cache_source_version: None,
             allele_match: Default::default(),
-            csq_rank: 0,
             field_order: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 
-        match PluginRegistry::open(cache_root, "22").await {
+        match PluginRegistry::open(cache_root, "22", None).await {
             Err(e) => assert!(
                 e.to_string().contains("shard is missing"),
                 "error should name the missing shard, got: {e}"

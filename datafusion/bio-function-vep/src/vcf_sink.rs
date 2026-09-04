@@ -457,6 +457,9 @@ pub struct AnnotateVcfConfig {
     /// `Some`, plugin CSQ fields are appended to output. `None` = disabled
     /// (byte-identical to no-plugin output).
     pub plugin_cache_root: Option<std::path::PathBuf>,
+    /// Plugin names in emitted CSQ block order. `None` discovers every plugin
+    /// alphabetically; `Some([])` disables plugin output.
+    pub plugins: Option<Vec<String>>,
     /// Tool name recorded in the output header's provenance lines, e.g.
     /// `"vepyr"`. `None` records this engine's own crate name. The value only
     /// labels provenance; it never claims the output came from Ensembl VEP.
@@ -513,6 +516,7 @@ impl Default for AnnotateVcfConfig {
             show_progress: false,
             on_batch_written: None,
             plugin_cache_root: None,
+            plugins: None,
             provenance_tool_name: None,
             provenance_tool_version: None,
             preserve_record_layout: false,
@@ -636,6 +640,18 @@ impl AnnotateVcfConfig {
             opts.insert(
                 "plugin_cache_root".into(),
                 serde_json::Value::String(root.to_string_lossy().into_owned()),
+            );
+        }
+        if let Some(ref plugins) = self.plugins {
+            opts.insert(
+                "plugins".into(),
+                serde_json::Value::Array(
+                    plugins
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
             );
         }
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
@@ -909,7 +925,7 @@ fn provenance_header_lines(
 fn csq_header_description(
     config: &AnnotateVcfConfig,
     cache_source_type: CacheSourceType,
-) -> String {
+) -> Result<String> {
     let field_names = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
         config.everything,
         cache_source_type == CacheSourceType::RefSeq,
@@ -920,14 +936,19 @@ fn csq_header_description(
     // Trailing custom-plugin CSQ fields (spec §5): read cheaply from manifests.
     #[cfg(feature = "parquet-cache")]
     if let Some(root) = &config.plugin_cache_root {
-        for name in crate::plugin_cache::registry::PluginRegistry::field_names(root) {
+        for name in crate::plugin_cache::registry::PluginRegistry::field_names(
+            root,
+            config.plugins.as_deref(),
+        )? {
             format_list.push('|');
             format_list.push_str(&name);
         }
     }
     // Byte-identical to the line Ensembl VEP writes in OutputFactory/VCF.pm.
     // Downstream tooling matches on this prefix, so it must not be reworded.
-    format!("Consequence annotations from Ensembl VEP. Format: {format_list}")
+    Ok(format!(
+        "Consequence annotations from Ensembl VEP. Format: {format_list}"
+    ))
 }
 
 /// Canonical 28-byte BGZF end-of-file marker (an empty BGZF block, SAM spec).
@@ -1506,6 +1527,7 @@ pub async fn annotate_to_vcf(
     // 5. Build output schema with merged metadata for VCF header.
     let df = ctx.sql(&sql).await?;
     let df_schema = df.schema();
+    let csq_description = csq_header_description(config, cache_source_type)?;
     let output_fields: Vec<datafusion::arrow::datatypes::Field> = df_schema
         .fields()
         .iter()
@@ -1523,10 +1545,12 @@ pub async fn annotate_to_vcf(
                 }
                 arrow_field.with_metadata(merged_metadata)
             } else if name == "CSQ" {
-                let description = csq_header_description(config, cache_source_type);
                 let mut meta = std::collections::HashMap::new();
                 meta.insert("bio.vcf.field.field_type".to_string(), "INFO".to_string());
-                meta.insert("bio.vcf.field.description".to_string(), description);
+                meta.insert(
+                    "bio.vcf.field.description".to_string(),
+                    csq_description.clone(),
+                );
                 meta.insert("bio.vcf.field.number".to_string(), ".".to_string());
                 meta.insert("bio.vcf.field.type".to_string(), "String".to_string());
                 arrow_field.with_metadata(meta)
@@ -1548,16 +1572,21 @@ pub async fn annotate_to_vcf(
         // Ensembl VEP writes one `##<FIELD>=<description>` line per plugin field
         // (from the plugin's `get_header_info()`), ahead of its provenance.
         #[cfg(feature = "parquet-cache")]
-        let (plugin_field_names, plugin_field_descriptions) = config
-            .plugin_cache_root
-            .as_ref()
-            .map(|root| {
+        let (plugin_field_names, plugin_field_descriptions) =
+            if let Some(root) = config.plugin_cache_root.as_ref() {
                 (
-                    crate::plugin_cache::registry::PluginRegistry::field_names(root),
-                    crate::plugin_cache::registry::PluginRegistry::field_descriptions(root),
+                    crate::plugin_cache::registry::PluginRegistry::field_names(
+                        root,
+                        config.plugins.as_deref(),
+                    )?,
+                    crate::plugin_cache::registry::PluginRegistry::field_descriptions(
+                        root,
+                        config.plugins.as_deref(),
+                    )?,
                 )
-            })
-            .unwrap_or_default();
+            } else {
+                Default::default()
+            };
         #[cfg(not(feature = "parquet-cache"))]
         let (plugin_field_names, plugin_field_descriptions): (
             Vec<String>,
@@ -2099,6 +2128,20 @@ mod tests {
     }
 
     #[test]
+    fn test_to_options_json_preserves_plugin_order() {
+        let config = AnnotateVcfConfig {
+            plugins: Some(vec!["clinvar".into(), "cadd".into()]),
+            ..Default::default()
+        };
+        let value: serde_json::Value = serde_json::from_str(&config.to_options_json()).unwrap();
+        assert_eq!(value["plugins"], serde_json::json!(["clinvar", "cadd"]));
+
+        let none: serde_json::Value =
+            serde_json::from_str(&AnnotateVcfConfig::default().to_options_json()).unwrap();
+        assert!(none.get("plugins").is_none());
+    }
+
+    #[test]
     fn test_to_options_json_with_backend_emits_cache_format() {
         let config = AnnotateVcfConfig::default();
 
@@ -2592,7 +2635,7 @@ mod tests {
             ..Default::default()
         };
 
-        let description = csq_header_description(&config, CacheSourceType::Ensembl);
+        let description = csq_header_description(&config, CacheSourceType::Ensembl).unwrap();
 
         assert!(
             description.starts_with("Consequence annotations from Ensembl VEP. Format: "),
@@ -2616,7 +2659,7 @@ mod tests {
                     flag_pick_allele_gene,
                     ..Default::default()
                 };
-                let description = csq_header_description(&config, source);
+                let description = csq_header_description(&config, source).unwrap();
                 assert!(
                     description.starts_with(PREFIX),
                     "{source:?} (pick={flag_pick_allele_gene}) produced: {description}"
@@ -2633,7 +2676,7 @@ mod tests {
             ..Default::default()
         };
 
-        let description = csq_header_description(&config, CacheSourceType::Ensembl);
+        let description = csq_header_description(&config, CacheSourceType::Ensembl).unwrap();
         assert!(description.starts_with("Consequence annotations from Ensembl VEP. Format: "));
         assert!(description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
     }
@@ -2646,7 +2689,7 @@ mod tests {
             ..Default::default()
         };
 
-        let description = csq_header_description(&config, CacheSourceType::Ensembl);
+        let description = csq_header_description(&config, CacheSourceType::Ensembl).unwrap();
         assert!(!description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
     }
 
