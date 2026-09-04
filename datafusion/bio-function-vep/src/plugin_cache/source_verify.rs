@@ -99,12 +99,15 @@ fn fingerprint(path: &Path) -> Result<(u64, Option<i64>)> {
 /// provenance records to write into the built cache's manifest.
 ///
 /// `prior` are the records of an earlier build into the same plugin directory.
-/// A source whose earlier record carries the expected digest for the same
-/// file name, size and mtime is trusted without re-hashing, so a per-chromosome
-/// workflow that calls the builder once per contig hashes an 87 GB input once,
-/// not once per call. Like any mtime-keyed cache this cannot tell apart a
-/// replacement copied with its timestamps preserved and the same byte length;
-/// a different name, size or mtime always re-hashes.
+/// A source whose earlier record carries a digest for the same file name, size
+/// and mtime is not re-hashed: that digest is reused and compared as if it had
+/// just been computed, so a per-chromosome workflow that calls the builder once
+/// per contig hashes an 87 GB input once, not once per call — in `Warn` mode
+/// too, where the recorded digest deliberately differs from the declared one,
+/// and in `Strict` mode a known mismatch fails without re-reading the file.
+/// Like any mtime-keyed cache this cannot tell apart a replacement copied with
+/// its timestamps preserved and the same byte length; a different name, size
+/// or mtime always re-hashes.
 pub fn verify_sources(
     manifest: &SourceManifest,
     mode: SourceVerification,
@@ -136,30 +139,31 @@ fn verify_source(
 
     let path = Path::new(&spec.path);
     let (size, mtime_ns) = fingerprint(path)?;
-    let earlier = prior.iter().find(|p| {
-        p.part == spec.part
+    let earlier = prior.iter().find_map(|p| {
+        (p.part == spec.part
             && p.file == record.file
-            && p.verified_md5.as_deref() == Some(expected)
             && p.size == Some(size)
             && mtime_ns.is_some()
-            && p.mtime_ns == mtime_ns
+            && p.mtime_ns == mtime_ns)
+            .then_some(p.verified_md5.as_deref())
+            .flatten()
     });
-    if earlier.is_some() {
-        info!(
-            "plugin '{plugin_name}' {label}: md5 {expected} verified by an earlier build \
-             (same file name, size and mtime), not re-hashing"
-        );
-        record.verified_md5 = Some(expected.to_string());
-        record.size = Some(size);
-        record.mtime_ns = mtime_ns;
-        return Ok(record);
-    }
-
-    info!(
-        "plugin '{plugin_name}' {label}: hashing {} ({size} bytes)",
-        path.display()
-    );
-    let (actual, hashed) = md5_file(path)?;
+    let (actual, hashed) = match earlier {
+        Some(digest) => {
+            info!(
+                "plugin '{plugin_name}' {label}: md5 {digest} computed by an earlier build \
+                 (same file name, size and mtime), not re-hashing"
+            );
+            (digest.to_string(), size)
+        }
+        None => {
+            info!(
+                "plugin '{plugin_name}' {label}: hashing {} ({size} bytes)",
+                path.display()
+            );
+            md5_file(path)?
+        }
+    };
     record.verified_md5 = Some(actual.clone());
     record.size = Some(hashed);
     record.mtime_ns = mtime_ns;
@@ -226,6 +230,73 @@ mod tests {
         let (digest, size) = md5_file(&big).unwrap();
         assert_eq!(size, body.len() as u64);
         assert_eq!(digest, format!("{:x}", Md5::digest(&body)));
+    }
+
+    /// A one-source manifest over `path` declaring `md5`, plus the record an
+    /// earlier build would have written for that file with digest `earlier`.
+    fn reuse_fixture(path: &Path, md5: &str, earlier: &str) -> (SourceManifest, Vec<SourceRecord>) {
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "csv"
+path = "{}"
+url = "https://example.org/demo.tsv"
+md5 = "{md5}"
+
+[[value_columns]]
+column = "x"
+csq_field = "X"
+type = "Utf8"
+"##,
+            path.display()
+        );
+        let manifest: SourceManifest = toml::from_str(&toml).unwrap();
+        let (size, mtime_ns) = fingerprint(path).unwrap();
+        let prior = vec![SourceRecord {
+            verified_md5: Some(earlier.into()),
+            size: Some(size),
+            mtime_ns,
+            ..SourceRecord::from_spec(&manifest.sources[0])
+        }];
+        (manifest, prior)
+    }
+
+    // The earlier build's digest is a property of the file, so it is reused
+    // whatever it was — warn mode's deliberate mismatch included — and a
+    // strict build with a known mismatch fails without re-reading the file.
+    #[test]
+    fn an_earlier_digest_is_reused_regardless_of_whether_it_matched() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("demo.tsv");
+        std::fs::write(&src, b"abc").unwrap();
+        let real = "900150983cd24fb0d6963f7d28e17f72";
+        let recorded = "11111111111111111111111111111111";
+        let declared = "22222222222222222222222222222222";
+
+        // Warn: the recorded (mismatching) digest is carried forward, not `real`.
+        let (manifest, prior) = reuse_fixture(&src, declared, recorded);
+        let records = verify_sources(&manifest, SourceVerification::Warn, &prior).unwrap();
+        assert_eq!(records[0].verified_md5.as_deref(), Some(recorded));
+
+        // Strict: the known mismatch is reported from the record, not re-hashed.
+        let error = verify_sources(&manifest, SourceVerification::Strict, &prior)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(recorded), "{error}");
+        assert!(!error.contains(real), "{error}");
+
+        // Strict with a recorded match is accepted without hashing either.
+        let (manifest, prior) = reuse_fixture(&src, declared, declared);
+        let records = verify_sources(&manifest, SourceVerification::Strict, &prior).unwrap();
+        assert_eq!(records[0].verified_md5.as_deref(), Some(declared));
+
+        // Without a usable record the file is hashed for real.
+        let records = verify_sources(&manifest, SourceVerification::Warn, &[]).unwrap();
+        assert_eq!(records[0].verified_md5.as_deref(), Some(real));
     }
 
     #[test]
