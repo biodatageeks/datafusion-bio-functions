@@ -5,9 +5,14 @@
 //!   --manifest <vepyr-plugins>/plugins/alphamissense/alphamissense.source.toml \
 //!   --source-path /tmp/AlphaMissense_hg38.bgz.tsv.gz \
 //!   --variation-cache-dir <cache root containing variation/> \
-//!   --out /tmp/plugin_cache [--chrom 22]
+//!   --out /tmp/plugin_cache [--chrom 22] [--verify-source strict|warn|skip]
 //!
 //! Multi-source manifests use one `--source-part <name>=<path>` per part.
+//! Each source is MD5-hashed once and checked against the manifest's
+//! `path_md5`/`md5` before anything is built (`--verify-source strict`, the
+//! default). Pass `warn` for a deliberate build from a re-compressed or
+//! derived file, or `skip` for a chromosome slice whose digest can never
+//! match the whole file's.
 //! Indexed TSV manifests query the requested chromosome natively through the
 //! source's sibling `.tbi`; no external `tabix` process or pre-slice is needed.
 //! ```
@@ -17,6 +22,7 @@ use std::path::PathBuf;
 use datafusion::common::{DataFusionError, Result};
 use datafusion_bio_function_vep::plugin_cache::builder::PluginCacheBuilder;
 use datafusion_bio_function_vep::plugin_cache::source_manifest::SourceManifest;
+use datafusion_bio_function_vep::plugin_cache::source_verify::SourceVerification;
 
 fn arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
@@ -86,6 +92,12 @@ async fn main() -> Result<()> {
         PluginCacheBuilder::new(&manifest, &manifest_file, &variation_cache_dir, &out);
     if let Some(chrom) = arg(&args, "--chrom") {
         builder = builder.with_chrom_filter([chrom]);
+    }
+    if let Some(mode) = arg(&args, "--verify-source") {
+        let verification: SourceVerification = mode
+            .parse()
+            .map_err(|e| DataFusionError::Execution(format!("--verify-source: {e}")))?;
+        builder = builder.with_source_verification(verification);
     }
     let cache = builder.build_all().await?;
     for c in &cache.chroms {
