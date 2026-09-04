@@ -95,6 +95,36 @@ fn fingerprint(path: &Path) -> Result<(u64, Option<i64>)> {
     Ok((meta.len(), mtime_ns))
 }
 
+/// Check that no verified source changed since it was fingerprinted. The
+/// providers reopen each source path per chromosome, so a file replaced after
+/// the hash but before or during ingestion would be published under a digest
+/// it does not have; the build calls this after every chromosome and refuses
+/// to write the manifest if a size or mtime moved. A replacement with the
+/// same size and mtime is the same blind spot as the reuse rule's.
+pub fn check_sources_unchanged(manifest: &SourceManifest, records: &[SourceRecord]) -> Result<()> {
+    for record in records.iter().filter(|r| r.verified_md5.is_some()) {
+        let Some(spec) = manifest.sources.iter().find(|s| s.part == record.part) else {
+            continue;
+        };
+        let path = Path::new(&spec.path);
+        let (size, mtime_ns) = fingerprint(path)?;
+        if record.size != Some(size) || record.mtime_ns != mtime_ns {
+            return Err(DataFusionError::Execution(format!(
+                "plugin '{}' {}: {} changed while it was being ingested (size {:?} -> {size}, \
+                 mtime_ns {:?} -> {mtime_ns:?}); the digest verified before the build no longer \
+                 describes the data read, so no manifest was written. Rebuild from the stable \
+                 file.",
+                manifest.plugin_name,
+                spec.label(),
+                path.display(),
+                record.size,
+                record.mtime_ns,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Verify every `[[source]]` of `manifest` under `mode` and return the
 /// provenance records to write into the built cache's manifest.
 ///
@@ -297,6 +327,36 @@ type = "Utf8"
         // Without a usable record the file is hashed for real.
         let records = verify_sources(&manifest, SourceVerification::Warn, &[]).unwrap();
         assert_eq!(records[0].verified_md5.as_deref(), Some(real));
+    }
+
+    #[test]
+    fn a_source_that_moves_after_verification_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("demo.tsv");
+        std::fs::write(&src, b"abc").unwrap();
+        let (manifest, _) = reuse_fixture(&src, "900150983cd24fb0d6963f7d28e17f72", "x");
+        let records = verify_sources(&manifest, SourceVerification::Strict, &[]).unwrap();
+        check_sources_unchanged(&manifest, &records).unwrap();
+
+        // Same bytes rewritten later: the mtime moves, and that is enough.
+        let file = std::fs::File::options().write(true).open(&src).unwrap();
+        file.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        )
+        .unwrap();
+        drop(file);
+        let error = check_sources_unchanged(&manifest, &records)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("changed while it was being ingested"),
+            "{error}"
+        );
+
+        // A skipped source has no digest to protect and is not checked.
+        let skipped = verify_sources(&manifest, SourceVerification::Skip, &[]).unwrap();
+        std::fs::write(&src, b"abcd").unwrap();
+        check_sources_unchanged(&manifest, &skipped).unwrap();
     }
 
     #[test]

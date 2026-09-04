@@ -13,7 +13,9 @@ use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::build::build_plugin_chrom;
 use crate::plugin_cache::cache_manifest::{CacheManifest, ChromEntry, SourceRecord};
 use crate::plugin_cache::source_manifest::SourceManifest;
-use crate::plugin_cache::source_verify::{SourceVerification, verify_sources};
+use crate::plugin_cache::source_verify::{
+    SourceVerification, check_sources_unchanged, verify_sources,
+};
 
 /// Builds every requested chromosome's plugin shard against a variation cache.
 pub struct PluginCacheBuilder<'a> {
@@ -191,6 +193,10 @@ impl<'a> PluginCacheBuilder<'a> {
                 &chrom,
             )
             .await?;
+            // The providers reopened the source for this chromosome; make sure
+            // it is still the file that was verified before publishing a
+            // digest for data that may not have been read.
+            check_sources_unchanged(self.manifest, &cache.sources)?;
             chroms.retain(|c| c.chrom != entry.chrom);
             chroms.push(entry);
         }
