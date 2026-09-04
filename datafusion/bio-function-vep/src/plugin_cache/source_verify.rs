@@ -1,6 +1,6 @@
 //! Build-input verification. Each resolved source file is hashed once, before
 //! the first chromosome is ingested, and compared to the digest its manifest
-//! declares (`path_md5`, else `md5`). A byte-parity-validated cache must not
+//! declares (`md5`). A byte-parity-validated cache must not
 //! silently drift from the input it was validated on — a truncated download,
 //! a newer weekly release, a re-sorted copy — and publish a manifest that
 //! claims the manifest's version regardless.
@@ -187,17 +187,16 @@ fn mismatch_message(
     label: &str,
     path: &Path,
     expected: &str,
-    declared_as: &str,
     upstream: &str,
     actual: &str,
     hashed: u64,
 ) -> String {
     format!(
         "plugin '{plugin_name}' {label}: MD5 mismatch for {}: expected {expected} (manifest \
-         {declared_as}{upstream}), got {actual} over {hashed} bytes. If this file is \
-         deliberately different from the declared input (a chromosome slice, a \
-         re-compression), build with source verification \"warn\" or \"skip\", or declare its \
-         digest as path_md5 in the manifest.",
+         md5{upstream}), got {actual} over {hashed} bytes. If this file is deliberately \
+         different from the declared input (a chromosome slice, a re-compression prepared \
+         as the plugin's README describes), build with source verification \"warn\" (records \
+         the digest found) or \"skip\".",
         path.display()
     )
 }
@@ -329,8 +328,7 @@ fn verify_source(
         .find(|p| p.part == spec.part && p.file == record.file);
 
     // The index decides which records each chromosome reads, so it is hashed
-    // (it is small) and recorded whenever the source has one, and checked
-    // against `index_md5` when the manifest declares it.
+    // (it is small) and recorded whenever the source has one.
     if let (Some(index), Some(index_path)) = (record.index.as_mut(), index_path(spec)) {
         let now = Fingerprint::of(&index_path)?;
         let actual = match earlier
@@ -341,27 +339,8 @@ fn verify_source(
             Some(digest) => digest,
             None => md5_file(&index_path)?.0,
         };
-        index.verified_md5 = Some(actual.clone());
+        index.verified_md5 = Some(actual);
         now.stamp_index(index);
-        if let Some(expected) = spec.index_md5.as_deref()
-            && actual != expected
-        {
-            let message = mismatch_message(
-                plugin_name,
-                &label,
-                &index_path,
-                expected,
-                "index_md5",
-                &upstream,
-                &actual,
-                now.size,
-            );
-            match mode {
-                SourceVerification::Strict => return Err(DataFusionError::Execution(message)),
-                SourceVerification::Warn => warn!("{message}"),
-                SourceVerification::Skip => unreachable!("skip returns before hashing"),
-            }
-        }
     }
 
     let Some(expected) = spec.expected_md5() else {
@@ -407,17 +386,11 @@ fn verify_source(
         return Ok(record);
     }
 
-    let declared_as = if spec.path_md5.is_some() {
-        "path_md5"
-    } else {
-        "md5"
-    };
     let message = mismatch_message(
         plugin_name,
         &label,
         path,
         expected,
-        declared_as,
         &upstream,
         &actual,
         now.size,
@@ -604,9 +577,8 @@ type = "Utf8"
         check_sources_unchanged(&manifest, &skipped).unwrap();
     }
 
-    /// A tabix VCF source with its `.tbi`, declaring `md5` for the data and
-    /// `index_md5` for the index.
-    fn indexed_fixture(dir: &Path, md5: &str, index_md5: &str) -> (SourceManifest, Path2) {
+    /// A tabix VCF source with its `.tbi`, declaring `md5` for the data.
+    fn indexed_fixture(dir: &Path, md5: &str) -> (SourceManifest, Path2) {
         let src = dir.join("demo.vcf.gz");
         std::fs::write(&src, b"abc").unwrap();
         let tbi = dir.join("demo.vcf.gz.tbi");
@@ -623,7 +595,6 @@ path = "{}"
 url = "https://example.org/demo.vcf.gz"
 md5 = "{md5}"
 index = "tabix"
-index_md5 = "{index_md5}"
 
 [[value_columns]]
 column = "x"
@@ -645,37 +616,20 @@ type = "Utf8"
         let dir = tempfile::tempdir().unwrap();
         let abc = "900150983cd24fb0d6963f7d28e17f72";
         let index = format!("{:x}", Md5::digest(b"index"));
-        let (manifest, paths) = indexed_fixture(dir.path(), abc, &index);
+        let (manifest, paths) = indexed_fixture(dir.path(), abc);
         let records = verify_sources(&manifest, SourceVerification::Strict, &[]).unwrap();
         let rec = &records[0];
         assert_eq!(rec.verified_md5.as_deref(), Some(abc));
         let idx = rec.index.as_ref().unwrap();
         assert_eq!(idx.file, "demo.vcf.gz.tbi");
-        assert_eq!(idx.md5.as_deref(), Some(index.as_str()));
         assert_eq!(idx.verified_md5.as_deref(), Some(index.as_str()));
         assert_eq!(idx.size, Some(5));
         assert!(idx.ctime_ns.is_some());
         check_sources_unchanged(&manifest, &records).unwrap();
 
-        // A wrong declared index digest fails strict, passes warn.
-        let mut wrong = manifest.clone();
-        wrong.sources[0].index_md5 = Some("00000000000000000000000000000000".into());
-        let error = verify_sources(&wrong, SourceVerification::Strict, &[])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("demo.vcf.gz.tbi"), "{error}");
-        assert!(error.contains("index_md5"), "{error}");
-        assert!(error.contains(&index), "{error}");
-        let warned = verify_sources(&wrong, SourceVerification::Warn, &[]).unwrap();
-        assert_eq!(
-            warned[0].index.as_ref().unwrap().verified_md5.as_deref(),
-            Some(index.as_str())
-        );
-
         // The index is hashed even when the data declares no digest…
         let mut undeclared = manifest.clone();
         undeclared.sources[0].md5 = None;
-        undeclared.sources[0].index_md5 = None;
         let records2 = verify_sources(&undeclared, SourceVerification::Strict, &[]).unwrap();
         assert_eq!(records2[0].verified_md5, None);
         assert_eq!(
@@ -685,7 +639,7 @@ type = "Utf8"
         // …and never in skip mode.
         let skipped = verify_sources(&manifest, SourceVerification::Skip, &[]).unwrap();
         let idx = skipped[0].index.as_ref().unwrap();
-        assert_eq!(idx.md5.as_deref(), Some(index.as_str()));
+        assert_eq!(idx.file, "demo.vcf.gz.tbi");
         assert_eq!(idx.verified_md5, None);
 
         // A stale index that omits a contig is a different file: the
@@ -702,11 +656,12 @@ type = "Utf8"
                 "{error}"
             );
         }
-        // And a fresh verification sees the new bytes.
-        let error = verify_sources(&manifest, SourceVerification::Strict, &[])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("demo.vcf.gz.tbi"), "{error}");
+        // And a fresh verification records the new index bytes.
+        let fresh = verify_sources(&manifest, SourceVerification::Strict, &[]).unwrap();
+        assert_ne!(
+            fresh[0].index.as_ref().unwrap().verified_md5.as_deref(),
+            Some(index.as_str())
+        );
         let _ = paths.src;
     }
 

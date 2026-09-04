@@ -47,7 +47,7 @@ pub struct MatchColumnRecord {
 /// Provenance of one build input, as recorded in the built cache so a shard
 /// can be traced to exact bytes without the source file.
 ///
-/// `md5`/`url`/`path_md5` are copied from the source manifest; `verified_md5`
+/// `md5`/`url` are copied from the source manifest; `verified_md5`
 /// is the digest the build actually computed over the resolved file (absent
 /// when verification was skipped or the manifest declared no digest), and
 /// `file`/`size`/`mtime_ns`/`ino`/`ctime_ns` fingerprint that file so an
@@ -65,8 +65,6 @@ pub struct SourceRecord {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub md5: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path_md5: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_md5: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,7 +94,6 @@ impl SourceRecord {
             .unwrap_or_else(|| spec.path.clone());
         let index = spec.index.map(|_| IndexRecord {
             file: format!("{file}.tbi"),
-            md5: spec.index_md5.clone(),
             verified_md5: None,
             size: None,
             mtime_ns: None,
@@ -108,7 +105,6 @@ impl SourceRecord {
             file,
             url: spec.url.clone(),
             md5: spec.md5.clone(),
-            path_md5: spec.path_md5.clone(),
             verified_md5: None,
             size: None,
             mtime_ns: None,
@@ -118,9 +114,9 @@ impl SourceRecord {
         }
     }
 
-    /// The digest this record declares for its build input: `path_md5`, else `md5`.
+    /// The digest this record declares for its build input.
     pub fn expected_md5(&self) -> Option<&str> {
-        self.path_md5.as_deref().or(self.md5.as_deref())
+        self.md5.as_deref()
     }
 }
 
@@ -129,8 +125,6 @@ impl SourceRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRecord {
     pub file: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub md5: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_md5: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

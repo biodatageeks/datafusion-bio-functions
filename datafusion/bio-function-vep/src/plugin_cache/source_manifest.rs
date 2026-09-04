@@ -87,25 +87,18 @@ pub struct SourceSpec {
     /// from. Recorded in the built cache's manifest; never fetched.
     #[serde(default)]
     pub url: Option<String>,
-    /// Provenance: MD5 (32 lowercase hex) of the file at `url`. When
-    /// `path_md5` is absent this is also the digest the build verifies the
-    /// resolved `path` against before ingesting anything.
+    /// Provenance: MD5 (32 lowercase hex) of the file at `url`, which is also
+    /// the digest the build verifies the resolved `path` against before
+    /// ingesting anything. A build input that is a derived artifact of `url`
+    /// (a BGZF re-compression of a plain-gzip file) cannot match it and is
+    /// built with verification set to warn or skip; the catalog documents the
+    /// preprocessing next to the manifest instead of declaring a second digest.
     #[serde(default)]
     pub md5: Option<String>,
-    /// MD5 of the actual build input when it is a derived artifact of `url`
-    /// (e.g. a BGZF+tabix re-compression of a plain-gzip upstream file) and so
-    /// cannot share its digest. Takes precedence over `md5` for verification.
-    #[serde(default)]
-    pub path_md5: Option<String>,
     /// Random-access index accompanying this source artifact. For tabix this
     /// declares that `path` is BGZF and has a sibling `<path>.tbi`.
     #[serde(default)]
     pub index: Option<SourceIndex>,
-    /// MD5 of that index file, when the publisher ships one (ClinVar's
-    /// `.tbi.md5`) or it was recorded with the build input. The index decides
-    /// which records a chromosome build reads, so it is verified like `path`.
-    #[serde(default)]
-    pub index_md5: Option<String>,
     /// For text VCF input, expose the record's INFO/FORMAT key lists as the
     /// reader's `_vcf_info_keys` / `_vcf_format_keys` columns. Typed VCF values
     /// alone cannot distinguish an explicit `KEY=.` from an absent key because
@@ -127,10 +120,9 @@ impl SourceSpec {
         }
     }
 
-    /// The digest the resolved `path` must hash to: `path_md5` when the build
-    /// input is a derived artifact, else `md5`. `None` means unverifiable.
+    /// The digest the resolved `path` must hash to. `None` means unverifiable.
     pub fn expected_md5(&self) -> Option<&str> {
-        self.path_md5.as_deref().or(self.md5.as_deref())
+        self.md5.as_deref()
     }
 
     /// Human-readable label for messages: the `part`, or the file name.
@@ -281,34 +273,21 @@ impl SourceManifest {
     /// built-cache manifests.
     pub fn validate(&self) -> Result<()> {
         for source in &self.sources {
-            for (key, digest) in [
-                ("md5", &source.md5),
-                ("path_md5", &source.path_md5),
-                ("index_md5", &source.index_md5),
-            ] {
-                if let Some(digest) = digest
-                    && !is_md5_hex(digest)
-                {
-                    return Err(DataFusionError::Execution(format!(
-                        "plugin '{}' {} declares {key} = {digest:?}, but an MD5 digest must be \
-                         32 lowercase hex characters",
-                        self.plugin_name,
-                        source.label()
-                    )));
-                }
+            if let Some(digest) = &source.md5
+                && !is_md5_hex(digest)
+            {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin '{}' {} declares md5 = {digest:?}, but an MD5 digest must be 32 \
+                     lowercase hex characters",
+                    self.plugin_name,
+                    source.label()
+                )));
             }
             if source.record_layout && source.provider != ProviderKind::Vcf {
                 return Err(DataFusionError::Execution(format!(
                     "plugin '{}' requests record_layout for a {:?} source; record layout is \
                      supported only for text VCF sources",
                     self.plugin_name, source.provider
-                )));
-            }
-            if source.index.is_none() && source.index_md5.is_some() {
-                return Err(DataFusionError::Execution(format!(
-                    "plugin '{}' {} declares index_md5 but no index",
-                    self.plugin_name,
-                    source.label()
                 )));
             }
             if source.index == Some(SourceIndex::Tabix) {
@@ -434,7 +413,6 @@ type = "Float32"
             m.sources[0].md5.as_deref(),
             Some("88577a55f1cd519d44e0f415ba248eb9")
         );
-        assert_eq!(m.sources[0].path_md5, None);
         assert_eq!(
             m.sources[0].expected_md5(),
             Some("88577a55f1cd519d44e0f415ba248eb9")
@@ -557,39 +535,16 @@ type = "Float32"
     }
 
     #[test]
-    fn path_md5_describes_the_build_input_and_wins_over_md5() {
-        let toml = CADD_LIKE.replace(
-            "index = \"tabix\"\n",
-            "path_md5 = \"46d0028375cf95088bd014ff6855cffd\"\nindex = \"tabix\"\n",
-        );
-        let m: SourceManifest = toml::from_str(&toml).unwrap();
-        m.validate().unwrap();
-        assert_eq!(
-            m.sources[0].md5.as_deref(),
-            Some("88577a55f1cd519d44e0f415ba248eb9")
-        );
-        assert_eq!(
-            m.sources[0].expected_md5(),
-            Some("46d0028375cf95088bd014ff6855cffd")
-        );
-    }
-
-    #[test]
     fn rejects_malformed_md5_digests() {
-        for (key, bad) in [
-            ("md5", "88577A55F1CD519D44E0F415BA248EB9"),
-            ("md5", "88577a55"),
-            ("path_md5", "not-a-digest-at-all-not-a-digest"),
-            ("index_md5", "88577A55F1CD519D44E0F415BA248EB9"),
+        for bad in [
+            "88577A55F1CD519D44E0F415BA248EB9",
+            "88577a55",
+            "not-a-digest-at-all-not-a-digest",
         ] {
             let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
-            match key {
-                "md5" => manifest.sources[0].md5 = Some(bad.into()),
-                "path_md5" => manifest.sources[0].path_md5 = Some(bad.into()),
-                _ => manifest.sources[0].index_md5 = Some(bad.into()),
-            }
+            manifest.sources[0].md5 = Some(bad.into());
             let error = manifest.validate().unwrap_err().to_string();
-            assert!(error.contains(key), "{error}");
+            assert!(error.contains("md5"), "{error}");
             assert!(error.contains("32 lowercase hex"), "{error}");
         }
     }
@@ -602,23 +557,10 @@ type = "Float32"
             path: "x".into(),
             url: None,
             md5: None,
-            path_md5: None,
             index: None,
-            index_md5: None,
             record_layout: false,
             csv: None,
         };
         assert_eq!(src.table_name("cadd"), "plugin_cadd_src");
-    }
-
-    #[test]
-    fn index_md5_needs_an_index() {
-        let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
-        manifest.sources[0].index_md5 = Some("88577a55f1cd519d44e0f415ba248eb9".into());
-        manifest.validate().unwrap();
-        manifest.sources[0].index = None;
-        manifest.sources[0].csv.as_mut().unwrap().compression = None;
-        let error = manifest.validate().unwrap_err().to_string();
-        assert!(error.contains("index_md5 but no index"), "{error}");
     }
 }

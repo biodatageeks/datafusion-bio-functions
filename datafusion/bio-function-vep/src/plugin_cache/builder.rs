@@ -62,7 +62,7 @@ impl<'a> PluginCacheBuilder<'a> {
         self
     }
 
-    /// How to treat each source's declared `md5`/`path_md5` before building.
+    /// How to treat each source's declared `md5` before building.
     /// Defaults to [`SourceVerification::Strict`]; a manifest that declares no
     /// digest is never hashed regardless of mode.
     pub fn with_source_verification(mut self, verification: SourceVerification) -> Self {
@@ -294,9 +294,9 @@ fn compare_provenance(prior: &CacheManifest, sources: &[SourceRecord]) -> Proven
             (None, None) => {}
             (Some(a), Some(b)) => match compare_digests(
                 a.verified_md5.as_deref(),
-                a.md5.as_deref(),
+                None,
                 b.verified_md5.as_deref(),
-                b.md5.as_deref(),
+                None,
             ) {
                 Provenance::Different => return Provenance::Different,
                 Provenance::Unverified => unverified = true,
@@ -593,7 +593,6 @@ type = "Float32"
             Some("https://example.org/demo/scores.tsv.gz")
         );
         assert_eq!(record.md5.as_deref(), Some(actual.as_str()));
-        assert_eq!(record.path_md5, None);
         assert_eq!(record.verified_md5.as_deref(), Some(actual.as_str()));
         assert_eq!(record.size, Some(size));
         assert!(record.mtime_ns.is_some());
@@ -639,25 +638,6 @@ type = "Float32"
         assert_eq!(record.md5.as_deref(), Some(WRONG_MD5));
         assert_eq!(record.verified_md5, None);
         assert_eq!(record.size, None);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn path_md5_is_checked_instead_of_the_upstream_md5() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut manifest, cache_dir, out) = verified_fixture(dir.path(), WRONG_MD5);
-        let (actual, _) =
-            crate::plugin_cache::source_verify::md5_file(Path::new(&manifest.sources[0].path))
-                .unwrap();
-        manifest.sources[0].path_md5 = Some(actual.clone());
-        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
-            .with_chrom_filter(["1"])
-            .build_all()
-            .await
-            .unwrap();
-        let record = &cache.sources[0];
-        assert_eq!(record.md5.as_deref(), Some(WRONG_MD5));
-        assert_eq!(record.path_md5.as_deref(), Some(actual.as_str()));
-        assert_eq!(record.verified_md5.as_deref(), Some(actual.as_str()));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -920,7 +900,6 @@ type = "Float32"
             file: "x".into(),
             url: None,
             md5: md5.map(String::from),
-            path_md5: None,
             verified_md5: verified.map(String::from),
             size: None,
             mtime_ns: None,
@@ -989,7 +968,6 @@ type = "Float32"
         let with_index = |mut r: SourceRecord, verified: Option<&str>| {
             r.index = Some(IndexRecord {
                 file: "x.tbi".into(),
-                md5: None,
                 verified_md5: verified.map(String::from),
                 size: None,
                 mtime_ns: None,

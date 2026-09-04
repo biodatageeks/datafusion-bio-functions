@@ -9,7 +9,7 @@
 //!
 //! Multi-source manifests use one `--source-part <name>=<path>` per part.
 //! Each source is MD5-hashed once and checked against the manifest's
-//! `path_md5`/`md5` before anything is built (`--verify-source strict`, the
+//! `md5` before anything is built (`--verify-source strict`, the
 //! default). Pass `warn` for a deliberate build from a re-compressed or
 //! derived file, or `skip` for a chromosome slice whose digest can never
 //! match the whole file's.
