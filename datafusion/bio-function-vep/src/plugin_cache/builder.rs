@@ -122,26 +122,44 @@ impl<'a> PluginCacheBuilder<'a> {
         // - same output schema — a filtered rebuild after a value/match-column
         //   change must NOT keep old shards under the new schema (that would
         //   misproject them / panic in `from_batch`);
-        // - same declared source digests — a filtered rebuild against a new
-        //   source release must NOT keep shards built from the old one under
-        //   a manifest that claims the new digest.
-        // In either case the stale entries are dropped.
-        let mut chroms: Vec<ChromEntry> = prior
-            .as_ref()
-            .filter(|old| schema_matches(old, &cache))
-            .filter(|old| {
-                let same = provenance_matches(old, &cache.sources);
-                if !same {
+        // - same source digests — a filtered rebuild against a new source
+        //   release must NOT keep shards built from the old one under a
+        //   manifest that claims the new digest.
+        // In either case the stale entries are dropped. A prior manifest with
+        // no `sources` block (built before provenance was recorded) cannot be
+        // compared at all: its chromosomes are kept only when this build makes
+        // no verified claim of its own, otherwise the build is refused rather
+        // than attributing a verified digest to shards of unknown origin.
+        let claims_verified = cache.sources.iter().any(|s| s.verified_md5.is_some());
+        let mut chroms: Vec<ChromEntry> =
+            match prior.as_ref().filter(|old| schema_matches(old, &cache)) {
+                None => vec![],
+                Some(old) if old.sources.is_empty() => {
+                    if claims_verified && !old.chroms.is_empty() {
+                        return Err(DataFusionError::Execution(format!(
+                            "plugin '{}': the existing cache at {} predates source provenance \
+                         (its manifest has no `sources`), so its {} chromosome(s) cannot be \
+                         attributed to the input verified for this build. Rebuild the whole \
+                         plugin (remove that directory, or build every chromosome), or add \
+                         chromosomes without a provenance claim using source verification \
+                         \"skip\".",
+                            self.manifest.plugin_name,
+                            plugin_dir.display(),
+                            old.chroms.len()
+                        )));
+                    }
+                    old.chroms.clone()
+                }
+                Some(old) if provenance_matches(old, &cache.sources) => old.chroms.clone(),
+                Some(_) => {
                     info!(
-                        "plugin '{}': source digests differ from the earlier build; its \
-                         other chromosomes are dropped from the manifest",
+                        "plugin '{}': source digests differ from the earlier build; its other \
+                     chromosomes are dropped from the manifest",
                         self.manifest.plugin_name
                     );
+                    vec![]
                 }
-                same
-            })
-            .map(|m| m.chroms.clone())
-            .unwrap_or_default();
+            };
         let _ = self.overwrite; // build_plugin_chrom overwrites the shard file per chrom.
         for chrom in self.resolve_chroms()? {
             let shard = self.variation_shard(&chrom);
@@ -193,13 +211,10 @@ fn schema_matches(a: &CacheManifest, b: &CacheManifest) -> bool {
 /// build's `sources`, part for part. Digests actually verified are compared
 /// when both builds have them — two `Warn` builds can share a declared digest
 /// and still hash different bytes — otherwise the declared digests are. A
-/// prior manifest with no `sources` block (built before provenance was
-/// recorded) cannot be compared and is trusted, as it was before. A part with
-/// no digest on either side has nothing to compare and passes.
+/// part with no digest on either side has nothing to compare and passes. A
+/// prior manifest with no `sources` block is the caller's decision, not this
+/// function's: it has no parts to match, so it never matches here.
 fn provenance_matches(prior: &CacheManifest, sources: &[SourceRecord]) -> bool {
-    if prior.sources.is_empty() {
-        return true;
-    }
     prior.sources.len() == sources.len()
         && sources.iter().all(|new| {
             prior
@@ -706,10 +721,52 @@ type = "Float32"
         );
     }
 
-    // A cache built before provenance was recorded has no `sources` block;
-    // an incremental build into it keeps its chromosomes as it always did.
+    // A cache built before provenance was recorded has no `sources` block.
+    // An incremental build that verifies its input must not attribute that
+    // digest to shards of unknown origin: it is refused, with the way out
+    // named. The same build without a provenance claim keeps the chromosomes
+    // as it always did.
     #[tokio::test(flavor = "multi_thread")]
-    async fn filtered_rebuild_into_a_cache_without_provenance_preserves_chroms() {
+    async fn filtered_rebuild_into_a_cache_without_provenance_is_refused_when_verifying() {
+        let dir = tempfile::tempdir().unwrap();
+        let (probe, _, _) = verified_fixture(dir.path(), WRONG_MD5);
+        let (actual, _) =
+            crate::plugin_cache::source_verify::md5_file(Path::new(&probe.sources[0].path))
+                .unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
+        let plugin_dir = out.join("plugin").join("demo");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let mut earlier = CacheManifest::from_source(&manifest, "demo.source.toml");
+        earlier.chroms = vec![ChromEntry {
+            chrom: "chr1".into(),
+            file: "chr1.parquet".into(),
+            rows: 1,
+            warm: 1,
+            cold: 0,
+        }];
+        earlier.write(&plugin_dir).unwrap();
+
+        let error = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .build_all()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("predates source provenance"), "{error}");
+        assert!(error.contains("1 chromosome(s)"), "{error}");
+        assert!(error.contains("\"skip\""), "{error}");
+        // Nothing was written: the earlier manifest is intact.
+        let kept: CacheManifest = serde_json::from_str(
+            &std::fs::read_to_string(plugin_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kept.chroms.len(), 1);
+        assert!(kept.sources.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn filtered_rebuild_into_a_cache_without_provenance_preserves_chroms_when_not_verifying()
+    {
         let dir = tempfile::tempdir().unwrap();
         let (probe, _, _) = verified_fixture(dir.path(), WRONG_MD5);
         let (actual, _) =
@@ -735,11 +792,23 @@ type = "Float32"
 
         let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
             .with_chrom_filter(["2"])
+            .with_source_verification(SourceVerification::Skip)
             .build_all()
             .await
             .unwrap();
         let chroms: Vec<&str> = cache.chroms.iter().map(|c| c.chrom.as_str()).collect();
         assert_eq!(chroms, ["chr1", "chr2"]);
+        assert!(cache.sources[0].verified_md5.is_none());
+
+        // A manifest that declares no digest makes no claim either.
+        let mut undeclared = manifest.clone();
+        undeclared.sources[0].md5 = None;
+        let cache = PluginCacheBuilder::new(&undeclared, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .build_all()
+            .await
+            .unwrap();
+        assert_eq!(cache.chroms.len(), 2);
     }
 
     #[test]
@@ -790,8 +859,9 @@ type = "Float32"
         // A skipped verification on one side falls back to the declared digest.
         assert!(provenance_matches(&prior, &same));
 
+        // No prior provenance never matches; `build_all` decides that case.
         prior.sources.clear();
-        assert!(provenance_matches(&prior, &changed));
+        assert!(!provenance_matches(&prior, &same));
     }
 
     // Two warn-mode builds against the same declared digest but different
