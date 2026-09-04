@@ -1164,22 +1164,33 @@ struct VepFlags {
 
 impl VepFlags {
     fn from_options_json(options_json: Option<&str>) -> Self {
+        Self::from_options_json_with_field_pruning(options_json, false)
+    }
+
+    fn from_options_json_with_field_pruning(
+        options_json: Option<&str>,
+        prune_unselected_fields: bool,
+    ) -> Self {
         let parse = |key| {
             options_json
                 .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
                 .unwrap_or(false)
         };
         let everything = parse("everything");
-        let selected_fields: Option<HashSet<String>> = options_json
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-            .and_then(|value| {
-                value.get("fields")?.as_array().map(|fields| {
-                    fields
-                        .iter()
-                        .filter_map(|field| field.as_str().map(ToString::to_string))
-                        .collect()
-                })
-            });
+        let selected_fields: Option<HashSet<String>> = prune_unselected_fields
+            .then(|| {
+                options_json
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .and_then(|value| {
+                        value.get("fields")?.as_array().map(|fields| {
+                            fields
+                                .iter()
+                                .filter_map(|field| field.as_str().map(ToString::to_string))
+                                .collect()
+                        })
+                    })
+            })
+            .flatten();
         let emits_any = |names: &[&str]| {
             selected_fields
                 .as_ref()
@@ -1187,10 +1198,9 @@ impl VepFlags {
         };
         // --everything implies all sub-flags per Config.pm#L346-L374.
         let max_af = (everything || parse("max_af")) && emits_any(&["MAX_AF", "MAX_AF_POPS"]);
-        let af = (everything || parse("af"))
-            && (max_af || emits_any(&["AF", "AFR_AF", "AMR_AF", "EAS_AF", "EUR_AF", "SAS_AF"]));
+        let af = (everything || parse("af")) && (max_af || emits_any(&["AF"]));
         let af_1kg = (everything || parse("af_1kg"))
-            && (max_af || emits_any(&["AF", "AFR_AF", "AMR_AF", "EAS_AF", "EUR_AF", "SAS_AF"]));
+            && (max_af || emits_any(&["AFR_AF", "AMR_AF", "EAS_AF", "EUR_AF", "SAS_AF"]));
         let af_gnomade = (everything || parse("af_gnomade"))
             && (max_af
                 || selected_fields.as_ref().is_none_or(|selected| {
@@ -5449,7 +5459,17 @@ impl AnnotateProvider {
             eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned START ======");
         }
 
-        let flags = VepFlags::from_options_json(self.options_json.as_deref());
+        let typed_cols_start = self.vcf_field_count() + 2;
+        let typed_cols_end = typed_cols_start + self.annotation_column_defs.len();
+        let skip_typed_cols = projection.is_some_and(|indices| {
+            !indices
+                .iter()
+                .any(|&index| index >= typed_cols_start && index < typed_cols_end)
+        });
+        let flags = VepFlags::from_options_json_with_field_pruning(
+            self.options_json.as_deref(),
+            skip_typed_cols,
+        );
         let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
         let transcript_selection = self.transcript_selection;
         let pick_flags = self.pick_flags.clone();
@@ -6791,18 +6811,15 @@ impl AnnotateProvider {
                         }
                     }
                 } // end if !skip_csq (cache-miss CSQ formatting)
-                if let Some(projection) = &self.csq_field_projection {
-                    projection.project_entries(
-                        &csq_buf,
-                        plugin_n_fields,
-                        &mut projected_csq_buf,
-                    )?;
-                    std::mem::swap(&mut csq_buf, &mut projected_csq_buf);
-                }
                 if let Some(started) = csq_format_started {
                     engine_profile.csq_format += started.elapsed();
                 }
             };
+
+            if !skip_csq && let Some(projection) = &self.csq_field_projection {
+                projection.project_entries(&csq_buf, plugin_n_fields, &mut projected_csq_buf)?;
+                std::mem::swap(&mut csq_buf, &mut projected_csq_buf);
+            }
 
             let append_scalars_started = engine_profile_enabled.then(Instant::now);
             if skip_csq {
@@ -16772,20 +16789,30 @@ mod tests {
 
     #[test]
     fn test_selected_fields_disable_unemitted_colocated_work() {
-        let omitted =
-            VepFlags::from_options_json(Some(r#"{"everything":true,"fields":["Allele","Gene"]}"#));
+        let omitted = VepFlags::from_options_json_with_field_pruning(
+            Some(r#"{"everything":true,"fields":["Allele","Gene"]}"#),
+            true,
+        );
         assert!(!omitted.check_existing);
         assert!(!omitted.af);
         assert!(!omitted.af_gnomade);
         assert!(!omitted.pubmed);
 
-        let selected = VepFlags::from_options_json(Some(
-            r#"{"everything":true,"fields":["Existing_variation","gnomADe_AF","PUBMED"]}"#,
-        ));
+        let selected = VepFlags::from_options_json_with_field_pruning(
+            Some(r#"{"everything":true,"fields":["Existing_variation","gnomADe_AF","PUBMED"]}"#),
+            true,
+        );
         assert!(selected.check_existing);
         assert!(selected.af_gnomade);
         assert!(selected.pubmed);
         assert!(!selected.af_gnomadg);
+
+        let typed_output =
+            VepFlags::from_options_json(Some(r#"{"everything":true,"fields":["Allele","Gene"]}"#));
+        assert!(typed_output.check_existing);
+        assert!(typed_output.af);
+        assert!(typed_output.af_gnomade);
+        assert!(typed_output.pubmed);
     }
 
     #[test]
