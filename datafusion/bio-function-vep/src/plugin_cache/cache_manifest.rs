@@ -50,8 +50,9 @@ pub struct MatchColumnRecord {
 /// `md5`/`url`/`path_md5` are copied from the source manifest; `verified_md5`
 /// is the digest the build actually computed over the resolved file (absent
 /// when verification was skipped or the manifest declared no digest), and
-/// `size`/`mtime` fingerprint that file so an incremental per-chromosome
-/// build can trust an earlier verification instead of re-hashing.
+/// `file`/`size`/`mtime_ns` fingerprint that file so an incremental
+/// per-chromosome build can trust an earlier verification instead of
+/// re-hashing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,9 +69,9 @@ pub struct SourceRecord {
     pub verified_md5: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
-    /// Modification time of the hashed file, seconds since the Unix epoch.
+    /// Modification time of the hashed file, nanoseconds since the Unix epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mtime: Option<i64>,
+    pub mtime_ns: Option<i64>,
 }
 
 impl SourceRecord {
@@ -88,8 +89,13 @@ impl SourceRecord {
             path_md5: spec.path_md5.clone(),
             verified_md5: None,
             size: None,
-            mtime: None,
+            mtime_ns: None,
         }
+    }
+
+    /// The digest this record declares for its build input: `path_md5`, else `md5`.
+    pub fn expected_md5(&self) -> Option<&str> {
+        self.path_md5.as_deref().or(self.md5.as_deref())
     }
 }
 
@@ -209,7 +215,9 @@ impl CacheManifest {
                 })
                 .collect(),
             chroms: vec![],
-            sources: src.sources.iter().map(SourceRecord::from_spec).collect(),
+            // Filled in by the build, like `chroms`: `build_all` verifies the
+            // sources and records what it found.
+            sources: vec![],
             cache_source_version: None,
             allele_match: src.allele_match,
             csq_rank: src.csq_rank,

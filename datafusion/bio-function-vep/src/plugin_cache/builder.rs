@@ -7,10 +7,11 @@
 use std::path::{Path, PathBuf};
 
 use datafusion::common::{DataFusionError, Result};
+use log::info;
 
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::build::build_plugin_chrom;
-use crate::plugin_cache::cache_manifest::{CacheManifest, ChromEntry};
+use crate::plugin_cache::cache_manifest::{CacheManifest, ChromEntry, SourceRecord};
 use crate::plugin_cache::source_manifest::SourceManifest;
 use crate::plugin_cache::source_verify::{SourceVerification, verify_sources};
 
@@ -99,29 +100,48 @@ impl<'a> PluginCacheBuilder<'a> {
 
     /// Build every resolved chromosome and write `plugin/<name>/manifest.json`.
     pub async fn build_all(&self) -> Result<CacheManifest> {
+        // A manifest built programmatically may not have passed through
+        // `SourceManifest::load`; the digest shape check has to run before
+        // any digest is compared.
+        self.manifest.validate()?;
         let plugin_dir = self.out.join("plugin").join(&self.manifest.plugin_name);
         let mut cache = CacheManifest::from_source(self.manifest, &self.manifest_file);
-        // Preserve chromosomes from a prior build (their shards remain on disk),
-        // so a filtered/incremental build UPSERTs the rebuilt chroms rather than
-        // dropping the others from the manifest that runtime discovery relies on.
-        // BUT only when the prior manifest's schema matches the new one — a
-        // filtered rebuild after a value/match-column change must NOT keep old
-        // shards under the new schema (that would misproject them / panic in
-        // `from_batch`); in that case we drop the stale entries.
         let prior: Option<CacheManifest> =
             std::fs::read_to_string(plugin_dir.join("manifest.json"))
                 .ok()
                 .and_then(|t| serde_json::from_str::<CacheManifest>(&t).ok());
-        let mut chroms: Vec<ChromEntry> = prior
-            .as_ref()
-            .filter(|old| schema_matches(old, &cache))
-            .map(|m| m.chroms.clone())
-            .unwrap_or_default();
         // Verify the inputs before ingesting anything — once per source part,
         // not once per chromosome. An earlier build's records let an
         // incremental per-chrom build skip re-hashing an unchanged file.
         let prior_sources = prior.as_ref().map(|m| m.sources.as_slice()).unwrap_or(&[]);
         cache.sources = verify_sources(self.manifest, self.verification, prior_sources)?;
+        // Preserve chromosomes from a prior build (their shards remain on disk),
+        // so a filtered/incremental build UPSERTs the rebuilt chroms rather than
+        // dropping the others from the manifest that runtime discovery relies on.
+        // BUT only when the prior build is compatible with this one:
+        // - same output schema — a filtered rebuild after a value/match-column
+        //   change must NOT keep old shards under the new schema (that would
+        //   misproject them / panic in `from_batch`);
+        // - same declared source digests — a filtered rebuild against a new
+        //   source release must NOT keep shards built from the old one under
+        //   a manifest that claims the new digest.
+        // In either case the stale entries are dropped.
+        let mut chroms: Vec<ChromEntry> = prior
+            .as_ref()
+            .filter(|old| schema_matches(old, &cache))
+            .filter(|old| {
+                let same = provenance_matches(old, &cache.sources);
+                if !same {
+                    info!(
+                        "plugin '{}': source digests differ from the earlier build; its \
+                         other chromosomes are dropped from the manifest",
+                        self.manifest.plugin_name
+                    );
+                }
+                same
+            })
+            .map(|m| m.chroms.clone())
+            .unwrap_or_default();
         let _ = self.overwrite; // build_plugin_chrom overwrites the shard file per chrom.
         for chrom in self.resolve_chroms()? {
             let shard = self.variation_shard(&chrom);
@@ -167,6 +187,27 @@ fn schema_matches(a: &CacheManifest, b: &CacheManifest) -> bool {
             .iter()
             .zip(&b.match_columns)
             .all(|(x, y)| x.column == y.column && x.template == y.template)
+}
+
+/// True when the prior build declared the same source digests, part for part,
+/// as this build's `sources`, so its shards came from the same input release.
+/// A prior manifest with no `sources` block (built before provenance was
+/// recorded) cannot be compared and is trusted, as it was before. A part with
+/// no digest on either side has nothing to compare and passes.
+fn provenance_matches(prior: &CacheManifest, sources: &[SourceRecord]) -> bool {
+    if prior.sources.is_empty() {
+        return true;
+    }
+    prior.sources.len() == sources.len()
+        && sources.iter().all(|new| {
+            prior.sources.iter().any(|old| {
+                old.part == new.part
+                    && match (old.expected_md5(), new.expected_md5()) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    }
+            })
+        })
 }
 
 #[cfg(test)]
@@ -434,7 +475,7 @@ type = "Float32"
         assert_eq!(record.path_md5, None);
         assert_eq!(record.verified_md5.as_deref(), Some(actual.as_str()));
         assert_eq!(record.size, Some(size));
-        assert!(record.mtime.is_some());
+        assert!(record.mtime_ns.is_some());
 
         // The record survives the round trip through manifest.json.
         let found = crate::plugin_cache::cache_manifest::discover_plugins(&out).unwrap();
@@ -524,27 +565,43 @@ type = "Float32"
         let (manifest, cache_dir, out) = verified_fixture(dir.path(), WRONG_MD5);
         let src = Path::new(&manifest.sources[0].path);
         let meta = std::fs::metadata(src).unwrap();
-        let mtime = meta
+        let mtime_ns = meta
             .modified()
             .unwrap()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64;
+            .as_nanos() as i64;
 
         // An earlier build's manifest claims to have verified the (wrong)
-        // digest over this exact size and mtime. A strict build now succeeds
-        // only if it trusts that record instead of re-hashing.
+        // digest over this exact file name, size and mtime. A strict build now
+        // succeeds only if it trusts that record instead of re-hashing.
         let plugin_dir = out.join("plugin").join("demo");
         std::fs::create_dir_all(&plugin_dir).unwrap();
         let mut earlier = CacheManifest::from_source(&manifest, "demo.source.toml");
-        earlier.sources = vec![SourceRecord {
+        let trusted = SourceRecord {
             verified_md5: Some(WRONG_MD5.into()),
             size: Some(meta.len()),
-            mtime: Some(mtime),
+            mtime_ns: Some(mtime_ns),
             ..SourceRecord::from_spec(&manifest.sources[0])
+        };
+
+        // The record is bound to the file name: a record for another file
+        // with the same size and mtime is not trusted, and the re-hash fails.
+        earlier.sources = vec![SourceRecord {
+            file: "other.tsv.gz".into(),
+            ..trusted.clone()
         }];
         earlier.write(&plugin_dir).unwrap();
+        let error = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .build_all()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MD5 mismatch"), "{error}");
 
+        earlier.sources = vec![trusted];
+        earlier.write(&plugin_dir).unwrap();
         let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
             .with_chrom_filter(["1"])
             .build_all()
@@ -567,6 +624,129 @@ type = "Float32"
             .unwrap_err()
             .to_string();
         assert!(error.contains("MD5 mismatch"), "{error}");
+    }
+
+    // A filtered rebuild from the SAME verified input keeps the other
+    // chromosomes — and the second call trusts the first call's verification.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn filtered_rebuild_from_the_same_source_preserves_other_chroms() {
+        let dir = tempfile::tempdir().unwrap();
+        let (probe, _, _) = verified_fixture(dir.path(), WRONG_MD5);
+        let (actual, _) =
+            crate::plugin_cache::source_verify::md5_file(Path::new(&probe.sources[0].path))
+                .unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
+        PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .build_all()
+            .await
+            .unwrap();
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .build_all()
+            .await
+            .unwrap();
+        let chroms: Vec<&str> = cache.chroms.iter().map(|c| c.chrom.as_str()).collect();
+        assert_eq!(chroms, ["chr1", "chr2"]);
+        assert_eq!(
+            cache.sources[0].verified_md5.as_deref(),
+            Some(actual.as_str())
+        );
+    }
+
+    // A filtered rebuild against a NEW source release must not keep shards
+    // built from the old one under a manifest that claims the new digest.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn filtered_rebuild_after_a_source_change_drops_stale_chroms() {
+        let dir = tempfile::tempdir().unwrap();
+        let (probe, _, _) = verified_fixture(dir.path(), WRONG_MD5);
+        let (actual, _) =
+            crate::plugin_cache::source_verify::md5_file(Path::new(&probe.sources[0].path))
+                .unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
+        PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .build_all()
+            .await
+            .unwrap();
+
+        // The manifest now declares a different release; build chr2 from it
+        // (warn mode, since the fixture file is unchanged).
+        let mut next = manifest.clone();
+        next.sources[0].md5 = Some(WRONG_MD5.into());
+        let cache = PluginCacheBuilder::new(&next, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .with_source_verification(SourceVerification::Warn)
+            .build_all()
+            .await
+            .unwrap();
+        let chroms: Vec<&str> = cache.chroms.iter().map(|c| c.chrom.as_str()).collect();
+        assert_eq!(chroms, ["chr2"], "chr1 was built from another release");
+        assert_eq!(cache.sources[0].md5.as_deref(), Some(WRONG_MD5));
+    }
+
+    // A cache built before provenance was recorded has no `sources` block;
+    // an incremental build into it keeps its chromosomes as it always did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn filtered_rebuild_into_a_cache_without_provenance_preserves_chroms() {
+        let dir = tempfile::tempdir().unwrap();
+        let (probe, _, _) = verified_fixture(dir.path(), WRONG_MD5);
+        let (actual, _) =
+            crate::plugin_cache::source_verify::md5_file(Path::new(&probe.sources[0].path))
+                .unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
+        let plugin_dir = out.join("plugin").join("demo");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let mut earlier = CacheManifest::from_source(&manifest, "demo.source.toml");
+        earlier.chroms = vec![ChromEntry {
+            chrom: "chr1".into(),
+            file: "chr1.parquet".into(),
+            rows: 1,
+            warm: 1,
+            cold: 0,
+        }];
+        earlier.write(&plugin_dir).unwrap();
+        assert!(
+            !std::fs::read_to_string(plugin_dir.join("manifest.json"))
+                .unwrap()
+                .contains("\"sources\"")
+        );
+
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .build_all()
+            .await
+            .unwrap();
+        let chroms: Vec<&str> = cache.chroms.iter().map(|c| c.chrom.as_str()).collect();
+        assert_eq!(chroms, ["chr1", "chr2"]);
+    }
+
+    #[test]
+    fn provenance_comparison_is_per_part_and_tolerates_undeclared_digests() {
+        let rec = |part: Option<&str>, md5: Option<&str>| SourceRecord {
+            part: part.map(String::from),
+            file: "x".into(),
+            url: None,
+            md5: md5.map(String::from),
+            path_md5: None,
+            verified_md5: None,
+            size: None,
+            mtime_ns: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, _, _) = verified_fixture(dir.path(), WRONG_MD5);
+        let mut prior = CacheManifest::from_source(&manifest, "demo.source.toml");
+        prior.sources = vec![rec(Some("snv"), Some("a")), rec(Some("indel"), Some("b"))];
+        let same = [rec(Some("snv"), Some("a")), rec(Some("indel"), Some("b"))];
+        let changed = [rec(Some("snv"), Some("a")), rec(Some("indel"), Some("c"))];
+        let undeclared = [rec(Some("snv"), None), rec(Some("indel"), Some("b"))];
+        let fewer = [rec(Some("snv"), Some("a"))];
+        assert!(provenance_matches(&prior, &same));
+        assert!(!provenance_matches(&prior, &changed));
+        assert!(provenance_matches(&prior, &undeclared));
+        assert!(!provenance_matches(&prior, &fewer));
+        prior.sources.clear();
+        assert!(provenance_matches(&prior, &changed));
     }
 
     // A filtered/incremental rebuild must UPSERT into the existing manifest, not

@@ -80,27 +80,31 @@ pub fn md5_file(path: &Path) -> Result<(String, u64)> {
     Ok((format!("{:x}", hasher.finalize()), size))
 }
 
-/// `(size, mtime)` of a file: the fingerprint an earlier verification is keyed by.
+/// `(size, mtime_ns)` of a file: with the file name, the fingerprint an
+/// earlier verification is keyed by. Full mtime precision, so two writes
+/// within one second are not confused.
 fn fingerprint(path: &Path) -> Result<(u64, Option<i64>)> {
     let meta = std::fs::metadata(path).map_err(|e| {
         DataFusionError::Execution(format!("stat source '{}': {e}", path.display()))
     })?;
-    let mtime = meta
+    let mtime_ns = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64);
-    Ok((meta.len(), mtime))
+        .and_then(|d| i64::try_from(d.as_nanos()).ok());
+    Ok((meta.len(), mtime_ns))
 }
 
 /// Verify every `[[source]]` of `manifest` under `mode` and return the
 /// provenance records to write into the built cache's manifest.
 ///
 /// `prior` are the records of an earlier build into the same plugin directory.
-/// A source whose earlier record carries the expected digest and the file's
-/// current `(size, mtime)` is trusted without re-hashing, so a per-chromosome
+/// A source whose earlier record carries the expected digest for the same
+/// file name, size and mtime is trusted without re-hashing, so a per-chromosome
 /// workflow that calls the builder once per contig hashes an 87 GB input once,
-/// not once per call.
+/// not once per call. Like any mtime-keyed cache this cannot tell apart a
+/// replacement copied with its timestamps preserved and the same byte length;
+/// a different name, size or mtime always re-hashes.
 pub fn verify_sources(
     manifest: &SourceManifest,
     mode: SourceVerification,
@@ -131,22 +135,23 @@ fn verify_source(
     }
 
     let path = Path::new(&spec.path);
-    let (size, mtime) = fingerprint(path)?;
+    let (size, mtime_ns) = fingerprint(path)?;
     let earlier = prior.iter().find(|p| {
         p.part == spec.part
+            && p.file == record.file
             && p.verified_md5.as_deref() == Some(expected)
             && p.size == Some(size)
-            && mtime.is_some()
-            && p.mtime == mtime
+            && mtime_ns.is_some()
+            && p.mtime_ns == mtime_ns
     });
     if earlier.is_some() {
         info!(
             "plugin '{plugin_name}' {label}: md5 {expected} verified by an earlier build \
-             (size and mtime unchanged), not re-hashing"
+             (same file name, size and mtime), not re-hashing"
         );
         record.verified_md5 = Some(expected.to_string());
         record.size = Some(size);
-        record.mtime = mtime;
+        record.mtime_ns = mtime_ns;
         return Ok(record);
     }
 
@@ -157,7 +162,7 @@ fn verify_source(
     let (actual, hashed) = md5_file(path)?;
     record.verified_md5 = Some(actual.clone());
     record.size = Some(hashed);
-    record.mtime = mtime;
+    record.mtime_ns = mtime_ns;
     if actual == expected {
         info!("plugin '{plugin_name}' {label}: md5 {actual} matches the manifest");
         return Ok(record);
