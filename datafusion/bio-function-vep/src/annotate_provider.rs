@@ -1686,12 +1686,27 @@ impl CsqPlaceholderLayout {
 /// Ordered projection from the active full base CSQ layout to a VEP-style
 /// `--fields` subset. Plugin fields are not selectable here: they remain a
 /// trailing block in registry order.
+const VCF_CORE_CSQ_FIELDS: [&str; 11] = [
+    "Allele",
+    "Gene",
+    "Feature",
+    "Feature_type",
+    "Consequence",
+    "cDNA_position",
+    "CDS_position",
+    "Protein_position",
+    "Amino_acids",
+    "Codons",
+    "Existing_variation",
+];
+
 #[derive(Debug, Clone)]
 struct CsqFieldProjection {
     indices: Vec<usize>,
     output_position_by_input: Vec<Option<usize>>,
     names: HashSet<&'static str>,
     full_base_field_count: usize,
+    is_vcf_core: bool,
 }
 
 impl CsqFieldProjection {
@@ -1724,6 +1739,7 @@ impl CsqFieldProjection {
             output_position_by_input,
             names: selected_names.into_iter().collect(),
             full_base_field_count,
+            is_vcf_core: requested.iter().map(String::as_str).eq(VCF_CORE_CSQ_FIELDS),
         })
     }
 
@@ -6074,10 +6090,17 @@ impl AnnotateProvider {
             }
 
             // Build the 33-field Batch 3 suffix (positions 41-73) shared across all transcripts.
-            let batch3_suffix =
+            let projects_vcf_core = self
+                .csq_field_projection
+                .as_ref()
+                .is_some_and(|projection| projection.is_vcf_core);
+            let batch3_suffix = if skip_csq || projects_vcf_core {
+                Cow::Borrowed("")
+            } else {
                 engine_profile_time!(engine_profile_enabled, engine_profile, batch3_suffix, {
                     batch3_suffix_for_csq(frequency_fields, &variant_fields)
-                });
+                })
+            };
 
             // `most_str` borrows for the row: `&'static` from `SoTerm::as_str()` on
             // the cache-miss path, or `cached_most` (used by-ref) on the fast path.
@@ -6087,6 +6110,7 @@ impl AnnotateProvider {
             let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
             // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
             let mut row_variant: Option<VariantInput> = None;
+            let mut csq_already_projected = false;
             let require_transcript_annotations = {
                 let base = pick_flags.requires_transcript_annotations(skip_csq, skip_typed_cols);
                 // Plugins need per-transcript amino-acid data → force the
@@ -6488,7 +6512,15 @@ impl AnnotateProvider {
                             .and_then(|tx| tx.uniprot_isoform.as_deref())
                             .unwrap_or("");
 
-                        if flags.everything {
+                        if projects_vcf_core {
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{gene}|{feature}|{feature_type}|{terms_str}|\
+                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                                 {existing_var}"
+                            );
+                            csq_already_projected = true;
+                        } else if flags.everything {
                             // HGVS_OFFSET mirrors the transcript-level HGVSc shift
                             // decision. RefSeq rows with failed BAM edit replay can
                             // still emit transcript-space HGVSc, but VEP suppresses
@@ -6816,7 +6848,10 @@ impl AnnotateProvider {
                 }
             };
 
-            if !skip_csq && let Some(projection) = &self.csq_field_projection {
+            if !skip_csq
+                && !csq_already_projected
+                && let Some(projection) = &self.csq_field_projection
+            {
                 projection.project_entries(&csq_buf, plugin_n_fields, &mut projected_csq_buf)?;
                 std::mem::swap(&mut csq_buf, &mut projected_csq_buf);
             }
