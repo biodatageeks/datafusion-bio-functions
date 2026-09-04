@@ -644,8 +644,12 @@ type = "Utf8"
 
         // A stale index that omits a contig is a different file: the
         // pre-commit check refuses the build — also when the data itself
-        // declared no digest and only the index was verified.
-        std::fs::write(&paths.tbi, b"stale").unwrap();
+        // declared no digest and only the index was verified. The rewrite
+        // changes the length: an in-place overwrite of the same length can
+        // land in the same coarse kernel clock tick as the fingerprint on
+        // Linux, leaving mtime and ctime identical, and this test is about
+        // the check, not about that window.
+        std::fs::write(&paths.tbi, b"stale index").unwrap();
         for recs in [&records, &records2] {
             let error = check_sources_unchanged(&manifest, recs)
                 .unwrap_err()
