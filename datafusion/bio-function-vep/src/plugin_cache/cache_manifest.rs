@@ -151,6 +151,7 @@ pub struct CacheManifest {
     /// built before provenance was recorded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<SourceRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_source_version: Option<String>,
     /// How Ensembl's own plugin matches a variant to a data row. Defaults to
     /// [`AlleleMatch::Exact`], which is what most plugins do.
@@ -307,6 +308,19 @@ pub fn discover_plugins(cache_root: &Path) -> Result<Vec<CacheManifest>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_manifest_without_source_version_deserializes() {
+        let json = r#"{
+            "plugin_name": "demo",
+            "source_manifest": "demo.source.toml",
+            "key_columns": [],
+            "value_columns": [],
+            "chroms": []
+        }"#;
+        let manifest: CacheManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.cache_source_version, None);
+    }
 
     #[test]
     fn writes_and_discovers_manifest() {
