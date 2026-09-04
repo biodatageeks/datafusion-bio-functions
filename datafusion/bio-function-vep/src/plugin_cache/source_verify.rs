@@ -216,7 +216,7 @@ pub fn stamp_fingerprint(path: &Path, record: &mut SourceRecord) -> Result<()> {
 /// and before its shard is committed, and refuses to go on if the identity
 /// moved (size, mtime, inode or change time).
 pub fn check_sources_unchanged(manifest: &SourceManifest, records: &[SourceRecord]) -> Result<()> {
-    for record in records.iter().filter(|r| r.verified_md5.is_some()) {
+    for record in records {
         let Some(spec) = manifest.sources.iter().find(|s| s.part == record.part) else {
             continue;
         };
@@ -240,8 +240,13 @@ pub fn check_sources_unchanged(manifest: &SourceManifest, records: &[SourceRecor
             ))
         };
         let path = Path::new(&spec.path);
-        let now = Fingerprint::of(path)?;
-        if !now.matches(record) {
+        // The data and the index are verified independently (a manifest may
+        // declare no digest for the data and still have its index hashed), so
+        // each is checked on its own evidence.
+        if record.verified_md5.is_some()
+            && let now = Fingerprint::of(path)?
+            && !now.matches(record)
+        {
             return Err(changed(
                 "source",
                 path,
@@ -684,16 +689,19 @@ type = "Utf8"
         assert_eq!(idx.verified_md5, None);
 
         // A stale index that omits a contig is a different file: the
-        // pre-commit check refuses the build.
+        // pre-commit check refuses the build — also when the data itself
+        // declared no digest and only the index was verified.
         std::fs::write(&paths.tbi, b"stale").unwrap();
-        let error = check_sources_unchanged(&manifest, &records)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("index"), "{error}");
-        assert!(
-            error.contains("changed while it was being ingested"),
-            "{error}"
-        );
+        for recs in [&records, &records2] {
+            let error = check_sources_unchanged(&manifest, recs)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("index"), "{error}");
+            assert!(
+                error.contains("changed while it was being ingested"),
+                "{error}"
+            );
+        }
         // And a fresh verification sees the new bytes.
         let error = verify_sources(&manifest, SourceVerification::Strict, &[])
             .unwrap_err()

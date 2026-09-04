@@ -274,23 +274,56 @@ fn compare_provenance(prior: &CacheManifest, sources: &[SourceRecord]) -> Proven
         let Some(old) = prior.sources.iter().find(|old| old.part == new.part) else {
             return Provenance::Different;
         };
-        match (old.verified_md5.as_deref(), new.verified_md5.as_deref()) {
-            (Some(a), Some(b)) if a != b => return Provenance::Different,
-            (Some(_), Some(_)) => {}
-            (None, Some(_)) => unverified = true,
-            (_, None) => {
-                if let (Some(a), Some(b)) = (old.expected_md5(), new.expected_md5())
-                    && a != b
-                {
-                    return Provenance::Different;
-                }
-            }
+        match compare_digests(
+            old.verified_md5.as_deref(),
+            old.expected_md5(),
+            new.verified_md5.as_deref(),
+            new.expected_md5(),
+        ) {
+            Provenance::Different => return Provenance::Different,
+            Provenance::Unverified => unverified = true,
+            Provenance::Same => {}
+        }
+        // The index decides which records a chromosome build reads, so a
+        // changed index is a changed input even over identical data bytes.
+        match (&old.index, &new.index) {
+            (None, None) => {}
+            (Some(a), Some(b)) => match compare_digests(
+                a.verified_md5.as_deref(),
+                a.md5.as_deref(),
+                b.verified_md5.as_deref(),
+                b.md5.as_deref(),
+            ) {
+                Provenance::Different => return Provenance::Different,
+                Provenance::Unverified => unverified = true,
+                Provenance::Same => {}
+            },
+            _ => return Provenance::Different,
         }
     }
     if unverified {
         Provenance::Unverified
     } else {
         Provenance::Same
+    }
+}
+
+/// One file's relation between two builds: verified digests when both have
+/// them; `Unverified` when only this build verified; else declared digests.
+fn compare_digests(
+    old_verified: Option<&str>,
+    old_declared: Option<&str>,
+    new_verified: Option<&str>,
+    new_declared: Option<&str>,
+) -> Provenance {
+    match (old_verified, new_verified) {
+        (Some(a), Some(b)) if a != b => Provenance::Different,
+        (Some(_), Some(_)) => Provenance::Same,
+        (None, Some(_)) => Provenance::Unverified,
+        (_, None) => match (old_declared, new_declared) {
+            (Some(a), Some(b)) if a != b => Provenance::Different,
+            _ => Provenance::Same,
+        },
     }
 }
 
@@ -866,16 +899,14 @@ type = "Float32"
         let chroms: Vec<&str> = cache.chroms.iter().map(|c| c.chrom.as_str()).collect();
         assert_eq!(chroms, ["chr1", "chr2"]);
         assert!(cache.sources[0].verified_md5.is_none());
-
-        // A manifest that declares no digest makes no claim either.
-        let mut undeclared = manifest.clone();
-        undeclared.sources[0].md5 = None;
-        let cache = PluginCacheBuilder::new(&undeclared, "demo.source.toml", &cache_dir, &out)
-            .with_chrom_filter(["2"])
-            .build_all()
-            .await
-            .unwrap();
-        assert_eq!(cache.chroms.len(), 2);
+        assert!(
+            cache.sources[0]
+                .index
+                .as_ref()
+                .unwrap()
+                .verified_md5
+                .is_none()
+        );
     }
 
     #[test]
@@ -946,6 +977,53 @@ type = "Float32"
         // The earlier build verified, this one skipped: declared digests decide.
         assert_eq!(compare_provenance(&prior, &same), Provenance::Same);
         assert_eq!(compare_provenance(&prior, &changed), Provenance::Different);
+
+        // The index takes part: identical data over a changed index is a
+        // different input, and an index verified now but not before is
+        // unattributable.
+        use crate::plugin_cache::cache_manifest::IndexRecord;
+        let with_index = |mut r: SourceRecord, verified: Option<&str>| {
+            r.index = Some(IndexRecord {
+                file: "x.tbi".into(),
+                md5: None,
+                verified_md5: verified.map(String::from),
+                size: None,
+                mtime_ns: None,
+                ino: None,
+                ctime_ns: None,
+            });
+            r
+        };
+        prior.sources = vec![
+            with_index(rec("snv", Some("a"), Some("a")), Some("i1")),
+            rec("indel", Some("b"), Some("b")),
+        ];
+        let same_index = [
+            with_index(rec("snv", Some("a"), Some("a")), Some("i1")),
+            rec("indel", Some("b"), Some("b")),
+        ];
+        let new_index = [
+            with_index(rec("snv", Some("a"), Some("a")), Some("i2")),
+            rec("indel", Some("b"), Some("b")),
+        ];
+        let index_gone = [
+            rec("snv", Some("a"), Some("a")),
+            rec("indel", Some("b"), Some("b")),
+        ];
+        assert_eq!(compare_provenance(&prior, &same_index), Provenance::Same);
+        assert_eq!(
+            compare_provenance(&prior, &new_index),
+            Provenance::Different
+        );
+        assert_eq!(
+            compare_provenance(&prior, &index_gone),
+            Provenance::Different
+        );
+        prior.sources[0].index.as_mut().unwrap().verified_md5 = None;
+        assert_eq!(
+            compare_provenance(&prior, &same_index),
+            Provenance::Unverified
+        );
 
         // No prior provenance: fine unless this build claims a verified input.
         prior.sources.clear();
