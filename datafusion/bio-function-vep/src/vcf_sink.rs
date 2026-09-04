@@ -1575,10 +1575,10 @@ pub async fn annotate_to_vcf(
         let (plugin_field_names, plugin_field_descriptions) =
             if let Some(root) = config.plugin_cache_root.as_ref() {
                 (
-                    crate::plugin_cache::registry::PluginRegistry::field_names(
-                        root,
-                        config.plugins.as_deref(),
-                    )?,
+                    // Clean up declarations from every cached plugin, not only
+                    // the selected subset. Otherwise re-annotating A+B with B
+                    // leaves A's stale unstructured header lines behind.
+                    crate::plugin_cache::registry::PluginRegistry::field_names(root, None)?,
                     crate::plugin_cache::registry::PluginRegistry::field_descriptions(
                         root,
                         config.plugins.as_deref(),
