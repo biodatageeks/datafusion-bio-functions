@@ -1679,6 +1679,7 @@ impl CsqPlaceholderLayout {
 #[derive(Debug, Clone)]
 struct CsqFieldProjection {
     indices: Vec<usize>,
+    output_position_by_input: Vec<Option<usize>>,
     names: HashSet<&'static str>,
     full_base_field_count: usize,
 }
@@ -1704,8 +1705,13 @@ impl CsqFieldProjection {
             include_pick,
         )
         .len();
+        let mut output_position_by_input = vec![None; full_base_field_count];
+        for (output_position, &input_position) in indices.iter().enumerate() {
+            output_position_by_input[input_position] = Some(output_position);
+        }
         Ok(Self {
             indices,
+            output_position_by_input,
             names: selected_names.into_iter().collect(),
             full_base_field_count,
         })
@@ -1723,29 +1729,36 @@ impl CsqFieldProjection {
     ) -> Result<()> {
         projected.clear();
         let expected = self.full_base_field_count + plugin_field_count;
+        let mut selected_values = vec![""; self.indices.len() + plugin_field_count];
         for (entry_index, entry) in full.split(',').enumerate() {
             if entry_index > 0 {
                 projected.push(',');
             }
-            let fields: Vec<&str> = entry.split('|').collect();
-            if fields.len() != expected {
+            selected_values.fill("");
+            let mut actual = 0;
+            for (input_position, value) in entry.split('|').enumerate() {
+                actual += 1;
+                if input_position < self.full_base_field_count {
+                    if let Some(output_position) = self.output_position_by_input[input_position] {
+                        selected_values[output_position] = value;
+                    }
+                } else if input_position < expected {
+                    selected_values
+                        [self.indices.len() + input_position - self.full_base_field_count] = value;
+                }
+            }
+            if actual != expected {
                 return Err(DataFusionError::Execution(format!(
                     "annotate_vep(): CSQ field projection expected {expected} fields but entry {} has {}",
                     entry_index + 1,
-                    fields.len()
+                    actual
                 )));
             }
-            let mut first = true;
-            for index in
-                self.indices.iter().copied().chain(
-                    self.full_base_field_count..self.full_base_field_count + plugin_field_count,
-                )
-            {
-                if !first {
+            for (output_position, value) in selected_values.iter().enumerate() {
+                if output_position > 0 {
                     projected.push('|');
                 }
-                first = false;
-                projected.push_str(fields[index]);
+                projected.push_str(value);
             }
         }
         Ok(())
