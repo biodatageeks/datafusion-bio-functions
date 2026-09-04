@@ -1825,6 +1825,17 @@ impl CsqFieldProjection {
     }
 }
 
+fn output_needs_sift_polyphen(
+    skip_csq: bool,
+    skip_typed_cols: bool,
+    csq_field_projection: Option<&CsqFieldProjection>,
+) -> bool {
+    !skip_typed_cols
+        || (!skip_csq
+            && csq_field_projection
+                .is_none_or(|projection| projection.emits("SIFT") || projection.emits("PolyPhen")))
+}
+
 #[derive(Debug)]
 struct CsqPlaceholderEntry<'a> {
     allele: &'a str,
@@ -5509,13 +5520,20 @@ impl AnnotateProvider {
             eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned START ======");
         }
 
-        let typed_cols_start = self.vcf_field_count() + 2;
+        let csq_col_idx = self.vcf_field_count();
+        let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
+        let typed_cols_start = csq_col_idx + 2;
         let typed_cols_end = typed_cols_start + self.annotation_column_defs.len();
         let skip_typed_cols = projection.is_some_and(|indices| {
             !indices
                 .iter()
                 .any(|&index| index >= typed_cols_start && index < typed_cols_end)
         });
+        let needs_sift_polyphen = output_needs_sift_polyphen(
+            skip_csq,
+            skip_typed_cols,
+            self.csq_field_projection.as_ref(),
+        );
         let flags = VepFlags::from_options_json_with_field_pruning(
             self.options_json.as_deref(),
             skip_typed_cols,
@@ -5673,6 +5691,7 @@ impl AnnotateProvider {
             target_partitions,
             projection: projection.cloned(),
             annotation_column_count: self.annotation_column_count(),
+            needs_sift_polyphen,
             fetch_limit,
             annotation_workers,
             #[cfg(feature = "parquet-cache")]
@@ -5891,11 +5910,11 @@ impl AnnotateProvider {
         let mut b_dbsnp_ids = ListBuilder::new(StringBuilder::new());
         let include_refseq_fields = transcript_selection.refseq_fields();
         let include_source_field = transcript_selection.source_field();
-        let needs_sift_polyphen = !skip_typed_cols
-            || self
-                .csq_field_projection
-                .as_ref()
-                .is_none_or(|projection| projection.emits("SIFT") || projection.emits("PolyPhen"));
+        let needs_sift_polyphen = output_needs_sift_polyphen(
+            skip_csq,
+            skip_typed_cols,
+            self.csq_field_projection.as_ref(),
+        );
         let needs_domains = !skip_typed_cols
             || self
                 .csq_field_projection
@@ -6344,7 +6363,7 @@ impl AnnotateProvider {
                 // legacy transcript-id store ignores this. SIFT is emitted only
                 // under `--everything`.
                 #[cfg(feature = "parquet-cache")]
-                if flags.everything {
+                if flags.everything && needs_sift_polyphen {
                     if let Some(store) = sift_store {
                         if store.is_position_sliced() {
                             let mut warm_keys: Vec<u64> = Vec::new();
@@ -8995,6 +9014,8 @@ struct ContigAnnotationConfig {
     target_partitions: usize,
     projection: Option<Vec<usize>>,
     annotation_column_count: usize,
+    /// Whether any projected CSQ or typed annotation output consumes SIFT/PolyPhen.
+    needs_sift_polyphen: bool,
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
     /// Number of parallel window workers for the annotation step within a
@@ -13586,17 +13607,18 @@ async fn prepare_contig_data(
     let use_lookup_sift = false;
 
     #[cfg(feature = "parquet-cache")]
-    let sift_prediction_store = if use_lookup_sift && config.flags.everything {
-        let sift_started = Instant::now();
-        let store =
-            load_parquet_sift_prediction_store_for_chrom(cache.as_parquet(), &chrom).await?;
-        record_contig_profile(&pipeline_profile, |profile| {
-            profile.sift_load += sift_started.elapsed();
-        });
-        store
-    } else {
-        None
-    };
+    let sift_prediction_store =
+        if use_lookup_sift && config.flags.everything && config.needs_sift_polyphen {
+            let sift_started = Instant::now();
+            let store =
+                load_parquet_sift_prediction_store_for_chrom(cache.as_parquet(), &chrom).await?;
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.sift_load += sift_started.elapsed();
+            });
+            store
+        } else {
+            None
+        };
     log_phase_rss(&chrom, "after_sift_load");
 
     let shared_ctx_started = Instant::now();
@@ -14638,6 +14660,7 @@ mod tests {
             target_partitions: 1,
             projection: None,
             annotation_column_count: 0,
+            needs_sift_polyphen: false,
             fetch_limit: None,
             annotation_workers: 1,
             pick_flags: PickFlags::default(),
@@ -16862,6 +16885,29 @@ mod tests {
             projected,
             "base-4|base-0|base-1|plugin-a|plugin-b,base-4|base-0|base-1|other-a|other-b"
         );
+    }
+
+    #[test]
+    fn test_sift_polyphen_work_follows_projected_outputs() {
+        let projection_for = |field: &str| {
+            CsqFieldProjection::for_mode(
+                true,
+                TranscriptSelectionFlags::default(),
+                false,
+                &[field.to_string()],
+            )
+            .unwrap()
+        };
+        let allele_only = projection_for("Allele");
+        let sift = projection_for("SIFT");
+        let polyphen = projection_for("PolyPhen");
+
+        assert!(!output_needs_sift_polyphen(false, true, Some(&allele_only)));
+        assert!(output_needs_sift_polyphen(false, true, Some(&sift)));
+        assert!(output_needs_sift_polyphen(false, true, Some(&polyphen)));
+        assert!(output_needs_sift_polyphen(false, false, Some(&allele_only)));
+        assert!(output_needs_sift_polyphen(false, true, None));
+        assert!(!output_needs_sift_polyphen(true, true, None));
     }
 
     #[test]
