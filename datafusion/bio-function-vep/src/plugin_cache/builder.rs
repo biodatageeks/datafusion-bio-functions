@@ -258,7 +258,11 @@ enum Provenance {
 /// [`Provenance::Unverified`]. When this build makes no verified claim, the
 /// declared digests decide; a part with no digest on either side passes.
 fn compare_provenance(prior: &CacheManifest, sources: &[SourceRecord]) -> Provenance {
-    let claims_verified = sources.iter().any(|s| s.verified_md5.is_some());
+    // A verified digest for either the data or its index is a claim about
+    // the input this build read.
+    let claims_verified = sources.iter().any(|s| {
+        s.verified_md5.is_some() || s.index.as_ref().is_some_and(|i| i.verified_md5.is_some())
+    });
     if prior.sources.is_empty() {
         return if claims_verified {
             Provenance::Unverified
@@ -1025,11 +1029,21 @@ type = "Float32"
             Provenance::Unverified
         );
 
-        // No prior provenance: fine unless this build claims a verified input.
+        // No prior provenance: fine unless this build claims a verified input
+        // — for the data, or for the index alone (a tabix manifest that
+        // declares no data digest still verifies its index).
         prior.sources.clear();
         assert_eq!(compare_provenance(&prior, &same), Provenance::Same);
         assert_eq!(
             compare_provenance(&prior, &verified_now),
+            Provenance::Unverified
+        );
+        let index_only = [
+            with_index(rec("snv", None, None), Some("i1")),
+            rec("indel", None, None),
+        ];
+        assert_eq!(
+            compare_provenance(&prior, &index_only),
             Provenance::Unverified
         );
     }
