@@ -1673,12 +1673,12 @@ impl CsqPlaceholderLayout {
         Self { fields }
     }
 
-    fn append_entry(&self, buf: &mut String, entry: &CsqPlaceholderEntry<'_>) {
+    fn append_entry<W: std::fmt::Write>(&self, buf: &mut W, entry: &CsqPlaceholderEntry<'_>) {
         for (idx, field) in self.fields.iter().enumerate() {
             if idx > 0 {
-                buf.push('|');
+                let _ = buf.write_char('|');
             }
-            buf.push_str(field.value(entry));
+            let _ = buf.write_str(field.value(entry));
         }
     }
 }
@@ -1731,45 +1731,91 @@ impl CsqFieldProjection {
         self.names.contains(field)
     }
 
-    fn project_entries(
-        &self,
-        full: &str,
-        plugin_field_count: usize,
-        projected: &mut String,
-    ) -> Result<()> {
-        projected.clear();
-        let expected = self.full_base_field_count + plugin_field_count;
-        let mut selected_values = vec![""; self.indices.len() + plugin_field_count];
-        for (entry_index, entry) in full.split(',').enumerate() {
-            if entry_index > 0 {
-                projected.push(',');
-            }
-            selected_values.fill("");
-            let mut actual = 0;
-            for (input_position, value) in entry.split('|').enumerate() {
-                actual += 1;
-                if input_position < self.full_base_field_count {
-                    if let Some(output_position) = self.output_position_by_input[input_position] {
-                        selected_values[output_position] = value;
-                    }
-                } else if input_position < expected {
-                    selected_values
-                        [self.indices.len() + input_position - self.full_base_field_count] = value;
+    fn value_buffer(&self) -> Vec<String> {
+        (0..self.indices.len()).map(|_| String::new()).collect()
+    }
+}
+
+enum CsqEntryWriter<'a> {
+    Full(&'a mut String),
+    Projected(CsqProjectionWriter<'a>),
+}
+
+impl<'a> CsqEntryWriter<'a> {
+    fn new(
+        output: &'a mut String,
+        projection: Option<&'a CsqFieldProjection>,
+        selected_values: &'a mut [String],
+    ) -> Self {
+        match projection {
+            Some(projection) => {
+                for value in selected_values.iter_mut() {
+                    value.clear();
                 }
+                Self::Projected(CsqProjectionWriter {
+                    output,
+                    projection,
+                    selected_values,
+                    input_position: 0,
+                })
             }
-            if actual != expected {
-                return Err(DataFusionError::Execution(format!(
-                    "annotate_vep(): CSQ field projection expected {expected} fields but entry {} has {}",
-                    entry_index + 1,
-                    actual
-                )));
+            None => Self::Full(output),
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        let Self::Projected(writer) = self else {
+            return Ok(());
+        };
+        let actual = writer.input_position + 1;
+        if actual != writer.projection.full_base_field_count {
+            return Err(DataFusionError::Execution(format!(
+                "annotate_vep(): CSQ field projection expected {} base fields but entry has {actual}",
+                writer.projection.full_base_field_count
+            )));
+        }
+        for (position, value) in writer.selected_values.iter().enumerate() {
+            if position > 0 {
+                writer.output.push('|');
             }
-            for (output_position, value) in selected_values.iter().enumerate() {
-                if output_position > 0 {
-                    projected.push('|');
-                }
-                projected.push_str(value);
+            writer.output.push_str(value);
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Write for CsqEntryWriter<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        match self {
+            Self::Full(output) => output.write_str(value),
+            Self::Projected(writer) => writer.write_str(value),
+        }
+    }
+}
+
+struct CsqProjectionWriter<'a> {
+    output: &'a mut String,
+    projection: &'a CsqFieldProjection,
+    selected_values: &'a mut [String],
+    input_position: usize,
+}
+
+impl std::fmt::Write for CsqProjectionWriter<'_> {
+    fn write_str(&mut self, mut value: &str) -> std::fmt::Result {
+        loop {
+            let (field_value, remainder) = value.split_once('|').unwrap_or((value, ""));
+            if let Some(Some(output_position)) = self
+                .projection
+                .output_position_by_input
+                .get(self.input_position)
+            {
+                self.selected_values[*output_position].push_str(field_value);
             }
+            if remainder.is_empty() && !value.ends_with('|') {
+                break;
+            }
+            self.input_position += 1;
+            value = remainder;
         }
         Ok(())
     }
@@ -5945,11 +5991,11 @@ impl AnnotateProvider {
         } else {
             String::with_capacity(4096)
         };
-        let mut projected_csq_buf = if skip_csq || self.csq_field_projection.is_none() {
-            String::new()
-        } else {
-            String::with_capacity(1024)
-        };
+        let mut selected_csq_values = self
+            .csq_field_projection
+            .as_ref()
+            .map(CsqFieldProjection::value_buffer)
+            .unwrap_or_default();
         let mut terms_buf = String::with_capacity(128);
         // Reusable permutation index for VEP-compatible CSQ ordering.
         // Allocated once, reused across all rows in the batch.
@@ -6128,7 +6174,13 @@ impl AnnotateProvider {
                         frequency_fields,
                         variant_fields: &variant_fields,
                     };
-                    placeholder_layout.append_entry(&mut csq_buf, &entry);
+                    let mut entry_writer = CsqEntryWriter::new(
+                        &mut csq_buf,
+                        self.csq_field_projection.as_ref(),
+                        &mut selected_csq_values,
+                    );
+                    placeholder_layout.append_entry(&mut entry_writer, &entry);
+                    entry_writer.finish()?;
                     // Unreachable when plugins are enabled: `plugin_n_fields > 0`
                     // forces `require_transcript_annotations` above, so the cached
                     // fast path is never taken and this stays a no-op (`empty_suffix(0)`).
@@ -6414,6 +6466,11 @@ impl AnnotateProvider {
                         if !csq_buf.is_empty() {
                             csq_buf.push(',');
                         }
+                        let mut entry_writer = CsqEntryWriter::new(
+                            &mut csq_buf,
+                            self.csq_field_projection.as_ref(),
+                            &mut selected_csq_values,
+                        );
                         let distance = OptDisplay(tc.distance);
                         let tc_flags = tc.flags.as_deref().unwrap_or("");
                         let pick_str = if tc.picked { "1" } else { "" };
@@ -6631,17 +6688,17 @@ impl AnnotateProvider {
                             // - VEP Constants.pm CSQ field order for --everything
                             //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
                             let _ = write!(
-                                csq_buf,
+                                entry_writer,
                                 "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                              {existing_var}|{distance}|{strand_str}|{tc_flags}"
                             );
                             if include_pick_output {
-                                let _ = write!(csq_buf, "|{pick_str}");
+                                let _ = write!(entry_writer, "|{pick_str}");
                             }
                             let _ = write!(
-                                csq_buf,
+                                entry_writer,
                                 "|\
                              {variant_class}|{symbol_source}|{hgnc_id}|\
                              {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
@@ -6649,17 +6706,17 @@ impl AnnotateProvider {
                             );
                             if include_source_field {
                                 let _ = write!(
-                                    csq_buf,
+                                    entry_writer,
                                     "|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
                                 );
                             } else if include_refseq_fields {
                                 let _ = write!(
-                                    csq_buf,
+                                    entry_writer,
                                     "|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
                                 );
                             }
                             let _ = write!(
-                                csq_buf,
+                                entry_writer,
                                 "|{gene_pheno}|\
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
@@ -6668,37 +6725,38 @@ impl AnnotateProvider {
                         } else {
                             // 74-field CSQ base layout, with optional PICK and RefSeq fields.
                             let _ = write!(
-                                csq_buf,
+                                entry_writer,
                                 "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                              {existing_var}|{distance}|{strand_str}|{tc_flags}"
                             );
                             if include_pick_output {
-                                let _ = write!(csq_buf, "|{pick_str}");
+                                let _ = write!(entry_writer, "|{pick_str}");
                             }
-                            let _ = write!(csq_buf, "|{symbol_source}|{hgnc_id}|");
+                            let _ = write!(entry_writer, "|{symbol_source}|{hgnc_id}|");
                             if include_source_field {
                                 let _ = write!(
-                                    csq_buf,
+                                    entry_writer,
                                     "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
                                 );
                             } else if include_refseq_fields {
                                 let _ = write!(
-                                    csq_buf,
+                                    entry_writer,
                                     "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
                                 );
                             } else {
-                                let _ = write!(csq_buf, "|||||{source_val}");
+                                let _ = write!(entry_writer, "|||||{source_val}");
                             }
                             let _ = write!(
-                                csq_buf,
+                                entry_writer,
                                 "|\
                              {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                              {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
-                             {batch3_suffix}"
+                                {batch3_suffix}"
                             );
                         }
+                        entry_writer.finish()?;
                         // Per-transcript trailing custom-plugin CSQ fields (spec
                         // §5.2). A non-missense consequence has no amino-acid change
                         // → discriminator `None` → probe miss → empty fields (gate).
@@ -6768,7 +6826,13 @@ impl AnnotateProvider {
                             frequency_fields,
                             variant_fields: &variant_fields,
                         };
-                        placeholder_layout.append_entry(&mut csq_buf, &entry);
+                        let mut entry_writer = CsqEntryWriter::new(
+                            &mut csq_buf,
+                            self.csq_field_projection.as_ref(),
+                            &mut selected_csq_values,
+                        );
+                        placeholder_layout.append_entry(&mut entry_writer, &entry);
+                        entry_writer.finish()?;
                         // No transcript here → no amino-acid change to build a
                         // discriminator from. Match-column plugins (e.g. AlphaMissense)
                         // therefore miss on the empty namespace → empty fields, exactly
@@ -6815,11 +6879,6 @@ impl AnnotateProvider {
                     engine_profile.csq_format += started.elapsed();
                 }
             };
-
-            if !skip_csq && let Some(projection) = &self.csq_field_projection {
-                projection.project_entries(&csq_buf, plugin_n_fields, &mut projected_csq_buf)?;
-                std::mem::swap(&mut csq_buf, &mut projected_csq_buf);
-            }
 
             let append_scalars_started = engine_profile_enabled.then(Instant::now);
             if skip_csq {
@@ -16774,12 +16833,22 @@ mod tests {
             .map(|index| format!("base-{index}"))
             .collect::<Vec<_>>()
             .join("|");
-        let full = format!("{base}|plugin-a|plugin-b,{base}|other-a|other-b");
         let mut projected = String::new();
-
-        projection
-            .project_entries(&full, 2, &mut projected)
-            .unwrap();
+        let mut values = projection.value_buffer();
+        for (entry_index, (plugin_a, plugin_b)) in
+            [("plugin-a", "plugin-b"), ("other-a", "other-b")]
+                .into_iter()
+                .enumerate()
+        {
+            if entry_index > 0 {
+                projected.push(',');
+            }
+            let mut writer = CsqEntryWriter::new(&mut projected, Some(&projection), &mut values);
+            use std::fmt::Write;
+            writer.write_str(&base).unwrap();
+            writer.finish().unwrap();
+            write!(projected, "|{plugin_a}|{plugin_b}").unwrap();
+        }
 
         assert_eq!(
             projected,
