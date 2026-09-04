@@ -26,6 +26,7 @@ pub struct PluginCacheBuilder<'a> {
     chrom_filter: Option<Vec<String>>,
     overwrite: bool,
     verification: SourceVerification,
+    source_version: Option<String>,
 }
 
 impl<'a> PluginCacheBuilder<'a> {
@@ -43,6 +44,7 @@ impl<'a> PluginCacheBuilder<'a> {
             chrom_filter: None,
             overwrite: false,
             verification: SourceVerification::default(),
+            source_version: None,
         }
     }
 
@@ -67,6 +69,15 @@ impl<'a> PluginCacheBuilder<'a> {
     /// digest is never hashed regardless of mode.
     pub fn with_source_verification(mut self, verification: SourceVerification) -> Self {
         self.verification = verification;
+        self
+    }
+
+    /// Record the exact source-manifest revision used for this build.
+    ///
+    /// Callers should prefer an immutable identifier (for example a git commit
+    /// SHA, optionally paired with the user-supplied tag or branch name).
+    pub fn with_source_version(mut self, version: impl Into<String>) -> Self {
+        self.source_version = Some(version.into());
         self
     }
 
@@ -108,6 +119,7 @@ impl<'a> PluginCacheBuilder<'a> {
         self.manifest.validate()?;
         let plugin_dir = self.out.join("plugin").join(&self.manifest.plugin_name);
         let mut cache = CacheManifest::from_source(self.manifest, &self.manifest_file);
+        cache.cache_source_version = self.source_version.clone();
         // Chromosomes this call rebuilds, and their variation shards — checked
         // first, before anything expensive: a mistyped chromosome or cache
         // directory must not cost a full read of an 87 GB source.
@@ -161,6 +173,21 @@ impl<'a> PluginCacheBuilder<'a> {
                     if carried == 0 {
                         vec![]
                     } else {
+                        if let (Some(old_version), Some(new_version)) = (
+                            old.cache_source_version.as_deref(),
+                            cache.cache_source_version.as_deref(),
+                        ) && old_version != new_version
+                        {
+                            return Err(DataFusionError::Execution(format!(
+                                "plugin '{}': the existing cache at {} has {carried} untouched \
+                                 chromosome(s) built from source manifest version {old_version:?}, \
+                                 but this build uses {new_version:?}. Rebuild every chromosome or \
+                                 use a separate plugin cache root rather than mixing manifest \
+                                 revisions.",
+                                self.manifest.plugin_name,
+                                plugin_dir.display(),
+                            )));
+                        }
                         match compare_provenance(old, &cache.sources) {
                             Provenance::Same => old.chroms.clone(),
                             Provenance::Different => {
@@ -471,10 +498,15 @@ type = "Float32"
             &out,
         )
         .with_chrom_filter(["1", "2"])
+        .with_source_version("v1.2.3@0123456789abcdef")
         .build_all()
         .await
         .unwrap();
         assert_eq!(cache.chroms.len(), 2);
+        assert_eq!(
+            cache.cache_source_version.as_deref(),
+            Some("v1.2.3@0123456789abcdef")
+        );
         assert!(
             out.join("plugin")
                 .join("demo")
@@ -732,11 +764,13 @@ type = "Float32"
         let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
         PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
             .with_chrom_filter(["1"])
+            .with_source_version("v1@1111111")
             .build_all()
             .await
             .unwrap();
         let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
             .with_chrom_filter(["2"])
+            .with_source_version("v1@1111111")
             .build_all()
             .await
             .unwrap();
@@ -745,6 +779,54 @@ type = "Float32"
         assert_eq!(
             cache.sources[0].verified_md5.as_deref(),
             Some(actual.as_str())
+        );
+        assert_eq!(cache.cache_source_version.as_deref(), Some("v1@1111111"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn filtered_rebuild_refuses_to_mix_source_manifest_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (probe, _, _) = verified_fixture(dir.path(), WRONG_MD5);
+        let (actual, _) =
+            crate::plugin_cache::source_verify::md5_file(Path::new(&probe.sources[0].path))
+                .unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
+        PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .with_source_version("v1@1111111")
+            .build_all()
+            .await
+            .unwrap();
+
+        let plugin_manifest = out.join("plugin/demo/manifest.json");
+        let before = std::fs::read_to_string(&plugin_manifest).unwrap();
+        let error = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .with_source_version("main@2222222")
+            .build_all()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 untouched chromosome(s)"), "{error}");
+        assert!(error.contains("v1@1111111"), "{error}");
+        assert!(error.contains("main@2222222"), "{error}");
+        assert!(error.contains("Rebuild every chromosome"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&plugin_manifest).unwrap(),
+            before,
+            "a refused incremental build must leave the earlier manifest intact"
+        );
+
+        // A complete rebuild carries no earlier chromosomes, so changing the
+        // source-manifest revision is safe and replaces the recorded version.
+        let rebuilt = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_source_version("main@2222222")
+            .build_all()
+            .await
+            .unwrap();
+        assert_eq!(
+            rebuilt.cache_source_version.as_deref(),
+            Some("main@2222222")
         );
     }
 
