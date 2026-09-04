@@ -1700,6 +1700,40 @@ const VCF_CORE_CSQ_FIELDS: [&str; 11] = [
     "Existing_variation",
 ];
 
+struct VcfCoreCsqEntry<'a> {
+    allele: &'a str,
+    gene: &'a str,
+    feature: &'a str,
+    feature_type: &'a str,
+    consequence: &'a str,
+    cdna_position: &'a str,
+    cds_position: &'a str,
+    protein_position: &'a str,
+    amino_acids: &'a str,
+    codons: &'a str,
+    existing_variation: &'a str,
+}
+
+impl VcfCoreCsqEntry<'_> {
+    fn append_to(&self, output: &mut String) {
+        let _ = write!(
+            output,
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.allele,
+            self.gene,
+            self.feature,
+            self.feature_type,
+            self.consequence,
+            self.cdna_position,
+            self.cds_position,
+            self.protein_position,
+            self.amino_acids,
+            self.codons,
+            self.existing_variation,
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CsqFieldProjection {
     indices: Vec<usize>,
@@ -6513,12 +6547,20 @@ impl AnnotateProvider {
                             .unwrap_or("");
 
                         if projects_vcf_core {
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{gene}|{feature}|{feature_type}|{terms_str}|\
-                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                                 {existing_var}"
-                            );
+                            VcfCoreCsqEntry {
+                                allele: &vep_allele,
+                                gene,
+                                feature,
+                                feature_type,
+                                consequence: terms_str,
+                                cdna_position: cdna_pos,
+                                cds_position: cds_pos,
+                                protein_position: protein_pos,
+                                amino_acids,
+                                codons: codons_str,
+                                existing_variation: existing_var,
+                            }
+                            .append_to(&mut csq_buf);
                             csq_already_projected = true;
                         } else if flags.everything {
                             // HGVS_OFFSET mirrors the transcript-level HGVSc shift
@@ -16819,6 +16861,70 @@ mod tests {
         assert_eq!(
             projected,
             "base-4|base-0|base-1|plugin-a|plugin-b,base-4|base-0|base-1|other-a|other-b"
+        );
+    }
+
+    #[test]
+    fn test_direct_vcf_core_writer_matches_general_projection() {
+        let requested = VCF_CORE_CSQ_FIELDS.map(str::to_string);
+        let projection = CsqFieldProjection::for_mode(
+            false,
+            TranscriptSelectionFlags::default(),
+            false,
+            &requested,
+        )
+        .unwrap();
+        assert!(projection.is_vcf_core);
+
+        let values = [
+            ("Allele", "G"),
+            ("Gene", "ENSG1"),
+            ("Feature", "ENST1"),
+            ("Feature_type", "Transcript"),
+            ("Consequence", "missense_variant"),
+            ("cDNA_position", "10"),
+            ("CDS_position", "7"),
+            ("Protein_position", "3"),
+            ("Amino_acids", "A/T"),
+            ("Codons", "Gcc/Acc"),
+            ("Existing_variation", "rs1"),
+        ];
+        let full =
+            crate::golden_benchmark::csq_field_names_for_mode_with_pick(false, false, false, false)
+                .into_iter()
+                .map(|name| {
+                    values
+                        .iter()
+                        .find_map(|(field, value)| (*field == name).then_some(*value))
+                        .unwrap_or("")
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+        let mut projected = String::new();
+        projection
+            .project_entries(&full, 0, &mut projected)
+            .unwrap();
+
+        let mut direct = String::new();
+        VcfCoreCsqEntry {
+            allele: "G",
+            gene: "ENSG1",
+            feature: "ENST1",
+            feature_type: "Transcript",
+            consequence: "missense_variant",
+            cdna_position: "10",
+            cds_position: "7",
+            protein_position: "3",
+            amino_acids: "A/T",
+            codons: "Gcc/Acc",
+            existing_variation: "rs1",
+        }
+        .append_to(&mut direct);
+
+        assert_eq!(direct, projected);
+        assert_eq!(
+            direct,
+            "G|ENSG1|ENST1|Transcript|missense_variant|10|7|3|A/T|Gcc/Acc|rs1"
         );
     }
 
