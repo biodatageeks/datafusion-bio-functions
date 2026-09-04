@@ -173,23 +173,26 @@ impl<'a> PluginCacheBuilder<'a> {
                     if carried == 0 {
                         vec![]
                     } else {
-                        if let (Some(old_version), Some(new_version)) = (
-                            old.cache_source_version.as_deref(),
-                            cache.cache_source_version.as_deref(),
-                        ) && old_version != new_version
-                        {
-                            return Err(DataFusionError::Execution(format!(
-                                "plugin '{}': the existing cache at {} has {carried} untouched \
-                                 chromosome(s) built from source manifest version {old_version:?}, \
-                                 but this build uses {new_version:?}. Rebuild every chromosome or \
-                                 use a separate plugin cache root rather than mixing manifest \
-                                 revisions.",
-                                self.manifest.plugin_name,
-                                plugin_dir.display(),
-                            )));
-                        }
                         match compare_provenance(old, &cache.sources) {
-                            Provenance::Same => old.chroms.clone(),
+                            Provenance::Same => {
+                                if let (Some(old_version), Some(new_version)) = (
+                                    old.cache_source_version.as_deref(),
+                                    cache.cache_source_version.as_deref(),
+                                ) && old_version != new_version
+                                {
+                                    return Err(DataFusionError::Execution(format!(
+                                        "plugin '{}': the existing cache at {} has {carried} \
+                                         untouched chromosome(s) built from source manifest \
+                                         version {old_version:?}, but this build uses \
+                                         {new_version:?}. Rebuild every chromosome or use a \
+                                         separate plugin cache root rather than mixing manifest \
+                                         revisions.",
+                                        self.manifest.plugin_name,
+                                        plugin_dir.display(),
+                                    )));
+                                }
+                                old.chroms.clone()
+                            }
                             Provenance::Different => {
                                 info!(
                                     "plugin '{}': source digests differ from the earlier build; \
@@ -842,6 +845,7 @@ type = "Float32"
         let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
         PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
             .with_chrom_filter(["1"])
+            .with_source_version("v1@1111111")
             .build_all()
             .await
             .unwrap();
@@ -862,6 +866,7 @@ type = "Float32"
         next.sources[0].md5 = Some(release2.clone());
         let cache = PluginCacheBuilder::new(&next, "demo.source.toml", &cache_dir, &out)
             .with_chrom_filter(["2"])
+            .with_source_version("v2@2222222")
             .build_all()
             .await
             .unwrap();
@@ -871,6 +876,7 @@ type = "Float32"
             cache.sources[0].verified_md5.as_deref(),
             Some(release2.as_str())
         );
+        assert_eq!(cache.cache_source_version.as_deref(), Some("v2@2222222"));
     }
 
     // A cache built before provenance was recorded has no `sources` block.
