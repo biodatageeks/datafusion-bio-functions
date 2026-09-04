@@ -460,6 +460,10 @@ pub struct AnnotateVcfConfig {
     /// Plugin names in emitted CSQ block order. `None` discovers every plugin
     /// alphabetically; `Some([])` disables plugin output.
     pub plugins: Option<Vec<String>>,
+    /// Ordered base CSQ fields to emit, mirroring VEP `--fields`. Custom-plugin
+    /// fields are always appended after this block. `None` keeps the full
+    /// active layout.
+    pub fields: Option<Vec<String>>,
     /// Tool name recorded in the output header's provenance lines, e.g.
     /// `"vepyr"`. `None` records this engine's own crate name. The value only
     /// labels provenance; it never claims the output came from Ensembl VEP.
@@ -517,6 +521,7 @@ impl Default for AnnotateVcfConfig {
             on_batch_written: None,
             plugin_cache_root: None,
             plugins: None,
+            fields: None,
             provenance_tool_name: None,
             provenance_tool_version: None,
             preserve_record_layout: false,
@@ -647,6 +652,18 @@ impl AnnotateVcfConfig {
                 "plugins".into(),
                 serde_json::Value::Array(
                     plugins
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(ref fields) = self.fields {
+            opts.insert(
+                "fields".into(),
+                serde_json::Value::Array(
+                    fields
                         .iter()
                         .cloned()
                         .map(serde_json::Value::String)
@@ -926,13 +943,30 @@ fn csq_header_description(
     config: &AnnotateVcfConfig,
     cache_source_type: CacheSourceType,
 ) -> Result<String> {
-    let field_names = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
+    let full_field_names = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
         config.everything,
         cache_source_type == CacheSourceType::RefSeq,
         cache_source_type == CacheSourceType::Merged,
         config.include_pick_output(),
     );
-    let mut format_list = field_names.join("|");
+    let selected_field_names = config
+        .fields
+        .as_deref()
+        .map(|requested| {
+            crate::golden_benchmark::resolve_csq_field_selection(
+                config.everything,
+                cache_source_type == CacheSourceType::RefSeq,
+                cache_source_type == CacheSourceType::Merged,
+                config.include_pick_output(),
+                requested,
+            )
+            .map(|(names, _)| names)
+        })
+        .transpose()?;
+    let mut format_list = selected_field_names
+        .as_deref()
+        .unwrap_or(&full_field_names)
+        .join("|");
     // Trailing custom-plugin CSQ fields (spec §5): read cheaply from manifests.
     #[cfg(feature = "parquet-cache")]
     if let Some(root) = &config.plugin_cache_root {
@@ -2142,6 +2176,19 @@ mod tests {
     }
 
     #[test]
+    fn test_to_options_json_preserves_selected_field_order() {
+        let config = AnnotateVcfConfig {
+            fields: Some(vec!["Allele".into(), "Gene".into(), "Consequence".into()]),
+            ..Default::default()
+        };
+        let value: serde_json::Value = serde_json::from_str(&config.to_options_json()).unwrap();
+        assert_eq!(
+            value["fields"],
+            serde_json::json!(["Allele", "Gene", "Consequence"])
+        );
+    }
+
+    #[test]
     fn test_to_options_json_with_backend_emits_cache_format() {
         let config = AnnotateVcfConfig::default();
 
@@ -2691,6 +2738,86 @@ mod tests {
 
         let description = csq_header_description(&config, CacheSourceType::Ensembl).unwrap();
         assert!(!description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
+    }
+
+    #[test]
+    fn test_csq_header_description_uses_selected_field_order() {
+        let config = AnnotateVcfConfig {
+            fields: Some(vec![
+                "Allele".into(),
+                "Gene".into(),
+                "Feature".into(),
+                "Feature_type".into(),
+                "Consequence".into(),
+                "cDNA_position".into(),
+                "CDS_position".into(),
+                "Protein_position".into(),
+                "Amino_acids".into(),
+                "Codons".into(),
+                "Existing_variation".into(),
+            ]),
+            ..Default::default()
+        };
+
+        let description = csq_header_description(&config, CacheSourceType::Ensembl).unwrap();
+
+        assert_eq!(
+            description,
+            "Consequence annotations from Ensembl VEP. Format: Allele|Gene|Feature|Feature_type|Consequence|cDNA_position|CDS_position|Protein_position|Amino_acids|Codons|Existing_variation"
+        );
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    #[test]
+    fn test_csq_header_description_appends_plugin_fields_after_core_selection() {
+        let root = unique_dir("core_fields_cadd_header");
+        let plugin_dir = root.join("plugin/cadd");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::json!({
+                "plugin_name": "cadd",
+                "source_manifest": "cadd.source.toml",
+                "key_columns": ["start", "allele_string"],
+                "match_columns": [],
+                "value_columns": [
+                    {"column": "phred", "csq_field": "CADD_PHRED", "type": "Utf8"},
+                    {"column": "raw", "csq_field": "CADD_RAW", "type": "Utf8"}
+                ],
+                "chroms": [],
+                "cache_source_version": null,
+                "allele_match": "exact",
+                "field_order": "declared"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let config = AnnotateVcfConfig {
+            fields: Some(vec![
+                "Allele".into(),
+                "Gene".into(),
+                "Feature".into(),
+                "Feature_type".into(),
+                "Consequence".into(),
+                "cDNA_position".into(),
+                "CDS_position".into(),
+                "Protein_position".into(),
+                "Amino_acids".into(),
+                "Codons".into(),
+                "Existing_variation".into(),
+            ]),
+            plugin_cache_root: Some(root.clone()),
+            plugins: Some(vec!["cadd".into()]),
+            ..Default::default()
+        };
+
+        let description = csq_header_description(&config, CacheSourceType::Ensembl).unwrap();
+
+        assert_eq!(
+            description,
+            "Consequence annotations from Ensembl VEP. Format: Allele|Gene|Feature|Feature_type|Consequence|cDNA_position|CDS_position|Protein_position|Amino_acids|Codons|Existing_variation|CADD_PHRED|CADD_RAW"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
