@@ -341,7 +341,8 @@ async fn write_tiered_shard(
     Ok((rows, warm, cold))
 }
 
-/// Build one chromosome's plugin shard. Returns the cache-manifest chrom entry.
+/// Build one chromosome's plugin shard and make it live. Returns the
+/// cache-manifest chrom entry.
 pub async fn build_plugin_chrom(
     src: &SourceManifest,
     source_manifest_file: &str,
@@ -349,33 +350,68 @@ pub async fn build_plugin_chrom(
     output_cache_root: &Path,
     chrom: &str,
 ) -> Result<ChromEntry> {
-    build_plugin_chrom_checked(
+    build_plugin_chrom_staged(
         src,
         source_manifest_file,
         variation_shard,
         output_cache_root,
         chrom,
-        || Ok(()),
     )
-    .await
+    .await?
+    .commit()
 }
 
-/// [`build_plugin_chrom`] with a check run after the chromosome has been
-/// ingested and written to its staging file, but before the live shard is
-/// touched. An `Err` leaves the previous shard (and the previous manifest)
-/// exactly as they were; the builder uses it to make sure the source file is
-/// still the one whose digest it verified.
-pub async fn build_plugin_chrom_checked<F>(
+/// A chromosome shard built to its staging file but not yet live. The
+/// previous shard, if any, is untouched until [`StagedShard::commit`]; dropping
+/// an uncommitted shard removes the staging file. The builder stages every
+/// chromosome of a build and commits them together, so a build that fails on a
+/// later chromosome leaves the cache exactly as it found it.
+#[derive(Debug)]
+pub struct StagedShard {
+    pub entry: ChromEntry,
+    /// The staging file, or `None` for an empty chromosome (whose commit
+    /// removes any previous shard instead).
+    staged: Option<PathBuf>,
+    live: PathBuf,
+}
+
+impl StagedShard {
+    /// Replace the live shard with the staged one (or remove it, for an empty
+    /// chromosome) and return the manifest entry.
+    pub fn commit(mut self) -> Result<ChromEntry> {
+        match self.staged.take() {
+            Some(staged) => std::fs::rename(&staged, &self.live).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "rename {} -> {}: {e}",
+                    staged.display(),
+                    self.live.display()
+                ))
+            })?,
+            None => {
+                let _ = std::fs::remove_file(&self.live);
+            }
+        }
+        Ok(self.entry.clone())
+    }
+}
+
+impl Drop for StagedShard {
+    fn drop(&mut self) {
+        if let Some(staged) = self.staged.take() {
+            let _ = std::fs::remove_file(staged);
+        }
+    }
+}
+
+/// [`build_plugin_chrom`] up to, but not including, the point where the
+/// live shard is touched.
+pub async fn build_plugin_chrom_staged(
     src: &SourceManifest,
     _source_manifest_file: &str,
     variation_shard: &Path,
     output_cache_root: &Path,
     chrom: &str,
-    before_commit: F,
-) -> Result<ChromEntry>
-where
-    F: FnOnce() -> Result<()>,
-{
+) -> Result<StagedShard> {
     src.validate()?;
     // Coarse-grained stage timing at `info` level — cheap (a handful of
     // `Instant::now()` calls) and the only thing that would have turned CADD
@@ -576,45 +612,41 @@ where
         t_start.elapsed().as_secs_f64()
     );
 
-    // Everything this chromosome needed from the source has been read; the
-    // caller's last word before the live shard is replaced or removed. On
-    // `Err` the staging file is dropped by `scratch` and the old shard stays.
-    before_commit()?;
-
-    // Empty chrom → no shard (matches variation builder cleanup). Remove any
-    // stale shard from a previous build so the manifest (rows: 0) matches disk
-    // and the runtime never opens a leftover file for an empty chrom.
+    // Empty chrom → no shard (matches variation builder cleanup). Its commit
+    // removes any stale shard from a previous build so the manifest (rows: 0)
+    // matches disk and the runtime never opens a leftover file for an empty
+    // chrom.
     if warm + cold == 0 {
         let _ = std::fs::remove_file(&build_tmp);
-        let _ = std::fs::remove_file(&shard_path);
-        return Ok(ChromEntry {
-            chrom: canonical_chrom_label(chrom),
-            file: file_name,
-            rows: 0,
-            warm: 0,
-            cold: 0,
+        return Ok(StagedShard {
+            entry: ChromEntry {
+                chrom: canonical_chrom_label(chrom),
+                file: file_name,
+                rows: 0,
+                warm: 0,
+                cold: 0,
+            },
+            staged: None,
+            live: shard_path,
         });
     }
 
-    std::fs::rename(&build_tmp, &shard_path).map_err(|e| {
-        DataFusionError::Execution(format!(
-            "rename {} -> {}: {e}",
-            build_tmp.display(),
-            shard_path.display()
-        ))
-    })?;
     scratch.disarm();
     info!(
-        "plugin_cache[{}/{chrom}]: done, rows={rows}, {:.1}s total",
+        "plugin_cache[{}/{chrom}]: staged, rows={rows}, {:.1}s total",
         src.plugin_name,
         t_start.elapsed().as_secs_f64()
     );
-    Ok(ChromEntry {
-        chrom: canonical_chrom_label(chrom),
-        file: file_name,
-        rows,
-        warm,
-        cold,
+    Ok(StagedShard {
+        staged: Some(build_tmp),
+        live: shard_path,
+        entry: ChromEntry {
+            chrom: canonical_chrom_label(chrom),
+            file: file_name,
+            rows,
+            warm,
+            cold,
+        },
     })
 }
 
@@ -725,10 +757,10 @@ type = "Float32"
         );
     }
 
-    // A failing pre-commit check leaves the live shard untouched and no
-    // staging file behind.
+    // A staged shard leaves the live one untouched until it is committed;
+    // dropping it removes the staging file.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failed_pre_commit_check_keeps_the_previous_shard() {
+    async fn a_staged_shard_leaves_the_live_shard_until_committed() {
         let dir = tempfile::tempdir().unwrap();
         let tsv = dir.path().join("src.tsv.gz");
         write_gz(&tsv, "chr1\t100\tA\tG\t0.9\n");
@@ -771,25 +803,26 @@ type = "Float32"
         let plugin_dir = out.join("plugin").join("demo");
         std::fs::create_dir_all(&plugin_dir).unwrap();
         let shard = plugin_dir.join("chr1.parquet");
+        let staging = plugin_dir.join("chr1.parquet.build.tmp");
         std::fs::write(&shard, b"previous shard").unwrap();
 
-        let error =
-            build_plugin_chrom_checked(&manifest, "demo.source.toml", &var, &out, "1", || {
-                Err(DataFusionError::Execution("source moved".into()))
-            })
+        let staged = build_plugin_chrom_staged(&manifest, "demo.source.toml", &var, &out, "1")
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("source moved"), "{error}");
+            .unwrap();
+        assert_eq!(staged.entry.rows, 1);
         assert_eq!(std::fs::read(&shard).unwrap(), b"previous shard");
-        assert!(!plugin_dir.join("chr1.parquet.build.tmp").exists());
+        assert!(staging.exists());
+        drop(staged);
+        assert!(!staging.exists());
+        assert_eq!(std::fs::read(&shard).unwrap(), b"previous shard");
 
-        // The same build with a passing check commits normally.
-        let entry =
-            build_plugin_chrom_checked(&manifest, "demo.source.toml", &var, &out, "1", || Ok(()))
-                .await
-                .unwrap();
+        let entry = build_plugin_chrom_staged(&manifest, "demo.source.toml", &var, &out, "1")
+            .await
+            .unwrap()
+            .commit()
+            .unwrap();
         assert_eq!(entry.rows, 1);
+        assert!(!staging.exists());
         assert_ne!(std::fs::read(&shard).unwrap(), b"previous shard");
     }
 

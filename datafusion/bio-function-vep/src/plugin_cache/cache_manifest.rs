@@ -82,6 +82,9 @@ pub struct SourceRecord {
     /// neither, in which case the file is always re-hashed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ctime_ns: Option<i64>,
+    /// The source's index file, for tabix-indexed sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<IndexRecord>,
 }
 
 impl SourceRecord {
@@ -91,6 +94,15 @@ impl SourceRecord {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_else(|| spec.path.clone());
+        let index = spec.index.map(|_| IndexRecord {
+            file: format!("{file}.tbi"),
+            md5: spec.index_md5.clone(),
+            verified_md5: None,
+            size: None,
+            mtime_ns: None,
+            ino: None,
+            ctime_ns: None,
+        });
         SourceRecord {
             part: spec.part.clone(),
             file,
@@ -102,6 +114,7 @@ impl SourceRecord {
             mtime_ns: None,
             ino: None,
             ctime_ns: None,
+            index,
         }
     }
 
@@ -109,6 +122,25 @@ impl SourceRecord {
     pub fn expected_md5(&self) -> Option<&str> {
         self.path_md5.as_deref().or(self.md5.as_deref())
     }
+}
+
+/// Provenance of a source's index file (the tabix `.tbi`), which decides
+/// which records each chromosome build reads and so is verified like the data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexRecord {
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_md5: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ino: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctime_ns: Option<i64>,
 }
 
 /// The cache manifest written by the build and read at runtime.

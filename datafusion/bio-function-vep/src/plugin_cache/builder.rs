@@ -10,7 +10,7 @@ use datafusion::common::{DataFusionError, Result};
 use log::info;
 
 use crate::cache::manifest::canonical_chrom_label;
-use crate::plugin_cache::build::build_plugin_chrom_checked;
+use crate::plugin_cache::build::{StagedShard, build_plugin_chrom_staged};
 use crate::plugin_cache::cache_manifest::{CacheManifest, ChromEntry, SourceRecord};
 use crate::plugin_cache::source_manifest::SourceManifest;
 use crate::plugin_cache::source_verify::{
@@ -108,6 +108,23 @@ impl<'a> PluginCacheBuilder<'a> {
         self.manifest.validate()?;
         let plugin_dir = self.out.join("plugin").join(&self.manifest.plugin_name);
         let mut cache = CacheManifest::from_source(self.manifest, &self.manifest_file);
+        // Chromosomes this call rebuilds, and their variation shards — checked
+        // first, before anything expensive: a mistyped chromosome or cache
+        // directory must not cost a full read of an 87 GB source.
+        let to_build = self.resolve_chroms()?;
+        let mut variation_shards = Vec::with_capacity(to_build.len());
+        for chrom in &to_build {
+            let shard = self.variation_shard(chrom);
+            if !shard.exists() {
+                return Err(DataFusionError::Execution(format!(
+                    "variation shard not found: {}",
+                    shard.display()
+                )));
+            }
+            variation_shards.push(shard);
+        }
+        let rebuilt: std::collections::HashSet<String> =
+            to_build.iter().map(|c| canonical_chrom_label(c)).collect();
         let prior: Option<CacheManifest> =
             std::fs::read_to_string(plugin_dir.join("manifest.json"))
                 .ok()
@@ -117,11 +134,6 @@ impl<'a> PluginCacheBuilder<'a> {
         // incremental per-chrom build skip re-hashing an unchanged file.
         let prior_sources = prior.as_ref().map(|m| m.sources.as_slice()).unwrap_or(&[]);
         cache.sources = verify_sources(self.manifest, self.verification, prior_sources)?;
-        // Chromosomes this call rebuilds; any other entry of a prior manifest
-        // is carried over only if it can be.
-        let to_build = self.resolve_chroms()?;
-        let rebuilt: std::collections::HashSet<String> =
-            to_build.iter().map(|c| canonical_chrom_label(c)).collect();
         // Preserve chromosomes from a prior build (their shards remain on disk),
         // so a filtered/incremental build UPSERTs the rebuilt chroms rather than
         // dropping the others from the manifest that runtime discovery relies on.
@@ -176,28 +188,27 @@ impl<'a> PluginCacheBuilder<'a> {
                     }
                 }
             };
-        let _ = self.overwrite; // build_plugin_chrom overwrites the shard file per chrom.
-        for chrom in to_build {
-            let shard = self.variation_shard(&chrom);
-            if !shard.exists() {
-                return Err(DataFusionError::Execution(format!(
-                    "variation shard not found: {}",
-                    shard.display()
-                )));
-            }
-            // The providers reopen the source for every chromosome; before the
-            // shard built from it replaces the live one, make sure it is still
-            // the file whose digest was verified. On failure the previous
-            // shard and manifest are left exactly as they were.
-            let entry = build_plugin_chrom_checked(
+        let _ = self.overwrite; // every requested shard is rebuilt regardless.
+        // Build every chromosome to its staging file first. The providers
+        // reopen the source for each one, so after each the sources are
+        // re-checked against the identity that was verified; nothing goes
+        // live until every chromosome passed, so a failure on the last one
+        // leaves the previous shards and manifest exactly as they were.
+        let mut staged: Vec<StagedShard> = Vec::with_capacity(to_build.len());
+        for (chrom, shard) in to_build.iter().zip(&variation_shards) {
+            let built = build_plugin_chrom_staged(
                 self.manifest,
                 &self.manifest_file,
-                &shard,
+                shard,
                 &self.out,
-                &chrom,
-                || check_sources_unchanged(self.manifest, &cache.sources),
+                chrom,
             )
             .await?;
+            check_sources_unchanged(self.manifest, &cache.sources)?;
+            staged.push(built);
+        }
+        for built in staged {
+            let entry = built.commit()?;
             chroms.retain(|c| c.chrom != entry.chrom);
             chroms.push(entry);
         }
@@ -880,6 +891,7 @@ type = "Float32"
             mtime_ns: None,
             ino: None,
             ctime_ns: None,
+            index: None,
         };
         let dir = tempfile::tempdir().unwrap();
         let (manifest, _, _) = verified_fixture(dir.path(), WRONG_MD5);

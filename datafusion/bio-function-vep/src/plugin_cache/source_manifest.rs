@@ -101,6 +101,11 @@ pub struct SourceSpec {
     /// declares that `path` is BGZF and has a sibling `<path>.tbi`.
     #[serde(default)]
     pub index: Option<SourceIndex>,
+    /// MD5 of that index file, when the publisher ships one (ClinVar's
+    /// `.tbi.md5`) or it was recorded with the build input. The index decides
+    /// which records a chromosome build reads, so it is verified like `path`.
+    #[serde(default)]
+    pub index_md5: Option<String>,
     /// For text VCF input, expose the record's INFO/FORMAT key lists as the
     /// reader's `_vcf_info_keys` / `_vcf_format_keys` columns. Typed VCF values
     /// alone cannot distinguish an explicit `KEY=.` from an absent key because
@@ -276,7 +281,11 @@ impl SourceManifest {
     /// built-cache manifests.
     pub fn validate(&self) -> Result<()> {
         for source in &self.sources {
-            for (key, digest) in [("md5", &source.md5), ("path_md5", &source.path_md5)] {
+            for (key, digest) in [
+                ("md5", &source.md5),
+                ("path_md5", &source.path_md5),
+                ("index_md5", &source.index_md5),
+            ] {
                 if let Some(digest) = digest
                     && !is_md5_hex(digest)
                 {
@@ -293,6 +302,13 @@ impl SourceManifest {
                     "plugin '{}' requests record_layout for a {:?} source; record layout is \
                      supported only for text VCF sources",
                     self.plugin_name, source.provider
+                )));
+            }
+            if source.index.is_none() && source.index_md5.is_some() {
+                return Err(DataFusionError::Execution(format!(
+                    "plugin '{}' {} declares index_md5 but no index",
+                    self.plugin_name,
+                    source.label()
                 )));
             }
             if source.index == Some(SourceIndex::Tabix) {
@@ -564,11 +580,13 @@ type = "Float32"
             ("md5", "88577A55F1CD519D44E0F415BA248EB9"),
             ("md5", "88577a55"),
             ("path_md5", "not-a-digest-at-all-not-a-digest"),
+            ("index_md5", "88577A55F1CD519D44E0F415BA248EB9"),
         ] {
             let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
             match key {
                 "md5" => manifest.sources[0].md5 = Some(bad.into()),
-                _ => manifest.sources[0].path_md5 = Some(bad.into()),
+                "path_md5" => manifest.sources[0].path_md5 = Some(bad.into()),
+                _ => manifest.sources[0].index_md5 = Some(bad.into()),
             }
             let error = manifest.validate().unwrap_err().to_string();
             assert!(error.contains(key), "{error}");
@@ -586,9 +604,21 @@ type = "Float32"
             md5: None,
             path_md5: None,
             index: None,
+            index_md5: None,
             record_layout: false,
             csv: None,
         };
         assert_eq!(src.table_name("cadd"), "plugin_cadd_src");
+    }
+
+    #[test]
+    fn index_md5_needs_an_index() {
+        let mut manifest: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        manifest.sources[0].index_md5 = Some("88577a55f1cd519d44e0f415ba248eb9".into());
+        manifest.validate().unwrap();
+        manifest.sources[0].index = None;
+        manifest.sources[0].csv.as_mut().unwrap().compression = None;
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(error.contains("index_md5 but no index"), "{error}");
     }
 }

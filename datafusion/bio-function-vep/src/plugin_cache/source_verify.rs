@@ -14,8 +14,8 @@ use datafusion::common::{DataFusionError, Result};
 use log::{info, warn};
 use md5::{Digest, Md5};
 
-use crate::plugin_cache::cache_manifest::SourceRecord;
-use crate::plugin_cache::source_manifest::{SourceManifest, SourceSpec};
+use crate::plugin_cache::cache_manifest::{IndexRecord, SourceRecord};
+use crate::plugin_cache::source_manifest::{SourceIndex, SourceManifest, SourceSpec};
 
 /// What to do when a source's digest is declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -135,15 +135,30 @@ impl Fingerprint {
         })
     }
 
-    /// True when `record` was taken from a file with this exact identity. A
-    /// fingerprint without a change time can never match: without it, a
-    /// replacement could not be told apart, so the file is re-hashed.
-    fn matches(&self, record: &SourceRecord) -> bool {
+    /// True when a record's identity fields were taken from a file with this
+    /// exact identity. A fingerprint without a change time can never match:
+    /// without it, a replacement could not be told apart, so the file is
+    /// re-hashed.
+    fn matches_fields(
+        &self,
+        size: Option<u64>,
+        mtime_ns: Option<i64>,
+        ino: Option<u64>,
+        ctime_ns: Option<i64>,
+    ) -> bool {
         self.ctime_ns.is_some()
-            && record.size == Some(self.size)
-            && record.mtime_ns == self.mtime_ns
-            && record.ino == self.ino
-            && record.ctime_ns == self.ctime_ns
+            && size == Some(self.size)
+            && mtime_ns == self.mtime_ns
+            && ino == self.ino
+            && ctime_ns == self.ctime_ns
+    }
+
+    fn matches(&self, record: &SourceRecord) -> bool {
+        self.matches_fields(record.size, record.mtime_ns, record.ino, record.ctime_ns)
+    }
+
+    fn matches_index(&self, record: &IndexRecord) -> bool {
+        self.matches_fields(record.size, record.mtime_ns, record.ino, record.ctime_ns)
     }
 
     fn stamp(&self, record: &mut SourceRecord) {
@@ -152,6 +167,39 @@ impl Fingerprint {
         record.ino = self.ino;
         record.ctime_ns = self.ctime_ns;
     }
+
+    fn stamp_index(&self, record: &mut IndexRecord) {
+        record.size = Some(self.size);
+        record.mtime_ns = self.mtime_ns;
+        record.ino = self.ino;
+        record.ctime_ns = self.ctime_ns;
+    }
+}
+
+/// The sibling index a tabix source is read through.
+fn index_path(spec: &SourceSpec) -> Option<std::path::PathBuf> {
+    (spec.index == Some(SourceIndex::Tabix)).then(|| format!("{}.tbi", spec.path).into())
+}
+
+/// The message for a digest that is not what the manifest declares.
+fn mismatch_message(
+    plugin_name: &str,
+    label: &str,
+    path: &Path,
+    expected: &str,
+    declared_as: &str,
+    upstream: &str,
+    actual: &str,
+    hashed: u64,
+) -> String {
+    format!(
+        "plugin '{plugin_name}' {label}: MD5 mismatch for {}: expected {expected} (manifest \
+         {declared_as}{upstream}), got {actual} over {hashed} bytes. If this file is \
+         deliberately different from the declared input (a chromosome slice, a \
+         re-compression), build with source verification \"warn\" or \"skip\", or declare its \
+         digest as path_md5 in the manifest.",
+        path.display()
+    )
 }
 
 /// Record `path`'s current identity on `record`, as a build would after
@@ -172,26 +220,57 @@ pub fn check_sources_unchanged(manifest: &SourceManifest, records: &[SourceRecor
         let Some(spec) = manifest.sources.iter().find(|s| s.part == record.part) else {
             continue;
         };
-        let path = Path::new(&spec.path);
-        let now = Fingerprint::of(path)?;
-        if !now.matches(record) {
-            return Err(DataFusionError::Execution(format!(
-                "plugin '{}' {}: {} changed while it was being ingested (size {:?} -> {}, \
-                 mtime_ns {:?} -> {:?}, ino {:?} -> {:?}, ctime_ns {:?} -> {:?}); the digest \
-                 verified before the build no longer describes the data read, so the shard \
-                 was not committed and no manifest was written. Rebuild from the stable file.",
+        let changed = |what: &str, path: &Path, before: [String; 4], now: &Fingerprint| {
+            DataFusionError::Execution(format!(
+                "plugin '{}' {}: {what} {} changed while it was being ingested (size {} -> {}, \
+                 mtime_ns {} -> {:?}, ino {} -> {:?}, ctime_ns {} -> {:?}); the digest \
+                 verified before the build no longer describes the data read, so no shard was \
+                 committed and no manifest was written. Rebuild from the stable file.",
                 manifest.plugin_name,
                 spec.label(),
                 path.display(),
-                record.size,
+                before[0],
                 now.size,
-                record.mtime_ns,
+                before[1],
                 now.mtime_ns,
-                record.ino,
+                before[2],
                 now.ino,
-                record.ctime_ns,
+                before[3],
                 now.ctime_ns,
-            )));
+            ))
+        };
+        let path = Path::new(&spec.path);
+        let now = Fingerprint::of(path)?;
+        if !now.matches(record) {
+            return Err(changed(
+                "source",
+                path,
+                [
+                    format!("{:?}", record.size),
+                    format!("{:?}", record.mtime_ns),
+                    format!("{:?}", record.ino),
+                    format!("{:?}", record.ctime_ns),
+                ],
+                &now,
+            ));
+        }
+        if let (Some(index), Some(index_path)) = (&record.index, index_path(spec))
+            && index.verified_md5.is_some()
+        {
+            let now = Fingerprint::of(&index_path)?;
+            if !now.matches_index(index) {
+                return Err(changed(
+                    "index",
+                    &index_path,
+                    [
+                        format!("{:?}", index.size),
+                        format!("{:?}", index.mtime_ns),
+                        format!("{:?}", index.ino),
+                        format!("{:?}", index.ctime_ns),
+                    ],
+                    &now,
+                ));
+            }
         }
     }
     Ok(())
@@ -231,23 +310,66 @@ fn verify_source(
 ) -> Result<SourceRecord> {
     let mut record = SourceRecord::from_spec(spec);
     let label = spec.label();
-    let Some(expected) = spec.expected_md5() else {
-        info!("plugin '{plugin_name}' {label}: no md5 declared, source not verified");
-        return Ok(record);
-    };
     if mode == SourceVerification::Skip {
         info!("plugin '{plugin_name}' {label}: source verification skipped");
         return Ok(record);
     }
+    let upstream = spec
+        .url
+        .as_deref()
+        .map(|u| format!(", upstream {u}"))
+        .unwrap_or_default();
+    let earlier = prior
+        .iter()
+        .find(|p| p.part == spec.part && p.file == record.file);
+
+    // The index decides which records each chromosome reads, so it is hashed
+    // (it is small) and recorded whenever the source has one, and checked
+    // against `index_md5` when the manifest declares it.
+    if let (Some(index), Some(index_path)) = (record.index.as_mut(), index_path(spec)) {
+        let now = Fingerprint::of(&index_path)?;
+        let actual = match earlier
+            .and_then(|p| p.index.as_ref())
+            .filter(|i| i.file == index.file && now.matches_index(i))
+            .and_then(|i| i.verified_md5.clone())
+        {
+            Some(digest) => digest,
+            None => md5_file(&index_path)?.0,
+        };
+        index.verified_md5 = Some(actual.clone());
+        now.stamp_index(index);
+        if let Some(expected) = spec.index_md5.as_deref()
+            && actual != expected
+        {
+            let message = mismatch_message(
+                plugin_name,
+                &label,
+                &index_path,
+                expected,
+                "index_md5",
+                &upstream,
+                &actual,
+                now.size,
+            );
+            match mode {
+                SourceVerification::Strict => return Err(DataFusionError::Execution(message)),
+                SourceVerification::Warn => warn!("{message}"),
+                SourceVerification::Skip => unreachable!("skip returns before hashing"),
+            }
+        }
+    }
+
+    let Some(expected) = spec.expected_md5() else {
+        info!("plugin '{plugin_name}' {label}: no md5 declared, source not verified");
+        return Ok(record);
+    };
 
     let path = Path::new(&spec.path);
     let now = Fingerprint::of(path)?;
-    let earlier = prior.iter().find_map(|p| {
-        (p.part == spec.part && p.file == record.file && now.matches(p))
-            .then_some(p.verified_md5.as_deref())
-            .flatten()
-    });
-    let actual = match earlier {
+    let reused = earlier
+        .filter(|p| now.matches(p))
+        .and_then(|p| p.verified_md5.as_deref());
+    let actual = match reused {
         Some(digest) => {
             info!(
                 "plugin '{plugin_name}' {label}: md5 {digest} computed by an earlier build over \
@@ -273,7 +395,6 @@ fn verify_source(
             digest
         }
     };
-    let hashed = now.size;
     record.verified_md5 = Some(actual.clone());
     now.stamp(&mut record);
     if actual == expected {
@@ -286,18 +407,15 @@ fn verify_source(
     } else {
         "md5"
     };
-    let upstream = spec
-        .url
-        .as_deref()
-        .map(|u| format!(", upstream {u}"))
-        .unwrap_or_default();
-    let message = format!(
-        "plugin '{plugin_name}' {label}: MD5 mismatch for {}: expected {expected} (manifest \
-         {declared_as}{upstream}), got {actual} over {hashed} bytes. If this file is \
-         deliberately different from the declared input (a chromosome slice, a \
-         re-compression), build with source verification \"warn\" or \"skip\", or declare its \
-         digest as path_md5 in the manifest.",
-        path.display()
+    let message = mismatch_message(
+        plugin_name,
+        &label,
+        path,
+        expected,
+        declared_as,
+        &upstream,
+        &actual,
+        now.size,
     );
     match mode {
         SourceVerification::Strict => Err(DataFusionError::Execution(message)),
@@ -479,6 +597,109 @@ type = "Utf8"
         let skipped = verify_sources(&manifest, SourceVerification::Skip, &[]).unwrap();
         std::fs::write(&src, b"abcd").unwrap();
         check_sources_unchanged(&manifest, &skipped).unwrap();
+    }
+
+    /// A tabix VCF source with its `.tbi`, declaring `md5` for the data and
+    /// `index_md5` for the index.
+    fn indexed_fixture(dir: &Path, md5: &str, index_md5: &str) -> (SourceManifest, Path2) {
+        let src = dir.join("demo.vcf.gz");
+        std::fs::write(&src, b"abc").unwrap();
+        let tbi = dir.join("demo.vcf.gz.tbi");
+        std::fs::write(&tbi, b"index").unwrap();
+        let toml = format!(
+            r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "vcf"
+path = "{}"
+url = "https://example.org/demo.vcf.gz"
+md5 = "{md5}"
+index = "tabix"
+index_md5 = "{index_md5}"
+
+[[value_columns]]
+column = "x"
+csq_field = "X"
+type = "Utf8"
+"##,
+            src.display()
+        );
+        (toml::from_str(&toml).unwrap(), Path2 { src, tbi })
+    }
+
+    struct Path2 {
+        src: std::path::PathBuf,
+        tbi: std::path::PathBuf,
+    }
+
+    #[test]
+    fn a_tabix_index_is_hashed_recorded_and_checked_like_the_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let abc = "900150983cd24fb0d6963f7d28e17f72";
+        let index = format!("{:x}", Md5::digest(b"index"));
+        let (manifest, paths) = indexed_fixture(dir.path(), abc, &index);
+        let records = verify_sources(&manifest, SourceVerification::Strict, &[]).unwrap();
+        let rec = &records[0];
+        assert_eq!(rec.verified_md5.as_deref(), Some(abc));
+        let idx = rec.index.as_ref().unwrap();
+        assert_eq!(idx.file, "demo.vcf.gz.tbi");
+        assert_eq!(idx.md5.as_deref(), Some(index.as_str()));
+        assert_eq!(idx.verified_md5.as_deref(), Some(index.as_str()));
+        assert_eq!(idx.size, Some(5));
+        assert!(idx.ctime_ns.is_some());
+        check_sources_unchanged(&manifest, &records).unwrap();
+
+        // A wrong declared index digest fails strict, passes warn.
+        let mut wrong = manifest.clone();
+        wrong.sources[0].index_md5 = Some("00000000000000000000000000000000".into());
+        let error = verify_sources(&wrong, SourceVerification::Strict, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("demo.vcf.gz.tbi"), "{error}");
+        assert!(error.contains("index_md5"), "{error}");
+        assert!(error.contains(&index), "{error}");
+        let warned = verify_sources(&wrong, SourceVerification::Warn, &[]).unwrap();
+        assert_eq!(
+            warned[0].index.as_ref().unwrap().verified_md5.as_deref(),
+            Some(index.as_str())
+        );
+
+        // The index is hashed even when the data declares no digest…
+        let mut undeclared = manifest.clone();
+        undeclared.sources[0].md5 = None;
+        undeclared.sources[0].index_md5 = None;
+        let records2 = verify_sources(&undeclared, SourceVerification::Strict, &[]).unwrap();
+        assert_eq!(records2[0].verified_md5, None);
+        assert_eq!(
+            records2[0].index.as_ref().unwrap().verified_md5.as_deref(),
+            Some(index.as_str())
+        );
+        // …and never in skip mode.
+        let skipped = verify_sources(&manifest, SourceVerification::Skip, &[]).unwrap();
+        let idx = skipped[0].index.as_ref().unwrap();
+        assert_eq!(idx.md5.as_deref(), Some(index.as_str()));
+        assert_eq!(idx.verified_md5, None);
+
+        // A stale index that omits a contig is a different file: the
+        // pre-commit check refuses the build.
+        std::fs::write(&paths.tbi, b"stale").unwrap();
+        let error = check_sources_unchanged(&manifest, &records)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("index"), "{error}");
+        assert!(
+            error.contains("changed while it was being ingested"),
+            "{error}"
+        );
+        // And a fresh verification sees the new bytes.
+        let error = verify_sources(&manifest, SourceVerification::Strict, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("demo.vcf.gz.tbi"), "{error}");
+        let _ = paths.src;
     }
 
     #[test]
