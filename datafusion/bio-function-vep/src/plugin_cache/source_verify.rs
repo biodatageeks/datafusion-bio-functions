@@ -5,7 +5,7 @@
 //! a newer weekly release, a re-sorted copy — and publish a manifest that
 //! claims the manifest's version regardless.
 
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::UNIX_EPOCH;
@@ -13,6 +13,7 @@ use std::time::UNIX_EPOCH;
 use datafusion::common::{DataFusionError, Result};
 use log::{info, warn};
 use md5::{Digest, Md5};
+use noodles_csi::BinningIndex;
 
 use crate::plugin_cache::cache_manifest::{IndexRecord, SourceRecord};
 use crate::plugin_cache::source_manifest::{SourceIndex, SourceManifest, SourceSpec};
@@ -201,6 +202,128 @@ fn mismatch_message(
     )
 }
 
+/// Check that a tabix index describes this data file. A stale index — one
+/// built from another version of the data — still parses and still names
+/// contigs, and the provider would follow it into the wrong bytes, so for
+/// every contig the index names, the record its first chunk points at is read
+/// from the data and must carry that contig in the index's own contig column.
+/// One block per contig is decompressed; nothing else is read.
+pub fn validate_tabix_index(data: &Path, index: &Path) -> Result<()> {
+    let open = |p: &Path| {
+        std::fs::File::open(p)
+            .map_err(|e| DataFusionError::Execution(format!("open '{}': {e}", p.display())))
+    };
+    let idx = noodles_tabix::io::Reader::new(open(index)?)
+        .read_index()
+        .map_err(|e| {
+            DataFusionError::Execution(format!("read tabix index '{}': {e}", index.display()))
+        })?;
+    let header = idx.header().ok_or_else(|| {
+        DataFusionError::Execution(format!("tabix index '{}' has no header", index.display()))
+    })?;
+    let contig_column = header.reference_sequence_name_index();
+    let comment = header.line_comment_prefix();
+    let mut reader = noodles_bgzf::io::Reader::new(open(data)?);
+    let mismatch = |name: &[u8], detail: String| {
+        DataFusionError::Execution(format!(
+            "tabix index '{}' does not describe '{}': it names contig '{}' but {detail}. The \
+             index was built from a different version of the data; rebuild it with `tabix` \
+             from the verified file.",
+            index.display(),
+            data.display(),
+            String::from_utf8_lossy(name),
+        ))
+    };
+    for (name, reference) in header
+        .reference_sequence_names()
+        .iter()
+        .zip(idx.reference_sequences())
+    {
+        let Some(first) = reference
+            .bins()
+            .values()
+            .flat_map(|bin| bin.chunks())
+            .map(|chunk| chunk.start())
+            .min()
+        else {
+            continue;
+        };
+        let offset = u64::from(first);
+        // Seek to the block only, then bound the in-block offset by the block's
+        // decompressed length ourselves: the reader would otherwise index past
+        // the block (and panic) for an offset that belongs to other data.
+        let (block, within): (u64, u16) = first.into();
+        let block_start = noodles_bgzf::VirtualPosition::try_from((block, 0)).map_err(|e| {
+            mismatch(
+                name,
+                format!("its first chunk ({offset:#x}) is not a position: {e}"),
+            )
+        })?;
+        reader.seek(block_start).map_err(|e| {
+            mismatch(
+                name,
+                format!("its first chunk ({offset:#x}) is not at a BGZF block of the data: {e}"),
+            )
+        })?;
+        let block_len = reader
+            .fill_buf()
+            .map_err(|e| {
+                mismatch(
+                    name,
+                    format!("the block at its first chunk ({offset:#x}) is unreadable: {e}"),
+                )
+            })?
+            .len();
+        if usize::from(within) > block_len {
+            return Err(mismatch(
+                name,
+                format!(
+                    "its first chunk ({offset:#x}) points {within} bytes into a block that holds \
+                     only {block_len}"
+                ),
+            ));
+        }
+        reader.consume(usize::from(within));
+        let mut line = Vec::new();
+        // A chunk starts at a record, but tolerate a comment line or two in
+        // case an indexer recorded the preceding header block.
+        for _ in 0..4 {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line).map_err(|e| {
+                mismatch(
+                    name,
+                    format!("the data at its first chunk ({offset:#x}) is unreadable: {e}"),
+                )
+            })?;
+            if n == 0 {
+                return Err(mismatch(
+                    name,
+                    format!("its first chunk ({offset:#x}) is past the end"),
+                ));
+            }
+            if line.first() != Some(&comment) {
+                break;
+            }
+        }
+        let found = line
+            .strip_suffix(b"\n")
+            .unwrap_or(&line)
+            .split(|&b| b == b'\t')
+            .nth(contig_column)
+            .unwrap_or(&[]);
+        if found != &name[..] {
+            return Err(mismatch(
+                name,
+                format!(
+                    "the record at its first chunk ({offset:#x}) reads contig '{}'",
+                    String::from_utf8_lossy(found)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Record `path`'s current identity on `record`, as a build would after
 /// hashing it. For tests and tools that construct provenance records by hand.
 pub fn stamp_fingerprint(path: &Path, record: &mut SourceRecord) -> Result<()> {
@@ -341,6 +464,10 @@ fn verify_source(
         };
         index.verified_md5 = Some(actual);
         now.stamp_index(index);
+        // No digest is declared for an index, so its correspondence with the
+        // data is checked structurally instead; a mismatch is never a
+        // deliberate derived input, so it fails in warn mode too.
+        validate_tabix_index(Path::new(&spec.path), &index_path)?;
     }
 
     let Some(expected) = spec.expected_md5() else {
@@ -577,12 +704,69 @@ type = "Utf8"
         check_sources_unchanged(&manifest, &skipped).unwrap();
     }
 
+    /// Write `rows` (chrom, 1-based pos, rest) as BGZF at `path` with a sibling
+    /// tabix index over columns 1 and 2.
+    fn write_bgzf_tabix(path: &Path, rows: &[(&str, usize, &str)]) {
+        use noodles_core_tabix::Position;
+        use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
+        use std::io::Write;
+        let mut writer = noodles_bgzf::io::Writer::new(std::fs::File::create(path).unwrap());
+        let mut indexer = noodles_tabix::index::Indexer::default();
+        indexer.set_header(
+            noodles_csi::binning_index::index::header::Builder::vcf()
+                .set_line_comment_prefix(b'#')
+                .build(),
+        );
+        let mut start = writer.virtual_position();
+        for &(chrom, pos, rest) in rows {
+            writeln!(writer, "{chrom}\t{pos}\t{rest}").unwrap();
+            let end = writer.virtual_position();
+            let p = Position::try_from(pos).unwrap();
+            indexer
+                .add_record(chrom, p, p, Chunk::new(start, end))
+                .unwrap();
+            start = end;
+        }
+        writer.finish().unwrap();
+        let index = std::fs::File::create(format!("{}.tbi", path.display())).unwrap();
+        noodles_tabix::io::Writer::new(index)
+            .write_index(&indexer.build())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_tabix_index_from_other_data_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.vcf.gz");
+        write_bgzf_tabix(&good, &[("1", 100, "a"), ("2", 200, "b")]);
+        validate_tabix_index(&good, &good.with_extension("gz.tbi")).unwrap();
+
+        // The same contigs, but a different (longer) data file: its index
+        // points where `good` has other bytes or no bytes at all.
+        let other = dir.path().join("other.vcf.gz");
+        let rows: Vec<(&str, usize, &str)> = (0..2000)
+            .map(|i| ("1", i + 1, "padding padding padding padding padding"))
+            .chain([("2", 5000, "x")])
+            .collect();
+        write_bgzf_tabix(&other, &rows);
+        let error = validate_tabix_index(&good, &other.with_extension("gz.tbi"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not describe"), "{error}");
+        assert!(error.contains("contig '2'"), "{error}");
+
+        // And a stale index that only names contig 1 over data that has both
+        // still checks what it names — the omission is the data digest's job.
+        let partial = dir.path().join("partial.vcf.gz");
+        write_bgzf_tabix(&partial, &[("1", 100, "a")]);
+        validate_tabix_index(&partial, &partial.with_extension("gz.tbi")).unwrap();
+    }
+
     /// A tabix VCF source with its `.tbi`, declaring `md5` for the data.
     fn indexed_fixture(dir: &Path, md5: &str) -> (SourceManifest, Path2) {
         let src = dir.join("demo.vcf.gz");
-        std::fs::write(&src, b"abc").unwrap();
+        write_bgzf_tabix(&src, &[("1", 100, "a"), ("2", 200, "b")]);
         let tbi = dir.join("demo.vcf.gz.tbi");
-        std::fs::write(&tbi, b"index").unwrap();
         let toml = format!(
             r##"
 plugin_name = "demo"
@@ -614,16 +798,18 @@ type = "Utf8"
     #[test]
     fn a_tabix_index_is_hashed_recorded_and_checked_like_the_data() {
         let dir = tempfile::tempdir().unwrap();
-        let abc = "900150983cd24fb0d6963f7d28e17f72";
-        let index = format!("{:x}", Md5::digest(b"index"));
-        let (manifest, paths) = indexed_fixture(dir.path(), abc);
+        let (probe, paths) = indexed_fixture(dir.path(), "00000000000000000000000000000000");
+        let (abc, _) = md5_file(&paths.src).unwrap();
+        let (index, index_size) = md5_file(&paths.tbi).unwrap();
+        let mut manifest = probe;
+        manifest.sources[0].md5 = Some(abc.clone());
         let records = verify_sources(&manifest, SourceVerification::Strict, &[]).unwrap();
         let rec = &records[0];
-        assert_eq!(rec.verified_md5.as_deref(), Some(abc));
+        assert_eq!(rec.verified_md5.as_deref(), Some(abc.as_str()));
         let idx = rec.index.as_ref().unwrap();
         assert_eq!(idx.file, "demo.vcf.gz.tbi");
         assert_eq!(idx.verified_md5.as_deref(), Some(index.as_str()));
-        assert_eq!(idx.size, Some(5));
+        assert_eq!(idx.size, Some(index_size));
         assert!(idx.ctime_ns.is_some());
         check_sources_unchanged(&manifest, &records).unwrap();
 
@@ -642,14 +828,16 @@ type = "Utf8"
         assert_eq!(idx.file, "demo.vcf.gz.tbi");
         assert_eq!(idx.verified_md5, None);
 
-        // A stale index that omits a contig is a different file: the
-        // pre-commit check refuses the build — also when the data itself
-        // declared no digest and only the index was verified. The rewrite
-        // changes the length: an in-place overwrite of the same length can
-        // land in the same coarse kernel clock tick as the fingerprint on
-        // Linux, leaving mtime and ctime identical, and this test is about
-        // the check, not about that window.
-        std::fs::write(&paths.tbi, b"stale index").unwrap();
+        // An index replaced mid-build is a different file: the pre-commit
+        // check refuses the build — also when the data itself declared no
+        // digest and only the index was verified. The replacement is a
+        // different length: an in-place overwrite of the same length can land
+        // in the same coarse kernel clock tick as the fingerprint on Linux,
+        // leaving mtime and ctime identical, and this test is about the check,
+        // not about that window.
+        let other = dir.path().join("other.vcf.gz");
+        write_bgzf_tabix(&other, &[("1", 100, "a"), ("2", 200, "b"), ("3", 300, "c")]);
+        std::fs::copy(other.with_extension("gz.tbi"), &paths.tbi).unwrap();
         for recs in [&records, &records2] {
             let error = check_sources_unchanged(&manifest, recs)
                 .unwrap_err()
@@ -660,12 +848,14 @@ type = "Utf8"
                 "{error}"
             );
         }
-        // And a fresh verification records the new index bytes.
-        let fresh = verify_sources(&manifest, SourceVerification::Strict, &[]).unwrap();
-        assert_ne!(
-            fresh[0].index.as_ref().unwrap().verified_md5.as_deref(),
-            Some(index.as_str())
-        );
+        // And a fresh verification refuses an index that describes other data,
+        // in warn mode as well: a stale index is never a deliberate input.
+        for mode in [SourceVerification::Strict, SourceVerification::Warn] {
+            let error = verify_sources(&manifest, mode, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("does not describe"), "{error}");
+        }
         let _ = paths.src;
     }
 
