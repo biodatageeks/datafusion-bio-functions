@@ -189,9 +189,11 @@ fn schema_matches(a: &CacheManifest, b: &CacheManifest) -> bool {
             .all(|(x, y)| x.column == y.column && x.template == y.template)
 }
 
-/// True when the prior build declared the same source digests, part for part,
-/// as this build's `sources`, so its shards came from the same input release.
-/// A prior manifest with no `sources` block (built before provenance was
+/// True when the prior build's shards came from the same input as this
+/// build's `sources`, part for part. Digests actually verified are compared
+/// when both builds have them — two `Warn` builds can share a declared digest
+/// and still hash different bytes — otherwise the declared digests are. A
+/// prior manifest with no `sources` block (built before provenance was
 /// recorded) cannot be compared and is trusted, as it was before. A part with
 /// no digest on either side has nothing to compare and passes.
 fn provenance_matches(prior: &CacheManifest, sources: &[SourceRecord]) -> bool {
@@ -200,14 +202,21 @@ fn provenance_matches(prior: &CacheManifest, sources: &[SourceRecord]) -> bool {
     }
     prior.sources.len() == sources.len()
         && sources.iter().all(|new| {
-            prior.sources.iter().any(|old| {
-                old.part == new.part
-                    && match (old.expected_md5(), new.expected_md5()) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => true,
-                    }
-            })
+            prior
+                .sources
+                .iter()
+                .any(|old| old.part == new.part && same_source_digest(old, new))
         })
+}
+
+fn same_source_digest(old: &SourceRecord, new: &SourceRecord) -> bool {
+    match (old.verified_md5.as_deref(), new.verified_md5.as_deref()) {
+        (Some(a), Some(b)) => a == b,
+        _ => match (old.expected_md5(), new.expected_md5()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -670,19 +679,31 @@ type = "Float32"
             .await
             .unwrap();
 
-        // The manifest now declares a different release; build chr2 from it
-        // (warn mode, since the fixture file is unchanged).
+        // A new release lands at the same path and the manifest declares its
+        // digest; build chr2 from it, strictly.
+        let src = PathBuf::from(&manifest.sources[0].path);
+        write_bgzf_tabix_bed(
+            &src,
+            &[
+                ("chr1", 99, 100, "A", "G", "0.1"),
+                ("chr2", 199, 200, "C", "T", "0.5"),
+            ],
+        );
+        let (release2, _) = crate::plugin_cache::source_verify::md5_file(&src).unwrap();
+        assert_ne!(release2, actual);
         let mut next = manifest.clone();
-        next.sources[0].md5 = Some(WRONG_MD5.into());
+        next.sources[0].md5 = Some(release2.clone());
         let cache = PluginCacheBuilder::new(&next, "demo.source.toml", &cache_dir, &out)
             .with_chrom_filter(["2"])
-            .with_source_verification(SourceVerification::Warn)
             .build_all()
             .await
             .unwrap();
         let chroms: Vec<&str> = cache.chroms.iter().map(|c| c.chrom.as_str()).collect();
         assert_eq!(chroms, ["chr2"], "chr1 was built from another release");
-        assert_eq!(cache.sources[0].md5.as_deref(), Some(WRONG_MD5));
+        assert_eq!(
+            cache.sources[0].verified_md5.as_deref(),
+            Some(release2.as_str())
+        );
     }
 
     // A cache built before provenance was recorded has no `sources` block;
@@ -745,8 +766,68 @@ type = "Float32"
         assert!(!provenance_matches(&prior, &changed));
         assert!(provenance_matches(&prior, &undeclared));
         assert!(!provenance_matches(&prior, &fewer));
+
+        // Verified digests win over declared ones when both builds have them:
+        // two warn-mode builds can share `md5 = "a"` and still hash different
+        // bytes; a strict build after a warn-mode one likewise differs.
+        let verified = |part: &str, md5: &str, actual: &str| SourceRecord {
+            verified_md5: Some(actual.into()),
+            ..rec(Some(part), Some(md5))
+        };
+        prior.sources = vec![verified("snv", "a", "a"), verified("indel", "b", "x")];
+        assert!(provenance_matches(
+            &prior,
+            &[verified("snv", "a", "a"), verified("indel", "b", "x")]
+        ));
+        assert!(!provenance_matches(
+            &prior,
+            &[verified("snv", "a", "a"), verified("indel", "b", "y")]
+        ));
+        assert!(!provenance_matches(
+            &prior,
+            &[verified("snv", "a", "a"), verified("indel", "b", "b")]
+        ));
+        // A skipped verification on one side falls back to the declared digest.
+        assert!(provenance_matches(&prior, &same));
+
         prior.sources.clear();
         assert!(provenance_matches(&prior, &changed));
+    }
+
+    // Two warn-mode builds against the same declared digest but different
+    // bytes must not be merged into one cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warn_mode_rebuild_from_different_bytes_drops_stale_chroms() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), WRONG_MD5);
+        let src = PathBuf::from(&manifest.sources[0].path);
+        let first = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .with_source_verification(SourceVerification::Warn)
+            .build_all()
+            .await
+            .unwrap();
+
+        // Same path, same declared digest, different bytes.
+        write_bgzf_tabix_bed(
+            &src,
+            &[
+                ("chr1", 99, 100, "A", "G", "0.1"),
+                ("chr2", 199, 200, "C", "T", "0.5"),
+            ],
+        );
+        let second = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .with_source_verification(SourceVerification::Warn)
+            .build_all()
+            .await
+            .unwrap();
+        assert_ne!(
+            first.sources[0].verified_md5,
+            second.sources[0].verified_md5
+        );
+        let chroms: Vec<&str> = second.chroms.iter().map(|c| c.chrom.as_str()).collect();
+        assert_eq!(chroms, ["chr2"], "chr1 was built from other bytes");
     }
 
     // A filtered/incremental rebuild must UPSERT into the existing manifest, not
