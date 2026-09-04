@@ -175,11 +175,15 @@ impl<'a> PluginCacheBuilder<'a> {
                     } else {
                         match compare_provenance(old, &cache.sources) {
                             Provenance::Same => {
-                                if let (Some(old_version), Some(new_version)) = (
-                                    old.cache_source_version.as_deref(),
-                                    cache.cache_source_version.as_deref(),
-                                ) && old_version != new_version
-                                {
+                                if old.cache_source_version != cache.cache_source_version {
+                                    let old_version = old
+                                        .cache_source_version
+                                        .as_deref()
+                                        .unwrap_or("unknown/unrecorded");
+                                    let new_version = cache
+                                        .cache_source_version
+                                        .as_deref()
+                                        .unwrap_or("unknown/unrecorded");
                                     return Err(DataFusionError::Execution(format!(
                                         "plugin '{}': the existing cache at {} has {carried} \
                                          untouched chromosome(s) built from source manifest \
@@ -831,6 +835,36 @@ type = "Float32"
             rebuilt.cache_source_version.as_deref(),
             Some("main@2222222")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn filtered_rebuild_refuses_to_relabel_unversioned_carried_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let (probe, _, _) = verified_fixture(dir.path(), WRONG_MD5);
+        let (actual, _) =
+            crate::plugin_cache::source_verify::md5_file(Path::new(&probe.sources[0].path))
+                .unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
+        PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .build_all()
+            .await
+            .unwrap();
+
+        let plugin_manifest = out.join("plugin/demo/manifest.json");
+        let before = std::fs::read_to_string(&plugin_manifest).unwrap();
+        let error = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .with_source_version("v2@2222222")
+            .build_all()
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unknown/unrecorded"), "{error}");
+        assert!(error.contains("v2@2222222"), "{error}");
+        assert!(error.contains("Rebuild every chromosome"), "{error}");
+        assert_eq!(std::fs::read_to_string(plugin_manifest).unwrap(), before);
     }
 
     // A filtered rebuild against a NEW source release must not keep shards
