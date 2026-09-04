@@ -40,13 +40,31 @@ pub fn tier_sql(normalized_view: &str, variation_probe: &str) -> String {
 }
 
 /// Same join, with the exact physical shard order: warm rows first, then cold,
-/// and position-ascending inside each tier. This lets the consumer write one
-/// Parquet file directly instead of encoding two tier files and decoding them
-/// again for a final merge.
-pub fn tier_sql_sorted(normalized_view: &str, variation_probe: &str) -> String {
+/// and position-ascending inside each tier. Equal-position rows are ordered by
+/// every normalized plugin column, making the order total even when distinct
+/// alleles, transcript discriminators, or values share a position. This lets
+/// the consumer write one reproducible Parquet file directly instead of
+/// encoding two tier files and decoding them again for a final merge.
+pub fn tier_sql_sorted(
+    normalized_view: &str,
+    variation_probe: &str,
+    normalized_columns: &[String],
+) -> String {
+    let mut order = vec![
+        "tier".to_string(),
+        "start".to_string(),
+        "allele_string".to_string(),
+    ];
+    order.extend(
+        normalized_columns
+            .iter()
+            .filter(|column| !matches!(column.as_str(), "tier" | "start" | "allele_string"))
+            .map(|column| format!("\"{}\"", column.replace('"', "\"\""))),
+    );
     format!(
-        "SELECT * FROM ({}) tiered ORDER BY tier, start",
-        tier_sql(normalized_view, variation_probe)
+        "SELECT * FROM ({}) tiered ORDER BY {}",
+        tier_sql(normalized_view, variation_probe),
+        order.join(", ")
     )
 }
 
@@ -62,7 +80,7 @@ pub async fn tiered_stream(
 }
 
 /// Same as `tiered_stream`, but output is guaranteed lexicographically sorted
-/// by `(tier, start)` (see `tier_sql_sorted`).
+/// by the total shard key led by `(tier, start)` (see `tier_sql_sorted`).
 pub async fn tiered_stream_sorted(
     ctx: &SessionContext,
     normalized_view: &str,
@@ -96,7 +114,7 @@ pub(crate) fn should_retry_hash_join(
 /// Retry the final sorted query when either its unspillable hash build or the
 /// downstream external sorter exhausts the pool. The sorter case matters when
 /// the hash estimate technically fits but leaves too little working memory for
-/// `ORDER BY tier, start`; dropping the hash plan before replanning as SMJ frees
+/// the total `ORDER BY tier, start, ...`; dropping the hash plan before replanning as SMJ frees
 /// that reservation without relying on a fixed headroom guess.
 pub(crate) fn should_retry_final_hash_plan(
     error: &DataFusionError,
@@ -400,7 +418,19 @@ async fn tiered_stream_impl(
     register_variation_probe_view(ctx, normalized_view, variation_shard).await?;
     materialize_probe(ctx).await?;
     let sql = if sorted {
-        tier_sql_sorted(normalized_view, "plugin_variation_probe")
+        let normalized_columns = ctx
+            .table(normalized_view)
+            .await?
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        tier_sql_sorted(
+            normalized_view,
+            "plugin_variation_probe",
+            &normalized_columns,
+        )
     } else {
         tier_sql(normalized_view, "plugin_variation_probe")
     };
@@ -428,13 +458,18 @@ pub(crate) async fn tiered_stream_sorted_adaptive(
     normalized_view: &str,
     variation_key_view: &str,
     variation_shard: &Path,
+    normalized_columns: &[String],
     pool: &dyn MemoryPool,
     tracer: &TracingPool,
 ) -> Result<AdaptiveTieredStream> {
     register_variation_probe_view(ctx, variation_key_view, variation_shard).await?;
     materialize_probe_adaptive(ctx, pool, tracer).await?;
 
-    let sql = tier_sql_sorted(normalized_view, "plugin_variation_probe");
+    let sql = tier_sql_sorted(
+        normalized_view,
+        "plugin_variation_probe",
+        normalized_columns,
+    );
     let (plan, algorithm) = adaptive_plan(ctx, &sql, "tier", pool).await?;
     log_plan("tier", plan.as_ref());
     tracer.clear_failures();
@@ -445,7 +480,13 @@ pub(crate) async fn tiered_stream_sorted_adaptive(
                 "plugin_cache: final HashJoin plan exhausted the pool before streaming; retrying with DataFusion SortMergeJoin"
             );
             Ok(AdaptiveTieredStream {
-                stream: tiered_stream_sorted_sort_merge(ctx, normalized_view, tracer).await?,
+                stream: tiered_stream_sorted_sort_merge(
+                    ctx,
+                    normalized_view,
+                    normalized_columns,
+                    tracer,
+                )
+                .await?,
                 algorithm: JoinAlgorithm::SortMerge,
             })
         }
@@ -459,9 +500,14 @@ pub(crate) async fn tiered_stream_sorted_adaptive(
 pub(crate) async fn tiered_stream_sorted_sort_merge(
     ctx: &SessionContext,
     normalized_view: &str,
+    normalized_columns: &[String],
     tracer: &TracingPool,
 ) -> Result<SendableRecordBatchStream> {
-    let sql = tier_sql_sorted(normalized_view, "plugin_variation_probe");
+    let sql = tier_sql_sorted(
+        normalized_view,
+        "plugin_variation_probe",
+        normalized_columns,
+    );
     let plan = sort_merge_plan(ctx, &sql, "tier_runtime_fallback").await?;
     log_plan("tier_runtime_fallback", plan.as_ref());
     tracer.clear_failures();
@@ -792,12 +838,20 @@ mod tests {
         )
         .unwrap();
         ctx.register_batch("plugin_demo_norm", plugin).unwrap();
+        let normalized_columns = vec![
+            "chrom".to_string(),
+            "start".to_string(),
+            "end".to_string(),
+            "allele_string".to_string(),
+            "demo_score".to_string(),
+        ];
 
         let adaptive = tiered_stream_sorted_adaptive(
             &ctx,
             "plugin_demo_norm",
             "plugin_demo_norm",
             &variation_path,
+            &normalized_columns,
             tracer.as_ref(),
             tracer.as_ref(),
         )
@@ -820,12 +874,17 @@ mod tests {
             "the final tier HashJoin must reach the injected rejecting pool"
         );
 
-        let batches = tiered_stream_sorted_sort_merge(&ctx, "plugin_demo_norm", tracer.as_ref())
-            .await
-            .unwrap()
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .unwrap();
+        let batches = tiered_stream_sorted_sort_merge(
+            &ctx,
+            "plugin_demo_norm",
+            &normalized_columns,
+            tracer.as_ref(),
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .unwrap();
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
     }
 
@@ -1049,6 +1108,90 @@ mod tests {
         // value column preserved, variation columns dropped
         assert!(b.schema().index_of("demo_score").is_ok());
         assert!(b.schema().index_of("tier").is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sorted_tier_stream_totally_orders_equal_position_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let variation_schema = Arc::new(Schema::new(vec![
+            Field::new("start", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("tier", DataType::Int8, false),
+        ]));
+        let variation = RecordBatch::try_new(
+            Arc::clone(&variation_schema),
+            vec![
+                Arc::new(UInt32Array::from(vec![100u32, 100])),
+                Arc::new(StringArray::from(vec!["A/G", "A/T"])),
+                Arc::new(Int8Array::from(vec![0i8, 0])),
+            ],
+        )
+        .unwrap();
+        let variation_path = dir.path().join("variation.parquet");
+        let file = std::fs::File::create(&variation_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, variation_schema, None).unwrap();
+        writer.write(&variation).unwrap();
+        writer.close().unwrap();
+
+        // Deliberately reverse every tie-breaker. The last two rows even share
+        // the runtime probe key, exercising the value-column fallback that
+        // keeps externally-created/incorrectly-assumed-unique inputs stable.
+        let plugin = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("protein_variant", DataType::Utf8, false),
+                Field::new("demo_score", DataType::Float32, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1", "1", "1"])),
+                Arc::new(UInt32Array::from(vec![100u32, 100, 100, 100])),
+                Arc::new(UInt32Array::from(vec![100u32, 100, 100, 100])),
+                Arc::new(StringArray::from(vec!["A/T", "A/G", "A/G", "A/G"])),
+                Arc::new(StringArray::from(vec!["z", "b", "a", "a"])),
+                Arc::new(Float32Array::from(vec![0.3f32, 0.2, 0.9, 0.1])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_batch("plugin_demo_norm", plugin).unwrap();
+
+        let batches = tiered_stream_sorted(&ctx, "plugin_demo_norm", &variation_path)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let allele = batch
+            .column(batch.schema().index_of("allele_string").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let protein = batch
+            .column(batch.schema().index_of("protein_variant").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let score = batch
+            .column(batch.schema().index_of("demo_score").unwrap())
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let rows = (0..batch.num_rows())
+            .map(|row| (allele.value(row), protein.value(row), score.value(row)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                ("A/G", "a", 0.1),
+                ("A/G", "a", 0.9),
+                ("A/G", "b", 0.2),
+                ("A/T", "z", 0.3),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

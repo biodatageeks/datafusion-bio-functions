@@ -8,7 +8,7 @@
 //! pool. If it does not, or the statistics are incomplete, only
 //! `prefer_hash_join` is changed and DataFusion plans its built-in
 //! SortMergeJoin. The final query always has an explicit
-//! `ORDER BY tier, start`, so correctness does not depend on execution-
+//! total `ORDER BY tier, start, ...`, so correctness does not depend on execution-
 //! partition or hash-table order and the result can be written directly in
 //! the point-lookup shard's physical order.
 
@@ -72,7 +72,8 @@ struct TierOrderSummary {
 /// and against the previous batch's final key. Return the batch's final key
 /// and its warm/cold row counts.
 ///
-/// The query's explicit `ORDER BY tier, start` provides this contract. Check
+/// The query's explicit total `ORDER BY tier, start, ...` provides this prefix
+/// contract. Check
 /// it at the storage boundary anyway: a planner/executor regression must abort
 /// the write instead of producing a page directory whose binary-search lookup
 /// can silently miss rows (`PageDir::resolve_ranges` assumes a sorted run).
@@ -298,9 +299,10 @@ impl Drop for ScratchGuard {
     }
 }
 
-/// Consume the globally `(tier, start)`-sorted stream and write it directly to
-/// the final temporary shard. The monotonicity check is a final assertion of
-/// the adaptive plan's explicit sorted-output contract.
+/// Consume the globally, totally sorted stream (whose leading keys are
+/// `(tier, start)`) and write it directly to the final temporary shard. The
+/// monotonicity check is a final assertion of the adaptive plan's explicit
+/// sorted-output contract.
 ///
 /// `PluginShardWriter::create` truncates its target path, so a runtime
 /// Hash-to-SMJ fallback safely overwrites any partial first attempt.
@@ -479,6 +481,11 @@ pub async fn build_plugin_chrom_staged(
     let norm_df = read_ctx.sql(&format!("SELECT * FROM {norm_view}")).await?;
     let (norm_stream, source_partitions) = ordered_parallel_source_stream(norm_df).await?;
     let norm_schema = norm_stream.schema();
+    let normalized_columns = norm_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>();
     // `assume_unique` sources are claimed to never repeat a probe key, so the
     // exhaustive keep-first pass (a HashSet<String> with one entry per row —
     // the dominant memory cost on the largest chromosomes) is skipped in
@@ -563,6 +570,7 @@ pub async fn build_plugin_chrom_staged(
         &dedup_view,
         &key_view,
         variation_shard,
+        &normalized_columns,
         pool.as_ref(),
         tracer.as_ref(),
     )
@@ -590,8 +598,13 @@ pub async fn build_plugin_chrom_staged(
                  ({read_rows} plugin rows this chrom) -- retrying with DataFusion SortMergeJoin",
                 src.plugin_name
             );
-            let merge_stream =
-                tiered_stream_sorted_sort_merge(&build_ctx, &dedup_view, tracer.as_ref()).await?;
+            let merge_stream = tiered_stream_sorted_sort_merge(
+                &build_ctx,
+                &dedup_view,
+                &normalized_columns,
+                tracer.as_ref(),
+            )
+            .await?;
             write_tiered_shard(
                 merge_stream,
                 &out_schema,
