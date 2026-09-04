@@ -1437,6 +1437,7 @@ dependencies = [
  "indicatif",
  "libc",
  "log",
+ "md-5",
  "memmap2",
  "mimalloc",
  "nohash-hasher",

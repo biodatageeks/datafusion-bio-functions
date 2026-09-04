@@ -26,6 +26,8 @@ coitrees = "0.4.0"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Streaming MD5 of plugin build inputs (`plugin_cache::source_verify`).
+md-5 = "0.10"
 tempfile = "3"
 noodles-core = "0.16"
 noodles-fasta = "0.49"
@@ -34,6 +36,7 @@ noodles-fasta = "0.49"
 noodles-core-tabix = { package = "noodles-core", git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-csi = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-tabix = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
+noodles-bgzf = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
 datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "12016a9304d3a14e4d56d9459f3bd6f1cb678d02" }
 datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "12016a9304d3a14e4d56d9459f3bd6f1cb678d02" }
@@ -48,7 +51,6 @@ libc = "0.2"
 
 [dev-dependencies]
 mimalloc = "0.1"
-noodles-bgzf = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
 noodles-vcf = { git = "https://github.com/biodatageeks/noodles.git", rev = "9b7b2c5b6531373918302d4c07410e583f1b5b5c" }
