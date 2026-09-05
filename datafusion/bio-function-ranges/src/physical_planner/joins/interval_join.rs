@@ -8,12 +8,13 @@ use crate::physical_planner::joins::utils::{
 };
 use crate::session_context::Algorithm;
 use ahash::AHashMap;
-use ahash::RandomState;
 use bio::data_structures::interval_tree as rust_bio;
 use datafusion::arrow::array::{Array, AsArray, PrimitiveArray, PrimitiveBuilder, RecordBatch};
 use datafusion::arrow::compute;
 use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
+use datafusion::common::hash_utils::RandomState;
 use datafusion::common::hash_utils::create_hashes;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{
     DataFusionError, JoinSide, JoinType, Result, Statistics, internal_err, plan_err, project_schema,
 };
@@ -25,6 +26,7 @@ use datafusion::physical_expr::{Distribution, Partitioning, PhysicalExpr, Physic
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::can_project;
 use datafusion::physical_plan::execution_plan::EmissionType;
+use datafusion::physical_plan::execution_plan::apply_expression_roots;
 use datafusion::physical_plan::joins::PartitionMode;
 use datafusion::physical_plan::joins::utils::{
     ColumnIndex, JoinFilter, JoinOn, JoinOnRef, StatefulStreamResult,
@@ -36,7 +38,7 @@ use datafusion::physical_plan::{
     handle_state,
 };
 use futures::{Stream, StreamExt, TryStreamExt, ready};
-use std::any::Any;
+
 use std::fmt::{Debug, Formatter};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -130,7 +132,7 @@ impl IntervalJoinExec {
         let (join_schema, column_indices) =
             build_join_schema(&left_schema, &right_schema, join_type);
 
-        let random_state = RandomState::with_seeds(0, 0, 0, 0);
+        let random_state = RandomState::default();
 
         let join_schema = Arc::new(join_schema);
 
@@ -379,12 +381,23 @@ impl DisplayAs for IntervalJoinExec {
 }
 
 impl ExecutionPlan for IntervalJoinExec {
-    fn name(&self) -> &'static str {
-        "IntervalJoinExec"
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        let join_keys = self
+            .on
+            .iter()
+            .flat_map(|(left, right)| [Arc::clone(left), Arc::clone(right)]);
+        let filter = self
+            .filter
+            .iter()
+            .map(|filter| Arc::clone(filter.expression()));
+        apply_expression_roots(join_keys.chain(filter), f)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &'static str {
+        "IntervalJoinExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -401,8 +414,8 @@ impl ExecutionPlan for IntervalJoinExec {
                 let (left_expr, right_expr) =
                     self.on.iter().map(|(l, r)| (l.clone(), r.clone())).unzip();
                 vec![
-                    Distribution::HashPartitioned(left_expr),
-                    Distribution::HashPartitioned(right_expr),
+                    Distribution::KeyPartitioned(left_expr),
+                    Distribution::KeyPartitioned(right_expr),
                 ]
             }
             PartitionMode::Auto => vec![
@@ -569,17 +582,8 @@ impl ExecutionPlan for IntervalJoinExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
-        let mut stats = estimate_join_statistics(
-            Arc::clone(&self.left),
-            Arc::clone(&self.right),
-            self.on.clone(),
-            &self.join_type,
-        )?;
-        if stats.column_statistics.len() != self.join_schema.fields().len() {
-            stats.column_statistics = Statistics::unknown_column(self.join_schema.as_ref());
-        }
-        Ok(stats.project(self.projection.as_ref()))
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        self.partition_statistics_inner(partition).map(Arc::new)
     }
 }
 
@@ -1708,6 +1712,21 @@ fn evaluate_as_i32(
         .to_owned();
 
     Ok(array)
+}
+
+impl IntervalJoinExec {
+    fn partition_statistics_inner(&self, _partition: Option<usize>) -> Result<Statistics> {
+        let mut stats = estimate_join_statistics(
+            Arc::clone(&self.left),
+            Arc::clone(&self.right),
+            self.on.clone(),
+            &self.join_type,
+        )?;
+        if stats.column_statistics.len() != self.join_schema.fields().len() {
+            stats.column_statistics = Statistics::unknown_column(self.join_schema.as_ref());
+        }
+        Ok(stats.project(self.projection.as_ref()))
+    }
 }
 
 #[cfg(test)]

@@ -539,7 +539,17 @@ mod tests {
         rejected_hash_grows: AtomicUsize,
     }
 
+    impl std::fmt::Display for RejectHashPool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RejectHashPool")
+        }
+    }
+
     impl MemoryPool for RejectHashPool {
+        fn name(&self) -> &str {
+            "RejectHashPool"
+        }
+
         fn grow(&self, reservation: &MemoryReservation, additional: usize) {
             self.inner.grow(reservation, additional);
         }

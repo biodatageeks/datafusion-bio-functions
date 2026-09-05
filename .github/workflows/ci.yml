@@ -21,7 +21,7 @@ jobs:
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: '1.91.0'
+          toolchain: '1.94.0'
           components: 'clippy, rustfmt'
 
       # `--all-features` enables `lance-cache`, whose `lance-index` dependency

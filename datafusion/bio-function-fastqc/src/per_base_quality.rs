@@ -1,5 +1,3 @@
-use std::any::Any;
-
 use crate::{QcModule, TidyRow};
 
 /// Max phred value tracked (0..=93 covers all realistic phred scores).
@@ -42,6 +40,10 @@ fn percentile(hist: &[u64; QUAL_MAX], total: u64, p: f64) -> f64 {
 }
 
 impl QcModule for PerBaseQuality {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "per_base_quality"
     }
@@ -113,10 +115,6 @@ impl QcModule for PerBaseQuality {
             "PASS"
         };
         out.push(TidyRow::status(m, status));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
