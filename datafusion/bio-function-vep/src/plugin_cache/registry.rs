@@ -402,7 +402,7 @@ mod tests {
             cache_source_version: None,
             allele_match: Default::default(),
             field_order: Default::default(),
-            assume_unique: false,
+            assume_unique: None,
         }
         .write(&plugin_dir)
         .unwrap();
@@ -563,7 +563,7 @@ mod tests {
             cache_source_version: None,
             allele_match: Default::default(),
             field_order: Default::default(),
-            assume_unique: false,
+            assume_unique: None,
         };
         manifest.write(&plugin_dir).unwrap();
 
@@ -652,7 +652,7 @@ mod tests {
             cache_source_version: None,
             allele_match: Default::default(),
             field_order: Default::default(),
-            assume_unique: false,
+            assume_unique: None,
         };
         manifest.write(&plugin_dir).unwrap();
 
@@ -728,7 +728,7 @@ mod tests {
             cache_source_version: None,
             allele_match: Default::default(),
             field_order: Default::default(),
-            assume_unique: false,
+            assume_unique: None,
         };
         manifest.write(&plugin_dir).unwrap();
 
@@ -782,7 +782,7 @@ mod tests {
             cache_source_version: None,
             allele_match: Default::default(),
             field_order: Default::default(),
-            assume_unique: false,
+            assume_unique: None,
         };
         manifest.write(&plugin_dir).unwrap();
 
