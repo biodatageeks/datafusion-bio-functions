@@ -5,7 +5,7 @@
 //! - runs Ensembl VEP in Docker as golden standard,
 //! - compares the golden output with `annotate_vep()` output.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -736,6 +736,49 @@ pub fn csq_field_names_for_mode_with_pick(
     fields
 }
 
+/// Resolve an ordered VEP-style `--fields` selection against the active CSQ
+/// layout. The returned indices address the full base layout; custom-plugin
+/// fields are deliberately outside this selection and are always appended.
+pub(crate) fn resolve_csq_field_selection(
+    everything: bool,
+    refseq: bool,
+    merged: bool,
+    include_pick: bool,
+    requested: &[String],
+) -> Result<(Vec<&'static str>, Vec<usize>)> {
+    if requested.is_empty() {
+        return Err(DataFusionError::Plan(
+            "annotate_vep(): fields must contain at least one base CSQ field".to_string(),
+        ));
+    }
+
+    let available = csq_field_names_for_mode_with_pick(everything, refseq, merged, include_pick);
+    let positions: HashMap<&str, usize> = available
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (*name, index))
+        .collect();
+    let mut seen = HashSet::with_capacity(requested.len());
+    let mut names = Vec::with_capacity(requested.len());
+    let mut indices = Vec::with_capacity(requested.len());
+    for name in requested {
+        if !seen.insert(name.as_str()) {
+            return Err(DataFusionError::Plan(format!(
+                "annotate_vep(): fields contains duplicate field '{name}'"
+            )));
+        }
+        let Some(&index) = positions.get(name.as_str()) else {
+            return Err(DataFusionError::Plan(format!(
+                "annotate_vep(): unknown CSQ field '{name}'. Available fields: {}",
+                available.join(", ")
+            )));
+        };
+        names.push(available[index]);
+        indices.push(index);
+    }
+    Ok((names, indices))
+}
+
 pub fn csq_field_names(everything: bool, include_pick: bool) -> Vec<&'static str> {
     csq_field_names_for_mode_with_pick(everything, false, false, include_pick)
 }
@@ -1305,6 +1348,31 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(CSQ_FIELD_NAMES[57], "gnomADg_AF");
         assert_eq!(CSQ_FIELD_NAMES[68], "MAX_AF");
         assert_eq!(CSQ_FIELD_NAMES[73], "PUBMED");
+    }
+
+    #[test]
+    fn resolve_csq_field_selection_preserves_requested_order() {
+        let requested = vec![
+            "Allele".to_string(),
+            "Gene".to_string(),
+            "Feature".to_string(),
+            "Consequence".to_string(),
+        ];
+        let (names, indices) =
+            resolve_csq_field_selection(false, false, false, false, &requested).unwrap();
+        assert_eq!(names, vec!["Allele", "Gene", "Feature", "Consequence"]);
+        assert_eq!(indices, vec![0, 4, 6, 1]);
+    }
+
+    #[test]
+    fn resolve_csq_field_selection_rejects_empty_duplicate_and_unknown_fields() {
+        for requested in [
+            Vec::<String>::new(),
+            vec!["Gene".to_string(), "Gene".to_string()],
+            vec!["NOT_A_CSQ_FIELD".to_string()],
+        ] {
+            assert!(resolve_csq_field_selection(false, false, false, false, &requested).is_err());
+        }
     }
 
     #[test]

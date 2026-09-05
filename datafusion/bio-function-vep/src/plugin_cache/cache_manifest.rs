@@ -157,27 +157,11 @@ pub struct CacheManifest {
     /// [`AlleleMatch::Exact`], which is what most plugins do.
     #[serde(default)]
     pub allele_match: AlleleMatch,
-    /// Position of this plugin's field block in the CSQ string. Ensembl emits
-    /// `--plugin` blocks in the order the flags were given and appends
-    /// `--custom` blocks last, so the order is a convention rather than
-    /// something derivable from the cache; it is pinned here. Plugins sharing a
-    /// rank fall back to plugin-name order.
-    #[serde(default = "default_csq_rank")]
-    pub csq_rank: u32,
     /// Field order *within* this plugin's block. Ensembl's plugin framework
     /// emits a plugin's own fields sorted by name, while `--custom` fields keep
     /// the order the user listed them in.
     #[serde(default)]
     pub field_order: FieldOrder,
-}
-
-fn default_csq_rank() -> u32 {
-    u32::MAX
-}
-
-/// Same default, reachable from the source manifest's serde attribute.
-pub fn default_csq_rank_pub() -> u32 {
-    default_csq_rank()
 }
 
 /// Field ordering within one plugin's CSQ block.
@@ -224,6 +208,15 @@ impl CacheManifest {
         Ok(())
     }
 
+    pub(crate) fn read(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| DataFusionError::Execution(format!("read {}: {e}", path.display())))?;
+        let manifest: Self = serde_json::from_str(&text)
+            .map_err(|e| DataFusionError::Execution(format!("parse {}: {e}", path.display())))?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
     /// Seed a cache manifest from a source manifest (chroms filled in by the build).
     pub fn from_source(src: &SourceManifest, source_manifest_file: &str) -> Self {
         CacheManifest {
@@ -259,7 +252,6 @@ impl CacheManifest {
             sources: vec![],
             cache_source_version: None,
             allele_match: src.allele_match,
-            csq_rank: src.csq_rank,
             field_order: src.field_order,
         }
     }
@@ -274,9 +266,8 @@ impl CacheManifest {
     }
 }
 
-/// Discover built plugins under `<cache_root>/plugin/*/manifest.json`, ordered by
-/// `csq_rank` then plugin name so the emitted CSQ field blocks are deterministic
-/// and can be pinned to the order Ensembl VEP writes them in.
+/// Discover built plugins under `<cache_root>/plugin/*/manifest.json`, ordered
+/// alphabetically by plugin name for deterministic default output.
 pub fn discover_plugins(cache_root: &Path) -> Result<Vec<CacheManifest>> {
     let plugin_root = cache_root.join("plugin");
     let mut out = Vec::new();
@@ -291,17 +282,10 @@ pub fn discover_plugins(cache_root: &Path) -> Result<Vec<CacheManifest>> {
             .path();
         let mf = dir.join("manifest.json");
         if mf.exists() {
-            let text = std::fs::read_to_string(&mf)
-                .map_err(|e| DataFusionError::Execution(format!("read {}: {e}", mf.display())))?;
-            let manifest: CacheManifest = serde_json::from_str(&text)
-                .map_err(|e| DataFusionError::Execution(format!("parse {}: {e}", mf.display())))?;
-            manifest.validate()?;
-            out.push(manifest);
+            out.push(CacheManifest::read(&mf)?);
         }
     }
-    out.sort_by(|a: &CacheManifest, b: &CacheManifest| {
-        (a.csq_rank, &a.plugin_name).cmp(&(b.csq_rank, &b.plugin_name))
-    });
+    out.sort_by(|a: &CacheManifest, b: &CacheManifest| a.plugin_name.cmp(&b.plugin_name));
     Ok(out)
 }
 
@@ -348,7 +332,6 @@ mod tests {
             sources: vec![],
             cache_source_version: None,
             allele_match: Default::default(),
-            csq_rank: 0,
             field_order: Default::default(),
         };
         m.write(&plugin_dir).unwrap();
@@ -356,6 +339,20 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].plugin_name, "demo");
         assert_eq!(found[0].chroms[0].rows, 3);
+
+        // Existing caches may still carry the retired ordering hint. Serde's
+        // default unknown-field behavior keeps those manifests readable.
+        let mut legacy: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(plugin_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        legacy["csq_rank"] = serde_json::json!(7);
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(discover_plugins(dir.path()).unwrap().len(), 1);
 
         m.value_columns = vec![ValueColumnRecord {
             column: "score".into(),

@@ -1164,22 +1164,118 @@ struct VepFlags {
 
 impl VepFlags {
     fn from_options_json(options_json: Option<&str>) -> Self {
+        Self::from_options_json_with_field_pruning(options_json, false)
+    }
+
+    fn from_options_json_with_field_pruning(
+        options_json: Option<&str>,
+        prune_unselected_fields: bool,
+    ) -> Self {
         let parse = |key| {
             options_json
                 .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
                 .unwrap_or(false)
         };
         let everything = parse("everything");
+        let selected_fields: Option<HashSet<String>> = prune_unselected_fields
+            .then(|| {
+                options_json
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .and_then(|value| {
+                        value.get("fields")?.as_array().map(|fields| {
+                            fields
+                                .iter()
+                                .filter_map(|field| field.as_str().map(ToString::to_string))
+                                .collect()
+                        })
+                    })
+            })
+            .flatten();
+        let emits_any = |names: &[&str]| {
+            selected_fields
+                .as_ref()
+                .is_none_or(|selected| names.iter().any(|name| selected.contains(*name)))
+        };
         // --everything implies all sub-flags per Config.pm#L346-L374.
-        let af = everything || parse("af");
-        let af_1kg = everything || parse("af_1kg");
-        let af_gnomade = everything || parse("af_gnomade");
-        let af_gnomadg = everything || parse("af_gnomadg");
-        let max_af = everything || parse("max_af");
-        let pubmed = everything || parse("pubmed");
+        let max_af = (everything || parse("max_af")) && emits_any(&["MAX_AF", "MAX_AF_POPS"]);
+        let af = (everything || parse("af")) && (max_af || emits_any(&["AF"]));
+        let af_1kg = (everything || parse("af_1kg"))
+            && (max_af || emits_any(&["AFR_AF", "AMR_AF", "EAS_AF", "EUR_AF", "SAS_AF"]));
+        let af_gnomade = (everything || parse("af_gnomade"))
+            && (max_af
+                || selected_fields.as_ref().is_none_or(|selected| {
+                    selected.iter().any(|name| name.starts_with("gnomADe_"))
+                }));
+        let af_gnomadg = (everything || parse("af_gnomadg"))
+            && (max_af
+                || selected_fields.as_ref().is_none_or(|selected| {
+                    selected.iter().any(|name| name.starts_with("gnomADg_"))
+                }));
+        let pubmed = (everything || parse("pubmed")) && emits_any(&["PUBMED"]);
         // VEP behavior: AF flags imply --check_existing.
-        let check_existing =
-            parse("check_existing") || af || af_1kg || af_gnomade || af_gnomadg || max_af || pubmed;
+        let check_existing = (everything
+            || parse("check_existing")
+            || af
+            || af_1kg
+            || af_gnomade
+            || af_gnomadg
+            || max_af
+            || pubmed)
+            && emits_any(&[
+                "Existing_variation",
+                "AF",
+                "AFR_AF",
+                "AMR_AF",
+                "EAS_AF",
+                "EUR_AF",
+                "SAS_AF",
+                "gnomADe_AF",
+                "gnomADe_AFR",
+                "gnomADe_AFR_AF",
+                "gnomADe_AMR",
+                "gnomADe_AMR_AF",
+                "gnomADe_ASJ",
+                "gnomADe_ASJ_AF",
+                "gnomADe_EAS",
+                "gnomADe_EAS_AF",
+                "gnomADe_FIN",
+                "gnomADe_FIN_AF",
+                "gnomADe_MID",
+                "gnomADe_MID_AF",
+                "gnomADe_NFE",
+                "gnomADe_NFE_AF",
+                "gnomADe_REMAINING",
+                "gnomADe_REMAINING_AF",
+                "gnomADe_SAS",
+                "gnomADe_SAS_AF",
+                "gnomADg_AF",
+                "gnomADg_AFR",
+                "gnomADg_AFR_AF",
+                "gnomADg_AMI",
+                "gnomADg_AMI_AF",
+                "gnomADg_AMR",
+                "gnomADg_AMR_AF",
+                "gnomADg_ASJ",
+                "gnomADg_ASJ_AF",
+                "gnomADg_EAS",
+                "gnomADg_EAS_AF",
+                "gnomADg_FIN",
+                "gnomADg_FIN_AF",
+                "gnomADg_MID",
+                "gnomADg_MID_AF",
+                "gnomADg_NFE",
+                "gnomADg_NFE_AF",
+                "gnomADg_REMAINING",
+                "gnomADg_REMAINING_AF",
+                "gnomADg_SAS",
+                "gnomADg_SAS_AF",
+                "MAX_AF",
+                "MAX_AF_POPS",
+                "CLIN_SIG",
+                "SOMATIC",
+                "PHENO",
+                "PUBMED",
+            ]);
         Self {
             check_existing,
             af,
@@ -1585,6 +1681,159 @@ impl CsqPlaceholderLayout {
             buf.push_str(field.value(entry));
         }
     }
+}
+
+/// Ordered projection from the active full base CSQ layout to a VEP-style
+/// `--fields` subset. Plugin fields are not selectable here: they remain a
+/// trailing block in registry order.
+const VCF_CORE_CSQ_FIELDS: [&str; 11] = [
+    "Allele",
+    "Gene",
+    "Feature",
+    "Feature_type",
+    "Consequence",
+    "cDNA_position",
+    "CDS_position",
+    "Protein_position",
+    "Amino_acids",
+    "Codons",
+    "Existing_variation",
+];
+
+struct VcfCoreCsqEntry<'a> {
+    allele: &'a str,
+    gene: &'a str,
+    feature: &'a str,
+    feature_type: &'a str,
+    consequence: &'a str,
+    cdna_position: &'a str,
+    cds_position: &'a str,
+    protein_position: &'a str,
+    amino_acids: &'a str,
+    codons: &'a str,
+    existing_variation: &'a str,
+}
+
+impl VcfCoreCsqEntry<'_> {
+    fn append_to(&self, output: &mut String) {
+        let _ = write!(
+            output,
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.allele,
+            self.gene,
+            self.feature,
+            self.feature_type,
+            self.consequence,
+            self.cdna_position,
+            self.cds_position,
+            self.protein_position,
+            self.amino_acids,
+            self.codons,
+            self.existing_variation,
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CsqFieldProjection {
+    indices: Vec<usize>,
+    output_position_by_input: Vec<Option<usize>>,
+    names: HashSet<&'static str>,
+    full_base_field_count: usize,
+    is_vcf_core: bool,
+}
+
+impl CsqFieldProjection {
+    fn for_mode(
+        everything: bool,
+        transcript_selection: TranscriptSelectionFlags,
+        include_pick: bool,
+        requested: &[String],
+    ) -> Result<Self> {
+        let (selected_names, indices) = crate::golden_benchmark::resolve_csq_field_selection(
+            everything,
+            transcript_selection.cache_source_type == CacheSourceType::RefSeq,
+            transcript_selection.cache_source_type == CacheSourceType::Merged,
+            include_pick,
+            requested,
+        )?;
+        let full_base_field_count = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
+            everything,
+            transcript_selection.cache_source_type == CacheSourceType::RefSeq,
+            transcript_selection.cache_source_type == CacheSourceType::Merged,
+            include_pick,
+        )
+        .len();
+        let mut output_position_by_input = vec![None; full_base_field_count];
+        for (output_position, &input_position) in indices.iter().enumerate() {
+            output_position_by_input[input_position] = Some(output_position);
+        }
+        Ok(Self {
+            indices,
+            output_position_by_input,
+            names: selected_names.into_iter().collect(),
+            full_base_field_count,
+            is_vcf_core: requested.iter().map(String::as_str).eq(VCF_CORE_CSQ_FIELDS),
+        })
+    }
+
+    fn emits(&self, field: &str) -> bool {
+        self.names.contains(field)
+    }
+
+    fn project_entries(
+        &self,
+        full: &str,
+        plugin_field_count: usize,
+        projected: &mut String,
+    ) -> Result<()> {
+        projected.clear();
+        let expected = self.full_base_field_count + plugin_field_count;
+        let mut selected_values = vec![""; self.indices.len() + plugin_field_count];
+        for (entry_index, entry) in full.split(',').enumerate() {
+            if entry_index > 0 {
+                projected.push(',');
+            }
+            selected_values.fill("");
+            let mut actual = 0;
+            for (input_position, value) in entry.split('|').enumerate() {
+                actual += 1;
+                if input_position < self.full_base_field_count {
+                    if let Some(output_position) = self.output_position_by_input[input_position] {
+                        selected_values[output_position] = value;
+                    }
+                } else if input_position < expected {
+                    selected_values
+                        [self.indices.len() + input_position - self.full_base_field_count] = value;
+                }
+            }
+            if actual != expected {
+                return Err(DataFusionError::Execution(format!(
+                    "annotate_vep(): CSQ field projection expected {expected} fields but entry {} has {}",
+                    entry_index + 1,
+                    actual
+                )));
+            }
+            for (output_position, value) in selected_values.iter().enumerate() {
+                if output_position > 0 {
+                    projected.push('|');
+                }
+                projected.push_str(value);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn output_needs_sift_polyphen(
+    skip_csq: bool,
+    skip_typed_cols: bool,
+    csq_field_projection: Option<&CsqFieldProjection>,
+) -> bool {
+    !skip_typed_cols
+        || (!skip_csq
+            && csq_field_projection
+                .is_none_or(|projection| projection.emits("SIFT") || projection.emits("PolyPhen")))
 }
 
 #[derive(Debug)]
@@ -3386,6 +3635,7 @@ pub struct AnnotateProvider {
     transcript_selection: TranscriptSelectionFlags,
     pick_flags: PickFlags,
     include_pick_output: bool,
+    csq_field_projection: Option<CsqFieldProjection>,
     annotation_column_defs: Vec<AnnotationColumnDef>,
     schema: SchemaRef,
     /// Set by the `vcf_sink` sharded-output entry to drive per-worker VCF shard
@@ -3394,6 +3644,10 @@ pub struct AnnotateProvider {
     /// Root of a custom-plugin cache (`<root>/plugin/*`). `None` = no plugins.
     #[cfg(feature = "parquet-cache")]
     plugin_cache_root: Option<std::path::PathBuf>,
+    /// Selected plugins in caller-supplied CSQ order. `None` means discover all
+    /// plugins alphabetically; `Some([])` disables every plugin.
+    #[cfg(feature = "parquet-cache")]
+    plugin_names: Option<Vec<String>>,
 }
 
 impl AnnotateProvider {
@@ -3412,8 +3666,24 @@ impl AnnotateProvider {
         )?;
         let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
         let include_pick_output = pick_flags.include_pick_output();
+        let requested_fields =
+            Self::parse_json_string_array_option(options_json.as_deref(), "fields")?;
+        let csq_field_projection = requested_fields
+            .as_deref()
+            .map(|requested| {
+                CsqFieldProjection::for_mode(
+                    VepFlags::from_options_json(options_json.as_deref()).everything,
+                    transcript_selection,
+                    include_pick_output,
+                    requested,
+                )
+            })
+            .transpose()?;
         let annotation_column_defs =
             annotation_column_defs_for_selection(transcript_selection, include_pick_output);
+        #[cfg(feature = "parquet-cache")]
+        let plugin_names =
+            Self::parse_json_string_array_option(options_json.as_deref(), "plugins")?;
         // Output schema starts with all VCF columns and appends annotation
         // fields. The input fields keep their metadata: it carries the VCF
         // typing the writer needs (`bio.vcf.field.*`) and the marker that
@@ -3455,11 +3725,14 @@ impl AnnotateProvider {
             transcript_selection,
             pick_flags,
             include_pick_output,
+            csq_field_projection,
             annotation_column_defs,
             schema: Arc::new(Schema::new(fields)),
             vcf_shard_ctx: None,
             #[cfg(feature = "parquet-cache")]
             plugin_cache_root: None,
+            #[cfg(feature = "parquet-cache")]
+            plugin_names,
         })
     }
 
@@ -3522,6 +3795,35 @@ impl AnnotateProvider {
             return None;
         }
         Some(value.to_string())
+    }
+
+    fn parse_json_string_array_option(
+        json: Option<&str>,
+        key: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|error| {
+            DataFusionError::Plan(format!("options_json must be valid JSON: {error}"))
+        })?;
+        let Some(selected) = value.get(key) else {
+            return Ok(None);
+        };
+        let values = selected.as_array().ok_or_else(|| {
+            DataFusionError::Plan(format!("options_json '{key}' must be an array of strings"))
+        })?;
+        values
+            .iter()
+            .map(|value| {
+                value.as_str().map(ToString::to_string).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "options_json '{key}' must be an array of strings"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     }
 
     fn parse_json_bool_option(json: &str, key: &str) -> Option<bool> {
@@ -5218,7 +5520,24 @@ impl AnnotateProvider {
             eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned START ======");
         }
 
-        let flags = VepFlags::from_options_json(self.options_json.as_deref());
+        let csq_col_idx = self.vcf_field_count();
+        let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
+        let typed_cols_start = csq_col_idx + 2;
+        let typed_cols_end = typed_cols_start + self.annotation_column_defs.len();
+        let skip_typed_cols = projection.is_some_and(|indices| {
+            !indices
+                .iter()
+                .any(|&index| index >= typed_cols_start && index < typed_cols_end)
+        });
+        let needs_sift_polyphen = output_needs_sift_polyphen(
+            skip_csq,
+            skip_typed_cols,
+            self.csq_field_projection.as_ref(),
+        );
+        let flags = VepFlags::from_options_json_with_field_pruning(
+            self.options_json.as_deref(),
+            skip_typed_cols,
+        );
         let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
         let transcript_selection = self.transcript_selection;
         let pick_flags = self.pick_flags.clone();
@@ -5269,6 +5588,17 @@ impl AnnotateProvider {
         let annotation_workers = requested_workers;
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
+
+        #[cfg(feature = "parquet-cache")]
+        if let Some(root) = self.plugin_cache_root.as_ref() {
+            // Per-contig registry construction normally validates this set, but
+            // an empty VCF returns before any registry is opened. Validate at
+            // planning time so errors never depend on input cardinality.
+            crate::plugin_cache::registry::PluginRegistry::validate_selection(
+                root,
+                self.plugin_names.as_deref(),
+            )?;
+        }
 
         // Discover contigs from VCF.
         let t_contigs = profile_start!();
@@ -5372,12 +5702,15 @@ impl AnnotateProvider {
             target_partitions,
             projection: projection.cloned(),
             annotation_column_count: self.annotation_column_count(),
+            needs_sift_polyphen,
             fetch_limit,
             annotation_workers,
             #[cfg(feature = "parquet-cache")]
             cache_root,
             #[cfg(feature = "parquet-cache")]
             plugin_cache_root: self.plugin_cache_root.clone(),
+            #[cfg(feature = "parquet-cache")]
+            plugin_names: self.plugin_names.clone(),
             #[cfg(feature = "parquet-cache")]
             parquet_backend,
             #[cfg(feature = "parquet-cache")]
@@ -5460,6 +5793,8 @@ impl AnnotateProvider {
         // CSQ emission below. `None`/0 fields ⇒ no plugins ⇒ byte-identical output.
         #[cfg(feature = "parquet-cache")]
         let plugin_n_fields = plugin_registry.map(|r| r.csq_fields().len()).unwrap_or(0);
+        #[cfg(not(feature = "parquet-cache"))]
+        let plugin_n_fields = 0usize;
         #[cfg(feature = "parquet-cache")]
         let plugin_slices = if let Some(reg) = plugin_registry.filter(|r| !r.is_empty()) {
             // Key plugin lookups on the VEP-normalized start (matches the
@@ -5586,6 +5921,21 @@ impl AnnotateProvider {
         let mut b_dbsnp_ids = ListBuilder::new(StringBuilder::new());
         let include_refseq_fields = transcript_selection.refseq_fields();
         let include_source_field = transcript_selection.source_field();
+        let needs_sift_polyphen = output_needs_sift_polyphen(
+            skip_csq,
+            skip_typed_cols,
+            self.csq_field_projection.as_ref(),
+        );
+        let needs_domains = !skip_typed_cols
+            || self
+                .csq_field_projection
+                .as_ref()
+                .is_none_or(|projection| projection.emits("DOMAINS"));
+        let needs_mirna = !skip_typed_cols
+            || self
+                .csq_field_projection
+                .as_ref()
+                .is_none_or(|projection| projection.emits("miRNA"));
 
         /// Append NULL to all annotation column builders for the selected mode.
         macro_rules! append_null_annotation_row {
@@ -5674,6 +6024,11 @@ impl AnnotateProvider {
             String::new()
         } else {
             String::with_capacity(4096)
+        };
+        let mut projected_csq_buf = if skip_csq || self.csq_field_projection.is_none() {
+            String::new()
+        } else {
+            String::with_capacity(1024)
         };
         let mut terms_buf = String::with_capacity(128);
         // Reusable permutation index for VEP-compatible CSQ ordering.
@@ -5799,10 +6154,17 @@ impl AnnotateProvider {
             }
 
             // Build the 33-field Batch 3 suffix (positions 41-73) shared across all transcripts.
-            let batch3_suffix =
+            let projects_vcf_core = self
+                .csq_field_projection
+                .as_ref()
+                .is_some_and(|projection| projection.is_vcf_core);
+            let batch3_suffix = if skip_csq || projects_vcf_core {
+                Cow::Borrowed("")
+            } else {
                 engine_profile_time!(engine_profile_enabled, engine_profile, batch3_suffix, {
                     batch3_suffix_for_csq(frequency_fields, &variant_fields)
-                });
+                })
+            };
 
             // `most_str` borrows for the row: `&'static` from `SoTerm::as_str()` on
             // the cache-miss path, or `cached_most` (used by-ref) on the fast path.
@@ -5812,6 +6174,7 @@ impl AnnotateProvider {
             let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
             // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
             let mut row_variant: Option<VariantInput> = None;
+            let mut csq_already_projected = false;
             let require_transcript_annotations = {
                 let base = pick_flags.requires_transcript_annotations(skip_csq, skip_typed_cols);
                 // Plugins need per-transcript amino-acid data → force the
@@ -6011,7 +6374,7 @@ impl AnnotateProvider {
                 // legacy transcript-id store ignores this. SIFT is emitted only
                 // under `--everything`.
                 #[cfg(feature = "parquet-cache")]
-                if flags.everything {
+                if flags.everything && needs_sift_polyphen {
                     if let Some(store) = sift_store {
                         if store.is_position_sliced() {
                             let mut warm_keys: Vec<u64> = Vec::new();
@@ -6213,7 +6576,23 @@ impl AnnotateProvider {
                             .and_then(|tx| tx.uniprot_isoform.as_deref())
                             .unwrap_or("");
 
-                        if flags.everything {
+                        if projects_vcf_core {
+                            VcfCoreCsqEntry {
+                                allele: &vep_allele,
+                                gene,
+                                feature,
+                                feature_type,
+                                consequence: terms_str,
+                                cdna_position: cdna_pos,
+                                cds_position: cds_pos,
+                                protein_position: protein_pos,
+                                amino_acids,
+                                codons: codons_str,
+                                existing_variation: existing_var,
+                            }
+                            .append_to(&mut csq_buf);
+                            csq_already_projected = true;
+                        } else if flags.everything {
                             // HGVS_OFFSET mirrors the transcript-level HGVSc shift
                             // decision. RefSeq rows with failed BAM edit replay can
                             // still emit transcript-space HGVSc, but VEP suppresses
@@ -6262,24 +6641,28 @@ impl AnnotateProvider {
                             // Traceability:
                             // - VEP OutputFactory.pm SIFT/PolyPhen output
                             //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799
-                            let (sift_str, polyphen_str) = engine_profile_time!(
-                                engine_profile_enabled,
-                                engine_profile,
-                                sift_polyphen,
-                                {
-                                    lookup_sift_polyphen(
-                                        tc.transcript_id.as_deref(),
-                                        tx_opt.and_then(|tx| tx.transcript_uid),
-                                        tc.protein_position.as_deref(),
-                                        tc.amino_acids.as_deref(),
-                                        sift_cache,
-                                        #[cfg(feature = "parquet-cache")]
-                                        sift_store,
-                                        #[cfg(not(feature = "parquet-cache"))]
-                                        _sift_kv,
-                                    )
-                                }
-                            );
+                            let (sift_str, polyphen_str) = if needs_sift_polyphen {
+                                engine_profile_time!(
+                                    engine_profile_enabled,
+                                    engine_profile,
+                                    sift_polyphen,
+                                    {
+                                        lookup_sift_polyphen(
+                                            tc.transcript_id.as_deref(),
+                                            tx_opt.and_then(|tx| tx.transcript_uid),
+                                            tc.protein_position.as_deref(),
+                                            tc.amino_acids.as_deref(),
+                                            sift_cache,
+                                            #[cfg(feature = "parquet-cache")]
+                                            sift_store,
+                                            #[cfg(not(feature = "parquet-cache"))]
+                                            _sift_kv,
+                                        )
+                                    }
+                                )
+                            } else {
+                                (String::new(), String::new())
+                            };
                             // DOMAINS: overlapping protein domain features.
                             // VEP gates DOMAINS on $pre->{coding} which requires
                             // a valid CDS coordinate mapping. Our cds_position is
@@ -6290,7 +6673,7 @@ impl AnnotateProvider {
                             //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm
                             let is_coding =
                                 tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
-                            let domains = if is_coding {
+                            let domains = if needs_domains && is_coding {
                                 engine_profile_time!(
                                     engine_profile_enabled,
                                     engine_profile,
@@ -6308,35 +6691,45 @@ impl AnnotateProvider {
                                 String::new()
                             };
                             // miRNA: ncRNA secondary structure overlap.
-                            let mirna_str = engine_profile_time!(
-                                engine_profile_enabled,
-                                engine_profile,
-                                mirna,
-                                {
-                                    let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
-                                    // Parse cDNA position range from the "N" or "N-M" string.
-                                    let (cs, ce) = tc
-                                        .cdna_position
-                                        .as_deref()
-                                        .and_then(|p| {
-                                            if let Some((a, b)) = p.split_once('-') {
-                                                Some((
-                                                    a.parse::<usize>().ok()?,
-                                                    b.parse::<usize>().ok()?,
-                                                ))
-                                            } else {
-                                                let v = p.parse::<usize>().ok()?;
-                                                Some((v, v))
-                                            }
-                                        })
-                                        .unwrap_or((0, 0));
-                                    if cs > 0 {
-                                        mirna_structure_field(ncrna, biotype, Some(cs), Some(ce))
-                                    } else {
-                                        String::new()
+                            let mirna_str = if needs_mirna {
+                                engine_profile_time!(
+                                    engine_profile_enabled,
+                                    engine_profile,
+                                    mirna,
+                                    {
+                                        let ncrna =
+                                            tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
+                                        // Parse cDNA position range from the "N" or "N-M" string.
+                                        let (cs, ce) = tc
+                                            .cdna_position
+                                            .as_deref()
+                                            .and_then(|p| {
+                                                if let Some((a, b)) = p.split_once('-') {
+                                                    Some((
+                                                        a.parse::<usize>().ok()?,
+                                                        b.parse::<usize>().ok()?,
+                                                    ))
+                                                } else {
+                                                    let v = p.parse::<usize>().ok()?;
+                                                    Some((v, v))
+                                                }
+                                            })
+                                            .unwrap_or((0, 0));
+                                        if cs > 0 {
+                                            mirna_structure_field(
+                                                ncrna,
+                                                biotype,
+                                                Some(cs),
+                                                Some(ce),
+                                            )
+                                        } else {
+                                            String::new()
+                                        }
                                     }
-                                }
-                            );
+                                )
+                            } else {
+                                String::new()
+                            };
                             // 80-field CSQ base layout, with optional PICK and RefSeq fields.
                             // Traceability:
                             // - VEP Constants.pm CSQ field order for --everything
@@ -6526,6 +6919,14 @@ impl AnnotateProvider {
                     engine_profile.csq_format += started.elapsed();
                 }
             };
+
+            if !skip_csq
+                && !csq_already_projected
+                && let Some(projection) = &self.csq_field_projection
+            {
+                projection.project_entries(&csq_buf, plugin_n_fields, &mut projected_csq_buf)?;
+                std::mem::swap(&mut csq_buf, &mut projected_csq_buf);
+            }
 
             let append_scalars_started = engine_profile_enabled.then(Instant::now);
             if skip_csq {
@@ -8624,6 +9025,8 @@ struct ContigAnnotationConfig {
     target_partitions: usize,
     projection: Option<Vec<usize>>,
     annotation_column_count: usize,
+    /// Whether any projected CSQ or typed annotation output consumes SIFT/PolyPhen.
+    needs_sift_polyphen: bool,
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
     /// Number of parallel window workers for the annotation step within a
@@ -8635,6 +9038,9 @@ struct ContigAnnotationConfig {
     /// Root of a custom-plugin cache (`<root>/plugin/*`); `None` = no plugins.
     #[cfg(feature = "parquet-cache")]
     plugin_cache_root: Option<std::path::PathBuf>,
+    /// Selected plugins in caller-supplied CSQ order; `None` discovers all.
+    #[cfg(feature = "parquet-cache")]
+    plugin_names: Option<Vec<String>>,
     /// When true, the variation lookup uses the Parquet backend (`new_parquet`)
     /// while context entities + SIFT still load from the co-located Parquet cache.
     #[cfg(feature = "parquet-cache")]
@@ -13212,17 +13618,18 @@ async fn prepare_contig_data(
     let use_lookup_sift = false;
 
     #[cfg(feature = "parquet-cache")]
-    let sift_prediction_store = if use_lookup_sift && config.flags.everything {
-        let sift_started = Instant::now();
-        let store =
-            load_parquet_sift_prediction_store_for_chrom(cache.as_parquet(), &chrom).await?;
-        record_contig_profile(&pipeline_profile, |profile| {
-            profile.sift_load += sift_started.elapsed();
-        });
-        store
-    } else {
-        None
-    };
+    let sift_prediction_store =
+        if use_lookup_sift && config.flags.everything && config.needs_sift_polyphen {
+            let sift_started = Instant::now();
+            let store =
+                load_parquet_sift_prediction_store_for_chrom(cache.as_parquet(), &chrom).await?;
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.sift_load += sift_started.elapsed();
+            });
+            store
+        } else {
+            None
+        };
     log_phase_rss(&chrom, "after_sift_load");
 
     let shared_ctx_started = Instant::now();
@@ -13333,7 +13740,12 @@ async fn prepare_contig_data(
     #[cfg(feature = "parquet-cache")]
     let plugin_registry = match &config.plugin_cache_root {
         Some(root) => {
-            let reg = crate::plugin_cache::registry::PluginRegistry::open(root, &chrom).await?;
+            let reg = crate::plugin_cache::registry::PluginRegistry::open(
+                root,
+                &chrom,
+                config.plugin_names.as_deref(),
+            )
+            .await?;
             if reg.is_empty() {
                 None
             } else {
@@ -13952,6 +14364,42 @@ mod tests {
     }
 
     #[test]
+    fn string_array_options_reject_malformed_values() {
+        assert_eq!(
+            AnnotateProvider::parse_json_string_array_option(
+                Some(r#"{"plugins":["zeta","alpha"]}"#),
+                "plugins",
+            )
+            .unwrap(),
+            Some(vec!["zeta".to_string(), "alpha".to_string()])
+        );
+        assert!(
+            AnnotateProvider::parse_json_string_array_option(
+                Some(r#"{"plugins":"alpha"}"#),
+                "plugins",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("must be an array of strings")
+        );
+        assert!(
+            AnnotateProvider::parse_json_string_array_option(
+                Some(r#"{"fields":["Allele",7]}"#),
+                "fields",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("must be an array of strings")
+        );
+        assert!(
+            AnnotateProvider::parse_json_string_array_option(Some("{"), "fields")
+                .unwrap_err()
+                .to_string()
+                .contains("options_json must be valid JSON")
+        );
+    }
+
+    #[test]
     fn drain_window_input_units_splits_boundary_batch() {
         use datafusion::arrow::array::Int64Array;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -14259,6 +14707,7 @@ mod tests {
             target_partitions: 1,
             projection: None,
             annotation_column_count: 0,
+            needs_sift_polyphen: false,
             fetch_limit: None,
             annotation_workers: 1,
             pick_flags: PickFlags::default(),
@@ -14266,6 +14715,8 @@ mod tests {
             cache_root: None,
             #[cfg(feature = "parquet-cache")]
             plugin_cache_root: None,
+            #[cfg(feature = "parquet-cache")]
+            plugin_names: None,
             #[cfg(feature = "parquet-cache")]
             parquet_backend: false,
             #[cfg(feature = "parquet-cache")]
@@ -16450,6 +16901,152 @@ mod tests {
             let layout = CsqPlaceholderLayout::for_mode(everything, selection, false);
             assert_eq!(layout.fields.len(), expected_len);
         }
+    }
+
+    #[test]
+    fn test_csq_field_projection_reorders_base_fields_and_keeps_plugin_tail() {
+        let requested = vec![
+            "Gene".to_string(),
+            "Allele".to_string(),
+            "Consequence".to_string(),
+        ];
+        let projection = CsqFieldProjection::for_mode(
+            false,
+            TranscriptSelectionFlags::default(),
+            false,
+            &requested,
+        )
+        .unwrap();
+        let base = (0..74)
+            .map(|index| format!("base-{index}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let full = format!("{base}|plugin-a|plugin-b,{base}|other-a|other-b");
+        let mut projected = String::new();
+
+        projection
+            .project_entries(&full, 2, &mut projected)
+            .unwrap();
+
+        assert_eq!(
+            projected,
+            "base-4|base-0|base-1|plugin-a|plugin-b,base-4|base-0|base-1|other-a|other-b"
+        );
+    }
+
+    #[test]
+    fn test_sift_polyphen_work_follows_projected_outputs() {
+        let projection_for = |field: &str| {
+            CsqFieldProjection::for_mode(
+                true,
+                TranscriptSelectionFlags::default(),
+                false,
+                &[field.to_string()],
+            )
+            .unwrap()
+        };
+        let allele_only = projection_for("Allele");
+        let sift = projection_for("SIFT");
+        let polyphen = projection_for("PolyPhen");
+
+        assert!(!output_needs_sift_polyphen(false, true, Some(&allele_only)));
+        assert!(output_needs_sift_polyphen(false, true, Some(&sift)));
+        assert!(output_needs_sift_polyphen(false, true, Some(&polyphen)));
+        assert!(output_needs_sift_polyphen(false, false, Some(&allele_only)));
+        assert!(output_needs_sift_polyphen(false, true, None));
+        assert!(!output_needs_sift_polyphen(true, true, None));
+    }
+
+    #[test]
+    fn test_direct_vcf_core_writer_matches_general_projection() {
+        let requested = VCF_CORE_CSQ_FIELDS.map(str::to_string);
+        let projection = CsqFieldProjection::for_mode(
+            false,
+            TranscriptSelectionFlags::default(),
+            false,
+            &requested,
+        )
+        .unwrap();
+        assert!(projection.is_vcf_core);
+
+        let values = [
+            ("Allele", "G"),
+            ("Gene", "ENSG1"),
+            ("Feature", "ENST1"),
+            ("Feature_type", "Transcript"),
+            ("Consequence", "missense_variant"),
+            ("cDNA_position", "10"),
+            ("CDS_position", "7"),
+            ("Protein_position", "3"),
+            ("Amino_acids", "A/T"),
+            ("Codons", "Gcc/Acc"),
+            ("Existing_variation", "rs1"),
+        ];
+        let full =
+            crate::golden_benchmark::csq_field_names_for_mode_with_pick(false, false, false, false)
+                .into_iter()
+                .map(|name| {
+                    values
+                        .iter()
+                        .find_map(|(field, value)| (*field == name).then_some(*value))
+                        .unwrap_or("")
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+        let mut projected = String::new();
+        projection
+            .project_entries(&full, 0, &mut projected)
+            .unwrap();
+
+        let mut direct = String::new();
+        VcfCoreCsqEntry {
+            allele: "G",
+            gene: "ENSG1",
+            feature: "ENST1",
+            feature_type: "Transcript",
+            consequence: "missense_variant",
+            cdna_position: "10",
+            cds_position: "7",
+            protein_position: "3",
+            amino_acids: "A/T",
+            codons: "Gcc/Acc",
+            existing_variation: "rs1",
+        }
+        .append_to(&mut direct);
+
+        assert_eq!(direct, projected);
+        assert_eq!(
+            direct,
+            "G|ENSG1|ENST1|Transcript|missense_variant|10|7|3|A/T|Gcc/Acc|rs1"
+        );
+    }
+
+    #[test]
+    fn test_selected_fields_disable_unemitted_colocated_work() {
+        let omitted = VepFlags::from_options_json_with_field_pruning(
+            Some(r#"{"everything":true,"fields":["Allele","Gene"]}"#),
+            true,
+        );
+        assert!(!omitted.check_existing);
+        assert!(!omitted.af);
+        assert!(!omitted.af_gnomade);
+        assert!(!omitted.pubmed);
+
+        let selected = VepFlags::from_options_json_with_field_pruning(
+            Some(r#"{"everything":true,"fields":["Existing_variation","gnomADe_AF","PUBMED"]}"#),
+            true,
+        );
+        assert!(selected.check_existing);
+        assert!(selected.af_gnomade);
+        assert!(selected.pubmed);
+        assert!(!selected.af_gnomadg);
+
+        let typed_output =
+            VepFlags::from_options_json(Some(r#"{"everything":true,"fields":["Allele","Gene"]}"#));
+        assert!(typed_output.check_existing);
+        assert!(typed_output.af);
+        assert!(typed_output.af_gnomade);
+        assert!(typed_output.pubmed);
     }
 
     #[test]

@@ -1311,7 +1311,6 @@ type = "Float32"
             sources: vec![],
             cache_source_version: None,
             allele_match: Default::default(),
-            csq_rank: 0,
             field_order: Default::default(),
         };
         assert!(schema_matches(&mk("DEMO"), &mk("DEMO")));

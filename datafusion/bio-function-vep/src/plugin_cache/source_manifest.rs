@@ -192,9 +192,6 @@ pub struct SourceManifest {
     /// `exact` matches SpliceAI's and dbNSFP's verbatim comparison.
     #[serde(default)]
     pub allele_match: crate::plugin_cache::cache_manifest::AlleleMatch,
-    /// Position of this plugin's field block in the CSQ string (lower first).
-    #[serde(default = "crate::plugin_cache::cache_manifest::default_csq_rank_pub")]
-    pub csq_rank: u32,
     /// Field order within this plugin's block.
     #[serde(default)]
     pub field_order: crate::plugin_cache::cache_manifest::FieldOrder,
