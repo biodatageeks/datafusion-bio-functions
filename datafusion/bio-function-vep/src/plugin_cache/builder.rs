@@ -1312,6 +1312,7 @@ type = "Float32"
             cache_source_version: None,
             allele_match: Default::default(),
             field_order: Default::default(),
+            assume_unique: false,
         };
         assert!(schema_matches(&mk("DEMO"), &mk("DEMO")));
         assert!(!schema_matches(&mk("DEMO"), &mk("DEMO2")));

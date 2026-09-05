@@ -162,6 +162,14 @@ pub struct CacheManifest {
     /// the order the user listed them in.
     #[serde(default)]
     pub field_order: FieldOrder,
+    /// Whether the source manifest declared `assume_unique`, in which case the
+    /// build skipped `dedup_keep_first` and only sampled the source's claim.
+    /// Recorded so a consumer can tell a cache in which duplicate probe keys
+    /// are impossible by construction from one where their absence rests on
+    /// the manifest author's claim. Absent in caches built before this field
+    /// existed, which reads as `false`.
+    #[serde(default)]
+    pub assume_unique: bool,
 }
 
 /// Field ordering within one plugin's CSQ block.
@@ -253,6 +261,7 @@ impl CacheManifest {
             cache_source_version: None,
             allele_match: src.allele_match,
             field_order: src.field_order,
+            assume_unique: src.assume_unique,
         }
     }
 
@@ -304,6 +313,48 @@ mod tests {
         }"#;
         let manifest: CacheManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.cache_source_version, None);
+        // Built before the flag was recorded: no claim of uniqueness is made.
+        assert!(!manifest.assume_unique);
+    }
+
+    const DEMO_SOURCE: &str = r##"
+plugin_name = "demo"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "csv"
+path = "/tmp/demo.tsv"
+  [source.csv]
+  delimiter = "\t"
+  has_header = false
+  schema = [{ name = "chrom", type = "Utf8" }]
+
+[[value_columns]]
+column = "demo_score"
+csq_field = "DEMO_SCORE"
+type = "Float32"
+"##;
+
+    #[test]
+    fn from_source_records_assume_unique() {
+        let src: SourceManifest = toml::from_str(DEMO_SOURCE).unwrap();
+        assert!(!src.assume_unique);
+        assert!(!CacheManifest::from_source(&src, "demo.source.toml").assume_unique);
+
+        // A top-level key must precede the first table in TOML.
+        let claimed = format!("assume_unique = true\n{DEMO_SOURCE}");
+        let src: SourceManifest = toml::from_str(&claimed).unwrap();
+        assert!(src.assume_unique);
+        let cache = CacheManifest::from_source(&src, "demo.source.toml");
+        assert!(cache.assume_unique);
+
+        // The flag survives the manifest.json round trip, so a reader of a built
+        // cache can tell a dedup-skipped build from a deduplicated one.
+        let json = serde_json::to_string(&cache).unwrap();
+        assert!(json.contains("\"assume_unique\":true"));
+        let back: CacheManifest = serde_json::from_str(&json).unwrap();
+        assert!(back.assume_unique);
     }
 
     #[test]
@@ -333,6 +384,7 @@ mod tests {
             cache_source_version: None,
             allele_match: Default::default(),
             field_order: Default::default(),
+            assume_unique: false,
         };
         m.write(&plugin_dir).unwrap();
         let found = discover_plugins(dir.path()).unwrap();

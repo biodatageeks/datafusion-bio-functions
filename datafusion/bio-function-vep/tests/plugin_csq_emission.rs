@@ -121,6 +121,7 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
         cache_source_version: None,
         allele_match: Default::default(),
         field_order: Default::default(),
+        assume_unique: false,
     };
     manifest.write(&plugin_dir).unwrap();
 }
@@ -228,6 +229,7 @@ async fn indel_probe_uses_normalized_start() {
         cache_source_version: None,
         allele_match: Default::default(),
         field_order: Default::default(),
+        assume_unique: false,
     };
     manifest.write(&plugin_dir).unwrap();
 
@@ -325,6 +327,7 @@ async fn minimised_fallback_and_alphabetical_fields_preserve_name_value_pairs() 
         cache_source_version: None,
         allele_match: AlleleMatch::Minimised,
         field_order: FieldOrder::Alphabetical,
+        assume_unique: false,
     };
     manifest.write(&plugin_dir).unwrap();
 
