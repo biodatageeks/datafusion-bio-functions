@@ -3,7 +3,7 @@
 //! [`PluginLookup::take_buffer`] per plugin per buffer, then synchronous
 //! per-transcript probes against the resulting [`PluginBufferSlice`]s.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 
 use datafusion::common::{DataFusionError, Result};
@@ -57,28 +57,43 @@ fn select_manifests(
     cache_root: &Path,
     plugin_names: Option<&[String]>,
 ) -> Result<Vec<CacheManifest>> {
-    let manifests = discover_plugins(cache_root)?;
     let Some(plugin_names) = plugin_names else {
-        return Ok(manifests);
+        return discover_plugins(cache_root);
     };
-
-    let available = manifests
-        .iter()
-        .map(|manifest| manifest.plugin_name.clone())
-        .collect::<Vec<_>>();
-    let mut by_name = manifests
-        .into_iter()
-        .map(|manifest| (manifest.plugin_name.clone(), manifest))
-        .collect::<HashMap<_, _>>();
     let mut seen = HashSet::with_capacity(plugin_names.len());
-    let mut selected = Vec::with_capacity(plugin_names.len());
     for name in plugin_names {
         if !seen.insert(name.as_str()) {
             return Err(DataFusionError::Execution(format!(
                 "duplicate plugin name in selection: '{name}'"
             )));
         }
-        let Some(manifest) = by_name.remove(name) else {
+    }
+    if plugin_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let plugin_root = cache_root.join("plugin");
+    let mut available = Vec::new();
+    if plugin_root.exists() {
+        for entry in std::fs::read_dir(&plugin_root).map_err(|e| {
+            DataFusionError::Execution(format!("read {}: {e}", plugin_root.display()))
+        })? {
+            let path = entry
+                .map_err(|e| DataFusionError::Execution(format!("dir entry: {e}")))?
+                .path();
+            if path.join("manifest.json").exists()
+                && let Some(name) = path.file_name().and_then(|name| name.to_str())
+            {
+                available.push(name.to_string());
+            }
+        }
+    }
+    available.sort();
+
+    let available_set: HashSet<&str> = available.iter().map(String::as_str).collect();
+    let mut selected = Vec::with_capacity(plugin_names.len());
+    for name in plugin_names {
+        if !available_set.contains(name.as_str()) {
             return Err(DataFusionError::Execution(format!(
                 "plugin '{name}' was requested but is not available; available plugins: {}",
                 if available.is_empty() {
@@ -87,7 +102,15 @@ fn select_manifests(
                     available.join(", ")
                 }
             )));
-        };
+        }
+        let manifest_path = plugin_root.join(name).join("manifest.json");
+        let manifest = CacheManifest::read(&manifest_path)?;
+        if manifest.plugin_name != *name {
+            return Err(DataFusionError::Execution(format!(
+                "plugin directory '{}' contains a manifest for '{}'",
+                name, manifest.plugin_name
+            )));
+        }
         selected.push(manifest);
     }
     Ok(selected)
@@ -184,6 +207,30 @@ impl PluginRegistry {
                     .collect::<Vec<_>>()
             })
             .collect())
+    }
+
+    /// Field names from every individually readable manifest, used only to
+    /// remove stale plugin declarations from an input VCF header. A malformed
+    /// disabled plugin must not prevent annotation with a selected subset.
+    pub fn field_names_for_cleanup(cache_root: &Path) -> Vec<String> {
+        let plugin_root = cache_root.join("plugin");
+        let Ok(entries) = std::fs::read_dir(&plugin_root) else {
+            return Vec::new();
+        };
+        let mut manifests = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| CacheManifest::read(&entry.path().join("manifest.json")).ok())
+            .collect::<Vec<_>>();
+        manifests.sort_by(|a, b| a.plugin_name.cmp(&b.plugin_name));
+        manifests
+            .iter()
+            .flat_map(|manifest| {
+                emit_order(manifest)
+                    .into_iter()
+                    .map(|index| manifest.value_columns[index].csq_field.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// `(csq_field, description)` for every plugin field that declares one, in
@@ -385,6 +432,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("available plugins: alpha, zeta"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn selection_does_not_validate_disabled_plugin_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        write_empty_manifest(dir.path(), "enabled", "ENABLED");
+        let broken_dir = dir.path().join("plugin").join("broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::write(broken_dir.join("manifest.json"), "not valid JSON").unwrap();
+
+        let selected = vec!["enabled".to_string()];
+        assert_eq!(
+            PluginRegistry::field_names(dir.path(), Some(&selected)).unwrap(),
+            vec!["ENABLED"]
+        );
+        assert_eq!(
+            PluginRegistry::field_descriptions(dir.path(), Some(&selected)).unwrap(),
+            vec![("ENABLED".to_string(), "enabled description".to_string())]
+        );
+        assert!(
+            !PluginRegistry::open(dir.path(), "22", Some(&selected))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let disabled = Vec::new();
+        assert!(
+            PluginRegistry::field_names(dir.path(), Some(&disabled))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            PluginRegistry::open(dir.path(), "22", Some(&disabled))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            PluginRegistry::field_names_for_cleanup(dir.path()),
+            vec!["ENABLED"]
+        );
+        assert!(PluginRegistry::field_names(dir.path(), None).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

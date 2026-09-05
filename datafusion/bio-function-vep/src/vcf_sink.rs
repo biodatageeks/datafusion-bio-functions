@@ -1612,7 +1612,7 @@ pub async fn annotate_to_vcf(
                     // Clean up declarations from every cached plugin, not only
                     // the selected subset. Otherwise re-annotating A+B with B
                     // leaves A's stale unstructured header lines behind.
-                    crate::plugin_cache::registry::PluginRegistry::field_names(root, None)?,
+                    crate::plugin_cache::registry::PluginRegistry::field_names_for_cleanup(root),
                     crate::plugin_cache::registry::PluginRegistry::field_descriptions(
                         root,
                         config.plugins.as_deref(),

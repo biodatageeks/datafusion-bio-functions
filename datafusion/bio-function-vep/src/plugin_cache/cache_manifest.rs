@@ -207,6 +207,15 @@ impl CacheManifest {
         Ok(())
     }
 
+    pub(crate) fn read(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| DataFusionError::Execution(format!("read {}: {e}", path.display())))?;
+        let manifest: Self = serde_json::from_str(&text)
+            .map_err(|e| DataFusionError::Execution(format!("parse {}: {e}", path.display())))?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
     /// Seed a cache manifest from a source manifest (chroms filled in by the build).
     pub fn from_source(src: &SourceManifest, source_manifest_file: &str) -> Self {
         CacheManifest {
@@ -272,12 +281,7 @@ pub fn discover_plugins(cache_root: &Path) -> Result<Vec<CacheManifest>> {
             .path();
         let mf = dir.join("manifest.json");
         if mf.exists() {
-            let text = std::fs::read_to_string(&mf)
-                .map_err(|e| DataFusionError::Execution(format!("read {}: {e}", mf.display())))?;
-            let manifest: CacheManifest = serde_json::from_str(&text)
-                .map_err(|e| DataFusionError::Execution(format!("parse {}: {e}", mf.display())))?;
-            manifest.validate()?;
-            out.push(manifest);
+            out.push(CacheManifest::read(&mf)?);
         }
     }
     out.sort_by(|a: &CacheManifest, b: &CacheManifest| a.plugin_name.cmp(&b.plugin_name));
