@@ -481,11 +481,6 @@ pub async fn build_plugin_chrom_staged(
     let norm_df = read_ctx.sql(&format!("SELECT * FROM {norm_view}")).await?;
     let (norm_stream, source_partitions) = ordered_parallel_source_stream(norm_df).await?;
     let norm_schema = norm_stream.schema();
-    let normalized_columns = norm_schema
-        .fields()
-        .iter()
-        .map(|field| field.name().clone())
-        .collect::<Vec<_>>();
     // `assume_unique` sources are claimed to never repeat a probe key, so the
     // exhaustive keep-first pass (a HashSet<String> with one entry per row —
     // the dominant memory cost on the largest chromosomes) is skipped in
@@ -570,7 +565,7 @@ pub async fn build_plugin_chrom_staged(
         &dedup_view,
         &key_view,
         variation_shard,
-        &normalized_columns,
+        &match_cols,
         pool.as_ref(),
         tracer.as_ref(),
     )
@@ -601,7 +596,7 @@ pub async fn build_plugin_chrom_staged(
             let merge_stream = tiered_stream_sorted_sort_merge(
                 &build_ctx,
                 &dedup_view,
-                &normalized_columns,
+                &match_cols,
                 tracer.as_ref(),
             )
             .await?;
