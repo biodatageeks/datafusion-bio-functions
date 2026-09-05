@@ -1,5 +1,3 @@
-use std::any::Any;
-
 use crate::{QcModule, TidyRow};
 
 /// FastQC "Per Base Sequence Content": per-position percentage of G/A/T/C
@@ -24,6 +22,10 @@ impl PerBaseContent {
 }
 
 impl QcModule for PerBaseContent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "per_base_content"
     }
@@ -88,10 +90,6 @@ impl QcModule for PerBaseContent {
             "PASS"
         };
         out.push(TidyRow::status(m, status));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

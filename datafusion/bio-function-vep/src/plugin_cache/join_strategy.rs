@@ -41,7 +41,7 @@ pub(crate) struct JoinDecision {
 }
 
 fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
-    if let Some(join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+    if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
         return Some(join);
     }
     plan.children()
@@ -50,7 +50,7 @@ fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
 }
 
 pub(crate) fn contains_sort_merge_join(plan: &dyn ExecutionPlan) -> bool {
-    plan.as_any().is::<SortMergeJoinExec>()
+    plan.is::<SortMergeJoinExec>()
         || plan
             .children()
             .into_iter()
@@ -95,7 +95,10 @@ pub(crate) fn choose_for_hash_plan(
         });
     }
 
-    let stats = join.left().partition_statistics(None)?;
+    let stats = datafusion::physical_plan::statistics::StatisticsContext::new().compute(
+        join.left().as_ref(),
+        &datafusion::physical_plan::statistics::StatisticsArgs::new(),
+    )?;
     let rows = stats.num_rows.get_value().copied();
     let data_bytes = stats.total_byte_size.get_value().copied();
     let (Some(rows), Some(data_bytes)) = (rows, data_bytes) else {

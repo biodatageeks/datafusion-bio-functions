@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 
 use crate::{QcModule, TidyRow};
@@ -63,6 +62,10 @@ impl KmerContent {
 }
 
 impl QcModule for KmerContent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "kmer_content"
     }
@@ -210,10 +213,6 @@ impl QcModule for KmerContent {
             out.push(row("max_position", e.max_pos as f64));
         }
         out.push(TidyRow::status(m, status));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

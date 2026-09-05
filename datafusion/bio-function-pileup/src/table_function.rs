@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -94,10 +93,6 @@ impl std::fmt::Debug for DepthTableProvider {
 
 #[async_trait]
 impl TableProvider for DepthTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         if self.config.per_base {
             per_base_output_schema(self.config.zero_based)

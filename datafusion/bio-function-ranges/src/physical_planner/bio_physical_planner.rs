@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{DFSchema, NullEquality, Result};
 use datafusion::config::ConfigOptions;
-use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::lit;
@@ -43,7 +42,7 @@ impl PhysicalOptimizerRule for IntervalJoinPhysicalOptimizationRule {
         let low_memory = bio_config.interval_join_low_memory;
 
         plan.transform_up(|plan| {
-            match plan.as_any().downcast_ref::<HashJoinExec>() {
+            match plan.downcast_ref::<HashJoinExec>() {
                 Some(join_exec) => {
                     info!("HashJoinExec detected");
                     if let Some(intervals) = parse(join_exec.filter()) {
@@ -64,7 +63,7 @@ impl PhysicalOptimizerRule for IntervalJoinPhysicalOptimizationRule {
                     }
                 },
                 None => {
-                    match plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
+                    match plan.downcast_ref::<NestedLoopJoinExec>() {
                         Some(join_exec) => {
                             info!("NestedLoopJoinExec detected");
                             if let Some(intervals) = parse(join_exec.filter()) {
@@ -156,7 +155,7 @@ impl PhysicalPlanner for BioPhysicalPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session_state: &dyn datafusion::catalog::Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let plan = self
             .planner
@@ -169,9 +168,10 @@ impl PhysicalPlanner for BioPhysicalPlanner {
         &self,
         expr: &Expr,
         input_dfschema: &DFSchema,
-        session_state: &SessionState,
+        session_state: &dyn datafusion::catalog::Session,
+        planning_ctx: &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         self.planner
-            .create_physical_expr(expr, input_dfschema, session_state)
+            .create_physical_expr(expr, input_dfschema, session_state, planning_ctx)
     }
 }

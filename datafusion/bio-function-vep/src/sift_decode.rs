@@ -50,10 +50,6 @@ impl Default for SiftDecodeUdf {
 }
 
 impl ScalarUDFImpl for SiftDecodeUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "vep_decode_sift_predictions"
     }

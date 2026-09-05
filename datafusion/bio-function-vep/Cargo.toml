@@ -37,11 +37,11 @@ noodles-core-tabix = { package = "noodles-core", git = "https://github.com/bioda
 noodles-csi = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-tabix = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-bgzf = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
-parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
-datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "12016a9304d3a14e4d56d9459f3bd6f1cb678d02" }
-datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "12016a9304d3a14e4d56d9459f3bd6f1cb678d02" }
-datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "12016a9304d3a14e4d56d9459f3bd6f1cb678d02" }
-datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "12016a9304d3a14e4d56d9459f3bd6f1cb678d02", optional = true }
+parquet = { version = "=59.2.0", features = ["arrow", "async", "zstd"] }
+datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "8dae5191a084fd09d8ae28eb1563b9117604cef4" }
+datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "8dae5191a084fd09d8ae28eb1563b9117604cef4" }
+datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "8dae5191a084fd09d8ae28eb1563b9117604cef4" }
+datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "8dae5191a084fd09d8ae28eb1563b9117604cef4", optional = true }
 indicatif = "0.18.4"
 
 # `libc` is only used by `peak_rss_mb()` (getrusage) on UNIX; scoping it here
@@ -56,7 +56,7 @@ datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
 noodles-vcf = { git = "https://github.com/biodatageeks/noodles.git", rev = "9b7b2c5b6531373918302d4c07410e583f1b5b5c" }
 env_logger = "0.11"
 tempfile = "3"
-arrow-array = "58.0.0"
+arrow-array = "59.2.0"
 memmap2 = "0.9"
 
 [[example]]

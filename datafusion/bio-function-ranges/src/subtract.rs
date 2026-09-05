@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -100,10 +99,6 @@ impl Debug for SubtractProvider {
 
 #[async_trait]
 impl TableProvider for SubtractProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -192,12 +187,19 @@ impl DisplayAs for SubtractExec {
 }
 
 impl ExecutionPlan for SubtractExec {
-    fn name(&self) -> &str {
-        "SubtractExec"
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &str {
+        "SubtractExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -206,11 +208,11 @@ impl ExecutionPlan for SubtractExec {
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![
-            Distribution::HashPartitioned(vec![Arc::new(Column::new(
+            Distribution::KeyPartitioned(vec![Arc::new(Column::new(
                 self.left_columns.0.as_str(),
                 self.left_contig_col_idx,
             ))]),
-            Distribution::HashPartitioned(vec![Arc::new(Column::new(
+            Distribution::KeyPartitioned(vec![Arc::new(Column::new(
                 self.right_columns.0.as_str(),
                 0,
             ))]),

@@ -291,12 +291,19 @@ impl DisplayAs for KvLookupExec {
 }
 
 impl ExecutionPlan for KvLookupExec {
-    fn name(&self) -> &str {
-        "KvLookupExec"
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &str {
+        "KvLookupExec"
     }
 
     fn schema(&self) -> SchemaRef {
