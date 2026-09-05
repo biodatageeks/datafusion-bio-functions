@@ -5589,6 +5589,17 @@ impl AnnotateProvider {
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
 
+        #[cfg(feature = "parquet-cache")]
+        if let Some(root) = self.plugin_cache_root.as_ref() {
+            // Per-contig registry construction normally validates this set, but
+            // an empty VCF returns before any registry is opened. Validate at
+            // planning time so errors never depend on input cardinality.
+            crate::plugin_cache::registry::PluginRegistry::validate_selection(
+                root,
+                self.plugin_names.as_deref(),
+            )?;
+        }
+
         // Discover contigs from VCF.
         let t_contigs = profile_start!();
         let vcf_contigs = self.discover_vcf_contigs().await?;

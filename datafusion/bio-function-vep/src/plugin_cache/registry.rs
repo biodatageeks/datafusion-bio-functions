@@ -120,6 +120,13 @@ fn select_manifests(
 }
 
 impl PluginRegistry {
+    /// Validate the selected manifest set without opening any chromosome shard.
+    /// Used during planning so invalid configuration is rejected even when the
+    /// input has no data-bearing contigs.
+    pub fn validate_selection(cache_root: &Path, plugin_names: Option<&[String]>) -> Result<()> {
+        select_manifests(cache_root, plugin_names).map(|_| ())
+    }
+
     /// Discover plugins under `cache_root` and open each one's shard for `chrom`.
     pub async fn open(
         cache_root: &Path,
@@ -425,12 +432,14 @@ mod tests {
         );
 
         let duplicate = vec!["alpha".to_string(), "alpha".to_string()];
+        assert!(PluginRegistry::validate_selection(dir.path(), Some(&duplicate)).is_err());
         let error = PluginRegistry::field_names(dir.path(), Some(&duplicate))
             .unwrap_err()
             .to_string();
         assert!(error.contains("duplicate plugin name"), "{error}");
 
         let missing = vec!["missing".to_string()];
+        assert!(PluginRegistry::validate_selection(dir.path(), Some(&missing)).is_err());
         let error = PluginRegistry::field_names(dir.path(), Some(&missing))
             .unwrap_err()
             .to_string();
@@ -446,6 +455,7 @@ mod tests {
         std::fs::write(broken_dir.join("manifest.json"), "not valid JSON").unwrap();
 
         let selected = vec!["enabled".to_string()];
+        PluginRegistry::validate_selection(dir.path(), Some(&selected)).unwrap();
         assert_eq!(
             PluginRegistry::field_names(dir.path(), Some(&selected)).unwrap(),
             vec!["ENABLED"]
@@ -462,6 +472,7 @@ mod tests {
         );
 
         let disabled = Vec::new();
+        PluginRegistry::validate_selection(dir.path(), Some(&disabled)).unwrap();
         assert!(
             PluginRegistry::field_names(dir.path(), Some(&disabled))
                 .unwrap()
@@ -477,8 +488,11 @@ mod tests {
             PluginRegistry::field_names_for_cleanup(dir.path()),
             vec!["ENABLED"]
         );
+        let broken = vec!["broken".to_string()];
+        assert!(PluginRegistry::validate_selection(dir.path(), Some(&broken)).is_err());
         // The unfiltered mode enables every plugin and therefore remains
         // intentionally strict about every manifest.
+        assert!(PluginRegistry::validate_selection(dir.path(), None).is_err());
         assert!(PluginRegistry::field_names(dir.path(), None).is_err());
     }
 
