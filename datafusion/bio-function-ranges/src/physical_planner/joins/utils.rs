@@ -29,6 +29,7 @@ use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::physical_plan::joins::utils::{JoinOn, adjust_right_output_partitioning};
 use datafusion::physical_plan::metrics;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::{ColumnStatistics, ExecutionPlan, Statistics};
 use datafusion::physical_plan::{ExecutionPlanProperties, Partitioning};
 
@@ -139,8 +140,11 @@ pub(crate) fn estimate_join_statistics(
     on: JoinOn,
     join_type: &JoinType,
 ) -> Result<Statistics> {
-    let left_stats = left.partition_statistics(None)?;
-    let right_stats = right.partition_statistics(None)?;
+    let stats_ctx = StatisticsContext::new();
+    let left_stats =
+        Arc::unwrap_or_clone(stats_ctx.compute(left.as_ref(), &StatisticsArgs::new())?);
+    let right_stats =
+        Arc::unwrap_or_clone(stats_ctx.compute(right.as_ref(), &StatisticsArgs::new())?);
     let schema = left.schema();
     let join_stats = estimate_join_cardinality(join_type, left_stats, right_stats, &on);
     let (num_rows, column_statistics) = match join_stats {
@@ -171,8 +175,8 @@ fn estimate_join_cardinality(
                 .iter()
                 .map(|(left, right)| {
                     match (
-                        left.as_any().downcast_ref::<Column>(),
-                        right.as_any().downcast_ref::<Column>(),
+                        left.downcast_ref::<Column>(),
+                        right.downcast_ref::<Column>(),
                     ) {
                         (Some(left), Some(right)) => (
                             left_stats.column_statistics[left.index()].clone(),

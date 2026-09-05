@@ -36,19 +36,18 @@ noodles-core-tabix = { package = "noodles-core", git = "https://github.com/bioda
 noodles-csi = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-tabix = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-bgzf = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
-parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
-# Pin all formats crates to the same full master rev. It includes the merged
-# RefSeq CDS-bound fix (#267), transcript SeqEdits column (#269), Character INFO
-# materialization (#266), percent-encoded VCF values (#264), MT codon_table
-# support (#262), gene bounds (#270), and raw INFO escape preservation (#207).
-# The formats release is postponed.
+parquet = { version = "=59.3.2", features = ["arrow", "async", "zstd"] }
+# Pin all formats crates to the DataFusion 55.2 branch of datafusion-bio-formats
+# (biodatageeks/datafusion-bio-formats#248, rebased on master v1.15.0, which
+# carries every fix the previous e0379fb pin did). Move to the release tag once
+# #248 is merged and tagged.
 # Every formats crate in this workspace, the pileup crate's included, has to name
 # the same tag or rev, or the lockfile resolves two copies of datafusion-bio-format-core.
-datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "e0379fb28a0d4d74f8da4c9cbd357182361349f9" }
-datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "e0379fb28a0d4d74f8da4c9cbd357182361349f9" }
-datafusion-bio-format-gff = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "e0379fb28a0d4d74f8da4c9cbd357182361349f9" }
-datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "e0379fb28a0d4d74f8da4c9cbd357182361349f9" }
-datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "e0379fb28a0d4d74f8da4c9cbd357182361349f9", optional = true }
+datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "d1eb0c37643eb53aa6bcaddd74fc64e04405c233" }
+datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "d1eb0c37643eb53aa6bcaddd74fc64e04405c233" }
+datafusion-bio-format-gff = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "d1eb0c37643eb53aa6bcaddd74fc64e04405c233" }
+datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "d1eb0c37643eb53aa6bcaddd74fc64e04405c233" }
+datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "d1eb0c37643eb53aa6bcaddd74fc64e04405c233", optional = true }
 indicatif = "0.18.4"
 
 # `libc` is only used by `peak_rss_mb()` (getrusage) on UNIX; scoping it here
@@ -63,7 +62,7 @@ datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
 noodles-vcf = { git = "https://github.com/biodatageeks/noodles.git", rev = "9b7b2c5b6531373918302d4c07410e583f1b5b5c" }
 env_logger = "0.11"
 tempfile = "3"
-arrow-array = "58.0.0"
+arrow-array = "59.3.2"
 memmap2 = "0.9"
 
 [[example]]

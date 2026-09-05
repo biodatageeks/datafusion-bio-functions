@@ -3,7 +3,6 @@
 //! Builds a `VariationLookupExec` (Parquet backend) over the per-chrom variation cache;
 //! consumed by the `annotate_vep` annotation path.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -275,10 +274,6 @@ impl Debug for LookupProvider {
 
 #[async_trait]
 impl TableProvider for LookupProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -368,10 +363,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for PartitionedVcf {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.0.clone()
         }

@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 
 use crate::{QcModule, TidyRow};
@@ -50,6 +49,10 @@ impl OverrepresentedSeqs {
 }
 
 impl QcModule for OverrepresentedSeqs {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "overrepresented"
     }
@@ -143,10 +146,6 @@ impl QcModule for OverrepresentedSeqs {
             "PASS"
         };
         out.push(TidyRow::status(m, status));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

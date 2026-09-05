@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -69,10 +68,6 @@ impl Debug for MergeProvider {
 
 #[async_trait]
 impl TableProvider for MergeProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -133,12 +128,19 @@ impl DisplayAs for MergeExec {
 }
 
 impl ExecutionPlan for MergeExec {
-    fn name(&self) -> &str {
-        "MergeExec"
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &str {
+        "MergeExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -146,7 +148,7 @@ impl ExecutionPlan for MergeExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::HashPartitioned(vec![Arc::new(Column::new(
+        vec![Distribution::KeyPartitioned(vec![Arc::new(Column::new(
             self.columns.0.as_str(),
             0,
         ))])]

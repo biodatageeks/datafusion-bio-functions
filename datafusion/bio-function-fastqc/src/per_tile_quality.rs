@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::BTreeMap;
 
 use crate::{QcModule, TidyRow};
@@ -59,6 +58,10 @@ impl PerTileQuality {
 }
 
 impl QcModule for PerTileQuality {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "per_tile_quality"
     }
@@ -146,10 +149,6 @@ impl QcModule for PerTileQuality {
             "PASS"
         };
         out.push(TidyRow::status(m, status));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

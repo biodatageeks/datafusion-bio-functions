@@ -1,5 +1,3 @@
-use std::any::Any;
-
 use crate::{QcModule, TidyRow};
 
 /// FastQC's built-in adapter k-mers (Configuration/adapter_list.txt). All are
@@ -48,6 +46,10 @@ impl Default for AdapterContent {
 }
 
 impl QcModule for AdapterContent {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "adapter_content"
     }
@@ -132,10 +134,6 @@ impl QcModule for AdapterContent {
             "PASS"
         };
         out.push(TidyRow::status(m, status));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

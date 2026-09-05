@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 
 use crate::{QcModule, TidyRow};
@@ -36,6 +35,10 @@ impl PerSeqGc {
 }
 
 impl QcModule for PerSeqGc {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "per_seq_gc"
     }
@@ -144,10 +147,6 @@ impl QcModule for PerSeqGc {
         // Status: FastQC's deviation of the observed GC distribution from a
         // mode-centred normal (gc_sequence warn=15%, error=30%).
         out.push(TidyRow::status(m, gc_status(&bins)));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
