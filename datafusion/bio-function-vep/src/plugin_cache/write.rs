@@ -1,7 +1,8 @@
 //! Tiered plugin shard writer — generalizes the variation writer to an
 //! arbitrary value schema. Reuses `parquet_cache::write::point_lookup_writer_properties`
 //! so plugin shards inherit the variation shard's no-dictionary, small-page,
-//! page-indexed, `(tier, start)`-sorted point-lookup layout verbatim.
+//! page-indexed, totally sorted point-lookup layout (led by `(tier, start)`)
+//! verbatim.
 
 use std::path::Path;
 use std::sync::Arc;
