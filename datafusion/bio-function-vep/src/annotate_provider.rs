@@ -237,6 +237,10 @@ fn list_i8_data_type() -> DataType {
     DataType::List(Arc::new(Field::new("item", DataType::Int8, true)))
 }
 
+fn list_f32_data_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Float32, true)))
+}
+
 fn list_i64_data_type() -> DataType {
     DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
 }
@@ -712,34 +716,37 @@ fn annotation_column_defs(include_pick_output: bool) -> Vec<AnnotationColumnDef>
             category: Variant,
             cache_col: None,
         },
+        // Motif columns are per-consequence lists aligned with `Consequence`:
+        // one element per CSQ entry, populated for MotifFeature entries and
+        // NULL for transcript/regulatory entries, exactly as the CSQ string.
         AnnotationColumnDef {
             name: "MOTIF_NAME",
-            data_type: DataType::Utf8,
-            category: Variant,
+            data_type: list_utf8_data_type(),
+            category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "MOTIF_POS",
-            data_type: DataType::Utf8,
-            category: Variant,
+            data_type: list_i64_data_type(),
+            category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "HIGH_INF_POS",
-            data_type: DataType::Utf8,
-            category: Variant,
+            data_type: list_utf8_data_type(),
+            category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "MOTIF_SCORE_CHANGE",
-            data_type: DataType::Float32,
-            category: Variant,
+            data_type: list_f32_data_type(),
+            category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "TRANSCRIPTION_FACTORS",
             data_type: list_utf8_data_type(),
-            category: Variant,
+            category: Transcript,
             cache_col: None,
         },
         // ── Cache-only (7) ──
@@ -5903,11 +5910,11 @@ impl AnnotateProvider {
         let mut b_somatic = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
         let mut b_pheno = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
         let mut b_pubmed = ListBuilder::new(StringBuilder::new());
-        let mut b_motif_name = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
-        let mut b_motif_pos = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
-        let mut b_high_inf_pos =
-            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
-        let mut b_motif_score_change = Float32Builder::with_capacity(batch.num_rows());
+        // Motif columns: per-consequence lists, see annotation_column_defs().
+        let mut b_motif_name = ListBuilder::new(StringBuilder::new());
+        let mut b_motif_pos = ListBuilder::new(Int64Builder::new());
+        let mut b_high_inf_pos = ListBuilder::new(StringBuilder::new());
+        let mut b_motif_score_change = ListBuilder::new(Float32Builder::new());
         let mut b_transcription_factors = ListBuilder::new(StringBuilder::new());
         // Cache-only (7)
         let mut b_clin_sig_allele = ListBuilder::new(StringBuilder::new());
@@ -6003,10 +6010,10 @@ impl AnnotateProvider {
                     b_somatic.append_null();
                     b_pheno.append_null();
                     b_pubmed.append(false);
-                    b_motif_name.append_null();
-                    b_motif_pos.append_null();
-                    b_high_inf_pos.append_null();
-                    b_motif_score_change.append_null();
+                    b_motif_name.append(false);
+                    b_motif_pos.append(false);
+                    b_high_inf_pos.append(false);
+                    b_motif_score_change.append(false);
                     b_transcription_factors.append(false);
                     b_clin_sig_allele.append(false);
                     b_clinical_impact.append_null();
@@ -7090,14 +7097,39 @@ impl AnnotateProvider {
                             None => b_distance.values().append_null(),
                         }
 
-                        // STRAND (Int8)
-                        match tx_opt {
-                            Some(tx) => {
-                                b_strand
-                                    .values()
-                                    .append_value(if tx.strand >= 0 { 1 } else { -1 })
-                            }
+                        // STRAND (Int8). MotifFeature consequences have no
+                        // transcript; use the motif's own strand like the CSQ path.
+                        match tx_opt.map(|tx| tx.strand).or(tc.motif_strand) {
+                            Some(v) => b_strand.values().append_value(if v >= 0 { 1 } else { -1 }),
                             None => b_strand.values().append_null(),
+                        }
+
+                        // MOTIF_NAME, MOTIF_POS, HIGH_INF_POS, MOTIF_SCORE_CHANGE,
+                        // TRANSCRIPTION_FACTORS: one element per entry, mirroring
+                        // the CSQ string (NULL outside MotifFeature entries).
+                        append_opt_str(b_motif_name.values(), tc.motif_name.as_deref());
+                        match tc.motif_pos {
+                            Some(p) => b_motif_pos.values().append_value(p),
+                            None => b_motif_pos.values().append_null(),
+                        }
+                        match tc.high_inf_pos {
+                            Some(true) => b_high_inf_pos.values().append_value("Y"),
+                            Some(false) => b_high_inf_pos.values().append_value("N"),
+                            None => b_high_inf_pos.values().append_null(),
+                        }
+                        match tc
+                            .motif_score_change
+                            .as_deref()
+                            .and_then(|s| s.parse::<f32>().ok())
+                        {
+                            Some(v) => b_motif_score_change.values().append_value(v),
+                            None => b_motif_score_change.values().append_null(),
+                        }
+                        match tc.motif_transcription_factors.as_deref() {
+                            Some(raw) if !raw.is_empty() => b_transcription_factors
+                                .values()
+                                .append_value(csq_multi_value(raw)),
+                            _ => b_transcription_factors.values().append_null(),
                         }
 
                         // FLAGS
@@ -7180,11 +7212,14 @@ impl AnnotateProvider {
                             b_ensp.values(),
                             tx_opt.and_then(|tx| tx.translation_stable_id.as_deref()),
                         );
-                        append_opt_str(
+                        // The cache joins multiple SWISSPROT/TREMBL accessions
+                        // with `,`; the CSQ path escapes them to `&`. Match it so
+                        // the typed element equals the CSQ sub-field.
+                        append_opt_multi(
                             b_swissprot.values(),
                             tx_opt.and_then(|tx| tx.swissprot.as_deref()),
                         );
-                        append_opt_str(
+                        append_opt_multi(
                             b_trembl.values(),
                             tx_opt.and_then(|tx| tx.trembl.as_deref()),
                         );
@@ -7383,6 +7418,11 @@ impl AnnotateProvider {
                     b_domains.append(true);
                     b_mirna.append(true);
                     b_hgvs_offset.append(true);
+                    b_motif_name.append(true);
+                    b_motif_pos.append(true);
+                    b_high_inf_pos.append(true);
+                    b_motif_score_change.append(true);
+                    b_transcription_factors.append(true);
                 } else {
                     // Cache-hit path: NULL lists for all transcript-level columns
                     b_consequence.append(false);
@@ -7435,6 +7475,11 @@ impl AnnotateProvider {
                     b_domains.append(false);
                     b_mirna.append(false);
                     b_hgvs_offset.append(false);
+                    b_motif_name.append(false);
+                    b_motif_pos.append(false);
+                    b_high_inf_pos.append(false);
+                    b_motif_score_change.append(false);
+                    b_transcription_factors.append(false);
                 }
 
                 // -- Frequency columns (29) --
@@ -7510,15 +7555,6 @@ impl AnnotateProvider {
                 } else {
                     b_pubmed.append(false);
                 }
-                // MOTIF_NAME, MOTIF_POS, HIGH_INF_POS, MOTIF_SCORE_CHANGE, TRANSCRIPTION_FACTORS
-                // These are currently not populated (always NULL) — they require motif feature
-                // consequence data that is not yet exposed in the per-transcript CSQ path.
-                b_motif_name.append_null();
-                b_motif_pos.append_null();
-                b_high_inf_pos.append_null();
-                b_motif_score_change.append_null();
-                b_transcription_factors.append(false);
-
                 // -- Cache-only columns (7) --
                 // Read from the intermediate batch's cache_ columns.
                 // clin_sig_allele (List<Utf8>, semicolon-separated)
@@ -7742,6 +7778,15 @@ impl AnnotateProvider {
 fn append_opt_str(builder: &mut StringBuilder, val: Option<&str>) {
     match val {
         Some(v) if !v.is_empty() => builder.append_value(v),
+        _ => builder.append_null(),
+    }
+}
+
+/// Like [`append_opt_str`] for a cache list value joined with `,`: emits it
+/// with VEP's `&` separator, so the typed element equals the CSQ sub-field.
+fn append_opt_multi(builder: &mut StringBuilder, val: Option<&str>) {
+    match val {
+        Some(v) if !v.is_empty() => builder.append_value(csq_multi_value(v)),
         _ => builder.append_null(),
     }
 }
@@ -17959,6 +18004,41 @@ mod tests {
         assert!(line.contains("engine=0.013s"));
         assert!(line.contains("projection=0.014s"));
         assert!(line.contains("input_buffers=15"));
+    }
+
+    #[test]
+    fn motif_columns_are_per_consequence_lists() {
+        // MOTIF_* and TRANSCRIPTION_FACTORS carry one element per CSQ entry,
+        // like every other transcript-level column, so a variant overlapping
+        // two motifs keeps both and the Nth element matches the Nth CSQ entry.
+        let defs = annotation_column_defs(false);
+        let data_type = |name: &str| {
+            defs.iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("missing column {name}"))
+                .data_type
+                .clone()
+        };
+        assert_eq!(data_type("MOTIF_NAME"), list_utf8_data_type());
+        assert_eq!(data_type("MOTIF_POS"), list_i64_data_type());
+        assert_eq!(data_type("HIGH_INF_POS"), list_utf8_data_type());
+        assert_eq!(data_type("MOTIF_SCORE_CHANGE"), list_f32_data_type());
+        assert_eq!(data_type("TRANSCRIPTION_FACTORS"), list_utf8_data_type());
+        assert_eq!(data_type("TREMBL"), list_utf8_data_type());
+    }
+
+    #[test]
+    fn append_opt_multi_uses_ampersand_like_the_csq_path() {
+        let mut b = StringBuilder::new();
+        append_opt_multi(&mut b, Some("B0QYZ8.92,X5DR28.82"));
+        append_opt_multi(&mut b, Some("X5DR28.82"));
+        append_opt_multi(&mut b, Some(""));
+        append_opt_multi(&mut b, None);
+        let arr = b.finish();
+        assert_eq!(arr.value(0), "B0QYZ8.92&X5DR28.82");
+        assert_eq!(arr.value(1), "X5DR28.82");
+        assert!(arr.is_null(2));
+        assert!(arr.is_null(3));
     }
 
     #[test]
