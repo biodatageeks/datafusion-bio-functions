@@ -222,6 +222,16 @@ impl<'a> PluginCacheBuilder<'a> {
                     }
                 }
             };
+        // Chromosomes carried from a cache that recorded no dedup policy keep
+        // the whole cache's policy unknown: this build knows what it did for
+        // the shards it rebuilt, not for the ones it kept.
+        if !chroms.is_empty()
+            && prior
+                .as_ref()
+                .is_some_and(|old| old.assume_unique.is_none())
+        {
+            cache.assume_unique = None;
+        }
         let _ = self.overwrite; // every requested shard is rebuilt regardless.
         // Build every chromosome to its staging file first. The providers
         // reopen the source for each one, so after each the sources are
@@ -260,8 +270,17 @@ impl<'a> PluginCacheBuilder<'a> {
 /// value columns (name/csq_field/type) and match discriminators (column/template)
 /// in the same order. Used to decide whether prior chrom shards can be preserved
 /// across a filtered rebuild.
+/// Two manifests describe the same cache shape when their value and match
+/// columns agree and, where both record it, their dedup policy does: shards
+/// built with `assume_unique` skipped `dedup_keep_first`, so carrying them
+/// under a manifest that says dedup ran (or the reverse) would misstate their
+/// provenance. An unrecorded policy on either side is not a conflict; the
+/// merged manifest then records no policy either (see `build_all`).
 fn schema_matches(a: &CacheManifest, b: &CacheManifest) -> bool {
-    a.value_columns.len() == b.value_columns.len()
+    matches!(
+        (a.assume_unique, b.assume_unique),
+        (None, _) | (_, None) | (Some(true), Some(true)) | (Some(false), Some(false))
+    ) && a.value_columns.len() == b.value_columns.len()
         && a.value_columns
             .iter()
             .zip(&b.value_columns)
@@ -788,6 +807,95 @@ type = "Float32"
             Some(actual.as_str())
         );
         assert_eq!(cache.cache_source_version.as_deref(), Some("v1@1111111"));
+        // Both builds ran dedup, so the cache-wide policy is known.
+        assert_eq!(cache.assume_unique, Some(false));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chromosomes_carried_from_a_cache_without_a_dedup_policy_leave_it_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (probe, _, _) = verified_fixture(dir.path(), WRONG_MD5);
+        let (actual, _) =
+            crate::plugin_cache::source_verify::md5_file(Path::new(&probe.sources[0].path))
+                .unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
+        PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .with_source_version("v1@1111111")
+            .build_all()
+            .await
+            .unwrap();
+        // Age the manifest: a cache built before the policy was recorded.
+        let plugin_manifest = out.join("plugin/demo/manifest.json");
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&plugin_manifest).unwrap()).unwrap();
+        assert!(
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("assume_unique")
+                .is_some()
+        );
+        std::fs::write(
+            &plugin_manifest,
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let cache = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .with_source_version("v1@1111111")
+            .build_all()
+            .await
+            .unwrap();
+        let chroms: Vec<&str> = cache.chroms.iter().map(|c| c.chrom.as_str()).collect();
+        assert_eq!(chroms, ["chr1", "chr2"], "chr1 is carried over");
+        assert_eq!(
+            cache.assume_unique, None,
+            "chr1's dedup policy is unknown, so no cache-wide claim is made"
+        );
+        assert!(
+            !std::fs::read_to_string(&plugin_manifest)
+                .unwrap()
+                .contains("assume_unique")
+        );
+
+        // Rebuilding every chromosome carries nothing, so the policy is known again.
+        let rebuilt = PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_source_version("v1@1111111")
+            .build_all()
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.assume_unique, Some(false));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dedup_policy_change_drops_carried_chromosomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (probe, _, _) = verified_fixture(dir.path(), WRONG_MD5);
+        let (actual, _) =
+            crate::plugin_cache::source_verify::md5_file(Path::new(&probe.sources[0].path))
+                .unwrap();
+        let (manifest, cache_dir, out) = verified_fixture(dir.path(), &actual);
+        PluginCacheBuilder::new(&manifest, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["1"])
+            .with_source_version("v1@1111111")
+            .build_all()
+            .await
+            .unwrap();
+        // The same source, now declared unique: chr1 was built with dedup, chr2
+        // will not be, so chr1 cannot stay under a manifest claiming otherwise.
+        let mut claimed = manifest.clone();
+        claimed.assume_unique = true;
+        let cache = PluginCacheBuilder::new(&claimed, "demo.source.toml", &cache_dir, &out)
+            .with_chrom_filter(["2"])
+            .with_source_version("v1@1111111")
+            .build_all()
+            .await
+            .unwrap();
+        let chroms: Vec<&str> = cache.chroms.iter().map(|c| c.chrom.as_str()).collect();
+        assert_eq!(chroms, ["chr2"], "chr1 is dropped like any schema change");
+        assert_eq!(cache.assume_unique, Some(true));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1312,8 +1420,21 @@ type = "Float32"
             cache_source_version: None,
             allele_match: Default::default(),
             field_order: Default::default(),
+            assume_unique: None,
         };
         assert!(schema_matches(&mk("DEMO"), &mk("DEMO")));
         assert!(!schema_matches(&mk("DEMO"), &mk("DEMO2")));
+
+        // A recorded dedup policy must agree; an unrecorded one is compatible
+        // with either, since it makes no claim to contradict.
+        let with = |policy: Option<bool>| CacheManifest {
+            assume_unique: policy,
+            ..mk("DEMO")
+        };
+        assert!(schema_matches(&with(Some(true)), &with(Some(true))));
+        assert!(!schema_matches(&with(Some(true)), &with(Some(false))));
+        assert!(!schema_matches(&with(Some(false)), &with(Some(true))));
+        assert!(schema_matches(&with(None), &with(Some(true))));
+        assert!(schema_matches(&with(Some(false)), &with(None)));
     }
 }
