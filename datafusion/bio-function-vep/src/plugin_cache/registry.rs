@@ -58,6 +58,9 @@ fn select_manifests(
     plugin_names: Option<&[String]>,
 ) -> Result<Vec<CacheManifest>> {
     let Some(plugin_names) = plugin_names else {
+        // No selection means every discovered plugin is enabled. Keep this
+        // path strict: silently skipping a corrupt enabled manifest would let
+        // the runtime CSQ values drift from the advertised header layout.
         return discover_plugins(cache_root);
     };
     let mut seen = HashSet::with_capacity(plugin_names.len());
@@ -474,6 +477,8 @@ mod tests {
             PluginRegistry::field_names_for_cleanup(dir.path()),
             vec!["ENABLED"]
         );
+        // The unfiltered mode enables every plugin and therefore remains
+        // intentionally strict about every manifest.
         assert!(PluginRegistry::field_names(dir.path(), None).is_err());
     }
 

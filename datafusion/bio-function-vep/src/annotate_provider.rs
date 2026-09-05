@@ -14353,6 +14353,42 @@ mod tests {
     }
 
     #[test]
+    fn string_array_options_reject_malformed_values() {
+        assert_eq!(
+            AnnotateProvider::parse_json_string_array_option(
+                Some(r#"{"plugins":["zeta","alpha"]}"#),
+                "plugins",
+            )
+            .unwrap(),
+            Some(vec!["zeta".to_string(), "alpha".to_string()])
+        );
+        assert!(
+            AnnotateProvider::parse_json_string_array_option(
+                Some(r#"{"plugins":"alpha"}"#),
+                "plugins",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("must be an array of strings")
+        );
+        assert!(
+            AnnotateProvider::parse_json_string_array_option(
+                Some(r#"{"fields":["Allele",7]}"#),
+                "fields",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("must be an array of strings")
+        );
+        assert!(
+            AnnotateProvider::parse_json_string_array_option(Some("{"), "fields")
+                .unwrap_err()
+                .to_string()
+                .contains("options_json must be valid JSON")
+        );
+    }
+
+    #[test]
     fn drain_window_input_units_splits_boundary_batch() {
         use datafusion::arrow::array::Int64Array;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
