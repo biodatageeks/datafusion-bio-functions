@@ -182,6 +182,8 @@ use crate::allele::{
     vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::AnnotationBackend;
+#[cfg(feature = "parquet-cache")]
+use crate::cache::lookup_exec::ParquetVariationLookupCell;
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 use crate::colocated::{
     AfColumns, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -10458,6 +10460,10 @@ struct RunActivationInputs {
     vcf_schema: Schema,
     cache_schema: Schema,
     fallback_coloc_sink: ColocatedSink,
+    /// One single-flight Parquet lookup cell per contig: every run's lookup
+    /// shares the decoded shard footer + page index (~0.5 GB on chr1).
+    #[cfg(feature = "parquet-cache")]
+    parquet_lookup_cell: Arc<ParquetVariationLookupCell>,
 }
 
 /// Gate state of the run currently being drained.
@@ -13896,6 +13902,38 @@ async fn prepare_contig_context(
 /// shared indexes and the shared annotation context, and plan the per-worker
 /// grid slices — but spawn no lookup worker and build no lookup provider.
 /// `activate_contig_lookups()` does that.
+/// Which planning arms a contig takes. Exactly one of the parallel flags can
+/// be set; `stateful_runs` is the serial region path on Merged/RefSeq.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContigModes {
+    /// `workers>1` without a VCF shard context: the streaming run pool.
+    stream_parallel: bool,
+    /// `workers>1` with a shard context on Merged/RefSeq: grid slices for the sink.
+    stateful_parallel: bool,
+    /// Serial region runs on Merged/RefSeq: grid-aligned with warm-up.
+    stateful_runs: bool,
+}
+
+fn contig_modes(
+    cache_enabled: bool,
+    annotation_workers: usize,
+    has_shard_ctx: bool,
+    cache_source_type: CacheSourceType,
+    has_regions: bool,
+) -> ContigModes {
+    let stateful = matches!(
+        cache_source_type,
+        CacheSourceType::Merged | CacheSourceType::RefSeq
+    );
+    let parallel = cache_enabled && annotation_workers > 1;
+    let stream_parallel = parallel && !has_shard_ctx;
+    ContigModes {
+        stream_parallel,
+        stateful_parallel: parallel && has_shard_ctx && stateful,
+        stateful_runs: cache_enabled && has_regions && stateful && !stream_parallel,
+    }
+}
+
 async fn prepare_contig_data(
     session: Arc<SessionContext>,
     cache: Arc<PartitionedAnnotationCache>,
@@ -13991,24 +14029,29 @@ async fn prepare_contig_data(
     // Stateful Merged/RefSeq at workers>1 runs N grid-aligned per-worker lookup
     // scans (planned below, once overlap_width is known), not the byte-budget
     // partitioning.
-    let stateful_parallel = cache_enabled
-        && config.annotation_workers > 1
-        && matches!(
-            config.cache_source_type,
-            CacheSourceType::Merged | CacheSourceType::RefSeq
-        );
     let contig_bounds: Option<Vec<RunBounds>> = config
         .regions
         .as_deref()
         .and_then(|runs| runs.get(&chrom).cloned());
     // A bounded run on a stateful source needs the buffer grid so the cut can
-    // be aligned to whole buffers and warmed up (design: stateful runs).
-    let stateful_runs = cache_enabled
-        && contig_bounds.is_some()
-        && matches!(
-            config.cache_source_type,
-            CacheSourceType::Merged | CacheSourceType::RefSeq
-        );
+    // be aligned to whole buffers and warmed up (design: stateful runs). The
+    // streaming run pool plans every source on the grid itself.
+    let ContigModes {
+        stream_parallel,
+        stateful_parallel,
+        stateful_runs,
+    } = contig_modes(
+        cache_enabled,
+        config.annotation_workers,
+        config.vcf_shard_ctx.is_some(),
+        config.cache_source_type,
+        contig_bounds.is_some(),
+    );
+    if stream_parallel {
+        // Parallelism comes from runs; each run's lookup is one ordered
+        // partition so the run task needs no fan-in.
+        config.target_partitions = 1;
+    }
 
     // Context arm: load transcripts, exons, translations, etc. (Parquet only).
     // Everything up to here (identity validation, schema reads) is setup that
@@ -14061,7 +14104,7 @@ async fn prepare_contig_data(
     // load (Parquet transcripts/exons) — independent IO, so the count is hidden
     // behind context load instead of running as a serial prelude before workers.
     let count_fut = async {
-        if stateful_parallel || stateful_runs {
+        if stateful_parallel || stateful_runs || stream_parallel {
             Some(
                 count_contig_buffer_boundaries(
                     &session,
@@ -14226,34 +14269,78 @@ async fn prepare_contig_data(
         grid_slices = slices;
     }
 
-    let runs: VecDeque<ContigRun> = match contig_bounds {
-        None => VecDeque::from([ContigRun::open()]),
-        Some(bounds) if stateful_runs => {
-            let (boundaries, _total_rows, _positions) = grid_count
-                .take()
-                .expect("stateful_runs implies the count future ran")?;
-            let positions: Vec<i64> = boundaries.iter().map(|b| b.pos).collect();
-            crate::regions::plan_runs(&bounds, Some(&positions))
+    let runs: VecDeque<ContigRun> = if stream_parallel {
+        let (boundaries, _total_rows, _positions) = grid_count
+            .take()
+            .expect("stream_parallel implies the count future ran")?;
+        let stateful = matches!(
+            config.cache_source_type,
+            CacheSourceType::Merged | CacheSourceType::RefSeq
+        );
+        // Ensembl has no cross-buffer state: a plain cut is exact, so its
+        // runs get no warm-up. Merged/RefSeq runs replay `overlap_width_bp`.
+        let overlap = if stateful { overlap_width_bp } else { 0 };
+        let b = boundaries.len().saturating_sub(1);
+        let positions: Vec<i64> = boundaries.iter().map(|bd| bd.pos).collect();
+        let ranges: Vec<(Vec<RunBounds>, (usize, usize))> = match &contig_bounds {
+            None => vec![(vec![RunBounds::OPEN], (0, b))],
+            Some(bounds) => crate::regions::plan_runs(bounds, Some(&positions))
                 .into_iter()
                 .map(|plan| {
-                    let (bk, bk1) = plan.buffers.expect("grid path plans buffer ranges");
-                    let slice = build_grid_slices(&boundaries, &[bk, bk1], overlap_width_bp)
-                        .into_iter()
-                        .next();
-                    ContigRun {
-                        bounds: plan.bounds,
-                        slice,
-                    }
+                    let buffers = plan.buffers.expect("grid path plans buffer ranges");
+                    (plan.bounds, buffers)
                 })
-                .collect()
+                .collect(),
+        };
+        let run_buffers = stream_run_buffers(
+            b,
+            config.annotation_workers,
+            stateful,
+            std::env::var("VEP_STREAM_RUN_BUFFERS").ok().as_deref(),
+        );
+        let planned = plan_stream_runs(&boundaries, &ranges, run_buffers, overlap);
+        pipeline_trace::emit(
+            "run_pool",
+            "plan",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("buffers", TraceValue::Usize(b)),
+                ("run_buffers", TraceValue::Usize(run_buffers)),
+                ("runs", TraceValue::Usize(planned.len())),
+                ("warm_up", TraceValue::Usize(usize::from(overlap > 0))),
+            ],
+        );
+        VecDeque::from(planned)
+    } else {
+        match contig_bounds {
+            None => VecDeque::from([ContigRun::open()]),
+            Some(bounds) if stateful_runs => {
+                let (boundaries, _total_rows, _positions) = grid_count
+                    .take()
+                    .expect("stateful_runs implies the count future ran")?;
+                let positions: Vec<i64> = boundaries.iter().map(|b| b.pos).collect();
+                crate::regions::plan_runs(&bounds, Some(&positions))
+                    .into_iter()
+                    .map(|plan| {
+                        let (bk, bk1) = plan.buffers.expect("grid path plans buffer ranges");
+                        let slice = build_grid_slices(&boundaries, &[bk, bk1], overlap_width_bp)
+                            .into_iter()
+                            .next();
+                        ContigRun {
+                            bounds: plan.bounds,
+                            slice,
+                        }
+                    })
+                    .collect()
+            }
+            Some(bounds) => crate::regions::plan_runs(&bounds, None)
+                .into_iter()
+                .map(|plan| ContigRun {
+                    bounds: plan.bounds,
+                    slice: None,
+                })
+                .collect(),
         }
-        Some(bounds) => crate::regions::plan_runs(&bounds, None)
-            .into_iter()
-            .map(|plan| ContigRun {
-                bounds: plan.bounds,
-                slice: None,
-            })
-            .collect(),
     };
     pipeline_trace::emit(
         "regions",
@@ -14365,6 +14452,8 @@ async fn activate_run_lookup(
         vcf_schema,
         cache_schema,
         fallback_coloc_sink,
+        #[cfg(feature = "parquet-cache")]
+        parquet_lookup_cell,
     } = inputs;
     #[cfg(feature = "parquet-cache")]
     let cache_enabled = config.cache_root.is_some();
@@ -14389,6 +14478,7 @@ async fn activate_run_lookup(
         if config.parquet_backend {
             provider.set_parquet_backend(true);
         }
+        provider.set_parquet_lookup_cell(parquet_lookup_cell);
     }
     let parallel_lookup = cache_enabled;
     if parallel_lookup {
@@ -14503,11 +14593,19 @@ async fn activate_contig_lookups(
     // for the grid providers built further down.
     let grid_vcf_schema = vcf_schema.clone();
     let grid_cache_schema = cache_schema.clone();
+    // One single-flight cell per contig: every run's lookup (and every grid
+    // slice of the sink) shares the decoded shard footer + page index instead
+    // of decoding it again. Scoped to this contig: rebuilt on the next
+    // activation.
+    #[cfg(feature = "parquet-cache")]
+    let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
     let run_inputs = RunActivationInputs {
         var_table: var_table.clone(),
         vcf_schema,
         cache_schema,
         fallback_coloc_sink,
+        #[cfg(feature = "parquet-cache")]
+        parquet_lookup_cell: Arc::clone(&shared_parquet_lookup_cell),
     };
     let mut lookup_partitions = if stateful_parallel {
         // The grid-aligned per-worker lookup scans are built below from the
@@ -14532,13 +14630,11 @@ async fn activate_contig_lookups(
         let task_ctx = session.task_ctx();
         // All workers of this contig probe the same variation shard, and the
         // lookup is immutable once opened (its per-partition cursor is a
-        // stateless placeholder, and each probe opens its own file handle). Share
-        // one single-flight cell so the shard footer + page index are decoded
-        // once per contig rather than once per worker — the page index alone is
-        // ~0.5 GB for chr1, so per-worker loads dominated peak RSS. Scoped to
-        // this contig: it is rebuilt on the next activation.
-        #[cfg(feature = "parquet-cache")]
-        let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
+        // stateless placeholder, and each probe opens its own file handle). They
+        // share the contig's single-flight cell (`shared_parquet_lookup_cell`)
+        // so the shard footer + page index are decoded once per contig rather
+        // than once per worker — the page index alone is ~0.5 GB for chr1, so
+        // per-worker loads dominated peak RSS.
         // `session.state()` was cloned once per worker inside the loop.
         let session_state = session.state();
         let mut prepared: Vec<(usize, LookupProvider, ColocatedSink)> =
@@ -15544,6 +15640,8 @@ mod tests {
                 vcf_schema: Schema::new(Vec::<Field>::new()),
                 cache_schema: Schema::new(Vec::<Field>::new()),
                 fallback_coloc_sink: Arc::new(Mutex::new(HashMap::new())),
+                #[cfg(feature = "parquet-cache")]
+                parquet_lookup_cell: Arc::new(tokio::sync::OnceCell::new()),
             },
             pipeline_profile: None,
         }
@@ -17215,6 +17313,52 @@ mod tests {
             "head advanced -> window moves"
         );
         assert!(!admission_allows(0, 9, 10, 10, 2, 1), "no runs left");
+    }
+
+    #[test]
+    fn contig_modes_are_exclusive() {
+        let m = |workers: usize, sink: bool, source: CacheSourceType, regions: bool| {
+            contig_modes(true, workers, sink, source, regions)
+        };
+        let modes =
+            |stream_parallel: bool, stateful_parallel: bool, stateful_runs: bool| ContigModes {
+                stream_parallel,
+                stateful_parallel,
+                stateful_runs,
+            };
+        // Serial.
+        assert_eq!(
+            m(1, false, CacheSourceType::Ensembl, false),
+            modes(false, false, false)
+        );
+        assert_eq!(
+            m(1, false, CacheSourceType::Merged, true),
+            modes(false, false, true)
+        );
+        // Sink.
+        assert_eq!(
+            m(4, true, CacheSourceType::Merged, false),
+            modes(false, true, false)
+        );
+        assert_eq!(
+            m(4, true, CacheSourceType::Ensembl, false),
+            modes(false, false, false)
+        );
+        // Streaming pool: never stateful_parallel, never stateful_runs (the pool
+        // plans regions itself), for every source.
+        assert_eq!(
+            m(4, false, CacheSourceType::Merged, true),
+            modes(true, false, false)
+        );
+        assert_eq!(
+            m(4, false, CacheSourceType::Ensembl, false),
+            modes(true, false, false)
+        );
+        // No cache root: nothing parallel.
+        assert_eq!(
+            contig_modes(false, 4, false, CacheSourceType::Merged, true),
+            modes(false, false, false)
+        );
     }
 
     #[test]
