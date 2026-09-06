@@ -10561,6 +10561,87 @@ fn build_grid_slices(
     slices
 }
 
+/// Runs per worker per contig on the streaming run pool: enough pieces that
+/// the ordered release does not idle on one straggler, few enough that the
+/// per-run lookup activation and (on stateful sources) warm-up stay small.
+const STREAM_RUNS_PER_WORKER: usize = 4;
+/// Every seam on Merged/RefSeq replays about `overlap_width_bp` of input
+/// (about one buffer at whole-genome density); four-buffer runs keep that
+/// replay a small share of the run's own work.
+const STREAM_MIN_RUN_BUFFERS_STATEFUL: usize = 4;
+
+/// Run length in whole buffers for a contig of `buffers` buffers. `env` is
+/// `VEP_STREAM_RUN_BUFFERS`; it overrides the formula but never the stateful
+/// floor. Scheduling only: the run cut never changes output.
+fn stream_run_buffers(buffers: usize, workers: usize, stateful: bool, env: Option<&str>) -> usize {
+    let floor = if stateful {
+        STREAM_MIN_RUN_BUFFERS_STATEFUL
+    } else {
+        1
+    };
+    let from_env = env
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    let chosen = from_env.unwrap_or_else(|| {
+        let target_runs = workers.max(1) * STREAM_RUNS_PER_WORKER;
+        buffers.div_ceil(target_runs).max(1)
+    });
+    chosen.max(floor)
+}
+
+/// Extra runs the pool may start beyond the `workers` running ones, so a
+/// worker that finishes early is not idle while the head run straggles. `env`
+/// is `VEP_STREAM_LOOKAHEAD_RUNS`; default `workers`.
+fn stream_lookahead_runs(workers: usize, env: Option<&str>) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(workers.max(1))
+}
+
+/// Cut each `(bounds, [bk, bk1))` buffer range into consecutive pieces of
+/// `run_buffers` whole buffers (the last piece may be shorter) and build one
+/// grid-aligned run per piece. `overlap_width_bp = 0` yields runs with no
+/// warm-up (stateless Ensembl). Runs come out in grid order, which is the
+/// release order of the pool.
+fn plan_stream_runs(
+    boundaries: &[GridBufferBoundary],
+    ranges: &[(Vec<RunBounds>, (usize, usize))],
+    run_buffers: usize,
+    overlap_width_bp: i64,
+) -> Vec<ContigRun> {
+    let step = run_buffers.max(1);
+    let mut runs = Vec::new();
+    for (bounds, (bk, bk1)) in ranges {
+        if bk >= bk1 {
+            continue;
+        }
+        let mut cuts: Vec<usize> = (*bk..*bk1).step_by(step).collect();
+        cuts.push(*bk1);
+        for slice in build_grid_slices(boundaries, &cuts, overlap_width_bp) {
+            runs.push(ContigRun {
+                bounds: bounds.clone(),
+                slice: Some(slice),
+            });
+        }
+    }
+    runs
+}
+
+/// Whether the pool may start run `next_start`: a worker slot is free and the
+/// run lies within the release window `[head, head + workers + lookahead)`.
+/// The window bounds the runs whose output can be resident at once.
+fn admission_allows(
+    running: usize,
+    head: usize,
+    next_start: usize,
+    total_runs: usize,
+    workers: usize,
+    lookahead: usize,
+) -> bool {
+    next_start < total_runs
+        && running < workers.max(1)
+        && next_start < head + workers.max(1) + lookahead
+}
+
 /// Per-buffer cost weight used by the balanced grid split: how many contig
 /// transcripts overlap the buffer's position span, plus a constant for the fixed
 /// per-buffer cost that is paid even in gene deserts.
@@ -17018,6 +17099,122 @@ mod tests {
         // worker 1 warm-starts at buffer 2 (overlap 0) → inherits its tie skip.
         assert_eq!(slices[1].warm_up_start_row, 10000);
         assert_eq!(slices[1].skip_leading_rows, 3);
+    }
+
+    #[test]
+    fn stream_run_buffers_default_and_floor() {
+        // 65 buffers, 8 workers: ceil(65 / 32) = 3, floored to 4 on stateful.
+        assert_eq!(stream_run_buffers(65, 8, true, None), 4);
+        assert_eq!(stream_run_buffers(65, 8, false, None), 3);
+        // Small contig: at least one buffer per run.
+        assert_eq!(stream_run_buffers(3, 8, false, None), 1);
+        assert_eq!(stream_run_buffers(3, 8, true, None), 4);
+        // Override wins but not below the stateful floor.
+        assert_eq!(stream_run_buffers(65, 8, false, Some("2")), 2);
+        assert_eq!(stream_run_buffers(65, 8, true, Some("2")), 4);
+        assert_eq!(stream_run_buffers(65, 8, true, Some("9")), 9);
+        // Garbage override is ignored.
+        assert_eq!(stream_run_buffers(65, 8, false, Some("x")), 3);
+        assert_eq!(stream_run_buffers(65, 8, false, Some("0")), 3);
+    }
+
+    #[test]
+    fn stream_lookahead_defaults_to_workers() {
+        assert_eq!(stream_lookahead_runs(8, None), 8);
+        assert_eq!(stream_lookahead_runs(8, Some("2")), 2);
+        assert_eq!(stream_lookahead_runs(8, Some("0")), 0);
+        assert_eq!(stream_lookahead_runs(8, Some("bad")), 8);
+    }
+
+    #[test]
+    fn plan_stream_runs_cuts_open_range_into_fixed_pieces() {
+        // 5 buffers of 5000 rows.
+        let bs = vec![
+            gb(0, 0),
+            gb(5000, 100),
+            gb(10000, 200),
+            gb(15000, 300),
+            gb(20000, 400),
+            gb(25000, i64::MAX),
+        ];
+        let ranges = vec![(vec![RunBounds::OPEN], (0usize, 5usize))];
+        let runs = plan_stream_runs(&bs, &ranges, 2, 0);
+        assert_eq!(runs.len(), 3, "5 buffers in pieces of 2 -> 2+2+1");
+        let s = |i: usize| runs[i].slice.as_ref().expect("stream runs carry a slice");
+        assert_eq!((s(0).emit_start_row, s(0).emit_end_row), (0, 10000));
+        assert_eq!((s(1).emit_start_row, s(1).emit_end_row), (10000, 20000));
+        assert_eq!((s(2).emit_start_row, s(2).emit_end_row), (20000, 25000));
+        // overlap 0: no warm-up, scan floor == seam.
+        assert_eq!(s(1).warm_up_start_row, 10000);
+        assert_eq!(s(1).scan_lo_pos, 200);
+        assert_eq!(
+            s(1).scan_hi_pos,
+            401,
+            "non-last piece scans one past its end seam"
+        );
+        assert_eq!(
+            s(2).scan_hi_pos,
+            i64::MAX,
+            "last piece reads to the contig end"
+        );
+        assert!(runs.iter().all(|r| r.bounds == vec![RunBounds::OPEN]));
+        assert!(
+            runs[1].probe_floor().is_none(),
+            "no warm-up -> no probe floor"
+        );
+    }
+
+    #[test]
+    fn plan_stream_runs_keeps_region_bounds_and_warm_up() {
+        let bs = vec![
+            gb(0, 0),
+            gb(5000, 100),
+            gb(10000, 200),
+            gb(15000, 300),
+            gb(20000, 400),
+            gb(25000, i64::MAX),
+        ];
+        let b1 = RunBounds {
+            lo: Some(150),
+            hi: Some(320),
+        };
+        // Region maps to buffers [1, 4): three buffers, run length 1 -> three runs.
+        let ranges = vec![(vec![b1], (1usize, 4usize))];
+        // Seam at pos 200, overlap 100: the warm-up starts at the first buffer
+        // whose start is <= 100, i.e. buffer 1.
+        let runs = plan_stream_runs(&bs, &ranges, 1, 100);
+        assert_eq!(runs.len(), 3);
+        for r in &runs {
+            assert_eq!(r.bounds, vec![b1], "every piece trims to the region bounds");
+        }
+        let s1 = runs[1].slice.as_ref().unwrap();
+        assert_eq!(s1.emit_start_row, 10000);
+        assert_eq!(
+            s1.warm_up_start_row, 5000,
+            "overlap 100 reaches back one buffer"
+        );
+        assert_eq!(runs[1].probe_floor(), Some(200));
+    }
+
+    #[test]
+    fn plan_stream_runs_empty_grid_plans_nothing() {
+        let bs = vec![gb(0, i64::MAX)];
+        let ranges = vec![(vec![RunBounds::OPEN], (0usize, 0usize))];
+        assert!(plan_stream_runs(&bs, &ranges, 4, 0).is_empty());
+    }
+
+    #[test]
+    fn admission_bounds_workers_and_lookahead() {
+        // workers=2, lookahead=1: at most 3 runs from head onwards.
+        assert!(admission_allows(0, 0, 0, 10, 2, 1));
+        assert!(admission_allows(1, 0, 1, 10, 2, 1));
+        assert!(!admission_allows(2, 0, 2, 10, 2, 1), "both workers busy");
+        assert!(!admission_allows(1, 0, 3, 10, 2, 1), "lookahead exhausted");
+        assert!(
+            admission_allows(1, 1, 3, 10, 2, 1),
+            "head advanced -> window moves"
+        );
+        assert!(!admission_allows(0, 9, 10, 10, 2, 1), "no runs left");
     }
 
     #[test]
