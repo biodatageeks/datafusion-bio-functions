@@ -168,7 +168,7 @@ Additional VCF columns (`id`, `qual`, `filter`, decomposed INFO/sample fields) a
 | `csq` | `Utf8` | Legacy pipe-delimited CSQ string (NULL unless explicitly projected) |
 | `most_severe_consequence` | `Utf8` | SO term for the most severe consequence across all transcripts |
 
-### Transcript-level columns (42)
+### Transcript-level columns (47)
 
 One entry per overlapping transcript. Enabled with `everything: true`.
 
@@ -216,6 +216,11 @@ One entry per overlapping transcript. Enabled with `everything: true`.
 | `DOMAINS` | `List<Utf8>` | Overlapping protein domains |
 | `miRNA` | `List<Utf8>` | miRNA secondary structure position |
 | `HGVS_OFFSET` | `List<Int64>` | HGVS offset for indels |
+| `MOTIF_NAME` | `List<Utf8>` | Binding matrix id of the motif feature (MotifFeature entries only, NULL elsewhere) |
+| `MOTIF_POS` | `List<Int64>` | 1-based position of the variant within the motif |
+| `HIGH_INF_POS` | `List<Utf8>` | `Y`/`N`: variant at a high-information motif position |
+| `MOTIF_SCORE_CHANGE` | `List<Float32>` | Change in motif score |
+| `TRANSCRIPTION_FACTORS` | `List<Utf8>` | Transcription factors binding the motif, `&`-joined like the CSQ string |
 
 ### Population frequency columns (29)
 
@@ -232,7 +237,7 @@ Resolved for the matching allele. Scalar `Float32` (~7.2 significant digits).
 | `MAX_AF` | `Float32` | computed | Maximum AF across all populations |
 | `MAX_AF_POPS` | `Utf8` | computed | Population(s) with maximum AF |
 
-### Variant-level annotation columns (9)
+### Variant-level annotation columns (4)
 
 | Column | Arrow Type | Description |
 |--------|------------|-------------|
@@ -240,11 +245,6 @@ Resolved for the matching allele. Scalar `Float32` (~7.2 significant digits).
 | `SOMATIC` | `Utf8` | Somatic variant flag |
 | `PHENO` | `Utf8` | Phenotype/disease association flag |
 | `PUBMED` | `List<Utf8>` | PubMed IDs |
-| `MOTIF_NAME` | `Utf8` | Motif feature name |
-| `MOTIF_POS` | `Utf8` | Position in motif |
-| `HIGH_INF_POS` | `Utf8` | High information position in motif |
-| `MOTIF_SCORE_CHANGE` | `Float32` | Change in motif score |
-| `TRANSCRIPTION_FACTORS` | `List<Utf8>` | Transcription factors binding the motif |
 
 ### Cache-only columns (7)
 
