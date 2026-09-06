@@ -159,6 +159,82 @@ pub(crate) fn restrict_contigs(contigs: Vec<String>, runs: &ContigRuns) -> Vec<S
         .collect()
 }
 
+/// Map an interval onto whole input buffers. `boundary_positions[k]` is the
+/// `start` of the first row of buffer `k`; the last entry (`i64::MAX`) is the
+/// terminal boundary, so there are `len - 1` buffers. Returns `(bk, bk1)` with
+/// `bk < bk1`: the first buffer whose start is at or below `lo` (buffer 0 when
+/// `lo` precedes every row) through the last buffer whose start is at or below
+/// `hi`, exclusive. Including buffer `bk` even when `lo` falls inside it is a
+/// superset; the output trim removes the extra rows.
+pub(crate) fn buffer_range_for_bounds(
+    boundary_positions: &[i64],
+    bounds: RunBounds,
+) -> (usize, usize) {
+    let b = boundary_positions.len().saturating_sub(1);
+    if b == 0 {
+        return (0, 0);
+    }
+    let bk = match bounds.lo {
+        None => 0,
+        // number of buffer starts <= lo, minus one; clamp at 0
+        Some(lo) => boundary_positions[..b]
+            .partition_point(|&p| p <= lo)
+            .saturating_sub(1),
+    };
+    let bk1 = match bounds.hi {
+        None => b,
+        Some(hi) => boundary_positions[..b]
+            .partition_point(|&p| p <= hi)
+            .max(bk + 1)
+            .min(b),
+    };
+    (bk, bk1)
+}
+
+/// One lookup pass over a contig: the original intervals it serves (for the
+/// output trim) and, on the grid path, the whole-buffer range it must annotate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RunPlan {
+    pub bounds: Vec<RunBounds>,
+    pub buffers: Option<(usize, usize)>,
+}
+
+/// Plan the runs of one contig. Without a grid (`None`, the stateless Ensembl
+/// path) every merged interval is its own run. With a grid, intervals map to
+/// buffer ranges and ranges that overlap or touch merge into one run so no
+/// buffer is warmed up and annotated twice.
+pub(crate) fn plan_runs(bounds: &[RunBounds], boundary_positions: Option<&[i64]>) -> Vec<RunPlan> {
+    let bounds = merge_bounds(bounds.to_vec());
+    let Some(positions) = boundary_positions else {
+        return bounds
+            .into_iter()
+            .map(|b| RunPlan {
+                bounds: vec![b],
+                buffers: None,
+            })
+            .collect();
+    };
+    if positions.len() < 2 {
+        return Vec::new();
+    }
+    let mut runs: Vec<RunPlan> = Vec::new();
+    for b in bounds {
+        let (bk, bk1) = buffer_range_for_bounds(positions, b);
+        match runs.last_mut() {
+            Some(last) if last.buffers.is_some_and(|(_, end)| bk <= end) => {
+                last.bounds.push(b);
+                let (start, end) = last.buffers.unwrap_or((bk, bk1));
+                last.buffers = Some((start, end.max(bk1)));
+            }
+            _ => runs.push(RunPlan {
+                bounds: vec![b],
+                buffers: Some((bk, bk1)),
+            }),
+        }
+    }
+    runs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +444,170 @@ mod tests {
         let kept = restrict_contigs(vec!["chr1".into(), "chr2".into(), "chr3".into()], &runs);
         assert_eq!(kept, vec!["chr1".to_string(), "chr3".to_string()]);
         assert!(restrict_contigs(vec!["chr2".into()], &runs).is_empty());
+    }
+
+    #[test]
+    fn buffer_range_maps_to_whole_buffers() {
+        // Buffers: [0..100), [100..200), [200..300), [300..]
+        let pos = [10, 100, 200, 300, i64::MAX];
+        assert_eq!(
+            buffer_range_for_bounds(
+                &pos,
+                RunBounds {
+                    lo: Some(150),
+                    hi: Some(250)
+                }
+            ),
+            (1, 3)
+        );
+        // exactly on a boundary
+        assert_eq!(
+            buffer_range_for_bounds(
+                &pos,
+                RunBounds {
+                    lo: Some(100),
+                    hi: Some(200)
+                }
+            ),
+            (1, 3)
+        );
+        // below the first row: clamp to buffer 0
+        assert_eq!(
+            buffer_range_for_bounds(
+                &pos,
+                RunBounds {
+                    lo: Some(1),
+                    hi: Some(5)
+                }
+            ),
+            (0, 1)
+        );
+        // beyond the last boundary: through the last buffer
+        assert_eq!(
+            buffer_range_for_bounds(
+                &pos,
+                RunBounds {
+                    lo: Some(350),
+                    hi: Some(900)
+                }
+            ),
+            (3, 4)
+        );
+        // open sides
+        assert_eq!(
+            buffer_range_for_bounds(
+                &pos,
+                RunBounds {
+                    lo: None,
+                    hi: Some(150)
+                }
+            ),
+            (0, 2)
+        );
+        assert_eq!(
+            buffer_range_for_bounds(
+                &pos,
+                RunBounds {
+                    lo: Some(250),
+                    hi: None
+                }
+            ),
+            (2, 4)
+        );
+        assert_eq!(buffer_range_for_bounds(&pos, RunBounds::OPEN), (0, 4));
+    }
+
+    #[test]
+    fn buffer_range_on_position_tie_includes_the_earlier_buffer() {
+        // A boundary at pos 100 with rows_before_pos > 0 means rows at 100 sit
+        // in BOTH buffer 0 and buffer 1; a run starting at 100 maps to buffer 1
+        // and the gate's skip_leading_rows drops the earlier buffer's ties.
+        let pos = [10, 100, 200, i64::MAX];
+        assert_eq!(
+            buffer_range_for_bounds(
+                &pos,
+                RunBounds {
+                    lo: Some(100),
+                    hi: Some(100)
+                }
+            ),
+            (1, 2)
+        );
+        // lo strictly inside buffer 0 that ends with a tie at 100: buffer 0.
+        assert_eq!(
+            buffer_range_for_bounds(
+                &pos,
+                RunBounds {
+                    lo: Some(99),
+                    hi: Some(100)
+                }
+            ),
+            (0, 2)
+        );
+    }
+
+    #[test]
+    fn plan_runs_without_grid_is_one_run_per_interval() {
+        let b = [
+            RunBounds {
+                lo: Some(1),
+                hi: Some(5),
+            },
+            RunBounds {
+                lo: Some(50),
+                hi: None,
+            },
+        ];
+        assert_eq!(
+            plan_runs(&b, None),
+            vec![
+                RunPlan {
+                    bounds: vec![b[0]],
+                    buffers: None
+                },
+                RunPlan {
+                    bounds: vec![b[1]],
+                    buffers: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_runs_with_grid_merges_touching_buffer_ranges() {
+        let pos = [10, 100, 200, 300, 400, i64::MAX];
+        let b = [
+            RunBounds {
+                lo: Some(20),
+                hi: Some(30),
+            }, // buffer 0
+            RunBounds {
+                lo: Some(120),
+                hi: Some(130),
+            }, // buffer 1 -> touches (0,1)+(1,2)
+            RunBounds {
+                lo: Some(350),
+                hi: Some(360),
+            }, // buffer 3
+        ];
+        assert_eq!(
+            plan_runs(&b, Some(&pos)),
+            vec![
+                RunPlan {
+                    bounds: vec![b[0], b[1]],
+                    buffers: Some((0, 2))
+                },
+                RunPlan {
+                    bounds: vec![b[2]],
+                    buffers: Some((3, 4))
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_runs_with_empty_grid_yields_no_runs() {
+        assert!(plan_runs(&[RunBounds::OPEN], Some(&[i64::MAX])).is_empty());
+        assert!(plan_runs(&[RunBounds::OPEN], Some(&[])).is_empty());
     }
 }
