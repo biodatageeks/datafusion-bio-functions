@@ -9494,6 +9494,11 @@ struct ContigPipelineProfile {
     projection: Duration,
     send_wait: Duration,
     ordered_drain_wait: Duration,
+    /// Streaming run pool: runs planned for the contig (0 on other paths).
+    run_pool_runs: usize,
+    /// Streaming run pool: time the ordered release waited on the head run
+    /// while a later run had already finished.
+    head_wait: Duration,
     lookup_partitions: usize,
     lookup_batches: usize,
     lookup_buffered_batches_max: usize,
@@ -9506,7 +9511,7 @@ struct ContigPipelineProfile {
 impl ContigPipelineProfile {
     fn summary_line(&self, chrom: &str) -> String {
         format!(
-            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} prepare_total={:.3}s prepare_setup={:.3}s prepare_shared_ctx={:.3}s context_load={:.3}s context_tx_scan={:.3}s context_tx={:.3}s context_exons_scan={:.3}s context_exons={:.3}s context_tl_scan={:.3}s context_tl={:.3}s context_reg_scan={:.3}s context_reg={:.3}s context_motif_scan={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s",
+            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} prepare_total={:.3}s prepare_setup={:.3}s prepare_shared_ctx={:.3}s context_load={:.3}s context_tx_scan={:.3}s context_tx={:.3}s context_exons_scan={:.3}s context_exons={:.3}s context_tl_scan={:.3}s context_tl={:.3}s context_reg_scan={:.3}s context_reg={:.3}s context_motif_scan={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s run_pool_runs={} head_wait={:.3}s",
             self.lookup_partitions,
             self.lookup_batches,
             self.lookup_buffered_batches_max,
@@ -9543,6 +9548,8 @@ impl ContigPipelineProfile {
             self.projection.as_secs_f64(),
             self.send_wait.as_secs_f64(),
             self.ordered_drain_wait.as_secs_f64(),
+            self.run_pool_runs,
+            self.head_wait.as_secs_f64(),
         )
     }
 }
@@ -12041,6 +12048,18 @@ impl ContigAnnotationStream {
         }
     }
 
+    /// Tear a run pool down on error: abort its tasks, deregister the contig's
+    /// tables, then surface `e` through `ErrorCleaningUp`.
+    fn fail_run_pool(&mut self, mut pool: RunPoolState, e: DataFusionError) {
+        pool.abort();
+        let fut = make_cleanup_future(
+            Arc::clone(&pool.session),
+            std::mem::take(&mut pool.ephemeral_tables),
+        );
+        self.state = StreamState::ErrorCleaningUp(fut, e);
+        self.abort_prefetch();
+    }
+
     fn cleanup_registered_tables_on_drop(&mut self) {
         self.abort_prefetch();
         match &mut self.state {
@@ -13590,22 +13609,59 @@ impl Stream for ContigAnnotationStream {
                         let session = Arc::clone(&self.session);
                         let config = self.config.clone();
                         if config.annotation_workers > 1 {
-                            // threads>1 == sharded VCF output: build N independent
-                            // per-partition fused pipelines (own lookup partition +
-                            // LOCAL colocated map + inline annotate), each streaming
-                            // its annotated batches directly into its own
-                            // position-ordered VCF body shard. No ordered drain, no
-                            // output channel. Entered only via vcf_sink (the sole
-                            // producer of the "threads" option), which sets
-                            // vcf_shard_ctx.
+                            // workers>1 with a shard context == sharded VCF output:
+                            // build N independent per-partition fused pipelines
+                            // (own lookup partition + LOCAL colocated map + inline
+                            // annotate), each streaming its annotated batches
+                            // directly into its own position-ordered VCF body
+                            // shard. Without a shard context (the RecordBatch
+                            // streaming path) the same workers run the contig's
+                            // grid-ordered runs as a pool released in order.
                             let Some(shard_ctx) = config.vcf_shard_ctx.clone() else {
-                                self.abort_prefetch();
-                                self.state = StreamState::Done;
-                                return Poll::Ready(Some(Err(DataFusionError::Internal(
-                                    "parallel annotation (threads>1) requires a VCF shard \
-                                     context; it is only supported via the VCF output sink"
-                                        .to_string(),
-                                ))));
+                                // Streaming path: the run pool. Run 0's lookup was
+                                // activated by `activate_contig_lookups`; the rest
+                                // activate inside their tasks.
+                                let mut runs =
+                                    VecDeque::with_capacity(ready.pending_runs.len() + 1);
+                                runs.push_back(ready.active_run.clone());
+                                runs.append(&mut ready.pending_runs);
+                                let total_runs = runs.len();
+                                let workers = config.annotation_workers.max(1);
+                                let lookahead = stream_lookahead_runs(
+                                    workers,
+                                    std::env::var("VEP_STREAM_LOOKAHEAD_RUNS").ok().as_deref(),
+                                );
+                                record_contig_profile(&ready.pipeline_profile, |profile| {
+                                    profile.run_pool_runs = total_runs;
+                                });
+                                let mut pool = RunPoolState {
+                                    pending: runs,
+                                    first_lookup: Some(std::mem::take(
+                                        &mut ready.lookup_partitions,
+                                    )),
+                                    total_runs,
+                                    next_start: 0,
+                                    head: 0,
+                                    active: HashMap::new(),
+                                    workers,
+                                    lookahead,
+                                    run_inputs: ready.run_inputs.clone(),
+                                    chrom: ready.chrom,
+                                    config,
+                                    session,
+                                    shared: Arc::clone(&ready.shared_context),
+                                    ephemeral_tables: ready.ephemeral_tables,
+                                    t_contig_active: ready.t_contig_active,
+                                    pipeline_profile: ready.pipeline_profile.clone(),
+                                    contig_rows: 0,
+                                    head_wait_started: None,
+                                };
+                                pool.admit();
+                                self.state = StreamState::AnnotatingRunPool(pool);
+                                // Committed to annotating this contig: overlap the
+                                // NEXT contig's data phase with it.
+                                self.start_prefetch_next_contig();
+                                continue;
                             };
                             let shared = Arc::clone(&ready.shared_context);
                             // Grid slices, indexed by lookup-partition logical id
@@ -14112,7 +14168,124 @@ impl Stream for ContigAnnotationStream {
                 }
 
                 StreamState::AnnotatingRunPool(_) => {
-                    unreachable!("wired in the next commit")
+                    let StreamState::AnnotatingRunPool(mut pool) =
+                        std::mem::replace(&mut self.state, StreamState::Done)
+                    else {
+                        unreachable!()
+                    };
+                    let limit_reached = fetch_limit.is_some_and(|limit| self.rows_emitted >= limit);
+                    if limit_reached || pool.head == pool.total_runs {
+                        // Contig done, or LIMIT satisfied: remaining runs could
+                        // only produce rows that would be dropped.
+                        pool.abort();
+                        profile_end!(
+                            &format!("{}: TOTAL", pool.chrom),
+                            pool.t_contig_active,
+                            format!("{} rows", pool.contig_rows)
+                        );
+                        emit_contig_pipeline_profile(&pool.shared.profile, &pool.chrom);
+                        let fut = make_cleanup_future(
+                            Arc::clone(&pool.session),
+                            std::mem::take(&mut pool.ephemeral_tables),
+                        );
+                        self.state = StreamState::CleaningUp(fut);
+                        continue;
+                    }
+                    pool.admit();
+                    // Completions and errors of the runs behind the head. Their
+                    // output stays in their channels until they are released.
+                    let head = pool.head;
+                    let mut failure: Option<DataFusionError> = None;
+                    for (index, task) in pool.active.iter_mut() {
+                        if *index == head || !task.running() {
+                            continue;
+                        }
+                        if let Poll::Ready(Err(e)) = task.poll_join(cx) {
+                            failure = Some(e);
+                            break;
+                        }
+                    }
+                    if let Some(e) = failure {
+                        self.fail_run_pool(pool, e);
+                        continue;
+                    }
+                    // A completion may have freed a worker slot.
+                    pool.admit();
+                    let any_finished_behind = pool.active.values().any(|t| !t.running());
+                    let task = pool
+                        .active
+                        .get_mut(&head)
+                        .expect("the head run is admitted before any later run");
+                    match task.rx.poll_recv(cx) {
+                        Poll::Ready(Some(batch)) => {
+                            if let Some(started) = pool.head_wait_started.take() {
+                                record_contig_profile(&pool.pipeline_profile, |profile| {
+                                    profile.head_wait += started.elapsed();
+                                });
+                            }
+                            let batch = match fetch_limit {
+                                Some(limit) => {
+                                    let remaining = limit.saturating_sub(self.rows_emitted);
+                                    if remaining == 0 {
+                                        self.state = StreamState::AnnotatingRunPool(pool);
+                                        continue; // the limit check above ends the contig
+                                    }
+                                    if batch.num_rows() > remaining {
+                                        batch.slice(0, remaining)
+                                    } else {
+                                        batch
+                                    }
+                                }
+                                None => batch,
+                            };
+                            self.rows_emitted += batch.num_rows();
+                            pool.contig_rows += batch.num_rows();
+                            record_contig_profile(&pool.pipeline_profile, |profile| {
+                                profile.output_batches += 1;
+                                profile.output_rows += batch.num_rows();
+                            });
+                            self.state = StreamState::AnnotatingRunPool(pool);
+                            return Poll::Ready(Some(Ok(batch)));
+                        }
+                        Poll::Ready(None) => {
+                            // The head's sender is gone: its task has ended.
+                            match task.poll_join(cx) {
+                                Poll::Pending => {
+                                    self.state = StreamState::AnnotatingRunPool(pool);
+                                    return Poll::Pending;
+                                }
+                                Poll::Ready(Ok(())) => {
+                                    pipeline_trace::emit(
+                                        "run_pool",
+                                        "release",
+                                        &[
+                                            ("chrom", TraceValue::Str(&pool.chrom)),
+                                            ("run", TraceValue::Usize(head)),
+                                            (
+                                                "elapsed",
+                                                TraceValue::Duration(task.started.elapsed()),
+                                            ),
+                                        ],
+                                    );
+                                    pool.active.remove(&head);
+                                    pool.head += 1;
+                                    self.state = StreamState::AnnotatingRunPool(pool);
+                                    continue;
+                                }
+                                Poll::Ready(Err(e)) => {
+                                    self.fail_run_pool(pool, e);
+                                    continue;
+                                }
+                            }
+                        }
+                        Poll::Pending => {
+                            if any_finished_behind && pool.head_wait_started.is_none() {
+                                pool.head_wait_started = Some(Instant::now());
+                            }
+                            self.state = StreamState::AnnotatingRunPool(pool);
+                            return Poll::Pending;
+                        }
+                    }
                 }
 
                 StreamState::CleaningUp(fut) => match fut.as_mut().poll(cx) {
