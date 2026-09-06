@@ -122,6 +122,43 @@ pub(crate) fn merge_bounds(mut bounds: Vec<RunBounds>) -> Vec<RunBounds> {
     merged
 }
 
+use std::collections::HashMap;
+
+/// Per-contig merged intervals, keyed by the VCF's own contig spelling.
+pub(crate) type ContigRuns = HashMap<String, Vec<RunBounds>>;
+
+/// Map each spec onto the VCF contig it names (through the alias set, so
+/// `1`/`chr1` and `M`/`MT`/`chrM`/`chrMT` match) and merge per contig. Specs
+/// naming a contig the VCF does not have select nothing and are dropped.
+pub(crate) fn resolve_regions(specs: &[RegionSpec], vcf_contigs: &[String]) -> ContigRuns {
+    let mut by_alias: HashMap<String, &String> = HashMap::new();
+    for contig in vcf_contigs {
+        for alias in crate::cache::manifest::contig_alias_set(contig) {
+            by_alias.entry(alias).or_insert(contig);
+        }
+    }
+    let mut runs: HashMap<String, Vec<RunBounds>> = HashMap::new();
+    for spec in specs {
+        if let Some(contig) = by_alias.get(&spec.chrom) {
+            runs.entry((*contig).clone()).or_default().push(RunBounds {
+                lo: spec.start,
+                hi: spec.end,
+            });
+        }
+    }
+    runs.into_iter()
+        .map(|(k, v)| (k, merge_bounds(v)))
+        .collect()
+}
+
+/// Keep only contigs that have a run, in the order given.
+pub(crate) fn restrict_contigs(contigs: Vec<String>, runs: &ContigRuns) -> Vec<String> {
+    contigs
+        .into_iter()
+        .filter(|c| runs.contains_key(c))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +327,46 @@ mod tests {
             ]),
             vec![RunBounds::OPEN]
         );
+    }
+
+    fn s(chrom: &str, start: Option<i64>, end: Option<i64>) -> RegionSpec {
+        RegionSpec {
+            chrom: chrom.into(),
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn resolve_matches_aliases_and_keeps_vcf_spelling() {
+        let vcf = vec!["chr1".to_string(), "chr2".to_string(), "chrM".to_string()];
+        let runs = resolve_regions(
+            &[
+                s("1", Some(10), Some(20)),
+                s("chr1", Some(15), Some(30)),
+                s("MT", None, None),
+                s("chr9", None, None),
+            ],
+            &vcf,
+        );
+        assert_eq!(runs.len(), 2, "chr9 is not in the VCF: {runs:?}");
+        assert_eq!(
+            runs["chr1"],
+            vec![RunBounds {
+                lo: Some(10),
+                hi: Some(30)
+            }]
+        );
+        assert_eq!(runs["chrM"], vec![RunBounds::OPEN]);
+    }
+
+    #[test]
+    fn restrict_contigs_keeps_vcf_order_and_drops_unlisted() {
+        let mut runs = ContigRuns::new();
+        runs.insert("chr3".into(), vec![RunBounds::OPEN]);
+        runs.insert("chr1".into(), vec![RunBounds::OPEN]);
+        let kept = restrict_contigs(vec!["chr1".into(), "chr2".into(), "chr3".into()], &runs);
+        assert_eq!(kept, vec!["chr1".to_string(), "chr3".to_string()]);
+        assert!(restrict_contigs(vec!["chr2".into()], &runs).is_empty());
     }
 }

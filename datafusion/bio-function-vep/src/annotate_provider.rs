@@ -3640,6 +3640,8 @@ pub struct AnnotateProvider {
     backend: AnnotationBackend,
     cache_source_type: CacheSourceType,
     options_json: Option<String>,
+    /// Validated `regions` option, resolved to VCF contigs at scan time.
+    regions: Option<Vec<crate::regions::RegionSpec>>,
     transcript_selection: TranscriptSelectionFlags,
     pick_flags: PickFlags,
     include_pick_output: bool,
@@ -3674,6 +3676,7 @@ impl AnnotateProvider {
         )?;
         let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
         let include_pick_output = pick_flags.include_pick_output();
+        let regions = crate::regions::parse_regions_option(options_json.as_deref())?;
         let requested_fields =
             Self::parse_json_string_array_option(options_json.as_deref(), "fields")?;
         let csq_field_projection = requested_fields
@@ -3730,6 +3733,7 @@ impl AnnotateProvider {
             backend,
             cache_source_type,
             options_json,
+            regions,
             transcript_selection,
             pick_flags,
             include_pick_output,
@@ -5611,6 +5615,22 @@ impl AnnotateProvider {
         // Discover contigs from VCF.
         let t_contigs = profile_start!();
         let vcf_contigs = self.discover_vcf_contigs().await?;
+        let contig_runs: Option<Arc<crate::regions::ContigRuns>> = match self.regions.as_deref() {
+            None => None,
+            Some(specs) => {
+                if self.vcf_shard_ctx.is_some() {
+                    return Err(DataFusionError::Plan(
+                        "annotate_vep(): regions are not supported with sharded VCF output \
+                         (workers>1); run with workers=1"
+                            .to_string(),
+                    ));
+                }
+                Some(Arc::new(crate::regions::resolve_regions(
+                    specs,
+                    &vcf_contigs,
+                )))
+            }
+        };
         // Build expanded cache chrom set with all equivalent spellings (bare,
         // chr-prefixed, and mitochondrial M/MT/chrM/chrMT) so that e.g. VCF
         // "chr1" matches cache "1" and VCF "M"/"chrM" matches cache "chrMT".
@@ -5620,6 +5640,10 @@ impl AnnotateProvider {
             cache_chroms.extend(crate::cache::manifest::contig_alias_set(c));
         }
         let contigs = select_cache_backed_contigs(&vcf_contigs, &cache_chroms, cache.base_dir())?;
+        let contigs = match contig_runs.as_deref() {
+            Some(runs) => crate::regions::restrict_contigs(contigs, runs),
+            None => contigs,
+        };
         let projected_schema = if let Some(indices) = projection {
             Arc::new(self.schema.project(indices)?)
         } else {
@@ -5724,6 +5748,7 @@ impl AnnotateProvider {
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: self.vcf_shard_ctx.clone(),
+            regions: contig_runs,
         };
 
         let exec = ContigAnnotationExec::new(
@@ -9111,6 +9136,8 @@ struct ContigAnnotationConfig {
     /// shard (no ordered drain / output channel). Set only by the `vcf_sink`
     /// direct-plan entry; `None` for the normal RecordBatch-streaming path.
     vcf_shard_ctx: Option<Arc<crate::vcf_sink::VcfShardContext>>,
+    /// Per-contig region runs (resolved to VCF spellings); `None` = whole file.
+    regions: Option<Arc<crate::regions::ContigRuns>>,
 }
 
 #[derive(Clone)]
@@ -14745,6 +14772,31 @@ mod tests {
         assert!(message.contains("variation"), "unexpected error: {message}");
     }
 
+    #[cfg(feature = "parquet-cache")]
+    #[tokio::test]
+    async fn regions_option_is_validated_at_construction() {
+        let session = Arc::new(SessionContext::new());
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = AnnotateProvider::new(
+            Arc::clone(&session),
+            "vcf".to_string(),
+            tmp.path().to_string_lossy().to_string(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Ensembl,
+            Some(r#"{"regions":[{"chrom":"chr1","start":9,"end":8}]}"#.to_string()),
+            vcf_schema,
+        )
+        .expect_err("start > end must be rejected");
+        assert!(err.to_string().contains("regions"), "{err}");
+    }
+
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
         ContigAnnotationConfig {
             vcf_table: "vcf".to_string(),
@@ -14780,6 +14832,7 @@ mod tests {
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: None,
+            regions: None,
         }
     }
 
