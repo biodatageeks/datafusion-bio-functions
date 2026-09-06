@@ -205,11 +205,12 @@ use crate::cache_common::SiftPredictionStoreRef;
 /// Column categories for typed non-meta annotation columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnnotationCategory {
-    /// Transcript-level fields from the most-severe transcript (42 columns).
+    /// Per-consequence fields, one list element per CSQ entry (47 columns,
+    /// the five motif columns included).
     Transcript,
     /// Population allele frequency fields, resolved for the matching allele (29 columns).
     Frequency,
-    /// Variant-level annotation columns from co-located data (9 columns).
+    /// Variant-level annotation columns from co-located data (4 columns).
     Variant,
     /// Cache-only columns not present in the CSQ string (7 columns).
     CacheOnly,
