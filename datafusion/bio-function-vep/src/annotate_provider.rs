@@ -14970,6 +14970,28 @@ async fn activate_run_lookup(
         }
         provider.set_parquet_lookup_cell(parquet_lookup_cell);
     }
+    // Streaming run pool: the run's plan inherits the VCF scan's partition
+    // count (the session's target partitions), but the run task consumes ONE
+    // ordered channel, so read every partition of the filtered plan in id order
+    // through a single worker, as the sink's grid slices do.
+    let pool_run = cache_enabled && config.annotation_workers > 1 && config.vcf_shard_ctx.is_none();
+    if pool_run {
+        let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+        if config.flags.check_existing {
+            provider.set_colocated_sink(Arc::clone(&sink));
+        }
+        let session_state = session.state();
+        let plan = provider.scan(&session_state, None, &[], None).await?;
+        return Ok(VecDeque::from([spawn_lookup_full_contig_worker(
+            plan,
+            session.task_ctx(),
+            0,
+            chrom,
+            sink,
+            LOOKUP_PARTITION_QUEUE_BATCHES,
+            pipeline_profile,
+        )]));
+    }
     let parallel_lookup = cache_enabled;
     if parallel_lookup {
         let session_state = session.state();
