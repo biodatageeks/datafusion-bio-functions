@@ -3680,20 +3680,6 @@ impl AnnotateProvider {
         let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
         let include_pick_output = pick_flags.include_pick_output();
         let regions = crate::regions::parse_regions_option(options_json.as_deref())?;
-        if regions.is_some() {
-            // Region runs are planned on the serial streaming path only; the
-            // parallel (`workers>1`) planner consumes the same buffer grid and
-            // the two cannot coexist on one contig.
-            let workers = options_json
-                .as_deref()
-                .and_then(|opts| Self::parse_json_i64_option(opts, "workers"))
-                .unwrap_or(1);
-            if workers > 1 {
-                return Err(DataFusionError::Plan(format!(
-                    "annotate_vep(): regions require workers=1, got workers={workers}"
-                )));
-            }
-        }
         let requested_fields =
             Self::parse_json_string_array_option(options_json.as_deref(), "fields")?;
         let csq_field_projection = requested_fields
@@ -15899,7 +15885,7 @@ mod tests {
 
     #[cfg(feature = "parquet-cache")]
     #[tokio::test]
-    async fn regions_with_workers_above_one_are_rejected_at_construction() {
+    async fn regions_with_workers_above_one_are_accepted_at_construction() {
         let session = Arc::new(SessionContext::new());
         let vcf_schema = Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -15920,13 +15906,10 @@ mod tests {
                 vcf_schema.clone(),
             )
         };
-        let err = build(r#"{"workers":2,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
-            .expect_err("regions with workers>1 must be rejected before planning");
-        let message = err.to_string();
-        assert!(
-            message.contains("regions") && message.contains("workers=1"),
-            "{message}"
-        );
+        // The streaming run pool plans regions itself; the sharded sink still
+        // rejects the combination at scan time.
+        build(r#"{"workers":2,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
+            .expect("regions with workers>1 are planned by the streaming run pool");
         build(r#"{"workers":1,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
             .expect("workers=1 with regions is accepted");
         build(r#"{"workers":4}"#).expect("workers>1 without regions is unchanged");
