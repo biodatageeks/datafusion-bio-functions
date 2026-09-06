@@ -5,7 +5,8 @@
 use datafusion::common::{DataFusionError, Result};
 use serde_json::Value;
 
-/// One `regions` entry as given in `options_json`, 1-based closed.
+/// One `regions` entry as given in `options_json`: 1-based closed, whatever
+/// coordinate system the VCF table uses. `resolve_regions` converts it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegionSpec {
     pub chrom: String,
@@ -130,7 +131,13 @@ pub(crate) type ContigRuns = HashMap<String, Vec<RunBounds>>;
 /// Map each spec onto the VCF contig it names (through the alias set, so
 /// `1`/`chr1` and `M`/`MT`/`chrM`/`chrMT` match) and merge per contig. Specs
 /// naming a contig the VCF does not have select nothing and are dropped.
-pub(crate) fn resolve_regions(specs: &[RegionSpec], vcf_contigs: &[String]) -> ContigRuns {
+/// `zero_based` says the table's `start` column is 0-based half-open, in
+/// which case the 1-based closed `[start, end]` becomes `[start-1, end-1]`.
+pub(crate) fn resolve_regions(
+    specs: &[RegionSpec],
+    vcf_contigs: &[String],
+    zero_based: bool,
+) -> ContigRuns {
     // Exact spellings win: a VCF that carries both `1` and `chr1` must map a
     // spec naming `chr1` onto `chr1`, so aliases only fill names no contig
     // spells exactly.
@@ -146,9 +153,10 @@ pub(crate) fn resolve_regions(specs: &[RegionSpec], vcf_contigs: &[String]) -> C
     let mut runs: HashMap<String, Vec<RunBounds>> = HashMap::new();
     for spec in specs {
         if let Some(contig) = by_alias.get(&spec.chrom) {
+            let shift = i64::from(zero_based);
             runs.entry((*contig).clone()).or_default().push(RunBounds {
-                lo: spec.start,
-                hi: spec.end,
+                lo: spec.start.map(|s| s - shift),
+                hi: spec.end.map(|e| e - shift),
             });
         }
     }
@@ -541,6 +549,7 @@ mod tests {
                 s("chr9", None, None),
             ],
             &vcf,
+            false,
         );
         assert_eq!(runs.len(), 2, "chr9 is not in the VCF: {runs:?}");
         assert_eq!(
@@ -560,6 +569,7 @@ mod tests {
         let runs = resolve_regions(
             &[s("chr1", Some(10), Some(20)), s("1", Some(30), Some(40))],
             &vcf,
+            false,
         );
         assert_eq!(
             runs["chr1"],
@@ -577,8 +587,34 @@ mod tests {
         );
         // Reverse header order must not change the answer.
         let vcf = vec!["chr1".to_string(), "1".to_string()];
-        let runs = resolve_regions(&[s("1", None, None)], &vcf);
+        let runs = resolve_regions(&[s("1", None, None)], &vcf, false);
         assert_eq!(runs.keys().collect::<Vec<_>>(), vec!["1"]);
+    }
+
+    #[test]
+    fn resolve_converts_to_a_zero_based_table() {
+        let vcf = vec!["chr1".to_string()];
+        let runs = resolve_regions(
+            &[s("chr1", Some(10), Some(20)), s("chr1", Some(1), None)],
+            &vcf,
+            true,
+        );
+        assert_eq!(
+            runs["chr1"],
+            vec![RunBounds {
+                lo: Some(0),
+                hi: None
+            }],
+            "1-based [1, ..] and [10, 20] become 0-based [0, ..] and merge"
+        );
+        let runs = resolve_regions(&[s("chr1", Some(10), Some(20))], &vcf, true);
+        assert_eq!(
+            runs["chr1"],
+            vec![RunBounds {
+                lo: Some(9),
+                hi: Some(19)
+            }]
+        );
     }
 
     #[test]

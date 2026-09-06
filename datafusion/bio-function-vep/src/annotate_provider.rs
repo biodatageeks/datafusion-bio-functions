@@ -5477,6 +5477,19 @@ impl AnnotateProvider {
     ///
     /// Does NOT use `"bio.vcf.contigs"` (all VCF header contigs) because
     /// GRCh38 headers list ~195 contigs even when only 1–22 have data.
+    /// Whether the VCF table's `start` column is 0-based half-open (the
+    /// provider stamps `bio.coordinate_system_zero_based` on its schema).
+    /// Absent metadata means 1-based, the default for `annotate_vep` callers.
+    async fn vcf_coordinate_system_zero_based(&self) -> Result<bool> {
+        let table = self.session.table(&self.vcf_table).await?;
+        let schema = table.schema();
+        Ok(schema
+            .as_arrow()
+            .metadata()
+            .get("bio.coordinate_system_zero_based")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true")))
+    }
+
     async fn discover_vcf_contigs(&self) -> Result<Vec<String>> {
         let table = self.session.table(&self.vcf_table).await?;
         let schema = table.schema();
@@ -5640,9 +5653,11 @@ impl AnnotateProvider {
                             .to_string(),
                     ));
                 }
+                let zero_based = self.vcf_coordinate_system_zero_based().await?;
                 Some(Arc::new(crate::regions::resolve_regions(
                     specs,
                     &vcf_contigs,
+                    zero_based,
                 )))
             }
         };
@@ -13498,8 +13513,15 @@ impl Stream for ContigAnnotationStream {
                     }
 
                     // Another region run on this contig: reuse the prepared context,
-                    // rebuild the lookup for the next window, warm up again.
-                    if let Some(next) = ann.pending_runs.pop_front() {
+                    // rebuild the lookup for the next window, warm up again. A
+                    // satisfied LIMIT ends the contig instead: the remaining runs
+                    // could only produce rows that would be dropped.
+                    let next_run = if limit_reached {
+                        None
+                    } else {
+                        ann.pending_runs.pop_front()
+                    };
+                    if let Some(next) = next_run {
                         abort_annotation_lookup_partitions(&mut ann);
                         ann.worker.reset_for_next_run();
                         ann.run = ActiveRunState::from_run(&next);
