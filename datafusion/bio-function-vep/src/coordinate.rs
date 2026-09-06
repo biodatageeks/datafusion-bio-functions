@@ -65,7 +65,7 @@ impl CoordinateNormalizer {
 }
 
 /// Read the coordinate system from schema metadata.
-fn is_zero_based(schema: &SchemaRef) -> bool {
+pub(crate) fn is_zero_based(schema: &SchemaRef) -> bool {
     schema
         .metadata()
         .get(COORDINATE_SYSTEM_METADATA_KEY)

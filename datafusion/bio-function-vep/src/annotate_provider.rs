@@ -189,6 +189,7 @@ use crate::colocated::{
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::MissWorklist;
 use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
+use crate::regions::{RunBounds, RunGate};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, FeatureType, GeometryCache, MirnaFeature,
@@ -3640,6 +3641,8 @@ pub struct AnnotateProvider {
     backend: AnnotationBackend,
     cache_source_type: CacheSourceType,
     options_json: Option<String>,
+    /// Validated `regions` option, resolved to VCF contigs at scan time.
+    regions: Option<Vec<crate::regions::RegionSpec>>,
     transcript_selection: TranscriptSelectionFlags,
     pick_flags: PickFlags,
     include_pick_output: bool,
@@ -3674,6 +3677,21 @@ impl AnnotateProvider {
         )?;
         let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
         let include_pick_output = pick_flags.include_pick_output();
+        let regions = crate::regions::parse_regions_option(options_json.as_deref())?;
+        if regions.is_some() {
+            // Region runs are planned on the serial streaming path only; the
+            // parallel (`workers>1`) planner consumes the same buffer grid and
+            // the two cannot coexist on one contig.
+            let workers = options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_i64_option(opts, "workers"))
+                .unwrap_or(1);
+            if workers > 1 {
+                return Err(DataFusionError::Plan(format!(
+                    "annotate_vep(): regions require workers=1, got workers={workers}"
+                )));
+            }
+        }
         let requested_fields =
             Self::parse_json_string_array_option(options_json.as_deref(), "fields")?;
         let csq_field_projection = requested_fields
@@ -3730,6 +3748,7 @@ impl AnnotateProvider {
             backend,
             cache_source_type,
             options_json,
+            regions,
             transcript_selection,
             pick_flags,
             include_pick_output,
@@ -5458,10 +5477,7 @@ impl AnnotateProvider {
     ///
     /// Does NOT use `"bio.vcf.contigs"` (all VCF header contigs) because
     /// GRCh38 headers list ~195 contigs even when only 1–22 have data.
-    async fn discover_vcf_contigs(&self) -> Result<Vec<String>> {
-        let table = self.session.table(&self.vcf_table).await?;
-        let schema = table.schema();
-        let arrow_schema = schema.as_arrow();
+    async fn discover_vcf_contigs(&self, arrow_schema: &Schema) -> Result<Vec<String>> {
         let metadata = arrow_schema.metadata();
 
         // Priority 1: TBI-indexed contigs (only data-bearing contigs, zero cost).
@@ -5610,7 +5626,35 @@ impl AnnotateProvider {
 
         // Discover contigs from VCF.
         let t_contigs = profile_start!();
-        let vcf_contigs = self.discover_vcf_contigs().await?;
+        // One table resolution serves contig discovery and, with `regions`,
+        // the coordinate system the bounds must be expressed in.
+        let vcf_arrow_schema: SchemaRef = Arc::new(
+            self.session
+                .table(&self.vcf_table)
+                .await?
+                .schema()
+                .as_arrow()
+                .clone(),
+        );
+        let vcf_contigs = self.discover_vcf_contigs(&vcf_arrow_schema).await?;
+        let contig_runs: Option<Arc<crate::regions::ContigRuns>> = match self.regions.as_deref() {
+            None => None,
+            Some(specs) => {
+                if self.vcf_shard_ctx.is_some() {
+                    return Err(DataFusionError::Plan(
+                        "annotate_vep(): regions are not supported with sharded VCF output \
+                         (workers>1); run with workers=1"
+                            .to_string(),
+                    ));
+                }
+                let zero_based = crate::coordinate::is_zero_based(&vcf_arrow_schema);
+                Some(Arc::new(crate::regions::resolve_regions(
+                    specs,
+                    &vcf_contigs,
+                    zero_based,
+                )))
+            }
+        };
         // Build expanded cache chrom set with all equivalent spellings (bare,
         // chr-prefixed, and mitochondrial M/MT/chrM/chrMT) so that e.g. VCF
         // "chr1" matches cache "1" and VCF "M"/"chrM" matches cache "chrMT".
@@ -5620,6 +5664,10 @@ impl AnnotateProvider {
             cache_chroms.extend(crate::cache::manifest::contig_alias_set(c));
         }
         let contigs = select_cache_backed_contigs(&vcf_contigs, &cache_chroms, cache.base_dir())?;
+        let contigs = match contig_runs.as_deref() {
+            Some(runs) => crate::regions::restrict_contigs(contigs, runs),
+            None => contigs,
+        };
         let projected_schema = if let Some(indices) = projection {
             Arc::new(self.schema.project(indices)?)
         } else {
@@ -5724,6 +5772,7 @@ impl AnnotateProvider {
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: self.vcf_shard_ctx.clone(),
+            regions: contig_runs,
         };
 
         let exec = ContigAnnotationExec::new(
@@ -9111,6 +9160,8 @@ struct ContigAnnotationConfig {
     /// shard (no ordered drain / output channel). Set only by the `vcf_sink`
     /// direct-plan entry; `None` for the normal RecordBatch-streaming path.
     vcf_shard_ctx: Option<Arc<crate::vcf_sink::VcfShardContext>>,
+    /// Per-contig region runs (resolved to VCF spellings); `None` = whole file.
+    regions: Option<Arc<crate::regions::ContigRuns>>,
 }
 
 #[derive(Clone)]
@@ -10316,6 +10367,129 @@ struct WorkerGridSlice {
     emit_end_row: usize,
 }
 
+/// One lookup pass over a contig. `bounds` are the caller's intervals this run
+/// serves (the output trim); `slice` is the whole-buffer window with warm-up
+/// on the stateful (Merged/RefSeq) grid path, `None` on the stateless path.
+#[derive(Clone, Debug)]
+struct ContigRun {
+    bounds: Vec<RunBounds>,
+    slice: Option<WorkerGridSlice>,
+}
+
+impl ContigRun {
+    fn open() -> Self {
+        Self {
+            bounds: vec![RunBounds::OPEN],
+            slice: None,
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.slice.is_none() && self.bounds.iter().all(RunBounds::is_open)
+    }
+
+    /// The VCF filter for this run's lookup scan: the contig plus the position
+    /// window the run must read (the slice's scan window on the grid path, the
+    /// merged interval itself otherwise).
+    fn lookup_filter(&self, chrom: &str) -> Expr {
+        let mut filter = col("chrom").eq(lit(chrom));
+        match &self.slice {
+            Some(s) => {
+                filter = filter.and(col("start").gt_eq(lit(s.scan_lo_pos)));
+                if s.scan_hi_pos != i64::MAX {
+                    filter = filter.and(col("start").lt(lit(s.scan_hi_pos)));
+                }
+            }
+            None => {
+                let lo = self.bounds.iter().map(|b| b.lo).min().flatten();
+                let hi = self.bounds.iter().map(|b| b.hi).max().flatten();
+                if self.bounds.iter().all(|b| b.lo.is_some()) {
+                    if let Some(lo) = lo {
+                        filter = filter.and(col("start").gt_eq(lit(lo)));
+                    }
+                }
+                if self.bounds.iter().all(|b| b.hi.is_some()) {
+                    if let Some(hi) = hi {
+                        filter = filter.and(col("start").lt_eq(lit(hi)));
+                    }
+                }
+            }
+        }
+        filter
+    }
+
+    /// Warm-up rows are read only to replay buffer state; skip their variation
+    /// probe (mirrors `VEP_SKIP_WARMUP_LOOKUP` on the sharded path).
+    fn probe_floor(&self) -> Option<i64> {
+        self.slice
+            .as_ref()
+            .filter(|s| s.scan_lo_pos < s.emit_start_pos)
+            .map(|s| s.emit_start_pos)
+    }
+
+    fn gate(&self) -> Option<crate::regions::RunGate> {
+        self.slice.as_ref().map(|s| {
+            crate::regions::RunGate::new(
+                s.skip_leading_rows,
+                s.warm_up_start_row,
+                s.emit_start_row,
+                s.emit_end_row,
+            )
+        })
+    }
+}
+
+/// The next region run to activate once a contig's current run has drained.
+/// A satisfied LIMIT ends the contig instead: the remaining runs could only
+/// produce rows that would be dropped, so they are discarded.
+fn next_region_run(limit_reached: bool, pending: &mut VecDeque<ContigRun>) -> Option<ContigRun> {
+    if limit_reached {
+        pending.clear();
+        return None;
+    }
+    pending.pop_front()
+}
+
+/// What a later run of the same contig needs to build its lookup after the
+/// first run has consumed `ContigPreparedData`.
+#[derive(Clone)]
+struct RunActivationInputs {
+    var_table: String,
+    vcf_schema: Schema,
+    cache_schema: Schema,
+    fallback_coloc_sink: ColocatedSink,
+}
+
+/// Gate state of the run currently being drained.
+struct ActiveRunState {
+    bounds: Vec<RunBounds>,
+    gate: Option<RunGate>,
+    warm_up: Vec<RecordBatch>,
+    warmed_up: bool,
+}
+
+impl ActiveRunState {
+    fn from_run(run: &ContigRun) -> Self {
+        let gate = run.gate();
+        let warmed_up = gate.as_ref().is_none_or(|g| !g.needs_warm_up());
+        Self {
+            bounds: run.bounds.clone(),
+            gate,
+            warm_up: Vec::new(),
+            warmed_up,
+        }
+    }
+
+    /// `None` for an open run (no trim), `Some` otherwise.
+    fn trim_bounds(&self) -> Option<Vec<RunBounds>> {
+        if self.bounds.iter().all(RunBounds::is_open) {
+            None
+        } else {
+            Some(self.bounds.clone())
+        }
+    }
+}
+
 /// Slice the global buffer grid (`boundaries`, length `B+1`, ascending) into up
 /// to `workers` contiguous whole-buffer ranges, each with a bounded-overlap
 /// warm-up start (design §5.1/§5.2). Empty ranges (when `workers > B`) are
@@ -10614,6 +10788,9 @@ struct ContigPreparedData {
     cache_schema: Schema,
     /// Colocated sink used by the serial (single-partition) lookup arm.
     fallback_coloc_sink: ColocatedSink,
+    /// Lookup passes over this contig, in position order. Exactly one open run
+    /// without `regions`.
+    runs: VecDeque<ContigRun>,
 }
 
 /// Everything needed to start streaming annotation for a contig.
@@ -10634,6 +10811,12 @@ struct ContigReadyState {
     /// fold that window into this contig's `TOTAL` / `variation_lookup` spans
     /// and make per-contig totals sum to far more than the run's wall time.
     t_contig_active: Instant,
+    /// The run whose lookup `lookup_partitions` serves.
+    active_run: ContigRun,
+    /// Later runs of this contig, activated one after another.
+    pending_runs: VecDeque<ContigRun>,
+    run_inputs: RunActivationInputs,
+    pipeline_profile: Option<SharedContigPipelineProfile>,
 }
 
 /// Mutable annotation state for window-based streaming within a single contig.
@@ -10654,6 +10837,12 @@ struct ContigAnnotationState {
     /// In-flight fused window-annotation tasks, FIFO (= window/output order).
     /// Up to `config.annotation_workers` run concurrently on the blocking pool.
     inflight: VecDeque<tokio::task::JoinHandle<WindowAnnotateResult>>,
+    /// Gate of the run being drained; later runs of the contig wait in
+    /// `pending_runs` and are activated one after another.
+    run: ActiveRunState,
+    pending_runs: VecDeque<ContigRun>,
+    run_inputs: RunActivationInputs,
+    pipeline_profile: Option<SharedContigPipelineProfile>,
 }
 
 /// Output of one fused window-annotation task: annotated batches plus the
@@ -10763,6 +10952,8 @@ struct BufferAnnotationContext {
 }
 
 type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>>> + Send>>;
+type RunActivateFuture =
+    Pin<Box<dyn Future<Output = Result<VecDeque<LookupPartitionHandle>>> + Send>>;
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 /// Resolves when all `threads>1` shard workers for a contig have finished,
 /// yielding the total output-row count (or the first worker error).
@@ -10780,6 +10971,11 @@ enum StreamState {
     /// Await the oldest in-flight fused window task (FIFO preserves output order).
     AwaitingWindow {
         handle: tokio::task::JoinHandle<WindowAnnotateResult>,
+        annotation_state: ContigAnnotationState,
+    },
+    /// A later region run of the current contig is building its filtered lookup.
+    ActivatingRun {
+        fut: RunActivateFuture,
         annotation_state: ContigAnnotationState,
     },
     /// Yield annotated batches from the current window, then resume annotation.
@@ -11165,7 +11361,8 @@ fn spawn_annotation_from_lookup_sharded(
                 let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
                 run_maybe_block_in_place(|| -> Result<()> {
                     hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-                    let out = annotate_worker_window(&mut worker, &window, projection.as_deref())?;
+                    let out =
+                        annotate_worker_window(&mut worker, &window, projection.as_deref(), None)?;
                     for b in out {
                         shard.write_batch(b)?;
                     }
@@ -11194,7 +11391,7 @@ fn spawn_annotation_from_lookup_sharded(
             if !window.is_empty() {
                 hydrate_worker_window(&mut worker, &window, cache_source_type)?;
             }
-            let out = annotate_worker_window(&mut worker, &window, projection.as_deref())?;
+            let out = annotate_worker_window(&mut worker, &window, projection.as_deref(), None)?;
             for b in out {
                 shard.write_batch(b)?;
             }
@@ -11233,6 +11430,17 @@ fn abort_annotation_lookup_partitions(ann: &mut ContigAnnotationState) {
 }
 
 impl AnnotationWorkerState {
+    /// Per-run state goes back to what a fresh worker holds; the colocated map
+    /// is per contig and is kept. The next run reconstructs its carried state
+    /// through warm-up.
+    fn reset_for_next_run(&mut self) {
+        self.window_buffer.clear();
+        self.input_buffer_accumulator = InputBufferAccumulator::default();
+        self.next_input_buffer_id = 0;
+        self.persisted_buffer_transcripts.clear();
+        self.lookup_done = false;
+    }
+
     fn new(shared: Arc<SharedContigAnnotationContext>) -> Result<Self> {
         let init_started = Instant::now();
         let profile = shared.profile.clone();
@@ -11437,6 +11645,10 @@ impl ContigAnnotationStream {
                 ..
             }
             | StreamState::AwaitingWindow {
+                annotation_state: ann,
+                ..
+            }
+            | StreamState::ActivatingRun {
                 annotation_state: ann,
                 ..
             } => {
@@ -12422,12 +12634,20 @@ fn annotate_worker_window(
     worker: &mut AnnotationWorkerState,
     window_batches: &[RecordBatch],
     projection: Option<&[usize]>,
+    emit_bounds: Option<&[RunBounds]>,
 ) -> Result<VecDeque<RecordBatch>> {
     let annotation_started = Instant::now();
     let shared = Arc::clone(&worker.shared);
     let profile = shared.profile.clone();
     let config = &shared.config;
     let tmp_provider = shared.tmp_provider.as_ref();
+    // Region runs annotate whole input buffers (stateful sources) and read
+    // overlap-based index windows, so the emitted rows are trimmed to the
+    // requested bounds here, before projection can drop the `start` column.
+    let trim_start_idx = match emit_bounds {
+        Some(_) => Some(TableProvider::schema(tmp_provider).index_of("start")?),
+        None => None,
+    };
     let engine = shared.engine.as_ref();
     let csq_col_idx = tmp_provider.vcf_field_count();
     let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
@@ -12509,6 +12729,15 @@ fn annotate_worker_window(
             record_contig_profile(&profile, |profile| {
                 profile.engine += engine_started.elapsed();
             });
+            let annotated = match (emit_bounds, trim_start_idx) {
+                (Some(bounds), Some(start_idx)) => {
+                    crate::regions::filter_batch_to_bounds(&annotated, start_idx, bounds)?
+                }
+                _ => annotated,
+            };
+            if annotated.num_rows() == 0 {
+                continue;
+            }
 
             if let Some(indices) = projection {
                 let projection_started = Instant::now();
@@ -12545,6 +12774,7 @@ fn annotate_window_owned(
     cache_source_type: CacheSourceType,
     projection: Option<Vec<usize>>,
     persisted_seed: PersistedBufferTranscripts,
+    emit_bounds: Option<Vec<RunBounds>>,
 ) -> Result<(VecDeque<RecordBatch>, PersistedBufferTranscripts)> {
     let mut worker = AnnotationWorkerState::new(shared)?;
     worker.colocated_map = colocated_snapshot;
@@ -12555,7 +12785,12 @@ fn annotate_window_owned(
     // sequentially (the stateful Merged/RefSeq path).
     worker.persisted_buffer_transcripts = persisted_seed;
     hydrate_worker_window(&mut worker, &window_batches, cache_source_type)?;
-    let out = annotate_worker_window(&mut worker, &window_batches, projection.as_deref())?;
+    let out = annotate_worker_window(
+        &mut worker,
+        &window_batches,
+        projection.as_deref(),
+        emit_bounds.as_deref(),
+    )?;
     Ok((out, worker.persisted_buffer_transcripts))
 }
 
@@ -12595,7 +12830,10 @@ fn poll_lookup_partition(
     }
 }
 
-fn apply_lookup_batch_message(ann: &mut ContigAnnotationState, message: LookupBatchMessage) {
+fn apply_lookup_batch_message(
+    ann: &mut ContigAnnotationState,
+    message: LookupBatchMessage,
+) -> Result<()> {
     record_contig_profile(&ann.worker.shared.profile, |profile| {
         profile.lookup_batches += 1;
     });
@@ -12615,10 +12853,34 @@ fn apply_lookup_batch_message(ann: &mut ContigAnnotationState, message: LookupBa
         ],
     );
     merge_colocated_delta(&mut ann.worker.colocated_map, message.colocated_delta);
-    if rows > 0 {
-        ann.contig_rows += rows;
-        ann.worker.window_buffer.push(message.batch);
+    let Some(gate) = ann.run.gate.as_mut() else {
+        if rows > 0 {
+            ann.contig_rows += rows;
+            ann.worker.window_buffer.push(message.batch);
+        }
+        return Ok(());
+    };
+    let out = gate.feed(message.batch);
+    if let Some(warm) = out.warm_up {
+        ann.run.warm_up.push(warm);
     }
+    if out.reached_emit && !ann.run.warmed_up {
+        // Replay whole grid buffers strictly before the seam, state-only, so
+        // the carried HGNC state is what the serial run would hold here.
+        let warm_up = std::mem::take(&mut ann.run.warm_up);
+        run_maybe_block_in_place(|| warm_up_worker_state(&mut ann.worker, warm_up))?;
+        ann.run.warmed_up = true;
+    }
+    if let Some(emit) = out.emit {
+        ann.contig_rows += emit.num_rows();
+        ann.worker.window_buffer.push(emit);
+    }
+    if out.done && !ann.worker.lookup_done {
+        // Rank-stop: every row of the run's emit range has been seen.
+        ann.worker.lookup_done = true;
+        abort_annotation_lookup_partitions(ann);
+    }
+    Ok(())
 }
 
 fn record_lookup_fan_in_profile(
@@ -12769,7 +13031,9 @@ fn poll_lookup_partitions(
             }
             Poll::Ready(Ok(Some(LookupPartitionPoll::Batch(message)))) => {
                 finish_lookup_waits(ann);
-                apply_lookup_batch_message(ann, message);
+                if let Err(e) = apply_lookup_batch_message(ann, message) {
+                    return Poll::Ready(Err(e));
+                }
                 made_progress = true;
             }
             Poll::Ready(Ok(Some(LookupPartitionPoll::Done(colocated_delta)))) => {
@@ -12798,6 +13062,17 @@ fn poll_lookup_partitions(
             Poll::Ready(Ok(None)) => {
                 finish_lookup_waits(ann);
                 ann.worker.lookup_done = true;
+                if !ann.run.warmed_up {
+                    // Stream ended before the emit rank (tiny tail run): still
+                    // replay the pending warm-up so state is consistent.
+                    let warm_up = std::mem::take(&mut ann.run.warm_up);
+                    if let Err(e) =
+                        run_maybe_block_in_place(|| warm_up_worker_state(&mut ann.worker, warm_up))
+                    {
+                        return Poll::Ready(Err(e));
+                    }
+                    ann.run.warmed_up = true;
+                }
                 profile_end!(
                     &format!("{}: 1. variation_lookup", ann.chrom),
                     ann.t_contig_active,
@@ -13046,6 +13321,10 @@ impl Stream for ContigAnnotationStream {
                                 lookup_wait_started: None,
                                 ordered_lookup_wait_started: None,
                                 inflight: VecDeque::new(),
+                                run: ActiveRunState::from_run(&ready.active_run),
+                                pending_runs: std::mem::take(&mut ready.pending_runs),
+                                run_inputs: ready.run_inputs.clone(),
+                                pipeline_profile: ready.pipeline_profile.clone(),
                             };
                             self.state = StreamState::AnnotatingContig(ann);
                             // Committed to annotating this contig: overlap the
@@ -13211,6 +13490,7 @@ impl Stream for ContigAnnotationStream {
                         let colocated = Arc::clone(&ann.worker.colocated_map);
                         let cache_source_type = ann.config.cache_source_type;
                         let persisted_seed = ann.worker.persisted_buffer_transcripts.clone();
+                        let emit_bounds = ann.run.trim_bounds();
                         let handle = tokio::task::spawn_blocking(move || {
                             annotate_window_owned(
                                 shared,
@@ -13219,6 +13499,7 @@ impl Stream for ContigAnnotationStream {
                                 cache_source_type,
                                 projection,
                                 persisted_seed,
+                                emit_bounds,
                             )
                         });
                         ann.inflight.push_back(handle);
@@ -13231,6 +13512,29 @@ impl Stream for ContigAnnotationStream {
                     if let Some(handle) = ann.inflight.pop_front() {
                         self.state = StreamState::AwaitingWindow {
                             handle,
+                            annotation_state: ann,
+                        };
+                        continue;
+                    }
+
+                    // Another region run on this contig: reuse the prepared context,
+                    // rebuild the lookup for the next window, warm up again. A
+                    // satisfied LIMIT ends the contig instead: the remaining runs
+                    // could only produce rows that would be dropped.
+                    if let Some(next) = next_region_run(limit_reached, &mut ann.pending_runs) {
+                        abort_annotation_lookup_partitions(&mut ann);
+                        ann.worker.reset_for_next_run();
+                        ann.run = ActiveRunState::from_run(&next);
+                        let fut: RunActivateFuture = Box::pin(activate_run_lookup(
+                            Arc::clone(&ann.session),
+                            ann.run_inputs.clone(),
+                            ann.config.clone(),
+                            ann.chrom.clone(),
+                            next,
+                            ann.pipeline_profile.clone(),
+                        ));
+                        self.state = StreamState::ActivatingRun {
+                            fut,
                             annotation_state: ann,
                         };
                         continue;
@@ -13258,6 +13562,42 @@ impl Stream for ContigAnnotationStream {
                     );
                     self.state = StreamState::CleaningUp(fut);
                     continue;
+                }
+
+                StreamState::ActivatingRun { .. } => {
+                    let StreamState::ActivatingRun {
+                        mut fut,
+                        annotation_state: mut ann,
+                    } = std::mem::replace(&mut self.state, StreamState::Done)
+                    else {
+                        unreachable!()
+                    };
+                    match fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.state = StreamState::ActivatingRun {
+                                fut,
+                                annotation_state: ann,
+                            };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(handles)) => {
+                            ann.lookup_partitions =
+                                LookupPartitionFanIn::new(handles, LOOKUP_PARTITION_QUEUE_BATCHES);
+                            ann.lookup_wait_started = None;
+                            ann.ordered_lookup_wait_started = None;
+                            self.state = StreamState::AnnotatingContig(ann);
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => {
+                            let fut = make_cleanup_future(
+                                Arc::clone(&ann.session),
+                                std::mem::take(&mut ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            self.abort_prefetch();
+                            continue;
+                        }
+                    }
                 }
 
                 StreamState::AwaitingWindow {
@@ -13576,6 +13916,18 @@ async fn prepare_contig_data(
             config.cache_source_type,
             CacheSourceType::Merged | CacheSourceType::RefSeq
         );
+    let contig_bounds: Option<Vec<RunBounds>> = config
+        .regions
+        .as_deref()
+        .and_then(|runs| runs.get(&chrom).cloned());
+    // A bounded run on a stateful source needs the buffer grid so the cut can
+    // be aligned to whole buffers and warmed up (design: stateful runs).
+    let stateful_runs = cache_enabled
+        && contig_bounds.is_some()
+        && matches!(
+            config.cache_source_type,
+            CacheSourceType::Merged | CacheSourceType::RefSeq
+        );
 
     // Context arm: load transcripts, exons, translations, etc. (Parquet only).
     // Everything up to here (identity validation, schema reads) is setup that
@@ -13628,7 +13980,7 @@ async fn prepare_contig_data(
     // load (Parquet transcripts/exons) — independent IO, so the count is hidden
     // behind context load instead of running as a serial prelude before workers.
     let count_fut = async {
-        if stateful_parallel {
+        if stateful_parallel || stateful_runs {
             Some(
                 count_contig_buffer_boundaries(
                     &session,
@@ -13644,7 +13996,7 @@ async fn prepare_contig_data(
         }
     };
     let context_result: Result<(Vec<TranscriptFeature>, HashMap<String, String>)>;
-    let grid_count;
+    let mut grid_count;
     (context_result, grid_count) = tokio::join!(context_fut, count_fut);
     // No lookup worker has been spawned yet on this path, so a context failure
     // has nothing to abort (the pre-split code aborted the byte-budget workers
@@ -13730,8 +14082,9 @@ async fn prepare_contig_data(
     // of lookup workers resident.
     let mut grid_slices: Vec<WorkerGridSlice> = Vec::new();
     if stateful_parallel {
-        let (boundaries, _total_rows, grid_positions) =
-            grid_count.expect("stateful_parallel implies the count future ran")?;
+        let (boundaries, _total_rows, grid_positions) = grid_count
+            .take()
+            .expect("stateful_parallel implies the count future ran")?;
         // Cost-weighted grid split (opt-in via VEP_GRID_BALANCE). The default
         // equal-buffer-count split equalises variants per worker, not work, so
         // gene-dense slices straggle; weighting by transcript overlap equalises
@@ -13790,6 +14143,49 @@ async fn prepare_contig_data(
         };
         let _ = _total_rows;
         grid_slices = slices;
+    }
+
+    let runs: VecDeque<ContigRun> = match contig_bounds {
+        None => VecDeque::from([ContigRun::open()]),
+        Some(bounds) if stateful_runs => {
+            let (boundaries, _total_rows, _positions) = grid_count
+                .take()
+                .expect("stateful_runs implies the count future ran")?;
+            let positions: Vec<i64> = boundaries.iter().map(|b| b.pos).collect();
+            crate::regions::plan_runs(&bounds, Some(&positions))
+                .into_iter()
+                .map(|plan| {
+                    let (bk, bk1) = plan.buffers.expect("grid path plans buffer ranges");
+                    let slice = build_grid_slices(&boundaries, &[bk, bk1], overlap_width_bp)
+                        .into_iter()
+                        .next();
+                    ContigRun {
+                        bounds: plan.bounds,
+                        slice,
+                    }
+                })
+                .collect()
+        }
+        Some(bounds) => crate::regions::plan_runs(&bounds, None)
+            .into_iter()
+            .map(|plan| ContigRun {
+                bounds: plan.bounds,
+                slice: None,
+            })
+            .collect(),
+    };
+    pipeline_trace::emit(
+        "regions",
+        "runs",
+        &[
+            ("chrom", TraceValue::Str(&chrom)),
+            ("runs", TraceValue::Usize(runs.len())),
+        ],
+    );
+    if runs.is_empty() {
+        // A degenerate grid (no data rows on the contig) plans no run: skip
+        // the contig rather than fall back to an unrestricted pass.
+        return Ok(None);
     }
 
     let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
@@ -13868,68 +14264,43 @@ async fn prepare_contig_data(
         vcf_schema,
         cache_schema,
         fallback_coloc_sink,
+        runs,
     }))
 }
 
-/// Activation half of contig preparation: build the `LookupProvider`s and spawn
-/// the lookup workers that feed the annotation workers.
-///
-/// Split out of `prepare_contig_data` because this is where the per-worker
-/// startup footprint is paid, and it must only be resident for the contig that
-/// is actually about to be annotated. Both the byte-budget/serial arms and the
-/// grid-aligned per-worker arm live here, so nothing is spawned by the data
-/// half. The consequence is that the byte-budget lookup build no longer
-/// overlaps the context load (the removed early-worker interleave); that cost
-/// is paid back once the data half runs ahead of the contig.
-async fn activate_contig_lookups(
+/// Build the filtered lookup for one run and spawn its position-ordered
+/// partition workers. Shared by the first run (from `activate_contig_lookups`)
+/// and every later run of the same contig (from the `ActivatingRun` state).
+async fn activate_run_lookup(
     session: Arc<SessionContext>,
-    data: ContigPreparedData,
-) -> Result<Option<ContigReadyState>> {
-    let ContigPreparedData {
-        chrom,
-        config,
-        pipeline_profile,
-        profile_handle,
-        ephemeral_tables,
-        shared_context,
-        grid_slices,
-        stateful_parallel,
+    inputs: RunActivationInputs,
+    config: ContigAnnotationConfig,
+    chrom: String,
+    run: ContigRun,
+    pipeline_profile: Option<SharedContigPipelineProfile>,
+) -> Result<VecDeque<LookupPartitionHandle>> {
+    let RunActivationInputs {
         var_table,
         vcf_schema,
         cache_schema,
         fallback_coloc_sink,
-    } = data;
-    // Two instants, one origin. Activation is the point where the contig
-    // genuinely begins, so it anchors BOTH the second-half prepare span and the
-    // contig's own wall clock. The data half cannot anchor either one: under
-    // `VEP_CONTIG_PREFETCH` it ran during the previous contig's annotation.
-    let t_activate = Instant::now();
-    let t_contig_active = t_activate;
-    if profiling_enabled() {
-        eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
-    }
-
+    } = inputs;
     #[cfg(feature = "parquet-cache")]
     let cache_enabled = config.cache_root.is_some();
     #[cfg(not(feature = "parquet-cache"))]
     let cache_enabled = false;
-
-    // Lookup arm: build LookupProvider, create stream (cheap — build+probe
-    // happens on first poll, NOT here). Keep schema clones for the grid
-    // providers built further down.
-    let grid_vcf_schema = vcf_schema.clone();
-    let grid_cache_schema = cache_schema.clone();
     let mut provider = LookupProvider::new(
         Arc::clone(&session),
         config.vcf_table.clone(),
-        var_table.clone(),
+        var_table,
         vcf_schema,
         cache_schema,
         config.cache_columns.clone(),
         config.extended_probes,
         config.allowed_failed,
     )?;
-    provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
+    provider.set_vcf_filter(Some(run.lookup_filter(&chrom)));
+    provider.set_probe_floor_pos(run.probe_floor());
     provider.set_target_partitions(config.target_partitions);
     #[cfg(feature = "parquet-cache")]
     if let Some(root) = &config.cache_root {
@@ -13939,12 +14310,7 @@ async fn activate_contig_lookups(
         }
     }
     let parallel_lookup = cache_enabled;
-    let mut lookup_partitions = if stateful_parallel {
-        // The grid-aligned per-worker lookup scans are built below from the
-        // slices planned by the data half. The `provider` built above is unused
-        // on this path.
-        VecDeque::new()
-    } else if parallel_lookup {
+    if parallel_lookup {
         let session_state = session.state();
         let mut plan = provider.scan(&session_state, None, &[], None).await?;
         let mut partition_count = plan.output_partitioning().partition_count().max(1);
@@ -13984,7 +14350,7 @@ async fn activate_contig_lookups(
                 pipeline_profile.clone(),
             ));
         }
-        handles
+        Ok(handles)
     } else {
         if config.flags.check_existing {
             provider.set_colocated_sink(Arc::clone(&fallback_coloc_sink));
@@ -13992,14 +14358,90 @@ async fn activate_contig_lookups(
         let session_state = session.state();
         let plan = provider.scan(&session_state, None, &[], None).await?;
         let lookup_stream = plan.execute(0, session.task_ctx())?;
-        VecDeque::from([spawn_lookup_stream_worker(
+        Ok(VecDeque::from([spawn_lookup_stream_worker(
             lookup_stream,
             plan.schema(),
             chrom.to_string(),
             fallback_coloc_sink,
             LOOKUP_PARTITION_QUEUE_BATCHES,
             pipeline_profile.clone(),
-        )])
+        )]))
+    }
+}
+
+/// Activation half of contig preparation: build the `LookupProvider`s and spawn
+/// the lookup workers that feed the annotation workers.
+///
+/// Split out of `prepare_contig_data` because this is where the per-worker
+/// startup footprint is paid, and it must only be resident for the contig that
+/// is actually about to be annotated. Both the byte-budget/serial arms and the
+/// grid-aligned per-worker arm live here, so nothing is spawned by the data
+/// half. The consequence is that the byte-budget lookup build no longer
+/// overlaps the context load (the removed early-worker interleave); that cost
+/// is paid back once the data half runs ahead of the contig.
+async fn activate_contig_lookups(
+    session: Arc<SessionContext>,
+    data: ContigPreparedData,
+) -> Result<Option<ContigReadyState>> {
+    let ContigPreparedData {
+        chrom,
+        config,
+        pipeline_profile,
+        profile_handle,
+        ephemeral_tables,
+        shared_context,
+        grid_slices,
+        stateful_parallel,
+        var_table,
+        vcf_schema,
+        cache_schema,
+        fallback_coloc_sink,
+        runs,
+    } = data;
+    let mut pending_runs = runs;
+    let active_run = pending_runs
+        .pop_front()
+        .expect("prepare_contig_data yields at least one run");
+    // Two instants, one origin. Activation is the point where the contig
+    // genuinely begins, so it anchors BOTH the second-half prepare span and the
+    // contig's own wall clock. The data half cannot anchor either one: under
+    // `VEP_CONTIG_PREFETCH` it ran during the previous contig's annotation.
+    let t_activate = Instant::now();
+    let t_contig_active = t_activate;
+    if profiling_enabled() {
+        eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    let cache_enabled = config.cache_root.is_some();
+    #[cfg(not(feature = "parquet-cache"))]
+    let cache_enabled = false;
+
+    // Lookup arm: build the first run's LookupProvider and spawn its workers
+    // (cheap — build+probe happens on first poll, NOT here). Keep schema clones
+    // for the grid providers built further down.
+    let grid_vcf_schema = vcf_schema.clone();
+    let grid_cache_schema = cache_schema.clone();
+    let run_inputs = RunActivationInputs {
+        var_table: var_table.clone(),
+        vcf_schema,
+        cache_schema,
+        fallback_coloc_sink,
+    };
+    let mut lookup_partitions = if stateful_parallel {
+        // The grid-aligned per-worker lookup scans are built below from the
+        // slices planned by the data half.
+        VecDeque::new()
+    } else {
+        activate_run_lookup(
+            Arc::clone(&session),
+            run_inputs.clone(),
+            config.clone(),
+            chrom.clone(),
+            active_run.clone(),
+            pipeline_profile.clone(),
+        )
+        .await?
     };
     record_contig_profile(&pipeline_profile, |profile| {
         profile.lookup_partitions = lookup_partitions.len();
@@ -14135,6 +14577,10 @@ async fn activate_contig_lookups(
         ephemeral_tables,
         chrom,
         t_contig_active,
+        active_run,
+        pending_runs,
+        run_inputs,
+        pipeline_profile,
     }))
 }
 
@@ -14745,6 +15191,144 @@ mod tests {
         assert!(message.contains("variation"), "unexpected error: {message}");
     }
 
+    #[cfg(feature = "parquet-cache")]
+    #[tokio::test]
+    async fn regions_option_is_validated_at_construction() {
+        let session = Arc::new(SessionContext::new());
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = AnnotateProvider::new(
+            Arc::clone(&session),
+            "vcf".to_string(),
+            tmp.path().to_string_lossy().to_string(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Ensembl,
+            Some(r#"{"regions":[{"chrom":"chr1","start":9,"end":8}]}"#.to_string()),
+            vcf_schema,
+        )
+        .expect_err("start > end must be rejected");
+        assert!(err.to_string().contains("regions"), "{err}");
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    #[tokio::test]
+    async fn regions_with_workers_above_one_are_rejected_at_construction() {
+        let session = Arc::new(SessionContext::new());
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let build = |options: &str| {
+            AnnotateProvider::new(
+                Arc::clone(&session),
+                "vcf".to_string(),
+                tmp.path().to_string_lossy().to_string(),
+                AnnotationBackend::Parquet,
+                CacheSourceType::Merged,
+                Some(options.to_string()),
+                vcf_schema.clone(),
+            )
+        };
+        let err = build(r#"{"workers":2,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
+            .expect_err("regions with workers>1 must be rejected before planning");
+        let message = err.to_string();
+        assert!(
+            message.contains("regions") && message.contains("workers=1"),
+            "{message}"
+        );
+        build(r#"{"workers":1,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
+            .expect("workers=1 with regions is accepted");
+        build(r#"{"workers":4}"#).expect("workers>1 without regions is unchanged");
+    }
+
+    #[test]
+    fn limit_reached_stops_region_run_chaining() {
+        let run = |lo: i64| ContigRun {
+            bounds: vec![RunBounds {
+                lo: Some(lo),
+                hi: Some(lo + 10),
+            }],
+            slice: None,
+        };
+        let mut pending: VecDeque<ContigRun> = VecDeque::from([run(1), run(100), run(200)]);
+        let next = next_region_run(false, &mut pending).expect("first pending run");
+        assert_eq!(next.bounds[0].lo, Some(1));
+        assert_eq!(pending.len(), 2);
+        assert!(next_region_run(true, &mut pending).is_none());
+        assert!(
+            pending.is_empty(),
+            "a satisfied LIMIT discards the remaining runs"
+        );
+        assert!(next_region_run(false, &mut pending).is_none());
+    }
+
+    #[test]
+    fn contig_run_lookup_filter_and_probe_floor() {
+        let open = ContigRun::open();
+        assert!(open.is_open());
+        assert_eq!(
+            format!("{}", open.lookup_filter("chr1")),
+            format!("{}", col("chrom").eq(lit("chr1")))
+        );
+        assert_eq!(open.probe_floor(), None);
+
+        let ensembl = ContigRun {
+            bounds: vec![RunBounds {
+                lo: Some(10),
+                hi: Some(20),
+            }],
+            slice: None,
+        };
+        assert_eq!(
+            format!("{}", ensembl.lookup_filter("chr1")),
+            format!(
+                "{}",
+                col("chrom")
+                    .eq(lit("chr1"))
+                    .and(col("start").gt_eq(lit(10_i64)))
+                    .and(col("start").lt_eq(lit(20_i64)))
+            )
+        );
+
+        let stateful = ContigRun {
+            bounds: vec![RunBounds {
+                lo: Some(150),
+                hi: Some(160),
+            }],
+            slice: Some(WorkerGridSlice {
+                worker_id: 0,
+                scan_lo_pos: 100,
+                emit_start_pos: 140,
+                scan_hi_pos: 201,
+                skip_leading_rows: 0,
+                warm_up_start_row: 0,
+                emit_start_row: 5000,
+                emit_end_row: 10000,
+            }),
+        };
+        assert_eq!(
+            format!("{}", stateful.lookup_filter("chr1")),
+            format!(
+                "{}",
+                col("chrom")
+                    .eq(lit("chr1"))
+                    .and(col("start").gt_eq(lit(100_i64)))
+                    .and(col("start").lt(lit(201_i64)))
+            )
+        );
+        assert_eq!(stateful.probe_floor(), Some(140));
+    }
+
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
         ContigAnnotationConfig {
             vcf_table: "vcf".to_string(),
@@ -14780,6 +15364,7 @@ mod tests {
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: None,
+            regions: None,
         }
     }
 
@@ -14871,6 +15456,15 @@ mod tests {
             lookup_wait_started: None,
             ordered_lookup_wait_started: None,
             inflight: VecDeque::new(),
+            run: ActiveRunState::from_run(&ContigRun::open()),
+            pending_runs: VecDeque::new(),
+            run_inputs: RunActivationInputs {
+                var_table: "__vep_indexed_variation".to_string(),
+                vcf_schema: Schema::new(Vec::<Field>::new()),
+                cache_schema: Schema::new(Vec::<Field>::new()),
+                fallback_coloc_sink: Arc::new(Mutex::new(HashMap::new())),
+            },
+            pipeline_profile: None,
         }
     }
 
@@ -16439,6 +17033,132 @@ mod tests {
         assert_eq!(bs[0].pos, 10);
         assert_eq!(bs[1].pos, 30);
         assert_eq!(bs[2].pos, i64::MAX);
+    }
+
+    #[test]
+    fn reset_for_next_run_clears_per_run_state_but_keeps_colocated() {
+        let shared = minimal_shared_contig_annotation_context_with_features(Vec::new(), Vec::new());
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        worker
+            .window_buffer
+            .push(make_buffer_batch_many("chr1", &[1, 2]));
+        worker.next_input_buffer_id = 7;
+        worker.lookup_done = true;
+        let colocated_before = Arc::clone(&worker.colocated_map);
+        worker.reset_for_next_run();
+        assert!(worker.window_buffer.is_empty());
+        assert_eq!(worker.next_input_buffer_id, 0);
+        assert!(!worker.lookup_done);
+        assert!(worker.persisted_buffer_transcripts.is_empty());
+        assert!(
+            Arc::ptr_eq(&worker.colocated_map, &colocated_before),
+            "colocated map is per contig and survives a run reset"
+        );
+    }
+
+    #[test]
+    fn gated_run_reconstructs_serial_state_at_a_mid_contig_cut() {
+        // Same donor/recipient pair as `warmup_reconstructs_serial_persisted_state`.
+        let mut tx_recipient = make_tx(
+            "XM_017001769.3",
+            Some("55791"),
+            Some("LRIF1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr1".to_string();
+        tx_recipient.start = 110_874_957;
+        tx_recipient.end = 110_963_922;
+        tx_recipient.biotype = "protein_coding".to_string();
+        let mut tx_donor = make_tx(
+            "ENST00000369763",
+            Some("ENSG00000121931"),
+            Some("LRIF1"),
+            Some("HGNC"),
+            Some("HGNC:30299"),
+        );
+        tx_donor.chrom = "chr1".to_string();
+        tx_donor.start = 110_947_190;
+        tx_donor.end = 110_963_922;
+        tx_donor.biotype = "protein_coding".to_string();
+        let shared = minimal_shared_contig_annotation_context_with_context(
+            vec![tx_recipient, tx_donor],
+            Vec::new(),
+            Vec::new(),
+        );
+        // Buffer 0 spans donor and recipient, so the donation happens there.
+        // Buffer 1 is the run we want: past both transcripts (no donation on
+        // its own) but still inside cache region 110, so the serial path keeps
+        // the donated copy alive through the carry. Serial = both buffers
+        // through the full prepare path in order.
+        let buffer0 = vec![make_buffer_batch_many(
+            "chr1",
+            &[109_528_491, 110_870_290, 110_947_275],
+        )];
+        let buffer1 = vec![make_buffer_batch_many("chr1", &[110_970_000, 110_980_000])];
+        let mut serial = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+        for buf in [&buffer0, &buffer1] {
+            let (chrom, lo, hi) = buffer_variant_bounds(buf).unwrap().unwrap();
+            let _ = prepare_buffer_annotation_context(&mut serial, buf, &chrom, lo, hi).unwrap();
+        }
+
+        // Non-vacuity: a fresh worker that sees only buffer 1 carries nothing.
+        let mut cold = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+        let (chrom, lo, hi) = buffer_variant_bounds(&buffer1).unwrap().unwrap();
+        let _ = prepare_buffer_annotation_context(&mut cold, &buffer1, &chrom, lo, hi).unwrap();
+        assert_ne!(
+            cold.persisted_buffer_transcripts, serial.persisted_buffer_transcripts,
+            "buffer 1 alone must not reproduce the serial carry (otherwise the test is vacuous)"
+        );
+
+        // Gated run: rows of buffer 0 are warm-up (ranks 0..3), buffer 1 is
+        // emitted (ranks 3..5). Feed as one stream of batches, as the lookup would.
+        let run = ContigRun {
+            bounds: vec![RunBounds {
+                lo: Some(110_970_000),
+                hi: Some(110_980_000),
+            }],
+            slice: Some(WorkerGridSlice {
+                worker_id: 0,
+                scan_lo_pos: 109_528_491,
+                emit_start_pos: 110_970_000,
+                scan_hi_pos: i64::MAX,
+                skip_leading_rows: 0,
+                warm_up_start_row: 0,
+                emit_start_row: 3,
+                emit_end_row: 5,
+            }),
+        };
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        let mut active = ActiveRunState::from_run(&run);
+        assert!(!active.warmed_up);
+        let mut emitted: Vec<RecordBatch> = Vec::new();
+        for batch in buffer0.into_iter().chain(buffer1.into_iter()) {
+            let out = active.gate.as_mut().unwrap().feed(batch);
+            if let Some(w) = out.warm_up {
+                active.warm_up.push(w);
+            }
+            if out.reached_emit && !active.warmed_up {
+                warm_up_worker_state(&mut worker, std::mem::take(&mut active.warm_up)).unwrap();
+                active.warmed_up = true;
+            }
+            if let Some(e) = out.emit {
+                emitted.push(e);
+            }
+        }
+        let (chrom, lo, hi) = buffer_variant_bounds(&emitted).unwrap().unwrap();
+        let _ = prepare_buffer_annotation_context(&mut worker, &emitted, &chrom, lo, hi).unwrap();
+
+        assert!(
+            !serial.persisted_buffer_transcripts.is_empty(),
+            "fixture must persist state"
+        );
+        assert_eq!(
+            worker.persisted_buffer_transcripts, serial.persisted_buffer_transcripts,
+            "gated run must reconstruct the serial carry at the cut"
+        );
+        assert_eq!(emitted.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        assert_eq!(active.trim_bounds().map(|b| b.len()), Some(1));
     }
 
     #[test]
