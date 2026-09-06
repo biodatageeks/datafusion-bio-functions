@@ -182,6 +182,8 @@ use crate::allele::{
     vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::AnnotationBackend;
+#[cfg(feature = "parquet-cache")]
+use crate::cache::lookup_exec::ParquetVariationLookupCell;
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 use crate::colocated::{
     AfColumns, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -3678,20 +3680,6 @@ impl AnnotateProvider {
         let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
         let include_pick_output = pick_flags.include_pick_output();
         let regions = crate::regions::parse_regions_option(options_json.as_deref())?;
-        if regions.is_some() {
-            // Region runs are planned on the serial streaming path only; the
-            // parallel (`workers>1`) planner consumes the same buffer grid and
-            // the two cannot coexist on one contig.
-            let workers = options_json
-                .as_deref()
-                .and_then(|opts| Self::parse_json_i64_option(opts, "workers"))
-                .unwrap_or(1);
-            if workers > 1 {
-                return Err(DataFusionError::Plan(format!(
-                    "annotate_vep(): regions require workers=1, got workers={workers}"
-                )));
-            }
-        }
         let requested_fields =
             Self::parse_json_string_array_option(options_json.as_deref(), "fields")?;
         let csq_field_projection = requested_fields
@@ -9492,6 +9480,11 @@ struct ContigPipelineProfile {
     projection: Duration,
     send_wait: Duration,
     ordered_drain_wait: Duration,
+    /// Streaming run pool: runs planned for the contig (0 on other paths).
+    run_pool_runs: usize,
+    /// Streaming run pool: time the ordered release waited on the head run
+    /// while a later run had already finished.
+    head_wait: Duration,
     lookup_partitions: usize,
     lookup_batches: usize,
     lookup_buffered_batches_max: usize,
@@ -9504,7 +9497,7 @@ struct ContigPipelineProfile {
 impl ContigPipelineProfile {
     fn summary_line(&self, chrom: &str) -> String {
         format!(
-            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} prepare_total={:.3}s prepare_setup={:.3}s prepare_shared_ctx={:.3}s context_load={:.3}s context_tx_scan={:.3}s context_tx={:.3}s context_exons_scan={:.3}s context_exons={:.3}s context_tl_scan={:.3}s context_tl={:.3}s context_reg_scan={:.3}s context_reg={:.3}s context_motif_scan={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s",
+            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} prepare_total={:.3}s prepare_setup={:.3}s prepare_shared_ctx={:.3}s context_load={:.3}s context_tx_scan={:.3}s context_tx={:.3}s context_exons_scan={:.3}s context_exons={:.3}s context_tl_scan={:.3}s context_tl={:.3}s context_reg_scan={:.3}s context_reg={:.3}s context_motif_scan={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s run_pool_runs={} head_wait={:.3}s",
             self.lookup_partitions,
             self.lookup_batches,
             self.lookup_buffered_batches_max,
@@ -9541,6 +9534,8 @@ impl ContigPipelineProfile {
             self.projection.as_secs_f64(),
             self.send_wait.as_secs_f64(),
             self.ordered_drain_wait.as_secs_f64(),
+            self.run_pool_runs,
+            self.head_wait.as_secs_f64(),
         )
     }
 }
@@ -10458,6 +10453,10 @@ struct RunActivationInputs {
     vcf_schema: Schema,
     cache_schema: Schema,
     fallback_coloc_sink: ColocatedSink,
+    /// One single-flight Parquet lookup cell per contig: every run's lookup
+    /// shares the decoded shard footer + page index (~0.5 GB on chr1).
+    #[cfg(feature = "parquet-cache")]
+    parquet_lookup_cell: Arc<ParquetVariationLookupCell>,
 }
 
 /// Gate state of the run currently being drained.
@@ -10559,6 +10558,87 @@ fn build_grid_slices(
         });
     }
     slices
+}
+
+/// Runs per worker per contig on the streaming run pool: enough pieces that
+/// the ordered release does not idle on one straggler, few enough that the
+/// per-run lookup activation and (on stateful sources) warm-up stay small.
+const STREAM_RUNS_PER_WORKER: usize = 4;
+/// Every seam on Merged/RefSeq replays about `overlap_width_bp` of input
+/// (about one buffer at whole-genome density); four-buffer runs keep that
+/// replay a small share of the run's own work.
+const STREAM_MIN_RUN_BUFFERS_STATEFUL: usize = 4;
+
+/// Run length in whole buffers for a contig of `buffers` buffers. `env` is
+/// `VEP_STREAM_RUN_BUFFERS`; it overrides the formula but never the stateful
+/// floor. Scheduling only: the run cut never changes output.
+fn stream_run_buffers(buffers: usize, workers: usize, stateful: bool, env: Option<&str>) -> usize {
+    let floor = if stateful {
+        STREAM_MIN_RUN_BUFFERS_STATEFUL
+    } else {
+        1
+    };
+    let from_env = env
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    let chosen = from_env.unwrap_or_else(|| {
+        let target_runs = workers.max(1) * STREAM_RUNS_PER_WORKER;
+        buffers.div_ceil(target_runs).max(1)
+    });
+    chosen.max(floor)
+}
+
+/// Extra runs the pool may start beyond the `workers` running ones, so a
+/// worker that finishes early is not idle while the head run straggles. `env`
+/// is `VEP_STREAM_LOOKAHEAD_RUNS`; default `workers`.
+fn stream_lookahead_runs(workers: usize, env: Option<&str>) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(workers.max(1))
+}
+
+/// Cut each `(bounds, [bk, bk1))` buffer range into consecutive pieces of
+/// `run_buffers` whole buffers (the last piece may be shorter) and build one
+/// grid-aligned run per piece. `overlap_width_bp = 0` yields runs with no
+/// warm-up (stateless Ensembl). Runs come out in grid order, which is the
+/// release order of the pool.
+fn plan_stream_runs(
+    boundaries: &[GridBufferBoundary],
+    ranges: &[(Vec<RunBounds>, (usize, usize))],
+    run_buffers: usize,
+    overlap_width_bp: i64,
+) -> Vec<ContigRun> {
+    let step = run_buffers.max(1);
+    let mut runs = Vec::new();
+    for (bounds, (bk, bk1)) in ranges {
+        if bk >= bk1 {
+            continue;
+        }
+        let mut cuts: Vec<usize> = (*bk..*bk1).step_by(step).collect();
+        cuts.push(*bk1);
+        for slice in build_grid_slices(boundaries, &cuts, overlap_width_bp) {
+            runs.push(ContigRun {
+                bounds: bounds.clone(),
+                slice: Some(slice),
+            });
+        }
+    }
+    runs
+}
+
+/// Whether the pool may start run `next_start`: a worker slot is free and the
+/// run lies within the release window `[head, head + workers + lookahead)`.
+/// The window bounds the runs whose output can be resident at once.
+fn admission_allows(
+    running: usize,
+    head: usize,
+    next_start: usize,
+    total_runs: usize,
+    workers: usize,
+    lookahead: usize,
+) -> bool {
+    next_start < total_runs
+        && running < workers.max(1)
+        && next_start < head + workers.max(1) + lookahead
 }
 
 /// Per-buffer cost weight used by the balanced grid split: how many contig
@@ -10892,6 +10972,247 @@ impl ParallelContigState {
     }
 }
 
+/// Guard that aborts a lookup worker when its run task ends or is aborted, so
+/// no lookup outlives its consumer.
+struct AbortJoinOnDrop(Option<tokio::task::JoinHandle<Result<()>>>);
+
+impl AbortJoinOnDrop {
+    /// Hand the handle back to await it (its result matters once the channel
+    /// has closed); the guard then aborts nothing.
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<Result<()>>> {
+        self.0.take()
+    }
+}
+
+impl Drop for AbortJoinOnDrop {
+    fn drop(&mut self) {
+        if let Some(join) = &self.0 {
+            join.abort();
+        }
+    }
+}
+
+/// One run of the streaming pool: its task, its output channel and, once the
+/// task has finished, its stats. Dropping it aborts the task.
+struct RunTask {
+    join: Option<tokio::task::JoinHandle<Result<RunStats>>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<RunBatch>,
+    stats: Option<RunStats>,
+    started: Instant,
+}
+
+impl RunTask {
+    fn running(&self) -> bool {
+        self.stats.is_none()
+    }
+
+    /// Poll the task's completion. `Ready(Ok(()))` once its stats are stored
+    /// (and on every later call); errors and panics come back as errors.
+    fn poll_join(&mut self, cx: &mut TaskCtx<'_>) -> Poll<Result<()>> {
+        let Some(join) = self.join.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(join).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Ok(stats))) => {
+                self.stats = Some(stats);
+                self.join = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
+            Poll::Ready(Err(join_err)) => {
+                Poll::Ready(Err(DataFusionError::External(Box::new(join_err))))
+            }
+        }
+    }
+}
+
+impl Drop for RunTask {
+    fn drop(&mut self) {
+        if let Some(join) = &self.join {
+            join.abort();
+        }
+    }
+}
+
+/// State of the `workers>1` streaming path: a pool of run tasks over one
+/// contig's grid-ordered runs. The head run's batches are forwarded live;
+/// later runs buffer in their channels until released in index order.
+struct RunPoolState {
+    /// Runs not yet started, in grid order; `next_start` is the index of the
+    /// front element.
+    pending: VecDeque<ContigRun>,
+    /// Lookup partitions of run 0, already activated by
+    /// `activate_contig_lookups`; taken when run 0 is spawned.
+    first_lookup: Option<VecDeque<LookupPartitionHandle>>,
+    total_runs: usize,
+    next_start: usize,
+    /// Index of the run whose output is being released.
+    head: usize,
+    /// Started runs not yet released, by index.
+    active: HashMap<usize, RunTask>,
+    workers: usize,
+    lookahead: usize,
+    /// Byte budget for batches queued by runs behind the head.
+    budget: Arc<OutputBudget>,
+    run_inputs: RunActivationInputs,
+    chrom: String,
+    config: ContigAnnotationConfig,
+    session: Arc<SessionContext>,
+    shared: Arc<SharedContigAnnotationContext>,
+    ephemeral_tables: Vec<String>,
+    /// See `ContigReadyState::t_contig_active`.
+    t_contig_active: Instant,
+    pipeline_profile: Option<SharedContigPipelineProfile>,
+    contig_rows: usize,
+    /// Set while the head has no batch ready but a later run has finished:
+    /// the time the ordered release spends waiting on a straggling head.
+    head_wait_started: Option<Instant>,
+}
+
+impl RunPoolState {
+    fn running(&self) -> usize {
+        self.active.values().filter(|t| t.running()).count()
+    }
+
+    /// Start runs while a worker slot is free and the release window allows.
+    fn admit(&mut self) {
+        while admission_allows(
+            self.running(),
+            self.head,
+            self.next_start,
+            self.total_runs,
+            self.workers,
+            self.lookahead,
+        ) {
+            let index = self.next_start;
+            let run = self
+                .pending
+                .pop_front()
+                .expect("pending runs cover every index below total_runs");
+            let preactivated = if index == 0 {
+                self.first_lookup.take()
+            } else {
+                None
+            };
+            let task = spawn_run_task(self, index, run, preactivated);
+            self.active.insert(index, task);
+            self.next_start += 1;
+        }
+    }
+
+    /// Abort every task and lookup (error, LIMIT, or drop).
+    fn abort(&mut self) {
+        self.active.clear(); // RunTask::drop aborts the task, which drops its lookup guard
+        self.pending.clear();
+        self.first_lookup = None; // LookupPartitionHandle::drop aborts run 0's lookup
+    }
+}
+
+/// Spawn the task for run `index`: activate its lookup (unless run 0's is
+/// handed in), then run the shared worker body into the run's channel.
+fn spawn_run_task(
+    pool: &RunPoolState,
+    index: usize,
+    run: ContigRun,
+    preactivated: Option<VecDeque<LookupPartitionHandle>>,
+) -> RunTask {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let session = Arc::clone(&pool.session);
+    let inputs = pool.run_inputs.clone();
+    let config = pool.config.clone();
+    let chrom = pool.chrom.clone();
+    let shared = Arc::clone(&pool.shared);
+    let profile = pool.pipeline_profile.clone();
+    let budget = Arc::clone(&pool.budget);
+    let join = tokio::spawn(async move {
+        let t_start = Instant::now();
+        pipeline_trace::emit(
+            "run_pool",
+            "start",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("run", TraceValue::Usize(index)),
+            ],
+        );
+        let mut handles = match preactivated {
+            Some(handles) => handles,
+            None => {
+                activate_run_lookup(
+                    session,
+                    inputs,
+                    config.clone(),
+                    chrom.clone(),
+                    run.clone(),
+                    profile,
+                )
+                .await?
+            }
+        };
+        if handles.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "streaming run pool expects one lookup partition per run, got {}",
+                handles.len()
+            )));
+        }
+        let mut handle = handles.pop_front().expect("one handle");
+        let Some((lookup_rx, lookup_join)) = handle.take_spawned_parts() else {
+            return Err(DataFusionError::Internal(
+                "streaming run pool requires spawned lookup partitions".to_string(),
+            ));
+        };
+        let mut lookup_guard = AbortJoinOnDrop(Some(lookup_join));
+        let emit_bounds = if run.bounds.iter().all(RunBounds::is_open) {
+            None
+        } else {
+            Some(run.bounds.clone())
+        };
+        let mut output = RunOutput::Batches { tx, budget, index };
+        let stats = annotate_lookup_run(
+            shared,
+            lookup_rx,
+            config.cache_source_type,
+            config.projection.clone(),
+            config.input_buffer_size,
+            run.slice.clone(),
+            emit_bounds,
+            &mut output,
+        )
+        .await?;
+        // A lookup failure closes the channel exactly like a completed lookup
+        // does, so a run that drained to the close must surface the worker's
+        // result; a rank-stopped run leaves the guard to abort the worker.
+        if stats.lookup_closed {
+            if let Some(lookup_join) = lookup_guard.take() {
+                match lookup_join.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(join_err) => return Err(DataFusionError::External(Box::new(join_err))),
+                }
+            }
+        }
+        pipeline_trace::emit(
+            "run_pool",
+            "done",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("run", TraceValue::Usize(index)),
+                ("input_rows", TraceValue::Usize(stats.input_rows)),
+                ("output_rows", TraceValue::Usize(stats.output_rows)),
+                ("warm_up_rows", TraceValue::Usize(stats.warm_up_rows)),
+                ("elapsed", TraceValue::Duration(t_start.elapsed())),
+            ],
+        );
+        Ok(stats)
+    });
+    RunTask {
+        join: Some(join),
+        rx,
+        stats: None,
+        started: Instant::now(),
+    }
+}
+
 /// Copy-on-write transcript: the same borrowed-or-owned shape as
 /// `std::borrow::Cow`, but the `Borrowed` arm stores an *index* into
 /// `SharedContigAnnotationContext::base_transcripts` instead of a reference, so
@@ -10968,6 +11289,8 @@ enum StreamState {
     AnnotatingContig(ContigAnnotationState),
     /// threads>1: drain N independent per-partition pipelines in partition order.
     AnnotatingParallel(ParallelContigState),
+    /// `workers>1` streaming path: the run pool (see `RunPoolState`).
+    AnnotatingRunPool(RunPoolState),
     /// Await the oldest in-flight fused window task (FIFO preserves output order).
     AwaitingWindow {
         handle: tokio::task::JoinHandle<WindowAnnotateResult>,
@@ -11268,9 +11591,310 @@ pub(crate) struct ShardResult {
     pub(crate) output_lines: usize,
 }
 
-fn spawn_annotation_from_lookup_sharded(
+const MIB: usize = 1 << 20;
+/// Default byte budget (MiB) for annotated batches queued by runs behind the
+/// head of the streaming run pool (`VEP_STREAM_BUFFER_MB`).
+const STREAM_BUFFER_MB_DEFAULT: usize = 1024;
+
+/// Byte budget for the streaming run pool's queued output. `env` is
+/// `VEP_STREAM_BUFFER_MB`.
+fn stream_buffer_mb(env: Option<&str>) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(STREAM_BUFFER_MB_DEFAULT)
+}
+
+/// Backpressure for the streaming run pool: every batch a run queues behind
+/// the head charges its Arrow size (in whole MiB) against one shared budget
+/// and carries the permit until the stream hands the batch to the caller.
+/// The head run is exempt, so the drain can never wait on a run that is
+/// itself waiting for budget held by runs behind it; a run that becomes the
+/// head while waiting is woken by the head watch and sends without a permit.
+struct OutputBudget {
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Budget in MiB (= permits).
+    cap: usize,
+    head_tx: tokio::sync::watch::Sender<usize>,
+}
+
+impl OutputBudget {
+    fn new(cap_mb: usize) -> Arc<Self> {
+        let cap = cap_mb.max(1);
+        Arc::new(Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(cap)),
+            cap,
+            head_tx: tokio::sync::watch::Sender::new(0),
+        })
+    }
+
+    /// Announce the run whose output is now being released.
+    fn set_head(&self, head: usize) {
+        self.head_tx.send_replace(head);
+    }
+
+    /// Wait for budget for `bytes` queued by run `index`; `None` when the run
+    /// is the head (no charge). A batch larger than the whole budget charges
+    /// the whole budget.
+    async fn charge(
+        &self,
+        index: usize,
+        bytes: usize,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let n = bytes.div_ceil(MIB).clamp(1, self.cap) as u32;
+        let mut head = self.head_tx.subscribe();
+        loop {
+            if *head.borrow_and_update() == index {
+                return None;
+            }
+            if let Ok(permit) = Arc::clone(&self.permits).try_acquire_many_owned(n) {
+                return Some(permit);
+            }
+            tokio::select! {
+                changed = head.changed() => {
+                    if changed.is_err() {
+                        // The pool is gone; nothing will ever drain us.
+                        return None;
+                    }
+                }
+                permit = Arc::clone(&self.permits).acquire_many_owned(n) => {
+                    return Some(permit.expect("output budget semaphore is never closed"));
+                }
+            }
+        }
+    }
+}
+
+/// A run's queued batch plus the budget it holds until the caller receives it.
+type RunBatch = (RecordBatch, Option<tokio::sync::OwnedSemaphorePermit>);
+
+/// Where a run's annotated batches go: the VCF sink's body shard, or the
+/// streaming run pool's per-run channel. The worker body is shared, so the
+/// two paths cannot drift.
+enum RunOutput {
+    Shard {
+        shard: Box<crate::vcf_sink::VcfBodyShardWriter>,
+        rows_done: Arc<std::sync::atomic::AtomicUsize>,
+    },
+    Batches {
+        tx: tokio::sync::mpsc::UnboundedSender<RunBatch>,
+        budget: Arc<OutputBudget>,
+        /// Run index, for the head exemption.
+        index: usize,
+    },
+}
+
+impl RunOutput {
+    /// Write one window's annotated batches; returns the rows written. The
+    /// shard write is blocking IO (formatting + compression) and runs under
+    /// `block_in_place`; the pool write awaits the output budget first.
+    async fn write_all(&mut self, out: VecDeque<RecordBatch>) -> Result<usize> {
+        let rows: usize = out.iter().map(RecordBatch::num_rows).sum();
+        match self {
+            RunOutput::Shard { shard, .. } => run_maybe_block_in_place(|| -> Result<()> {
+                for b in out {
+                    shard.write_batch(b)?;
+                }
+                Ok(())
+            })?,
+            RunOutput::Batches { tx, budget, index } => {
+                for b in out {
+                    let permit = budget.charge(*index, b.get_array_memory_size()).await;
+                    tx.send((b, permit)).map_err(|_| {
+                        DataFusionError::Execution(
+                            "run pool output receiver dropped before the run finished".to_string(),
+                        )
+                    })?;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Progress accounting after a window: the sink's live progress bar reads
+    /// `rows_done`; the pool has no such counter.
+    fn window_done(&self, input_rows: usize) {
+        if let RunOutput::Shard { rows_done, .. } = self {
+            rows_done.fetch_add(input_rows, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Per-run counters reported by `annotate_lookup_run`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RunStats {
+    /// Emit-range input rows annotated.
+    input_rows: usize,
+    /// Annotated rows written to the output.
+    output_rows: usize,
+    /// Warm-up rows replayed state-only (Merged/RefSeq seams).
+    warm_up_rows: usize,
+    /// True when the lookup channel closed (the lookup worker ended) rather
+    /// than the run rank-stopping; the caller must then inspect the lookup
+    /// worker's result, since a failed lookup closes the channel the same way.
+    lookup_closed: bool,
+}
+
+/// The fused lookup -> gate -> warm-up -> hydrate -> annotate loop of one run
+/// (formerly the body of `spawn_annotation_from_lookup_sharded`). Drains one
+/// ordered lookup partition, applies the grid slice (skip ties, warm-up
+/// replay, rank-stop), cuts windows of `input_buffer_size` input units, and
+/// writes every annotated batch to `output`. `emit_bounds` trims each window
+/// to a region's intervals (`None` = no trim).
+#[allow(clippy::too_many_arguments)]
+async fn annotate_lookup_run(
     shared: Arc<SharedContigAnnotationContext>,
     mut lookup_rx: tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
+    cache_source_type: CacheSourceType,
+    projection: Option<Vec<usize>>,
+    input_buffer_size: usize,
+    slice: Option<WorkerGridSlice>,
+    emit_bounds: Option<Vec<RunBounds>>,
+    output: &mut RunOutput,
+) -> Result<RunStats> {
+    let mut worker = AnnotationWorkerState::new(shared)?;
+    let mut stats = RunStats::default();
+    // Grid bounds (global row ranks). The worker's stream is its
+    // [scan_lo_pos, scan_hi_pos) window; its first row is rank `warm_up_start`
+    // after dropping `skip_leading_rows` tie-rows at scan_lo_pos. Without a
+    // slice (byte-budget path) it emits the whole stream with no warm-up.
+    let (mut to_skip, warm_up_start, emit_start, emit_end) = match &slice {
+        Some(s) => (
+            s.skip_leading_rows,
+            s.warm_up_start_row,
+            s.emit_start_row,
+            s.emit_end_row,
+        ),
+        None => (0usize, 0usize, 0usize, usize::MAX),
+    };
+    let mut global_row = warm_up_start; // rank of the first kept row
+    let mut warm_up_batches: Vec<RecordBatch> = Vec::new();
+    let mut warmed_up = emit_start <= warm_up_start; // worker 0 / no warm-up region
+    let mut lookup_closed = true;
+    // Drain lookup → local colocated map → (skip ties | warm-up state-only |
+    // emit | discard >=emit_end) → annotate emit windows → write to the output.
+    while let Some(msg) = lookup_rx.recv().await {
+        let msg = msg?;
+        merge_colocated_delta(&mut worker.colocated_map, msg.colocated_delta);
+        let mut batch = msg.batch;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        // Drop leading tie-rows at scan_lo_pos that belong to the previous
+        // buffer (rank < warm_up_start).
+        if to_skip > 0 {
+            let drop = to_skip.min(batch.num_rows());
+            let remaining = batch.num_rows() - drop;
+            batch = batch.slice(drop, remaining);
+            to_skip -= drop;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+        }
+        let n = batch.num_rows();
+        let batch_start = global_row;
+        let batch_end = global_row + n;
+        global_row = batch_end;
+
+        // Split by global rank: warm-up ([warm_up_start, emit_start)), emit
+        // ([emit_start, emit_end)), trailing discard (>= emit_end).
+        let warm_end = emit_start.saturating_sub(batch_start).min(n);
+        let emit_from = warm_end;
+        let emit_to = emit_end.saturating_sub(batch_start).min(n);
+        if warm_end > 0 {
+            warm_up_batches.push(batch.slice(0, warm_end));
+        }
+        // Once we reach emit_start, replay the collected warm-up buffers
+        // state-only so the carried HGNC state is correct before emitting.
+        if !warmed_up && batch_end >= emit_start {
+            let wbatches = std::mem::take(&mut warm_up_batches);
+            stats.warm_up_rows += wbatches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            run_maybe_block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
+            warmed_up = true;
+        }
+        if emit_to > emit_from {
+            worker
+                .window_buffer
+                .push(batch.slice(emit_from, emit_to - emit_from));
+        }
+        // Cut windows at exactly `input_buffer_size` VEP INPUT UNITS (alt-allele
+        // count), matching the serial/grid buffer cuts: a multi-allelic row like
+        // `A,C` counts as two units. Counting Arrow rows here would misalign the
+        // shard-local cuts against the contig-global grid, changing buffer-local
+        // HGNC/transcript donation only under parallel output. Mirrors the
+        // `AnnotatingContig` grid path's `window_buffer_input_units` +
+        // `drain_window_input_units`.
+        while window_buffer_input_units(&worker.window_buffer) >= input_buffer_size {
+            let window = drain_window_input_units(&mut worker.window_buffer, input_buffer_size);
+            let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
+            let out = run_maybe_block_in_place(|| -> Result<VecDeque<RecordBatch>> {
+                hydrate_worker_window(&mut worker, &window, cache_source_type)?;
+                annotate_worker_window(
+                    &mut worker,
+                    &window,
+                    projection.as_deref(),
+                    emit_bounds.as_deref(),
+                )
+            })?;
+            stats.output_rows += output.write_all(out).await?;
+            // Report annotated input rows so the sink's progress bar advances live.
+            stats.input_rows += window_input_rows;
+            output.window_done(window_input_rows);
+        }
+        if batch_end >= emit_end {
+            lookup_closed = false;
+            break; // rank-stop: emitted this worker's whole range
+        }
+    }
+    stats.lookup_closed = lookup_closed;
+    // Stream ended before the emit range was reached (e.g. tiny tail worker):
+    // still replay any pending warm-up so state is consistent.
+    if !warmed_up {
+        let wbatches = std::mem::take(&mut warm_up_batches);
+        stats.warm_up_rows += wbatches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        run_maybe_block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
+    }
+    // Final flush: annotate the remaining partial emit window.
+    worker.lookup_done = true;
+    let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
+    let window_input_rows: usize = window.iter().map(|b| b.num_rows()).sum();
+    let out = run_maybe_block_in_place(|| -> Result<VecDeque<RecordBatch>> {
+        if !window.is_empty() {
+            hydrate_worker_window(&mut worker, &window, cache_source_type)?;
+        }
+        annotate_worker_window(
+            &mut worker,
+            &window,
+            projection.as_deref(),
+            emit_bounds.as_deref(),
+        )
+    })?;
+    stats.output_rows += output.write_all(out).await?;
+    stats.input_rows += window_input_rows;
+    output.window_done(window_input_rows);
+    if profiling_enabled() {
+        eprintln!(
+            "[VEP_RSS] run done colocated_entries={} input_rows={} output_rows={} peak_rss={}MB",
+            worker.colocated_map.len(),
+            stats.input_rows,
+            stats.output_rows,
+            peak_rss_mb(),
+        );
+    }
+    Ok(stats)
+}
+
+/// `threads>1` sharded-output worker: drains its lookup partition, annotates
+/// full windows inline (the shared `annotate_lookup_run` body), and streams
+/// each annotated batch directly into its own VCF body shard via
+/// [`crate::vcf_sink::VcfBodyShardWriter`] — no output channel, no ordered
+/// drain. Returns the shard's row counts (for contig row accounting). On error
+/// the shard may be left partially written; the orchestrator aborts the
+/// sibling workers and surfaces the error before any concat, so no partial
+/// shard is ever assembled.
+#[allow(clippy::too_many_arguments)]
+fn spawn_annotation_from_lookup_sharded(
+    shared: Arc<SharedContigAnnotationContext>,
+    lookup_rx: tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
     cache_source_type: CacheSourceType,
     projection: Option<Vec<usize>>,
     input_buffer_size: usize,
@@ -11279,8 +11903,7 @@ fn spawn_annotation_from_lookup_sharded(
     slice: Option<WorkerGridSlice>,
 ) -> tokio::task::JoinHandle<Result<ShardResult>> {
     tokio::spawn(async move {
-        let mut worker = AnnotationWorkerState::new(shared)?;
-        let mut shard = crate::vcf_sink::VcfBodyShardWriter::create(
+        let shard = crate::vcf_sink::VcfBodyShardWriter::create(
             &shard_path,
             Arc::clone(&shard_ctx.vcf_info_fields),
             Arc::clone(&shard_ctx.unique_format_tags),
@@ -11288,129 +11911,26 @@ fn spawn_annotation_from_lookup_sharded(
             shard_ctx.coordinate_zero_based,
             shard_ctx.shard_compression,
         )?;
-        // Grid bounds (global row ranks). The worker's stream is its
-        // [scan_lo_pos, scan_hi_pos) window; its first row is rank `warm_up_start`
-        // after dropping `skip_leading_rows` tie-rows at scan_lo_pos. Without a
-        // slice (byte-budget path) it emits the whole stream with no warm-up.
-        let (mut to_skip, warm_up_start, emit_start, emit_end) = match &slice {
-            Some(s) => (
-                s.skip_leading_rows,
-                s.warm_up_start_row,
-                s.emit_start_row,
-                s.emit_end_row,
-            ),
-            None => (0usize, 0usize, 0usize, usize::MAX),
+        let mut output = RunOutput::Shard {
+            shard: Box::new(shard),
+            rows_done: Arc::clone(&shard_ctx.rows_done),
         };
-        let mut global_row = warm_up_start; // rank of the first kept row
-        let mut warm_up_batches: Vec<RecordBatch> = Vec::new();
-        let mut warmed_up = emit_start <= warm_up_start; // worker 0 / no warm-up region
-        // Drain lookup → local colocated map → (skip ties | warm-up state-only |
-        // emit | discard >=emit_end) → annotate emit windows → write to the shard.
-        while let Some(msg) = lookup_rx.recv().await {
-            let msg = msg?;
-            merge_colocated_delta(&mut worker.colocated_map, msg.colocated_delta);
-            let mut batch = msg.batch;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            // Drop leading tie-rows at scan_lo_pos that belong to the previous
-            // buffer (rank < warm_up_start).
-            if to_skip > 0 {
-                let drop = to_skip.min(batch.num_rows());
-                let remaining = batch.num_rows() - drop;
-                batch = batch.slice(drop, remaining);
-                to_skip -= drop;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-            }
-            let n = batch.num_rows();
-            let batch_start = global_row;
-            let batch_end = global_row + n;
-            global_row = batch_end;
-
-            // Split by global rank: warm-up ([warm_up_start, emit_start)), emit
-            // ([emit_start, emit_end)), trailing discard (>= emit_end).
-            let warm_end = emit_start.saturating_sub(batch_start).min(n);
-            let emit_from = warm_end;
-            let emit_to = emit_end.saturating_sub(batch_start).min(n);
-            if warm_end > 0 {
-                warm_up_batches.push(batch.slice(0, warm_end));
-            }
-            // Once we reach emit_start, replay the collected warm-up buffers
-            // state-only so the carried HGNC state is correct before emitting.
-            if !warmed_up && batch_end >= emit_start {
-                let wbatches = std::mem::take(&mut warm_up_batches);
-                run_maybe_block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
-                warmed_up = true;
-            }
-            if emit_to > emit_from {
-                worker
-                    .window_buffer
-                    .push(batch.slice(emit_from, emit_to - emit_from));
-            }
-            // Cut windows at exactly `input_buffer_size` VEP INPUT UNITS (alt-allele
-            // count), matching the serial/grid buffer cuts: a multi-allelic row like
-            // `A,C` counts as two units. Counting Arrow rows here would misalign the
-            // shard-local cuts against the contig-global grid, changing buffer-local
-            // HGNC/transcript donation only under parallel VCF output. Mirrors the
-            // `AnnotatingContig` grid path's `window_buffer_input_units` +
-            // `drain_window_input_units`.
-            while window_buffer_input_units(&worker.window_buffer) >= input_buffer_size {
-                let window = drain_window_input_units(&mut worker.window_buffer, input_buffer_size);
-                let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
-                run_maybe_block_in_place(|| -> Result<()> {
-                    hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-                    let out =
-                        annotate_worker_window(&mut worker, &window, projection.as_deref(), None)?;
-                    for b in out {
-                        shard.write_batch(b)?;
-                    }
-                    Ok(())
-                })?;
-                // Report annotated input rows so the progress bar advances live.
-                shard_ctx
-                    .rows_done
-                    .fetch_add(window_input_rows, std::sync::atomic::Ordering::Relaxed);
-            }
-            if batch_end >= emit_end {
-                break; // rank-stop: emitted this worker's whole range
-            }
-        }
-        // Stream ended before the emit range was reached (e.g. tiny tail worker):
-        // still replay any pending warm-up so state is consistent.
-        if !warmed_up {
-            let wbatches = std::mem::take(&mut warm_up_batches);
-            run_maybe_block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
-        }
-        // Final flush: annotate the remaining partial emit window.
-        worker.lookup_done = true;
-        let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
-        let window_input_rows: usize = window.iter().map(|b| b.num_rows()).sum();
-        run_maybe_block_in_place(|| -> Result<()> {
-            if !window.is_empty() {
-                hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-            }
-            let out = annotate_worker_window(&mut worker, &window, projection.as_deref(), None)?;
-            for b in out {
-                shard.write_batch(b)?;
-            }
-            Ok(())
-        })?;
-        shard_ctx
-            .rows_done
-            .fetch_add(window_input_rows, std::sync::atomic::Ordering::Relaxed);
-        if profiling_enabled() {
-            eprintln!(
-                "[VEP_RSS] shard partition done colocated_entries={} shard_rows={} peak_rss={}MB",
-                worker.colocated_map.len(),
-                shard.input_rows,
-                peak_rss_mb(),
-            );
-        }
+        annotate_lookup_run(
+            shared,
+            lookup_rx,
+            cache_source_type,
+            projection,
+            input_buffer_size,
+            slice,
+            None,
+            &mut output,
+        )
+        .await?;
+        let RunOutput::Shard { shard, .. } = output else {
+            unreachable!("sharded output is a shard")
+        };
         let input_rows = shard.input_rows;
         let output_lines = shard.lines;
-        let _ = (emit_start, emit_end, global_row);
         shard.finish()?;
         Ok(ShardResult {
             input_rows,
@@ -11632,6 +12152,18 @@ impl ContigAnnotationStream {
         }
     }
 
+    /// Tear a run pool down on error: abort its tasks, deregister the contig's
+    /// tables, then surface `e` through `ErrorCleaningUp`.
+    fn fail_run_pool(&mut self, mut pool: RunPoolState, e: DataFusionError) {
+        pool.abort();
+        let fut = make_cleanup_future(
+            Arc::clone(&pool.session),
+            std::mem::take(&mut pool.ephemeral_tables),
+        );
+        self.state = StreamState::ErrorCleaningUp(fut, e);
+        self.abort_prefetch();
+    }
+
     fn cleanup_registered_tables_on_drop(&mut self) {
         self.abort_prefetch();
         match &mut self.state {
@@ -11660,6 +12192,11 @@ impl ContigAnnotationStream {
                 state.abort();
                 deregister_tables_sync(&state.session, &state.ephemeral_tables);
                 state.ephemeral_tables.clear();
+            }
+            StreamState::AnnotatingRunPool(pool) => {
+                pool.abort();
+                deregister_tables_sync(&pool.session, &pool.ephemeral_tables);
+                pool.ephemeral_tables.clear();
             }
             StreamState::CleaningUp(_) | StreamState::ErrorCleaningUp(_, _) => {}
             StreamState::StartContig
@@ -13176,22 +13713,62 @@ impl Stream for ContigAnnotationStream {
                         let session = Arc::clone(&self.session);
                         let config = self.config.clone();
                         if config.annotation_workers > 1 {
-                            // threads>1 == sharded VCF output: build N independent
-                            // per-partition fused pipelines (own lookup partition +
-                            // LOCAL colocated map + inline annotate), each streaming
-                            // its annotated batches directly into its own
-                            // position-ordered VCF body shard. No ordered drain, no
-                            // output channel. Entered only via vcf_sink (the sole
-                            // producer of the "threads" option), which sets
-                            // vcf_shard_ctx.
+                            // workers>1 with a shard context == sharded VCF output:
+                            // build N independent per-partition fused pipelines
+                            // (own lookup partition + LOCAL colocated map + inline
+                            // annotate), each streaming its annotated batches
+                            // directly into its own position-ordered VCF body
+                            // shard. Without a shard context (the RecordBatch
+                            // streaming path) the same workers run the contig's
+                            // grid-ordered runs as a pool released in order.
                             let Some(shard_ctx) = config.vcf_shard_ctx.clone() else {
-                                self.abort_prefetch();
-                                self.state = StreamState::Done;
-                                return Poll::Ready(Some(Err(DataFusionError::Internal(
-                                    "parallel annotation (threads>1) requires a VCF shard \
-                                     context; it is only supported via the VCF output sink"
-                                        .to_string(),
-                                ))));
+                                // Streaming path: the run pool. Run 0's lookup was
+                                // activated by `activate_contig_lookups`; the rest
+                                // activate inside their tasks.
+                                let mut runs =
+                                    VecDeque::with_capacity(ready.pending_runs.len() + 1);
+                                runs.push_back(ready.active_run.clone());
+                                runs.append(&mut ready.pending_runs);
+                                let total_runs = runs.len();
+                                let workers = config.annotation_workers.max(1);
+                                let lookahead = stream_lookahead_runs(
+                                    workers,
+                                    std::env::var("VEP_STREAM_LOOKAHEAD_RUNS").ok().as_deref(),
+                                );
+                                record_contig_profile(&ready.pipeline_profile, |profile| {
+                                    profile.run_pool_runs = total_runs;
+                                });
+                                let mut pool = RunPoolState {
+                                    pending: runs,
+                                    first_lookup: Some(std::mem::take(
+                                        &mut ready.lookup_partitions,
+                                    )),
+                                    total_runs,
+                                    next_start: 0,
+                                    head: 0,
+                                    active: HashMap::new(),
+                                    workers,
+                                    lookahead,
+                                    budget: OutputBudget::new(stream_buffer_mb(
+                                        std::env::var("VEP_STREAM_BUFFER_MB").ok().as_deref(),
+                                    )),
+                                    run_inputs: ready.run_inputs.clone(),
+                                    chrom: ready.chrom,
+                                    config,
+                                    session,
+                                    shared: Arc::clone(&ready.shared_context),
+                                    ephemeral_tables: ready.ephemeral_tables,
+                                    t_contig_active: ready.t_contig_active,
+                                    pipeline_profile: ready.pipeline_profile.clone(),
+                                    contig_rows: 0,
+                                    head_wait_started: None,
+                                };
+                                pool.admit();
+                                self.state = StreamState::AnnotatingRunPool(pool);
+                                // Committed to annotating this contig: overlap the
+                                // NEXT contig's data phase with it.
+                                self.start_prefetch_next_contig();
+                                continue;
                             };
                             let shared = Arc::clone(&ready.shared_context);
                             // Grid slices, indexed by lookup-partition logical id
@@ -13697,6 +14274,131 @@ impl Stream for ContigAnnotationStream {
                     self.state = StreamState::AnnotatingContig(ann);
                 }
 
+                StreamState::AnnotatingRunPool(_) => {
+                    let StreamState::AnnotatingRunPool(mut pool) =
+                        std::mem::replace(&mut self.state, StreamState::Done)
+                    else {
+                        unreachable!()
+                    };
+                    let limit_reached = fetch_limit.is_some_and(|limit| self.rows_emitted >= limit);
+                    if limit_reached || pool.head == pool.total_runs {
+                        // Contig done, or LIMIT satisfied: remaining runs could
+                        // only produce rows that would be dropped.
+                        pool.abort();
+                        profile_end!(
+                            &format!("{}: TOTAL", pool.chrom),
+                            pool.t_contig_active,
+                            format!("{} rows", pool.contig_rows)
+                        );
+                        emit_contig_pipeline_profile(&pool.shared.profile, &pool.chrom);
+                        let fut = make_cleanup_future(
+                            Arc::clone(&pool.session),
+                            std::mem::take(&mut pool.ephemeral_tables),
+                        );
+                        self.state = StreamState::CleaningUp(fut);
+                        continue;
+                    }
+                    pool.admit();
+                    // Completions and errors of the runs behind the head. Their
+                    // output stays in their channels until they are released.
+                    let head = pool.head;
+                    let mut failure: Option<DataFusionError> = None;
+                    for (index, task) in pool.active.iter_mut() {
+                        if *index == head || !task.running() {
+                            continue;
+                        }
+                        if let Poll::Ready(Err(e)) = task.poll_join(cx) {
+                            failure = Some(e);
+                            break;
+                        }
+                    }
+                    if let Some(e) = failure {
+                        self.fail_run_pool(pool, e);
+                        continue;
+                    }
+                    // A completion may have freed a worker slot.
+                    pool.admit();
+                    let any_finished_behind = pool.active.values().any(|t| !t.running());
+                    let task = pool
+                        .active
+                        .get_mut(&head)
+                        .expect("the head run is admitted before any later run");
+                    match task.rx.poll_recv(cx) {
+                        Poll::Ready(Some((batch, permit))) => {
+                            // The batch leaves the pool's queues: give its
+                            // budget back before handing it to the caller.
+                            drop(permit);
+                            if let Some(started) = pool.head_wait_started.take() {
+                                record_contig_profile(&pool.pipeline_profile, |profile| {
+                                    profile.head_wait += started.elapsed();
+                                });
+                            }
+                            let batch = match fetch_limit {
+                                Some(limit) => {
+                                    let remaining = limit.saturating_sub(self.rows_emitted);
+                                    if remaining == 0 {
+                                        self.state = StreamState::AnnotatingRunPool(pool);
+                                        continue; // the limit check above ends the contig
+                                    }
+                                    if batch.num_rows() > remaining {
+                                        batch.slice(0, remaining)
+                                    } else {
+                                        batch
+                                    }
+                                }
+                                None => batch,
+                            };
+                            self.rows_emitted += batch.num_rows();
+                            pool.contig_rows += batch.num_rows();
+                            record_contig_profile(&pool.pipeline_profile, |profile| {
+                                profile.output_batches += 1;
+                                profile.output_rows += batch.num_rows();
+                            });
+                            self.state = StreamState::AnnotatingRunPool(pool);
+                            return Poll::Ready(Some(Ok(batch)));
+                        }
+                        Poll::Ready(None) => {
+                            // The head's sender is gone: its task has ended.
+                            match task.poll_join(cx) {
+                                Poll::Pending => {
+                                    self.state = StreamState::AnnotatingRunPool(pool);
+                                    return Poll::Pending;
+                                }
+                                Poll::Ready(Ok(())) => {
+                                    pipeline_trace::emit(
+                                        "run_pool",
+                                        "release",
+                                        &[
+                                            ("chrom", TraceValue::Str(&pool.chrom)),
+                                            ("run", TraceValue::Usize(head)),
+                                            (
+                                                "elapsed",
+                                                TraceValue::Duration(task.started.elapsed()),
+                                            ),
+                                        ],
+                                    );
+                                    pool.active.remove(&head);
+                                    pool.head += 1;
+                                    pool.budget.set_head(pool.head);
+                                    self.state = StreamState::AnnotatingRunPool(pool);
+                                    continue;
+                                }
+                                Poll::Ready(Err(e)) => {
+                                    self.fail_run_pool(pool, e);
+                                    continue;
+                                }
+                            }
+                        }
+                        Poll::Pending => {
+                            if any_finished_behind && pool.head_wait_started.is_none() {
+                                pool.head_wait_started = Some(Instant::now());
+                            }
+                            self.state = StreamState::AnnotatingRunPool(pool);
+                            return Poll::Pending;
+                        }
+                    }
+                }
+
                 StreamState::CleaningUp(fut) => match fut.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => {
@@ -13815,6 +14517,38 @@ async fn prepare_contig_context(
 /// shared indexes and the shared annotation context, and plan the per-worker
 /// grid slices — but spawn no lookup worker and build no lookup provider.
 /// `activate_contig_lookups()` does that.
+/// Which planning arms a contig takes. Exactly one of the parallel flags can
+/// be set; `stateful_runs` is the serial region path on Merged/RefSeq.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContigModes {
+    /// `workers>1` without a VCF shard context: the streaming run pool.
+    stream_parallel: bool,
+    /// `workers>1` with a shard context on Merged/RefSeq: grid slices for the sink.
+    stateful_parallel: bool,
+    /// Serial region runs on Merged/RefSeq: grid-aligned with warm-up.
+    stateful_runs: bool,
+}
+
+fn contig_modes(
+    cache_enabled: bool,
+    annotation_workers: usize,
+    has_shard_ctx: bool,
+    cache_source_type: CacheSourceType,
+    has_regions: bool,
+) -> ContigModes {
+    let stateful = matches!(
+        cache_source_type,
+        CacheSourceType::Merged | CacheSourceType::RefSeq
+    );
+    let parallel = cache_enabled && annotation_workers > 1;
+    let stream_parallel = parallel && !has_shard_ctx;
+    ContigModes {
+        stream_parallel,
+        stateful_parallel: parallel && has_shard_ctx && stateful,
+        stateful_runs: cache_enabled && has_regions && stateful && !stream_parallel,
+    }
+}
+
 async fn prepare_contig_data(
     session: Arc<SessionContext>,
     cache: Arc<PartitionedAnnotationCache>,
@@ -13910,24 +14644,32 @@ async fn prepare_contig_data(
     // Stateful Merged/RefSeq at workers>1 runs N grid-aligned per-worker lookup
     // scans (planned below, once overlap_width is known), not the byte-budget
     // partitioning.
-    let stateful_parallel = cache_enabled
-        && config.annotation_workers > 1
-        && matches!(
-            config.cache_source_type,
-            CacheSourceType::Merged | CacheSourceType::RefSeq
-        );
     let contig_bounds: Option<Vec<RunBounds>> = config
         .regions
         .as_deref()
         .and_then(|runs| runs.get(&chrom).cloned());
     // A bounded run on a stateful source needs the buffer grid so the cut can
-    // be aligned to whole buffers and warmed up (design: stateful runs).
-    let stateful_runs = cache_enabled
-        && contig_bounds.is_some()
-        && matches!(
-            config.cache_source_type,
-            CacheSourceType::Merged | CacheSourceType::RefSeq
-        );
+    // be aligned to whole buffers and warmed up (design: stateful runs). The
+    // streaming run pool plans every source on the grid itself.
+    let ContigModes {
+        stream_parallel,
+        stateful_parallel,
+        stateful_runs,
+    } = contig_modes(
+        cache_enabled,
+        config.annotation_workers,
+        config.vcf_shard_ctx.is_some(),
+        config.cache_source_type,
+        contig_bounds.is_some(),
+    );
+    if stream_parallel {
+        // Parallelism comes from runs, not from partitions inside a run. This
+        // field only sizes the probe readers inside `KvLookupExec`; the run's
+        // *plan* still inherits the session's scan partitioning, which the
+        // run task reads in id order through one full-plan lookup worker
+        // (`activate_run_lookup`). Intentional: a run is one ordered stream.
+        config.target_partitions = 1;
+    }
 
     // Context arm: load transcripts, exons, translations, etc. (Parquet only).
     // Everything up to here (identity validation, schema reads) is setup that
@@ -13980,7 +14722,7 @@ async fn prepare_contig_data(
     // load (Parquet transcripts/exons) — independent IO, so the count is hidden
     // behind context load instead of running as a serial prelude before workers.
     let count_fut = async {
-        if stateful_parallel || stateful_runs {
+        if stateful_parallel || stateful_runs || stream_parallel {
             Some(
                 count_contig_buffer_boundaries(
                     &session,
@@ -14145,34 +14887,78 @@ async fn prepare_contig_data(
         grid_slices = slices;
     }
 
-    let runs: VecDeque<ContigRun> = match contig_bounds {
-        None => VecDeque::from([ContigRun::open()]),
-        Some(bounds) if stateful_runs => {
-            let (boundaries, _total_rows, _positions) = grid_count
-                .take()
-                .expect("stateful_runs implies the count future ran")?;
-            let positions: Vec<i64> = boundaries.iter().map(|b| b.pos).collect();
-            crate::regions::plan_runs(&bounds, Some(&positions))
+    let runs: VecDeque<ContigRun> = if stream_parallel {
+        let (boundaries, _total_rows, _positions) = grid_count
+            .take()
+            .expect("stream_parallel implies the count future ran")?;
+        let stateful = matches!(
+            config.cache_source_type,
+            CacheSourceType::Merged | CacheSourceType::RefSeq
+        );
+        // Ensembl has no cross-buffer state: a plain cut is exact, so its
+        // runs get no warm-up. Merged/RefSeq runs replay `overlap_width_bp`.
+        let overlap = if stateful { overlap_width_bp } else { 0 };
+        let b = boundaries.len().saturating_sub(1);
+        let positions: Vec<i64> = boundaries.iter().map(|bd| bd.pos).collect();
+        let ranges: Vec<(Vec<RunBounds>, (usize, usize))> = match &contig_bounds {
+            None => vec![(vec![RunBounds::OPEN], (0, b))],
+            Some(bounds) => crate::regions::plan_runs(bounds, Some(&positions))
                 .into_iter()
                 .map(|plan| {
-                    let (bk, bk1) = plan.buffers.expect("grid path plans buffer ranges");
-                    let slice = build_grid_slices(&boundaries, &[bk, bk1], overlap_width_bp)
-                        .into_iter()
-                        .next();
-                    ContigRun {
-                        bounds: plan.bounds,
-                        slice,
-                    }
+                    let buffers = plan.buffers.expect("grid path plans buffer ranges");
+                    (plan.bounds, buffers)
                 })
-                .collect()
+                .collect(),
+        };
+        let run_buffers = stream_run_buffers(
+            b,
+            config.annotation_workers,
+            stateful,
+            std::env::var("VEP_STREAM_RUN_BUFFERS").ok().as_deref(),
+        );
+        let planned = plan_stream_runs(&boundaries, &ranges, run_buffers, overlap);
+        pipeline_trace::emit(
+            "run_pool",
+            "plan",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("buffers", TraceValue::Usize(b)),
+                ("run_buffers", TraceValue::Usize(run_buffers)),
+                ("runs", TraceValue::Usize(planned.len())),
+                ("warm_up", TraceValue::Usize(usize::from(overlap > 0))),
+            ],
+        );
+        VecDeque::from(planned)
+    } else {
+        match contig_bounds {
+            None => VecDeque::from([ContigRun::open()]),
+            Some(bounds) if stateful_runs => {
+                let (boundaries, _total_rows, _positions) = grid_count
+                    .take()
+                    .expect("stateful_runs implies the count future ran")?;
+                let positions: Vec<i64> = boundaries.iter().map(|b| b.pos).collect();
+                crate::regions::plan_runs(&bounds, Some(&positions))
+                    .into_iter()
+                    .map(|plan| {
+                        let (bk, bk1) = plan.buffers.expect("grid path plans buffer ranges");
+                        let slice = build_grid_slices(&boundaries, &[bk, bk1], overlap_width_bp)
+                            .into_iter()
+                            .next();
+                        ContigRun {
+                            bounds: plan.bounds,
+                            slice,
+                        }
+                    })
+                    .collect()
+            }
+            Some(bounds) => crate::regions::plan_runs(&bounds, None)
+                .into_iter()
+                .map(|plan| ContigRun {
+                    bounds: plan.bounds,
+                    slice: None,
+                })
+                .collect(),
         }
-        Some(bounds) => crate::regions::plan_runs(&bounds, None)
-            .into_iter()
-            .map(|plan| ContigRun {
-                bounds: plan.bounds,
-                slice: None,
-            })
-            .collect(),
     };
     pipeline_trace::emit(
         "regions",
@@ -14284,6 +15070,8 @@ async fn activate_run_lookup(
         vcf_schema,
         cache_schema,
         fallback_coloc_sink,
+        #[cfg(feature = "parquet-cache")]
+        parquet_lookup_cell,
     } = inputs;
     #[cfg(feature = "parquet-cache")]
     let cache_enabled = config.cache_root.is_some();
@@ -14308,6 +15096,29 @@ async fn activate_run_lookup(
         if config.parquet_backend {
             provider.set_parquet_backend(true);
         }
+        provider.set_parquet_lookup_cell(parquet_lookup_cell);
+    }
+    // Streaming run pool: the run's plan inherits the VCF scan's partition
+    // count (the session's target partitions), but the run task consumes ONE
+    // ordered channel, so read every partition of the filtered plan in id order
+    // through a single worker, as the sink's grid slices do.
+    let pool_run = cache_enabled && config.annotation_workers > 1 && config.vcf_shard_ctx.is_none();
+    if pool_run {
+        let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+        if config.flags.check_existing {
+            provider.set_colocated_sink(Arc::clone(&sink));
+        }
+        let session_state = session.state();
+        let plan = provider.scan(&session_state, None, &[], None).await?;
+        return Ok(VecDeque::from([spawn_lookup_full_contig_worker(
+            plan,
+            session.task_ctx(),
+            0,
+            chrom,
+            sink,
+            LOOKUP_PARTITION_QUEUE_BATCHES,
+            pipeline_profile,
+        )]));
     }
     let parallel_lookup = cache_enabled;
     if parallel_lookup {
@@ -14422,11 +15233,19 @@ async fn activate_contig_lookups(
     // for the grid providers built further down.
     let grid_vcf_schema = vcf_schema.clone();
     let grid_cache_schema = cache_schema.clone();
+    // One single-flight cell per contig: every run's lookup (and every grid
+    // slice of the sink) shares the decoded shard footer + page index instead
+    // of decoding it again. Scoped to this contig: rebuilt on the next
+    // activation.
+    #[cfg(feature = "parquet-cache")]
+    let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
     let run_inputs = RunActivationInputs {
         var_table: var_table.clone(),
         vcf_schema,
         cache_schema,
         fallback_coloc_sink,
+        #[cfg(feature = "parquet-cache")]
+        parquet_lookup_cell: Arc::clone(&shared_parquet_lookup_cell),
     };
     let mut lookup_partitions = if stateful_parallel {
         // The grid-aligned per-worker lookup scans are built below from the
@@ -14451,13 +15270,11 @@ async fn activate_contig_lookups(
         let task_ctx = session.task_ctx();
         // All workers of this contig probe the same variation shard, and the
         // lookup is immutable once opened (its per-partition cursor is a
-        // stateless placeholder, and each probe opens its own file handle). Share
-        // one single-flight cell so the shard footer + page index are decoded
-        // once per contig rather than once per worker — the page index alone is
-        // ~0.5 GB for chr1, so per-worker loads dominated peak RSS. Scoped to
-        // this contig: it is rebuilt on the next activation.
-        #[cfg(feature = "parquet-cache")]
-        let shared_parquet_lookup_cell = Arc::new(tokio::sync::OnceCell::new());
+        // stateless placeholder, and each probe opens its own file handle). They
+        // share the contig's single-flight cell (`shared_parquet_lookup_cell`)
+        // so the shard footer + page index are decoded once per contig rather
+        // than once per worker — the page index alone is ~0.5 GB for chr1, so
+        // per-worker loads dominated peak RSS.
         // `session.state()` was cloned once per worker inside the loop.
         let session_state = session.state();
         let mut prepared: Vec<(usize, LookupProvider, ColocatedSink)> =
@@ -15218,7 +16035,7 @@ mod tests {
 
     #[cfg(feature = "parquet-cache")]
     #[tokio::test]
-    async fn regions_with_workers_above_one_are_rejected_at_construction() {
+    async fn regions_with_workers_above_one_are_accepted_at_construction() {
         let session = Arc::new(SessionContext::new());
         let vcf_schema = Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -15239,13 +16056,10 @@ mod tests {
                 vcf_schema.clone(),
             )
         };
-        let err = build(r#"{"workers":2,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
-            .expect_err("regions with workers>1 must be rejected before planning");
-        let message = err.to_string();
-        assert!(
-            message.contains("regions") && message.contains("workers=1"),
-            "{message}"
-        );
+        // The streaming run pool plans regions itself; the sharded sink still
+        // rejects the combination at scan time.
+        build(r#"{"workers":2,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
+            .expect("regions with workers>1 are planned by the streaming run pool");
         build(r#"{"workers":1,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
             .expect("workers=1 with regions is accepted");
         build(r#"{"workers":4}"#).expect("workers>1 without regions is unchanged");
@@ -15463,6 +16277,8 @@ mod tests {
                 vcf_schema: Schema::new(Vec::<Field>::new()),
                 cache_schema: Schema::new(Vec::<Field>::new()),
                 fallback_coloc_sink: Arc::new(Mutex::new(HashMap::new())),
+                #[cfg(feature = "parquet-cache")]
+                parquet_lookup_cell: Arc::new(tokio::sync::OnceCell::new()),
             },
             pipeline_profile: None,
         }
@@ -17018,6 +17834,331 @@ mod tests {
         // worker 1 warm-starts at buffer 2 (overlap 0) → inherits its tie skip.
         assert_eq!(slices[1].warm_up_start_row, 10000);
         assert_eq!(slices[1].skip_leading_rows, 3);
+    }
+
+    #[test]
+    fn stream_run_buffers_default_and_floor() {
+        // 65 buffers, 8 workers: ceil(65 / 32) = 3, floored to 4 on stateful.
+        assert_eq!(stream_run_buffers(65, 8, true, None), 4);
+        assert_eq!(stream_run_buffers(65, 8, false, None), 3);
+        // Small contig: at least one buffer per run.
+        assert_eq!(stream_run_buffers(3, 8, false, None), 1);
+        assert_eq!(stream_run_buffers(3, 8, true, None), 4);
+        // Override wins but not below the stateful floor.
+        assert_eq!(stream_run_buffers(65, 8, false, Some("2")), 2);
+        assert_eq!(stream_run_buffers(65, 8, true, Some("2")), 4);
+        assert_eq!(stream_run_buffers(65, 8, true, Some("9")), 9);
+        // Garbage override is ignored.
+        assert_eq!(stream_run_buffers(65, 8, false, Some("x")), 3);
+        assert_eq!(stream_run_buffers(65, 8, false, Some("0")), 3);
+    }
+
+    #[test]
+    fn stream_lookahead_defaults_to_workers() {
+        assert_eq!(stream_lookahead_runs(8, None), 8);
+        assert_eq!(stream_lookahead_runs(8, Some("2")), 2);
+        assert_eq!(stream_lookahead_runs(8, Some("0")), 0);
+        assert_eq!(stream_lookahead_runs(8, Some("bad")), 8);
+    }
+
+    #[test]
+    fn plan_stream_runs_cuts_open_range_into_fixed_pieces() {
+        // 5 buffers of 5000 rows.
+        let bs = vec![
+            gb(0, 0),
+            gb(5000, 100),
+            gb(10000, 200),
+            gb(15000, 300),
+            gb(20000, 400),
+            gb(25000, i64::MAX),
+        ];
+        let ranges = vec![(vec![RunBounds::OPEN], (0usize, 5usize))];
+        let runs = plan_stream_runs(&bs, &ranges, 2, 0);
+        assert_eq!(runs.len(), 3, "5 buffers in pieces of 2 -> 2+2+1");
+        let s = |i: usize| runs[i].slice.as_ref().expect("stream runs carry a slice");
+        assert_eq!((s(0).emit_start_row, s(0).emit_end_row), (0, 10000));
+        assert_eq!((s(1).emit_start_row, s(1).emit_end_row), (10000, 20000));
+        assert_eq!((s(2).emit_start_row, s(2).emit_end_row), (20000, 25000));
+        // overlap 0: no warm-up, scan floor == seam.
+        assert_eq!(s(1).warm_up_start_row, 10000);
+        assert_eq!(s(1).scan_lo_pos, 200);
+        assert_eq!(
+            s(1).scan_hi_pos,
+            401,
+            "non-last piece scans one past its end seam"
+        );
+        assert_eq!(
+            s(2).scan_hi_pos,
+            i64::MAX,
+            "last piece reads to the contig end"
+        );
+        assert!(runs.iter().all(|r| r.bounds == vec![RunBounds::OPEN]));
+        assert!(
+            runs[1].probe_floor().is_none(),
+            "no warm-up -> no probe floor"
+        );
+    }
+
+    #[test]
+    fn plan_stream_runs_keeps_region_bounds_and_warm_up() {
+        let bs = vec![
+            gb(0, 0),
+            gb(5000, 100),
+            gb(10000, 200),
+            gb(15000, 300),
+            gb(20000, 400),
+            gb(25000, i64::MAX),
+        ];
+        let b1 = RunBounds {
+            lo: Some(150),
+            hi: Some(320),
+        };
+        // Region maps to buffers [1, 4): three buffers, run length 1 -> three runs.
+        let ranges = vec![(vec![b1], (1usize, 4usize))];
+        // Seam at pos 200, overlap 100: the warm-up starts at the first buffer
+        // whose start is <= 100, i.e. buffer 1.
+        let runs = plan_stream_runs(&bs, &ranges, 1, 100);
+        assert_eq!(runs.len(), 3);
+        for r in &runs {
+            assert_eq!(r.bounds, vec![b1], "every piece trims to the region bounds");
+        }
+        let s1 = runs[1].slice.as_ref().unwrap();
+        assert_eq!(s1.emit_start_row, 10000);
+        assert_eq!(
+            s1.warm_up_start_row, 5000,
+            "overlap 100 reaches back one buffer"
+        );
+        assert_eq!(runs[1].probe_floor(), Some(200));
+    }
+
+    #[test]
+    fn plan_stream_runs_empty_grid_plans_nothing() {
+        let bs = vec![gb(0, i64::MAX)];
+        let ranges = vec![(vec![RunBounds::OPEN], (0usize, 0usize))];
+        assert!(plan_stream_runs(&bs, &ranges, 4, 0).is_empty());
+    }
+
+    #[test]
+    fn admission_bounds_workers_and_lookahead() {
+        // workers=2, lookahead=1: at most 3 runs from head onwards.
+        assert!(admission_allows(0, 0, 0, 10, 2, 1));
+        assert!(admission_allows(1, 0, 1, 10, 2, 1));
+        assert!(!admission_allows(2, 0, 2, 10, 2, 1), "both workers busy");
+        assert!(!admission_allows(1, 0, 3, 10, 2, 1), "lookahead exhausted");
+        assert!(
+            admission_allows(1, 1, 3, 10, 2, 1),
+            "head advanced -> window moves"
+        );
+        assert!(!admission_allows(0, 9, 10, 10, 2, 1), "no runs left");
+    }
+
+    #[test]
+    fn contig_modes_are_exclusive() {
+        let m = |workers: usize, sink: bool, source: CacheSourceType, regions: bool| {
+            contig_modes(true, workers, sink, source, regions)
+        };
+        let modes =
+            |stream_parallel: bool, stateful_parallel: bool, stateful_runs: bool| ContigModes {
+                stream_parallel,
+                stateful_parallel,
+                stateful_runs,
+            };
+        // Serial.
+        assert_eq!(
+            m(1, false, CacheSourceType::Ensembl, false),
+            modes(false, false, false)
+        );
+        assert_eq!(
+            m(1, false, CacheSourceType::Merged, true),
+            modes(false, false, true)
+        );
+        // Sink.
+        assert_eq!(
+            m(4, true, CacheSourceType::Merged, false),
+            modes(false, true, false)
+        );
+        assert_eq!(
+            m(4, true, CacheSourceType::Ensembl, false),
+            modes(false, false, false)
+        );
+        // Streaming pool: never stateful_parallel, never stateful_runs (the pool
+        // plans regions itself), for every source.
+        assert_eq!(
+            m(4, false, CacheSourceType::Merged, true),
+            modes(true, false, false)
+        );
+        assert_eq!(
+            m(4, false, CacheSourceType::Ensembl, false),
+            modes(true, false, false)
+        );
+        // No cache root: nothing parallel.
+        assert_eq!(
+            contig_modes(false, 4, false, CacheSourceType::Merged, true),
+            modes(false, false, false)
+        );
+    }
+
+    fn tagged_batch(tag: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                tag,
+            ]))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_output_batches_forwards_in_order() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut out = RunOutput::Batches {
+            tx,
+            budget: OutputBudget::new(4),
+            index: 1,
+        };
+        let rows = out
+            .write_all(VecDeque::from([tagged_batch(1), tagged_batch(2)]))
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
+        out.window_done(7); // no-op for batches
+        drop(out);
+        let mut tags = Vec::new();
+        while let Ok((b, permit)) = rx.try_recv() {
+            assert!(permit.is_some(), "a non-head run's batch carries budget");
+            tags.push(
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+            );
+        }
+        assert_eq!(tags, vec![1, 2]);
+        assert!(rx.try_recv().is_err(), "sender dropped -> channel closed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_output_batches_errors_when_receiver_is_gone() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let mut out = RunOutput::Batches {
+            tx,
+            budget: OutputBudget::new(4),
+            index: 0,
+        };
+        let err = out
+            .write_all(VecDeque::from([tagged_batch(1)]))
+            .await
+            .expect_err("dropped receiver must surface");
+        assert!(err.to_string().contains("run pool"), "{err}");
+    }
+
+    #[test]
+    fn stream_buffer_mb_default_and_override() {
+        assert_eq!(stream_buffer_mb(None), STREAM_BUFFER_MB_DEFAULT);
+        assert_eq!(stream_buffer_mb(Some("256")), 256);
+        assert_eq!(stream_buffer_mb(Some("0")), STREAM_BUFFER_MB_DEFAULT);
+        assert_eq!(stream_buffer_mb(Some("x")), STREAM_BUFFER_MB_DEFAULT);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_budget_exempts_head_and_blocks_others_until_released() {
+        let budget = OutputBudget::new(2); // 2 MiB
+        // The head never waits, whatever the size.
+        assert!(budget.charge(0, 10 * MIB).await.is_none());
+        // Run 1 takes the whole budget; run 2 must wait for it.
+        let held = budget.charge(1, 2 * MIB).await.expect("budget available");
+        let waiting = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.charge(2, MIB).await }
+        });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiting.is_finished(),
+            "run 2 must block while run 1 holds the budget"
+        );
+        drop(held);
+        let permit = waiting.await.unwrap();
+        assert!(
+            permit.is_some(),
+            "run 2 charged the budget once it was free"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_budget_wakes_a_waiter_that_becomes_head() {
+        let budget = OutputBudget::new(1);
+        let held = budget.charge(1, MIB).await.expect("budget available");
+        let waiting = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.charge(2, MIB).await }
+        });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished());
+        // Run 2 becomes the head: it is released without a permit even though
+        // run 1 still holds the whole budget.
+        budget.set_head(2);
+        let permit = waiting.await.unwrap();
+        assert!(
+            permit.is_none(),
+            "the head sends without charging the budget"
+        );
+        drop(held);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_task_reports_running_until_joined() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunBatch>();
+        let join = tokio::spawn(async {
+            Ok(RunStats {
+                input_rows: 3,
+                output_rows: 4,
+                warm_up_rows: 0,
+                lookup_closed: true,
+            })
+        });
+        let mut task = RunTask {
+            join: Some(join),
+            rx,
+            stats: None,
+            started: Instant::now(),
+        };
+        assert!(task.running());
+        // Poll until the spawned task has resolved.
+        std::future::poll_fn(|cx| task.poll_join(cx))
+            .await
+            .expect("join ok");
+        assert!(!task.running());
+        assert_eq!(task.stats.unwrap().output_rows, 4);
+        // A second poll is a no-op.
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(task.poll_join(cx))).await,
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_task_surfaces_task_errors() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunBatch>();
+        let join = tokio::spawn(async {
+            Err::<RunStats, _>(DataFusionError::Execution("boom".to_string()))
+        });
+        let mut task = RunTask {
+            join: Some(join),
+            rx,
+            stats: None,
+            started: Instant::now(),
+        };
+        let err = std::future::poll_fn(|cx| task.poll_join(cx))
+            .await
+            .expect_err("error surfaces");
+        assert!(err.to_string().contains("boom"));
     }
 
     #[test]
