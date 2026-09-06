@@ -131,7 +131,13 @@ pub(crate) type ContigRuns = HashMap<String, Vec<RunBounds>>;
 /// `1`/`chr1` and `M`/`MT`/`chrM`/`chrMT` match) and merge per contig. Specs
 /// naming a contig the VCF does not have select nothing and are dropped.
 pub(crate) fn resolve_regions(specs: &[RegionSpec], vcf_contigs: &[String]) -> ContigRuns {
+    // Exact spellings win: a VCF that carries both `1` and `chr1` must map a
+    // spec naming `chr1` onto `chr1`, so aliases only fill names no contig
+    // spells exactly.
     let mut by_alias: HashMap<String, &String> = HashMap::new();
+    for contig in vcf_contigs {
+        by_alias.entry(contig.clone()).or_insert(contig);
+    }
     for contig in vcf_contigs {
         for alias in crate::cache::manifest::contig_alias_set(contig) {
             by_alias.entry(alias).or_insert(contig);
@@ -329,6 +335,8 @@ pub(crate) fn filter_batch_to_bounds(
     start_idx: usize,
     bounds: &[RunBounds],
 ) -> Result<RecordBatch> {
+    // An open bound accepts every position, so the union does too; this does
+    // not depend on the bounds having been merged.
     if bounds.iter().any(RunBounds::is_open) || batch.num_rows() == 0 {
         return Ok(batch.clone());
     }
@@ -543,6 +551,34 @@ mod tests {
             }]
         );
         assert_eq!(runs["chrM"], vec![RunBounds::OPEN]);
+    }
+
+    #[test]
+    fn resolve_prefers_exact_spelling_over_an_alias() {
+        // Both spellings present: each spec selects the contig it names.
+        let vcf = vec!["1".to_string(), "chr1".to_string()];
+        let runs = resolve_regions(
+            &[s("chr1", Some(10), Some(20)), s("1", Some(30), Some(40))],
+            &vcf,
+        );
+        assert_eq!(
+            runs["chr1"],
+            vec![RunBounds {
+                lo: Some(10),
+                hi: Some(20)
+            }]
+        );
+        assert_eq!(
+            runs["1"],
+            vec![RunBounds {
+                lo: Some(30),
+                hi: Some(40)
+            }]
+        );
+        // Reverse header order must not change the answer.
+        let vcf = vec!["chr1".to_string(), "1".to_string()];
+        let runs = resolve_regions(&[s("1", None, None)], &vcf);
+        assert_eq!(runs.keys().collect::<Vec<_>>(), vec!["1"]);
     }
 
     #[test]

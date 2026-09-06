@@ -3678,6 +3678,20 @@ impl AnnotateProvider {
         let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
         let include_pick_output = pick_flags.include_pick_output();
         let regions = crate::regions::parse_regions_option(options_json.as_deref())?;
+        if regions.is_some() {
+            // Region runs are planned on the serial streaming path only; the
+            // parallel (`workers>1`) planner consumes the same buffer grid and
+            // the two cannot coexist on one contig.
+            let workers = options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_i64_option(opts, "workers"))
+                .unwrap_or(1);
+            if workers > 1 {
+                return Err(DataFusionError::Plan(format!(
+                    "annotate_vep(): regions require workers=1, got workers={workers}"
+                )));
+            }
+        }
         let requested_fields =
             Self::parse_json_string_array_option(options_json.as_deref(), "fields")?;
         let csq_field_projection = requested_fields
@@ -14146,6 +14160,11 @@ async fn prepare_contig_data(
             ("runs", TraceValue::Usize(runs.len())),
         ],
     );
+    if runs.is_empty() {
+        // A degenerate grid (no data rows on the contig) plans no run: skip
+        // the contig rather than fall back to an unrestricted pass.
+        return Ok(None);
+    }
 
     let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
 
@@ -14358,7 +14377,9 @@ async fn activate_contig_lookups(
         runs,
     } = data;
     let mut pending_runs = runs;
-    let active_run = pending_runs.pop_front().unwrap_or_else(ContigRun::open);
+    let active_run = pending_runs
+        .pop_front()
+        .expect("prepare_contig_data yields at least one run");
     // Two instants, one origin. Activation is the point where the contig
     // genuinely begins, so it anchors BOTH the second-half prepare span and the
     // contig's own wall clock. The data half cannot anchor either one: under
@@ -15171,6 +15192,41 @@ mod tests {
         )
         .expect_err("start > end must be rejected");
         assert!(err.to_string().contains("regions"), "{err}");
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    #[tokio::test]
+    async fn regions_with_workers_above_one_are_rejected_at_construction() {
+        let session = Arc::new(SessionContext::new());
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let build = |options: &str| {
+            AnnotateProvider::new(
+                Arc::clone(&session),
+                "vcf".to_string(),
+                tmp.path().to_string_lossy().to_string(),
+                AnnotationBackend::Parquet,
+                CacheSourceType::Merged,
+                Some(options.to_string()),
+                vcf_schema.clone(),
+            )
+        };
+        let err = build(r#"{"workers":2,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
+            .expect_err("regions with workers>1 must be rejected before planning");
+        let message = err.to_string();
+        assert!(
+            message.contains("regions") && message.contains("workers=1"),
+            "{message}"
+        );
+        build(r#"{"workers":1,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
+            .expect("workers=1 with regions is accepted");
+        build(r#"{"workers":4}"#).expect("workers>1 without regions is unchanged");
     }
 
     #[test]
