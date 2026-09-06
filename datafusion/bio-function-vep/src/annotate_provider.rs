@@ -7107,30 +7107,40 @@ impl AnnotateProvider {
 
                         // MOTIF_NAME, MOTIF_POS, HIGH_INF_POS, MOTIF_SCORE_CHANGE,
                         // TRANSCRIPTION_FACTORS: one element per entry, mirroring
-                        // the CSQ string (NULL outside MotifFeature entries).
-                        append_opt_str(b_motif_name.values(), tc.motif_name.as_deref());
-                        match tc.motif_pos {
-                            Some(p) => b_motif_pos.values().append_value(p),
-                            None => b_motif_pos.values().append_null(),
-                        }
-                        match tc.high_inf_pos {
-                            Some(true) => b_high_inf_pos.values().append_value("Y"),
-                            Some(false) => b_high_inf_pos.values().append_value("N"),
-                            None => b_high_inf_pos.values().append_null(),
-                        }
-                        match tc
-                            .motif_score_change
-                            .as_deref()
-                            .and_then(|s| s.parse::<f32>().ok())
-                        {
-                            Some(v) => b_motif_score_change.values().append_value(v),
-                            None => b_motif_score_change.values().append_null(),
-                        }
-                        match tc.motif_transcription_factors.as_deref() {
-                            Some(raw) if !raw.is_empty() => b_transcription_factors
-                                .values()
-                                .append_value(csq_multi_value(raw)),
-                            _ => b_transcription_factors.values().append_null(),
+                        // the CSQ string (NULL outside MotifFeature entries). The
+                        // fields exist only in the `everything` CSQ layout, so
+                        // like APPRIS and DOMAINS they stay NULL without it.
+                        if flags.everything {
+                            append_opt_str(b_motif_name.values(), tc.motif_name.as_deref());
+                            match tc.motif_pos {
+                                Some(p) => b_motif_pos.values().append_value(p),
+                                None => b_motif_pos.values().append_null(),
+                            }
+                            match tc.high_inf_pos {
+                                Some(true) => b_high_inf_pos.values().append_value("Y"),
+                                Some(false) => b_high_inf_pos.values().append_value("N"),
+                                None => b_high_inf_pos.values().append_null(),
+                            }
+                            match tc
+                                .motif_score_change
+                                .as_deref()
+                                .and_then(|s| s.parse::<f32>().ok())
+                            {
+                                Some(v) => b_motif_score_change.values().append_value(v),
+                                None => b_motif_score_change.values().append_null(),
+                            }
+                            match tc.motif_transcription_factors.as_deref() {
+                                Some(raw) if !raw.is_empty() => b_transcription_factors
+                                    .values()
+                                    .append_value(csq_multi_value(raw)),
+                                _ => b_transcription_factors.values().append_null(),
+                            }
+                        } else {
+                            b_motif_name.values().append_null();
+                            b_motif_pos.values().append_null();
+                            b_high_inf_pos.values().append_null();
+                            b_motif_score_change.values().append_null();
+                            b_transcription_factors.values().append_null();
                         }
 
                         // FLAGS
@@ -7785,9 +7795,11 @@ fn append_opt_str(builder: &mut StringBuilder, val: Option<&str>) {
 
 /// Like [`append_opt_str`] for a cache list value joined with `,`: emits it
 /// with VEP's `&` separator, so the typed element equals the CSQ sub-field.
+/// The CSQ path renders these through [`csq_escape`], whose `-` placeholder
+/// becomes an empty sub-field; the typed column maps it to NULL likewise.
 fn append_opt_multi(builder: &mut StringBuilder, val: Option<&str>) {
     match val {
-        Some(v) if !v.is_empty() => builder.append_value(csq_multi_value(v)),
+        Some(v) if !v.is_empty() && v != "-" => builder.append_value(csq_multi_value(v)),
         _ => builder.append_null(),
     }
 }
@@ -18035,11 +18047,13 @@ mod tests {
         append_opt_multi(&mut b, Some("X5DR28.82"));
         append_opt_multi(&mut b, Some(""));
         append_opt_multi(&mut b, None);
+        append_opt_multi(&mut b, Some("-")); // csq_escape renders `-` as empty
         let arr = b.finish();
         assert_eq!(arr.value(0), "B0QYZ8.92&X5DR28.82");
         assert_eq!(arr.value(1), "X5DR28.82");
         assert!(arr.is_null(2));
         assert!(arr.is_null(3));
+        assert!(arr.is_null(4));
     }
 
     #[test]
