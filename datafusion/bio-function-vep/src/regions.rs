@@ -235,6 +235,115 @@ pub(crate) fn plan_runs(bounds: &[RunBounds], boundary_positions: Option<&[i64]>
     runs
 }
 
+use datafusion::arrow::array::{BooleanArray, Int64Array};
+use datafusion::arrow::compute::{cast, filter_record_batch};
+use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::record_batch::RecordBatch;
+
+/// Rank gate for one run: drops the position-tie rows that belong to the
+/// previous buffer, routes warm-up rows and emit rows, and stops at the emit
+/// end. Same semantics as the sharded worker's inline gate.
+#[derive(Debug)]
+pub(crate) struct RunGate {
+    to_skip: usize,
+    next_rank: usize,
+    emit_start_row: usize,
+    emit_end_row: usize,
+    warm_up_start_row: usize,
+    reached_emit: bool,
+}
+
+pub(crate) struct GateOutput {
+    pub warm_up: Option<RecordBatch>,
+    pub emit: Option<RecordBatch>,
+    /// True on the batch that first reaches `emit_start_row` (or when there
+    /// is no warm-up region, on the first non-empty batch). The caller replays
+    /// the collected warm-up rows before pushing `emit`.
+    pub reached_emit: bool,
+    /// True once every row up to `emit_end_row` has been seen.
+    pub done: bool,
+}
+
+impl RunGate {
+    pub fn new(
+        skip_leading_rows: usize,
+        warm_up_start_row: usize,
+        emit_start_row: usize,
+        emit_end_row: usize,
+    ) -> Self {
+        Self {
+            to_skip: skip_leading_rows,
+            next_rank: warm_up_start_row,
+            emit_start_row,
+            emit_end_row,
+            warm_up_start_row,
+            reached_emit: false,
+        }
+    }
+
+    pub fn needs_warm_up(&self) -> bool {
+        self.emit_start_row > self.warm_up_start_row
+    }
+
+    pub fn feed(&mut self, mut batch: RecordBatch) -> GateOutput {
+        let mut out = GateOutput {
+            warm_up: None,
+            emit: None,
+            reached_emit: false,
+            done: false,
+        };
+        if self.to_skip > 0 {
+            let drop = self.to_skip.min(batch.num_rows());
+            batch = batch.slice(drop, batch.num_rows() - drop);
+            self.to_skip -= drop;
+        }
+        let n = batch.num_rows();
+        if n == 0 {
+            return out;
+        }
+        let batch_start = self.next_rank;
+        let batch_end = batch_start + n;
+        self.next_rank = batch_end;
+        let warm_end = self.emit_start_row.saturating_sub(batch_start).min(n);
+        let emit_to = self.emit_end_row.saturating_sub(batch_start).min(n);
+        if warm_end > 0 {
+            out.warm_up = Some(batch.slice(0, warm_end));
+        }
+        if !self.reached_emit && batch_end >= self.emit_start_row {
+            self.reached_emit = true;
+            out.reached_emit = true;
+        }
+        if emit_to > warm_end {
+            out.emit = Some(batch.slice(warm_end, emit_to - warm_end));
+        }
+        out.done = batch_end >= self.emit_end_row;
+        out
+    }
+}
+
+/// Keep the rows whose `start` lies inside at least one interval. Used after
+/// annotation (before projection) because stateful runs annotate whole
+/// buffers and indexed reads are overlap-based.
+pub(crate) fn filter_batch_to_bounds(
+    batch: &RecordBatch,
+    start_idx: usize,
+    bounds: &[RunBounds],
+) -> Result<RecordBatch> {
+    if bounds.iter().any(RunBounds::is_open) || batch.num_rows() == 0 {
+        return Ok(batch.clone());
+    }
+    let starts = cast(batch.column(start_idx), &DataType::Int64)?;
+    let starts = starts
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| DataFusionError::Internal("start column did not cast to Int64".into()))?;
+    let mask: BooleanArray = starts
+        .iter()
+        .map(|v| v.map(|pos| bounds.iter().any(|b| b.contains(pos))))
+        .collect();
+    Ok(filter_record_batch(batch, &mask)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +718,125 @@ mod tests {
     fn plan_runs_with_empty_grid_yields_no_runs() {
         assert!(plan_runs(&[RunBounds::OPEN], Some(&[i64::MAX])).is_empty());
         assert!(plan_runs(&[RunBounds::OPEN], Some(&[])).is_empty());
+    }
+
+    use datafusion::arrow::array::{Array, Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn batch(starts: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"; starts.len()])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(starts.to_vec())) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn starts(b: &RecordBatch) -> Vec<i64> {
+        b.column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn gate_splits_skip_warmup_emit_and_stops() {
+        // ranks after skipping 1 tie row: 10,11,12 | 13,14,15 | 16,17
+        let mut gate = RunGate::new(1, 10, 13, 16);
+        assert!(gate.needs_warm_up());
+        let out = gate.feed(batch(&[99, 100, 101])); // 99 skipped; ranks 10,11 warm-up
+        assert_eq!(starts(out.warm_up.as_ref().unwrap()), vec![100, 101]);
+        assert!(out.emit.is_none() && !out.reached_emit && !out.done);
+        let out = gate.feed(batch(&[102, 103, 104])); // rank 12 warm-up, 13,14 emit
+        assert_eq!(starts(out.warm_up.as_ref().unwrap()), vec![102]);
+        assert_eq!(starts(out.emit.as_ref().unwrap()), vec![103, 104]);
+        assert!(out.reached_emit && !out.done);
+        let out = gate.feed(batch(&[105, 106, 107])); // 15 emit; 16,17 discarded
+        assert!(out.warm_up.is_none());
+        assert_eq!(starts(out.emit.as_ref().unwrap()), vec![105]);
+        assert!(out.done);
+    }
+
+    #[test]
+    fn gate_without_warm_up_emits_from_the_first_row() {
+        let mut gate = RunGate::new(0, 0, 0, 2);
+        assert!(!gate.needs_warm_up());
+        let out = gate.feed(batch(&[1, 2, 3]));
+        assert!(out.warm_up.is_none());
+        assert_eq!(starts(out.emit.as_ref().unwrap()), vec![1, 2]);
+        assert!(out.reached_emit && out.done);
+    }
+
+    #[test]
+    fn gate_reports_reached_emit_once_and_handles_empty_batches() {
+        let mut gate = RunGate::new(0, 0, 2, usize::MAX);
+        let out = gate.feed(batch(&[]));
+        assert!(out.warm_up.is_none() && out.emit.is_none() && !out.reached_emit);
+        let out = gate.feed(batch(&[1, 2, 3]));
+        assert!(out.reached_emit);
+        let out = gate.feed(batch(&[4]));
+        assert!(
+            !out.reached_emit,
+            "reached_emit fires only on the crossing batch"
+        );
+        assert_eq!(starts(out.emit.as_ref().unwrap()), vec![4]);
+        assert!(!out.done, "open upper rank never stops");
+    }
+
+    #[test]
+    fn filter_batch_keeps_rows_inside_any_interval() {
+        let b = batch(&[5, 10, 15, 20, 25, 30]);
+        let out = filter_batch_to_bounds(
+            &b,
+            1,
+            &[
+                RunBounds {
+                    lo: Some(10),
+                    hi: Some(15),
+                },
+                RunBounds {
+                    lo: Some(30),
+                    hi: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(starts(&out), vec![10, 15, 30]);
+        let same = filter_batch_to_bounds(&b, 1, &[RunBounds::OPEN]).unwrap();
+        assert_eq!(same.num_rows(), 6);
+    }
+
+    #[test]
+    fn filter_batch_accepts_uint32_start() {
+        use datafusion::arrow::array::UInt32Array;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "start",
+            DataType::UInt32,
+            false,
+        )]));
+        let b = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(UInt32Array::from(vec![1u32, 7, 9])) as Arc<dyn Array>],
+        )
+        .unwrap();
+        let out = filter_batch_to_bounds(
+            &b,
+            0,
+            &[RunBounds {
+                lo: Some(7),
+                hi: Some(9),
+            }],
+        )
+        .unwrap();
+        assert_eq!(out.num_rows(), 2);
     }
 }
