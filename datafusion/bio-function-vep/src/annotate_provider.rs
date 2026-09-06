@@ -5477,23 +5477,7 @@ impl AnnotateProvider {
     ///
     /// Does NOT use `"bio.vcf.contigs"` (all VCF header contigs) because
     /// GRCh38 headers list ~195 contigs even when only 1–22 have data.
-    /// Whether the VCF table's `start` column is 0-based half-open (the
-    /// provider stamps `bio.coordinate_system_zero_based` on its schema).
-    /// Absent metadata means 1-based, the default for `annotate_vep` callers.
-    async fn vcf_coordinate_system_zero_based(&self) -> Result<bool> {
-        let table = self.session.table(&self.vcf_table).await?;
-        let schema = table.schema();
-        Ok(schema
-            .as_arrow()
-            .metadata()
-            .get("bio.coordinate_system_zero_based")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true")))
-    }
-
-    async fn discover_vcf_contigs(&self) -> Result<Vec<String>> {
-        let table = self.session.table(&self.vcf_table).await?;
-        let schema = table.schema();
-        let arrow_schema = schema.as_arrow();
+    async fn discover_vcf_contigs(&self, arrow_schema: &Schema) -> Result<Vec<String>> {
         let metadata = arrow_schema.metadata();
 
         // Priority 1: TBI-indexed contigs (only data-bearing contigs, zero cost).
@@ -5642,7 +5626,17 @@ impl AnnotateProvider {
 
         // Discover contigs from VCF.
         let t_contigs = profile_start!();
-        let vcf_contigs = self.discover_vcf_contigs().await?;
+        // One table resolution serves contig discovery and, with `regions`,
+        // the coordinate system the bounds must be expressed in.
+        let vcf_arrow_schema: SchemaRef = Arc::new(
+            self.session
+                .table(&self.vcf_table)
+                .await?
+                .schema()
+                .as_arrow()
+                .clone(),
+        );
+        let vcf_contigs = self.discover_vcf_contigs(&vcf_arrow_schema).await?;
         let contig_runs: Option<Arc<crate::regions::ContigRuns>> = match self.regions.as_deref() {
             None => None,
             Some(specs) => {
@@ -5653,7 +5647,7 @@ impl AnnotateProvider {
                             .to_string(),
                     ));
                 }
-                let zero_based = self.vcf_coordinate_system_zero_based().await?;
+                let zero_based = crate::coordinate::is_zero_based(&vcf_arrow_schema);
                 Some(Arc::new(crate::regions::resolve_regions(
                     specs,
                     &vcf_contigs,
@@ -10445,6 +10439,17 @@ impl ContigRun {
     }
 }
 
+/// The next region run to activate once a contig's current run has drained.
+/// A satisfied LIMIT ends the contig instead: the remaining runs could only
+/// produce rows that would be dropped, so they are discarded.
+fn next_region_run(limit_reached: bool, pending: &mut VecDeque<ContigRun>) -> Option<ContigRun> {
+    if limit_reached {
+        pending.clear();
+        return None;
+    }
+    pending.pop_front()
+}
+
 /// What a later run of the same contig needs to build its lookup after the
 /// first run has consumed `ContigPreparedData`.
 #[derive(Clone)]
@@ -13516,12 +13521,7 @@ impl Stream for ContigAnnotationStream {
                     // rebuild the lookup for the next window, warm up again. A
                     // satisfied LIMIT ends the contig instead: the remaining runs
                     // could only produce rows that would be dropped.
-                    let next_run = if limit_reached {
-                        None
-                    } else {
-                        ann.pending_runs.pop_front()
-                    };
-                    if let Some(next) = next_run {
+                    if let Some(next) = next_region_run(limit_reached, &mut ann.pending_runs) {
                         abort_annotation_lookup_partitions(&mut ann);
                         ann.worker.reset_for_next_run();
                         ann.run = ActiveRunState::from_run(&next);
@@ -15249,6 +15249,27 @@ mod tests {
         build(r#"{"workers":1,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
             .expect("workers=1 with regions is accepted");
         build(r#"{"workers":4}"#).expect("workers>1 without regions is unchanged");
+    }
+
+    #[test]
+    fn limit_reached_stops_region_run_chaining() {
+        let run = |lo: i64| ContigRun {
+            bounds: vec![RunBounds {
+                lo: Some(lo),
+                hi: Some(lo + 10),
+            }],
+            slice: None,
+        };
+        let mut pending: VecDeque<ContigRun> = VecDeque::from([run(1), run(100), run(200)]);
+        let next = next_region_run(false, &mut pending).expect("first pending run");
+        assert_eq!(next.bounds[0].lo, Some(1));
+        assert_eq!(pending.len(), 2);
+        assert!(next_region_run(true, &mut pending).is_none());
+        assert!(
+            pending.is_empty(),
+            "a satisfied LIMIT discards the remaining runs"
+        );
+        assert!(next_region_run(false, &mut pending).is_none());
     }
 
     #[test]
