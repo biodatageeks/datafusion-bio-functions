@@ -10979,6 +10979,222 @@ impl ParallelContigState {
     }
 }
 
+/// Guard that aborts a lookup worker when its run task ends or is aborted, so
+/// no lookup outlives its consumer.
+struct AbortJoinOnDrop(tokio::task::JoinHandle<Result<()>>);
+
+impl Drop for AbortJoinOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// One run of the streaming pool: its task, its output channel and, once the
+/// task has finished, its stats. Dropping it aborts the task.
+struct RunTask {
+    join: Option<tokio::task::JoinHandle<Result<RunStats>>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<RecordBatch>,
+    stats: Option<RunStats>,
+    started: Instant,
+}
+
+impl RunTask {
+    fn running(&self) -> bool {
+        self.stats.is_none()
+    }
+
+    /// Poll the task's completion. `Ready(Ok(()))` once its stats are stored
+    /// (and on every later call); errors and panics come back as errors.
+    fn poll_join(&mut self, cx: &mut TaskCtx<'_>) -> Poll<Result<()>> {
+        let Some(join) = self.join.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(join).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Ok(stats))) => {
+                self.stats = Some(stats);
+                self.join = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
+            Poll::Ready(Err(join_err)) => {
+                Poll::Ready(Err(DataFusionError::External(Box::new(join_err))))
+            }
+        }
+    }
+}
+
+impl Drop for RunTask {
+    fn drop(&mut self) {
+        if let Some(join) = &self.join {
+            join.abort();
+        }
+    }
+}
+
+/// State of the `workers>1` streaming path: a pool of run tasks over one
+/// contig's grid-ordered runs. The head run's batches are forwarded live;
+/// later runs buffer in their channels until released in index order.
+struct RunPoolState {
+    /// Runs not yet started, in grid order; `next_start` is the index of the
+    /// front element.
+    pending: VecDeque<ContigRun>,
+    /// Lookup partitions of run 0, already activated by
+    /// `activate_contig_lookups`; taken when run 0 is spawned.
+    first_lookup: Option<VecDeque<LookupPartitionHandle>>,
+    total_runs: usize,
+    next_start: usize,
+    /// Index of the run whose output is being released.
+    head: usize,
+    /// Started runs not yet released, by index.
+    active: HashMap<usize, RunTask>,
+    workers: usize,
+    lookahead: usize,
+    run_inputs: RunActivationInputs,
+    chrom: String,
+    config: ContigAnnotationConfig,
+    session: Arc<SessionContext>,
+    shared: Arc<SharedContigAnnotationContext>,
+    ephemeral_tables: Vec<String>,
+    /// See `ContigReadyState::t_contig_active`.
+    t_contig_active: Instant,
+    pipeline_profile: Option<SharedContigPipelineProfile>,
+    contig_rows: usize,
+    /// Set while the head has no batch ready but a later run has finished:
+    /// the time the ordered release spends waiting on a straggling head.
+    head_wait_started: Option<Instant>,
+}
+
+impl RunPoolState {
+    fn running(&self) -> usize {
+        self.active.values().filter(|t| t.running()).count()
+    }
+
+    /// Start runs while a worker slot is free and the release window allows.
+    fn admit(&mut self) {
+        while admission_allows(
+            self.running(),
+            self.head,
+            self.next_start,
+            self.total_runs,
+            self.workers,
+            self.lookahead,
+        ) {
+            let index = self.next_start;
+            let run = self
+                .pending
+                .pop_front()
+                .expect("pending runs cover every index below total_runs");
+            let preactivated = if index == 0 {
+                self.first_lookup.take()
+            } else {
+                None
+            };
+            let task = spawn_run_task(self, index, run, preactivated);
+            self.active.insert(index, task);
+            self.next_start += 1;
+        }
+    }
+
+    /// Abort every task and lookup (error, LIMIT, or drop).
+    fn abort(&mut self) {
+        self.active.clear(); // RunTask::drop aborts the task, which drops its lookup guard
+        self.pending.clear();
+        self.first_lookup = None; // LookupPartitionHandle::drop aborts run 0's lookup
+    }
+}
+
+/// Spawn the task for run `index`: activate its lookup (unless run 0's is
+/// handed in), then run the shared worker body into the run's channel.
+fn spawn_run_task(
+    pool: &RunPoolState,
+    index: usize,
+    run: ContigRun,
+    preactivated: Option<VecDeque<LookupPartitionHandle>>,
+) -> RunTask {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let session = Arc::clone(&pool.session);
+    let inputs = pool.run_inputs.clone();
+    let config = pool.config.clone();
+    let chrom = pool.chrom.clone();
+    let shared = Arc::clone(&pool.shared);
+    let profile = pool.pipeline_profile.clone();
+    let join = tokio::spawn(async move {
+        let t_start = Instant::now();
+        pipeline_trace::emit(
+            "run_pool",
+            "start",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("run", TraceValue::Usize(index)),
+            ],
+        );
+        let mut handles = match preactivated {
+            Some(handles) => handles,
+            None => {
+                activate_run_lookup(
+                    session,
+                    inputs,
+                    config.clone(),
+                    chrom.clone(),
+                    run.clone(),
+                    profile,
+                )
+                .await?
+            }
+        };
+        if handles.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "streaming run pool expects one lookup partition per run, got {}",
+                handles.len()
+            )));
+        }
+        let mut handle = handles.pop_front().expect("one handle");
+        let Some((lookup_rx, lookup_join)) = handle.take_spawned_parts() else {
+            return Err(DataFusionError::Internal(
+                "streaming run pool requires spawned lookup partitions".to_string(),
+            ));
+        };
+        let _lookup_guard = AbortJoinOnDrop(lookup_join);
+        let emit_bounds = if run.bounds.iter().all(RunBounds::is_open) {
+            None
+        } else {
+            Some(run.bounds.clone())
+        };
+        let mut output = RunOutput::Batches { tx };
+        let stats = annotate_lookup_run(
+            shared,
+            lookup_rx,
+            config.cache_source_type,
+            config.projection.clone(),
+            config.input_buffer_size,
+            run.slice.clone(),
+            emit_bounds,
+            &mut output,
+        )
+        .await?;
+        pipeline_trace::emit(
+            "run_pool",
+            "done",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("run", TraceValue::Usize(index)),
+                ("input_rows", TraceValue::Usize(stats.input_rows)),
+                ("output_rows", TraceValue::Usize(stats.output_rows)),
+                ("warm_up_rows", TraceValue::Usize(stats.warm_up_rows)),
+                ("elapsed", TraceValue::Duration(t_start.elapsed())),
+            ],
+        );
+        Ok(stats)
+    });
+    RunTask {
+        join: Some(join),
+        rx,
+        stats: None,
+        started: Instant::now(),
+    }
+}
+
 /// Copy-on-write transcript: the same borrowed-or-owned shape as
 /// `std::borrow::Cow`, but the `Borrowed` arm stores an *index* into
 /// `SharedContigAnnotationContext::base_transcripts` instead of a reference, so
@@ -11055,6 +11271,8 @@ enum StreamState {
     AnnotatingContig(ContigAnnotationState),
     /// threads>1: drain N independent per-partition pipelines in partition order.
     AnnotatingParallel(ParallelContigState),
+    /// `workers>1` streaming path: the run pool (see `RunPoolState`).
+    AnnotatingRunPool(RunPoolState),
     /// Await the oldest in-flight fused window task (FIFO preserves output order).
     AwaitingWindow {
         handle: tokio::task::JoinHandle<WindowAnnotateResult>,
@@ -11851,6 +12069,11 @@ impl ContigAnnotationStream {
                 state.abort();
                 deregister_tables_sync(&state.session, &state.ephemeral_tables);
                 state.ephemeral_tables.clear();
+            }
+            StreamState::AnnotatingRunPool(pool) => {
+                pool.abort();
+                deregister_tables_sync(&pool.session, &pool.ephemeral_tables);
+                pool.ephemeral_tables.clear();
             }
             StreamState::CleaningUp(_) | StreamState::ErrorCleaningUp(_, _) => {}
             StreamState::StartContig
@@ -13886,6 +14109,10 @@ impl Stream for ContigAnnotationStream {
                         unreachable!()
                     };
                     self.state = StreamState::AnnotatingContig(ann);
+                }
+
+                StreamState::AnnotatingRunPool(_) => {
+                    unreachable!("wired in the next commit")
                 }
 
                 StreamState::CleaningUp(fut) => match fut.as_mut().poll(cx) {
@@ -17512,6 +17739,54 @@ mod tests {
         let mut out = RunOutput::Batches { tx };
         let err = out.write(batch).expect_err("dropped receiver must surface");
         assert!(err.to_string().contains("run pool"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_task_reports_running_until_joined() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RecordBatch>();
+        let join = tokio::spawn(async {
+            Ok(RunStats {
+                input_rows: 3,
+                output_rows: 4,
+                warm_up_rows: 0,
+            })
+        });
+        let mut task = RunTask {
+            join: Some(join),
+            rx,
+            stats: None,
+            started: Instant::now(),
+        };
+        assert!(task.running());
+        // Poll until the spawned task has resolved.
+        std::future::poll_fn(|cx| task.poll_join(cx))
+            .await
+            .expect("join ok");
+        assert!(!task.running());
+        assert_eq!(task.stats.unwrap().output_rows, 4);
+        // A second poll is a no-op.
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(task.poll_join(cx))).await,
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_task_surfaces_task_errors() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RecordBatch>();
+        let join = tokio::spawn(async {
+            Err::<RunStats, _>(DataFusionError::Execution("boom".to_string()))
+        });
+        let mut task = RunTask {
+            join: Some(join),
+            rx,
+            stats: None,
+            started: Instant::now(),
+        };
+        let err = std::future::poll_fn(|cx| task.poll_join(cx))
+            .await
+            .expect_err("error surfaces");
+        assert!(err.to_string().contains("boom"));
     }
 
     #[test]
