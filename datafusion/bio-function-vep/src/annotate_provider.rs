@@ -11355,9 +11355,217 @@ pub(crate) struct ShardResult {
     pub(crate) output_lines: usize,
 }
 
-fn spawn_annotation_from_lookup_sharded(
+/// Where a run's annotated batches go: the VCF sink's body shard, or the
+/// streaming run pool's per-run channel. The worker body is shared, so the
+/// two paths cannot drift.
+enum RunOutput {
+    Shard {
+        shard: Box<crate::vcf_sink::VcfBodyShardWriter>,
+        rows_done: Arc<std::sync::atomic::AtomicUsize>,
+    },
+    Batches {
+        tx: tokio::sync::mpsc::UnboundedSender<RecordBatch>,
+    },
+}
+
+impl RunOutput {
+    fn write(&mut self, batch: RecordBatch) -> Result<()> {
+        match self {
+            RunOutput::Shard { shard, .. } => shard.write_batch(batch),
+            RunOutput::Batches { tx } => tx.send(batch).map_err(|_| {
+                DataFusionError::Execution(
+                    "run pool output receiver dropped before the run finished".to_string(),
+                )
+            }),
+        }
+    }
+
+    /// Progress accounting after a window: the sink's live progress bar reads
+    /// `rows_done`; the pool has no such counter.
+    fn window_done(&self, input_rows: usize) {
+        if let RunOutput::Shard { rows_done, .. } = self {
+            rows_done.fetch_add(input_rows, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Per-run counters reported by `annotate_lookup_run`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RunStats {
+    /// Emit-range input rows annotated.
+    input_rows: usize,
+    /// Annotated rows written to the output.
+    output_rows: usize,
+    /// Warm-up rows replayed state-only (Merged/RefSeq seams).
+    warm_up_rows: usize,
+}
+
+/// The fused lookup -> gate -> warm-up -> hydrate -> annotate loop of one run
+/// (formerly the body of `spawn_annotation_from_lookup_sharded`). Drains one
+/// ordered lookup partition, applies the grid slice (skip ties, warm-up
+/// replay, rank-stop), cuts windows of `input_buffer_size` input units, and
+/// writes every annotated batch to `output`. `emit_bounds` trims each window
+/// to a region's intervals (`None` = no trim).
+#[allow(clippy::too_many_arguments)]
+async fn annotate_lookup_run(
     shared: Arc<SharedContigAnnotationContext>,
     mut lookup_rx: tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
+    cache_source_type: CacheSourceType,
+    projection: Option<Vec<usize>>,
+    input_buffer_size: usize,
+    slice: Option<WorkerGridSlice>,
+    emit_bounds: Option<Vec<RunBounds>>,
+    output: &mut RunOutput,
+) -> Result<RunStats> {
+    let mut worker = AnnotationWorkerState::new(shared)?;
+    let mut stats = RunStats::default();
+    // Grid bounds (global row ranks). The worker's stream is its
+    // [scan_lo_pos, scan_hi_pos) window; its first row is rank `warm_up_start`
+    // after dropping `skip_leading_rows` tie-rows at scan_lo_pos. Without a
+    // slice (byte-budget path) it emits the whole stream with no warm-up.
+    let (mut to_skip, warm_up_start, emit_start, emit_end) = match &slice {
+        Some(s) => (
+            s.skip_leading_rows,
+            s.warm_up_start_row,
+            s.emit_start_row,
+            s.emit_end_row,
+        ),
+        None => (0usize, 0usize, 0usize, usize::MAX),
+    };
+    let mut global_row = warm_up_start; // rank of the first kept row
+    let mut warm_up_batches: Vec<RecordBatch> = Vec::new();
+    let mut warmed_up = emit_start <= warm_up_start; // worker 0 / no warm-up region
+    // Drain lookup → local colocated map → (skip ties | warm-up state-only |
+    // emit | discard >=emit_end) → annotate emit windows → write to the output.
+    while let Some(msg) = lookup_rx.recv().await {
+        let msg = msg?;
+        merge_colocated_delta(&mut worker.colocated_map, msg.colocated_delta);
+        let mut batch = msg.batch;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        // Drop leading tie-rows at scan_lo_pos that belong to the previous
+        // buffer (rank < warm_up_start).
+        if to_skip > 0 {
+            let drop = to_skip.min(batch.num_rows());
+            let remaining = batch.num_rows() - drop;
+            batch = batch.slice(drop, remaining);
+            to_skip -= drop;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+        }
+        let n = batch.num_rows();
+        let batch_start = global_row;
+        let batch_end = global_row + n;
+        global_row = batch_end;
+
+        // Split by global rank: warm-up ([warm_up_start, emit_start)), emit
+        // ([emit_start, emit_end)), trailing discard (>= emit_end).
+        let warm_end = emit_start.saturating_sub(batch_start).min(n);
+        let emit_from = warm_end;
+        let emit_to = emit_end.saturating_sub(batch_start).min(n);
+        if warm_end > 0 {
+            warm_up_batches.push(batch.slice(0, warm_end));
+        }
+        // Once we reach emit_start, replay the collected warm-up buffers
+        // state-only so the carried HGNC state is correct before emitting.
+        if !warmed_up && batch_end >= emit_start {
+            let wbatches = std::mem::take(&mut warm_up_batches);
+            stats.warm_up_rows += wbatches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            run_maybe_block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
+            warmed_up = true;
+        }
+        if emit_to > emit_from {
+            worker
+                .window_buffer
+                .push(batch.slice(emit_from, emit_to - emit_from));
+        }
+        // Cut windows at exactly `input_buffer_size` VEP INPUT UNITS (alt-allele
+        // count), matching the serial/grid buffer cuts: a multi-allelic row like
+        // `A,C` counts as two units. Counting Arrow rows here would misalign the
+        // shard-local cuts against the contig-global grid, changing buffer-local
+        // HGNC/transcript donation only under parallel output. Mirrors the
+        // `AnnotatingContig` grid path's `window_buffer_input_units` +
+        // `drain_window_input_units`.
+        while window_buffer_input_units(&worker.window_buffer) >= input_buffer_size {
+            let window = drain_window_input_units(&mut worker.window_buffer, input_buffer_size);
+            let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
+            run_maybe_block_in_place(|| -> Result<()> {
+                hydrate_worker_window(&mut worker, &window, cache_source_type)?;
+                let out = annotate_worker_window(
+                    &mut worker,
+                    &window,
+                    projection.as_deref(),
+                    emit_bounds.as_deref(),
+                )?;
+                for b in out {
+                    stats.output_rows += b.num_rows();
+                    output.write(b)?;
+                }
+                Ok(())
+            })?;
+            // Report annotated input rows so the sink's progress bar advances live.
+            stats.input_rows += window_input_rows;
+            output.window_done(window_input_rows);
+        }
+        if batch_end >= emit_end {
+            break; // rank-stop: emitted this worker's whole range
+        }
+    }
+    // Stream ended before the emit range was reached (e.g. tiny tail worker):
+    // still replay any pending warm-up so state is consistent.
+    if !warmed_up {
+        let wbatches = std::mem::take(&mut warm_up_batches);
+        stats.warm_up_rows += wbatches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        run_maybe_block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
+    }
+    // Final flush: annotate the remaining partial emit window.
+    worker.lookup_done = true;
+    let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
+    let window_input_rows: usize = window.iter().map(|b| b.num_rows()).sum();
+    run_maybe_block_in_place(|| -> Result<()> {
+        if !window.is_empty() {
+            hydrate_worker_window(&mut worker, &window, cache_source_type)?;
+        }
+        let out = annotate_worker_window(
+            &mut worker,
+            &window,
+            projection.as_deref(),
+            emit_bounds.as_deref(),
+        )?;
+        for b in out {
+            stats.output_rows += b.num_rows();
+            output.write(b)?;
+        }
+        Ok(())
+    })?;
+    stats.input_rows += window_input_rows;
+    output.window_done(window_input_rows);
+    if profiling_enabled() {
+        eprintln!(
+            "[VEP_RSS] run done colocated_entries={} input_rows={} output_rows={} peak_rss={}MB",
+            worker.colocated_map.len(),
+            stats.input_rows,
+            stats.output_rows,
+            peak_rss_mb(),
+        );
+    }
+    Ok(stats)
+}
+
+/// `threads>1` sharded-output worker: drains its lookup partition, annotates
+/// full windows inline (the shared `annotate_lookup_run` body), and streams
+/// each annotated batch directly into its own VCF body shard via
+/// [`crate::vcf_sink::VcfBodyShardWriter`] — no output channel, no ordered
+/// drain. Returns the shard's row counts (for contig row accounting). On error
+/// the shard may be left partially written; the orchestrator aborts the
+/// sibling workers and surfaces the error before any concat, so no partial
+/// shard is ever assembled.
+#[allow(clippy::too_many_arguments)]
+fn spawn_annotation_from_lookup_sharded(
+    shared: Arc<SharedContigAnnotationContext>,
+    lookup_rx: tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
     cache_source_type: CacheSourceType,
     projection: Option<Vec<usize>>,
     input_buffer_size: usize,
@@ -11366,8 +11574,7 @@ fn spawn_annotation_from_lookup_sharded(
     slice: Option<WorkerGridSlice>,
 ) -> tokio::task::JoinHandle<Result<ShardResult>> {
     tokio::spawn(async move {
-        let mut worker = AnnotationWorkerState::new(shared)?;
-        let mut shard = crate::vcf_sink::VcfBodyShardWriter::create(
+        let shard = crate::vcf_sink::VcfBodyShardWriter::create(
             &shard_path,
             Arc::clone(&shard_ctx.vcf_info_fields),
             Arc::clone(&shard_ctx.unique_format_tags),
@@ -11375,129 +11582,26 @@ fn spawn_annotation_from_lookup_sharded(
             shard_ctx.coordinate_zero_based,
             shard_ctx.shard_compression,
         )?;
-        // Grid bounds (global row ranks). The worker's stream is its
-        // [scan_lo_pos, scan_hi_pos) window; its first row is rank `warm_up_start`
-        // after dropping `skip_leading_rows` tie-rows at scan_lo_pos. Without a
-        // slice (byte-budget path) it emits the whole stream with no warm-up.
-        let (mut to_skip, warm_up_start, emit_start, emit_end) = match &slice {
-            Some(s) => (
-                s.skip_leading_rows,
-                s.warm_up_start_row,
-                s.emit_start_row,
-                s.emit_end_row,
-            ),
-            None => (0usize, 0usize, 0usize, usize::MAX),
+        let mut output = RunOutput::Shard {
+            shard: Box::new(shard),
+            rows_done: Arc::clone(&shard_ctx.rows_done),
         };
-        let mut global_row = warm_up_start; // rank of the first kept row
-        let mut warm_up_batches: Vec<RecordBatch> = Vec::new();
-        let mut warmed_up = emit_start <= warm_up_start; // worker 0 / no warm-up region
-        // Drain lookup → local colocated map → (skip ties | warm-up state-only |
-        // emit | discard >=emit_end) → annotate emit windows → write to the shard.
-        while let Some(msg) = lookup_rx.recv().await {
-            let msg = msg?;
-            merge_colocated_delta(&mut worker.colocated_map, msg.colocated_delta);
-            let mut batch = msg.batch;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            // Drop leading tie-rows at scan_lo_pos that belong to the previous
-            // buffer (rank < warm_up_start).
-            if to_skip > 0 {
-                let drop = to_skip.min(batch.num_rows());
-                let remaining = batch.num_rows() - drop;
-                batch = batch.slice(drop, remaining);
-                to_skip -= drop;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-            }
-            let n = batch.num_rows();
-            let batch_start = global_row;
-            let batch_end = global_row + n;
-            global_row = batch_end;
-
-            // Split by global rank: warm-up ([warm_up_start, emit_start)), emit
-            // ([emit_start, emit_end)), trailing discard (>= emit_end).
-            let warm_end = emit_start.saturating_sub(batch_start).min(n);
-            let emit_from = warm_end;
-            let emit_to = emit_end.saturating_sub(batch_start).min(n);
-            if warm_end > 0 {
-                warm_up_batches.push(batch.slice(0, warm_end));
-            }
-            // Once we reach emit_start, replay the collected warm-up buffers
-            // state-only so the carried HGNC state is correct before emitting.
-            if !warmed_up && batch_end >= emit_start {
-                let wbatches = std::mem::take(&mut warm_up_batches);
-                run_maybe_block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
-                warmed_up = true;
-            }
-            if emit_to > emit_from {
-                worker
-                    .window_buffer
-                    .push(batch.slice(emit_from, emit_to - emit_from));
-            }
-            // Cut windows at exactly `input_buffer_size` VEP INPUT UNITS (alt-allele
-            // count), matching the serial/grid buffer cuts: a multi-allelic row like
-            // `A,C` counts as two units. Counting Arrow rows here would misalign the
-            // shard-local cuts against the contig-global grid, changing buffer-local
-            // HGNC/transcript donation only under parallel VCF output. Mirrors the
-            // `AnnotatingContig` grid path's `window_buffer_input_units` +
-            // `drain_window_input_units`.
-            while window_buffer_input_units(&worker.window_buffer) >= input_buffer_size {
-                let window = drain_window_input_units(&mut worker.window_buffer, input_buffer_size);
-                let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
-                run_maybe_block_in_place(|| -> Result<()> {
-                    hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-                    let out =
-                        annotate_worker_window(&mut worker, &window, projection.as_deref(), None)?;
-                    for b in out {
-                        shard.write_batch(b)?;
-                    }
-                    Ok(())
-                })?;
-                // Report annotated input rows so the progress bar advances live.
-                shard_ctx
-                    .rows_done
-                    .fetch_add(window_input_rows, std::sync::atomic::Ordering::Relaxed);
-            }
-            if batch_end >= emit_end {
-                break; // rank-stop: emitted this worker's whole range
-            }
-        }
-        // Stream ended before the emit range was reached (e.g. tiny tail worker):
-        // still replay any pending warm-up so state is consistent.
-        if !warmed_up {
-            let wbatches = std::mem::take(&mut warm_up_batches);
-            run_maybe_block_in_place(|| warm_up_worker_state(&mut worker, wbatches))?;
-        }
-        // Final flush: annotate the remaining partial emit window.
-        worker.lookup_done = true;
-        let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
-        let window_input_rows: usize = window.iter().map(|b| b.num_rows()).sum();
-        run_maybe_block_in_place(|| -> Result<()> {
-            if !window.is_empty() {
-                hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-            }
-            let out = annotate_worker_window(&mut worker, &window, projection.as_deref(), None)?;
-            for b in out {
-                shard.write_batch(b)?;
-            }
-            Ok(())
-        })?;
-        shard_ctx
-            .rows_done
-            .fetch_add(window_input_rows, std::sync::atomic::Ordering::Relaxed);
-        if profiling_enabled() {
-            eprintln!(
-                "[VEP_RSS] shard partition done colocated_entries={} shard_rows={} peak_rss={}MB",
-                worker.colocated_map.len(),
-                shard.input_rows,
-                peak_rss_mb(),
-            );
-        }
+        annotate_lookup_run(
+            shared,
+            lookup_rx,
+            cache_source_type,
+            projection,
+            input_buffer_size,
+            slice,
+            None,
+            &mut output,
+        )
+        .await?;
+        let RunOutput::Shard { shard, .. } = output else {
+            unreachable!("sharded output is a shard")
+        };
         let input_rows = shard.input_rows;
         let output_lines = shard.lines;
-        let _ = (emit_start, emit_end, global_row);
         shard.finish()?;
         Ok(ShardResult {
             input_rows,
@@ -17359,6 +17463,55 @@ mod tests {
             contig_modes(false, 4, false, CacheSourceType::Merged, true),
             modes(false, false, false)
         );
+    }
+
+    #[test]
+    fn run_output_batches_forwards_in_order() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]));
+        let batch = |tag: i64| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                    tag,
+                ]))],
+            )
+            .unwrap()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut out = RunOutput::Batches { tx };
+        out.write(batch(1)).unwrap();
+        out.write(batch(2)).unwrap();
+        out.window_done(7); // no-op for batches
+        drop(out);
+        let mut tags = Vec::new();
+        while let Ok(b) = rx.try_recv() {
+            tags.push(
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+            );
+        }
+        assert_eq!(tags, vec![1, 2]);
+        assert!(rx.try_recv().is_err(), "sender dropped -> channel closed");
+    }
+
+    #[test]
+    fn run_output_batches_errors_when_receiver_is_gone() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                1,
+            ]))],
+        )
+        .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let mut out = RunOutput::Batches { tx };
+        let err = out.write(batch).expect_err("dropped receiver must surface");
+        assert!(err.to_string().contains("run pool"), "{err}");
     }
 
     #[test]
