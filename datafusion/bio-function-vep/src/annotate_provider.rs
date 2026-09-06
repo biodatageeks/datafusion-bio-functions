@@ -10974,11 +10974,21 @@ impl ParallelContigState {
 
 /// Guard that aborts a lookup worker when its run task ends or is aborted, so
 /// no lookup outlives its consumer.
-struct AbortJoinOnDrop(tokio::task::JoinHandle<Result<()>>);
+struct AbortJoinOnDrop(Option<tokio::task::JoinHandle<Result<()>>>);
+
+impl AbortJoinOnDrop {
+    /// Hand the handle back to await it (its result matters once the channel
+    /// has closed); the guard then aborts nothing.
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<Result<()>>> {
+        self.0.take()
+    }
+}
 
 impl Drop for AbortJoinOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(join) = &self.0 {
+            join.abort();
+        }
     }
 }
 
@@ -10986,7 +10996,7 @@ impl Drop for AbortJoinOnDrop {
 /// task has finished, its stats. Dropping it aborts the task.
 struct RunTask {
     join: Option<tokio::task::JoinHandle<Result<RunStats>>>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<RecordBatch>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<RunBatch>,
     stats: Option<RunStats>,
     started: Instant,
 }
@@ -11043,6 +11053,8 @@ struct RunPoolState {
     active: HashMap<usize, RunTask>,
     workers: usize,
     lookahead: usize,
+    /// Byte budget for batches queued by runs behind the head.
+    budget: Arc<OutputBudget>,
     run_inputs: RunActivationInputs,
     chrom: String,
     config: ContigAnnotationConfig,
@@ -11112,6 +11124,7 @@ fn spawn_run_task(
     let chrom = pool.chrom.clone();
     let shared = Arc::clone(&pool.shared);
     let profile = pool.pipeline_profile.clone();
+    let budget = Arc::clone(&pool.budget);
     let join = tokio::spawn(async move {
         let t_start = Instant::now();
         pipeline_trace::emit(
@@ -11148,13 +11161,13 @@ fn spawn_run_task(
                 "streaming run pool requires spawned lookup partitions".to_string(),
             ));
         };
-        let _lookup_guard = AbortJoinOnDrop(lookup_join);
+        let mut lookup_guard = AbortJoinOnDrop(Some(lookup_join));
         let emit_bounds = if run.bounds.iter().all(RunBounds::is_open) {
             None
         } else {
             Some(run.bounds.clone())
         };
-        let mut output = RunOutput::Batches { tx };
+        let mut output = RunOutput::Batches { tx, budget, index };
         let stats = annotate_lookup_run(
             shared,
             lookup_rx,
@@ -11166,6 +11179,18 @@ fn spawn_run_task(
             &mut output,
         )
         .await?;
+        // A lookup failure closes the channel exactly like a completed lookup
+        // does, so a run that drained to the close must surface the worker's
+        // result; a rank-stopped run leaves the guard to abort the worker.
+        if stats.lookup_closed {
+            if let Some(lookup_join) = lookup_guard.take() {
+                match lookup_join.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(join_err) => return Err(DataFusionError::External(Box::new(join_err))),
+                }
+            }
+        }
         pipeline_trace::emit(
             "run_pool",
             "done",
@@ -11566,6 +11591,82 @@ pub(crate) struct ShardResult {
     pub(crate) output_lines: usize,
 }
 
+const MIB: usize = 1 << 20;
+/// Default byte budget (MiB) for annotated batches queued by runs behind the
+/// head of the streaming run pool (`VEP_STREAM_BUFFER_MB`).
+const STREAM_BUFFER_MB_DEFAULT: usize = 1024;
+
+/// Byte budget for the streaming run pool's queued output. `env` is
+/// `VEP_STREAM_BUFFER_MB`.
+fn stream_buffer_mb(env: Option<&str>) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(STREAM_BUFFER_MB_DEFAULT)
+}
+
+/// Backpressure for the streaming run pool: every batch a run queues behind
+/// the head charges its Arrow size (in whole MiB) against one shared budget
+/// and carries the permit until the stream hands the batch to the caller.
+/// The head run is exempt, so the drain can never wait on a run that is
+/// itself waiting for budget held by runs behind it; a run that becomes the
+/// head while waiting is woken by the head watch and sends without a permit.
+struct OutputBudget {
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Budget in MiB (= permits).
+    cap: usize,
+    head_tx: tokio::sync::watch::Sender<usize>,
+}
+
+impl OutputBudget {
+    fn new(cap_mb: usize) -> Arc<Self> {
+        let cap = cap_mb.max(1);
+        Arc::new(Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(cap)),
+            cap,
+            head_tx: tokio::sync::watch::Sender::new(0),
+        })
+    }
+
+    /// Announce the run whose output is now being released.
+    fn set_head(&self, head: usize) {
+        self.head_tx.send_replace(head);
+    }
+
+    /// Wait for budget for `bytes` queued by run `index`; `None` when the run
+    /// is the head (no charge). A batch larger than the whole budget charges
+    /// the whole budget.
+    async fn charge(
+        &self,
+        index: usize,
+        bytes: usize,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let n = bytes.div_ceil(MIB).clamp(1, self.cap) as u32;
+        let mut head = self.head_tx.subscribe();
+        loop {
+            if *head.borrow_and_update() == index {
+                return None;
+            }
+            if let Ok(permit) = Arc::clone(&self.permits).try_acquire_many_owned(n) {
+                return Some(permit);
+            }
+            tokio::select! {
+                changed = head.changed() => {
+                    if changed.is_err() {
+                        // The pool is gone; nothing will ever drain us.
+                        return None;
+                    }
+                }
+                permit = Arc::clone(&self.permits).acquire_many_owned(n) => {
+                    return Some(permit.expect("output budget semaphore is never closed"));
+                }
+            }
+        }
+    }
+}
+
+/// A run's queued batch plus the budget it holds until the caller receives it.
+type RunBatch = (RecordBatch, Option<tokio::sync::OwnedSemaphorePermit>);
+
 /// Where a run's annotated batches go: the VCF sink's body shard, or the
 /// streaming run pool's per-run channel. The worker body is shared, so the
 /// two paths cannot drift.
@@ -11575,20 +11676,38 @@ enum RunOutput {
         rows_done: Arc<std::sync::atomic::AtomicUsize>,
     },
     Batches {
-        tx: tokio::sync::mpsc::UnboundedSender<RecordBatch>,
+        tx: tokio::sync::mpsc::UnboundedSender<RunBatch>,
+        budget: Arc<OutputBudget>,
+        /// Run index, for the head exemption.
+        index: usize,
     },
 }
 
 impl RunOutput {
-    fn write(&mut self, batch: RecordBatch) -> Result<()> {
+    /// Write one window's annotated batches; returns the rows written. The
+    /// shard write is blocking IO (formatting + compression) and runs under
+    /// `block_in_place`; the pool write awaits the output budget first.
+    async fn write_all(&mut self, out: VecDeque<RecordBatch>) -> Result<usize> {
+        let rows: usize = out.iter().map(RecordBatch::num_rows).sum();
         match self {
-            RunOutput::Shard { shard, .. } => shard.write_batch(batch),
-            RunOutput::Batches { tx } => tx.send(batch).map_err(|_| {
-                DataFusionError::Execution(
-                    "run pool output receiver dropped before the run finished".to_string(),
-                )
-            }),
+            RunOutput::Shard { shard, .. } => run_maybe_block_in_place(|| -> Result<()> {
+                for b in out {
+                    shard.write_batch(b)?;
+                }
+                Ok(())
+            })?,
+            RunOutput::Batches { tx, budget, index } => {
+                for b in out {
+                    let permit = budget.charge(*index, b.get_array_memory_size()).await;
+                    tx.send((b, permit)).map_err(|_| {
+                        DataFusionError::Execution(
+                            "run pool output receiver dropped before the run finished".to_string(),
+                        )
+                    })?;
+                }
+            }
         }
+        Ok(rows)
     }
 
     /// Progress accounting after a window: the sink's live progress bar reads
@@ -11609,6 +11728,10 @@ struct RunStats {
     output_rows: usize,
     /// Warm-up rows replayed state-only (Merged/RefSeq seams).
     warm_up_rows: usize,
+    /// True when the lookup channel closed (the lookup worker ended) rather
+    /// than the run rank-stopping; the caller must then inspect the lookup
+    /// worker's result, since a failed lookup closes the channel the same way.
+    lookup_closed: bool,
 }
 
 /// The fused lookup -> gate -> warm-up -> hydrate -> annotate loop of one run
@@ -11646,6 +11769,7 @@ async fn annotate_lookup_run(
     let mut global_row = warm_up_start; // rank of the first kept row
     let mut warm_up_batches: Vec<RecordBatch> = Vec::new();
     let mut warmed_up = emit_start <= warm_up_start; // worker 0 / no warm-up region
+    let mut lookup_closed = true;
     // Drain lookup → local colocated map → (skip ties | warm-up state-only |
     // emit | discard >=emit_end) → annotate emit windows → write to the output.
     while let Some(msg) = lookup_rx.recv().await {
@@ -11702,28 +11826,26 @@ async fn annotate_lookup_run(
         while window_buffer_input_units(&worker.window_buffer) >= input_buffer_size {
             let window = drain_window_input_units(&mut worker.window_buffer, input_buffer_size);
             let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
-            run_maybe_block_in_place(|| -> Result<()> {
+            let out = run_maybe_block_in_place(|| -> Result<VecDeque<RecordBatch>> {
                 hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-                let out = annotate_worker_window(
+                annotate_worker_window(
                     &mut worker,
                     &window,
                     projection.as_deref(),
                     emit_bounds.as_deref(),
-                )?;
-                for b in out {
-                    stats.output_rows += b.num_rows();
-                    output.write(b)?;
-                }
-                Ok(())
+                )
             })?;
+            stats.output_rows += output.write_all(out).await?;
             // Report annotated input rows so the sink's progress bar advances live.
             stats.input_rows += window_input_rows;
             output.window_done(window_input_rows);
         }
         if batch_end >= emit_end {
+            lookup_closed = false;
             break; // rank-stop: emitted this worker's whole range
         }
     }
+    stats.lookup_closed = lookup_closed;
     // Stream ended before the emit range was reached (e.g. tiny tail worker):
     // still replay any pending warm-up so state is consistent.
     if !warmed_up {
@@ -11735,22 +11857,18 @@ async fn annotate_lookup_run(
     worker.lookup_done = true;
     let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
     let window_input_rows: usize = window.iter().map(|b| b.num_rows()).sum();
-    run_maybe_block_in_place(|| -> Result<()> {
+    let out = run_maybe_block_in_place(|| -> Result<VecDeque<RecordBatch>> {
         if !window.is_empty() {
             hydrate_worker_window(&mut worker, &window, cache_source_type)?;
         }
-        let out = annotate_worker_window(
+        annotate_worker_window(
             &mut worker,
             &window,
             projection.as_deref(),
             emit_bounds.as_deref(),
-        )?;
-        for b in out {
-            stats.output_rows += b.num_rows();
-            output.write(b)?;
-        }
-        Ok(())
+        )
     })?;
+    stats.output_rows += output.write_all(out).await?;
     stats.input_rows += window_input_rows;
     output.window_done(window_input_rows);
     if profiling_enabled() {
@@ -13631,6 +13749,9 @@ impl Stream for ContigAnnotationStream {
                                     active: HashMap::new(),
                                     workers,
                                     lookahead,
+                                    budget: OutputBudget::new(stream_buffer_mb(
+                                        std::env::var("VEP_STREAM_BUFFER_MB").ok().as_deref(),
+                                    )),
                                     run_inputs: ready.run_inputs.clone(),
                                     chrom: ready.chrom,
                                     config,
@@ -14203,7 +14324,10 @@ impl Stream for ContigAnnotationStream {
                         .get_mut(&head)
                         .expect("the head run is admitted before any later run");
                     match task.rx.poll_recv(cx) {
-                        Poll::Ready(Some(batch)) => {
+                        Poll::Ready(Some((batch, permit))) => {
+                            // The batch leaves the pool's queues: give its
+                            // budget back before handing it to the caller.
+                            drop(permit);
                             if let Some(started) = pool.head_wait_started.take() {
                                 record_contig_profile(&pool.pipeline_profile, |profile| {
                                     profile.head_wait += started.elapsed();
@@ -14255,6 +14379,7 @@ impl Stream for ContigAnnotationStream {
                                     );
                                     pool.active.remove(&head);
                                     pool.head += 1;
+                                    pool.budget.set_head(pool.head);
                                     self.state = StreamState::AnnotatingRunPool(pool);
                                     continue;
                                 }
@@ -14538,8 +14663,11 @@ async fn prepare_contig_data(
         contig_bounds.is_some(),
     );
     if stream_parallel {
-        // Parallelism comes from runs; each run's lookup is one ordered
-        // partition so the run task needs no fan-in.
+        // Parallelism comes from runs, not from partitions inside a run. This
+        // field only sizes the probe readers inside `KvLookupExec`; the run's
+        // *plan* still inherits the session's scan partitioning, which the
+        // run task reads in id order through one full-plan lookup worker
+        // (`activate_run_lookup`). Intentional: a run is one ordered stream.
         config.target_partitions = 1;
     }
 
@@ -17870,26 +17998,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_output_batches_forwards_in_order() {
+    fn tagged_batch(tag: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]));
-        let batch = |tag: i64| {
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
-                    tag,
-                ]))],
-            )
-            .unwrap()
-        };
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                tag,
+            ]))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_output_batches_forwards_in_order() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut out = RunOutput::Batches { tx };
-        out.write(batch(1)).unwrap();
-        out.write(batch(2)).unwrap();
+        let mut out = RunOutput::Batches {
+            tx,
+            budget: OutputBudget::new(4),
+            index: 1,
+        };
+        let rows = out
+            .write_all(VecDeque::from([tagged_batch(1), tagged_batch(2)]))
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
         out.window_done(7); // no-op for batches
         drop(out);
         let mut tags = Vec::new();
-        while let Ok(b) = rx.try_recv() {
+        while let Ok((b, permit)) = rx.try_recv() {
+            assert!(permit.is_some(), "a non-head run's batch carries budget");
             tags.push(
                 b.column(0)
                     .as_any()
@@ -17902,31 +18039,88 @@ mod tests {
         assert!(rx.try_recv().is_err(), "sender dropped -> channel closed");
     }
 
-    #[test]
-    fn run_output_batches_errors_when_receiver_is_gone() {
-        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
-                1,
-            ]))],
-        )
-        .unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_output_batches_errors_when_receiver_is_gone() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(rx);
-        let mut out = RunOutput::Batches { tx };
-        let err = out.write(batch).expect_err("dropped receiver must surface");
+        let mut out = RunOutput::Batches {
+            tx,
+            budget: OutputBudget::new(4),
+            index: 0,
+        };
+        let err = out
+            .write_all(VecDeque::from([tagged_batch(1)]))
+            .await
+            .expect_err("dropped receiver must surface");
         assert!(err.to_string().contains("run pool"), "{err}");
+    }
+
+    #[test]
+    fn stream_buffer_mb_default_and_override() {
+        assert_eq!(stream_buffer_mb(None), STREAM_BUFFER_MB_DEFAULT);
+        assert_eq!(stream_buffer_mb(Some("256")), 256);
+        assert_eq!(stream_buffer_mb(Some("0")), STREAM_BUFFER_MB_DEFAULT);
+        assert_eq!(stream_buffer_mb(Some("x")), STREAM_BUFFER_MB_DEFAULT);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_budget_exempts_head_and_blocks_others_until_released() {
+        let budget = OutputBudget::new(2); // 2 MiB
+        // The head never waits, whatever the size.
+        assert!(budget.charge(0, 10 * MIB).await.is_none());
+        // Run 1 takes the whole budget; run 2 must wait for it.
+        let held = budget.charge(1, 2 * MIB).await.expect("budget available");
+        let waiting = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.charge(2, MIB).await }
+        });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiting.is_finished(),
+            "run 2 must block while run 1 holds the budget"
+        );
+        drop(held);
+        let permit = waiting.await.unwrap();
+        assert!(
+            permit.is_some(),
+            "run 2 charged the budget once it was free"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_budget_wakes_a_waiter_that_becomes_head() {
+        let budget = OutputBudget::new(1);
+        let held = budget.charge(1, MIB).await.expect("budget available");
+        let waiting = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.charge(2, MIB).await }
+        });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished());
+        // Run 2 becomes the head: it is released without a permit even though
+        // run 1 still holds the whole budget.
+        budget.set_head(2);
+        let permit = waiting.await.unwrap();
+        assert!(
+            permit.is_none(),
+            "the head sends without charging the budget"
+        );
+        drop(held);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_task_reports_running_until_joined() {
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RecordBatch>();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunBatch>();
         let join = tokio::spawn(async {
             Ok(RunStats {
                 input_rows: 3,
                 output_rows: 4,
                 warm_up_rows: 0,
+                lookup_closed: true,
             })
         });
         let mut task = RunTask {
@@ -17951,7 +18145,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_task_surfaces_task_errors() {
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RecordBatch>();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunBatch>();
         let join = tokio::spawn(async {
             Err::<RunStats, _>(DataFusionError::Execution("boom".to_string()))
         });
