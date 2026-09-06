@@ -10918,6 +10918,8 @@ struct BufferAnnotationContext {
 }
 
 type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>>> + Send>>;
+type RunActivateFuture =
+    Pin<Box<dyn Future<Output = Result<VecDeque<LookupPartitionHandle>>> + Send>>;
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 /// Resolves when all `threads>1` shard workers for a contig have finished,
 /// yielding the total output-row count (or the first worker error).
@@ -10935,6 +10937,11 @@ enum StreamState {
     /// Await the oldest in-flight fused window task (FIFO preserves output order).
     AwaitingWindow {
         handle: tokio::task::JoinHandle<WindowAnnotateResult>,
+        annotation_state: ContigAnnotationState,
+    },
+    /// A later region run of the current contig is building its filtered lookup.
+    ActivatingRun {
+        fut: RunActivateFuture,
         annotation_state: ContigAnnotationState,
     },
     /// Yield annotated batches from the current window, then resume annotation.
@@ -11320,7 +11327,8 @@ fn spawn_annotation_from_lookup_sharded(
                 let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
                 run_maybe_block_in_place(|| -> Result<()> {
                     hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-                    let out = annotate_worker_window(&mut worker, &window, projection.as_deref())?;
+                    let out =
+                        annotate_worker_window(&mut worker, &window, projection.as_deref(), None)?;
                     for b in out {
                         shard.write_batch(b)?;
                     }
@@ -11349,7 +11357,7 @@ fn spawn_annotation_from_lookup_sharded(
             if !window.is_empty() {
                 hydrate_worker_window(&mut worker, &window, cache_source_type)?;
             }
-            let out = annotate_worker_window(&mut worker, &window, projection.as_deref())?;
+            let out = annotate_worker_window(&mut worker, &window, projection.as_deref(), None)?;
             for b in out {
                 shard.write_batch(b)?;
             }
@@ -11388,6 +11396,17 @@ fn abort_annotation_lookup_partitions(ann: &mut ContigAnnotationState) {
 }
 
 impl AnnotationWorkerState {
+    /// Per-run state goes back to what a fresh worker holds; the colocated map
+    /// is per contig and is kept. The next run reconstructs its carried state
+    /// through warm-up.
+    fn reset_for_next_run(&mut self) {
+        self.window_buffer.clear();
+        self.input_buffer_accumulator = InputBufferAccumulator::default();
+        self.next_input_buffer_id = 0;
+        self.persisted_buffer_transcripts.clear();
+        self.lookup_done = false;
+    }
+
     fn new(shared: Arc<SharedContigAnnotationContext>) -> Result<Self> {
         let init_started = Instant::now();
         let profile = shared.profile.clone();
@@ -11592,6 +11611,10 @@ impl ContigAnnotationStream {
                 ..
             }
             | StreamState::AwaitingWindow {
+                annotation_state: ann,
+                ..
+            }
+            | StreamState::ActivatingRun {
                 annotation_state: ann,
                 ..
             } => {
@@ -12577,12 +12600,20 @@ fn annotate_worker_window(
     worker: &mut AnnotationWorkerState,
     window_batches: &[RecordBatch],
     projection: Option<&[usize]>,
+    emit_bounds: Option<&[RunBounds]>,
 ) -> Result<VecDeque<RecordBatch>> {
     let annotation_started = Instant::now();
     let shared = Arc::clone(&worker.shared);
     let profile = shared.profile.clone();
     let config = &shared.config;
     let tmp_provider = shared.tmp_provider.as_ref();
+    // Region runs annotate whole input buffers (stateful sources) and read
+    // overlap-based index windows, so the emitted rows are trimmed to the
+    // requested bounds here, before projection can drop the `start` column.
+    let trim_start_idx = match emit_bounds {
+        Some(_) => Some(TableProvider::schema(tmp_provider).index_of("start")?),
+        None => None,
+    };
     let engine = shared.engine.as_ref();
     let csq_col_idx = tmp_provider.vcf_field_count();
     let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
@@ -12664,6 +12695,15 @@ fn annotate_worker_window(
             record_contig_profile(&profile, |profile| {
                 profile.engine += engine_started.elapsed();
             });
+            let annotated = match (emit_bounds, trim_start_idx) {
+                (Some(bounds), Some(start_idx)) => {
+                    crate::regions::filter_batch_to_bounds(&annotated, start_idx, bounds)?
+                }
+                _ => annotated,
+            };
+            if annotated.num_rows() == 0 {
+                continue;
+            }
 
             if let Some(indices) = projection {
                 let projection_started = Instant::now();
@@ -12700,6 +12740,7 @@ fn annotate_window_owned(
     cache_source_type: CacheSourceType,
     projection: Option<Vec<usize>>,
     persisted_seed: PersistedBufferTranscripts,
+    emit_bounds: Option<Vec<RunBounds>>,
 ) -> Result<(VecDeque<RecordBatch>, PersistedBufferTranscripts)> {
     let mut worker = AnnotationWorkerState::new(shared)?;
     worker.colocated_map = colocated_snapshot;
@@ -12710,7 +12751,12 @@ fn annotate_window_owned(
     // sequentially (the stateful Merged/RefSeq path).
     worker.persisted_buffer_transcripts = persisted_seed;
     hydrate_worker_window(&mut worker, &window_batches, cache_source_type)?;
-    let out = annotate_worker_window(&mut worker, &window_batches, projection.as_deref())?;
+    let out = annotate_worker_window(
+        &mut worker,
+        &window_batches,
+        projection.as_deref(),
+        emit_bounds.as_deref(),
+    )?;
     Ok((out, worker.persisted_buffer_transcripts))
 }
 
@@ -13410,6 +13456,7 @@ impl Stream for ContigAnnotationStream {
                         let colocated = Arc::clone(&ann.worker.colocated_map);
                         let cache_source_type = ann.config.cache_source_type;
                         let persisted_seed = ann.worker.persisted_buffer_transcripts.clone();
+                        let emit_bounds = ann.run.trim_bounds();
                         let handle = tokio::task::spawn_blocking(move || {
                             annotate_window_owned(
                                 shared,
@@ -13418,6 +13465,7 @@ impl Stream for ContigAnnotationStream {
                                 cache_source_type,
                                 projection,
                                 persisted_seed,
+                                emit_bounds,
                             )
                         });
                         ann.inflight.push_back(handle);
@@ -13430,6 +13478,27 @@ impl Stream for ContigAnnotationStream {
                     if let Some(handle) = ann.inflight.pop_front() {
                         self.state = StreamState::AwaitingWindow {
                             handle,
+                            annotation_state: ann,
+                        };
+                        continue;
+                    }
+
+                    // Another region run on this contig: reuse the prepared context,
+                    // rebuild the lookup for the next window, warm up again.
+                    if let Some(next) = ann.pending_runs.pop_front() {
+                        abort_annotation_lookup_partitions(&mut ann);
+                        ann.worker.reset_for_next_run();
+                        ann.run = ActiveRunState::from_run(&next);
+                        let fut: RunActivateFuture = Box::pin(activate_run_lookup(
+                            Arc::clone(&ann.session),
+                            ann.run_inputs.clone(),
+                            ann.config.clone(),
+                            ann.chrom.clone(),
+                            next,
+                            ann.pipeline_profile.clone(),
+                        ));
+                        self.state = StreamState::ActivatingRun {
+                            fut,
                             annotation_state: ann,
                         };
                         continue;
@@ -13457,6 +13526,42 @@ impl Stream for ContigAnnotationStream {
                     );
                     self.state = StreamState::CleaningUp(fut);
                     continue;
+                }
+
+                StreamState::ActivatingRun { .. } => {
+                    let StreamState::ActivatingRun {
+                        mut fut,
+                        annotation_state: mut ann,
+                    } = std::mem::replace(&mut self.state, StreamState::Done)
+                    else {
+                        unreachable!()
+                    };
+                    match fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.state = StreamState::ActivatingRun {
+                                fut,
+                                annotation_state: ann,
+                            };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(handles)) => {
+                            ann.lookup_partitions =
+                                LookupPartitionFanIn::new(handles, LOOKUP_PARTITION_QUEUE_BATCHES);
+                            ann.lookup_wait_started = None;
+                            ann.ordered_lookup_wait_started = None;
+                            self.state = StreamState::AnnotatingContig(ann);
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => {
+                            let fut = make_cleanup_future(
+                                Arc::clone(&ann.session),
+                                std::mem::take(&mut ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            self.abort_prefetch();
+                            continue;
+                        }
+                    }
                 }
 
                 StreamState::AwaitingWindow {
@@ -16829,6 +16934,27 @@ mod tests {
         assert_eq!(bs[0].pos, 10);
         assert_eq!(bs[1].pos, 30);
         assert_eq!(bs[2].pos, i64::MAX);
+    }
+
+    #[test]
+    fn reset_for_next_run_clears_per_run_state_but_keeps_colocated() {
+        let shared = minimal_shared_contig_annotation_context_with_features(Vec::new(), Vec::new());
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        worker
+            .window_buffer
+            .push(make_buffer_batch_many("chr1", &[1, 2]));
+        worker.next_input_buffer_id = 7;
+        worker.lookup_done = true;
+        let colocated_before = Arc::clone(&worker.colocated_map);
+        worker.reset_for_next_run();
+        assert!(worker.window_buffer.is_empty());
+        assert_eq!(worker.next_input_buffer_id, 0);
+        assert!(!worker.lookup_done);
+        assert!(worker.persisted_buffer_transcripts.is_empty());
+        assert!(
+            Arc::ptr_eq(&worker.colocated_map, &colocated_before),
+            "colocated map is per contig and survives a run reset"
+        );
     }
 
     #[test]
