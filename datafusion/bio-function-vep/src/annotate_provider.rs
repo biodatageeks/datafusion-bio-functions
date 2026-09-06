@@ -189,7 +189,7 @@ use crate::colocated::{
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::MissWorklist;
 use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
-use crate::regions::RunBounds;
+use crate::regions::{RunBounds, RunGate};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, FeatureType, GeometryCache, MirnaFeature,
@@ -10426,6 +10426,36 @@ struct RunActivationInputs {
     fallback_coloc_sink: ColocatedSink,
 }
 
+/// Gate state of the run currently being drained.
+struct ActiveRunState {
+    bounds: Vec<RunBounds>,
+    gate: Option<RunGate>,
+    warm_up: Vec<RecordBatch>,
+    warmed_up: bool,
+}
+
+impl ActiveRunState {
+    fn from_run(run: &ContigRun) -> Self {
+        let gate = run.gate();
+        let warmed_up = gate.as_ref().is_none_or(|g| !g.needs_warm_up());
+        Self {
+            bounds: run.bounds.clone(),
+            gate,
+            warm_up: Vec::new(),
+            warmed_up,
+        }
+    }
+
+    /// `None` for an open run (no trim), `Some` otherwise.
+    fn trim_bounds(&self) -> Option<Vec<RunBounds>> {
+        if self.bounds.iter().all(RunBounds::is_open) {
+            None
+        } else {
+            Some(self.bounds.clone())
+        }
+    }
+}
+
 /// Slice the global buffer grid (`boundaries`, length `B+1`, ascending) into up
 /// to `workers` contiguous whole-buffer ranges, each with a bounded-overlap
 /// warm-up start (design §5.1/§5.2). Empty ranges (when `workers > B`) are
@@ -10773,6 +10803,12 @@ struct ContigAnnotationState {
     /// In-flight fused window-annotation tasks, FIFO (= window/output order).
     /// Up to `config.annotation_workers` run concurrently on the blocking pool.
     inflight: VecDeque<tokio::task::JoinHandle<WindowAnnotateResult>>,
+    /// Gate of the run being drained; later runs of the contig wait in
+    /// `pending_runs` and are activated one after another.
+    run: ActiveRunState,
+    pending_runs: VecDeque<ContigRun>,
+    run_inputs: RunActivationInputs,
+    pipeline_profile: Option<SharedContigPipelineProfile>,
 }
 
 /// Output of one fused window-annotation task: annotated batches plus the
@@ -12714,7 +12750,10 @@ fn poll_lookup_partition(
     }
 }
 
-fn apply_lookup_batch_message(ann: &mut ContigAnnotationState, message: LookupBatchMessage) {
+fn apply_lookup_batch_message(
+    ann: &mut ContigAnnotationState,
+    message: LookupBatchMessage,
+) -> Result<()> {
     record_contig_profile(&ann.worker.shared.profile, |profile| {
         profile.lookup_batches += 1;
     });
@@ -12734,10 +12773,34 @@ fn apply_lookup_batch_message(ann: &mut ContigAnnotationState, message: LookupBa
         ],
     );
     merge_colocated_delta(&mut ann.worker.colocated_map, message.colocated_delta);
-    if rows > 0 {
-        ann.contig_rows += rows;
-        ann.worker.window_buffer.push(message.batch);
+    let Some(gate) = ann.run.gate.as_mut() else {
+        if rows > 0 {
+            ann.contig_rows += rows;
+            ann.worker.window_buffer.push(message.batch);
+        }
+        return Ok(());
+    };
+    let out = gate.feed(message.batch);
+    if let Some(warm) = out.warm_up {
+        ann.run.warm_up.push(warm);
     }
+    if out.reached_emit && !ann.run.warmed_up {
+        // Replay whole grid buffers strictly before the seam, state-only, so
+        // the carried HGNC state is what the serial run would hold here.
+        let warm_up = std::mem::take(&mut ann.run.warm_up);
+        run_maybe_block_in_place(|| warm_up_worker_state(&mut ann.worker, warm_up))?;
+        ann.run.warmed_up = true;
+    }
+    if let Some(emit) = out.emit {
+        ann.contig_rows += emit.num_rows();
+        ann.worker.window_buffer.push(emit);
+    }
+    if out.done && !ann.worker.lookup_done {
+        // Rank-stop: every row of the run's emit range has been seen.
+        ann.worker.lookup_done = true;
+        abort_annotation_lookup_partitions(ann);
+    }
+    Ok(())
 }
 
 fn record_lookup_fan_in_profile(
@@ -12888,7 +12951,9 @@ fn poll_lookup_partitions(
             }
             Poll::Ready(Ok(Some(LookupPartitionPoll::Batch(message)))) => {
                 finish_lookup_waits(ann);
-                apply_lookup_batch_message(ann, message);
+                if let Err(e) = apply_lookup_batch_message(ann, message) {
+                    return Poll::Ready(Err(e));
+                }
                 made_progress = true;
             }
             Poll::Ready(Ok(Some(LookupPartitionPoll::Done(colocated_delta)))) => {
@@ -12917,6 +12982,17 @@ fn poll_lookup_partitions(
             Poll::Ready(Ok(None)) => {
                 finish_lookup_waits(ann);
                 ann.worker.lookup_done = true;
+                if !ann.run.warmed_up {
+                    // Stream ended before the emit rank (tiny tail run): still
+                    // replay the pending warm-up so state is consistent.
+                    let warm_up = std::mem::take(&mut ann.run.warm_up);
+                    if let Err(e) =
+                        run_maybe_block_in_place(|| warm_up_worker_state(&mut ann.worker, warm_up))
+                    {
+                        return Poll::Ready(Err(e));
+                    }
+                    ann.run.warmed_up = true;
+                }
                 profile_end!(
                     &format!("{}: 1. variation_lookup", ann.chrom),
                     ann.t_contig_active,
@@ -13165,6 +13241,10 @@ impl Stream for ContigAnnotationStream {
                                 lookup_wait_started: None,
                                 ordered_lookup_wait_started: None,
                                 inflight: VecDeque::new(),
+                                run: ActiveRunState::from_run(&ready.active_run),
+                                pending_runs: std::mem::take(&mut ready.pending_runs),
+                                run_inputs: ready.run_inputs.clone(),
+                                pipeline_profile: ready.pipeline_profile.clone(),
                             };
                             self.state = StreamState::AnnotatingContig(ann);
                             // Committed to annotating this contig: overlap the
@@ -15172,6 +15252,15 @@ mod tests {
             lookup_wait_started: None,
             ordered_lookup_wait_started: None,
             inflight: VecDeque::new(),
+            run: ActiveRunState::from_run(&ContigRun::open()),
+            pending_runs: VecDeque::new(),
+            run_inputs: RunActivationInputs {
+                var_table: "__vep_indexed_variation".to_string(),
+                vcf_schema: Schema::new(Vec::<Field>::new()),
+                cache_schema: Schema::new(Vec::<Field>::new()),
+                fallback_coloc_sink: Arc::new(Mutex::new(HashMap::new())),
+            },
+            pipeline_profile: None,
         }
     }
 
@@ -16740,6 +16829,111 @@ mod tests {
         assert_eq!(bs[0].pos, 10);
         assert_eq!(bs[1].pos, 30);
         assert_eq!(bs[2].pos, i64::MAX);
+    }
+
+    #[test]
+    fn gated_run_reconstructs_serial_state_at_a_mid_contig_cut() {
+        // Same donor/recipient pair as `warmup_reconstructs_serial_persisted_state`.
+        let mut tx_recipient = make_tx(
+            "XM_017001769.3",
+            Some("55791"),
+            Some("LRIF1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr1".to_string();
+        tx_recipient.start = 110_874_957;
+        tx_recipient.end = 110_963_922;
+        tx_recipient.biotype = "protein_coding".to_string();
+        let mut tx_donor = make_tx(
+            "ENST00000369763",
+            Some("ENSG00000121931"),
+            Some("LRIF1"),
+            Some("HGNC"),
+            Some("HGNC:30299"),
+        );
+        tx_donor.chrom = "chr1".to_string();
+        tx_donor.start = 110_947_190;
+        tx_donor.end = 110_963_922;
+        tx_donor.biotype = "protein_coding".to_string();
+        let shared = minimal_shared_contig_annotation_context_with_context(
+            vec![tx_recipient, tx_donor],
+            Vec::new(),
+            Vec::new(),
+        );
+        // Buffer 0 spans donor and recipient, so the donation happens there.
+        // Buffer 1 is the run we want: past both transcripts (no donation on
+        // its own) but still inside cache region 110, so the serial path keeps
+        // the donated copy alive through the carry. Serial = both buffers
+        // through the full prepare path in order.
+        let buffer0 = vec![make_buffer_batch_many(
+            "chr1",
+            &[109_528_491, 110_870_290, 110_947_275],
+        )];
+        let buffer1 = vec![make_buffer_batch_many("chr1", &[110_970_000, 110_980_000])];
+        let mut serial = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+        for buf in [&buffer0, &buffer1] {
+            let (chrom, lo, hi) = buffer_variant_bounds(buf).unwrap().unwrap();
+            let _ = prepare_buffer_annotation_context(&mut serial, buf, &chrom, lo, hi).unwrap();
+        }
+
+        // Non-vacuity: a fresh worker that sees only buffer 1 carries nothing.
+        let mut cold = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+        let (chrom, lo, hi) = buffer_variant_bounds(&buffer1).unwrap().unwrap();
+        let _ = prepare_buffer_annotation_context(&mut cold, &buffer1, &chrom, lo, hi).unwrap();
+        assert_ne!(
+            cold.persisted_buffer_transcripts, serial.persisted_buffer_transcripts,
+            "buffer 1 alone must not reproduce the serial carry (otherwise the test is vacuous)"
+        );
+
+        // Gated run: rows of buffer 0 are warm-up (ranks 0..3), buffer 1 is
+        // emitted (ranks 3..5). Feed as one stream of batches, as the lookup would.
+        let run = ContigRun {
+            bounds: vec![RunBounds {
+                lo: Some(110_970_000),
+                hi: Some(110_980_000),
+            }],
+            slice: Some(WorkerGridSlice {
+                worker_id: 0,
+                scan_lo_pos: 109_528_491,
+                emit_start_pos: 110_970_000,
+                scan_hi_pos: i64::MAX,
+                skip_leading_rows: 0,
+                warm_up_start_row: 0,
+                emit_start_row: 3,
+                emit_end_row: 5,
+            }),
+        };
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        let mut active = ActiveRunState::from_run(&run);
+        assert!(!active.warmed_up);
+        let mut emitted: Vec<RecordBatch> = Vec::new();
+        for batch in buffer0.into_iter().chain(buffer1.into_iter()) {
+            let out = active.gate.as_mut().unwrap().feed(batch);
+            if let Some(w) = out.warm_up {
+                active.warm_up.push(w);
+            }
+            if out.reached_emit && !active.warmed_up {
+                warm_up_worker_state(&mut worker, std::mem::take(&mut active.warm_up)).unwrap();
+                active.warmed_up = true;
+            }
+            if let Some(e) = out.emit {
+                emitted.push(e);
+            }
+        }
+        let (chrom, lo, hi) = buffer_variant_bounds(&emitted).unwrap().unwrap();
+        let _ = prepare_buffer_annotation_context(&mut worker, &emitted, &chrom, lo, hi).unwrap();
+
+        assert!(
+            !serial.persisted_buffer_transcripts.is_empty(),
+            "fixture must persist state"
+        );
+        assert_eq!(
+            worker.persisted_buffer_transcripts, serial.persisted_buffer_transcripts,
+            "gated run must reconstruct the serial carry at the cut"
+        );
+        assert_eq!(emitted.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        assert_eq!(active.trim_bounds().map(|b| b.len()), Some(1));
     }
 
     #[test]
