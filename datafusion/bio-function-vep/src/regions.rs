@@ -176,10 +176,13 @@ pub(crate) fn restrict_contigs(contigs: Vec<String>, runs: &ContigRuns) -> Vec<S
 /// Map an interval onto whole input buffers. `boundary_positions[k]` is the
 /// `start` of the first row of buffer `k`; the last entry (`i64::MAX`) is the
 /// terminal boundary, so there are `len - 1` buffers. Returns `(bk, bk1)` with
-/// `bk < bk1`: the first buffer whose start is at or below `lo` (buffer 0 when
-/// `lo` precedes every row) through the last buffer whose start is at or below
-/// `hi`, exclusive. Including buffer `bk` even when `lo` falls inside it is a
-/// superset; the output trim removes the extra rows.
+/// `bk < bk1`: the first buffer whose start is strictly below `lo` (buffer 0
+/// when `lo` precedes every row) through the last buffer whose start is at or
+/// below `hi`, exclusive. "Strictly below" matters when `lo` equals a buffer's
+/// first position: records at that position may also close the preceding
+/// buffer (a position tie across the cut), and those satisfy the interval too,
+/// so the preceding buffer is included. Including a buffer `lo` falls inside
+/// is a superset either way; the output trim removes the extra rows.
 pub(crate) fn buffer_range_for_bounds(
     boundary_positions: &[i64],
     bounds: RunBounds,
@@ -190,9 +193,9 @@ pub(crate) fn buffer_range_for_bounds(
     }
     let bk = match bounds.lo {
         None => 0,
-        // number of buffer starts <= lo, minus one; clamp at 0
+        // number of buffer starts strictly below lo, minus one; clamp at 0
         Some(lo) => boundary_positions[..b]
-            .partition_point(|&p| p <= lo)
+            .partition_point(|&p| p < lo)
             .saturating_sub(1),
     };
     let bk1 = match bounds.hi {
@@ -641,12 +644,23 @@ mod tests {
             ),
             (1, 3)
         );
-        // exactly on a boundary
+        // exactly on a boundary: the preceding buffer may end with ties at
+        // that position, so it is included
         assert_eq!(
             buffer_range_for_bounds(
                 &pos,
                 RunBounds {
                     lo: Some(100),
+                    hi: Some(200)
+                }
+            ),
+            (0, 3)
+        );
+        assert_eq!(
+            buffer_range_for_bounds(
+                &pos,
+                RunBounds {
+                    lo: Some(101),
                     hi: Some(200)
                 }
             ),
@@ -700,9 +714,9 @@ mod tests {
 
     #[test]
     fn buffer_range_on_position_tie_includes_the_earlier_buffer() {
-        // A boundary at pos 100 with rows_before_pos > 0 means rows at 100 sit
-        // in BOTH buffer 0 and buffer 1; a run starting at 100 maps to buffer 1
-        // and the gate's skip_leading_rows drops the earlier buffer's ties.
+        // A boundary at pos 100 may carry rows at 100 in BOTH buffer 0 (its
+        // tail) and buffer 1 (its head); a run starting at 100 must emit both,
+        // so it starts at buffer 0.
         let pos = [10, 100, 200, i64::MAX];
         assert_eq!(
             buffer_range_for_bounds(
@@ -712,7 +726,7 @@ mod tests {
                     hi: Some(100)
                 }
             ),
-            (1, 2)
+            (0, 2)
         );
         // lo strictly inside buffer 0 that ends with a tie at 100: buffer 0.
         assert_eq!(
