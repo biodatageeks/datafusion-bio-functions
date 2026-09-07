@@ -49,7 +49,7 @@ Functions operate on Arrow arrays (`arrow::array`) and return Arrow arrays. Use 
 ## Conventions from Sibling Repos
 
 - Apache 2.0 license
-- Git dependencies for cross-repo references use pinned commit hashes (e.g., `git = "https://github.com/biodatageeks/...", rev = "abc123"`)
+- Git dependencies for cross-repo references use release tags (e.g., `git = "https://github.com/biodatageeks/...", tag = "v1.12.1"`). Keep every reference to a given repo on the same tag — mixing tags (or a `rev` pin) across workspace crates duplicates that repo and its transitive deps in `Cargo.lock`.
 - `polars-bio` will reference this repo the same way it references `datafusion-bio-formats`
 - Mutation testing is set up (cargo-mutants) — `mutants.out*/` is gitignored
 - IDE: RustRover/IntelliJ (`.idea/` is gitignored)
