@@ -1353,14 +1353,21 @@ impl TranscriptConsequenceEngine {
                             profile.transcript_reference_fields += started.elapsed();
                         }
                         let coding_started = profiling.then(Instant::now);
+                        // Leading `N` padding on a `cds_start_nf` transcript makes the
+                        // CDS start unknown, which both the normal output path and the
+                        // minimised-HGVS path below must honour -- hoisted so the two
+                        // cannot drift apart.
+                        let n_pad_len = tx_translation
+                            .and_then(|t| t.cds_sequence.as_deref())
+                            .map(|s| s.as_bytes().iter().take_while(|&&b| b == b'N').count())
+                            .unwrap_or(0);
+                        let cds_start_is_unknown = |start: Option<usize>| {
+                            tx.cds_start_nf
+                                && n_pad_len > 0
+                                && start.is_some_and(|p| p <= n_pad_len)
+                        };
                         let (cds_position, protein_position, amino_acids, codons, protein_hgvs) =
                             if let Some(ref cc) = coding_class {
-                                let n_pad_len = tx_translation
-                                    .and_then(|t| t.cds_sequence.as_deref())
-                                    .map(|s| {
-                                        s.as_bytes().iter().take_while(|&&b| b == b'N').count()
-                                    })
-                                    .unwrap_or(0);
                                 let use_unknown_start_format = tx.cds_start_nf
                                     && n_pad_len > 0
                                     && cc.cds_position_start.is_some_and(|p| p <= n_pad_len);
@@ -1499,7 +1506,16 @@ impl TranscriptConsequenceEngine {
                                         .cds_position_end
                                         .or(cc.cds_position_start)
                                         .map(|p| p.saturating_sub(from_end));
-                                    format_coords_ensembl(start, end)
+                                    // Same unknown-start rule as the normal path: a
+                                    // minimised MNV that still begins inside the `N`
+                                    // padding of a `cds_start_nf` transcript must keep
+                                    // the `?-` spelling rather than gain a definite
+                                    // coordinate from the numeric bounds.
+                                    if cds_start_is_unknown(start) {
+                                        format_coords_ensembl(None, end.or(start))
+                                    } else {
+                                        format_coords_ensembl(start, end)
+                                    }
                                 });
                                 (
                                     minimised.ref_allele.as_str(),
