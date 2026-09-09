@@ -1450,6 +1450,75 @@ impl TranscriptConsequenceEngine {
                                 profile.transcript_hgvsc_indel_candidates += 1;
                             }
                         }
+                        // VEP computes HGVS from the minimised allele while the CSQ
+                        // position columns keep the untrimmed span, so a same-length
+                        // multi-base substitution needs both spellings. Minimise the
+                        // pair HGVS actually uses: on a BAM-edited cache that is
+                        // `used_ref`, not the given VCF REF. No-op for SNVs and indels.
+                        //
+                        // Not for a transcript carrying RNA-edit attributes. Ensembl
+                        // clips, then puts the untrimmed alleles back for those:
+                        //
+                        //   ensembl-variation release/116
+                        //   TranscriptVariationAllele.pm:1510-1514
+                        //     if (scalar @edit_attrs > 0) {
+                        //       $hgvs_notation->{ref} = $ref->feature_seq;
+                        //       $hgvs_notation->{alt} = $self->feature_seq;
+                        //     }
+                        //
+                        // `@edit_attrs` are the `_rna_edit` transcript attributes,
+                        // which is what `refseq_edits` holds here. Minimising those
+                        // regressed 14 of 22 autosomes against the VEP 116 reference,
+                        // one record each -- e.g. chr4:20837686 ATT>TTT on NM_147183.3,
+                        // where VEP emits `c.225+12857AAT>AAA` and minimising gave
+                        // `c.225+12857T>A`.
+                        let hgvs_minimised = if tx.refseq_edits.is_empty() {
+                            minimised_substitution(variant, hgvsc_ref_allele)
+                        } else {
+                            None
+                        };
+                        let (
+                            hgvsc_ref_allele,
+                            hgvsc_alt_allele,
+                            hgvsc_start,
+                            hgvsc_end,
+                            hgvsc_cdna_position,
+                            hgvsc_cds_position,
+                        ) = match hgvs_minimised.as_ref() {
+                            Some((minimised, prefix, suffix)) => {
+                                // Genomic left/right trims map to CDS start/end
+                                // offsets, swapped on the reverse strand.
+                                let (from_start, from_end) = if tx.strand >= 0 {
+                                    (*prefix, *suffix)
+                                } else {
+                                    (*suffix, *prefix)
+                                };
+                                let cds = coding_class.as_ref().and_then(|cc| {
+                                    let start = cc.cds_position_start.map(|p| p + from_start);
+                                    let end = cc
+                                        .cds_position_end
+                                        .or(cc.cds_position_start)
+                                        .map(|p| p.saturating_sub(from_end));
+                                    format_coords_ensembl(start, end)
+                                });
+                                (
+                                    minimised.ref_allele.as_str(),
+                                    minimised.alt_allele.as_str(),
+                                    minimised.start,
+                                    minimised.end,
+                                    compute_cdna_position(minimised, tx, tx_exons),
+                                    cds,
+                                )
+                            }
+                            None => (
+                                hgvsc_ref_allele,
+                                variant.alt_allele.as_str(),
+                                variant.start,
+                                variant.end,
+                                cdna_position.clone(),
+                                cds_position.clone(),
+                            ),
+                        };
                         let mut hgvsc_detail_profile = (profiling
                             && hgvsc_detail_profile_enabled())
                         .then(HgvscProfile::default);
@@ -1457,12 +1526,12 @@ impl TranscriptConsequenceEngine {
                             crate::hgvs::format_hgvsc_profiled_with_semantics(
                                 tx,
                                 tx_exons_for_hgvsc,
-                                cdna_position.as_deref(),
-                                cds_position.as_deref(),
+                                hgvsc_cdna_position.as_deref(),
+                                hgvsc_cds_position.as_deref(),
                                 hgvsc_ref_allele,
-                                &variant.alt_allele,
-                                variant.start,
-                                variant.end,
+                                hgvsc_alt_allele,
+                                hgvsc_start,
+                                hgvsc_end,
                                 hgvs_shift,
                                 detail_profile,
                                 self.semantics,
@@ -1471,12 +1540,12 @@ impl TranscriptConsequenceEngine {
                             crate::hgvs::format_hgvsc_with_semantics(
                                 tx,
                                 tx_exons_for_hgvsc,
-                                cdna_position.as_deref(),
-                                cds_position.as_deref(),
+                                hgvsc_cdna_position.as_deref(),
+                                hgvsc_cds_position.as_deref(),
                                 hgvsc_ref_allele,
-                                &variant.alt_allele,
-                                variant.start,
-                                variant.end,
+                                hgvsc_alt_allele,
+                                hgvsc_start,
+                                hgvsc_end,
                                 hgvs_shift,
                                 self.semantics,
                             )
@@ -8873,6 +8942,53 @@ pub(crate) fn unshifted_cdna_bounds_for_hgvs_shift(
 ///   RefSeq mismatch offsets are surfaced separately via `REFSEQ_OFFSET`
 ///   rather than applied to `cDNA_position`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L489>
+/// The minimised spelling of a same-length multi-base substitution, or `None`
+/// when minimising would change nothing.
+///
+/// Ensembl VEP uses two different spellings of the same variant: the CSQ
+/// position columns describe the **untrimmed** span, while HGVS is computed
+/// from the **minimised** allele. `TCC>TGC` at chr1:451000 is reported by VEP
+/// as `CDS_position=677-679` but `HGVSc=c.678G>C`.
+///
+/// `VariantInput::from_vcf` already fully reduces indels, and an SNV has
+/// nothing to reduce, so this returns `Some` only for a same-length multi-base
+/// pair that shares a leading or trailing base. The reference half is the
+/// allele HGVS actually uses -- `used_ref` on a BAM-edited cache, which is
+/// where GIVEN_REF and USED_REF diverge -- not necessarily the given VCF REF. Returns the minimised variant
+/// plus the number of bases trimmed from the left and right in GENOMIC order;
+/// the caller flips them for a reverse-strand transcript.
+///
+/// See biodatageeks/vepyr#95.
+fn minimised_substitution(
+    variant: &VariantInput,
+    hgvs_ref_allele: &str,
+) -> Option<(VariantInput, usize, usize)> {
+    let r = hgvs_ref_allele.as_bytes();
+    let a = variant.alt_allele.as_bytes();
+    if r.len() != a.len() || r.len() < 2 {
+        return None;
+    }
+    let prefix = r.iter().zip(a.iter()).take_while(|(x, y)| x == y).count();
+    if prefix == r.len() {
+        return None; // ref == alt; nothing to describe
+    }
+    let suffix = r[prefix..]
+        .iter()
+        .rev()
+        .zip(a[prefix..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    if prefix == 0 && suffix == 0 {
+        return None;
+    }
+    let mut minimised = variant.clone();
+    minimised.ref_allele = hgvs_ref_allele[prefix..r.len() - suffix].to_string();
+    minimised.alt_allele = variant.alt_allele[prefix..a.len() - suffix].to_string();
+    minimised.start = variant.start + prefix as i64;
+    minimised.end = variant.end - suffix as i64;
+    Some((minimised, prefix, suffix))
+}
+
 fn compute_cdna_position(
     variant: &VariantInput,
     tx: &TranscriptFeature,
