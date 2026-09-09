@@ -50,12 +50,14 @@ impl VariantInput {
             .take_while(|(a, b)| a == b)
             .count();
 
-        // Skip trimming for identical alleles or same-length substitutions
-        // with no common prefix (SNV/MNV). Different-length alleles (indels)
+        // Skip trimming for identical alleles, and for ALL same-length
+        // substitutions (SNV/MNV) regardless of shared prefix -- VEP never
+        // minimises a same-length pair, so neither end is trimmed and
+        // `new_start` below must not advance. Different-length alleles (indels)
         // still need suffix trimming even when prefix_len==0, e.g.
         // T->AGTAAATTTTTTTTCT suffix-trims to ""->AGTAAATTTTTTTTC (insertion).
         if (prefix_len == ref_bytes.len() && prefix_len == alt_bytes.len())
-            || (prefix_len == 0 && ref_bytes.len() == alt_bytes.len())
+            || ref_bytes.len() == alt_bytes.len()
         {
             return Self {
                 chrom,
@@ -13795,14 +13797,48 @@ mod tests {
     }
 
     #[test]
-    fn from_vcf_mnv_prefix_only_no_suffix_trim() {
-        // MNV: REF=ATCG ALT=AGCG → same length, only prefix "A" trimmed
-        // VEP does NOT suffix-trim same-length substitutions
+    fn from_vcf_mnv_is_not_trimmed() {
+        // MNV: REF=ATCG ALT=AGCG → same length, so VEP trims NEITHER end and
+        // does not advance the start (Parser.pm:871-880 — minimise_alleles
+        // fires only when the original REF/ALT differ in length). This
+        // previously asserted start 101 with TCG/GCG, which put every derived
+        // Codons/CDS_position/HGVSc one base to the right of VEP.
         let v = VariantInput::from_vcf("22".into(), 100, 103, "ATCG".into(), "AGCG".into());
-        assert_eq!(v.start, 101);
+        assert_eq!(v.start, 100);
         assert_eq!(v.end, 103);
-        assert_eq!(v.ref_allele, "TCG");
-        assert_eq!(v.alt_allele, "GCG");
+        assert_eq!(v.ref_allele, "ATCG");
+        assert_eq!(v.alt_allele, "AGCG");
+    }
+
+    #[test]
+    fn from_vcf_agrees_with_vcf_to_vep_allele() {
+        // Allele comes from vcf_to_vep_allele and the coordinates from here.
+        // The two carry duplicate copies of the same policy, so a fix that
+        // lands in one and not the other is worse than no fix at all.
+        for (r, a) in [
+            ("GAC", "GTC"),
+            ("GA", "GT"),
+            ("ATCG", "AGCG"),
+            ("ATTG", "AG"),
+            ("AG", "ATCG"),
+            ("T", "TGCCCA"),
+            ("CG", "C"),
+            ("C", "T"),
+        ] {
+            let (er, ea) = crate::allele::vcf_to_vep_allele(r, a);
+            let v = VariantInput::from_vcf(
+                "22".into(),
+                100,
+                100 + r.len() as i64 - 1,
+                r.into(),
+                a.into(),
+            );
+            assert_eq!(
+                (v.ref_allele.as_str(), v.alt_allele.as_str()),
+                (er.as_str(), ea.as_str()),
+                "from_vcf disagrees with vcf_to_vep_allele for {r}>{a}"
+            );
+        }
     }
 
     #[test]

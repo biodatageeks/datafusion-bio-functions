@@ -178,8 +178,9 @@ use std::borrow::Cow;
 use std::fmt::Write;
 
 use crate::allele::{
-    MatchedVariantAllele, plugin_probe_allele, reverse_complement_allele, vcf_to_vep_allele,
-    vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
+    MatchedVariantAllele, plugin_probe_allele, plugin_probe_input_allele,
+    reverse_complement_allele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end,
+    vep_norm_start,
 };
 use crate::annotation_store::AnnotationBackend;
 #[cfg(feature = "parquet-cache")]
@@ -5852,8 +5853,11 @@ impl AnnotateProvider {
                     let start_val = int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0);
                     let ref_al = string_at(batch.column(ref_idx).as_ref(), row).unwrap_or_default();
                     let alt_al = string_at(batch.column(alt_idx).as_ref(), row).unwrap_or_default();
+                    // Frozen plugin-key spelling -- must match what the built
+                    // shards store, not what VEP would say. See
+                    // `plugin_probe_input_allele`.
                     let (input_ref, input_alt, input_start) =
-                        vcf_to_vep_input_allele(start_val, &ref_al, &alt_al);
+                        plugin_probe_input_allele(start_val, &ref_al, &alt_al);
                     // Both spellings the probe may ask for: the primary key and the
                     // fully minimal fallback, whose start shifts when a shared
                     // prefix is trimmed. Taking only the primary would leave the
@@ -6853,6 +6857,11 @@ impl AnnotateProvider {
                         // → discriminator `None` → probe miss → empty fields (gate).
                         #[cfg(feature = "parquet-cache")]
                         if plugin_n_fields > 0 {
+                            // Plugin keys and the attribute discriminator keep the
+                            // pre-vepyr#95 spelling; the CSQ fields above use the
+                            // VEP-correct one. See `plugin_probe_input_allele`.
+                            let (plugin_key_ref, plugin_key_alt, plugin_key_start) =
+                                plugin_probe_input_allele(start_val, &ref_al, &alt_allele);
                             let ns = crate::plugin_cache::template::build_attr_namespace(
                                 terms_str,
                                 gene,
@@ -6867,14 +6876,17 @@ impl AnnotateProvider {
                                 protein_pos,
                                 amino_acids,
                                 codons_str,
-                                input_ref.as_str(),
-                                input_alt.as_str(),
+                                plugin_key_ref.as_str(),
+                                plugin_key_alt.as_str(),
                             );
-                            let plugin_allele = format!("{input_ref}/{input_alt}");
+                            let plugin_allele = format!("{plugin_key_ref}/{plugin_key_alt}");
                             // Fully minimal spelling, used only when the primary
                             // key misses (see `probe_all`).
-                            let (min_ref, min_alt, min_start) =
-                                plugin_probe_allele(input_start, &input_ref, &input_alt);
+                            let (min_ref, min_alt, min_start) = plugin_probe_allele(
+                                plugin_key_start,
+                                &plugin_key_ref,
+                                &plugin_key_alt,
+                            );
                             let minimal_allele = format!("{min_ref}/{min_alt}");
                             let fallback_key = (minimal_allele != plugin_allele).then(|| {
                                 (
@@ -6888,7 +6900,7 @@ impl AnnotateProvider {
                                     // VEP-normalized start (== start_val for SNVs),
                                     // matching the buffer take above.
                                     s.probe_all(
-                                        u32::try_from(input_start).unwrap_or(0),
+                                        u32::try_from(plugin_key_start).unwrap_or(0),
                                         &plugin_allele,
                                         fallback_key,
                                         &ns,
@@ -6930,9 +6942,14 @@ impl AnnotateProvider {
                         if plugin_n_fields > 0 {
                             // `input_allele_string` was moved upstream; rebuild the
                             // `ref/alt` allele exactly as the transcript path does.
-                            let plugin_allele = format!("{input_ref}/{input_alt}");
-                            let (min_ref, min_alt, min_start) =
-                                plugin_probe_allele(input_start, &input_ref, &input_alt);
+                            let (plugin_key_ref, plugin_key_alt, plugin_key_start) =
+                                plugin_probe_input_allele(start_val, &ref_al, &alt_allele);
+                            let plugin_allele = format!("{plugin_key_ref}/{plugin_key_alt}");
+                            let (min_ref, min_alt, min_start) = plugin_probe_allele(
+                                plugin_key_start,
+                                &plugin_key_ref,
+                                &plugin_key_alt,
+                            );
                             let minimal_allele = format!("{min_ref}/{min_alt}");
                             let fallback_key = (minimal_allele != plugin_allele).then(|| {
                                 (
@@ -6944,7 +6961,7 @@ impl AnnotateProvider {
                                 .as_ref()
                                 .map(|s| {
                                     s.probe_all(
-                                        u32::try_from(input_start).unwrap_or(0),
+                                        u32::try_from(plugin_key_start).unwrap_or(0),
                                         &plugin_allele,
                                         fallback_key,
                                         &[],
