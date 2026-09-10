@@ -6429,14 +6429,6 @@ impl AnnotateProvider {
                     continue;
                 };
 
-                // VEP skips star alleles entirely — no CSQ produced.
-                if alt_allele == "*" {
-                    csq_builder.append_null();
-                    most_builder.append_null();
-                    append_null_annotation_row!();
-                    continue;
-                }
-
                 let mut variant = VariantInput::from_vcf(
                     chrom.clone(),
                     start,
@@ -7967,6 +7959,36 @@ impl AnnotateProvider {
         }
         Ok(batch)
     }
+}
+
+/// Whether the buffered rows can be trusted to satisfy a pushed-down LIMIT,
+/// i.e. whether it is safe to stop pulling from the lookup.
+///
+/// Buffered INPUT rows are only an upper bound on what they will emit:
+/// annotation removes non-variant records (`ALT=.`), and region trimming drops
+/// out-of-bounds rows. So a buffer that looks like enough may not be.
+///
+/// That matters because this decision stops the lookup. Stop while holding a
+/// PARTIAL buffer — one below `input_buffer_size`, which the window dispatch
+/// deliberately refuses to cut mid-stream so it stays aligned with VEP's
+/// InputBuffer boundaries — and nothing can make progress: no window is
+/// dispatched, so no rows are emitted, and the state machine falls through to
+/// "no window to produce and nothing in flight", aborting the lookup with
+/// fewer than `limit` rows emitted and the buffered remainder discarded.
+///
+/// Hence the dispatchability requirement. With no rows dropped it changes
+/// nothing: a dispatched full window emits its full row count, so a partial
+/// buffer can only arise once the lookup is done, which this allows.
+fn limit_satisfied_by_buffer(
+    fetch_limit: Option<usize>,
+    rows_emitted: usize,
+    buffered_rows: usize,
+    buffered_units: usize,
+    input_buffer_size: usize,
+    lookup_done: bool,
+) -> bool {
+    let buffer_is_dispatchable = buffered_units >= input_buffer_size.max(1) || lookup_done;
+    buffer_is_dispatchable && fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit)
 }
 
 /// Append an optional string value to a StringBuilder: non-empty Some → value, else → NULL.
@@ -14142,28 +14164,14 @@ impl Stream for ContigAnnotationStream {
                     // to avoid unnecessary annotation work.
                     let buffered_rows: usize =
                         ann.worker.window_buffer.iter().map(|b| b.num_rows()).sum();
-                    // Buffered INPUT rows are only an upper bound on what they
-                    // will emit: annotation removes non-variant records, and
-                    // region trimming drops out-of-bounds rows. So a buffer
-                    // that looks like enough may not be.
-                    //
-                    // That matters here because this flag stops us pulling from
-                    // the lookup. Stop while holding a PARTIAL buffer -- one
-                    // below input_buffer_size, which the dispatch below refuses
-                    // to cut mid-stream -- and nothing can make progress: no
-                    // window is dispatched, no rows are emitted, and the state
-                    // machine falls through to "contig done", aborting the
-                    // lookup with fewer than `limit` rows. So only trust the
-                    // buffered count when that buffer can actually be
-                    // dispatched. With no rows dropped this is a no-op: a
-                    // dispatched full window emits its full row count, so the
-                    // partial-buffer case only arises once the lookup is done.
-                    let buffer_is_dispatchable =
-                        window_buffer_input_units(&ann.worker.window_buffer)
-                            >= ann.config.input_buffer_size.max(1)
-                            || ann.worker.lookup_done;
-                    let limit_buffered = buffer_is_dispatchable
-                        && fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit);
+                    let limit_buffered = limit_satisfied_by_buffer(
+                        fetch_limit,
+                        rows_emitted,
+                        buffered_rows,
+                        window_buffer_input_units(&ann.worker.window_buffer),
+                        ann.config.input_buffer_size,
+                        ann.worker.lookup_done,
+                    );
                     let ready_input_buffer_count = ann
                         .worker
                         .input_buffer_accumulator
@@ -16242,6 +16250,90 @@ mod tests {
         build(r#"{"workers":1,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
             .expect("workers=1 with regions is accepted");
         build(r#"{"workers":4}"#).expect("workers>1 without regions is unchanged");
+    }
+
+    // ---- limit_satisfied_by_buffer ----
+    //
+    // The regression these pin: buffered INPUT rows are an upper bound on what
+    // they emit, because annotation removes non-variant records and region
+    // trimming drops out-of-bounds rows. Trusting them while holding a buffer
+    // too small to dispatch stalls the stream, and it ends the contig by
+    // aborting the lookup with fewer than `limit` rows.
+
+    const BUF: usize = 5000;
+
+    #[test]
+    fn no_limit_never_stops_the_lookup() {
+        assert!(!limit_satisfied_by_buffer(None, 0, BUF, BUF, BUF, false));
+        assert!(!limit_satisfied_by_buffer(
+            None, 10_000, BUF, BUF, BUF, true
+        ));
+    }
+
+    #[test]
+    fn a_full_buffer_that_covers_the_limit_stops_the_lookup() {
+        // Dispatchable, and emitted + buffered >= limit.
+        assert!(limit_satisfied_by_buffer(
+            Some(5000),
+            0,
+            BUF,
+            BUF,
+            BUF,
+            false
+        ));
+        assert!(limit_satisfied_by_buffer(
+            Some(5000),
+            2500,
+            2500,
+            BUF,
+            BUF,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_buffer_short_of_the_limit_keeps_pulling() {
+        assert!(!limit_satisfied_by_buffer(
+            Some(5000),
+            0,
+            4999,
+            BUF,
+            BUF,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_partial_buffer_does_not_stop_the_lookup_even_when_it_looks_like_enough() {
+        // THE regression. One row was dropped, so 4999 were emitted from a
+        // 5000-row window and a single row is left over. `4999 + 1 >= 5000`
+        // looks satisfied, but 1 unit cannot be dispatched (the dispatch
+        // refuses a sub-buffer window mid-stream), so stopping here would
+        // leave nothing able to make progress and the contig would end with
+        // 4999 rows instead of 5000.
+        assert!(!limit_satisfied_by_buffer(
+            Some(5000),
+            4999,
+            1,
+            1,
+            BUF,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_partial_buffer_does_stop_the_lookup_once_it_is_exhausted() {
+        // With the lookup done there is no more input to pull, so the partial
+        // buffer is all there is and dispatching it is allowed.
+        assert!(limit_satisfied_by_buffer(Some(5000), 4999, 1, 1, BUF, true));
+    }
+
+    #[test]
+    fn a_zero_input_buffer_size_still_treats_a_nonempty_buffer_as_dispatchable() {
+        // `.max(1)` guards the degenerate config; without it `0 >= 0` would be
+        // trivially true and the check would be meaningless.
+        assert!(!limit_satisfied_by_buffer(Some(10), 10, 0, 0, 0, false));
+        assert!(limit_satisfied_by_buffer(Some(10), 5, 5, 1, 0, false));
     }
 
     #[test]
