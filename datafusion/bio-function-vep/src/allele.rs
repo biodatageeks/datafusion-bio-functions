@@ -288,14 +288,31 @@ pub fn get_matched_variant_alleles(
 /// VCF: REF="A", ALT="G"       → VEP: "A/G"     (SNV)
 /// VCF: REF="AC", ALT="GT"     → VEP: "AC/GT"   (MNV)
 /// VCF: REF="TCAC", ALT="T"    → VEP: "CAC/-"   (deletion, prefix+suffix)
-/// VCF: REF="ATCG", ALT="AGCG" → VEP: "TCG/GCG"  (MNV: prefix-only trim, no suffix trim)
+/// VCF: REF="ATCG", ALT="AGCG" → VEP: "ATCG/AGCG" (MNV, same length: untouched)
 ///
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String) {
-    if ref_allele.len() == 1 && alt_allele.len() == 1 {
-        // SNV
+    // Same length is not an indel, and VEP minimises nothing here -- no prefix
+    // trim, no suffix trim, no coordinate shift.
+    //
+    // Ensembl VEP's default rule for a VCF record is composed of two steps and
+    // the second is easy to miss:
+    //   Parser/VCF.pm:295-297  is_indel = length(ALT) != length(REF)
+    //   Parser/VCF.pm:325-336  chop ONE anchor base, indels only
+    //   Parser.pm:881          minimise_alleles(), NOT gated on --minimal
+    //                          (that gate is :852). It fires whenever the
+    //                          ORIGINAL REF/ALT differ in length (:871-880)
+    //                          and does a full prefix + suffix trim, via
+    //                          ensembl-variation Utils/Sequence.pm:965.
+    //
+    // Net: same length -> untouched; different length -> fully reduced.
+    // Verified against ensembl-vep release/116.0 and a VEP 116.0 container run
+    // (GCC>GTC -> Allele=GTC). See biodatageeks/vepyr#95.
+    //
+    // This also covers SNVs, which are the one-base case of "same length".
+    if ref_allele.len() == alt_allele.len() {
         return (ref_allele.to_string(), alt_allele.to_string());
     }
 
@@ -351,6 +368,56 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
 /// the reported start coordinate is incremented when that happens. Unlike
 /// `vcf_to_vep_allele()`, this does not perform suffix trimming.
 pub fn vcf_to_vep_input_allele(
+    pos: i64,
+    ref_allele: &str,
+    alt_allele: &str,
+) -> (String, String, i64) {
+    // Parser/VCF.pm:295-297 -- an indel is a LENGTH DIFFERENCE, not "anything
+    // that is not an SNV". Treating an MNV as an indel here chopped its anchor
+    // base and advanced the position, which fed a wrong `parser_*` spelling
+    // into HGVSp and the colocated key.
+    let is_indel = ref_allele.len() != alt_allele.len();
+    if is_indel
+        && !ref_allele.is_empty()
+        && !alt_allele.is_empty()
+        && ref_allele.as_bytes()[0] == alt_allele.as_bytes()[0]
+    {
+        let ref_trimmed = &ref_allele[1..];
+        let alt_trimmed = &alt_allele[1..];
+        return (
+            if ref_trimmed.is_empty() {
+                "-".to_string()
+            } else {
+                ref_trimmed.to_string()
+            },
+            if alt_trimmed.is_empty() {
+                "-".to_string()
+            } else {
+                alt_trimmed.to_string()
+            },
+            pos + 1,
+        );
+    }
+
+    (ref_allele.to_string(), alt_allele.to_string(), pos)
+}
+
+/// Plugin-cache probe key spelling, deliberately frozen at the pre-vepyr#95
+/// semantics (`is_indel` == "not an SNV", rather than VEP's length difference).
+///
+/// This is a **storage compatibility contract, not VEP semantics.** The
+/// published plugin source manifests replicate the old predicate in their build
+/// SQL -- `vepyr-plugins/plugins/cadd/cadd.source.toml:47-48` and
+/// `plugins/clinvar/clinvar.source.toml:109-110`, both followed by `pos + 1` and
+/// a one-base chop -- so every shard already built stores a same-length
+/// multi-base pair anchor-shifted. Moving the runtime key to VEP's rule without
+/// rebuilding those caches would turn every MNV plugin lookup into a silent
+/// miss, and ClinVar really does carry same-length delins records.
+///
+/// So the annotation path uses `vcf_to_vep_input_allele` (VEP-correct) and the
+/// plugin probe uses this (cache-correct). When the manifests are corrected and
+/// the CADD/ClinVar caches rebuilt, this function and its three call sites go.
+pub fn plugin_probe_input_allele(
     pos: i64,
     ref_allele: &str,
     alt_allele: &str,
@@ -765,7 +832,11 @@ fn vep_prefix_suffix_len(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
     let ref_bytes = ref_allele.as_bytes();
     let alt_bytes = alt_allele.as_bytes();
 
-    if ref_bytes.len() == 1 && alt_bytes.len() == 1 {
+    // Same-length pairs are never minimised by VEP, so neither end is trimmed
+    // and the start does not move -- SNVs included, being the one-base case.
+    // This duplicates `vcf_to_vep_allele`'s policy and must stay in step with
+    // it: `Allele` comes from that function and the coordinates from this one.
+    if ref_bytes.len() == alt_bytes.len() {
         return (0, 0);
     }
 
@@ -1042,10 +1113,12 @@ mod tests {
 
     #[test]
     fn test_complex_indel_common_prefix() {
-        // VCF: REF=ATCG, ALT=ATTT → common prefix AT, then CG→TT
+        // VCF: REF=ATCG, ALT=ATTT → SAME LENGTH, so VEP trims nothing.
+        // Was previously asserted as CG/TT; see the vepyr#95 block below for
+        // why a same-length pair is never minimised (Parser.pm:871-880).
         let (r, a) = vcf_to_vep_allele("ATCG", "ATTT");
-        assert_eq!(r, "CG");
-        assert_eq!(a, "TT");
+        assert_eq!(r, "ATCG");
+        assert_eq!(a, "ATTT");
     }
 
     #[test]
@@ -1162,11 +1235,12 @@ mod tests {
 
     #[test]
     fn test_vcf_to_vep_allele_mnv_no_suffix_trim() {
-        // REF=ATCG ALT=AGCG → same length (MNV), only prefix-trim "A"
-        // VEP does NOT suffix-trim MNVs
+        // REF=ATCG ALT=AGCG → same length (MNV). VEP trims neither end: the
+        // old expectation TCG/GCG was the prefix half of a trim VEP never runs
+        // on a same-length pair.
         let (r, a) = vcf_to_vep_allele("ATCG", "AGCG");
-        assert_eq!(r, "TCG");
-        assert_eq!(a, "GCG");
+        assert_eq!(r, "ATCG");
+        assert_eq!(a, "AGCG");
     }
 
     #[test]
@@ -1208,6 +1282,148 @@ mod tests {
         let (r, a) = vcf_to_vep_allele("A", "A");
         assert_eq!(r, "A");
         assert_eq!(a, "A");
+    }
+
+    // ---------------------------------------------------------------------
+    // vepyr#95 — VEP's default parser leaves same-length pairs untouched.
+    //
+    // Ensembl VEP release/116.0 composes TWO steps for a VCF record, and the
+    // second is the one that is easy to miss:
+    //
+    //   Parser/VCF.pm:295-297  is_indel = length(ALT) != length(REF)
+    //   Parser/VCF.pm:325-336  chop ONE anchor base — indels only
+    //   Parser.pm:881          minimise_alleles(), NOT gated on --minimal
+    //                          (that gate is :852). It fires whenever the
+    //                          ORIGINAL untrimmed REF/ALT differ in length
+    //                          (:871-880) and does a FULL prefix + suffix trim
+    //                          via ensembl-variation Utils/Sequence.pm:965.
+    //
+    // Net default rule:  same length → untouched
+    //                    different length → fully reduced (prefix AND suffix)
+    //
+    // Confirmed end to end against Ensembl VEP 116.0 in docker:
+    //   GCC>GTC   → Allele=GTC   (vepyr previously emitted TC)
+    //   CCTGG>CTTGG → Allele=CTTGG
+    //   TTCA>TA   → Allele=-     (already correct — do not "fix" this)
+    //   TCCC>TC   → Allele=-     (already correct)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn mnv_is_not_trimmed_in_default_mode() {
+        // The issue's headline case, at POS 100 → VEP reports GAC/GTC, 100-102.
+        let (r, a) = vcf_to_vep_allele("GAC", "GTC");
+        assert_eq!((r.as_str(), a.as_str()), ("GAC", "GTC"));
+
+        // Two bases, shared prefix: today this trimmed to A/T and was then
+        // classified as an SNV rather than a substitution.
+        let (r, a) = vcf_to_vep_allele("GA", "GT");
+        assert_eq!((r.as_str(), a.as_str()), ("GA", "GT"));
+
+        // The long pair from t/Parser.t:94-103 — untouched in default mode.
+        let (r, a) = vcf_to_vep_allele("TTCCTTCCGACGGTACACACACACA", "TTCCTTCCGTCGGTACACACACACA");
+        assert_eq!(r, "TTCCTTCCGACGGTACACACACACA");
+        assert_eq!(a, "TTCCTTCCGTCGGTACACACACACA");
+
+        // Positive controls: same-length pairs with no shared prefix were
+        // already correct and must not move.
+        let (r, a) = vcf_to_vep_allele("CTA", "ATA");
+        assert_eq!((r.as_str(), a.as_str()), ("CTA", "ATA"));
+        let (r, a) = vcf_to_vep_allele("C", "T");
+        assert_eq!((r.as_str(), a.as_str()), ("C", "T"));
+    }
+
+    /// FROZEN. The indel path is already VEP-correct and this test exists to
+    /// stop it being "fixed". vepyr#95 proposed trimming exactly one leading
+    /// base and never a suffix, which would break every one of these — and
+    /// re-open the chr14 DISTANCE mismatch that engine PR #110 fixed.
+    #[test]
+    fn indel_trim_is_unchanged_by_the_mnv_fix() {
+        // Shared prefix AND shared suffix. VEP 116.0 emits Allele=- here.
+        let (r, a) = vcf_to_vep_allele("ATTG", "AG");
+        assert_eq!((r.as_str(), a.as_str()), ("TT", "-"));
+
+        let (r, a) = vcf_to_vep_allele("AG", "ATCG");
+        assert_eq!((r.as_str(), a.as_str()), ("-", "TC"));
+
+        // No shared first base, but a shared suffix — the issue predicted
+        // AT/GTT here; VEP gives A/GT.
+        let (r, a) = vcf_to_vep_allele("AT", "GTT");
+        assert_eq!((r.as_str(), a.as_str()), ("A", "GT"));
+
+        // The chr14 shape from engine PR #110.
+        let (r, a) = vcf_to_vep_allele("T", "AGTAAATTTTTTTTCT");
+        assert_eq!((r.as_str(), a.as_str()), ("-", "AGTAAATTTTTTTTC"));
+
+        // The three indel shapes the chr1 golden fixture actually contains.
+        let (r, a) = vcf_to_vep_allele("T", "TGCCCA");
+        assert_eq!((r.as_str(), a.as_str()), ("-", "GCCCA"));
+        let (r, a) = vcf_to_vep_allele("CG", "C");
+        assert_eq!((r.as_str(), a.as_str()), ("G", "-"));
+        let (r, a) = vcf_to_vep_allele("CCT", "C");
+        assert_eq!((r.as_str(), a.as_str()), ("CT", "-"));
+    }
+
+    #[test]
+    fn mnv_coordinates_do_not_shift() {
+        // vep_norm_start duplicates vcf_to_vep_allele's policy, so it has to
+        // move with it or Allele and the coordinates disagree.
+        assert_eq!(vep_norm_start(100, "GAC", "GTC"), 100);
+        assert_eq!(vep_norm_end(100, "GAC", "GTC"), 102);
+        assert_eq!(vep_norm_start(100, "ATCG", "AGCG"), 100);
+        assert_eq!(vep_norm_end(100, "ATCG", "AGCG"), 103);
+
+        // Frozen: the indel coordinates are unchanged.
+        assert_eq!(vep_norm_start(35295124, "CT", "C"), 35295125);
+        assert_eq!(vep_norm_end(35295124, "CT", "C"), 35295125);
+        assert_eq!(vep_norm_start(32519310, "C", "CT"), 32519311);
+        assert_eq!(vep_norm_end(32519310, "C", "CT"), 32519310);
+    }
+
+    #[test]
+    fn input_allele_does_not_anchor_chop_an_mnv() {
+        // `vcf_to_vep_input_allele` ports Parser/VCF.pm:325-336, whose is_indel
+        // is a LENGTH difference — not "anything that is not an SNV". An MNV
+        // must keep its anchor base and its position.
+        let (r, a, pos) = vcf_to_vep_input_allele(100, "GAC", "GTC");
+        assert_eq!((r.as_str(), a.as_str(), pos), ("GAC", "GTC", 100));
+
+        // Frozen: indels still lose exactly one anchor base and advance by one.
+        let (r, a, pos) = vcf_to_vep_input_allele(100, "A", "ATG");
+        assert_eq!((r.as_str(), a.as_str(), pos), ("-", "TG", 101));
+        let (r, a, pos) = vcf_to_vep_input_allele(100, "ATTG", "AG");
+        assert_eq!((r.as_str(), a.as_str(), pos), ("TTG", "G", 101));
+    }
+
+    /// The plugin probe key must NOT move with the VEP fix, or every MNV lookup
+    /// against an already-built CADD/ClinVar shard becomes a silent miss.
+    #[test]
+    fn plugin_probe_key_is_unchanged_by_the_mnv_fix() {
+        // The annotation path now reports VEP's spelling ...
+        let (r, a, pos) = vcf_to_vep_input_allele(100, "GAC", "GTC");
+        assert_eq!((r.as_str(), a.as_str(), pos), ("GAC", "GTC", 100));
+
+        // ... while the plugin key keeps the anchor-shifted spelling the built
+        // shards were keyed on. These two disagreeing is the entire point.
+        let (r, a, pos) = plugin_probe_input_allele(100, "GAC", "GTC");
+        assert_eq!((r.as_str(), a.as_str(), pos), ("AC", "TC", 101));
+
+        // Every other shape must agree between the two, so the frozen copy is
+        // only ever load-bearing for same-length multi-base pairs.
+        for (r, alt) in [
+            ("A", "G"),
+            ("A", "ATG"),
+            ("ATTG", "AG"),
+            ("CG", "C"),
+            ("CCT", "C"),
+            ("T", "TGCCCA"),
+            ("T", "AGTAAATTTTTTTTCT"),
+        ] {
+            assert_eq!(
+                plugin_probe_input_allele(100, r, alt),
+                vcf_to_vep_input_allele(100, r, alt),
+                "plugin key needlessly diverges for {r}>{alt}"
+            );
+        }
     }
 
     #[test]
