@@ -288,17 +288,12 @@ pub fn get_matched_variant_alleles(
 /// VCF: REF="A", ALT="G"       → VEP: "A/G"     (SNV)
 /// VCF: REF="AC", ALT="GT"     → VEP: "AC/GT"   (MNV)
 /// VCF: REF="TCAC", ALT="T"    → VEP: "CAC/-"   (deletion, prefix+suffix)
-/// VCF: REF="ATCG", ALT="AGCG" → VEP: "TCG/GCG"  (MNV: prefix-only trim, no suffix trim)
+/// VCF: REF="ATCG", ALT="AGCG" → VEP: "ATCG/AGCG" (MNV, same length: untouched)
 ///
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String) {
-    if ref_allele.len() == 1 && alt_allele.len() == 1 {
-        // SNV
-        return (ref_allele.to_string(), alt_allele.to_string());
-    }
-
     // Same length is not an indel, and VEP minimises nothing here -- no prefix
     // trim, no suffix trim, no coordinate shift.
     //
@@ -315,6 +310,8 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
     // Net: same length -> untouched; different length -> fully reduced.
     // Verified against ensembl-vep release/116.0 and a VEP 116.0 container run
     // (GCC>GTC -> Allele=GTC). See biodatageeks/vepyr#95.
+    //
+    // This also covers SNVs, which are the one-base case of "same length".
     if ref_allele.len() == alt_allele.len() {
         return (ref_allele.to_string(), alt_allele.to_string());
     }
@@ -835,14 +832,10 @@ fn vep_prefix_suffix_len(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
     let ref_bytes = ref_allele.as_bytes();
     let alt_bytes = alt_allele.as_bytes();
 
-    if ref_bytes.len() == 1 && alt_bytes.len() == 1 {
-        return (0, 0);
-    }
-
     // Same-length pairs are never minimised by VEP, so neither end is trimmed
-    // and the start does not move. This duplicates `vcf_to_vep_allele`'s policy
-    // and must stay in step with it: `Allele` comes from that function and the
-    // coordinates from this one.
+    // and the start does not move -- SNVs included, being the one-base case.
+    // This duplicates `vcf_to_vep_allele`'s policy and must stay in step with
+    // it: `Allele` comes from that function and the coordinates from this one.
     if ref_bytes.len() == alt_bytes.len() {
         return (0, 0);
     }
