@@ -2532,15 +2532,28 @@ fn csq_multi_value(raw: &str) -> String {
     raw.replace(',', "&")
 }
 
-/// Ensembl VEP's `\s` under **byte** semantics.
+/// Ensembl VEP's `\s` as it actually behaves on VEP's data: `[ \t\n\x0B\f\r]`.
 ///
-/// `OutputFactory/VCF.pm` has no `use utf8`, and nothing under
-/// `modules/Bio/EnsEMBL/VEP/` installs an encoding layer, so Perl `\s` there is
-/// `[ \t\n\x0B\f\r]` and nothing else.
+/// Perl's `\s` is not one rule. On a UTF8-flagged string it is
+/// `\p{White_Space}` and matches U+0085 NEL and U+00A0 NBSP; on a byte string
+/// it falls back to ASCII semantics and does not. Which applies is decided by
+/// the string, plus `use feature 'unicode_strings'` (implied by `use v5.12`+) --
+/// **not** by `use utf8`, which only governs how source literals are parsed.
 ///
-/// Neither Rust stdlib predicate matches that set, and they miss in opposite
-/// directions -- which is why this is spelled out rather than delegated:
-/// - `char::is_whitespace` also matches U+0085 NEL and U+00A0 NBSP; VEP does not.
+/// VEP's strings are byte strings: nothing under `modules/Bio/EnsEMBL/VEP/`
+/// enables `unicode_strings` or `use v5.12`+, and nothing installs an `:encoding`
+/// layer, calls `decode`, or `binmode`s a handle. So input read from a cache or
+/// a VCF stays bytes and gets ASCII semantics.
+///
+/// The consequence is concrete rather than theoretical. A UTF-8 encoded NBSP in
+/// a real file is the two bytes `C2 A0`; Perl sees two characters, neither of
+/// which is `\s`, and `s/\s+/_/g` leaves them alone. Rust decodes the same
+/// bytes to one `char` U+00A0, for which `is_whitespace()` is true -- so
+/// `is_whitespace` would escape a character VEP emits verbatim.
+///
+/// Neither stdlib predicate matches the set, and they miss in opposite
+/// directions, which is why it is spelled out rather than delegated:
+/// - `char::is_whitespace` also matches U+0085 and U+00A0; VEP (on bytes) does not.
 /// - `char::is_ascii_whitespace` omits U+000B vertical tab; VEP matches it.
 const fn is_vep_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')
@@ -19991,8 +20004,23 @@ mod tests {
         assert_eq!(csq_escape("a\x0Bb"), "a_b", "VT is Perl \\s");
         assert_eq!(csq_escape("a\x0Cb"), "a_b", "FF is Perl \\s");
         assert_eq!(csq_escape("a\rb"), "a_b", "CR is Perl \\s");
-        assert_eq!(csq_escape("a\u{85}b"), "a\u{85}b", "NEL is NOT Perl \\s");
-        assert_eq!(csq_escape("a\u{A0}b"), "a\u{A0}b", "NBSP is NOT Perl \\s");
+        // NEL and NBSP: VEP reads bytes, so a UTF-8 encoded NBSP reaches its
+        // regex as `C2 A0` -- two characters, neither of which is `\s` under
+        // ASCII semantics -- and `s/\s+/_/g` leaves them verbatim. Rust decodes
+        // the same bytes to one char that `is_whitespace()` accepts, so using
+        // that predicate would escape what VEP passes through.
+        assert_eq!(
+            csq_escape("a\u{85}b"),
+            "a\u{85}b",
+            "NEL is NOT Perl \\s on bytes"
+        );
+        assert_eq!(
+            csq_escape("a\u{A0}b"),
+            "a\u{A0}b",
+            "NBSP is NOT Perl \\s on bytes"
+        );
+        // The same bytes as VEP actually sees them: still untouched.
+        assert_eq!(csq_escape("a\u{C2}\u{A0}b"), "a\u{C2}\u{A0}b");
     }
 
     #[test]
