@@ -19993,9 +19993,8 @@ mod tests {
 
     #[test]
     fn csq_escape_matches_perl_backslash_s_not_rust_is_whitespace() {
-        // VCF.pm has no `use utf8` and nothing under modules/Bio/EnsEMBL/VEP/
-        // sets an encoding layer, so Perl `\s` is BYTE semantics:
-        //   [ \t\n\x0B\f\r] -- and NOT U+0085 NEL or U+00A0 NBSP.
+        // Perl `\s` on VEP's data is [ \t\n\x0B\f\r] -- see is_vep_space for
+        // why (UTF8-flagging plus `unicode_strings`, NOT `use utf8`).
         // Measured against perl 5.28.3.
         //
         // This test fails under BOTH stdlib predicates, in opposite directions:
