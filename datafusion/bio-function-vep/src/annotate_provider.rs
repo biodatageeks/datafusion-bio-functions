@@ -20004,11 +20004,17 @@ mod tests {
         assert_eq!(csq_escape("a\x0Bb"), "a_b", "VT is Perl \\s");
         assert_eq!(csq_escape("a\x0Cb"), "a_b", "FF is Perl \\s");
         assert_eq!(csq_escape("a\rb"), "a_b", "CR is Perl \\s");
-        // NEL and NBSP: VEP reads bytes, so a UTF-8 encoded NBSP reaches its
-        // regex as `C2 A0` -- two characters, neither of which is `\s` under
-        // ASCII semantics -- and `s/\s+/_/g` leaves them verbatim. Rust decodes
-        // the same bytes to one char that `is_whitespace()` accepts, so using
-        // that predicate would escape what VEP passes through.
+        // NEL and NBSP. The two sides see the same file differently, and that
+        // asymmetry is the whole reason this predicate is explicit:
+        //
+        //   file bytes  61 C2 A0 62
+        //   Perl (no decode layer): 4 chars, `C2` and `A0` separately, neither
+        //     of which is `\s` under ASCII semantics -> `s/\s+/_/g` no-ops.
+        //   Rust: `&str` is always valid UTF-8, so those bytes are 3 chars and
+        //     the NBSP arrives as one U+00A0 -- which `is_whitespace()` accepts.
+        //
+        // So csq_escape never sees undecoded bytes; it sees the decoded char,
+        // and must decline to escape it in order to match VEP.
         assert_eq!(
             csq_escape("a\u{85}b"),
             "a\u{85}b",
@@ -20019,8 +20025,6 @@ mod tests {
             "a\u{A0}b",
             "NBSP is NOT Perl \\s on bytes"
         );
-        // The same bytes as VEP actually sees them: still untouched.
-        assert_eq!(csq_escape("a\u{C2}\u{A0}b"), "a\u{C2}\u{A0}b");
     }
 
     #[test]
