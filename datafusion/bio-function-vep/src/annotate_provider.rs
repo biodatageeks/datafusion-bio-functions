@@ -79,6 +79,7 @@ struct EngineAnnotationProfile {
     null_chrom_rows: usize,
     null_alt_rows: usize,
     star_allele_rows: usize,
+    non_variant_rows: usize,
     cached_fast_rows: usize,
     engine_rows: usize,
     assignments: usize,
@@ -118,11 +119,12 @@ impl EngineAnnotationProfile {
 
     fn summary_line(&self) -> String {
         format!(
-            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s",
+            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} non_variant_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s",
             self.rows,
             self.null_chrom_rows,
             self.null_alt_rows,
             self.star_allele_rows,
+            self.non_variant_rows,
             self.cached_fast_rows,
             self.engine_rows,
             self.assignments,
@@ -158,6 +160,7 @@ use datafusion::arrow::array::{
     LargeStringArray, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder,
     StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
+use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
@@ -178,7 +181,7 @@ use std::borrow::Cow;
 use std::fmt::Write;
 
 use crate::allele::{
-    MatchedVariantAllele, plugin_probe_allele, plugin_probe_input_allele,
+    AltKind, MatchedVariantAllele, alt_kind, plugin_probe_allele, plugin_probe_input_allele,
     reverse_complement_allele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end,
     vep_norm_start,
 };
@@ -1172,6 +1175,10 @@ struct VepFlags {
     pubmed: bool,
     /// When true, all VEP features are enabled and 80-field CSQ schema is used.
     everything: bool,
+    /// Keep records that carry no alternate allele (`ALT=.`) instead of
+    /// dropping them. VEP's `--allow_non_variant`; false by default, matching
+    /// its absence from VEP's `%DEFAULTS` (`Config.pm:142`).
+    allow_non_variant: bool,
 }
 
 impl VepFlags {
@@ -1297,6 +1304,7 @@ impl VepFlags {
             max_af,
             pubmed,
             everything,
+            allow_non_variant: parse("allow_non_variant"),
         }
     }
 
@@ -6168,6 +6176,10 @@ impl AnnotateProvider {
             flags.everything,
         );
         let mut tx_engine_profile = engine_profile_enabled.then(TranscriptEngineProfile::default);
+        // Rows to remove after the loop (`ALT=.` without --allow_non_variant).
+        // `Vec::new` does not allocate, so this costs nothing on a batch that
+        // contains no such record.
+        let mut dropped_rows: Vec<usize> = Vec::new();
 
         for row in 0..batch.num_rows() {
             let row_setup_started = engine_profile_enabled.then(Instant::now);
@@ -6192,16 +6204,48 @@ impl AnnotateProvider {
                 continue;
             };
 
-            // VEP skips star alleles entirely — no CSQ produced.
-            if alt_allele == "*" {
-                if let Some(started) = row_setup_started {
-                    engine_profile.star_allele_rows += 1;
-                    engine_profile.row_setup += started.elapsed();
+            // What the ALT means. `*` is skipped per allele and the record
+            // survives; `.` means the record carries no alternate allele at
+            // all, and VEP drops the whole record unless --allow_non_variant.
+            match alt_kind(&alt_allele) {
+                // VEP skips star alleles entirely — no CSQ produced.
+                AltKind::Star => {
+                    if let Some(started) = row_setup_started {
+                        engine_profile.star_allele_rows += 1;
+                        engine_profile.row_setup += started.elapsed();
+                    }
+                    csq_builder.append_null();
+                    most_builder.append_null();
+                    append_null_annotation_row!();
+                    continue;
                 }
-                csq_builder.append_null();
-                most_builder.append_null();
-                append_null_annotation_row!();
-                continue;
+                // A record with no ALT is not a variant. Ensembl returns no
+                // VariationFeature for it at all (Parser/VCF.pm:263-266), so
+                // nothing downstream ever sees it; we reproduce that by
+                // removing the row after the loop. Under --allow_non_variant
+                // the row stays, carrying a null CSQ, which is what VEP's VCF
+                // writer emits (OutputFactory/VCF.pm:341-353 appends no key
+                // when there are no consequences).
+                //
+                // The row is appended either way: these builders are strictly
+                // 1:1 with the input batch — the passthrough columns are taken
+                // from it wholesale — so a row cannot be dropped from inside
+                // the loop. `dropped_rows` stays empty on every batch that has
+                // no such record, which is every batch in the parity corpus.
+                AltKind::NonVariant => {
+                    if let Some(started) = row_setup_started {
+                        engine_profile.non_variant_rows += 1;
+                        engine_profile.row_setup += started.elapsed();
+                    }
+                    if !flags.allow_non_variant {
+                        dropped_rows.push(row);
+                    }
+                    csq_builder.append_null();
+                    most_builder.append_null();
+                    append_null_annotation_row!();
+                    continue;
+                }
+                AltKind::Sequence => {}
             }
 
             // VEP-style allele minimization: strip shared prefix and suffix between REF and ALT.
@@ -7900,6 +7944,20 @@ impl AnnotateProvider {
         );
 
         let batch = RecordBatch::try_new(self.schema.clone(), out_cols)?;
+        // Physically remove the non-variant rows. Ensembl never builds a
+        // VariationFeature for them (Parser/VCF.pm:263-266), so they must not
+        // reach any output. This runs before `filter_batch_to_bounds`, which
+        // is unaffected: its `start_idx` is a *column* index, not a row
+        // offset, so removing rows cannot shift it.
+        let batch = if dropped_rows.is_empty() {
+            batch
+        } else {
+            let mut keep = vec![true; batch.num_rows()];
+            for row in dropped_rows {
+                keep[row] = false;
+            }
+            filter_record_batch(&batch, &BooleanArray::from(keep))?
+        };
         if let Some(started) = finish_builders_started {
             engine_profile.finish_builders += started.elapsed();
             eprintln!("{}", engine_profile.summary_line());

@@ -277,6 +277,81 @@ pub fn get_matched_variant_alleles(
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
+/// How the engine must treat a VCF record's ALT field.
+///
+/// The reader hands us every alternate allele joined into one string, so this
+/// is the single place that decides what that string means. Keeping the three
+/// answers in one predicate is deliberate: the `"*"` test used to be spelled
+/// inline at three separate sites, which is how `ALT=.` came to be treated as
+/// an ordinary sequence and annotated as a one-base deletion
+/// (biodatageeks/vepyr#97).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltKind {
+    /// An ordinary sequence ALT. Annotate it.
+    Sequence,
+    /// The star / overlapping-deletion allele. VEP skips it *per allele* and
+    /// keeps the record, so the row is emitted with no CSQ.
+    Star,
+    /// The record carries no alternate allele (`ALT=.`). VEP drops the *whole
+    /// record* unless `--allow_non_variant` is given.
+    NonVariant,
+}
+
+/// Classify a reader-joined ALT string.
+///
+/// # Non-variant
+///
+/// Ensembl tests the **first** alternate allele only, and compares it to the
+/// literal `.`:
+///
+/// ```perl
+/// # Parser/VCF.pm:259
+/// if($alts->[0] eq '.') {
+/// ```
+///
+/// So `ALT=.` and `ALT=.,C` are non-variant, while `ALT=C,.` is an ordinary
+/// record whose second allele happens to be a dot. We reproduce that by
+/// testing the first token rather than the joined string.
+///
+/// Two spellings reach us for the same thing, because the readers disagree.
+/// `bio-format-vcf`'s text, BGZF and BCF paths yield the **empty string**:
+/// noodles erases `.` to `""` in `record/fields.rs` before the
+/// `AlternateBases` wrapper is built, so no dot survives to be joined. The
+/// VCF-Zarr reader instead emits a literal `"."`. Both mean "no alternate
+/// allele", so both are tested here.
+///
+/// The separator set matches [`allele_matches`]: `|` is what the text readers
+/// join with, `,` is what the Zarr reader uses.
+///
+/// # Star
+///
+/// Whole-string equality, which is what the three inline tests this function
+/// replaces already did. Deliberately *not* first-token: Ensembl skips `*` per
+/// allele rather than per record, so `ALT=C,*` is a record that still gets a
+/// CSQ for `C`, and treating it as a whole-record star would lose that. The
+/// engine does not yet split multi-allelic ALTs (see the pinning test
+/// `vcf_source_multiallelic_alt_shape_is_pinned`), so `ALT=C,*` stays
+/// misannotated for now — this predicate is where that fix will land, and
+/// changing it here would move behaviour with no gate able to see it.
+///
+/// Traceability:
+/// - Ensembl VEP non-variant handling, `Parser/VCF.pm` L256-L267
+///   <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/Parser/VCF.pm#L256-L267>
+/// - Ensembl Variation per-allele star skip, `VariationFeatureOverlap.pm` L479-L491
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeatureOverlap.pm#L479-L491>
+pub fn alt_kind(alt: &str) -> AltKind {
+    // `split` always yields at least one item, so the empty string classifies
+    // as non-variant through the same arm as a literal dot.
+    let first = alt.split(['|', ',']).next().unwrap_or("");
+    if first.is_empty() || first == "." {
+        return AltKind::NonVariant;
+    }
+    if alt == "*" {
+        return AltKind::Star;
+    }
+    AltKind::Sequence
+}
+
 ///
 /// Convert VCF REF/ALT pair to VEP allele format.
 ///
@@ -807,7 +882,16 @@ fn vep_allele_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
         let ref_idx = if refs.len() == 1 { 0 } else { i };
         let alt_idx = if alts.len() == 1 { 0 } else { i };
 
-        if refs.is_null(ref_idx) || alts.is_null(alt_idx) {
+        // A non-variant ALT has no VEP allele to report. Returning NULL is
+        // the honest answer for a SQL scalar and keeps the UDF total; the
+        // alternative considered in biodatageeks/vepyr#97 was a debug_assert
+        // in vcf_to_vep_allele, which would abort a user's query on a legal
+        // if unusual input and, being debug-only, would never fire in the
+        // release builds this crate ships anyway.
+        if refs.is_null(ref_idx)
+            || alts.is_null(alt_idx)
+            || alt_kind(alts.value(alt_idx)) == AltKind::NonVariant
+        {
             builder.append_null();
         } else {
             let (vep_ref, vep_alt) = vcf_to_vep_allele(refs.value(ref_idx), alts.value(alt_idx));
@@ -1560,6 +1644,72 @@ mod tests {
         assert_eq!(
             plugin_probe_allele(100, "ATCG", "AGCG"),
             ("T".into(), "G".into(), 101)
+        );
+    }
+    // ---- alt_kind: the six ALT shapes a reader can hand us ----
+    //
+    // Each row cites what Ensembl VEP 116.0 does, so a future reader can tell
+    // a port from a guess. The rule is Parser/VCF.pm:259 `$alts->[0] eq '.'`
+    // for non-variant and VariationFeatureOverlap.pm:484 for the per-allele
+    // star skip.
+
+    #[test]
+    fn an_absent_alt_is_non_variant_in_both_reader_spellings() {
+        // ALT=. -- VEP drops the record (Parser/VCF.pm:263-266).
+        // The text/BGZF/BCF readers join zero alternate bases into "".
+        assert_eq!(alt_kind(""), AltKind::NonVariant);
+        // The VCF-Zarr reader spells the same thing as a literal dot.
+        assert_eq!(alt_kind("."), AltKind::NonVariant);
+    }
+
+    #[test]
+    fn a_dot_first_alt_is_non_variant_but_a_dot_second_alt_is_not() {
+        // This is the whole reason the predicate tests the FIRST token: VEP
+        // compares $alts->[0], not the joined string.
+        //
+        // ALT=.,C -> dropped, because the first alternate allele is a dot.
+        assert_eq!(alt_kind(".|C"), AltKind::NonVariant);
+        assert_eq!(alt_kind(".,C"), AltKind::NonVariant);
+        // ALT=C,. -> kept. VEP builds allele_string "REF/C/." and carries the
+        // dot through as a literal alternate allele.
+        assert_eq!(alt_kind("C|."), AltKind::Sequence);
+        assert_eq!(alt_kind("C,."), AltKind::Sequence);
+    }
+
+    #[test]
+    fn star_classification_is_unchanged_from_the_inline_tests_it_replaces() {
+        // A standalone star is the star allele.
+        assert_eq!(alt_kind("*"), AltKind::Star);
+        // A star alongside a real allele is NOT, because the engine does not
+        // split multi-allelic ALTs yet and VEP's star skip is per allele, not
+        // per record. This reproduces the previous `alt_allele == "*"` exactly.
+        // If this assertion ever flips, the 512 standalone-star records in the
+        // parity corpus are the only thing the gate can see -- the C,* shape
+        // has zero corpus exposure, so a change here would be invisible to it.
+        assert_eq!(alt_kind("C|*"), AltKind::Sequence);
+        assert_eq!(alt_kind("*|C"), AltKind::Sequence);
+    }
+
+    #[test]
+    fn ordinary_alleles_are_sequences() {
+        assert_eq!(alt_kind("C"), AltKind::Sequence);
+        assert_eq!(alt_kind("ACGT"), AltKind::Sequence);
+        assert_eq!(alt_kind("C|T"), AltKind::Sequence);
+        // A symbolic ALT is classified as a sequence today. That is a known,
+        // separate defect (it gets annotated as a sequence change); naming it
+        // here so the next person knows this predicate is where it lands.
+        assert_eq!(alt_kind("<DEL>"), AltKind::Sequence);
+    }
+
+    #[test]
+    fn a_real_deletion_still_converts_after_the_guard() {
+        // Positive control from biodatageeks/vepyr#97: the guard must not
+        // disturb a genuine deletion, which is what an empty ALT was being
+        // mistaken for.
+        assert_eq!(alt_kind("A"), AltKind::Sequence);
+        assert_eq!(
+            vcf_to_vep_allele("ACGT", "A"),
+            ("CGT".to_string(), "-".to_string())
         );
     }
 }

@@ -27,8 +27,8 @@ use futures::{Stream, StreamExt};
 use smallvec::SmallVec;
 
 use crate::allele::{
-    VariantAlleleInput, allele_matches, get_matched_variant_alleles, vcf_to_vep_allele,
-    vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
+    AltKind, VariantAlleleInput, allele_matches, alt_kind, get_matched_variant_alleles,
+    vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::cache::key_encoding::chrom_to_code;
 use crate::cache::variant_key::{
@@ -1655,6 +1655,27 @@ impl KvLookupStream {
 
             let vcf_ref = refs.value_or_empty(row);
             let vcf_alt = alts.value_or_empty(row);
+
+            // A record with no alternate allele is not a variant, so it has
+            // nothing to be co-located with. Ensembl never builds a
+            // VariationFeature for it (Parser/VCF.pm:263-266), so no
+            // annotation source — existing-variant lookup included — ever runs
+            // against it. Without this the probe key is built from
+            // vcf_to_vep_allele(ref, "") = (ref, "-"), i.e. a deletion that
+            // was never in the input, which can match a real cache entry and
+            // attach a spurious Existing_variation/AF to the record.
+            // This site is reached before annotation and is not covered by the
+            // guard in annotate_provider's row loop. See biodatageeks/vepyr#97.
+            //
+            // Unconditional, i.e. not gated on --allow_non_variant, and that
+            // matches VEP either way: under the flag Ensembl does build a
+            // VariationFeature, but with allele_string = REF alone (no `/`),
+            // so `compare_existing` has no alternate allele to match and
+            // reports no co-located variant. Skipping the probe reaches the
+            // same observable answer without inventing a deletion key.
+            if alt_kind(vcf_alt) == AltKind::NonVariant {
+                continue;
+            }
 
             let chrom_code = chrom_to_code(chrom);
 
