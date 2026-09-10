@@ -422,12 +422,29 @@ every value having had its `|` rewritten first:
 The four substitutions commute — none emits a `,`, `;`, `|` or whitespace — so
 the single pass in `csq_escape` is equivalent to VEP's sequence.
 
-**Whitespace is Perl `\s` under byte semantics**, i.e. `[ \t\n\x0B\f\r]`.
-`VCF.pm` has no `use utf8` and nothing under `modules/Bio/EnsEMBL/VEP/` installs
-an encoding layer. Neither Rust stdlib predicate matches that set:
-`char::is_whitespace` also matches U+0085 NEL and U+00A0 NBSP, and
+**Whitespace is Perl `\s` as it behaves on VEP's data**, i.e. `[ \t\n\x0B\f\r]`.
+
+Perl's `\s` is not one rule. On a UTF8-flagged string it is `\p{White_Space}`
+and matches U+0085 NEL and U+00A0 NBSP; on a byte string it falls back to ASCII
+semantics and does not. Which applies is decided by the string's UTF8 flag plus
+`use feature 'unicode_strings'` (implied by `use v5.12`+) — **not** by
+`use utf8`, which only governs how source literals are parsed.
+
+VEP's strings are byte strings: nothing under `modules/Bio/EnsEMBL/VEP/` enables
+`unicode_strings` or `use v5.12`+, and nothing installs an `:encoding` layer,
+calls `decode`, or `binmode`s a handle, so input read from a cache or a VCF
+stays bytes.
+
+Neither Rust stdlib predicate matches that set, and they miss in opposite
+directions: `char::is_whitespace` also matches NEL and NBSP, and
 `char::is_ascii_whitespace` omits U+000B vertical tab. The engine spells the set
 out in `is_vep_space` rather than delegating to either.
+
+Note the two sides read the same file differently, which is what the predicate
+exists to reconcile: the bytes `61 C2 A0 62` are four characters to Perl —
+`C2` and `A0` separately, neither of them `\s` — and three to Rust, where the
+NBSP arrives as one decoded `char` that `is_whitespace()` would accept. Escaping
+it would diverge from VEP, which passes it through.
 
 **`-` is blanked for plugin values.** A plugin field whose value is exactly `-`
 emits empty, as VEP does. `PluginScalar::Null` also emits empty, so a bare `-`
