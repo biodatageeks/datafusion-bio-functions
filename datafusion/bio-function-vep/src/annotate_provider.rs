@@ -14142,8 +14142,28 @@ impl Stream for ContigAnnotationStream {
                     // to avoid unnecessary annotation work.
                     let buffered_rows: usize =
                         ann.worker.window_buffer.iter().map(|b| b.num_rows()).sum();
-                    let limit_buffered =
-                        fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit);
+                    // Buffered INPUT rows are only an upper bound on what they
+                    // will emit: annotation removes non-variant records, and
+                    // region trimming drops out-of-bounds rows. So a buffer
+                    // that looks like enough may not be.
+                    //
+                    // That matters here because this flag stops us pulling from
+                    // the lookup. Stop while holding a PARTIAL buffer -- one
+                    // below input_buffer_size, which the dispatch below refuses
+                    // to cut mid-stream -- and nothing can make progress: no
+                    // window is dispatched, no rows are emitted, and the state
+                    // machine falls through to "contig done", aborting the
+                    // lookup with fewer than `limit` rows. So only trust the
+                    // buffered count when that buffer can actually be
+                    // dispatched. With no rows dropped this is a no-op: a
+                    // dispatched full window emits its full row count, so the
+                    // partial-buffer case only arises once the lookup is done.
+                    let buffer_is_dispatchable =
+                        window_buffer_input_units(&ann.worker.window_buffer)
+                            >= ann.config.input_buffer_size.max(1)
+                            || ann.worker.lookup_done;
+                    let limit_buffered = buffer_is_dispatchable
+                        && fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit);
                     let ready_input_buffer_count = ann
                         .worker
                         .input_buffer_accumulator
