@@ -1656,40 +1656,47 @@ impl KvLookupStream {
             let vcf_ref = refs.value_or_empty(row);
             let vcf_alt = alts.value_or_empty(row);
 
-            // A record with no alternate allele is not a variant, so it has
-            // nothing to be co-located with. Ensembl never builds a
-            // VariationFeature for it (Parser/VCF.pm:263-266), so no
-            // annotation source — existing-variant lookup included — ever runs
-            // against it. Without this the probe key is built from
-            // vcf_to_vep_allele(ref, "") = (ref, "-"), i.e. a deletion that
-            // was never in the input, which can match a real cache entry and
-            // attach a spurious Existing_variation/AF to the record.
-            // This site is reached before annotation and is not covered by the
-            // guard in annotate_provider's row loop. See biodatageeks/vepyr#97.
-            //
-            // Unconditional, i.e. not gated on --allow_non_variant, and that
-            // matches VEP either way: under the flag Ensembl does build a
-            // VariationFeature, but with allele_string = REF alone (no `/`),
-            // so `compare_existing` has no alternate allele to match and
-            // reports no co-located variant. Skipping the probe reaches the
-            // same observable answer without inventing a deletion key.
-            if alt_kind(vcf_alt) == AltKind::NonVariant {
-                continue;
-            }
-
             let chrom_code = chrom_to_code(chrom);
 
             // Probe a small set of start positions used by VEP-style caches.
             // All variants at a given (chrom, start) are in one entry, so we
             // only need to probe distinct start values.
             let probe_build_started = self.profile_detailed.then(Instant::now);
-            let probe_starts = build_probe_starts(
-                norm_start_i64,
-                norm_end_i64,
-                vcf_ref,
-                vcf_alt,
-                self.extended_probes,
-            );
+            let probe_starts = if alt_kind(vcf_alt) == AltKind::NonVariant {
+                // A record with no alternate allele is not a variant, so it
+                // has nothing to be co-located with. Ensembl never builds a
+                // VariationFeature for it (Parser/VCF.pm:263-266), so no
+                // annotation source — existing-variant lookup included — ever
+                // runs against it. Left to itself this probe would build its
+                // compare key from vcf_to_vep_allele(ref, "") = (ref, "-"),
+                // a deletion that was never in the input, which can match a
+                // real cache entry and attach a spurious Existing_variation or
+                // AF to the record. This site runs BEFORE annotation and is
+                // not covered by the guard in annotate_provider's row loop.
+                //
+                // Not gated on --allow_non_variant, and that agrees with VEP
+                // either way: under the flag Ensembl does build a
+                // VariationFeature, but with allele_string = REF alone (no
+                // `/`), so `compare_existing` has no alternate allele to match
+                // and reports no co-located variant.
+                //
+                // Probing nothing rather than skipping the row: this exec
+                // emits one output row per input row, so a `continue` here
+                // would delete the record from the pipeline before annotation
+                // ever saw it. With no probe match the fallback below appends
+                // null cache columns and emits the row, which is what a
+                // variant with no co-located entry already does.
+                // See biodatageeks/vepyr#97.
+                Vec::new()
+            } else {
+                build_probe_starts(
+                    norm_start_i64,
+                    norm_end_i64,
+                    vcf_ref,
+                    vcf_alt,
+                    self.extended_probes,
+                )
+            };
             if let Some(t0) = probe_build_started {
                 self.profile.probe_build += t0.elapsed();
             }
