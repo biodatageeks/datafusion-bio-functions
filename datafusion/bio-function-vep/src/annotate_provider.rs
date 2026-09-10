@@ -2532,28 +2532,72 @@ fn csq_multi_value(raw: &str) -> String {
     raw.replace(',', "&")
 }
 
-fn csq_escape(val: &str) -> std::borrow::Cow<'_, str> {
+/// Ensembl VEP's `\s` under **byte** semantics.
+///
+/// `OutputFactory/VCF.pm` has no `use utf8`, and nothing under
+/// `modules/Bio/EnsEMBL/VEP/` installs an encoding layer, so Perl `\s` there is
+/// `[ \t\n\x0B\f\r]` and nothing else.
+///
+/// Neither Rust stdlib predicate matches that set, and they miss in opposite
+/// directions -- which is why this is spelled out rather than delegated:
+/// - `char::is_whitespace` also matches U+0085 NEL and U+00A0 NBSP; VEP does not.
+/// - `char::is_ascii_whitespace` omits U+000B vertical tab; VEP matches it.
+const fn is_vep_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')
+}
+
+/// Escape one CSQ field value exactly as Ensembl VEP does.
+///
+/// Traceability: `OutputFactory/VCF.pm:396-405`, applied per field value before
+/// `join('|', @chunk)` at `:419` -- so VEP's own `|` separator is structurally
+/// protected, because every value has already had its `|` rewritten to `&`.
+///
+/// ```text
+/// $data = '' if $data eq '-';   # :396-398, every column except Allele
+/// $data =~ s/\,/\&/g;           # :401
+/// $data =~ s/\;/\%3B/g;         # :402
+/// $data =~ s/\s+/\_/g;          # :403  -- a RUN collapses to ONE underscore
+/// $data =~ s/\|/\&/g;           # :404
+/// ```
+///
+/// The four substitutions commute: none emits a `,`, `;`, `|` or whitespace, so
+/// the order above is unobservable and this single pass is equivalent.
+///
+/// Shared with the plugin CSQ path (`plugin_cache::csq`) so the two cannot drift
+/// apart again; `=` is NOT escaped here, because VEP has no such rule.
+pub(crate) fn csq_escape(val: &str) -> std::borrow::Cow<'_, str> {
     if val == "-" {
         return std::borrow::Cow::Borrowed("");
     }
 
     let mut changed = false;
     let mut escaped = String::with_capacity(val.len());
+    // `s/\s+/_/g` is quantified: emit one `_` per RUN, not per character.
+    let mut prev_was_space = false;
     for ch in val.chars() {
         match ch {
             ',' | '|' => {
                 escaped.push('&');
                 changed = true;
+                prev_was_space = false;
             }
             ';' => {
                 escaped.push_str("%3B");
                 changed = true;
+                prev_was_space = false;
             }
-            ch if ch.is_whitespace() => {
-                escaped.push('_');
+            ch if is_vep_space(ch) => {
+                if !prev_was_space {
+                    escaped.push('_');
+                }
+                // Still a change even when the character is collapsed away.
                 changed = true;
+                prev_was_space = true;
             }
-            _ => escaped.push(ch),
+            _ => {
+                escaped.push(ch);
+                prev_was_space = false;
+            }
         }
     }
 
@@ -3564,7 +3608,22 @@ fn sift_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<String, Ca
 ///
 /// VEP uses `--sift b` / `--polyphen b` format (both prediction and score).
 fn format_prediction(prediction: &str, score: f32) -> String {
-    let pred = prediction.replace(' ', "_").replace("_-_", "_");
+    // OutputFactory.pm:1819-1820 -- `s/\s+/_/g` collapses the RUN first, and the
+    // `_-_` fixup runs after. Reversing the two differs on a run beside a dash.
+    let mut collapsed = String::with_capacity(prediction.len());
+    let mut prev_was_space = false;
+    for c in prediction.chars() {
+        if is_vep_space(c) {
+            if !prev_was_space {
+                collapsed.push('_');
+            }
+            prev_was_space = true;
+        } else {
+            collapsed.push(c);
+            prev_was_space = false;
+        }
+    }
+    let pred = collapsed.replace("_-_", "_");
     format!("{pred}({score})")
 }
 
@@ -8353,9 +8412,21 @@ fn lookup_domains(
             if parts.is_empty() {
                 continue;
             }
-            let mut label = parts.join(":");
-            // Replace spaces, semicolons, and equals signs with underscores.
-            label = label.replace(' ', "_").replace(';', "_").replace('=', "_");
+            // OutputFactory.pm:1505 -- `s/[\s;=]/_/g`. Note there is NO
+            // quantifier here: DOMAINS escapes PER CHARACTER, unlike the CSQ
+            // value rule at VCF.pm:403. Real VEP emits `a__b` for `a  b`, so
+            // collapsing runs here would create a mismatch, not fix one.
+            let label: String = parts
+                .join(":")
+                .chars()
+                .map(|c| {
+                    if is_vep_space(c) || c == ';' || c == '=' {
+                        '_'
+                    } else {
+                        c
+                    }
+                })
+                .collect();
             labels.push(label);
         }
     }
@@ -17211,6 +17282,27 @@ mod tests {
     }
 
     #[test]
+    fn format_prediction_collapses_whitespace_runs_like_vep() {
+        // OutputFactory.pm:1819-1820 is `s/\s+/_/g` THEN `s/\_\-\_/\_/g`.
+        // The run collapse comes FIRST; doing the `_-_` fixup before collapsing
+        // gives different output on a run adjacent to a dash.
+        assert_eq!(
+            format_prediction("probably  damaging", 0.9),
+            "probably_damaging(0.9)"
+        );
+        // A tab is Perl `\s` too -- today's `.replace(' ', ..)` misses it.
+        assert_eq!(
+            format_prediction("tolerated\tlow", 0.1),
+            "tolerated_low(0.1)"
+        );
+        // The `_-_` rule still applies after collapsing.
+        assert_eq!(
+            format_prediction("tolerated - low confidence", 0.2),
+            "tolerated_low_confidence(0.2)"
+        );
+    }
+
+    #[test]
     fn test_format_prediction_tolerated_low_confidence() {
         assert_eq!(
             format_prediction("tolerated - low confidence", 0.23),
@@ -17564,6 +17656,47 @@ mod tests {
         assert_eq!(
             lookup_domains(Some("ENST00000001"), Some("10"), None, &ctx),
             "Gene3D_db:1.10.510.10"
+        );
+    }
+
+    #[test]
+    fn lookup_domains_escapes_per_character_not_as_a_run() {
+        // OutputFactory.pm:1505 is `s/[\s;=]/_/g` -- NO quantifier. DOMAINS is
+        // the one escaper that must NOT collapse: real VEP emits `a__b` here,
+        // so collapsing would CREATE a mismatch on 60,815 chr22 values.
+        let translations = vec![make_translation(
+            "ENST00000001",
+            vec![ProteinDomainFeature {
+                analysis: Some("a  b".to_string()),
+                hseqname: Some("x".to_string()),
+                start: 1,
+                end: 50,
+            }],
+        )];
+        let ctx = minimal_ctx(&translations);
+        assert_eq!(
+            lookup_domains(Some("ENST00000001"), Some("10"), None, &ctx),
+            "a__b:x"
+        );
+    }
+
+    #[test]
+    fn lookup_domains_escapes_tab_like_vep() {
+        // `[\s;=]` catches a tab; today's `.replace(' ', ..)` lets it through
+        // and a raw tab in an INFO value corrupts the VCF column layout.
+        let translations = vec![make_translation(
+            "ENST00000001",
+            vec![ProteinDomainFeature {
+                analysis: Some("a\tb".to_string()),
+                hseqname: Some("c;d=e".to_string()),
+                start: 1,
+                end: 50,
+            }],
+        )];
+        let ctx = minimal_ctx(&translations);
+        assert_eq!(
+            lookup_domains(Some("ENST00000001"), Some("10"), None, &ctx),
+            "a_b:c_d_e"
         );
     }
 
@@ -19812,6 +19945,62 @@ mod tests {
         assert_eq!(escaped, val);
         // Should be a borrowed Cow (no allocation)
         assert!(matches!(escaped, std::borrow::Cow::Borrowed(_)));
+    }
+
+    // ── vepyr#93: whitespace runs, the VEP `\s` set, and one escaper ──────
+
+    #[test]
+    fn csq_escape_collapses_whitespace_runs_like_vep() {
+        // OutputFactory/VCF.pm:403 is `s/\s+/\_/g` -- a QUANTIFIED run, so any
+        // number of consecutive whitespace chars yields exactly one underscore.
+        // t/OutputFactory_VCF.t:245-246
+        assert_eq!(csq_escape("A  G"), "A_G");
+        // The full substitution set in VEP's order. t/OutputFactory_VCF.t:329-334
+        assert_eq!(csq_escape("ENST00,00  03|07;301"), "ENST00&00_03&07%3B301");
+        // A mixed run -- tab + space + space -- is still one underscore.
+        assert_eq!(csq_escape("a\t  b"), "a_b");
+        // Leading and trailing runs collapse too: VCF.pm has no trim step.
+        assert_eq!(csq_escape("  x  "), "_x_");
+    }
+
+    #[test]
+    fn csq_escape_single_space_is_unchanged_positive_control() {
+        // The path that is already correct and must stay correct: 60,815 chr22
+        // DOMAINS values carry exactly one space and pass byte-for-byte today.
+        assert_eq!(csq_escape("A G"), "A_G");
+        assert_eq!(csq_escape("PROSITE profiles"), "PROSITE_profiles");
+    }
+
+    #[test]
+    fn csq_escape_does_not_touch_equals() {
+        // VEP 116 has no `=` rule for CSQ values. The POD table at VCF.pm:76-78
+        // claims `= ==> %3B`, which is a typo for `;` -- the code has no `=` arm.
+        assert_eq!(csq_escape("a=b"), "a=b");
+    }
+
+    #[test]
+    fn csq_escape_matches_perl_backslash_s_not_rust_is_whitespace() {
+        // VCF.pm has no `use utf8` and nothing under modules/Bio/EnsEMBL/VEP/
+        // sets an encoding layer, so Perl `\s` is BYTE semantics:
+        //   [ \t\n\x0B\f\r] -- and NOT U+0085 NEL or U+00A0 NBSP.
+        // Measured against perl 5.28.3.
+        //
+        // This test fails under BOTH stdlib predicates, in opposite directions:
+        //   char::is_whitespace       also matches NEL and NBSP (over-matches)
+        //   char::is_ascii_whitespace omits U+000B vertical tab  (under-matches)
+        assert_eq!(csq_escape("a\x0Bb"), "a_b", "VT is Perl \\s");
+        assert_eq!(csq_escape("a\x0Cb"), "a_b", "FF is Perl \\s");
+        assert_eq!(csq_escape("a\rb"), "a_b", "CR is Perl \\s");
+        assert_eq!(csq_escape("a\u{85}b"), "a\u{85}b", "NEL is NOT Perl \\s");
+        assert_eq!(csq_escape("a\u{A0}b"), "a\u{A0}b", "NBSP is NOT Perl \\s");
+    }
+
+    #[test]
+    fn csq_escape_borrowed_fast_path_survives_the_run_collapse() {
+        let val = "Q9Y6K1.3";
+        assert!(matches!(csq_escape(val), std::borrow::Cow::Borrowed(_)));
+        // A value that only *collapses* still allocates -- it changed.
+        assert!(matches!(csq_escape("A  G"), std::borrow::Cow::Owned(_)));
     }
 
     #[test]
