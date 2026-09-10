@@ -399,6 +399,80 @@ async batched page-read → in-memory slice → sync per-row/per-transcript read
 One-dataset-per-plugin means enabling/disabling a plugin adds/removes exactly its
 columns, with no effect on variation or other plugins.
 
+### 5.5 CSQ value escaping
+
+Plugin values are escaped by exactly the same rules as built-in CSQ fields,
+because VEP treats them as the same thing: `OutputFactory/VCF.pm:449` pushes
+`get_plugin_headers` into `@fields`, and `:387` is the loop that walks that list.
+There is **one** escaper in the engine — `annotate_provider::csq_escape` — and
+`plugin_cache::csq` calls it. Two copies drifted apart once already (vepyr#93).
+
+VEP's rules, `OutputFactory/VCF.pm:396-405`, applied per field value *before*
+`join('|', @chunk)` at `:419` — so VEP's own `|` separator is structurally safe,
+every value having had its `|` rewritten first:
+
+| rule | source | note |
+|---|---|---|
+| `-` → `''` | `:396-398` | every column **except** `Allele`, plugins included |
+| `,` → `&` | `:401` | |
+| `;` → `%3B` | `:402` | |
+| `\s+` → `_` | `:403` | a **run** collapses to ONE underscore |
+| `\|` → `&` | `:404` | |
+
+The four substitutions commute — none emits a `,`, `;`, `|` or whitespace — so
+the single pass in `csq_escape` is equivalent to VEP's sequence.
+
+**Whitespace is Perl `\s` as it behaves on VEP's data**, i.e. `[ \t\n\x0B\f\r]`.
+
+Perl's `\s` is not one rule. On a UTF8-flagged string it is `\p{White_Space}`
+and matches U+0085 NEL and U+00A0 NBSP; on a byte string it falls back to ASCII
+semantics and does not. Which applies is decided by the string's UTF8 flag plus
+`use feature 'unicode_strings'` (implied by `use v5.12`+) — **not** by
+`use utf8`, which only governs how source literals are parsed.
+
+VEP's strings are byte strings: nothing under `modules/Bio/EnsEMBL/VEP/` enables
+`unicode_strings` or `use v5.12`+, and nothing installs an `:encoding` layer,
+calls `decode`, or `binmode`s a handle, so input read from a cache or a VCF
+stays bytes.
+
+Neither Rust stdlib predicate matches that set, and they miss in opposite
+directions: `char::is_whitespace` also matches NEL and NBSP, and
+`char::is_ascii_whitespace` omits U+000B vertical tab. The engine spells the set
+out in `is_vep_space` rather than delegating to either.
+
+Note the two sides read the same file differently, which is what the predicate
+exists to reconcile: the bytes `61 C2 A0 62` are four characters to Perl —
+`C2` and `A0` separately, neither of them `\s` — and three to Rust, where the
+NBSP arrives as one decoded `char` that `is_whitespace()` would accept. Escaping
+it would diverge from VEP, which passes it through.
+
+**`-` is blanked for plugin values.** A plugin field whose value is exactly `-`
+emits empty, as VEP does. `PluginScalar::Null` also emits empty, so a bare `-`
+and a cache miss are indistinguishable downstream — including in vepyr, where an
+empty CSQ token becomes `null` in the LazyFrame. VEP has the identical
+conflation; this is parity, not data loss peculiar to us. A plugin that needs a
+meaningful `-` cannot express it in VCF CSQ output at all.
+
+**One deliberate deviation: `=` → `%3D`, plugin values only.** VEP does *not*
+escape `=` in a CSQ value — its only `=`→`%3D` is HGVSp (`OutputFactory.pm:1757`)
+and that is `no_escape`-gated. The engine escapes it anyway on the plugin path
+because ClinVar `CLNVI` carries BIC `base_change=…` values that VEP emits
+already-`%3D`-encoded from the source VCF (VCF 4.3 requires the encoding in an
+INFO value); without it, 556 `ClinVar_CLNVI` entries across 7 records mismatch.
+The underlying cause is an upstream INFO percent-decode. When that is fixed the
+deviation should be **removed**, not relocated.
+
+**Escapers that are deliberately not this one.** Two other fields have their own
+VEP rules and must not be folded in:
+
+| field | rule | source | shape |
+|---|---|---|---|
+| `DOMAINS` | `s/[\s;=]/_/g` | `OutputFactory.pm:1505` | **per character** — no quantifier |
+| `SIFT`/`PolyPhen` | `s/\s+/_/g` then `s/\_\-\_/\_/g` | `OutputFactory.pm:1819-1820` | run, then the `_-_` fixup |
+
+`DOMAINS` is the trap: real VEP emits `a__b` for `a  b`, so collapsing runs there
+would *create* a mismatch on the ~60k chr22 values that pass byte-for-byte today.
+
 ## 6. Manifests
 
 Two manifests bracket the build: the **source manifest** is the declarative build
