@@ -6,7 +6,10 @@
 //! normalizes contig/coordinates to the variation convention, LEFT-joins the
 //! variation shard to inherit its warm/cold `tier`, and writes
 //! `plugin/<name>/<chrom>.parquet` reusing the variation shard's
-//! lookup-optimized writer properties.
+//! lookup-optimized writer properties. A manifest with `lookup = "interval"`
+//! (gene or region tracks) skips the allele and the tier join: its shards are
+//! probed at runtime through per-discriminator COITrees by overlap with the
+//! variant's VEP-normalised span, first row in file order winning.
 
 pub mod build;
 pub mod builder;

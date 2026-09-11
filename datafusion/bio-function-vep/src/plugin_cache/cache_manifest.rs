@@ -172,6 +172,38 @@ pub struct CacheManifest {
     /// is made for the cache as a whole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assume_unique: Option<bool>,
+    /// Lookup kind the shards were built for. Absent in caches built before
+    /// interval plugins existed, which are all point lookups.
+    #[serde(default)]
+    pub lookup: LookupKind,
+}
+
+/// How the runtime finds a shard row for a consequence line.
+///
+/// `Point` is the original exact probe on `(start, allele_string, <match…>)`
+/// with variation-inherited tiering. `Interval` rows carry a genomic span and
+/// no allele: a row matches when its `[start, end]` overlaps the variant's
+/// VEP-normalised span and every match discriminator agrees. The first such
+/// row in file order wins, as a tabix-backed Ensembl plugin returns records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LookupKind {
+    #[default]
+    Point,
+    Interval,
+}
+
+/// The shard key columns a lookup kind stores, in shard order.
+pub fn key_columns(lookup: LookupKind) -> Vec<String> {
+    match lookup {
+        LookupKind::Point => vec![
+            "chrom".into(),
+            "start".into(),
+            "end".into(),
+            "allele_string".into(),
+        ],
+        LookupKind::Interval => vec!["chrom".into(), "start".into(), "end".into()],
+    }
 }
 
 /// Field ordering within one plugin's CSQ block.
@@ -232,12 +264,7 @@ impl CacheManifest {
         CacheManifest {
             plugin_name: src.plugin_name.clone(),
             source_manifest: source_manifest_file.to_string(),
-            key_columns: vec![
-                "chrom".into(),
-                "start".into(),
-                "end".into(),
-                "allele_string".into(),
-            ],
+            key_columns: key_columns(src.lookup),
             match_columns: src
                 .match_columns
                 .iter()
@@ -264,6 +291,7 @@ impl CacheManifest {
             allele_match: src.allele_match,
             field_order: src.field_order,
             assume_unique: Some(src.assume_unique),
+            lookup: src.lookup,
         }
     }
 
@@ -303,6 +331,49 @@ pub fn discover_plugins(cache_root: &Path) -> Result<Vec<CacheManifest>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_manifest_without_lookup_reads_as_point() {
+        let json = r#"{
+            "plugin_name": "demo",
+            "source_manifest": "demo.source.toml",
+            "key_columns": ["chrom","start","end","allele_string"],
+            "value_columns": [{"column":"s","csq_field":"S","type":"Float32"}],
+            "chroms": []
+        }"#;
+        let m: CacheManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.lookup, LookupKind::Point);
+    }
+
+    #[test]
+    fn interval_manifest_records_lookup_and_key_columns() {
+        let src: SourceManifest = toml::from_str(
+            r##"
+plugin_name = "po"
+coordinate_system = "1-based"
+lookup = "interval"
+ingest_sql = "SELECT 1"
+[[source]]
+provider = "gff"
+path = "/tmp/po.gff3.gz"
+  [source.gff]
+  attributes = ["gene_id"]
+[[match_column]]
+column = "gene_id"
+template = "{Gene}"
+[[value_columns]]
+column = "rat"
+csq_field = "PO_Rat"
+type = "Utf8"
+"##,
+        )
+        .unwrap();
+        let cache = CacheManifest::from_source(&src, "po.source.toml");
+        assert_eq!(cache.lookup, LookupKind::Interval);
+        assert_eq!(cache.key_columns, vec!["chrom", "start", "end"]);
+        let json = serde_json::to_string(&cache).unwrap();
+        assert!(json.contains("\"lookup\":\"interval\""));
+    }
 
     #[test]
     fn legacy_manifest_without_source_version_deserializes() {
@@ -395,6 +466,7 @@ type = "Float32"
             allele_match: Default::default(),
             field_order: Default::default(),
             assume_unique: None,
+            lookup: Default::default(),
         };
         m.write(&plugin_dir).unwrap();
         let found = discover_plugins(dir.path()).unwrap();

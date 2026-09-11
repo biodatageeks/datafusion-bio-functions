@@ -25,21 +25,32 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 
+use crate::plugin_cache::cache_manifest::LookupKind;
+
 /// ASCII unit separator between key fields — will not occur in genomic contig /
 /// allele / amino-acid-change strings, so it can't collide two distinct keys.
 const KEY_SEP: char = '\u{1f}';
 
+/// The runtime probe key a shard row must be unique on, in shard order: the
+/// positional part per lookup kind, then each match-discriminator column in
+/// manifest order. `chrom` is constant within a per-chrom build. For point
+/// lookups `end` is not part of the probe key; for interval lookups it is.
+pub fn probe_key_columns(lookup: LookupKind, match_columns: &[String]) -> Vec<String> {
+    let mut key: Vec<String> = match lookup {
+        LookupKind::Point => vec!["start".into(), "allele_string".into()],
+        LookupKind::Interval => vec!["start".into(), "end".into()],
+    };
+    key.extend(match_columns.iter().cloned());
+    key
+}
+
 /// Consume `stream` (ordered source-partition replay) and return its batches
-/// with only the **first** row per `(start, allele_string, <match col values…>)`
-/// key retained — matching VEP's first-in-file rule. Later duplicates are dropped.
-///
-/// The key is exactly the runtime probe key (`PluginBufferSlice::probe`): `start`,
-/// `allele_string`, then each match-discriminator column in manifest order. `chrom`
-/// is constant within a per-chrom build and `end` is not part of the probe key, so
-/// neither participates.
+/// with only the **first** row per `key_columns` value retained — matching
+/// VEP's first-in-file rule. Later duplicates are dropped. `key_columns` is the
+/// full probe key from [`probe_key_columns`].
 pub async fn dedup_keep_first(
     mut stream: SendableRecordBatchStream,
-    match_columns: &[String],
+    key_columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<RecordBatch> = Vec::new();
@@ -47,8 +58,7 @@ pub async fn dedup_keep_first(
     // `None` never collapse into the same key.
     let opts = FormatOptions::default().with_null("\u{0}NULL");
 
-    let mut key_names: Vec<&str> = vec!["start", "allele_string"];
-    key_names.extend(match_columns.iter().map(|s| s.as_str()));
+    let key_names: Vec<&str> = key_columns.iter().map(|s| s.as_str()).collect();
 
     while let Some(batch) = stream.next().await {
         let batch = batch?;
@@ -119,14 +129,13 @@ const SAMPLE_CAP: usize = 2_000_000;
 /// only occur past that prefix will not be caught by this pass.
 pub async fn check_assume_unique_sample(
     mut stream: SendableRecordBatchStream,
-    match_columns: &[String],
+    key_columns: &[String],
 ) -> Result<Vec<RecordBatch>> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<RecordBatch> = Vec::new();
     let opts = FormatOptions::default().with_null("\u{0}NULL");
 
-    let mut key_names: Vec<&str> = vec!["start", "allele_string"];
-    key_names.extend(match_columns.iter().map(|s| s.as_str()));
+    let key_names: Vec<&str> = key_columns.iter().map(|s| s.as_str()).collect();
 
     while let Some(batch) = stream.next().await {
         let batch = batch?;
@@ -230,9 +239,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn keeps_first_of_duplicate_key() {
         let stream = stream_of(norm_batch()).await;
-        let out = dedup_keep_first(stream, &["protein_variant".to_string()])
-            .await
-            .unwrap();
+        let out = dedup_keep_first(
+            stream,
+            &probe_key_columns(LookupKind::Point, &["protein_variant".to_string()]),
+        )
+        .await
+        .unwrap();
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 3, "one duplicate H101Y row must be dropped");
 
@@ -268,9 +280,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn check_assume_unique_sample_rejects_a_real_duplicate() {
         let stream = stream_of(norm_batch()).await;
-        let err = check_assume_unique_sample(stream, &["protein_variant".to_string()])
-            .await
-            .unwrap_err();
+        let err = check_assume_unique_sample(
+            stream,
+            &probe_key_columns(LookupKind::Point, &["protein_variant".to_string()]),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("violated its own claim"));
     }
 
@@ -295,7 +310,9 @@ mod tests {
         )
         .unwrap();
         let stream = stream_of(batch).await;
-        let out = check_assume_unique_sample(stream, &[]).await.unwrap();
+        let out = check_assume_unique_sample(stream, &probe_key_columns(LookupKind::Point, &[]))
+            .await
+            .unwrap();
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 2, "unique input must pass through untouched");
     }
@@ -322,7 +339,9 @@ mod tests {
         )
         .unwrap();
         let stream = stream_of(batch).await;
-        let out = dedup_keep_first(stream, &[]).await.unwrap();
+        let out = dedup_keep_first(stream, &probe_key_columns(LookupKind::Point, &[]))
+            .await
+            .unwrap();
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1);
         let sc = out[0]

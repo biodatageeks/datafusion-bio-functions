@@ -5,15 +5,22 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use datafusion::common::{DataFusionError, Result};
 
 use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::{
-    AlleleMatch, CacheManifest, FieldOrder, discover_plugins,
+    AlleleMatch, CacheManifest, FieldOrder, LookupKind, discover_plugins,
 };
-use crate::plugin_cache::lookup::{PluginBufferSlice, PluginLookup, PluginScalar};
+use crate::plugin_cache::lookup::{IntervalLookup, PluginBufferSlice, PluginLookup, PluginScalar};
 use crate::plugin_cache::template::CompiledTemplate;
+
+/// The per-chrom shard handle of one plugin, by lookup kind.
+enum LookupHandle {
+    Point(Box<PluginLookup>),
+    Interval(Arc<IntervalLookup>),
+}
 
 /// One enabled plugin, with its per-chrom lookup (absent if this plugin has no
 /// shard for the current chrom).
@@ -27,7 +34,7 @@ struct PluginEntry {
     match_templates: Vec<CompiledTemplate>,
     n_match: usize,
     n_values: usize,
-    lookup: Option<PluginLookup>,
+    lookup: Option<LookupHandle>,
 }
 
 /// All enabled plugins for one chromosome, in requested order (or alphabetical
@@ -182,7 +189,14 @@ impl PluginRegistry {
                             shard.display()
                         )));
                     }
-                    Some(PluginLookup::open(&shard, match_columns, value_columns).await?)
+                    Some(match m.lookup {
+                        LookupKind::Point => LookupHandle::Point(Box::new(
+                            PluginLookup::open(&shard, match_columns, value_columns).await?,
+                        )),
+                        LookupKind::Interval => LookupHandle::Interval(Arc::new(
+                            IntervalLookup::open(&shard, match_columns, value_columns).await?,
+                        )),
+                    })
                 }
                 _ => None,
             };
@@ -281,14 +295,20 @@ impl PluginRegistry {
     pub async fn take_buffer_all(&self, sorted_unique_starts: &[u32]) -> Result<BufferSlices> {
         let mut entries = Vec::with_capacity(self.plugins.len());
         for p in &self.plugins {
-            let slice = match &p.lookup {
-                Some(lk) => {
+            let (slice, interval) = match &p.lookup {
+                Some(LookupHandle::Point(lk)) => {
                     let batch = lk.take_buffer(sorted_unique_starts).await?;
-                    Some(PluginBufferSlice::from_batch(
-                        &batch, p.n_match, p.n_values,
-                    )?)
+                    (
+                        Some(PluginBufferSlice::from_batch(
+                            &batch, p.n_match, p.n_values,
+                        )?),
+                        None,
+                    )
                 }
-                None => None,
+                // Interval shards are resident for the whole contig; nothing
+                // to take per buffer.
+                Some(LookupHandle::Interval(il)) => (None, Some(Arc::clone(il))),
+                None => (None, None),
             };
             entries.push(SliceEntry {
                 csq_fields_len: p.csq_fields.len(),
@@ -296,6 +316,7 @@ impl PluginRegistry {
                 allele_match: p.allele_match,
                 match_templates: p.match_templates.clone(),
                 slice,
+                interval,
             });
         }
         Ok(BufferSlices { entries })
@@ -309,6 +330,7 @@ struct SliceEntry {
     allele_match: AlleleMatch,
     match_templates: Vec<CompiledTemplate>,
     slice: Option<PluginBufferSlice>,
+    interval: Option<Arc<IntervalLookup>>,
 }
 
 /// The per-buffer working set across all plugins. Probed synchronously per
@@ -324,18 +346,28 @@ impl BufferSlices {
     /// templates against the engine-attribute namespace `attrs` (same order as
     /// [`crate::plugin_cache::template::ATTR_NAMES`]); a plugin with no shard, or
     /// a position/allele/discriminator miss, yields `PluginScalar::Null` per
-    /// field (the per-transcript gate for match-column plugins).
+    /// field (the per-transcript gate for match-column plugins). `span` is the
+    /// variant's VEP-normalised inclusive `[start, end]` with `span.0 <= span.1`
+    /// (the caller swaps insertion coordinates); interval plugins probe by it.
     pub fn probe_all(
         &self,
         start: u32,
         allele_string: &str,
         fallback_key: Option<(u32, &str)>,
+        span: (u32, u32),
         attrs: &[Option<&str>],
     ) -> Vec<PluginScalar> {
         let mut out = Vec::new();
         for e in &self.entries {
             let match_values: Vec<Option<String>> =
                 e.match_templates.iter().map(|t| t.eval(attrs)).collect();
+            if let Some(il) = &e.interval {
+                match il.probe(span.0, span.1, &match_values) {
+                    Some(values) => out.extend(e.emit_order.iter().map(|&i| values[i].clone())),
+                    None => out.extend(std::iter::repeat_n(PluginScalar::Null, e.csq_fields_len)),
+                }
+                continue;
+            }
             let hit = e
                 .slice
                 .as_ref()
@@ -403,9 +435,111 @@ mod tests {
             allele_match: Default::default(),
             field_order: Default::default(),
             assume_unique: None,
+            lookup: Default::default(),
         }
         .write(&plugin_dir)
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interval_plugin_probes_by_span_and_gene() {
+        use crate::plugin_cache::cache_manifest::key_columns;
+        use crate::plugin_cache::lookup::test_support::write_interval_shard;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path();
+        let plugin_dir = cache_root.join("plugin").join("po");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        write_interval_shard(&plugin_dir.join("chr1.parquet"));
+        CacheManifest {
+            plugin_name: "po".into(),
+            source_manifest: "po.source.toml".into(),
+            key_columns: key_columns(LookupKind::Interval),
+            match_columns: vec![MatchColumnRecord {
+                column: "gene_id".into(),
+                template: "{Gene}".into(),
+            }],
+            value_columns: vec![ValueColumnRecord {
+                column: "rat".into(),
+                csq_field: "PO_Rat".into(),
+                ty: "Utf8".into(),
+                description: None,
+            }],
+            chroms: vec![ChromEntry {
+                chrom: "chr1".into(),
+                file: "chr1.parquet".into(),
+                rows: 4,
+                warm: 0,
+                cold: 4,
+            }],
+            sources: vec![],
+            cache_source_version: None,
+            allele_match: Default::default(),
+            field_order: Default::default(),
+            assume_unique: Some(true),
+            lookup: LookupKind::Interval,
+        }
+        .write(&plugin_dir)
+        .unwrap();
+
+        let reg = PluginRegistry::open(cache_root, "1", None).await.unwrap();
+        assert_eq!(reg.csq_fields(), vec!["PO_Rat"]);
+        // Interval plugins ignore the buffer take; an empty start list is fine.
+        let slices = reg.take_buffer_all(&[]).await.unwrap();
+        let ns = build_attr_namespace(
+            "intron_variant",
+            "ENSG1",
+            "SYM",
+            "Transcript",
+            "ENST1",
+            "lncRNA",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "A",
+            "G",
+        );
+        assert_eq!(
+            slices.probe_all(160, "A/G", None, (160, 160), &ns),
+            vec![PluginScalar::Str("wide".into())]
+        );
+        assert_eq!(
+            slices.probe_all(350, "A/G", None, (350, 350), &ns),
+            vec![PluginScalar::Str("late".into())]
+        );
+        assert_eq!(
+            slices.probe_all(351, "A/G", None, (351, 351), &ns),
+            vec![PluginScalar::Null]
+        );
+        let other = build_attr_namespace(
+            "intron_variant",
+            "ENSG2",
+            "SYM",
+            "Transcript",
+            "ENST2",
+            "lncRNA",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "A",
+            "G",
+        );
+        assert_eq!(
+            slices.probe_all(160, "A/G", None, (160, 160), &other),
+            vec![PluginScalar::Null]
+        );
+        // No transcript → empty namespace → discriminator None → miss.
+        assert_eq!(
+            slices.probe_all(160, "A/G", None, (160, 160), &[]),
+            vec![PluginScalar::Null]
+        );
     }
 
     #[test]
@@ -515,7 +649,7 @@ mod tests {
             ty: ValueType::Float32,
             description: None,
         }];
-        let schema = plugin_output_schema(&matches, &vals);
+        let schema = plugin_output_schema(LookupKind::Point, &matches, &vals);
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -564,6 +698,7 @@ mod tests {
             allele_match: Default::default(),
             field_order: Default::default(),
             assume_unique: None,
+            lookup: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 
@@ -589,7 +724,7 @@ mod tests {
             "A",
             "G",
         );
-        let hit = slices.probe_all(100, "A/G", None, &ns_hit);
+        let hit = slices.probe_all(100, "A/G", None, (100, 100), &ns_hit);
         match hit[0] {
             PluginScalar::F32(v) => assert!((v - 0.0427).abs() < 1e-6),
             ref other => panic!("{other:?}"),
@@ -612,7 +747,7 @@ mod tests {
             "A",
             "G",
         );
-        let none = slices.probe_all(100, "A/G", None, &ns_miss);
+        let none = slices.probe_all(100, "A/G", None, (100, 100), &ns_miss);
         assert_eq!(none, vec![PluginScalar::Null]);
     }
 
@@ -653,6 +788,7 @@ mod tests {
             allele_match: Default::default(),
             field_order: Default::default(),
             assume_unique: None,
+            lookup: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 
@@ -661,7 +797,7 @@ mod tests {
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
         // No shard → empty (Null) field, not an error.
         assert_eq!(
-            slices.probe_all(100, "A/G", None, &[]),
+            slices.probe_all(100, "A/G", None, (100, 100), &[]),
             vec![PluginScalar::Null]
         );
     }
@@ -684,7 +820,7 @@ mod tests {
             ty: ValueType::Float32,
             description: None,
         }];
-        let schema = plugin_output_schema(&[], &vals);
+        let schema = plugin_output_schema(LookupKind::Point, &[], &vals);
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -729,19 +865,20 @@ mod tests {
             allele_match: Default::default(),
             field_order: Default::default(),
             assume_unique: None,
+            lookup: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 
         let reg = PluginRegistry::open(cache_root, "22", None).await.unwrap();
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
         // Empty namespace (no transcript) still hits the per-variant row.
-        match slices.probe_all(100, "A/G", None, &[])[0] {
+        match slices.probe_all(100, "A/G", None, (100, 100), &[])[0] {
             PluginScalar::F32(v) => assert!((v - 0.5).abs() < 1e-6),
             ref other => panic!("{other:?}"),
         }
         // Wrong allele still misses.
         assert_eq!(
-            slices.probe_all(100, "C/T", None, &[]),
+            slices.probe_all(100, "C/T", None, (100, 100), &[]),
             vec![PluginScalar::Null]
         );
     }
@@ -783,6 +920,7 @@ mod tests {
             allele_match: Default::default(),
             field_order: Default::default(),
             assume_unique: None,
+            lookup: Default::default(),
         };
         manifest.write(&plugin_dir).unwrap();
 

@@ -11,7 +11,8 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Float32Array, Int8Array, StringArray, UInt32Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion_bio_function_vep::plugin_cache::cache_manifest::{
-    AlleleMatch, CacheManifest, ChromEntry, FieldOrder, MatchColumnRecord, ValueColumnRecord,
+    AlleleMatch, CacheManifest, ChromEntry, FieldOrder, LookupKind, MatchColumnRecord,
+    ValueColumnRecord,
 };
 use datafusion_bio_function_vep::plugin_cache::csq::{empty_suffix, field_suffix};
 use datafusion_bio_function_vep::plugin_cache::registry::PluginRegistry;
@@ -63,7 +64,7 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
             description: None,
         },
     ];
-    let schema = plugin_output_schema(&matches, &vals);
+    let schema = plugin_output_schema(LookupKind::Point, &matches, &vals);
     // chr22:22893742 C>G, missense W (protein_variant "C17W"): am 0.4833 / ambiguous.
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -122,6 +123,7 @@ fn build_alphamissense_shard(cache_root: &std::path::Path) {
         allele_match: Default::default(),
         field_order: Default::default(),
         assume_unique: None,
+        lookup: Default::default(),
     };
     manifest.write(&plugin_dir).unwrap();
 }
@@ -143,24 +145,24 @@ async fn plugin_csq_gates_per_transcript() {
 
     // Transcript line 1: missense C17W (Amino_acids "C/W", Protein_position "17").
     let ns_missense = ns_aa("C/W", "17");
-    let missense = slices.probe_all(22893742, "C/G", None, &ns_missense);
+    let missense = slices.probe_all(22893742, "C/G", None, (22893742, 22893742), &ns_missense);
     assert_eq!(field_suffix(&missense), "|0.4833|ambiguous");
 
     // Transcript line 2: intron (no amino-acid change) → gate → empty fields.
     let ns_intron = ns_aa("", "");
-    let intron = slices.probe_all(22893742, "C/G", None, &ns_intron);
+    let intron = slices.probe_all(22893742, "C/G", None, (22893742, 22893742), &ns_intron);
     assert_eq!(field_suffix(&intron), empty_suffix(n));
     assert_eq!(field_suffix(&intron), "||");
 
     // A different protein change at the same position (wrong isoform) → miss.
     let ns_wrong = ns_aa("C/Y", "17");
     assert_eq!(
-        field_suffix(&slices.probe_all(22893742, "C/G", None, &ns_wrong)),
+        field_suffix(&slices.probe_all(22893742, "C/G", None, (22893742, 22893742), &ns_wrong)),
         "||"
     );
 
     // A variant with no shard row (different position) → empty fields.
-    let none_here = slices.probe_all(99999999, "A/G", None, &ns_missense);
+    let none_here = slices.probe_all(99999999, "A/G", None, (99999999, 99999999), &ns_missense);
     assert_eq!(field_suffix(&none_here), "||");
 }
 
@@ -184,7 +186,7 @@ async fn indel_probe_uses_normalized_start() {
         ty: ValueType::Float32,
         description: None,
     }];
-    let schema = plugin_output_schema(&matches, &vals);
+    let schema = plugin_output_schema(LookupKind::Point, &matches, &vals);
     // One row at the NORMALIZED coordinates: start 101, allele "-/TG".
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -230,6 +232,7 @@ async fn indel_probe_uses_normalized_start() {
         allele_match: Default::default(),
         field_order: Default::default(),
         assume_unique: None,
+        lookup: Default::default(),
     };
     manifest.write(&plugin_dir).unwrap();
 
@@ -238,13 +241,13 @@ async fn indel_probe_uses_normalized_start() {
     // Normalized start (101) hits.
     let hit = reg.take_buffer_all(&[101]).await.unwrap();
     assert_eq!(
-        field_suffix(&hit.probe_all(101, "-/TG", None, &[])),
+        field_suffix(&hit.probe_all(101, "-/TG", None, (101, 101), &[])),
         "|0.75"
     );
     // Raw VCF POS (100) misses — this is what the pre-fix code used.
     let miss = reg.take_buffer_all(&[100]).await.unwrap();
     assert_eq!(
-        field_suffix(&miss.probe_all(100, "-/TG", None, &[])),
+        field_suffix(&miss.probe_all(100, "-/TG", None, (100, 100), &[])),
         empty_suffix(1)
     );
 }
@@ -274,7 +277,7 @@ async fn minimised_fallback_and_alphabetical_fields_preserve_name_value_pairs() 
             description: Some("A description".into()),
         },
     ];
-    let schema = plugin_output_schema(&[], &vals);
+    let schema = plugin_output_schema(LookupKind::Point, &[], &vals);
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -328,6 +331,7 @@ async fn minimised_fallback_and_alphabetical_fields_preserve_name_value_pairs() 
         allele_match: AlleleMatch::Minimised,
         field_order: FieldOrder::Alphabetical,
         assume_unique: None,
+        lookup: Default::default(),
     };
     manifest.write(&plugin_dir).unwrap();
 
@@ -343,12 +347,12 @@ async fn minimised_fallback_and_alphabetical_fields_preserve_name_value_pairs() 
 
     let slices = registry.take_buffer_all(&[101]).await.unwrap();
     assert_eq!(
-        field_suffix(&slices.probe_all(100, "AA/GA", None, &[])),
+        field_suffix(&slices.probe_all(100, "AA/GA", None, (100, 100), &[])),
         "||",
         "the unreduced primary key must miss"
     );
     assert_eq!(
-        field_suffix(&slices.probe_all(100, "AA/GA", Some((101, "A/G")), &[])),
+        field_suffix(&slices.probe_all(100, "AA/GA", Some((101, "A/G")), (100, 100), &[])),
         "|a-value|z-value",
         "the minimised fallback must hit and preserve alphabetical name/value pairing"
     );

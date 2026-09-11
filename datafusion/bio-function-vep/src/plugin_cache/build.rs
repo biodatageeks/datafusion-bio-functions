@@ -15,9 +15,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int8Array, UInt32Array};
-use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::array::{Array, ArrayRef, Int8Array, UInt32Array, UInt64Array};
+use datafusion::arrow::compute::{SortColumn, cast, concat_batches, lexsort_to_indices, take};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::dataframe::DataFrame;
@@ -31,8 +31,8 @@ use log::info;
 use std::time::Instant;
 
 use crate::cache::manifest::canonical_chrom_label;
-use crate::plugin_cache::cache_manifest::ChromEntry;
-use crate::plugin_cache::dedup::{check_assume_unique_sample, dedup_keep_first};
+use crate::plugin_cache::cache_manifest::{ChromEntry, LookupKind};
+use crate::plugin_cache::dedup::{check_assume_unique_sample, dedup_keep_first, probe_key_columns};
 use crate::plugin_cache::join::{
     partition_batches, should_retry_final_hash_plan, tiered_stream_sorted_adaptive,
     tiered_stream_sorted_sort_merge,
@@ -445,6 +445,7 @@ pub async fn build_plugin_chrom_staged(
     let norm_sql = wrap_normalization(
         &src.ingest_view_name(),
         src.coordinate_system.clone(),
+        src.lookup,
         &match_cols,
         &value_cols,
     );
@@ -488,10 +489,11 @@ pub async fn build_plugin_chrom_staged(
     // claim instead of trusting it blindly (see `check_assume_unique_sample`
     // docs for why this can't be exhaustive without reintroducing the same
     // memory cost the flag exists to avoid).
+    let key_cols = probe_key_columns(src.lookup, &match_cols);
     let deduped = if src.assume_unique {
-        check_assume_unique_sample(norm_stream, &match_cols).await?
+        check_assume_unique_sample(norm_stream, &key_cols).await?
     } else {
-        dedup_keep_first(norm_stream, &match_cols).await?
+        dedup_keep_first(norm_stream, &key_cols).await?
     };
     // The source scan is done — drop the decompressed temp before the join leg.
     drop(src_temps);
@@ -502,6 +504,34 @@ pub async fn build_plugin_chrom_staged(
         src.plugin_name,
         t_start.elapsed().as_secs_f64()
     );
+
+    let out_schema = plugin_output_schema(src.lookup, &src.match_columns, &src.value_columns);
+    let plugin_dir = output_cache_root.join("plugin").join(&src.plugin_name);
+    std::fs::create_dir_all(&plugin_dir)
+        .map_err(|e| DataFusionError::Execution(format!("mkdir {}: {e}", plugin_dir.display())))?;
+    let file_name = format!("{}.parquet", canonical_chrom_label(chrom));
+    let shard_path = plugin_dir.join(&file_name);
+    // Write to a sibling temporary path and atomically rename only after the
+    // Parquet footer is flushed. A failed/retried hash plan can safely
+    // truncate this same path without exposing a partial runtime shard.
+    let build_tmp = plugin_dir.join(format!("{file_name}.build.tmp"));
+    let scratch = ScratchGuard::new([build_tmp.clone()]);
+
+    if src.lookup == LookupKind::Interval {
+        // No allele → nothing to inherit a tier from. Sort by (start, arrival
+        // order) so the shard preserves the tabix/file order VEP iterates, and
+        // stamp every row cold.
+        let (rows, warm, cold) =
+            write_interval_shard(deduped, &out_schema, &build_tmp, chrom, &src.plugin_name).await?;
+        info!(
+            "plugin_cache[{}/{chrom}]: interval shard written, rows={rows}, {:.1}s total",
+            src.plugin_name,
+            t_start.elapsed().as_secs_f64()
+        );
+        return finish_staged(
+            scratch, build_tmp, shard_path, file_name, chrom, rows, warm, cold,
+        );
+    }
 
     // The join and ORDER BY share one bounded spill pool. TracingPool is always
     // installed because it also attributes a rejected reservation to the
@@ -542,18 +572,6 @@ pub async fn build_plugin_chrom_staged(
     let key_mem = MemTable::try_new(key_schema, key_batches)
         .map_err(|e| DataFusionError::Execution(format!("variation-key memtable: {e}")))?;
     build_ctx.register_table(&key_view, Arc::new(key_mem))?;
-
-    let out_schema = plugin_output_schema(&src.match_columns, &src.value_columns);
-    let plugin_dir = output_cache_root.join("plugin").join(&src.plugin_name);
-    std::fs::create_dir_all(&plugin_dir)
-        .map_err(|e| DataFusionError::Execution(format!("mkdir {}: {e}", plugin_dir.display())))?;
-    let file_name = format!("{}.parquet", canonical_chrom_label(chrom));
-    let shard_path = plugin_dir.join(&file_name);
-    // Write to a sibling temporary path and atomically rename only after the
-    // Parquet footer is flushed. A failed/retried hash plan can safely
-    // truncate this same path without exposing a partial runtime shard.
-    let build_tmp = plugin_dir.join(format!("{file_name}.build.tmp"));
-    let scratch = ScratchGuard::new([build_tmp.clone()]);
 
     // Execute the explicitly sorted parallel plan and stream it directly into
     // one final-order temp shard. If a HashJoin estimate was optimistic, or it
@@ -620,10 +638,31 @@ pub async fn build_plugin_chrom_staged(
         t_start.elapsed().as_secs_f64()
     );
 
-    // Empty chrom → no shard (matches variation builder cleanup). Its commit
-    // removes any stale shard from a previous build so the manifest (rows: 0)
-    // matches disk and the runtime never opens a leftover file for an empty
-    // chrom.
+    info!(
+        "plugin_cache[{}/{chrom}]: staged, rows={rows}, {:.1}s total",
+        src.plugin_name,
+        t_start.elapsed().as_secs_f64()
+    );
+    finish_staged(
+        scratch, build_tmp, shard_path, file_name, chrom, rows, warm, cold,
+    )
+}
+
+/// Turn a written (or empty) build temp into a [`StagedShard`]. An empty chrom
+/// gets no shard (matches variation builder cleanup): its commit removes any
+/// stale shard from a previous build so the manifest (rows: 0) matches disk
+/// and the runtime never opens a leftover file for an empty chrom.
+#[allow(clippy::too_many_arguments)]
+fn finish_staged(
+    scratch: ScratchGuard,
+    build_tmp: PathBuf,
+    shard_path: PathBuf,
+    file_name: String,
+    chrom: &str,
+    rows: usize,
+    warm: usize,
+    cold: usize,
+) -> Result<StagedShard> {
     if warm + cold == 0 {
         let _ = std::fs::remove_file(&build_tmp);
         return Ok(StagedShard {
@@ -638,13 +677,7 @@ pub async fn build_plugin_chrom_staged(
             live: shard_path,
         });
     }
-
     scratch.disarm();
-    info!(
-        "plugin_cache[{}/{chrom}]: staged, rows={rows}, {:.1}s total",
-        src.plugin_name,
-        t_start.elapsed().as_secs_f64()
-    );
     Ok(StagedShard {
         staged: Some(build_tmp),
         live: shard_path,
@@ -658,6 +691,73 @@ pub async fn build_plugin_chrom_staged(
     })
 }
 
+/// Interval shards skip the tier join: concatenate the deduped batches, order
+/// by `(start, arrival ordinal)`, append `tier = 1`, and write. Returns
+/// `(rows, warm = 0, cold = rows)`.
+async fn write_interval_shard(
+    deduped: Vec<RecordBatch>,
+    out_schema: &SchemaRef,
+    path: &Path,
+    chrom: &str,
+    plugin_name: &str,
+) -> Result<(usize, usize, usize)> {
+    let mut writer = PluginShardWriter::create(path, Arc::clone(out_schema))?;
+    let non_empty: Vec<RecordBatch> = deduped.into_iter().filter(|b| b.num_rows() > 0).collect();
+    if non_empty.is_empty() {
+        let rows = writer.finish()?;
+        return Ok((rows, 0, rows));
+    }
+    let all = concat_batches(&non_empty[0].schema(), &non_empty)
+        .map_err(|e| DataFusionError::Execution(format!("concat interval rows: {e}")))?;
+    let n = all.num_rows();
+    let ordinal: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..n as u64));
+    let start_idx = all.schema().index_of("start")?;
+    let indices = lexsort_to_indices(
+        &[
+            SortColumn {
+                values: Arc::clone(all.column(start_idx)),
+                options: None,
+            },
+            SortColumn {
+                values: ordinal,
+                options: None,
+            },
+        ],
+        None,
+    )
+    .map_err(|e| DataFusionError::Execution(format!("sort interval rows: {e}")))?;
+    let mut columns: Vec<ArrayRef> = all
+        .columns()
+        .iter()
+        .map(|c| take(c.as_ref(), &indices, None))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| DataFusionError::Execution(format!("take interval rows: {e}")))?;
+    let mut fields: Vec<Field> = all
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.push(Field::new("tier", DataType::Int8, false));
+    columns.push(Arc::new(Int8Array::from(vec![1i8; n])));
+    let sorted = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| DataFusionError::Execution(format!("interval batch: {e}")))?;
+    let reordered = reproject_cast(&sorted, out_schema)?;
+    let tier_idx = out_schema.index_of("tier")?;
+    let out_start_idx = out_schema.index_of("start")?;
+    inspect_tier_start_order(
+        &reordered,
+        out_start_idx,
+        tier_idx,
+        chrom,
+        plugin_name,
+        None,
+    )?;
+    writer.write(&reordered)?;
+    let rows = writer.finish()?;
+    Ok((rows, 0, rows))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,6 +767,124 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use std::io::Write;
     use std::sync::Arc;
+
+    async fn read_all(path: &std::path::Path) -> Vec<RecordBatch> {
+        use futures::TryStreamExt;
+        use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+        let file = tokio::fs::File::open(path).await.unwrap();
+        let mut stream = ParquetRecordBatchStreamBuilder::new(file)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(b) = stream.try_next().await.unwrap() {
+            out.push(b);
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interval_build_writes_span_rows_in_file_order_without_tier_join() {
+        use crate::plugin_cache::provider::test_gff::{gff_body, write_gz};
+        let dir = tempfile::tempdir().unwrap();
+        let gz = dir.path().join("po.gff3.gz");
+        write_gz(&gz, &gff_body());
+        let manifest: SourceManifest = toml::from_str(&format!(
+            r##"
+plugin_name = "po"
+coordinate_system = "1-based"
+lookup = "interval"
+field_order = "alphabetical"
+ingest_sql = """
+SELECT chrom, start, "end", gene_id,
+       "Rat_gene_id" AS rat_gene_id, "Rat_Orthologous_phenotype" AS rat_phenotype
+FROM plugin_po_src
+"""
+[[source]]
+provider = "gff"
+path = "{}"
+  [source.gff]
+  attributes = ["gene_id", "Rat_gene_id", "Rat_Orthologous_phenotype"]
+[[match_column]]
+column = "gene_id"
+template = "{{Gene}}"
+[[value_columns]]
+column = "rat_gene_id"
+csq_field = "PO_Rat_geneid"
+type = "Utf8"
+[[value_columns]]
+column = "rat_phenotype"
+csq_field = "PO_Rat_phenotype"
+type = "Utf8"
+"##,
+            gz.display()
+        ))
+        .unwrap();
+        // The variation shard is unused by an interval build; any readable
+        // shard satisfies the signature.
+        let variation = dir.path().join("chr1.parquet");
+        write_synthetic_variation(&variation, &[]);
+        let out = dir.path().join("cache");
+        let entry = build_plugin_chrom(&manifest, "po.source.toml", &variation, &out, "1")
+            .await
+            .unwrap();
+        assert_eq!((entry.rows, entry.warm, entry.cold), (2, 0, 2));
+        let shard = out.join("plugin/po/chr1.parquet");
+        let batches = read_all(&shard).await;
+        let names: Vec<_> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "chrom",
+                "start",
+                "end",
+                "gene_id",
+                "rat_gene_id",
+                "rat_phenotype",
+                "tier"
+            ]
+        );
+        let starts: Vec<u32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(starts, vec![600000, 610000]);
+        let tiers: Vec<i8> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(6)
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(tiers, vec![1, 1]);
+        let rat = batches[0]
+            .column(5)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            rat.value(0),
+            " a b|c;d",
+            "leading space and %3B survive the build"
+        );
+    }
 
     fn write_gz(path: &std::path::Path, body: &str) {
         let f = std::fs::File::create(path).unwrap();
@@ -1067,9 +1285,12 @@ type = "Float32"
         let df = ctx.table("normalized").await.unwrap();
         let (stream, source_partitions) = ordered_parallel_source_stream(df).await.unwrap();
         assert_eq!(source_partitions, 2);
-        let deduped = dedup_keep_first(stream, &["protein_variant".into()])
-            .await
-            .unwrap();
+        let deduped = dedup_keep_first(
+            stream,
+            &probe_key_columns(LookupKind::Point, &["protein_variant".into()]),
+        )
+        .await
+        .unwrap();
         assert_eq!(deduped.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
         let score = deduped[0]
             .column(deduped[0].schema().index_of("am_pathogenicity").unwrap())

@@ -983,6 +983,20 @@ pub fn vep_norm_end(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> i64 {
     vcf_pos + ref_allele.len() as i64 - 1 - suffix_len as i64
 }
 
+/// The genomic span a tabix-backed Ensembl plugin queries for a variant: the
+/// VEP-normalised `[start, end]`, with an insertion's `start > end` swapped the
+/// way `PhenotypeOrthologous.pm` and `ReferenceQuality.pm` do before calling
+/// `get_data`. Inclusive, 1-based, clamped to `u32`.
+pub fn plugin_probe_span(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> (u32, u32) {
+    let s = vep_norm_start(vcf_pos, ref_allele, alt_allele);
+    let e = vep_norm_end(vcf_pos, ref_allele, alt_allele);
+    let (lo, hi) = if s > e { (e, s) } else { (s, e) };
+    (
+        u32::try_from(lo).unwrap_or(0),
+        u32::try_from(hi).unwrap_or(0),
+    )
+}
+
 /// Create the `vep_norm_start(pos, ref, alt)` scalar UDF.
 ///
 /// Traceability:
@@ -1550,6 +1564,18 @@ mod tests {
     /// Equal-length MNVs left behind by `bcftools norm -m -both`. Each pair is a
     /// real chr21 HG002 variant whose CADD score was present in the shard under
     /// the minimal key but missed by an unreduced probe.
+    #[test]
+    fn plugin_probe_span_is_vep_span_with_insertions_swapped() {
+        // SNV
+        assert_eq!(plugin_probe_span(100, "A", "G"), (100, 100));
+        // deletion CT>C: VEP start 101, end 101
+        assert_eq!(plugin_probe_span(100, "CT", "C"), (101, 101));
+        // insertion C>CT: VEP start 101, end 100 → swapped [100, 101]
+        assert_eq!(plugin_probe_span(100, "C", "CT"), (100, 101));
+        // MNV
+        assert_eq!(plugin_probe_span(100, "AC", "GT"), (100, 101));
+    }
+
     #[test]
     fn plugin_probe_allele_reduces_untrimmed_mnvs() {
         // chr21:13973877, 12 shared trailing bases -> a plain T>G substitution.

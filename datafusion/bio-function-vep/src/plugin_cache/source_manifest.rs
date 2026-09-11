@@ -223,6 +223,10 @@ pub struct SourceManifest {
     /// it is not a generic performance knob.
     #[serde(default)]
     pub assume_unique: bool,
+    /// Lookup kind; `interval` drops `allele_string` and the variation tier
+    /// join and matches rows by span overlap plus discriminators.
+    #[serde(default)]
+    pub lookup: crate::plugin_cache::cache_manifest::LookupKind,
 }
 
 /// Standard VCF meta-information keys and provenance keys owned by this sink.
@@ -373,6 +377,15 @@ impl SourceManifest {
                     )));
                 }
             }
+        }
+        if self.lookup == crate::plugin_cache::cache_manifest::LookupKind::Interval
+            && self.allele_match != crate::plugin_cache::cache_manifest::AlleleMatch::Exact
+        {
+            return Err(DataFusionError::Execution(format!(
+                "plugin '{}' sets allele_match = {:?} with lookup = \"interval\"; interval rows \
+                 carry no allele, so allele_match has no meaning there",
+                self.plugin_name, self.allele_match
+            )));
         }
         for value in &self.value_columns {
             validate_csq_field_name(&self.plugin_name, &value.csq_field)?;
@@ -535,6 +548,26 @@ type = "Utf8"
         let m: SourceManifest = toml::from_str(&wrong).unwrap();
         let err = m.validate().unwrap_err().to_string();
         assert!(err.contains("[source.gff]") && err.contains("Bed"), "{err}");
+    }
+
+    #[test]
+    fn interval_lookup_rejects_minimised_allele_match() {
+        let text = GFF_MANIFEST.replace(
+            "coordinate_system = \"1-based\"",
+            "coordinate_system = \"1-based\"\nlookup = \"interval\"\nallele_match = \"minimised\"",
+        );
+        let m: SourceManifest = toml::from_str(&text).unwrap();
+        let err = m.validate().unwrap_err().to_string();
+        assert!(err.contains("allele_match"), "{err}");
+    }
+
+    #[test]
+    fn lookup_defaults_to_point() {
+        let m: SourceManifest = toml::from_str(CADD_LIKE).unwrap();
+        assert_eq!(
+            m.lookup,
+            crate::plugin_cache::cache_manifest::LookupKind::Point
+        );
     }
 
     #[test]
