@@ -317,6 +317,20 @@ impl SourceManifest {
                         source.label()
                     )));
                 }
+                (ProviderKind::Gff, Some(gff)) => {
+                    // Each attribute becomes an Arrow column of that name, so a
+                    // repeat would be a duplicate field; say so here rather than
+                    // from deep inside the reader.
+                    let mut seen = std::collections::HashSet::new();
+                    if let Some(dup) = gff.attributes.iter().find(|a| !seen.insert(a.as_str())) {
+                        return Err(DataFusionError::Execution(format!(
+                            "plugin '{}' {} lists attribute {dup:?} more than once in \
+                             [source.gff].attributes",
+                            self.plugin_name,
+                            source.label()
+                        )));
+                    }
+                }
                 (other, Some(_)) if other != ProviderKind::Gff => {
                     return Err(DataFusionError::Execution(format!(
                         "plugin '{}' {} declares [source.gff] for a {other:?} source",
@@ -477,6 +491,20 @@ type = "Utf8"
         let m: SourceManifest = toml::from_str(&empty).unwrap();
         let err = m.validate().unwrap_err().to_string();
         assert!(err.contains("at least one attribute"), "{err}");
+    }
+
+    #[test]
+    fn gff_attributes_must_be_unique() {
+        let dup = GFF_MANIFEST.replace(
+            "attributes = [\"gene_id\", \"Rat_gene_id\"]",
+            "attributes = [\"gene_id\", \"Rat_gene_id\", \"gene_id\"]",
+        );
+        let m: SourceManifest = toml::from_str(&dup).unwrap();
+        let err = m.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("more than once") && err.contains("gene_id"),
+            "{err}"
+        );
     }
 
     #[test]
