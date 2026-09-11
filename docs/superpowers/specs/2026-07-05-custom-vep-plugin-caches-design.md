@@ -667,9 +667,11 @@ key and the frequency join.
   of scope**: they key by gene/transcript ID, not genomic position, so neither the
   variation frequency join nor the position point-lookup applies. They would need a
   separate gene-keyed mechanism.
-- **Per-interval / overlap plugins** (Conservation, regulatory tracks) are
-  structurally supported by `start`/`end`, but frequency-tiering degrades to the
-  interval's start position; treat as a secondary case, not the primary target.
+- **Per-interval / overlap plugins** (gene or region tracks such as
+  PhenotypeOrthologous) are supported since `lookup = "interval"` landed:
+  shards keep `start`/`end` and no allele, skip the tier join, and are probed
+  by span overlap through per-discriminator COITrees. See vepyr's
+  `docs/superpowers/specs/2026-09-11-gff-plugin-source-and-phenotypeorthologous-design.md`.
 - No merged/bundled wide plugin shard (Section-3 option 2/3): revisit only if
   per-variant N-lookup cost is measured to matter for the hot production set.
 - No storing of joined AF in the plugin cache: runtime already gets frequency from
