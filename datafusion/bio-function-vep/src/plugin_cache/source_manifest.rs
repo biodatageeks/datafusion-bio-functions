@@ -321,11 +321,19 @@ impl SourceManifest {
                     // Each attribute becomes an Arrow column of that name, so a
                     // repeat would be a duplicate field; say so here rather than
                     // from deep inside the reader.
-                    let mut seen = std::collections::HashSet::new();
+                    // The reader appends the attributes after its eight fixed
+                    // columns, so an attribute named like one of them would be a
+                    // second field of that name too.
+                    const GFF_FIXED_COLUMNS: [&str; 8] = [
+                        "chrom", "start", "end", "type", "source", "score", "strand", "phase",
+                    ];
+                    let mut seen: std::collections::HashSet<&str> =
+                        GFF_FIXED_COLUMNS.into_iter().collect();
                     if let Some(dup) = gff.attributes.iter().find(|a| !seen.insert(a.as_str())) {
                         return Err(DataFusionError::Execution(format!(
                             "plugin '{}' {} lists attribute {dup:?} more than once in \
-                             [source.gff].attributes",
+                             [source.gff].attributes, or it names one of the fixed GFF \
+                             columns (chrom, start, end, type, source, score, strand, phase)",
                             self.plugin_name,
                             source.label()
                         )));
@@ -503,6 +511,18 @@ type = "Utf8"
         let err = m.validate().unwrap_err().to_string();
         assert!(
             err.contains("more than once") && err.contains("gene_id"),
+            "{err}"
+        );
+
+        // A fixed GFF column name would shadow the reader's own field.
+        let fixed = GFF_MANIFEST.replace(
+            "attributes = [\"gene_id\", \"Rat_gene_id\"]",
+            "attributes = [\"gene_id\", \"start\"]",
+        );
+        let m: SourceManifest = toml::from_str(&fixed).unwrap();
+        let err = m.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("fixed GFF") && err.contains("\"start\""),
             "{err}"
         );
     }
