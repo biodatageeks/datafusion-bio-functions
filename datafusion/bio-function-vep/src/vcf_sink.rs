@@ -481,6 +481,11 @@ pub struct AnnotateVcfConfig {
     /// this on. Costs two dictionary-encoded string columns through the
     /// pipeline.
     pub preserve_record_layout: bool,
+    /// Keep records that carry no alternate allele (`ALT=.`) instead of
+    /// dropping them, as Ensembl VEP's `--allow_non_variant` does. A kept
+    /// record is written with its original line and no `CSQ` key, matching
+    /// `OutputFactory/VCF.pm:341-353`. False by default, matching VEP.
+    pub allow_non_variant: bool,
 }
 
 impl Default for AnnotateVcfConfig {
@@ -525,6 +530,7 @@ impl Default for AnnotateVcfConfig {
             provenance_tool_name: None,
             provenance_tool_version: None,
             preserve_record_layout: false,
+            allow_non_variant: false,
         }
     }
 }
@@ -558,6 +564,7 @@ impl AnnotateVcfConfig {
             ("flag_pick", self.flag_pick),
             ("flag_pick_allele", self.flag_pick_allele),
             ("flag_pick_allele_gene", self.flag_pick_allele_gene),
+            ("allow_non_variant", self.allow_non_variant),
         ] {
             if enabled {
                 opts.insert(key.into(), serde_json::Value::Bool(true));

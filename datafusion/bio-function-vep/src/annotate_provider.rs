@@ -79,6 +79,7 @@ struct EngineAnnotationProfile {
     null_chrom_rows: usize,
     null_alt_rows: usize,
     star_allele_rows: usize,
+    non_variant_rows: usize,
     cached_fast_rows: usize,
     engine_rows: usize,
     assignments: usize,
@@ -118,11 +119,12 @@ impl EngineAnnotationProfile {
 
     fn summary_line(&self) -> String {
         format!(
-            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s",
+            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} non_variant_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s",
             self.rows,
             self.null_chrom_rows,
             self.null_alt_rows,
             self.star_allele_rows,
+            self.non_variant_rows,
             self.cached_fast_rows,
             self.engine_rows,
             self.assignments,
@@ -158,6 +160,7 @@ use datafusion::arrow::array::{
     LargeStringArray, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder,
     StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
+use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
@@ -178,7 +181,7 @@ use std::borrow::Cow;
 use std::fmt::Write;
 
 use crate::allele::{
-    MatchedVariantAllele, plugin_probe_allele, plugin_probe_input_allele,
+    AltKind, MatchedVariantAllele, alt_kind, plugin_probe_allele, plugin_probe_input_allele,
     reverse_complement_allele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end,
     vep_norm_start,
 };
@@ -1172,6 +1175,10 @@ struct VepFlags {
     pubmed: bool,
     /// When true, all VEP features are enabled and 80-field CSQ schema is used.
     everything: bool,
+    /// Keep records that carry no alternate allele (`ALT=.`) instead of
+    /// dropping them. VEP's `--allow_non_variant`; false by default, matching
+    /// its absence from VEP's `%DEFAULTS` (`Config.pm:142`).
+    allow_non_variant: bool,
 }
 
 impl VepFlags {
@@ -1297,6 +1304,7 @@ impl VepFlags {
             max_af,
             pubmed,
             everything,
+            allow_non_variant: parse("allow_non_variant"),
         }
     }
 
@@ -6168,6 +6176,10 @@ impl AnnotateProvider {
             flags.everything,
         );
         let mut tx_engine_profile = engine_profile_enabled.then(TranscriptEngineProfile::default);
+        // Rows to remove after the loop (`ALT=.` without --allow_non_variant).
+        // `Vec::new` does not allocate, so this costs nothing on a batch that
+        // contains no such record.
+        let mut dropped_rows: Vec<usize> = Vec::new();
 
         for row in 0..batch.num_rows() {
             let row_setup_started = engine_profile_enabled.then(Instant::now);
@@ -6192,16 +6204,48 @@ impl AnnotateProvider {
                 continue;
             };
 
-            // VEP skips star alleles entirely — no CSQ produced.
-            if alt_allele == "*" {
-                if let Some(started) = row_setup_started {
-                    engine_profile.star_allele_rows += 1;
-                    engine_profile.row_setup += started.elapsed();
+            // What the ALT means. `*` is skipped per allele and the record
+            // survives; `.` means the record carries no alternate allele at
+            // all, and VEP drops the whole record unless --allow_non_variant.
+            match alt_kind(&alt_allele) {
+                // VEP skips star alleles entirely — no CSQ produced.
+                AltKind::Star => {
+                    if let Some(started) = row_setup_started {
+                        engine_profile.star_allele_rows += 1;
+                        engine_profile.row_setup += started.elapsed();
+                    }
+                    csq_builder.append_null();
+                    most_builder.append_null();
+                    append_null_annotation_row!();
+                    continue;
                 }
-                csq_builder.append_null();
-                most_builder.append_null();
-                append_null_annotation_row!();
-                continue;
+                // A record with no ALT is not a variant. Ensembl returns no
+                // VariationFeature for it at all (Parser/VCF.pm:263-266), so
+                // nothing downstream ever sees it; we reproduce that by
+                // removing the row after the loop. Under --allow_non_variant
+                // the row stays, carrying a null CSQ, which is what VEP's VCF
+                // writer emits (OutputFactory/VCF.pm:341-353 appends no key
+                // when there are no consequences).
+                //
+                // The row is appended either way: these builders are strictly
+                // 1:1 with the input batch — the passthrough columns are taken
+                // from it wholesale — so a row cannot be dropped from inside
+                // the loop. `dropped_rows` stays empty on every batch that has
+                // no such record, which is every batch in the parity corpus.
+                AltKind::NonVariant => {
+                    if let Some(started) = row_setup_started {
+                        engine_profile.non_variant_rows += 1;
+                        engine_profile.row_setup += started.elapsed();
+                    }
+                    if !flags.allow_non_variant {
+                        dropped_rows.push(row);
+                    }
+                    csq_builder.append_null();
+                    most_builder.append_null();
+                    append_null_annotation_row!();
+                    continue;
+                }
+                AltKind::Sequence => {}
             }
 
             // VEP-style allele minimization: strip shared prefix and suffix between REF and ALT.
@@ -6384,14 +6428,6 @@ impl AnnotateProvider {
                     append_null_annotation_row!();
                     continue;
                 };
-
-                // VEP skips star alleles entirely — no CSQ produced.
-                if alt_allele == "*" {
-                    csq_builder.append_null();
-                    most_builder.append_null();
-                    append_null_annotation_row!();
-                    continue;
-                }
 
                 let mut variant = VariantInput::from_vcf(
                     chrom.clone(),
@@ -7900,6 +7936,20 @@ impl AnnotateProvider {
         );
 
         let batch = RecordBatch::try_new(self.schema.clone(), out_cols)?;
+        // Physically remove the non-variant rows. Ensembl never builds a
+        // VariationFeature for them (Parser/VCF.pm:263-266), so they must not
+        // reach any output. This runs before `filter_batch_to_bounds`, which
+        // is unaffected: its `start_idx` is a *column* index, not a row
+        // offset, so removing rows cannot shift it.
+        let batch = if dropped_rows.is_empty() {
+            batch
+        } else {
+            let mut keep = vec![true; batch.num_rows()];
+            for row in dropped_rows {
+                keep[row] = false;
+            }
+            filter_record_batch(&batch, &BooleanArray::from(keep))?
+        };
         if let Some(started) = finish_builders_started {
             engine_profile.finish_builders += started.elapsed();
             eprintln!("{}", engine_profile.summary_line());
@@ -7909,6 +7959,36 @@ impl AnnotateProvider {
         }
         Ok(batch)
     }
+}
+
+/// Whether the buffered rows can be trusted to satisfy a pushed-down LIMIT,
+/// i.e. whether it is safe to stop pulling from the lookup.
+///
+/// Buffered INPUT rows are only an upper bound on what they will emit:
+/// annotation removes non-variant records (`ALT=.`), and region trimming drops
+/// out-of-bounds rows. So a buffer that looks like enough may not be.
+///
+/// That matters because this decision stops the lookup. Stop while holding a
+/// PARTIAL buffer — one below `input_buffer_size`, which the window dispatch
+/// deliberately refuses to cut mid-stream so it stays aligned with VEP's
+/// InputBuffer boundaries — and nothing can make progress: no window is
+/// dispatched, so no rows are emitted, and the state machine falls through to
+/// "no window to produce and nothing in flight", aborting the lookup with
+/// fewer than `limit` rows emitted and the buffered remainder discarded.
+///
+/// Hence the dispatchability requirement. With no rows dropped it changes
+/// nothing: a dispatched full window emits its full row count, so a partial
+/// buffer can only arise once the lookup is done, which this allows.
+fn limit_satisfied_by_buffer(
+    fetch_limit: Option<usize>,
+    rows_emitted: usize,
+    buffered_rows: usize,
+    buffered_units: usize,
+    input_buffer_size: usize,
+    lookup_done: bool,
+) -> bool {
+    let buffer_is_dispatchable = buffered_units >= input_buffer_size.max(1) || lookup_done;
+    buffer_is_dispatchable && fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit)
 }
 
 /// Append an optional string value to a StringBuilder: non-empty Some → value, else → NULL.
@@ -10329,6 +10409,31 @@ impl<'a> AltColumnView<'a> {
 fn alt_input_units(alt: &str) -> usize {
     let alt = alt.trim();
     if alt.is_empty() || alt == "." {
+        // KNOWN DIVERGENCE from VEP, deliberately left in place.
+        //
+        // This is a non-variant record. Ensembl never builds a
+        // VariationFeature for it (Parser/VCF.pm:263-266), so it never enters
+        // the InputBuffer and consumes none of --buffer_size. By the rule
+        // stated above -- units are parsed VariationFeatures -- it should
+        // therefore count 0 here, not 1, and a dropped non-variant record can
+        // currently shift every later buffer boundary by one.
+        //
+        // Returning 0 is not a local change. Both paths that fill
+        // `window_buffer` slice batches by contig-global ROW rank
+        // (`annotate_lookup_run`'s `global_row` against `emit_start`/
+        // `emit_end`, and `apply_lookup_batch_message`'s run gate), so making a
+        // row cost nothing -- or removing it before buffering, which is the
+        // same fix -- desynchronises that seam in two places at once.
+        //
+        // Left as is because the risk is bounded and the fix is not verifiable
+        // here: buffer composition only changes per-variant output for caches
+        // carrying cross-buffer state (merged/RefSeq), the parity corpus holds
+        // no such record at all, so no gate can confirm a change, and a
+        // six-variant merged-cache fixture with a non-variant record wedged in
+        // the middle annotates identically at buffer_size 2, 3 and 5000
+        // (vepyr's test_a_dropped_record_does_not_shift_buffer_boundaries).
+        //
+        // Raised by review on biodatageeks/datafusion-bio-functions#245.
         return 1;
     }
     alt.split([',', '|'])
@@ -14084,8 +14189,14 @@ impl Stream for ContigAnnotationStream {
                     // to avoid unnecessary annotation work.
                     let buffered_rows: usize =
                         ann.worker.window_buffer.iter().map(|b| b.num_rows()).sum();
-                    let limit_buffered =
-                        fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit);
+                    let limit_buffered = limit_satisfied_by_buffer(
+                        fetch_limit,
+                        rows_emitted,
+                        buffered_rows,
+                        window_buffer_input_units(&ann.worker.window_buffer),
+                        ann.config.input_buffer_size,
+                        ann.worker.lookup_done,
+                    );
                     let ready_input_buffer_count = ann
                         .worker
                         .input_buffer_accumulator
@@ -16164,6 +16275,90 @@ mod tests {
         build(r#"{"workers":1,"regions":[{"chrom":"chr1","start":1,"end":2}]}"#)
             .expect("workers=1 with regions is accepted");
         build(r#"{"workers":4}"#).expect("workers>1 without regions is unchanged");
+    }
+
+    // ---- limit_satisfied_by_buffer ----
+    //
+    // The regression these pin: buffered INPUT rows are an upper bound on what
+    // they emit, because annotation removes non-variant records and region
+    // trimming drops out-of-bounds rows. Trusting them while holding a buffer
+    // too small to dispatch stalls the stream, and it ends the contig by
+    // aborting the lookup with fewer than `limit` rows.
+
+    const BUF: usize = 5000;
+
+    #[test]
+    fn no_limit_never_stops_the_lookup() {
+        assert!(!limit_satisfied_by_buffer(None, 0, BUF, BUF, BUF, false));
+        assert!(!limit_satisfied_by_buffer(
+            None, 10_000, BUF, BUF, BUF, true
+        ));
+    }
+
+    #[test]
+    fn a_full_buffer_that_covers_the_limit_stops_the_lookup() {
+        // Dispatchable, and emitted + buffered >= limit.
+        assert!(limit_satisfied_by_buffer(
+            Some(5000),
+            0,
+            BUF,
+            BUF,
+            BUF,
+            false
+        ));
+        assert!(limit_satisfied_by_buffer(
+            Some(5000),
+            2500,
+            2500,
+            BUF,
+            BUF,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_buffer_short_of_the_limit_keeps_pulling() {
+        assert!(!limit_satisfied_by_buffer(
+            Some(5000),
+            0,
+            4999,
+            BUF,
+            BUF,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_partial_buffer_does_not_stop_the_lookup_even_when_it_looks_like_enough() {
+        // THE regression. One row was dropped, so 4999 were emitted from a
+        // 5000-row window and a single row is left over. `4999 + 1 >= 5000`
+        // looks satisfied, but 1 unit cannot be dispatched (the dispatch
+        // refuses a sub-buffer window mid-stream), so stopping here would
+        // leave nothing able to make progress and the contig would end with
+        // 4999 rows instead of 5000.
+        assert!(!limit_satisfied_by_buffer(
+            Some(5000),
+            4999,
+            1,
+            1,
+            BUF,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_partial_buffer_does_stop_the_lookup_once_it_is_exhausted() {
+        // With the lookup done there is no more input to pull, so the partial
+        // buffer is all there is and dispatching it is allowed.
+        assert!(limit_satisfied_by_buffer(Some(5000), 4999, 1, 1, BUF, true));
+    }
+
+    #[test]
+    fn a_zero_input_buffer_size_still_treats_a_nonempty_buffer_as_dispatchable() {
+        // `.max(1)` guards the degenerate config; without it `0 >= 0` would be
+        // trivially true and the check would be meaningless.
+        assert!(!limit_satisfied_by_buffer(Some(10), 10, 0, 0, 0, false));
+        assert!(limit_satisfied_by_buffer(Some(10), 5, 5, 1, 0, false));
     }
 
     #[test]
