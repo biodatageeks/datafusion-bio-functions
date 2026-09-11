@@ -694,6 +694,14 @@ fn finish_staged(
 /// Interval shards skip the tier join: concatenate the deduped batches, order
 /// by `(start, arrival ordinal)`, append `tier = 1`, and write. Returns
 /// `(rows, warm = 0, cold = rows)`.
+///
+/// `start` is the primary key on purpose. Ensembl's tabix-backed plugins can
+/// only read a position-sorted file (tabix refuses anything else), so the
+/// "first record" a plugin returns for an overlap query is the overlapping row
+/// with the smallest start, ties broken by file order. Sorting an unsorted
+/// ingest the same way is what makes an unindexed CSV/Parquet/GFF source
+/// behave like the bgzip+tabix copy the user would have had to feed VEP; the
+/// arrival ordinal only breaks ties within one start.
 async fn write_interval_shard(
     deduped: Vec<RecordBatch>,
     out_schema: &SchemaRef,

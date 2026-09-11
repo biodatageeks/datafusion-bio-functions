@@ -301,8 +301,10 @@ struct IntervalRow {
 /// Whole-shard interval lookup for `LookupKind::Interval` plugins: one
 /// `COITree` per discriminator tuple over closed 1-based spans, read once at
 /// open and probed synchronously. `probe` returns the overlapping row with the
-/// smallest file ordinal, which is the record a tabix-backed Ensembl plugin
-/// takes. A plugin with no match columns has a single tree.
+/// smallest shard ordinal. The shard is written in `(start, arrival)` order
+/// (`build::write_interval_shard`), which is the iteration order of the
+/// position-sorted tabix file an Ensembl plugin reads, so this is the record
+/// such a plugin takes. A plugin with no match columns has a single tree.
 pub struct IntervalLookup {
     rows: Vec<IntervalRow>,
     trees: HashMap<Vec<Option<String>>, COITree<usize, u32>>,
