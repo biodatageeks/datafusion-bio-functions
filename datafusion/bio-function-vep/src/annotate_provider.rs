@@ -10409,6 +10409,31 @@ impl<'a> AltColumnView<'a> {
 fn alt_input_units(alt: &str) -> usize {
     let alt = alt.trim();
     if alt.is_empty() || alt == "." {
+        // KNOWN DIVERGENCE from VEP, deliberately left in place.
+        //
+        // This is a non-variant record. Ensembl never builds a
+        // VariationFeature for it (Parser/VCF.pm:263-266), so it never enters
+        // the InputBuffer and consumes none of --buffer_size. By the rule
+        // stated above -- units are parsed VariationFeatures -- it should
+        // therefore count 0 here, not 1, and a dropped non-variant record can
+        // currently shift every later buffer boundary by one.
+        //
+        // Returning 0 is not a local change. Both paths that fill
+        // `window_buffer` slice batches by contig-global ROW rank
+        // (`annotate_lookup_run`'s `global_row` against `emit_start`/
+        // `emit_end`, and `apply_lookup_batch_message`'s run gate), so making a
+        // row cost nothing -- or removing it before buffering, which is the
+        // same fix -- desynchronises that seam in two places at once.
+        //
+        // Left as is because the risk is bounded and the fix is not verifiable
+        // here: buffer composition only changes per-variant output for caches
+        // carrying cross-buffer state (merged/RefSeq), the parity corpus holds
+        // no such record at all, so no gate can confirm a change, and a
+        // six-variant merged-cache fixture with a non-variant record wedged in
+        // the middle annotates identically at buffer_size 2, 3 and 5000
+        // (vepyr's test_a_dropped_record_does_not_shift_buffer_boundaries).
+        //
+        // Raised by review on biodatageeks/datafusion-bio-functions#245.
         return 1;
     }
     alt.split([',', '|'])
