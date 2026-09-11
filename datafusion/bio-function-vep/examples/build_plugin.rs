@@ -13,8 +13,9 @@
 //! default). Pass `warn` for a deliberate build from a re-compressed or
 //! derived file, or `skip` for a chromosome slice whose digest can never
 //! match the whole file's.
-//! Indexed TSV manifests query the requested chromosome natively through the
-//! source's sibling `.tbi`; no external `tabix` process or pre-slice is needed.
+//! Indexed TSV and GFF manifests (`index = "tabix"`) query the requested
+//! chromosome natively through the source's sibling `.tbi`; no external `tabix`
+//! process or pre-slice is needed.
 //! ```
 
 use std::path::PathBuf;
