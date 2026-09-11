@@ -987,14 +987,24 @@ pub fn vep_norm_end(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> i64 {
 /// VEP-normalised `[start, end]`, with an insertion's `start > end` swapped the
 /// way `PhenotypeOrthologous.pm` and `ReferenceQuality.pm` do before calling
 /// `get_data`. Inclusive, 1-based, clamped to `u32`.
-pub fn plugin_probe_span(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> (u32, u32) {
+///
+/// `None` for a symbolic allele (`<DEL>`, `<INS>`, …, or the `*` spanning
+/// deletion). Ensembl plugins default to `variant_feature_types =
+/// ['VariationFeature']` (`BaseVepPlugin::new`), so `run_plugins` never calls a
+/// tabix plugin for a StructuralVariationFeature: such records get empty plugin
+/// fields, and deriving a span from their `END` would populate rows VEP leaves
+/// blank.
+pub fn plugin_probe_span(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> Option<(u32, u32)> {
+    if alt_allele.starts_with('<') || alt_allele == "*" {
+        return None;
+    }
     let s = vep_norm_start(vcf_pos, ref_allele, alt_allele);
     let e = vep_norm_end(vcf_pos, ref_allele, alt_allele);
     let (lo, hi) = if s > e { (e, s) } else { (s, e) };
-    (
+    Some((
         u32::try_from(lo).unwrap_or(0),
         u32::try_from(hi).unwrap_or(0),
-    )
+    ))
 }
 
 /// Create the `vep_norm_start(pos, ref, alt)` scalar UDF.
@@ -1567,13 +1577,16 @@ mod tests {
     #[test]
     fn plugin_probe_span_is_vep_span_with_insertions_swapped() {
         // SNV
-        assert_eq!(plugin_probe_span(100, "A", "G"), (100, 100));
+        assert_eq!(plugin_probe_span(100, "A", "G"), Some((100, 100)));
         // deletion CT>C: VEP start 101, end 101
-        assert_eq!(plugin_probe_span(100, "CT", "C"), (101, 101));
+        assert_eq!(plugin_probe_span(100, "CT", "C"), Some((101, 101)));
         // insertion C>CT: VEP start 101, end 100 → swapped [100, 101]
-        assert_eq!(plugin_probe_span(100, "C", "CT"), (100, 101));
+        assert_eq!(plugin_probe_span(100, "C", "CT"), Some((100, 101)));
         // MNV
-        assert_eq!(plugin_probe_span(100, "AC", "GT"), (100, 101));
+        assert_eq!(plugin_probe_span(100, "AC", "GT"), Some((100, 101)));
+        // symbolic / structural: VEP never runs a tabix plugin on these
+        assert_eq!(plugin_probe_span(100, "A", "<DEL>"), None);
+        assert_eq!(plugin_probe_span(100, "A", "*"), None);
     }
 
     #[test]

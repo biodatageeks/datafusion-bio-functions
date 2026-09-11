@@ -348,13 +348,15 @@ impl BufferSlices {
     /// a position/allele/discriminator miss, yields `PluginScalar::Null` per
     /// field (the per-transcript gate for match-column plugins). `span` is the
     /// variant's VEP-normalised inclusive `[start, end]` with `span.0 <= span.1`
-    /// (the caller swaps insertion coordinates); interval plugins probe by it.
+    /// (the caller swaps insertion coordinates); interval plugins probe by it,
+    /// and `None` (a symbolic allele, which Ensembl never hands to a plugin)
+    /// makes every interval plugin miss.
     pub fn probe_all(
         &self,
         start: u32,
         allele_string: &str,
         fallback_key: Option<(u32, &str)>,
-        span: (u32, u32),
+        span: Option<(u32, u32)>,
         attrs: &[Option<&str>],
     ) -> Vec<PluginScalar> {
         let mut out = Vec::new();
@@ -362,7 +364,7 @@ impl BufferSlices {
             let match_values: Vec<Option<String>> =
                 e.match_templates.iter().map(|t| t.eval(attrs)).collect();
             if let Some(il) = &e.interval {
-                match il.probe(span.0, span.1, &match_values) {
+                match span.and_then(|(lo, hi)| il.probe(lo, hi, &match_values)) {
                     Some(values) => out.extend(e.emit_order.iter().map(|&i| values[i].clone())),
                     None => out.extend(std::iter::repeat_n(PluginScalar::Null, e.csq_fields_len)),
                 }
@@ -503,15 +505,15 @@ mod tests {
             "G",
         );
         assert_eq!(
-            slices.probe_all(160, "A/G", None, (160, 160), &ns),
+            slices.probe_all(160, "A/G", None, Some((160, 160)), &ns),
             vec![PluginScalar::Str("wide".into())]
         );
         assert_eq!(
-            slices.probe_all(350, "A/G", None, (350, 350), &ns),
+            slices.probe_all(350, "A/G", None, Some((350, 350)), &ns),
             vec![PluginScalar::Str("late".into())]
         );
         assert_eq!(
-            slices.probe_all(351, "A/G", None, (351, 351), &ns),
+            slices.probe_all(351, "A/G", None, Some((351, 351)), &ns),
             vec![PluginScalar::Null]
         );
         let other = build_attr_namespace(
@@ -532,12 +534,17 @@ mod tests {
             "G",
         );
         assert_eq!(
-            slices.probe_all(160, "A/G", None, (160, 160), &other),
+            slices.probe_all(160, "A/G", None, Some((160, 160)), &other),
+            vec![PluginScalar::Null]
+        );
+        // Symbolic allele → no span → miss even with a matching gene.
+        assert_eq!(
+            slices.probe_all(160, "A/<DEL>", None, None, &ns),
             vec![PluginScalar::Null]
         );
         // No transcript → empty namespace → discriminator None → miss.
         assert_eq!(
-            slices.probe_all(160, "A/G", None, (160, 160), &[]),
+            slices.probe_all(160, "A/G", None, Some((160, 160)), &[]),
             vec![PluginScalar::Null]
         );
     }
@@ -724,7 +731,7 @@ mod tests {
             "A",
             "G",
         );
-        let hit = slices.probe_all(100, "A/G", None, (100, 100), &ns_hit);
+        let hit = slices.probe_all(100, "A/G", None, Some((100, 100)), &ns_hit);
         match hit[0] {
             PluginScalar::F32(v) => assert!((v - 0.0427).abs() < 1e-6),
             ref other => panic!("{other:?}"),
@@ -747,7 +754,7 @@ mod tests {
             "A",
             "G",
         );
-        let none = slices.probe_all(100, "A/G", None, (100, 100), &ns_miss);
+        let none = slices.probe_all(100, "A/G", None, Some((100, 100)), &ns_miss);
         assert_eq!(none, vec![PluginScalar::Null]);
     }
 
@@ -797,7 +804,7 @@ mod tests {
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
         // No shard → empty (Null) field, not an error.
         assert_eq!(
-            slices.probe_all(100, "A/G", None, (100, 100), &[]),
+            slices.probe_all(100, "A/G", None, Some((100, 100)), &[]),
             vec![PluginScalar::Null]
         );
     }
@@ -872,13 +879,13 @@ mod tests {
         let reg = PluginRegistry::open(cache_root, "22", None).await.unwrap();
         let slices = reg.take_buffer_all(&[100]).await.unwrap();
         // Empty namespace (no transcript) still hits the per-variant row.
-        match slices.probe_all(100, "A/G", None, (100, 100), &[])[0] {
+        match slices.probe_all(100, "A/G", None, Some((100, 100)), &[])[0] {
             PluginScalar::F32(v) => assert!((v - 0.5).abs() < 1e-6),
             ref other => panic!("{other:?}"),
         }
         // Wrong allele still misses.
         assert_eq!(
-            slices.probe_all(100, "C/T", None, (100, 100), &[]),
+            slices.probe_all(100, "C/T", None, Some((100, 100)), &[]),
             vec![PluginScalar::Null]
         );
     }

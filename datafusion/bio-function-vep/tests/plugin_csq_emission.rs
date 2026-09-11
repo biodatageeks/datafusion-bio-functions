@@ -145,24 +145,48 @@ async fn plugin_csq_gates_per_transcript() {
 
     // Transcript line 1: missense C17W (Amino_acids "C/W", Protein_position "17").
     let ns_missense = ns_aa("C/W", "17");
-    let missense = slices.probe_all(22893742, "C/G", None, (22893742, 22893742), &ns_missense);
+    let missense = slices.probe_all(
+        22893742,
+        "C/G",
+        None,
+        Some((22893742, 22893742)),
+        &ns_missense,
+    );
     assert_eq!(field_suffix(&missense), "|0.4833|ambiguous");
 
     // Transcript line 2: intron (no amino-acid change) → gate → empty fields.
     let ns_intron = ns_aa("", "");
-    let intron = slices.probe_all(22893742, "C/G", None, (22893742, 22893742), &ns_intron);
+    let intron = slices.probe_all(
+        22893742,
+        "C/G",
+        None,
+        Some((22893742, 22893742)),
+        &ns_intron,
+    );
     assert_eq!(field_suffix(&intron), empty_suffix(n));
     assert_eq!(field_suffix(&intron), "||");
 
     // A different protein change at the same position (wrong isoform) → miss.
     let ns_wrong = ns_aa("C/Y", "17");
     assert_eq!(
-        field_suffix(&slices.probe_all(22893742, "C/G", None, (22893742, 22893742), &ns_wrong)),
+        field_suffix(&slices.probe_all(
+            22893742,
+            "C/G",
+            None,
+            Some((22893742, 22893742)),
+            &ns_wrong
+        )),
         "||"
     );
 
     // A variant with no shard row (different position) → empty fields.
-    let none_here = slices.probe_all(99999999, "A/G", None, (99999999, 99999999), &ns_missense);
+    let none_here = slices.probe_all(
+        99999999,
+        "A/G",
+        None,
+        Some((99999999, 99999999)),
+        &ns_missense,
+    );
     assert_eq!(field_suffix(&none_here), "||");
 }
 
@@ -241,13 +265,13 @@ async fn indel_probe_uses_normalized_start() {
     // Normalized start (101) hits.
     let hit = reg.take_buffer_all(&[101]).await.unwrap();
     assert_eq!(
-        field_suffix(&hit.probe_all(101, "-/TG", None, (101, 101), &[])),
+        field_suffix(&hit.probe_all(101, "-/TG", None, Some((101, 101)), &[])),
         "|0.75"
     );
     // Raw VCF POS (100) misses — this is what the pre-fix code used.
     let miss = reg.take_buffer_all(&[100]).await.unwrap();
     assert_eq!(
-        field_suffix(&miss.probe_all(100, "-/TG", None, (100, 100), &[])),
+        field_suffix(&miss.probe_all(100, "-/TG", None, Some((100, 100)), &[])),
         empty_suffix(1)
     );
 }
@@ -347,12 +371,12 @@ async fn minimised_fallback_and_alphabetical_fields_preserve_name_value_pairs() 
 
     let slices = registry.take_buffer_all(&[101]).await.unwrap();
     assert_eq!(
-        field_suffix(&slices.probe_all(100, "AA/GA", None, (100, 100), &[])),
+        field_suffix(&slices.probe_all(100, "AA/GA", None, Some((100, 100)), &[])),
         "||",
         "the unreduced primary key must miss"
     );
     assert_eq!(
-        field_suffix(&slices.probe_all(100, "AA/GA", Some((101, "A/G")), (100, 100), &[])),
+        field_suffix(&slices.probe_all(100, "AA/GA", Some((101, "A/G")), Some((100, 100)), &[])),
         "|a-value|z-value",
         "the minimised fallback must hit and preserve alphabetical name/value pairing"
     );
