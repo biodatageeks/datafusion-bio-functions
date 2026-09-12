@@ -1,8 +1,8 @@
 //! Backend-neutral cache helpers shared by the annotation engine and the Parquet
 //! cache backend.
 //!
-//! These types were extracted from the (now Parquet-only) `kv_cache`/`warm_cache`
-//! modules so the Parquet path does not depend on the deleted fjall/parquet code:
+//! These types outlived the removed fjall/Lance-era `kv_cache`/`warm_cache`
+//! modules; they are the parts the Parquet path still needs:
 //! the `SiftPredictionStore` trait the Parquet SIFT stores implement, the
 //! prediction (de)serialization family used by the Parquet SIFT layout and
 //! builder, and the allele-frequency helpers used to select warm positions

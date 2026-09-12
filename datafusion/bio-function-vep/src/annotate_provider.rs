@@ -873,7 +873,7 @@ fn annotation_column_defs_for_selection(
 /// Returns the list of cache column names needed for the variation lookup query.
 ///
 /// This is the backward-compatible list of column names that the `requested_columns`
-/// logic uses to select columns from the variation cache parquet/fjall store.
+/// logic uses to select columns from the Parquet variation cache.
 pub fn cache_lookup_column_names() -> Vec<&'static str> {
     vec![
         // Variant identity
@@ -3411,7 +3411,7 @@ fn position_predictions_from_batch(
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| {
-            DataFusionError::Execution("Lance SIFT position key column must be UInt64".into())
+            DataFusionError::Execution("SIFT position key column must be UInt64".into())
         })?;
 
     let mut predictions = HashMap::with_capacity(batch.num_rows());
@@ -3575,7 +3575,7 @@ fn binary_at(array: &dyn Array, row: usize) -> Result<Option<&[u8]>> {
         return Ok(Some(array.value(row)));
     }
     Err(DataFusionError::Execution(format!(
-        "Lance SIFT predictions expected binary array, got {:?}",
+        "SIFT predictions expected binary array, got {:?}",
         array.data_type()
     )))
 }
@@ -11060,7 +11060,7 @@ struct ContigPreparedData {
     /// True when activation must build grid-aligned per-worker lookups
     /// (stateful Merged/RefSeq at workers>1) instead of the byte-budget path.
     stateful_parallel: bool,
-    /// Placeholder variation table name; the KvLookupExec resolves the real
+    /// Placeholder variation table name; the VariationLookupExec resolves the real
     /// dataset via the cache root.
     var_table: String,
     /// Schemas for the `LookupProvider`s built during activation.
@@ -14174,8 +14174,8 @@ impl Stream for ContigAnnotationStream {
                 }
 
                 StreamState::AnnotatingContig(ann) => {
-                    // Pull looked-up batches into the window buffer. For fjall,
-                    // lookup partitions run concurrently, but this state machine
+                    // Pull looked-up batches into the window buffer. Lookup
+                    // partitions run concurrently, but this state machine
                     // drains their bounded receivers strictly by partition id.
                     //
                     // LIMIT pushdown: once we have enough buffered rows to
@@ -14812,7 +14812,7 @@ async fn prepare_contig_data(
     let ephemeral_tables: Vec<String> = Vec::new();
 
     // Variation table: Parquet variation cache (per-chrom dataset under
-    // `variation.cache/`). The KvLookupExec resolves the dataset itself via
+    // `variation.cache/`). The VariationLookupExec resolves the dataset itself via
     // the cache root, so a placeholder table name is sufficient.
     #[cfg(feature = "parquet-cache")]
     let cache_enabled = config.cache_root.is_some();
@@ -14834,7 +14834,7 @@ async fn prepare_contig_data(
         .as_arrow()
         .clone();
     // The Parquet variation lookup reads the cache schema directly from the
-    // per-chrom Parquet shard; the KvLookupExec resolves the shard path via the
+    // per-chrom Parquet shard; the VariationLookupExec resolves the shard path via the
     // cache root.
     #[cfg(feature = "parquet-cache")]
     let cache_schema = {
@@ -14870,7 +14870,7 @@ async fn prepare_contig_data(
     );
     if stream_parallel {
         // Parallelism comes from runs, not from partitions inside a run. This
-        // field only sizes the probe readers inside `KvLookupExec`; the run's
+        // field only sizes the probe readers inside `VariationLookupExec`; the run's
         // *plan* still inherits the session's scan partitioning, which the
         // run task reads in id order through one full-plan lookup worker
         // (`activate_run_lookup`). Intentional: a run is one ordered stream.

@@ -2,7 +2,7 @@
 name: vep-perf-profiling
 description: >-
   Profile the VEP annotation pipeline end-to-end and present a structured timing
-  breakdown (pipeline stages, Lance variation/SIFT lookup, engine + transcript-engine
+  breakdown (pipeline stages, variation/SIFT lookup, engine + transcript-engine
   stages) to find bottlenecks. Use this whenever the user wants to profile, benchmark,
   or get a performance/timing breakdown of vepyr annotation, the variation cache lookup,
   the VEP engine, or asks "where is the time going / what's the bottleneck" for chr-scale
@@ -26,16 +26,18 @@ Pin threads to 1 so each stage's time is real, not overlapped. Enable every prof
 
 ```bash
 cd /Users/mwiewior/research/git/vepyr/e2e-testing/scripts
-LANCE_CPU_THREADS=1 LANCE_IO_THREADS=1 RAYON_NUM_THREADS=1 \
-VEP_PROFILE=1 VEP_ENGINE_PROFILE=1 VEP_TX_ENGINE_PROFILE=1 VEP_ENGINE_PROFILE_HGVSC=1 VEP_LANCE_PROFILE=1 \
+RAYON_NUM_THREADS=1 \
+VEP_PROFILE=1 VEP_ENGINE_PROFILE=1 VEP_TX_ENGINE_PROFILE=1 VEP_ENGINE_PROFILE_HGVSC=1 VEP_LOOKUP_PROFILE_DETAILED=1 \
   env -u VIRTUAL_ENV -u CONDA_PREFIX uv run python run_annotation_fast.py \
-  chr1 --cache merged --forks 0 --force --backend lance --skip-compare \
+  chr1 --cache merged --forks 0 --force --skip-compare \
   >/tmp/prof.stdout 2>/tmp/prof.profile
 ```
 
 Profile knobs (each prints to stderr, aggregated per batch):
 - `VEP_PROFILE` → `pipeline_profile` (annotate/engine/lookup_wait/hydrate/context_*) + vcf_sink + concurrency_plan.
-- `VEP_LANCE_PROFILE` → `[vep-lance-profile]` per-batch: `variation_take`, `sift_key_take`, dataset `open`, `variation_resolve`.
+- `VEP_LOOKUP_PROFILE` / `VEP_LOOKUP_PROFILE_DETAILED` → `[vep-lookup-profile]` totals per lookup stream
+  (batches, probes, stage split) and `[vep-lookup-profile-detail]` lines (`stages`, `match`, `variation`:
+  probes, matches, rows scanned, shard opens, `variation_take` time).
 - `VEP_ENGINE_PROFILE` → per-batch engine stages (`evaluate_prepared`, `colocated_fields`, `csq_format`, `collapse_pick_sort`, …).
 - `VEP_TX_ENGINE_PROFILE` → transcript-engine stages (`tx_query_total`, `transcript_output_materialize`, `transcript_hgvsc`, `transcript_overlap_eval`, …).
 - `VEP_ENGINE_PROFILE_HGVSC` → extra HGVSc sub-timers (coord_map/simple_fast/fallback); 0 if off.
@@ -51,8 +53,8 @@ Run the script — it parses `/tmp/prof.profile` into the four sections.
 bash <skill-dir>/scripts/breakdown.sh /tmp/prof.profile
 ```
 
-It emits: pipeline stage line, per-event Lance lookup totals + `variation_take` per-batch
-distribution, the full engine stage list, and the full transcript-engine stage list (each summed
+It emits: pipeline stage line, the variation lookup profile lines, the full engine stage
+list, and the full transcript-engine stage list (each summed
 across all batches, sorted by time).
 
 ## 3. Present it
@@ -65,8 +67,8 @@ breakdown exists to support.
 ## Pipeline (VEP_PROFILE)
 annotate / engine / lookup_wait / hydrate / context_load
 
-## Lance lookup (VEP_LANCE_PROFILE)
-table: event | n | total | (variation_take per-batch min/median/mean/max)
+## Variation lookup (VEP_LOOKUP_PROFILE)
+`[vep-lookup-profile]` totals; `[vep-lookup-profile-detail]` stages / match / variation lines
 
 ## Engine — top level (VEP_ENGINE_PROFILE), additive
 evaluate_prepared (the transcript-engine call), colocated_fields, csq_format, collapse_pick_sort, ...
@@ -94,6 +96,5 @@ tx_query_total -> transcript_output_materialize / transcript_hgvsc (coord_map/si
 
 ## When comparing two cache layouts / encodings
 Run the profile on each and compare `variation_take` (total + per-batch), `lookup_wait`, `engine`,
-and AF/dataset on-disk size. For raw read-amplification (bytes read, IOPS) — which `VEP_LANCE_PROFILE`
-does NOT give — use the Lance sandbox `take-batches-bench` against captured row_ids instead; that's a
-separate read-amp measurement, not part of this timing skill.
+and AF/dataset on-disk size. Raw read-amplification (bytes read, IOPS) is not part of the lookup
+profile; that is a separate measurement, not part of this timing skill.

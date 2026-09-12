@@ -1,4 +1,4 @@
-//! KvLookupExec: ExecutionPlan that streams VCF batches and probes
+//! VariationLookupExec: ExecutionPlan that streams VCF batches and probes
 //! the Parquet columnar variation dataset per-position for annotation.
 
 use std::any::Any;
@@ -76,13 +76,13 @@ where
     }
 }
 
-const DEFAULT_LANCE_LOOKUP_PROCESS_BATCH_ROWS: usize = 5_000;
+const DEFAULT_LOOKUP_SLICE_ROWS: usize = 5_000;
 
-/// Physical execution plan for KV-backed variant lookup.
+/// Physical execution plan for the Parquet variation lookup.
 ///
 /// Takes a VCF input plan, probes the Parquet variation dataset per-position,
 /// and emits LEFT JOIN output (unmatched VCF rows get NULL cache columns).
-pub struct KvLookupExec {
+pub struct VariationLookupExec {
     input: Arc<dyn ExecutionPlan>,
     variation_storage: VariationLookupStorage,
     cache_schema: SchemaRef,
@@ -160,12 +160,12 @@ fn build_lookup_output_schema(
     )
 }
 
-impl KvLookupExec {
+impl VariationLookupExec {
     /// Construct a variation lookup exec backed by the Parquet cache. The read
     /// seam resolves through [`SinglePathParquetVariationLookup`].
     #[cfg(feature = "parquet-cache")]
     #[allow(clippy::too_many_arguments)]
-    pub fn new_parquet(
+    pub fn new(
         input: Arc<dyn ExecutionPlan>,
         cache_root: PathBuf,
         cache_schema: SchemaRef,
@@ -249,25 +249,25 @@ impl KvLookupExec {
     }
 }
 
-impl Debug for KvLookupExec {
+impl Debug for VariationLookupExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "KvLookupExec {{ cache_columns: {:?} }}",
+            "VariationLookupExec {{ cache_columns: {:?} }}",
             self.cache_columns
         )
     }
 }
 
-impl DisplayAs for KvLookupExec {
+impl DisplayAs for VariationLookupExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "KvLookupExec: columns={:?}", self.cache_columns)
+        write!(f, "VariationLookupExec: columns={:?}", self.cache_columns)
     }
 }
 
-impl ExecutionPlan for KvLookupExec {
+impl ExecutionPlan for VariationLookupExec {
     fn name(&self) -> &str {
-        "KvLookupExec"
+        "VariationLookupExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -292,7 +292,7 @@ impl ExecutionPlan for KvLookupExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1);
         let cache_root = self.variation_storage.cache_root.clone();
-        let mut exec = KvLookupExec::new_parquet(
+        let mut exec = VariationLookupExec::new(
             children[0].clone(),
             cache_root,
             self.cache_schema.clone(),
@@ -313,7 +313,7 @@ impl ExecutionPlan for KvLookupExec {
         exec = exec.with_target_partitions(self.target_partitions);
         exec = exec.with_probe_floor_pos(self.probe_floor_pos);
         // Carry the shared per-contig variation lookup forward across re-planning
-        // instead of letting new_parquet reset it.
+        // instead of letting new reset it.
         #[cfg(feature = "parquet-cache")]
         {
             exec.parquet_lookup_cell = Arc::clone(&self.parquet_lookup_cell);
@@ -334,7 +334,7 @@ impl ExecutionPlan for KvLookupExec {
             .or_else(|| self.colocated_sink.clone());
 
         #[cfg_attr(not(feature = "parquet-cache"), allow(unused_mut))]
-        let mut stream = KvLookupStream::new(
+        let mut stream = VariationLookupStream::new(
             input_stream,
             self.variation_storage.clone(),
             self.cache_schema.clone(),
@@ -363,13 +363,14 @@ impl ExecutionPlan for KvLookupExec {
     }
 }
 
-/// Streaming implementation that processes VCF batches and probes the KV store.
+/// Streaming implementation that processes VCF batches and probes the Parquet
+/// variation shard.
 ///
 /// When a colocated sink is present, batches are buffered during the probe
 /// phase and only emitted after the input stream is exhausted. This ensures
 /// the colocated sink is fully populated before downstream consumers build
 /// the colocated map.
-struct KvLookupStream {
+struct VariationLookupStream {
     probe_floor_pos: Option<i64>,
     input: SendableRecordBatchStream,
     variation_storage: VariationLookupStorage,
@@ -403,7 +404,7 @@ struct KvLookupStream {
     input_exhausted: bool,
 }
 
-struct WarmColocIndices {
+struct ColocatedColumnIndices {
     variation_name: usize,
     end_col: Option<usize>,
     failed: Option<usize>,
@@ -417,7 +418,7 @@ struct WarmColocIndices {
 }
 
 #[derive(Debug, Clone)]
-struct PendingColdProbe {
+struct PendingProbe {
     chrom: String,
     probe_start: i64,
     vcf_ref: String,
@@ -427,9 +428,9 @@ struct PendingColdProbe {
     vcf_row: u32,
 }
 
-/// Outcome of probing a single cold-tier position for a VCF variant.
+/// Outcome of probing a single position for a VCF variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColdProbeResult {
+enum ProbeResult {
     Match,
     PositionCoveredNoExact,
     NotCovered,
@@ -472,11 +473,8 @@ fn push_unique_column(columns: &mut Vec<String>, name: &str) {
     }
 }
 
-/// Columns to project from the Parquet variation dataset for a cold-tier probe.
-fn cold_parquet_projection_columns(
-    cache_columns: &[String],
-    include_colocated: bool,
-) -> Vec<String> {
+/// Columns to project from the Parquet variation shard for a probe.
+fn variation_projection_columns(cache_columns: &[String], include_colocated: bool) -> Vec<String> {
     let mut columns = Vec::with_capacity(cache_columns.len() + 16);
     for name in ["allele_string", "end", "failed"] {
         push_unique_column(&mut columns, name);
@@ -505,7 +503,7 @@ fn cold_parquet_projection_columns(
 }
 
 #[derive(Default)]
-struct ColdChunkProbeMetrics {
+struct ProbeMetrics {
     append_elapsed: Duration,
     colocated_prepare_elapsed: Duration,
     colocated_match_elapsed: Duration,
@@ -513,12 +511,12 @@ struct ColdChunkProbeMetrics {
     exact_match_calls: u64,
     colocated_allele_rows: u64,
     colocated_entries: u64,
-    cold_rows_scanned: u64,
+    rows_scanned: u64,
     emitted: bool,
 }
 
 fn format_variation_lookup_profile_line(cache_root: &str) -> String {
-    format!("[vep-kv-profile-detail] variation_lookup storage=parquet cache_root={cache_root}")
+    format!("[vep-lookup-profile-detail] variation_lookup storage=parquet cache_root={cache_root}")
 }
 
 #[cfg(feature = "parquet-cache")]
@@ -558,7 +556,7 @@ struct LookupProfile {
     colocated_flush: Duration,
     null_append: Duration,
     /// Time spent opening the contig shard (footer + page index); once per contig.
-    position_index_load: Duration,
+    shard_open: Duration,
     primary_allele_rows: u64,
     exact_match_calls: u64,
     primary_matches: u64,
@@ -566,14 +564,14 @@ struct LookupProfile {
     colocated_entries: u64,
     null_rows: u64,
     /// Number of shard opens (one per contig per shared cell).
-    position_index_loaded: u64,
-    cold_parquet_probes: u64,
-    cold_parquet_matches: u64,
-    cold_parquet_position_misses: u64,
-    cold_parquet_not_covered: u64,
-    cold_parquet_rows_scanned: u64,
+    shard_opens: u64,
+    variation_probes: u64,
+    variation_matches: u64,
+    variation_position_misses: u64,
+    variation_not_covered: u64,
+    variation_rows_scanned: u64,
     /// Time spent in the per-batch Parquet take (`resolve_and_take`).
-    cold_parquet_load: Duration,
+    variation_take: Duration,
 }
 
 impl LookupProfile {
@@ -596,15 +594,15 @@ impl LookupProfile {
             + self.colocated_match
             + self.colocated_flush
             + self.null_append
-            + self.position_index_load
-            + self.cold_parquet_load
+            + self.shard_open
+            + self.variation_take
     }
 
     fn detail_lines(&self) -> Vec<String> {
         let detail_total = self.detail_known();
         vec![
             format!(
-                "[vep-kv-profile-detail] stages total_s={:.3} probe_build={:.3}s ({:.1}%) cache_column_append={:.3}s ({:.1}%) colocated_prepare={:.3}s ({:.1}%) colocated_match={:.3}s ({:.1}%) colocated_flush={:.3}s ({:.1}%) null_append={:.3}s ({:.1}%) position_index_load={:.3}s ({:.1}%) cold_tier_load={:.3}s ({:.1}%)",
+                "[vep-lookup-profile-detail] stages total_s={:.3} probe_build={:.3}s ({:.1}%) cache_column_append={:.3}s ({:.1}%) colocated_prepare={:.3}s ({:.1}%) colocated_match={:.3}s ({:.1}%) colocated_flush={:.3}s ({:.1}%) null_append={:.3}s ({:.1}%) shard_open={:.3}s ({:.1}%) variation_take={:.3}s ({:.1}%)",
                 detail_total.as_secs_f64(),
                 self.probe_build.as_secs_f64(),
                 Self::pct(self.probe_build, detail_total),
@@ -618,13 +616,13 @@ impl LookupProfile {
                 Self::pct(self.colocated_flush, detail_total),
                 self.null_append.as_secs_f64(),
                 Self::pct(self.null_append, detail_total),
-                self.position_index_load.as_secs_f64(),
-                Self::pct(self.position_index_load, detail_total),
-                self.cold_parquet_load.as_secs_f64(),
-                Self::pct(self.cold_parquet_load, detail_total),
+                self.shard_open.as_secs_f64(),
+                Self::pct(self.shard_open, detail_total),
+                self.variation_take.as_secs_f64(),
+                Self::pct(self.variation_take, detail_total),
             ),
             format!(
-                "[vep-kv-profile-detail] match primary_allele_rows={} exact_match_calls={} primary_matches={} colocated_allele_rows={} colocated_entries={} null_rows={}",
+                "[vep-lookup-profile-detail] match primary_allele_rows={} exact_match_calls={} primary_matches={} colocated_allele_rows={} colocated_entries={} null_rows={}",
                 self.primary_allele_rows,
                 self.exact_match_calls,
                 self.primary_matches,
@@ -633,13 +631,13 @@ impl LookupProfile {
                 self.null_rows,
             ),
             format!(
-                "[vep-kv-profile-detail] cold_tier probes={} matches={} position_misses={} not_covered={} rows_scanned={} shard_opens={}",
-                self.cold_parquet_probes,
-                self.cold_parquet_matches,
-                self.cold_parquet_position_misses,
-                self.cold_parquet_not_covered,
-                self.cold_parquet_rows_scanned,
-                self.position_index_loaded,
+                "[vep-lookup-profile-detail] variation probes={} matches={} position_misses={} not_covered={} rows_scanned={} shard_opens={}",
+                self.variation_probes,
+                self.variation_matches,
+                self.variation_position_misses,
+                self.variation_not_covered,
+                self.variation_rows_scanned,
+                self.shard_opens,
             ),
         ]
     }
@@ -657,7 +655,7 @@ impl LookupProfile {
             self.output_rows as f64 / total.as_secs_f64()
         };
         eprintln!(
-            "[vep-kv-profile] batches={} input_rows={} warm_up_skipped_rows={} output_rows={} probes={} total_s={:.3} input_rows_per_s={:.1} output_rows_per_s={:.1}",
+            "[vep-lookup-profile] batches={} input_rows={} warm_up_skipped_rows={} output_rows={} probes={} total_s={:.3} input_rows_per_s={:.1} output_rows_per_s={:.1}",
             self.batches,
             self.input_rows,
             self.warm_up_skipped_rows,
@@ -668,7 +666,7 @@ impl LookupProfile {
             output_rate
         );
         eprintln!(
-            "[vep-kv-profile] extract_cols={:.3}s ({:.1}%) match_loop={:.3}s ({:.1}%) vcf_take={:.3}s ({:.1}%) cache_build={:.3}s ({:.1}%)",
+            "[vep-lookup-profile] extract_cols={:.3}s ({:.1}%) match_loop={:.3}s ({:.1}%) vcf_take={:.3}s ({:.1}%) cache_build={:.3}s ({:.1}%)",
             self.extract_cols.as_secs_f64(),
             Self::pct(self.extract_cols, total),
             self.match_loop.as_secs_f64(),
@@ -686,21 +684,21 @@ impl LookupProfile {
     }
 }
 
-fn kv_profile_enabled() -> bool {
-    std::env::var_os("VEP_KV_PROFILE").is_some()
-        || std::env::var_os("VEP_KV_PROFILE_DETAILED").is_some()
+fn lookup_profile_enabled() -> bool {
+    std::env::var_os("VEP_LOOKUP_PROFILE").is_some()
+        || std::env::var_os("VEP_LOOKUP_PROFILE_DETAILED").is_some()
 }
 
-fn kv_profile_detailed_enabled() -> bool {
-    std::env::var_os("VEP_KV_PROFILE_DETAILED").is_some()
+fn lookup_profile_detailed_enabled() -> bool {
+    std::env::var_os("VEP_LOOKUP_PROFILE_DETAILED").is_some()
 }
 
-fn lookup_process_batch_rows() -> usize {
-    std::env::var("VEP_LANCE_LOOKUP_PROCESS_BATCH_ROWS")
+fn lookup_slice_rows() -> usize {
+    std::env::var("VEP_LOOKUP_SLICE_ROWS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_LANCE_LOOKUP_PROCESS_BATCH_ROWS)
+        .unwrap_or(DEFAULT_LOOKUP_SLICE_ROWS)
 }
 
 fn enqueue_record_batch_slices(
@@ -776,7 +774,7 @@ fn probe_taken_batch_position(
     builders: &mut [Box<dyn datafusion::arrow::array::ArrayBuilder>],
     vcf_indices: &mut Vec<u32>,
     coloc_buf: Option<&mut HashMap<ColocatedKey, ColocatedSinkValue>>,
-) -> Result<(ColdProbeResult, ColdChunkProbeMetrics)> {
+) -> Result<(ProbeResult, ProbeMetrics)> {
     struct PreparedColoc {
         chrom_norm: String,
         input_start: i64,
@@ -788,9 +786,9 @@ fn probe_taken_batch_position(
         unshifted_output_allele: Option<String>,
     }
 
-    let mut metrics = ColdChunkProbeMetrics::default();
+    let mut metrics = ProbeMetrics::default();
     if rows.is_empty() {
-        return Ok((ColdProbeResult::NotCovered, metrics));
+        return Ok((ProbeResult::NotCovered, metrics));
     }
     let indices = BatchProbeIndices::new(batch)?;
     let mut coloc_buf = coloc_buf;
@@ -840,7 +838,7 @@ fn probe_taken_batch_position(
             continue;
         };
 
-        metrics.cold_rows_scanned += 1;
+        metrics.rows_scanned += 1;
         if profile_detailed {
             metrics.primary_allele_rows += 1;
             metrics.exact_match_calls += 1;
@@ -934,7 +932,7 @@ fn probe_taken_batch_position(
                 let Some(output_indices) = batch_output_indices(batch, cache_columns, col_map)
                 else {
                     return Err(DataFusionError::Execution(
-                        "Lance batch missing one or more requested cache output columns".into(),
+                        "variation batch missing one or more requested cache output columns".into(),
                     ));
                 };
                 vcf_indices.push(vcf_row);
@@ -947,9 +945,9 @@ fn probe_taken_batch_position(
     }
 
     if matched {
-        Ok((ColdProbeResult::Match, metrics))
+        Ok((ProbeResult::Match, metrics))
     } else {
-        Ok((ColdProbeResult::PositionCoveredNoExact, metrics))
+        Ok((ProbeResult::PositionCoveredNoExact, metrics))
     }
 }
 
@@ -966,7 +964,7 @@ impl BatchProbeIndices {
         let schema = batch.schema();
         Ok(Self {
             allele_string: schema.index_of("allele_string").map_err(|_| {
-                DataFusionError::Execution("Lance batch missing allele_string".into())
+                DataFusionError::Execution("variation batch missing allele_string".into())
             })?,
             end: schema.index_of("end").ok(),
             failed: schema.index_of("failed").ok(),
@@ -979,12 +977,12 @@ fn start_row_map(batch: &RecordBatch) -> Result<HashMap<u32, Vec<u32>>> {
     let schema = batch.schema();
     let start_idx = schema
         .index_of("start")
-        .map_err(|_| DataFusionError::Execution("Lance batch missing start".into()))?;
+        .map_err(|_| DataFusionError::Execution("variation batch missing start".into()))?;
     let starts = batch
         .column(start_idx)
         .as_any()
         .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| DataFusionError::Execution("Lance batch start must be UInt32".into()))?;
+        .ok_or_else(|| DataFusionError::Execution("variation batch start must be UInt32".into()))?;
     let mut rows = HashMap::<u32, Vec<u32>>::new();
     for row in 0..batch.num_rows() {
         if !starts.is_null(row) {
@@ -994,7 +992,7 @@ fn start_row_map(batch: &RecordBatch) -> Result<HashMap<u32, Vec<u32>>> {
     Ok(rows)
 }
 
-impl KvLookupStream {
+impl VariationLookupStream {
     #[allow(clippy::too_many_arguments)]
     fn new(
         input: SendableRecordBatchStream,
@@ -1013,9 +1011,9 @@ impl KvLookupStream {
         target_partitions: usize,
         probe_floor_pos: Option<i64>,
     ) -> Self {
-        let profile_enabled = kv_profile_enabled();
-        let profile_detailed = kv_profile_detailed_enabled();
-        if profile_detailed || std::env::var_os("VEP_LANCE_PROFILE").is_some() {
+        let profile_enabled = lookup_profile_enabled();
+        let profile_detailed = lookup_profile_detailed_enabled();
+        if profile_detailed {
             let cache_root_label = variation_storage.cache_root.display().to_string();
             eprintln!(
                 "{}",
@@ -1088,7 +1086,7 @@ impl KvLookupStream {
                     cache_root.display()
                 ))
             })?;
-            let projection = cold_parquet_projection_columns(cache_columns, collect_colocated);
+            let projection = variation_projection_columns(cache_columns, collect_colocated);
             let cell = Arc::clone(&self.parquet_lookup_cell);
             let open_started = Instant::now();
             let open_fut = async {
@@ -1102,29 +1100,25 @@ impl KvLookupStream {
             };
             let _lookup = block_on(open_fut)?;
             if self.profile_enabled {
-                self.profile.position_index_load += open_started.elapsed();
-                self.profile.position_index_loaded += 1;
+                self.profile.shard_open += open_started.elapsed();
+                self.profile.shard_opens += 1;
             }
         }
         Ok(())
     }
 
-    fn record_cold_chunk_probe_metrics(
-        &mut self,
-        result: ColdProbeResult,
-        metrics: ColdChunkProbeMetrics,
-    ) {
-        self.profile.cold_parquet_probes += 1;
+    fn record_probe_metrics(&mut self, result: ProbeResult, metrics: ProbeMetrics) {
+        self.profile.variation_probes += 1;
         self.profile.cache_column_append += metrics.append_elapsed;
         self.profile.colocated_prepare += metrics.colocated_prepare_elapsed;
         self.profile.colocated_match += metrics.colocated_match_elapsed;
-        self.profile.cold_parquet_rows_scanned += metrics.cold_rows_scanned;
+        self.profile.variation_rows_scanned += metrics.rows_scanned;
         match result {
-            ColdProbeResult::Match => self.profile.cold_parquet_matches += 1,
-            ColdProbeResult::PositionCoveredNoExact => {
-                self.profile.cold_parquet_position_misses += 1;
+            ProbeResult::Match => self.profile.variation_matches += 1,
+            ProbeResult::PositionCoveredNoExact => {
+                self.profile.variation_position_misses += 1;
             }
-            ColdProbeResult::NotCovered => self.profile.cold_parquet_not_covered += 1,
+            ProbeResult::NotCovered => self.profile.variation_not_covered += 1,
         }
         if self.profile_detailed {
             self.profile.primary_allele_rows += metrics.primary_allele_rows;
@@ -1144,7 +1138,7 @@ impl KvLookupStream {
     }
 
     fn input_slice_rows(&self) -> usize {
-        lookup_process_batch_rows()
+        lookup_slice_rows()
     }
 
     fn process_next_pending_input_slice(&mut self) -> Option<Result<RecordBatch>> {
@@ -1278,8 +1272,8 @@ impl KvLookupStream {
                 None
             };
         let mut row_output_emitted = vec![false; num_rows];
-        let mut pending_cold_probes: Vec<PendingColdProbe> = Vec::new();
-        let mut pending_cold_by_row: Vec<Vec<usize>> = vec![Vec::new(); num_rows];
+        let mut pending_probes: Vec<PendingProbe> = Vec::new();
+        let mut pending_by_row: Vec<Vec<usize>> = vec![Vec::new(); num_rows];
 
         for row in 0..num_rows {
             let raw_chrom = chroms.value_or_empty(row);
@@ -1352,8 +1346,8 @@ impl KvLookupStream {
                 if self.profile_enabled {
                     self.profile.probes += 1;
                 }
-                let pending_idx = pending_cold_probes.len();
-                pending_cold_probes.push(PendingColdProbe {
+                let pending_idx = pending_probes.len();
+                pending_probes.push(PendingProbe {
                     chrom: chrom.to_string(),
                     probe_start: *probe_start,
                     vcf_ref: vcf_ref.to_string(),
@@ -1362,10 +1356,10 @@ impl KvLookupStream {
                     vcf_iv_end,
                     vcf_row: row as u32,
                 });
-                pending_cold_by_row[row].push(pending_idx);
+                pending_by_row[row].push(pending_idx);
             }
 
-            if pending_cold_by_row[row].is_empty() {
+            if pending_by_row[row].is_empty() {
                 let null_append_started = self.profile_detailed.then(Instant::now);
                 // No coordinate probe matched any allele -> null cache columns.
                 vcf_indices.push(row as u32);
@@ -1380,12 +1374,12 @@ impl KvLookupStream {
             }
         }
 
-        if !pending_cold_probes.is_empty() {
+        if !pending_probes.is_empty() {
             let mut taken_by_chrom =
                 HashMap::<String, (RecordBatch, HashMap<u32, Vec<u32>>)>::new();
 
             let mut pending_starts_by_chrom: HashMap<String, Vec<u32>> = HashMap::new();
-            for pending in &pending_cold_probes {
+            for pending in &pending_probes {
                 if let Ok(start) = u32::try_from(pending.probe_start) {
                     pending_starts_by_chrom
                         .entry(pending.chrom.clone())
@@ -1411,13 +1405,13 @@ impl KvLookupStream {
                     block_on(lookup.resolve_and_take(&starts))?
                 };
                 if let Some(t0) = take_started {
-                    self.profile.cold_parquet_load += t0.elapsed();
+                    self.profile.variation_take += t0.elapsed();
                 }
                 let row_map = start_row_map(&taken.batch)?;
                 taken_by_chrom.insert(chrom, (taken.batch, row_map));
             }
 
-            for pending in &pending_cold_probes {
+            for pending in &pending_probes {
                 let row = pending.vcf_row as usize;
                 let emit_output = !row_output_emitted[row];
                 let (result, metrics) =
@@ -1448,21 +1442,18 @@ impl KvLookupStream {
                             coloc_buf.as_mut(),
                         )?
                     } else {
-                        (
-                            ColdProbeResult::NotCovered,
-                            ColdChunkProbeMetrics::default(),
-                        )
+                        (ProbeResult::NotCovered, ProbeMetrics::default())
                     };
 
                 if self.profile_enabled {
-                    self.record_cold_chunk_probe_metrics(result, metrics);
+                    self.record_probe_metrics(result, metrics);
                 }
-                if result == ColdProbeResult::Match && emit_output {
+                if result == ProbeResult::Match && emit_output {
                     row_output_emitted[row] = true;
                 }
             }
 
-            for (row, pending_indices) in pending_cold_by_row.iter().enumerate() {
+            for (row, pending_indices) in pending_by_row.iter().enumerate() {
                 if pending_indices.is_empty() || row_output_emitted[row] {
                     continue;
                 }
@@ -1641,7 +1632,7 @@ fn batch_string_value(
         Ok(Some(array.value(row).to_string()))
     } else {
         Err(DataFusionError::Execution(format!(
-            "Lance batch column expected string array, got {:?}",
+            "variation batch column expected string array, got {:?}",
             array.data_type()
         )))
     }
@@ -1703,10 +1694,10 @@ mod batch_i64_boolean_tests {
 }
 
 #[cfg(feature = "parquet-cache")]
-fn resolve_batch_coloc_indices(batch: &RecordBatch) -> Option<WarmColocIndices> {
+fn resolve_batch_coloc_indices(batch: &RecordBatch) -> Option<ColocatedColumnIndices> {
     let schema = batch.schema();
     let find = |name: &str| schema.index_of(name).ok();
-    Some(WarmColocIndices {
+    Some(ColocatedColumnIndices {
         variation_name: find("variation_name")?,
         end_col: find("end"),
         failed: find("failed"),
@@ -2176,11 +2167,7 @@ fn canonical_event_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize)
     (ref_end - ref_start, alt_end - alt_start)
 }
 
-/// Resolve column indices within the KV entry for co-located fields.
-///
-/// The entry stores all cache schema columns except chrom/start, in schema order
-/// minus those two. `end` is stored as a regular column inside the entry.
-impl Stream for KvLookupStream {
+impl Stream for VariationLookupStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -2188,7 +2175,7 @@ impl Stream for KvLookupStream {
             return Poll::Ready(Some(result));
         }
 
-        // KvLookupExec reads ALL alleles at each position in a single point
+        // VariationLookupExec reads ALL alleles at each position in a single point
         // lookup (the position entry contains all alleles), so co-located
         // data for each VCF row is complete immediately — no buffering needed.
         match self.input.poll_next_unpin(cx) {
@@ -2209,7 +2196,7 @@ impl Stream for KvLookupStream {
     }
 }
 
-impl RecordBatchStream for KvLookupStream {
+impl RecordBatchStream for VariationLookupStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -2289,31 +2276,31 @@ mod tests {
         profile.colocated_match += Duration::from_millis(9);
         profile.colocated_flush += Duration::from_millis(10);
         profile.null_append += Duration::from_millis(11);
-        profile.position_index_load += Duration::from_millis(12);
-        profile.cold_parquet_load += Duration::from_millis(13);
+        profile.shard_open += Duration::from_millis(12);
+        profile.variation_take += Duration::from_millis(13);
         profile.primary_allele_rows = 19;
         profile.exact_match_calls = 22;
         profile.primary_matches = 23;
         profile.colocated_allele_rows = 24;
         profile.colocated_entries = 25;
         profile.null_rows = 26;
-        profile.position_index_loaded = 1;
-        profile.cold_parquet_probes = 36;
-        profile.cold_parquet_matches = 37;
-        profile.cold_parquet_position_misses = 2;
-        profile.cold_parquet_not_covered = 3;
-        profile.cold_parquet_rows_scanned = 38;
+        profile.shard_opens = 1;
+        profile.variation_probes = 36;
+        profile.variation_matches = 37;
+        profile.variation_position_misses = 2;
+        profile.variation_not_covered = 3;
+        profile.variation_rows_scanned = 38;
 
         let lines = profile.detail_lines();
 
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("probe_build=0.001s"));
-        assert!(lines[0].contains("position_index_load=0.012s"));
-        assert!(lines[0].contains("cold_tier_load=0.013s"));
+        assert!(lines[0].contains("shard_open=0.012s"));
+        assert!(lines[0].contains("variation_take=0.013s"));
         assert!(lines[1].contains("primary_allele_rows=19"));
         assert!(lines[1].contains("colocated_entries=25"));
         assert!(lines[1].contains("null_rows=26"));
-        assert!(lines[2].contains("cold_tier probes=36"));
+        assert!(lines[2].contains("variation probes=36"));
         assert!(lines[2].contains(" matches=37"));
         assert!(lines[2].contains("position_misses=2"));
         assert!(lines[2].contains("rows_scanned=38"));
@@ -2404,7 +2391,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result, ColdProbeResult::Match);
+        assert_eq!(result, ProbeResult::Match);
         assert_eq!(metrics.colocated_entries, 1);
         let key = ("1".to_string(), 244_978_492, 244_978_492, "A/-".to_string());
         let sink_value = coloc

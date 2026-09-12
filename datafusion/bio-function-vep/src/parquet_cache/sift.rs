@@ -1,8 +1,8 @@
 //! Parquet point-lookup for the `translation_sift` cache entity.
 //!
 //! Position-sliced SIFT/PolyPhen blobs keyed by a `u64` `(transcript_uid<<32) |
-//! position`. Mirrors the Parquet `KeyU64LanceLookup` contract — `open` + a
-//! `take_keys(&[u64]) -> (RecordBatch, present)` — but resolves keys through the
+//! position`. Exposes `open` + a `take_keys(&[u64]) -> (RecordBatch, present)`
+//! and resolves keys through the
 //! footer [`PageDir`] (u64 key column) + [`CoalescingAsyncReader`] instead of an
 //! in-memory BTree. The shard is written no-dictionary, page-indexed, and
 //! physically sorted by `key` (a single monotone run — SIFT keys are unique), so

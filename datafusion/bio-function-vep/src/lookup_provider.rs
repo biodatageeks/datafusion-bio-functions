@@ -1,6 +1,6 @@
 //! Lookup provider for the Parquet variation cache.
 //!
-//! Builds a `KvLookupExec` (Parquet backend) over the per-chrom variation cache;
+//! Builds a `VariationLookupExec` (Parquet backend) over the per-chrom variation cache;
 //! consumed by the `annotate_vep` annotation path.
 
 use std::any::Any;
@@ -54,7 +54,7 @@ fn wrap_with_projection(
 }
 
 /// Table provider that implements variant lookup against the Parquet variation
-/// cache via `KvLookupExec`.
+/// cache via `VariationLookupExec`.
 ///
 /// VCF variants are streamed and probed against the per-chrom Parquet variation
 /// dataset; `match_allele()` is applied as a post-filter and unmatched VCF rows
@@ -264,11 +264,11 @@ impl TableProvider for LookupProvider {
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Parquet cache dispatch: when a variation cache root is set, use the
-        // KvLookupExec (Parquet backend) instead of the interval join.
+        // VariationLookupExec (Parquet backend) instead of the interval join.
         #[cfg(feature = "parquet-cache")]
         if let Some(cache_root) = &self.cache_root {
             use crate::allele::allele_matches;
-            use crate::cache::lookup_exec::KvLookupExec;
+            use crate::cache::lookup_exec::VariationLookupExec;
 
             let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
             let vcf_df = self.session.table(&self.vcf_table).await?;
@@ -279,7 +279,7 @@ impl TableProvider for LookupProvider {
             };
             let vcf_plan = vcf_df.create_physical_plan().await?;
 
-            let mut exec = KvLookupExec::new_parquet(
+            let mut exec = VariationLookupExec::new(
                 vcf_plan,
                 cache_root.clone(),
                 self.cache_schema.clone(),
@@ -309,7 +309,7 @@ impl TableProvider for LookupProvider {
         // Parquet is the only supported variation-lookup backend; a LookupProvider
         // is always constructed with a Parquet cache root by the annotation path.
         Err(DataFusionError::Plan(
-            "LookupProvider::scan requires a Lance variation cache root".to_string(),
+            "LookupProvider::scan requires a Parquet variation cache root".to_string(),
         ))
     }
 }

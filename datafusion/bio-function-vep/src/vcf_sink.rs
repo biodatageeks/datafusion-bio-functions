@@ -1412,7 +1412,7 @@ pub async fn annotate_to_vcf(
     let concurrency_plan = VepConcurrencyPlan::from_config(config);
     if sink_profile_enabled() {
         eprintln!(
-            "[VEP_PROFILE] concurrency_plan lookup_partitions={} workers={} cold_parquet_target_partitions={} spawn_vcf_provider_open={}",
+            "[VEP_PROFILE] concurrency_plan lookup_partitions={} workers={} lookup_target_partitions={} spawn_vcf_provider_open={}",
             concurrency_plan.lookup_partitions,
             config.workers,
             config.target_partitions,

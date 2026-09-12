@@ -889,13 +889,11 @@ fn transform_variation_tier_batch(
     columns.push(Arc::new(Int8Array::from(tier_values)) as ArrayRef);
 
     let full = RecordBatch::try_new(target_schema, columns).map_err(|err| {
-        DataFusionError::Execution(format!("failed to build Lance variation batch: {err}"))
+        DataFusionError::Execution(format!("failed to build variation batch: {err}"))
     })?;
     let mask = BooleanArray::from(keep);
     filter_record_batch(&full, &mask).map_err(|err| {
-        DataFusionError::Execution(format!(
-            "failed to filter Lance variation tier batch: {err}"
-        ))
+        DataFusionError::Execution(format!("failed to filter variation tier batch: {err}"))
     })
 }
 
@@ -906,7 +904,7 @@ fn attach_schema_metadata_to_batch(
 ) -> Result<RecordBatch> {
     let schema = with_cache_identity_metadata(batch.schema().as_ref(), source_type, cache_version);
     RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).map_err(|err| {
-        DataFusionError::Execution(format!("failed to attach Lance schema metadata: {err}"))
+        DataFusionError::Execution(format!("failed to attach schema metadata: {err}"))
     })
 }
 
@@ -1164,8 +1162,9 @@ fn project_batch_to_schema(batch: RecordBatch, target_schema: SchemaRef) -> Resu
             })?;
         columns.push(batch.column(index).clone());
     }
-    RecordBatch::try_new(target_schema, columns)
-        .map_err(|err| DataFusionError::Execution(format!("failed to project Lance batch: {err}")))
+    RecordBatch::try_new(target_schema, columns).map_err(|err| {
+        DataFusionError::Execution(format!("failed to project variation batch: {err}"))
+    })
 }
 
 fn chroms_from_schema(schema: &SchemaRef) -> Vec<String> {
