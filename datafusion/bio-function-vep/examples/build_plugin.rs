@@ -15,7 +15,8 @@
 //! match the whole file's.
 //! Indexed TSV and GFF manifests (`index = "tabix"`) query the requested
 //! chromosome natively through the source's sibling `.tbi`; no external `tabix`
-//! process or pre-slice is needed.
+//! process or pre-slice is needed. `lookup = "interval"` manifests still take
+//! `--variation-cache-dir` (it enumerates the chromosomes) but run no tier join.
 //! ```
 
 use std::path::PathBuf;

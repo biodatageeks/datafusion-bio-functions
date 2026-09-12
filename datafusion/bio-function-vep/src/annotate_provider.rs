@@ -182,8 +182,8 @@ use std::fmt::Write;
 
 use crate::allele::{
     AltKind, MatchedVariantAllele, alt_kind, plugin_probe_allele, plugin_probe_input_allele,
-    reverse_complement_allele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end,
-    vep_norm_start,
+    plugin_probe_span, reverse_complement_allele, vcf_to_vep_allele, vcf_to_vep_input_allele,
+    vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::AnnotationBackend;
 #[cfg(feature = "parquet-cache")]
@@ -7002,6 +7002,7 @@ impl AnnotateProvider {
                                     minimal_allele.as_str(),
                                 )
                             });
+                            let probe_span = plugin_probe_span(start_val, &ref_al, &alt_allele);
                             let scalars = plugin_slices
                                 .as_ref()
                                 .map(|s| {
@@ -7011,6 +7012,7 @@ impl AnnotateProvider {
                                         u32::try_from(plugin_key_start).unwrap_or(0),
                                         &plugin_allele,
                                         fallback_key,
+                                        probe_span,
                                         &ns,
                                     )
                                 })
@@ -7065,6 +7067,7 @@ impl AnnotateProvider {
                                     minimal_allele.as_str(),
                                 )
                             });
+                            let probe_span = plugin_probe_span(start_val, &ref_al, &alt_allele);
                             let scalars = plugin_slices
                                 .as_ref()
                                 .map(|s| {
@@ -7072,6 +7075,7 @@ impl AnnotateProvider {
                                         u32::try_from(plugin_key_start).unwrap_or(0),
                                         &plugin_allele,
                                         fallback_key,
+                                        probe_span,
                                         &[],
                                     )
                                 })

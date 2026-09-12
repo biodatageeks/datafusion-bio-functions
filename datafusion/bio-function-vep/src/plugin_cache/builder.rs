@@ -277,10 +277,12 @@ impl<'a> PluginCacheBuilder<'a> {
 /// provenance. An unrecorded policy on either side is not a conflict; the
 /// merged manifest then records no policy either (see `build_all`).
 fn schema_matches(a: &CacheManifest, b: &CacheManifest) -> bool {
-    matches!(
-        (a.assume_unique, b.assume_unique),
-        (None, _) | (_, None) | (Some(true), Some(true)) | (Some(false), Some(false))
-    ) && a.value_columns.len() == b.value_columns.len()
+    a.lookup == b.lookup
+        && matches!(
+            (a.assume_unique, b.assume_unique),
+            (None, _) | (_, None) | (Some(true), Some(true)) | (Some(false), Some(false))
+        )
+        && a.value_columns.len() == b.value_columns.len()
         && a.value_columns
             .iter()
             .zip(&b.value_columns)
@@ -1421,6 +1423,7 @@ type = "Float32"
             allele_match: Default::default(),
             field_order: Default::default(),
             assume_unique: None,
+            lookup: Default::default(),
         };
         assert!(schema_matches(&mk("DEMO"), &mk("DEMO")));
         assert!(!schema_matches(&mk("DEMO"), &mk("DEMO2")));

@@ -983,6 +983,42 @@ pub fn vep_norm_end(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> i64 {
     vcf_pos + ref_allele.len() as i64 - 1 - suffix_len as i64
 }
 
+/// True for an ALT that VCF classifies as structural rather than a sequence
+/// allele: a symbolic `<…>` allele, the `*` spanning deletion, or a breakend
+/// (`A]2:321]`, `]2:321]A`, `[chr:pos[A`, and the single-breakend forms
+/// `.A` / `A.`). Ensembl represents all of these as StructuralVariationFeatures.
+pub fn is_structural_alt(alt_allele: &str) -> bool {
+    alt_allele.starts_with('<')
+        || alt_allele == "*"
+        || alt_allele.contains('[')
+        || alt_allele.contains(']')
+        || (alt_allele.len() > 1 && (alt_allele.starts_with('.') || alt_allele.ends_with('.')))
+}
+
+/// The genomic span a tabix-backed Ensembl plugin queries for a variant: the
+/// VEP-normalised `[start, end]`, with an insertion's `start > end` swapped the
+/// way `PhenotypeOrthologous.pm` and `ReferenceQuality.pm` do before calling
+/// `get_data`. Inclusive, 1-based, clamped to `u32`.
+///
+/// `None` for a structural allele (see [`is_structural_alt`]: symbolic `<DEL>`,
+/// the `*` spanning deletion, breakends). Ensembl plugins default to `variant_feature_types =
+/// ['VariationFeature']` (`BaseVepPlugin::new`), so `run_plugins` never calls a
+/// tabix plugin for a StructuralVariationFeature: such records get empty plugin
+/// fields, and deriving a span from their `END` would populate rows VEP leaves
+/// blank.
+pub fn plugin_probe_span(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> Option<(u32, u32)> {
+    if is_structural_alt(alt_allele) {
+        return None;
+    }
+    let s = vep_norm_start(vcf_pos, ref_allele, alt_allele);
+    let e = vep_norm_end(vcf_pos, ref_allele, alt_allele);
+    let (lo, hi) = if s > e { (e, s) } else { (s, e) };
+    Some((
+        u32::try_from(lo).unwrap_or(0),
+        u32::try_from(hi).unwrap_or(0),
+    ))
+}
+
 /// Create the `vep_norm_start(pos, ref, alt)` scalar UDF.
 ///
 /// Traceability:
@@ -1550,6 +1586,29 @@ mod tests {
     /// Equal-length MNVs left behind by `bcftools norm -m -both`. Each pair is a
     /// real chr21 HG002 variant whose CADD score was present in the shard under
     /// the minimal key but missed by an unreduced probe.
+    #[test]
+    fn plugin_probe_span_is_vep_span_with_insertions_swapped() {
+        // SNV
+        assert_eq!(plugin_probe_span(100, "A", "G"), Some((100, 100)));
+        // deletion CT>C: VEP start 101, end 101
+        assert_eq!(plugin_probe_span(100, "CT", "C"), Some((101, 101)));
+        // insertion C>CT: VEP start 101, end 100 → swapped [100, 101]
+        assert_eq!(plugin_probe_span(100, "C", "CT"), Some((100, 101)));
+        // MNV
+        assert_eq!(plugin_probe_span(100, "AC", "GT"), Some((100, 101)));
+        // symbolic / structural: VEP never runs a tabix plugin on these
+        assert_eq!(plugin_probe_span(100, "A", "<DEL>"), None);
+        assert_eq!(plugin_probe_span(100, "A", "*"), None);
+        // breakends, paired and single
+        assert_eq!(plugin_probe_span(100, "A", "A]2:321]"), None);
+        assert_eq!(plugin_probe_span(100, "A", "]2:321]A"), None);
+        assert_eq!(plugin_probe_span(100, "A", "[chr3:1234[T"), None);
+        assert_eq!(plugin_probe_span(100, "A", ".A"), None);
+        assert_eq!(plugin_probe_span(100, "A", "A."), None);
+        // a plain sequence allele is untouched
+        assert_eq!(plugin_probe_span(100, "A", "T"), Some((100, 100)));
+    }
+
     #[test]
     fn plugin_probe_allele_reduces_untrimmed_mnvs() {
         // chr21:13973877, 12 shared trailing bases -> a plain T>G substitution.

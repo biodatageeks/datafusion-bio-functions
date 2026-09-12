@@ -24,6 +24,8 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 
+use coitrees::{COITree, GenericInterval, Interval, IntervalTree};
+
 use crate::parquet_cache::page_dir::{
     CoalescingAsyncReader, IoCounters, PageDir, selection_from_offsets, selection_from_ranges,
 };
@@ -288,6 +290,195 @@ impl PluginBufferSlice {
     }
 }
 
+/// One interval row's values, in shard column order. Its position in
+/// `IntervalLookup::rows` is the file ordinal, which is also the COITree
+/// metadata, so the tie-break "first record in file order" is a `min` over
+/// the ordinals the tree reports.
+struct IntervalRow {
+    values: Vec<PluginScalar>,
+}
+
+/// Whole-shard interval lookup for `LookupKind::Interval` plugins: one
+/// `COITree` per discriminator tuple over closed 1-based spans, read once at
+/// open and probed synchronously. `probe` returns the overlapping row with the
+/// smallest shard ordinal. The shard is written in `(start, arrival)` order
+/// (`build::write_interval_shard`), which is the iteration order of the
+/// position-sorted tabix file an Ensembl plugin reads, so this is the record
+/// such a plugin takes. A plugin with no match columns has a single tree.
+pub struct IntervalLookup {
+    rows: Vec<IntervalRow>,
+    trees: HashMap<Vec<Option<String>>, COITree<usize, u32>>,
+    n_values: usize,
+}
+
+impl IntervalLookup {
+    /// Read the whole shard (`start, end, <match…>, <value…>`) and index it.
+    pub async fn open(
+        shard: &Path,
+        match_columns: Vec<String>,
+        value_columns: Vec<String>,
+    ) -> Result<Self> {
+        let file = tokio::fs::File::open(shard).await.map_err(|e| {
+            DataFusionError::Execution(format!("open plugin shard '{}': {e}", shard.display()))
+        })?;
+        let builder = ParquetRecordBatchStreamBuilder::new(file)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("open interval shard: {e}")))?;
+        let arrow_schema = builder.schema().clone();
+        let mut wanted = vec!["start".to_string(), "end".to_string()];
+        wanted.extend(match_columns.iter().cloned());
+        wanted.extend(value_columns.iter().cloned());
+        let roots: Vec<usize> = wanted
+            .iter()
+            .map(|n| {
+                arrow_schema.index_of(n).map_err(|e| {
+                    DataFusionError::Execution(format!("interval shard column {n}: {e}"))
+                })
+            })
+            .collect::<Result<_>>()?;
+        let mask = ProjectionMask::roots(builder.parquet_schema(), roots);
+        let mut stream = builder
+            .with_projection(mask)
+            .with_batch_size(8192)
+            .build()
+            .map_err(|e| DataFusionError::Execution(format!("build interval stream: {e}")))?;
+        let n_match = match_columns.len();
+        let n_values = value_columns.len();
+        let mut rows: Vec<IntervalRow> = Vec::new();
+        let mut intervals: HashMap<Vec<Option<String>>, Vec<Interval<usize>>> = HashMap::new();
+        while let Some(b) = stream
+            .try_next()
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("read interval batch: {e}")))?
+        {
+            let schema = b.schema();
+            let col = |name: &str| -> Result<usize> {
+                schema
+                    .index_of(name)
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))
+            };
+            let start = b
+                .column(col("start")?)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| DataFusionError::Execution("start column must be UInt32".into()))?;
+            let end = b
+                .column(col("end")?)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| DataFusionError::Execution("end column must be UInt32".into()))?;
+            let match_idx: Vec<usize> = match_columns
+                .iter()
+                .map(|n| col(n))
+                .collect::<Result<_>>()?;
+            let value_idx: Vec<usize> = value_columns
+                .iter()
+                .map(|n| col(n))
+                .collect::<Result<_>>()?;
+            for r in 0..b.num_rows() {
+                let mut key = Vec::with_capacity(n_match);
+                for &i in &match_idx {
+                    key.push(string_value(b.column(i).as_ref(), r)?);
+                }
+                let mut values = Vec::with_capacity(n_values);
+                for &i in &value_idx {
+                    values.push(decode_scalar(b.column(i).as_ref(), r)?);
+                }
+                let ordinal = rows.len();
+                rows.push(IntervalRow { values });
+                // Closed 1-based span; positions fit i32 for every contig.
+                intervals.entry(key).or_default().push(Interval::new(
+                    i32::try_from(start.value(r)).unwrap_or(i32::MAX),
+                    i32::try_from(end.value(r)).unwrap_or(i32::MAX),
+                    ordinal,
+                ));
+            }
+        }
+        let trees = intervals
+            .into_iter()
+            .map(|(key, ivs)| (key, COITree::new(&ivs)))
+            .collect();
+        Ok(Self {
+            rows,
+            trees,
+            n_values,
+        })
+    }
+
+    pub fn n_values(&self) -> usize {
+        self.n_values
+    }
+
+    /// First row (file order) whose inclusive span overlaps `[span_start, span_end]`
+    /// under the given discriminators; `None` on a miss or a `None` discriminator
+    /// that the shard stores as `Some`.
+    pub fn probe(
+        &self,
+        span_start: u32,
+        span_end: u32,
+        match_values: &[Option<String>],
+    ) -> Option<&[PluginScalar]> {
+        let tree = self.trees.get(match_values)?;
+        let (first, last) = (
+            i32::try_from(span_start).unwrap_or(i32::MAX),
+            i32::try_from(span_end).unwrap_or(i32::MAX),
+        );
+        let mut best: Option<usize> = None;
+        tree.query(first, last, |node| {
+            let ordinal = *GenericInterval::<usize>::metadata(node);
+            best = Some(best.map_or(ordinal, |b| b.min(ordinal)));
+        });
+        best.map(|i| self.rows[i].values.as_slice())
+    }
+}
+
+/// Test fixtures shared with the registry tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::plugin_cache::cache_manifest::LookupKind;
+    use crate::plugin_cache::source_manifest::{MatchColumn, ValueColumn, ValueType};
+    use crate::plugin_cache::write::{PluginShardWriter, plugin_output_schema};
+    use datafusion::arrow::array::{Int8Array, StringArray, UInt32Array};
+
+    /// Three rows for ENSG1 in file order wide, narrow, late (all cover 160;
+    /// a tree visits them in its own order, so the ordinal tie-break is what
+    /// makes "wide" win) and one row for ENSG2 with no value.
+    pub(crate) fn write_interval_shard(path: &std::path::Path) {
+        let matches = vec![MatchColumn {
+            column: "gene_id".into(),
+            template: "{Gene}".into(),
+        }];
+        let vals = vec![ValueColumn {
+            column: "rat".into(),
+            csq_field: "PO_Rat".into(),
+            ty: ValueType::Utf8,
+            description: None,
+        }];
+        let schema = plugin_output_schema(LookupKind::Interval, &matches, &vals);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1", "1", "1"])),
+                Arc::new(UInt32Array::from(vec![100u32, 150, 155, 400])),
+                Arc::new(UInt32Array::from(vec![300u32, 200, 350, 500])),
+                Arc::new(StringArray::from(vec!["ENSG1", "ENSG1", "ENSG1", "ENSG2"])),
+                Arc::new(StringArray::from(vec![
+                    Some("wide"),
+                    Some("narrow"),
+                    Some("late"),
+                    None,
+                ])),
+                Arc::new(Int8Array::from(vec![1i8, 1, 1, 1])),
+            ],
+        )
+        .unwrap();
+        let mut w = PluginShardWriter::create(path, schema).unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+    }
+}
+
 /// Read a string cell across the Utf8 / LargeUtf8 / Utf8View encodings
 /// DataFusion may materialize.
 fn string_value(col: &dyn Array, row: usize) -> Result<Option<String>> {
@@ -329,6 +520,7 @@ fn decode_scalar(col: &dyn Array, row: usize) -> Result<PluginScalar> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_cache::cache_manifest::LookupKind;
     use crate::plugin_cache::source_manifest::{MatchColumn, ValueColumn, ValueType};
     use crate::plugin_cache::write::{PluginShardWriter, plugin_output_schema};
     use datafusion::arrow::array::{Float32Array, Int8Array, StringArray, UInt32Array};
@@ -347,7 +539,7 @@ mod tests {
             ty: ValueType::Float32,
             description: None,
         }];
-        let schema = plugin_output_schema(&matches, &vals);
+        let schema = plugin_output_schema(LookupKind::Point, &matches, &vals);
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -389,6 +581,43 @@ mod tests {
         );
         // empty request → empty batch
         assert_eq!(lk.take_buffer(&[]).await.unwrap().num_rows(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interval_probe_overlaps_and_gates_on_discriminator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chr1.parquet");
+        super::test_support::write_interval_shard(&path);
+        let lk = IntervalLookup::open(&path, vec!["gene_id".into()], vec!["rat".into()])
+            .await
+            .unwrap();
+        let g1 = [Some("ENSG1".to_string())];
+        let g2 = [Some("ENSG2".to_string())];
+        // inside all three ENSG1 spans → first in FILE order, whatever the tree visits first
+        assert_eq!(
+            lk.probe(160, 160, &g1).unwrap(),
+            &[PluginScalar::Str("wide".into())]
+        );
+        // only "late" covers 320..350
+        assert_eq!(
+            lk.probe(320, 320, &g1).unwrap(),
+            &[PluginScalar::Str("late".into())]
+        );
+        // boundaries are inclusive
+        assert_eq!(
+            lk.probe(300, 300, &g1).unwrap(),
+            &[PluginScalar::Str("wide".into())]
+        );
+        assert_eq!(
+            lk.probe(99, 100, &g1).unwrap(),
+            &[PluginScalar::Str("wide".into())]
+        );
+        assert!(lk.probe(351, 351, &g1).is_none());
+        // an insertion span [pos, pos+1] straddling a start boundary
+        assert_eq!(lk.probe(399, 400, &g2).unwrap(), &[PluginScalar::Null]);
+        // discriminator gate
+        assert!(lk.probe(160, 160, &[Some("ENSG9".to_string())]).is_none());
+        assert!(lk.probe(160, 160, &[None]).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -12,6 +12,7 @@ use datafusion::common::Result;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility};
 use datafusion::prelude::create_udf;
 
+use crate::plugin_cache::cache_manifest::LookupKind;
 use crate::plugin_cache::source_manifest::CoordinateSystem;
 
 /// Bare Ensembl contig form matching the variation `chrom` column
@@ -54,14 +55,16 @@ pub fn canonical_contig_udf() -> ScalarUDF {
 }
 
 /// Build the normalization SQL over `inner_view`: canonicalize `chrom`, cast
-/// `start`/`end` (with the coordinate shift), keep `allele_string`, then append
-/// each match column (§3.4 discriminators) and value column verbatim. Columns are
-/// enumerated explicitly (no `SELECT *`/`EXCLUDE`) so the projection is stable
-/// across DataFusion versions. Output column order:
-/// `chrom, start, end, allele_string, <match cols…>, <value cols…>`.
+/// `start`/`end` (with the coordinate shift), keep `allele_string` for point
+/// lookups (interval rows have none), then append each match column (§3.4
+/// discriminators) and value column verbatim. Columns are enumerated
+/// explicitly (no `SELECT *`/`EXCLUDE`) so the projection is stable across
+/// DataFusion versions. Output column order:
+/// `chrom, start, end[, allele_string], <match cols…>, <value cols…>`.
 pub fn wrap_normalization(
     inner_view: &str,
     coord: CoordinateSystem,
+    lookup: LookupKind,
     match_columns: &[String],
     value_columns: &[String],
 ) -> String {
@@ -70,8 +73,11 @@ pub fn wrap_normalization(
         CoordinateSystem::ZeroBasedHalfOpen => "CAST(start AS BIGINT) + 1".to_string(),
     };
     let mut projection = format!(
-        "canonical_contig(chrom) AS chrom, {start_expr} AS start, CAST(\"end\" AS BIGINT) AS \"end\", allele_string"
+        "canonical_contig(chrom) AS chrom, {start_expr} AS start, CAST(\"end\" AS BIGINT) AS \"end\""
     );
+    if lookup == LookupKind::Point {
+        projection.push_str(", allele_string");
+    }
     for col in match_columns.iter().chain(value_columns.iter()) {
         projection.push_str(&format!(", {col}"));
     }
@@ -102,7 +108,13 @@ mod tests {
     #[test]
     fn one_based_passes_through_zero_based_shifts() {
         let vals = vec!["demo_score".to_string()];
-        let one = wrap_normalization("plugin_demo_ingest", CoordinateSystem::OneBased, &[], &vals);
+        let one = wrap_normalization(
+            "plugin_demo_ingest",
+            CoordinateSystem::OneBased,
+            LookupKind::Point,
+            &[],
+            &vals,
+        );
         assert!(one.contains("canonical_contig(chrom) AS chrom"));
         assert!(one.contains("CAST(start AS BIGINT) AS start"));
         assert!(one.contains(", demo_score"));
@@ -111,6 +123,7 @@ mod tests {
         let zero = wrap_normalization(
             "plugin_demo_ingest",
             CoordinateSystem::ZeroBasedHalfOpen,
+            LookupKind::Point,
             &[],
             &vals,
         );
@@ -124,12 +137,29 @@ mod tests {
         let sql = wrap_normalization(
             "plugin_am_ingest",
             CoordinateSystem::OneBased,
+            LookupKind::Point,
             &matches,
             &vals,
         );
         let mi = sql.find("protein_variant").unwrap();
         let vi = sql.find("am_pathogenicity").unwrap();
         assert!(mi < vi, "match column must precede value column: {sql}");
+    }
+
+    #[test]
+    fn interval_projection_has_no_allele_string() {
+        let sql = wrap_normalization(
+            "plugin_po_ingest",
+            CoordinateSystem::OneBased,
+            LookupKind::Interval,
+            &["gene_id".to_string()],
+            &["rat".to_string()],
+        );
+        assert!(!sql.contains("allele_string"), "{sql}");
+        assert!(
+            sql.contains("CAST(\"end\" AS BIGINT) AS \"end\", gene_id, rat"),
+            "{sql}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

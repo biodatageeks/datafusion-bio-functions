@@ -13,6 +13,7 @@ use datafusion::common::{DataFusionError, Result};
 use parquet::arrow::ArrowWriter;
 
 use crate::parquet_cache::write::point_lookup_writer_properties;
+use crate::plugin_cache::cache_manifest::LookupKind;
 use crate::plugin_cache::source_manifest::{MatchColumn, ValueColumn, ValueType};
 
 fn arrow_type(ty: ValueType) -> DataType {
@@ -26,13 +27,19 @@ fn arrow_type(ty: ValueType) -> DataType {
 /// Physical output schema for a plugin shard: shared key columns, the optional
 /// per-transcript match columns (Utf8 discriminators, §3.4), the plugin's value
 /// columns (nullable), then the derived `tier`.
-pub fn plugin_output_schema(matches: &[MatchColumn], values: &[ValueColumn]) -> SchemaRef {
+pub fn plugin_output_schema(
+    lookup: LookupKind,
+    matches: &[MatchColumn],
+    values: &[ValueColumn],
+) -> SchemaRef {
     let mut fields = vec![
         Field::new("chrom", DataType::Utf8, false),
         Field::new("start", DataType::UInt32, false),
         Field::new("end", DataType::UInt32, false),
-        Field::new("allele_string", DataType::Utf8, false),
     ];
+    if lookup == LookupKind::Point {
+        fields.push(Field::new("allele_string", DataType::Utf8, false));
+    }
     for m in matches {
         fields.push(Field::new(&m.column, DataType::Utf8, true));
     }
@@ -83,6 +90,30 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
+    #[test]
+    fn interval_schema_drops_allele_string_and_keeps_tier() {
+        let schema = plugin_output_schema(
+            LookupKind::Interval,
+            &[MatchColumn {
+                column: "gene_id".into(),
+                template: "{Gene}".into(),
+            }],
+            &f32_value_col(),
+        );
+        let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "chrom",
+                "start",
+                "end",
+                "gene_id",
+                "am_pathogenicity",
+                "tier"
+            ]
+        );
+    }
+
     fn f32_value_col() -> Vec<ValueColumn> {
         vec![ValueColumn {
             column: "am_pathogenicity".into(),
@@ -94,7 +125,7 @@ mod tests {
 
     #[test]
     fn output_schema_has_key_values_tier_in_order() {
-        let s = plugin_output_schema(&[], &f32_value_col());
+        let s = plugin_output_schema(LookupKind::Point, &[], &f32_value_col());
         let names: Vec<_> = s.fields().iter().map(|f| f.name().clone()).collect();
         assert_eq!(
             names,
@@ -123,7 +154,7 @@ mod tests {
             column: "protein_variant".into(),
             template: "{ref_aa}{Protein_position}{alt_aa}".into(),
         }];
-        let s = plugin_output_schema(&matches, &f32_value_col());
+        let s = plugin_output_schema(LookupKind::Point, &matches, &f32_value_col());
         let names: Vec<_> = s.fields().iter().map(|f| f.name().clone()).collect();
         assert_eq!(
             names,
@@ -141,7 +172,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn writes_readable_shard() {
-        let schema = plugin_output_schema(&[], &f32_value_col());
+        let schema = plugin_output_schema(LookupKind::Point, &[], &f32_value_col());
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
