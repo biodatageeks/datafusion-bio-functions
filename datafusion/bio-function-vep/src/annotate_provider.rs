@@ -15622,19 +15622,19 @@ impl TableProvider for AnnotateProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Parquet is the only cache backend. `cache_format` is still accepted for
-        // backward compatibility ("cache" is a historical alias) but always
-        // resolves to the Parquet shards.
+        // Parquet is the only cache backend. `cache_format` is validated so a
+        // stale caller fails loudly instead of silently reading Parquet under
+        // another name.
         let cache_format = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "cache_format"))
             .unwrap_or_else(|| "parquet".to_string());
         match cache_format.as_str() {
-            "lance" | "parquet" => {}
+            "parquet" => {}
             other => {
                 return Err(DataFusionError::Plan(format!(
-                    "annotate_vep(): cache_format must be 'lance' or 'parquet', got '{other}'"
+                    "annotate_vep(): cache_format must be 'parquet', got '{other}'"
                 )));
             }
         }
@@ -16188,7 +16188,7 @@ mod tests {
             tmp.path().to_string_lossy().to_string(),
             AnnotationBackend::Parquet,
             CacheSourceType::Merged,
-            Some(r#"{"partitioned":true,"cache_format":"lance","everything":true}"#.to_string()),
+            Some(r#"{"partitioned":true,"cache_format":"parquet","everything":true}"#.to_string()),
             vcf_schema,
         )
         .unwrap();
@@ -16201,11 +16201,46 @@ mod tests {
         let message = err.to_string();
         assert!(
             !message.contains("cache_format must"),
-            "the 'lance' cache_format alias was rejected: {message}"
+            "cache_format 'parquet' was rejected: {message}"
         );
-        // "cache" is accepted as a historical alias and resolves to Parquet, so
-        // the empty cache dir fails on the missing Parquet variation layout.
+        // With a valid cache_format the empty cache dir fails on the missing
+        // Parquet variation layout.
         assert!(message.contains("variation"), "unexpected error: {message}");
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    #[tokio::test]
+    async fn cache_format_lance_alias_is_rejected() {
+        let session = Arc::new(SessionContext::new());
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = AnnotateProvider::new(
+            Arc::clone(&session),
+            "vcf".to_string(),
+            tmp.path().to_string_lossy().to_string(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Merged,
+            Some(r#"{"partitioned":true,"cache_format":"lance","everything":true}"#.to_string()),
+            vcf_schema,
+        )
+        .unwrap();
+
+        let state = session.state();
+        let err = provider
+            .scan(&state, None, &[], None)
+            .await
+            .expect_err("the removed 'lance' alias must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("cache_format must be 'parquet'"),
+            "unexpected error: {message}"
+        );
     }
 
     #[cfg(feature = "parquet-cache")]

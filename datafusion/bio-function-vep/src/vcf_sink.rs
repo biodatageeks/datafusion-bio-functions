@@ -681,13 +681,15 @@ impl AnnotateVcfConfig {
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
 
-    fn to_options_json_with_backend(&self, backend: &str) -> String {
+    /// `to_options_json` plus the `cache_format` the engine validates; the
+    /// Parquet cache is the only format, so this is a constant.
+    fn to_options_json_with_cache_format(&self) -> String {
         let mut value: serde_json::Value =
             serde_json::from_str(&self.to_options_json()).expect("generated options JSON is valid");
         if let Some(opts) = value.as_object_mut() {
             opts.insert(
                 "cache_format".into(),
-                serde_json::Value::String(cache_format_for_backend(backend).to_string()),
+                serde_json::Value::String(CACHE_FORMAT.to_string()),
             );
         }
         value.to_string()
@@ -698,15 +700,10 @@ impl AnnotateVcfConfig {
     }
 }
 
-fn cache_format_for_backend(_backend: &str) -> &str {
-    // Parquet is the only supported cache format.
-    "parquet"
-}
+/// The only cache format; recorded in provenance and passed to the engine.
+const CACHE_FORMAT: &str = "parquet";
 
-fn cache_source_type_from_cache_source_for_backend(
-    cache_source: &str,
-    _backend: &str,
-) -> Result<CacheSourceType> {
+fn cache_source_type_from_cache_source(cache_source: &str) -> Result<CacheSourceType> {
     #[cfg(feature = "parquet-cache")]
     {
         CacheSourceType::from_partitioned_parquet_cache_source(cache_source)
@@ -880,7 +877,7 @@ fn provenance_header_lines(
         env!("CARGO_PKG_VERSION"),
         escape_header_attribute(cache_source),
         cache_source_type.as_str(),
-        escape_header_attribute(cache_format_for_backend(backend)),
+        escape_header_attribute(CACHE_FORMAT),
     );
 
     // The caller's product name, recorded but not load-bearing.
@@ -935,7 +932,7 @@ fn provenance_header_lines(
             .as_ref()
             .map(|p| p.display().to_string()),
         "options": serde_json::from_str::<serde_json::Value>(
-            &config.to_options_json_with_backend(backend),
+            &config.to_options_json_with_cache_format(),
         )
         .unwrap_or(serde_json::Value::Null),
     });
@@ -1408,7 +1405,7 @@ pub async fn annotate_to_vcf(
              bgzip + tabix the VCF, or run with workers=1"
         )));
     }
-    let cache_source_type = cache_source_type_from_cache_source_for_backend(cache_source, backend)?;
+    let cache_source_type = cache_source_type_from_cache_source(cache_source)?;
     let concurrency_plan = VepConcurrencyPlan::from_config(config);
     if sink_profile_enabled() {
         eprintln!(
@@ -1554,7 +1551,7 @@ pub async fn annotate_to_vcf(
     );
     let select_list = annotation_select_list(&projection_names);
 
-    let options_json = config.to_options_json_with_backend(backend);
+    let options_json = config.to_options_json_with_cache_format();
     let opts_clause = format!(", '{}'", options_json.replace('\'', "''"));
     let sql = format!(
         "SELECT {select_list} FROM annotate_vep('{vcf_table}', '{}', '{}'{opts_clause})",
@@ -2196,10 +2193,10 @@ mod tests {
     }
 
     #[test]
-    fn test_to_options_json_with_backend_emits_cache_format() {
+    fn test_to_options_json_with_cache_format_emits_parquet() {
         let config = AnnotateVcfConfig::default();
 
-        let json = config.to_options_json_with_backend("lance");
+        let json = config.to_options_json_with_cache_format();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(value["cache_format"], "parquet");
@@ -2545,13 +2542,12 @@ mod tests {
 
     #[test]
     fn provenance_records_the_real_cache_format_not_the_backend_token() {
-        // `backend` is a vestigial identifier — callers pass "lance" while the
-        // storage is Parquet — so recording it would state something false in an
-        // audit trail. Record the resolved cache format instead.
+        // The header records the cache format, never the backend token, so the
+        // token cannot leak into an audit trail.
         let lines = provenance_header_lines(
             "/in.vcf",
             "/cache",
-            "lance",
+            "parquet",
             "/out.vcf",
             &AnnotateVcfConfig::default(),
             CacheSourceType::Merged,
@@ -2562,13 +2558,9 @@ mod tests {
             lines[0]
         );
         for line in &lines {
-            assert!(
-                !line.contains("lance"),
-                "vestigial backend token leaked: {line}"
-            );
             assert!(!line.contains("backend"), "{line}");
         }
-        // `to_options_json_with_backend` already resolves cache_format into the
+        // `to_options_json_with_cache_format` already puts cache_format into the
         // nested options object, so the invocation must not repeat it.
         assert_eq!(
             lines[1].matches("\"cache_format\"").count(),

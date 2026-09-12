@@ -24,9 +24,7 @@ pub enum CacheFormat {
 impl CacheFormat {
     pub fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
-            // "cache" is accepted as a historical alias but always resolves to
-            // the Parquet cache — the only supported output format.
-            "lance" | "parquet" => Ok(Self::Parquet),
+            "parquet" => Ok(Self::Parquet),
             other => Err(DataFusionError::Execution(format!(
                 "cache_format must be 'parquet', got '{other}'"
             ))),
@@ -277,10 +275,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_format_parser_accepts_parquet_and_lance_alias() {
+    fn cache_format_parser_accepts_parquet_only() {
         assert_eq!(CacheFormat::parse("parquet").unwrap(), CacheFormat::Parquet);
-        assert_eq!(CacheFormat::parse("lance").unwrap(), CacheFormat::Parquet);
-        assert_eq!(CacheFormat::parse("LANCE").unwrap(), CacheFormat::Parquet);
+        assert_eq!(CacheFormat::parse("PARQUET").unwrap(), CacheFormat::Parquet);
+        assert!(CacheFormat::parse("lance").is_err());
         assert!(CacheFormat::parse("indexed_parquet").is_err());
         assert!(CacheFormat::parse("legacy_fjall").is_err());
     }
