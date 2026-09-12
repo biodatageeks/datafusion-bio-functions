@@ -1,6 +1,6 @@
 //! Lookup provider for the Parquet variation cache.
 //!
-//! Builds a `KvLookupExec` (Parquet backend) over the per-chrom variation cache;
+//! Builds a `VariationLookupExec` (Parquet backend) over the per-chrom variation cache;
 //! consumed by the `annotate_vep` annotation path.
 
 use std::any::Any;
@@ -54,7 +54,7 @@ fn wrap_with_projection(
 }
 
 /// Table provider that implements variant lookup against the Parquet variation
-/// cache via `KvLookupExec`.
+/// cache via `VariationLookupExec`.
 ///
 /// VCF variants are streamed and probed against the per-chrom Parquet variation
 /// dataset; `match_allele()` is applied as a post-filter and unmatched VCF rows
@@ -85,11 +85,6 @@ pub struct LookupProvider {
     /// `variation.cache/chrN.cache` plus the sidecar position/bloom indexes.
     #[cfg(feature = "parquet-cache")]
     cache_root: Option<PathBuf>,
-    /// When true, the variation lookup uses the Parquet backend
-    /// (`variation/chrN.parquet`) instead of Parquet. The cache root is
-    /// still carried in `cache_root` (the shared cache base dir).
-    #[cfg(feature = "parquet-cache")]
-    parquet_backend: bool,
     /// Maximum number of independent cold readers used by lookup.
     target_partitions: usize,
     probe_floor_pos: Option<i64>,
@@ -167,8 +162,6 @@ impl LookupProvider {
             partition_colocated_sinks: None,
             #[cfg(feature = "parquet-cache")]
             cache_root: None,
-            #[cfg(feature = "parquet-cache")]
-            parquet_backend: false,
             target_partitions: 1,
             probe_floor_pos: None,
             vcf_filter: None,
@@ -199,13 +192,6 @@ impl LookupProvider {
     #[cfg(feature = "parquet-cache")]
     pub fn set_cache_root(&mut self, root: impl Into<PathBuf>) {
         self.cache_root = Some(root.into());
-    }
-
-    /// Select the Parquet variation backend (default is Parquet). The cache root is
-    /// set separately via [`Self::set_cache_root`] (the shared base dir).
-    #[cfg(feature = "parquet-cache")]
-    pub fn set_parquet_backend(&mut self, parquet: bool) {
-        self.parquet_backend = parquet;
     }
 
     pub fn set_target_partitions(&mut self, target_partitions: usize) {
@@ -278,13 +264,12 @@ impl TableProvider for LookupProvider {
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Parquet cache dispatch: when a variation cache root is set, use the
-        // KvLookupExec (Parquet backend) instead of the interval join.
+        // VariationLookupExec (Parquet backend) instead of the interval join.
         #[cfg(feature = "parquet-cache")]
         if let Some(cache_root) = &self.cache_root {
             use crate::allele::allele_matches;
-            use crate::cache::lookup_exec::{KvLookupExec, KvMatchMode};
+            use crate::cache::lookup_exec::VariationLookupExec;
 
-            let _ = self.parquet_backend;
             let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
             let vcf_df = self.session.table(&self.vcf_table).await?;
             let vcf_df = if let Some(ref filter) = self.vcf_filter {
@@ -294,12 +279,11 @@ impl TableProvider for LookupProvider {
             };
             let vcf_plan = vcf_df.create_physical_plan().await?;
 
-            let mut exec = KvLookupExec::new_parquet(
+            let mut exec = VariationLookupExec::new(
                 vcf_plan,
                 cache_root.clone(),
                 self.cache_schema.clone(),
                 self.cache_columns.clone(),
-                KvMatchMode::Exact,
                 allele_matches as fn(&str, &str, &str) -> bool,
                 vcf_has_chr,
                 self.coord_normalizer.input_zero_based,
@@ -325,7 +309,7 @@ impl TableProvider for LookupProvider {
         // Parquet is the only supported variation-lookup backend; a LookupProvider
         // is always constructed with a Parquet cache root by the annotation path.
         Err(DataFusionError::Plan(
-            "LookupProvider::scan requires a Lance variation cache root".to_string(),
+            "LookupProvider::scan requires a Parquet variation cache root".to_string(),
         ))
     }
 }

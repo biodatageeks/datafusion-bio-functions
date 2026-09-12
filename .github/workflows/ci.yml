@@ -24,8 +24,8 @@ jobs:
           toolchain: '1.91.0'
           components: 'clippy, rustfmt'
 
-      # `--all-features` enables `lance-cache`, whose `lance-index` dependency
-      # builds `prost`, which requires the protobuf compiler at build time.
+      # Transitive dependencies that generate protobuf code (`prost`) need the
+      # protobuf compiler at build time.
       - name: Setup protoc
         uses: arduino/setup-protoc@v3
         with:

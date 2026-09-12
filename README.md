@@ -15,7 +15,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 |-------|-------------|--------|
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
 | **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations | ✅ |
-| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via the `annotate_vep()` table function over a Lance cache backend | ✅ |
+| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via the `annotate_vep()` table function over a Parquet cache backend | ✅ |
 
 ## Features
 
@@ -45,8 +45,8 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 
 ### VEP Annotation
 
-- **`annotate_vep()` Table Function**: SQL entrypoint that annotates a VCF against a pre-built **Lance** VEP cache — known-variant lookup plus transcript-aware consequence annotation (Ensembl-VEP-style CSQ fields).
-- **Lance cache backend**: the single cache/lookup path. Per-chromosome Lance datasets hold the variation cache, transcript/exon/regulatory context, and SIFT/PolyPhen predictions.
+- **`annotate_vep()` Table Function**: SQL entrypoint that annotates a VCF against a pre-built **Parquet** VEP cache — known-variant lookup plus transcript-aware consequence annotation (Ensembl-VEP-style CSQ fields).
+- **Parquet cache backend**: the single cache/lookup path. Per-chromosome Parquet shards hold the variation cache, transcript/exon/regulatory context, and SIFT/PolyPhen predictions.
 - **Within-contig parallelism**: a single `threads` knob fuses and parallelizes lookup, annotation, and output.
 
 #### `annotate_vep` API
@@ -61,13 +61,13 @@ annotate_vep(
 ```
 
 - `vcf_table`: registered input VCF table.
-- `cache_source`: path to the partitioned Lance cache directory (containing `variation.lance/`).
-- `backend`: must be `lance` (the only supported backend).
-- `options_json` (optional): JSON object of annotation/runtime options, e.g. `everything`, `pick`, `pick_allele`, `per_gene`, `hgvs`, `refseq`, `merged`, `gencode_basic`, `threads`. The cache-source mode (`ensembl` / `merged` / `refseq`) is read from Arrow schema metadata on the Lance variation dataset.
+- `cache_source`: path to the partitioned Parquet cache directory (containing `variation/`).
+- `backend`: must be `parquet` (the only supported backend).
+- `options_json` (optional): JSON object of annotation/runtime options, e.g. `everything`, `pick`, `pick_allele`, `per_gene`, `hgvs`, `refseq`, `merged`, `gencode_basic`, `threads`. The cache-source mode (`ensembl` / `merged` / `refseq`) is read from Arrow schema metadata on the Parquet variation shard.
 
 Annotation behavior:
-- known-variant metadata from the Lance variation cache (co-located IDs, clinical significance, allele frequencies),
-- transcript-aware SO terms and ranked `most_severe_consequence` from the partitioned Lance transcript/exon/regulatory context,
+- known-variant metadata from the Parquet variation cache (co-located IDs, clinical significance, allele frequencies),
+- transcript-aware SO terms and ranked `most_severe_consequence` from the partitioned Parquet transcript/exon/regulatory context,
 - HGVSc/HGVSp, SIFT/PolyPhen, and the full `--everything` CSQ field set when requested,
 - unmatched rows pass through with `NULL` annotations.
 
@@ -75,8 +75,8 @@ Annotation behavior:
 
 | Capability | Ensembl-VEP (release 115) | bio-functions-vep (current) |
 |------------|----------------------------|-----------------------------|
-| Known-variant cache lookup | ✅ (`--check_existing`, colocated behavior) | ✅ (Lance variation lookup) |
-| Transcript consequence engine | ✅ (full SO consequence model) | ✅ ranked SO output from the Lance transcript/exon context |
+| Known-variant cache lookup | ✅ (`--check_existing`, colocated behavior) | ✅ (Parquet variation lookup) |
+| Transcript consequence engine | ✅ (full SO consequence model) | ✅ ranked SO output from the Parquet transcript/exon context |
 | Supported consequence terms | 41/41 | 41/41 term handlers wired |
 | HGVSc/HGVSp, SIFT/PolyPhen, `--everything` | ✅ | ✅ |
 | Native SQL execution in DataFusion | ❌ | ✅ |
@@ -85,13 +85,13 @@ Annotation behavior:
 
 End-to-end annotation and parity comparison against Ensembl VEP are driven from
 the [`vepyr`](https://github.com/biodatageeks/vepyr) Python wrapper, which calls
-`annotate_vep` over the Lance cache and diffs the output VCF against the
+`annotate_vep` over the Parquet cache and diffs the output VCF against the
 reference Ensembl VEP output:
 
 ```bash
 # in the vepyr repo
 RUSTFLAGS="-C target-cpu=native" uv sync --reinstall-package vepyr
-uv run python run_annotation_fast.py chr1 --cache merged --force --backend lance --threads 8
+uv run python run_annotation_fast.py chr1 --cache merged --force --threads 8
 ```
 
 #### Usage from Rust
@@ -103,22 +103,22 @@ use datafusion_bio_function_vep::register_vep_functions;
 let ctx = SessionContext::new();
 register_vep_functions(&ctx);
 
-// `vcf` is a registered VCF table; `/path/to/cache` contains `variation.lance/`.
+// `vcf` is a registered VCF table; `/path/to/cache` contains `variation/`.
 let df = ctx
-    .sql("SELECT * FROM annotate_vep('vcf', '/path/to/cache', 'lance', '{\"everything\":true}')")
+    .sql("SELECT * FROM annotate_vep('vcf', '/path/to/cache', 'parquet', '{\"everything\":true}')")
     .await?;
 ```
 
-#### Building the Lance cache
+#### Building the Parquet cache
 
-The partitioned Lance cache is built from a raw Ensembl VEP cache via
+The partitioned Parquet cache is built from a raw Ensembl VEP cache via
 `CacheBuilder` (requires the `cache-builder` feature). This is normally driven
 through vepyr's cache-build entrypoint; a per-chromosome build example is also
 provided:
 
 ```bash
-cargo run -p datafusion-bio-function-vep --example build_lance_variation_chrom \
-  --features "lance-cache,cache-builder" --release
+cargo run -p datafusion-bio-function-vep --example build_parquet_variation_chrom \
+  --features cache-builder --release
 ```
 
 ## Installation

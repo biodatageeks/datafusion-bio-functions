@@ -17,8 +17,8 @@ use crate::plugin_cache::source_manifest::CoordinateSystem;
 
 /// Bare Ensembl contig form matching the variation `chrom` column
 /// (`1`..`22`, `X`, `Y`, `MT`): strip any `chr` prefix, fold the mitochondrial
-/// aliases to `MT`, uppercase the rest. Mirrors `cache::key_encoding` prefix
-/// handling so plugin and variation contigs agree by construction.
+/// aliases to `MT`, uppercase the rest. Matches the variation shard's contig
+/// naming so plugin and variation contigs agree by construction.
 pub fn canonical_contig_str(raw: &str) -> String {
     // Strip a leading `chr` case-insensitively (`chr1`/`CHR1`/`Chr1` all → `1`);
     // a source that spells contigs `CHR1` would otherwise canonicalize to `CHR1`

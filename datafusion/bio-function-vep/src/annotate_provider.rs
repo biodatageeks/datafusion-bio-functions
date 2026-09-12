@@ -873,7 +873,7 @@ fn annotation_column_defs_for_selection(
 /// Returns the list of cache column names needed for the variation lookup query.
 ///
 /// This is the backward-compatible list of column names that the `requested_columns`
-/// logic uses to select columns from the variation cache parquet/fjall store.
+/// logic uses to select columns from the Parquet variation cache.
 pub fn cache_lookup_column_names() -> Vec<&'static str> {
     vec![
         // Variant identity
@@ -3411,7 +3411,7 @@ fn position_predictions_from_batch(
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| {
-            DataFusionError::Execution("Lance SIFT position key column must be UInt64".into())
+            DataFusionError::Execution("SIFT position key column must be UInt64".into())
         })?;
 
     let mut predictions = HashMap::with_capacity(batch.num_rows());
@@ -3575,7 +3575,7 @@ fn binary_at(array: &dyn Array, row: usize) -> Result<Option<&[u8]>> {
         return Ok(Some(array.value(row)));
     }
     Err(DataFusionError::Execution(format!(
-        "Lance SIFT predictions expected binary array, got {:?}",
+        "SIFT predictions expected binary array, got {:?}",
         array.data_type()
     )))
 }
@@ -5797,10 +5797,6 @@ impl AnnotateProvider {
             .filter(|name| available_cache_columns.contains(*name))
             .map(ToString::to_string)
             .collect();
-        // The base dir holds the parquet.* shards; the variation exec is always
-        // built via `new_parquet`.
-        #[cfg(feature = "parquet-cache")]
-        let parquet_backend = true;
         #[cfg(feature = "parquet-cache")]
         let cache_root = Some(cache.base_dir().to_path_buf());
 
@@ -5836,8 +5832,6 @@ impl AnnotateProvider {
             plugin_cache_root: self.plugin_cache_root.clone(),
             #[cfg(feature = "parquet-cache")]
             plugin_names: self.plugin_names.clone(),
-            #[cfg(feature = "parquet-cache")]
-            parquet_backend,
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: self.vcf_shard_ctx.clone(),
@@ -9321,10 +9315,6 @@ struct ContigAnnotationConfig {
     /// Selected plugins in caller-supplied CSQ order; `None` discovers all.
     #[cfg(feature = "parquet-cache")]
     plugin_names: Option<Vec<String>>,
-    /// When true, the variation lookup uses the Parquet backend (`new_parquet`)
-    /// while context entities + SIFT still load from the co-located Parquet cache.
-    #[cfg(feature = "parquet-cache")]
-    parquet_backend: bool,
     /// Shared transcript-id SIFT store (opened once, reused across contigs).
     #[cfg(feature = "parquet-cache")]
     sift_prediction_store: Option<SiftPredictionStoreRef>,
@@ -11070,7 +11060,7 @@ struct ContigPreparedData {
     /// True when activation must build grid-aligned per-worker lookups
     /// (stateful Merged/RefSeq at workers>1) instead of the byte-budget path.
     stateful_parallel: bool,
-    /// Placeholder variation table name; the KvLookupExec resolves the real
+    /// Placeholder variation table name; the VariationLookupExec resolves the real
     /// dataset via the cache root.
     var_table: String,
     /// Schemas for the `LookupProvider`s built during activation.
@@ -14184,8 +14174,8 @@ impl Stream for ContigAnnotationStream {
                 }
 
                 StreamState::AnnotatingContig(ann) => {
-                    // Pull looked-up batches into the window buffer. For fjall,
-                    // lookup partitions run concurrently, but this state machine
+                    // Pull looked-up batches into the window buffer. Lookup
+                    // partitions run concurrently, but this state machine
                     // drains their bounded receivers strictly by partition id.
                     //
                     // LIMIT pushdown: once we have enough buffered rows to
@@ -14822,7 +14812,7 @@ async fn prepare_contig_data(
     let ephemeral_tables: Vec<String> = Vec::new();
 
     // Variation table: Parquet variation cache (per-chrom dataset under
-    // `variation.cache/`). The KvLookupExec resolves the dataset itself via
+    // `variation.cache/`). The VariationLookupExec resolves the dataset itself via
     // the cache root, so a placeholder table name is sufficient.
     #[cfg(feature = "parquet-cache")]
     let cache_enabled = config.cache_root.is_some();
@@ -14844,7 +14834,7 @@ async fn prepare_contig_data(
         .as_arrow()
         .clone();
     // The Parquet variation lookup reads the cache schema directly from the
-    // per-chrom Parquet shard; the KvLookupExec resolves the shard path via the
+    // per-chrom Parquet shard; the VariationLookupExec resolves the shard path via the
     // cache root.
     #[cfg(feature = "parquet-cache")]
     let cache_schema = {
@@ -14880,7 +14870,7 @@ async fn prepare_contig_data(
     );
     if stream_parallel {
         // Parallelism comes from runs, not from partitions inside a run. This
-        // field only sizes the probe readers inside `KvLookupExec`; the run's
+        // field only sizes the probe readers inside `VariationLookupExec`; the run's
         // *plan* still inherits the session's scan partitioning, which the
         // run task reads in id order through one full-plan lookup worker
         // (`activate_run_lookup`). Intentional: a run is one ordered stream.
@@ -15309,9 +15299,6 @@ async fn activate_run_lookup(
     #[cfg(feature = "parquet-cache")]
     if let Some(root) = &config.cache_root {
         provider.set_cache_root(root.clone());
-        if config.parquet_backend {
-            provider.set_parquet_backend(true);
-        }
         provider.set_parquet_lookup_cell(parquet_lookup_cell);
     }
     // Streaming run pool: the run's plan inherits the VCF scan's partition
@@ -15533,9 +15520,6 @@ async fn activate_contig_lookups(
             #[cfg(feature = "parquet-cache")]
             if let Some(root) = &config.cache_root {
                 wprovider.set_cache_root(root.clone());
-                if config.parquet_backend {
-                    wprovider.set_parquet_backend(true);
-                }
                 wprovider.set_parquet_lookup_cell(Arc::clone(&shared_parquet_lookup_cell));
             }
             let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
@@ -15638,19 +15622,19 @@ impl TableProvider for AnnotateProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Parquet is the only cache backend. `cache_format` is still accepted for
-        // backward compatibility ("cache" is a historical alias) but always
-        // resolves to the Parquet shards.
+        // Parquet is the only cache backend. `cache_format` is validated so a
+        // stale caller fails loudly instead of silently reading Parquet under
+        // another name.
         let cache_format = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "cache_format"))
             .unwrap_or_else(|| "parquet".to_string());
         match cache_format.as_str() {
-            "lance" | "parquet" => {}
+            "parquet" => {}
             other => {
                 return Err(DataFusionError::Plan(format!(
-                    "annotate_vep(): cache_format must be 'lance' or 'parquet', got '{other}'"
+                    "annotate_vep(): cache_format must be 'parquet', got '{other}'"
                 )));
             }
         }
@@ -16204,7 +16188,7 @@ mod tests {
             tmp.path().to_string_lossy().to_string(),
             AnnotationBackend::Parquet,
             CacheSourceType::Merged,
-            Some(r#"{"partitioned":true,"cache_format":"lance","everything":true}"#.to_string()),
+            Some(r#"{"partitioned":true,"cache_format":"parquet","everything":true}"#.to_string()),
             vcf_schema,
         )
         .unwrap();
@@ -16217,11 +16201,46 @@ mod tests {
         let message = err.to_string();
         assert!(
             !message.contains("cache_format must"),
-            "the 'lance' cache_format alias was rejected: {message}"
+            "cache_format 'parquet' was rejected: {message}"
         );
-        // "cache" is accepted as a historical alias and resolves to Parquet, so
-        // the empty cache dir fails on the missing Parquet variation layout.
+        // With a valid cache_format the empty cache dir fails on the missing
+        // Parquet variation layout.
         assert!(message.contains("variation"), "unexpected error: {message}");
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    #[tokio::test]
+    async fn cache_format_lance_alias_is_rejected() {
+        let session = Arc::new(SessionContext::new());
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = AnnotateProvider::new(
+            Arc::clone(&session),
+            "vcf".to_string(),
+            tmp.path().to_string_lossy().to_string(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Merged,
+            Some(r#"{"partitioned":true,"cache_format":"lance","everything":true}"#.to_string()),
+            vcf_schema,
+        )
+        .unwrap();
+
+        let state = session.state();
+        let err = provider
+            .scan(&state, None, &[], None)
+            .await
+            .expect_err("the removed 'lance' alias must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("cache_format must be 'parquet'"),
+            "unexpected error: {message}"
+        );
     }
 
     #[cfg(feature = "parquet-cache")]
@@ -16473,8 +16492,6 @@ mod tests {
             plugin_cache_root: None,
             #[cfg(feature = "parquet-cache")]
             plugin_names: None,
-            #[cfg(feature = "parquet-cache")]
-            parquet_backend: false,
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: None,

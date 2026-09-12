@@ -600,9 +600,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut cursor = lookup.new_cursor();
         let probes = vec![starts[0], starts[41], starts[299]];
-        let taken = lookup.resolve_and_take(&probes, &mut cursor).await.unwrap();
+        let taken = lookup.resolve_and_take(&probes).await.unwrap();
         assert_eq!(taken.resolved.matched_positions, probes.len());
 
         let out = &taken.batch;

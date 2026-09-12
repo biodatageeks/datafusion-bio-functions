@@ -27,8 +27,9 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use std::sync::Arc;
 
 use crate::cache::af_bundle::{AF_GROUPS, unbundle_af_columns};
-use crate::cache::row_index::ResolvedRowIds;
-use crate::cache::variation_runtime::{TakenVariationRows, ensure_runtime_projection};
+use crate::cache::variation_runtime::{
+    ResolvedRowIds, TakenVariationRows, ensure_runtime_projection,
+};
 use crate::parquet_cache::encode::reconstruct_af_group_string;
 use crate::parquet_cache::page_dir::{
     CoalescingAsyncReader, IoCounters, PageDir, selection_from_offsets, selection_from_ranges,
@@ -36,11 +37,6 @@ use crate::parquet_cache::page_dir::{
 
 /// Coalescing-reader window (bytes). 64 KiB is the measured sweet spot.
 const COALESCE_GAP_BYTES: u64 = 64 * 1024;
-
-/// Per-partition cursor. Parquet resolution is stateless (the [`PageDir`] lives
-/// on the lookup), so this is a placeholder that matches the Parquet call shape.
-#[derive(Default)]
-pub struct ParquetPositionCursor;
 
 /// Per-contig Parquet variation lookup.
 pub struct SinglePathParquetVariationLookup {
@@ -81,10 +77,6 @@ impl SinglePathParquetVariationLookup {
         })
     }
 
-    pub fn new_cursor(&self) -> ParquetPositionCursor {
-        ParquetPositionCursor
-    }
-
     pub fn projection(&self) -> &[String] {
         &self.projection
     }
@@ -122,7 +114,6 @@ impl SinglePathParquetVariationLookup {
     pub async fn resolve_and_take(
         &self,
         sorted_unique_starts: &[u32],
-        _cursor: &mut ParquetPositionCursor,
     ) -> Result<TakenVariationRows> {
         let probe_set: HashSet<u32> = sorted_unique_starts.iter().copied().collect();
         let counters = IoCounters::new();
@@ -415,9 +406,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut cursor = lookup.new_cursor();
         let probes = vec![starts[4], starts[101], starts[400]]; // rows 4,101,400
-        let taken = lookup.resolve_and_take(&probes, &mut cursor).await.unwrap();
+        let taken = lookup.resolve_and_take(&probes).await.unwrap();
 
         assert_eq!(taken.resolved.matched_positions, probes.len());
         let out = &taken.batch;
