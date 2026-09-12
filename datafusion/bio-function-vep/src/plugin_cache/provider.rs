@@ -8,7 +8,8 @@
 //! columns the reader parses off each line, not how many it exposes) — a
 //! source needing more than one extra field packs it into `name` and splits
 //! it back out in `ingest_sql`, the same trick SpliceAI's flattened INFO tag
-//! uses.
+//! uses. GFF uses `datafusion-bio-format-gff`'s `GffTableProvider` with the
+//! manifest's `[source.gff].attributes` projected as flat Utf8 columns.
 
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
@@ -17,6 +18,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
 use datafusion_bio_format_bed::table_provider::{BEDFields, BedTableProvider};
+use datafusion_bio_format_core::object_storage::ObjectStorageOptions;
+use datafusion_bio_format_gff::table_provider::GffTableProvider;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use noodles_core_tabix::Region;
 use noodles_csi::BinningIndex;
@@ -45,7 +48,11 @@ fn csv_schema(csv: &CsvParams) -> Schema {
 
 /// Query one chromosome from a BGZF source through its sibling tabix index and
 /// materialize only those records to a plain file DataFusion can split-scan.
-fn materialize_tabix_chrom(path: &str, chrom: &str) -> Result<(String, tempfile::TempPath)> {
+fn materialize_tabix_chrom(
+    path: &str,
+    chrom: &str,
+    suffix: &str,
+) -> Result<(String, tempfile::TempPath)> {
     let mut reader = noodles_tabix::io::indexed_reader::Builder::default()
         .build_from_path(path)
         .map_err(|e| {
@@ -80,7 +87,7 @@ fn materialize_tabix_chrom(path: &str, chrom: &str) -> Result<(String, tempfile:
 
     let mut tmp = tempfile::Builder::new()
         .prefix("plugin_src_")
-        .suffix(".tsv")
+        .suffix(suffix)
         .tempfile()
         .map_err(|e| DataFusionError::Execution(format!("create temp for '{path}': {e}")))?;
 
@@ -137,7 +144,7 @@ fn materialize_plain(
                 "BGZF/tabix source '{path}' requires a chromosome-scoped plugin-cache build"
             ))
         })?;
-        let (plain, temp) = materialize_tabix_chrom(path, chrom)?;
+        let (plain, temp) = materialize_tabix_chrom(path, chrom, ".tsv")?;
         return Ok((plain, Some(temp)));
     }
     if !gzip {
@@ -252,6 +259,47 @@ async fn register_sources_impl(
                 };
                 ctx.register_table(&table, Arc::new(provider))?;
             }
+            ProviderKind::Gff => {
+                let gff = spec.gff.as_ref().ok_or_else(|| {
+                    DataFusionError::Execution(format!("gff source '{table}' missing [source.gff]"))
+                })?;
+                // Same lock-step rule as the VCF/BED arms: `ingest_sql` sees the
+                // coordinate system the manifest declares.
+                let zero_based = matches!(
+                    manifest.coordinate_system,
+                    CoordinateSystem::ZeroBasedHalfOpen
+                );
+                // A tabix-indexed GFF is sliced to the requested contig exactly
+                // like an indexed TSV (records are copied verbatim, so the temp
+                // is valid GFF3). Plain or gzip GFF is opened in place: the
+                // reader detects compression by content and reads it whole.
+                let path = if spec.index == Some(SourceIndex::Tabix) {
+                    let chrom = chrom.ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "BGZF/tabix source '{}' requires a chromosome-scoped plugin-cache build",
+                            spec.path
+                        ))
+                    })?;
+                    let (plain, temp) = materialize_tabix_chrom(&spec.path, chrom, ".gff3")?;
+                    temps.push(temp);
+                    plain
+                } else {
+                    spec.path.clone()
+                };
+                // The GFF reader unwraps its storage options (unlike the BED
+                // reader), so hand it the defaults: local file, compression
+                // detected by content.
+                let provider = GffTableProvider::new(
+                    path,
+                    Some(gff.attributes.clone()),
+                    Some(ObjectStorageOptions::default()),
+                    zero_based,
+                )
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("open GFF source '{table}': {e}"))
+                })?;
+                ctx.register_table(&table, Arc::new(provider))?;
+            }
             ProviderKind::Bed => {
                 // Same reasoning as the VCF branch above: the manifest's
                 // `coordinate_system` drives what `ingest_sql` expects, so
@@ -300,14 +348,225 @@ pub async fn register_sources_for_chrom(
     register_sources_impl(ctx, manifest, Some(chrom)).await
 }
 
+/// Synthetic GFF3 fixtures shared by the provider, build and lookup tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::plugin_cache::source_manifest::SourceManifest;
-    use datafusion::arrow::array::{Array, Int64Array, StringArray};
+pub(crate) mod test_gff {
     use noodles_core_tabix::Position;
     use noodles_csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
     use std::io::Write;
+
+    /// Three gene features on two contigs. `%3B` must decode, the leading space
+    /// on the rat phenotype must survive, and the mouse attribute is absent on
+    /// the second row.
+    pub(crate) const GFF_ROWS: &[(&str, usize, usize, &str)] = &[
+        (
+            "1",
+            600000,
+            605000,
+            "ID=gene:ENSG1;gene_id=ENSG1;Rat_gene_id=RNO1;Rat_Orthologous_phenotype= a b|c%3Bd;Mouse_gene_id=MUS1",
+        ),
+        (
+            "1",
+            610000,
+            612000,
+            "ID=gene:ENSG2;gene_id=ENSG2;Rat_gene_id=RNO2;Rat_Orthologous_phenotype=x",
+        ),
+        (
+            "2",
+            100,
+            200,
+            "ID=gene:ENSG3;gene_id=ENSG3;Rat_gene_id=RNO3;Rat_Orthologous_phenotype=y",
+        ),
+    ];
+
+    pub(crate) fn gff_body() -> String {
+        let mut s = String::from("##gff-version 3\n");
+        for &(c, st, en, attrs) in GFF_ROWS {
+            s.push_str(&format!("{c}\ttest\tgene\t{st}\t{en}\t.\t+\t.\t{attrs}\n"));
+        }
+        s
+    }
+
+    pub(crate) fn write_gz(path: &std::path::Path, body: &str) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        enc.write_all(body.as_bytes()).unwrap();
+        enc.finish().unwrap();
+    }
+
+    pub(crate) fn write_bgzf_tabix_gff(path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = noodles_bgzf::io::Writer::new(file);
+        let mut indexer = noodles_tabix::index::Indexer::default();
+        indexer.set_header(
+            csi::binning_index::index::header::Builder::gff()
+                .set_line_skip_count(0)
+                .build(),
+        );
+        writeln!(writer, "##gff-version 3").unwrap();
+        let mut chunk_start = writer.virtual_position();
+        for &(c, st, en, attrs) in GFF_ROWS {
+            writeln!(writer, "{c}\ttest\tgene\t{st}\t{en}\t.\t+\t.\t{attrs}").unwrap();
+            let chunk_end = writer.virtual_position();
+            indexer
+                .add_record(
+                    c,
+                    Position::try_from(st).unwrap(),
+                    Position::try_from(en).unwrap(),
+                    Chunk::new(chunk_start, chunk_end),
+                )
+                .unwrap();
+            chunk_start = chunk_end;
+        }
+        writer.finish().unwrap();
+        let index_file = std::fs::File::create(format!("{}.tbi", path.display())).unwrap();
+        let mut index_writer = noodles_tabix::io::Writer::new(index_file);
+        index_writer.write_index(&indexer.build()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_gff::{gff_body, write_bgzf_tabix_gff};
+    use super::*;
+    use crate::plugin_cache::source_manifest::SourceManifest;
+    use datafusion::arrow::array::{Array, Int64Array, StringArray, UInt32Array};
+    use noodles_core_tabix::Position;
+    use noodles_csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
+    use std::io::Write;
+
+    fn gff_manifest(path: &std::path::Path, tabix: bool) -> SourceManifest {
+        let index = if tabix { "index = \"tabix\"" } else { "" };
+        toml::from_str(&format!(
+            r##"
+plugin_name = "po"
+coordinate_system = "1-based"
+ingest_sql = "SELECT 1"
+
+[[source]]
+provider = "gff"
+path = "{}"
+{index}
+  [source.gff]
+  attributes = ["gene_id", "Rat_gene_id", "Rat_Orthologous_phenotype", "Mouse_gene_id"]
+
+[[value_columns]]
+column = "rat"
+csq_field = "PO_Rat"
+type = "Utf8"
+"##,
+            path.display()
+        ))
+        .unwrap()
+    }
+
+    type GffRow = (
+        String,
+        u32,
+        u32,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    async fn collect_gff(ctx: &SessionContext) -> Vec<GffRow> {
+        let batches = ctx
+            .sql(
+                "SELECT chrom, start, \"end\", gene_id, \"Rat_Orthologous_phenotype\", \
+                 \"Mouse_gene_id\" FROM plugin_po_src ORDER BY start",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        for b in &batches {
+            let chrom = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let start = b.column(1).as_any().downcast_ref::<UInt32Array>().unwrap();
+            let end = b.column(2).as_any().downcast_ref::<UInt32Array>().unwrap();
+            let gene = b.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+            let rat = b.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+            let mouse = b.column(5).as_any().downcast_ref::<StringArray>().unwrap();
+            for r in 0..b.num_rows() {
+                let opt = |a: &StringArray| (!a.is_null(r)).then(|| a.value(r).to_string());
+                out.push((
+                    chrom.value(r).to_string(),
+                    start.value(r),
+                    end.value(r),
+                    opt(gene),
+                    opt(rat),
+                    opt(mouse),
+                ));
+            }
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gff_plain_and_gzip_expose_flat_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("po.gff3");
+        std::fs::write(&plain, gff_body()).unwrap();
+        let gz = dir.path().join("po.gff3.gz");
+        super::test_gff::write_gz(&gz, &gff_body());
+
+        for path in [plain, gz] {
+            let ctx = SessionContext::new();
+            let temps = register_sources(&ctx, &gff_manifest(&path, false))
+                .await
+                .unwrap();
+            assert!(temps.is_empty(), "gff needs no staging temp: {path:?}");
+            let rows = collect_gff(&ctx).await;
+            assert_eq!(rows.len(), 3, "{path:?}");
+            assert_eq!(rows[0].0, "2");
+            assert_eq!(
+                (rows[1].1, rows[1].2),
+                (600000, 605000),
+                "1-based coordinates pass through"
+            );
+            assert_eq!(rows[1].3.as_deref(), Some("ENSG1"));
+            assert_eq!(
+                rows[1].4.as_deref(),
+                Some(" a b|c;d"),
+                "leading space kept, %3B decoded"
+            );
+            assert_eq!(rows[1].5.as_deref(), Some("MUS1"));
+            assert_eq!(rows[2].5, None, "absent attribute is NULL");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gff_tabix_source_materializes_only_requested_contig() {
+        let dir = tempfile::tempdir().unwrap();
+        let gz = dir.path().join("po.gff3.gz");
+        write_bgzf_tabix_gff(&gz);
+        let manifest = gff_manifest(&gz, true);
+
+        let ctx = SessionContext::new();
+        let temps = register_sources_for_chrom(&ctx, &manifest, "chr1")
+            .await
+            .unwrap();
+        assert_eq!(temps.len(), 1);
+        let rows = collect_gff(&ctx).await;
+        assert_eq!(
+            rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            vec!["1", "1"]
+        );
+        assert_eq!(rows[0].4.as_deref(), Some(" a b|c;d"));
+
+        // A contig absent from the index yields zero rows, not an error. The
+        // staged slice lives only as long as its temp handle, so keep it.
+        let ctx = SessionContext::new();
+        let _temps_x = register_sources_for_chrom(&ctx, &manifest, "X")
+            .await
+            .unwrap();
+        assert!(collect_gff(&ctx).await.is_empty());
+
+        // Unscoped registration of a tabix source is refused, as for csv.
+        let ctx = SessionContext::new();
+        assert!(register_sources(&ctx, &manifest).await.is_err());
+    }
 
     fn write_gz(path: &std::path::Path, body: &str) {
         let f = std::fs::File::create(path).unwrap();

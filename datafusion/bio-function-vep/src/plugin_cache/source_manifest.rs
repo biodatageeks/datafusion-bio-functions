@@ -26,6 +26,18 @@ pub enum ProviderKind {
     Tsv,
     Parquet,
     Bed,
+    /// GFF3 via `datafusion-bio-format-gff`. `[source.gff].attributes` names the
+    /// attribute keys exposed as flat Utf8 columns next to the eight fixed
+    /// GFF columns (`chrom, start, end, type, source, score, strand, phase`).
+    Gff,
+}
+
+/// GFF provider parameters.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GffParams {
+    /// Attribute keys to project as flat nullable Utf8 columns, in this order.
+    /// Values are percent-decoded by the reader and otherwise untouched.
+    pub attributes: Vec<String>,
 }
 
 /// Arrow value type for a declared column.
@@ -108,6 +120,8 @@ pub struct SourceSpec {
     pub record_layout: bool,
     #[serde(default)]
     pub csv: Option<CsvParams>,
+    #[serde(default)]
+    pub gff: Option<GffParams>,
 }
 
 impl SourceSpec {
@@ -287,14 +301,61 @@ impl SourceManifest {
                     self.plugin_name, source.provider
                 )));
             }
+            match (source.provider, source.gff.as_ref()) {
+                (ProviderKind::Gff, None) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "plugin '{}' {} is a gff source but has no [source.gff] table",
+                        self.plugin_name,
+                        source.label()
+                    )));
+                }
+                (ProviderKind::Gff, Some(gff)) if gff.attributes.is_empty() => {
+                    return Err(DataFusionError::Execution(format!(
+                        "plugin '{}' {} must list at least one attribute in \
+                         [source.gff].attributes",
+                        self.plugin_name,
+                        source.label()
+                    )));
+                }
+                (ProviderKind::Gff, Some(gff)) => {
+                    // Each attribute becomes an Arrow column of that name, so a
+                    // repeat would be a duplicate field; say so here rather than
+                    // from deep inside the reader.
+                    // The reader appends the attributes after its eight fixed
+                    // columns, so an attribute named like one of them would be a
+                    // second field of that name too.
+                    const GFF_FIXED_COLUMNS: [&str; 8] = [
+                        "chrom", "start", "end", "type", "source", "score", "strand", "phase",
+                    ];
+                    let mut seen: std::collections::HashSet<&str> =
+                        GFF_FIXED_COLUMNS.into_iter().collect();
+                    if let Some(dup) = gff.attributes.iter().find(|a| !seen.insert(a.as_str())) {
+                        return Err(DataFusionError::Execution(format!(
+                            "plugin '{}' {} lists attribute {dup:?} more than once in \
+                             [source.gff].attributes, or it names one of the fixed GFF \
+                             columns (chrom, start, end, type, source, score, strand, phase)",
+                            self.plugin_name,
+                            source.label()
+                        )));
+                    }
+                }
+                (other, Some(_)) if other != ProviderKind::Gff => {
+                    return Err(DataFusionError::Execution(format!(
+                        "plugin '{}' {} declares [source.gff] for a {other:?} source",
+                        self.plugin_name,
+                        source.label()
+                    )));
+                }
+                _ => {}
+            }
             if source.index == Some(SourceIndex::Tabix) {
                 if !matches!(
                     source.provider,
-                    ProviderKind::Csv | ProviderKind::Tsv | ProviderKind::Vcf
+                    ProviderKind::Csv | ProviderKind::Tsv | ProviderKind::Vcf | ProviderKind::Gff
                 ) {
                     return Err(DataFusionError::Execution(format!(
                         "plugin '{}' declares a tabix index for a {:?} source; tabix indexes are \
-                         supported only for csv/tsv/vcf providers",
+                         supported only for csv/tsv/vcf/gff providers",
                         self.plugin_name, source.provider
                     )));
                 }
@@ -388,6 +449,93 @@ column = "demo_score"
 csq_field = "DEMO_SCORE"
 type = "Float32"
 "##;
+
+    const GFF_MANIFEST: &str = r##"
+plugin_name = "po"
+coordinate_system = "1-based"
+ingest_sql = "SELECT chrom, start, \"end\", gene_id, \"Rat_gene_id\" AS rat FROM plugin_po_src"
+
+[[source]]
+provider = "gff"
+path = "/tmp/po.gff3.gz"
+url = "https://example.org/po.gff3.gz"
+md5 = "20e5401a198d7d3db66a982c037d3ad4"
+index = "tabix"
+  [source.gff]
+  attributes = ["gene_id", "Rat_gene_id"]
+
+[[value_columns]]
+column = "rat"
+csq_field = "PO_Rat"
+type = "Utf8"
+"##;
+
+    #[test]
+    fn parses_gff_source_with_attributes() {
+        let m: SourceManifest = toml::from_str(GFF_MANIFEST).unwrap();
+        m.validate().unwrap();
+        assert_eq!(m.sources[0].provider, ProviderKind::Gff);
+        assert_eq!(
+            m.sources[0].gff.as_ref().unwrap().attributes,
+            vec!["gene_id".to_string(), "Rat_gene_id".to_string()]
+        );
+        assert_eq!(m.sources[0].index, Some(SourceIndex::Tabix));
+    }
+
+    #[test]
+    fn gff_source_requires_attributes() {
+        let missing = GFF_MANIFEST.replace(
+            "  [source.gff]\n  attributes = [\"gene_id\", \"Rat_gene_id\"]\n",
+            "",
+        );
+        let m: SourceManifest = toml::from_str(&missing).unwrap();
+        let err = m.validate().unwrap_err().to_string();
+        assert!(err.contains("[source.gff]"), "{err}");
+
+        let empty = GFF_MANIFEST.replace(
+            "attributes = [\"gene_id\", \"Rat_gene_id\"]",
+            "attributes = []",
+        );
+        let m: SourceManifest = toml::from_str(&empty).unwrap();
+        let err = m.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one attribute"), "{err}");
+    }
+
+    #[test]
+    fn gff_attributes_must_be_unique() {
+        let dup = GFF_MANIFEST.replace(
+            "attributes = [\"gene_id\", \"Rat_gene_id\"]",
+            "attributes = [\"gene_id\", \"Rat_gene_id\", \"gene_id\"]",
+        );
+        let m: SourceManifest = toml::from_str(&dup).unwrap();
+        let err = m.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("more than once") && err.contains("gene_id"),
+            "{err}"
+        );
+
+        // A fixed GFF column name would shadow the reader's own field.
+        let fixed = GFF_MANIFEST.replace(
+            "attributes = [\"gene_id\", \"Rat_gene_id\"]",
+            "attributes = [\"gene_id\", \"start\"]",
+        );
+        let m: SourceManifest = toml::from_str(&fixed).unwrap();
+        let err = m.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("fixed GFF") && err.contains("\"start\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn gff_table_is_rejected_on_other_providers() {
+        let wrong = GFF_MANIFEST
+            .replace("provider = \"gff\"", "provider = \"bed\"")
+            .replace("index = \"tabix\"\n", "");
+        let m: SourceManifest = toml::from_str(&wrong).unwrap();
+        let err = m.validate().unwrap_err().to_string();
+        assert!(err.contains("[source.gff]") && err.contains("Bed"), "{err}");
+    }
 
     #[test]
     fn parses_source_manifest() {
@@ -557,6 +705,7 @@ type = "Float32"
             index: None,
             record_layout: false,
             csv: None,
+            gff: None,
         };
         assert_eq!(src.table_name("cadd"), "plugin_cadd_src");
     }
