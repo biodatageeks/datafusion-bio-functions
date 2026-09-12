@@ -867,7 +867,6 @@ fn merge_annotation_header_lines(
 fn provenance_header_lines(
     input_vcf: &str,
     cache_source: &str,
-    backend: &str,
     output_vcf: &str,
     config: &AnnotateVcfConfig,
     cache_source_type: CacheSourceType,
@@ -1638,7 +1637,6 @@ pub async fn annotate_to_vcf(
             provenance_header_lines(
                 input_vcf,
                 cache_source,
-                backend,
                 output_vcf,
                 config,
                 cache_source_type,
@@ -2461,7 +2459,6 @@ mod tests {
         provenance_header_lines(
             "/in/sample.vcf.gz",
             cache,
-            "parquet",
             "/out/sample.annotated.vcf",
             config,
             CacheSourceType::Merged,
@@ -2498,7 +2495,6 @@ mod tests {
         provenance_header_lines(
             "/in/sample.vcf.gz",
             "/caches/116_GRCh38_merged",
-            "parquet",
             "/out/sample.annotated.vcf",
             config,
             CacheSourceType::Merged,
@@ -2542,12 +2538,11 @@ mod tests {
 
     #[test]
     fn provenance_records_the_real_cache_format_not_the_backend_token() {
-        // The header records the cache format, never the backend token, so the
-        // token cannot leak into an audit trail.
+        // The header records the cache format and never sees a backend token,
+        // so none can leak into an audit trail.
         let lines = provenance_header_lines(
             "/in.vcf",
             "/cache",
-            "parquet",
             "/out.vcf",
             &AnnotateVcfConfig::default(),
             CacheSourceType::Merged,
