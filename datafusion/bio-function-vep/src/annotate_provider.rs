@@ -5797,10 +5797,6 @@ impl AnnotateProvider {
             .filter(|name| available_cache_columns.contains(*name))
             .map(ToString::to_string)
             .collect();
-        // The base dir holds the parquet.* shards; the variation exec is always
-        // built via `new_parquet`.
-        #[cfg(feature = "parquet-cache")]
-        let parquet_backend = true;
         #[cfg(feature = "parquet-cache")]
         let cache_root = Some(cache.base_dir().to_path_buf());
 
@@ -5836,8 +5832,6 @@ impl AnnotateProvider {
             plugin_cache_root: self.plugin_cache_root.clone(),
             #[cfg(feature = "parquet-cache")]
             plugin_names: self.plugin_names.clone(),
-            #[cfg(feature = "parquet-cache")]
-            parquet_backend,
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: self.vcf_shard_ctx.clone(),
@@ -9321,10 +9315,6 @@ struct ContigAnnotationConfig {
     /// Selected plugins in caller-supplied CSQ order; `None` discovers all.
     #[cfg(feature = "parquet-cache")]
     plugin_names: Option<Vec<String>>,
-    /// When true, the variation lookup uses the Parquet backend (`new_parquet`)
-    /// while context entities + SIFT still load from the co-located Parquet cache.
-    #[cfg(feature = "parquet-cache")]
-    parquet_backend: bool,
     /// Shared transcript-id SIFT store (opened once, reused across contigs).
     #[cfg(feature = "parquet-cache")]
     sift_prediction_store: Option<SiftPredictionStoreRef>,
@@ -15309,9 +15299,6 @@ async fn activate_run_lookup(
     #[cfg(feature = "parquet-cache")]
     if let Some(root) = &config.cache_root {
         provider.set_cache_root(root.clone());
-        if config.parquet_backend {
-            provider.set_parquet_backend(true);
-        }
         provider.set_parquet_lookup_cell(parquet_lookup_cell);
     }
     // Streaming run pool: the run's plan inherits the VCF scan's partition
@@ -15533,9 +15520,6 @@ async fn activate_contig_lookups(
             #[cfg(feature = "parquet-cache")]
             if let Some(root) = &config.cache_root {
                 wprovider.set_cache_root(root.clone());
-                if config.parquet_backend {
-                    wprovider.set_parquet_backend(true);
-                }
                 wprovider.set_parquet_lookup_cell(Arc::clone(&shared_parquet_lookup_cell));
             }
             let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
@@ -16473,8 +16457,6 @@ mod tests {
             plugin_cache_root: None,
             #[cfg(feature = "parquet-cache")]
             plugin_names: None,
-            #[cfg(feature = "parquet-cache")]
-            parquet_backend: false,
             #[cfg(feature = "parquet-cache")]
             sift_prediction_store: None,
             vcf_shard_ctx: None,

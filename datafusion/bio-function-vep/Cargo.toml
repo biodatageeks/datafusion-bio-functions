@@ -16,10 +16,6 @@ bytes = "1"
 log.workspace = true
 async-trait = "0.1.88"
 chrono = "0.4"
-ahash = { version = "0.8.6", optional = true }
-hashbrown = { version = "0.16.1", optional = true }
-nohash-hasher = { version = "0.2.0", optional = true }
-rapidhash = { version = "4.4.1", optional = true }
 smallvec = { version = "1.15.1", optional = true }
 flate2 = "1.1.0"
 coitrees = "0.4.0"
@@ -88,10 +84,6 @@ required-features = ["parquet-cache", "cache-builder"]
 default = ["parquet-cache"]
 # Parquet cache read runtime (variation/SIFT point-lookups + context scans).
 parquet-cache = [
-    "dep:ahash",
-    "dep:hashbrown",
-    "dep:nohash-hasher",
-    "dep:rapidhash",
     "dep:smallvec",
 ]
 cache-builder = ["parquet-cache", "dep:datafusion-bio-format-ensembl-cache"]
