@@ -449,4 +449,222 @@ mod tests {
             assert_eq!(out_vn.value(r), format!("rs{orig}"));
         }
     }
+
+    /// Build a small shard whose three AF groups cover the shapes the read path
+    /// has to reproduce byte for byte, and return it with the source group text.
+    /// `None` is an absent group; every `Some` has exactly one `|`-separated
+    /// segment per population, so segment `p` IS the expected member value.
+    #[allow(clippy::type_complexity)]
+    fn af_shape_fixture() -> (
+        tempfile::NamedTempFile,
+        Vec<u32>,
+        Vec<(&'static str, Vec<Option<&'static str>>)>,
+    ) {
+        let groups: Vec<(&'static str, Vec<Option<&'static str>>)> = vec![
+            (
+                "af_global",
+                vec![
+                    Some("A:0.1|A:0.2|A:0.3|A:0.4|A:0.5|A:0.6"),
+                    // multi-allelic; population 1 lacks G, population 2 is absent
+                    Some("A:0.1,G:0.2|A:0.3||A:0.5,G:0.6|A:0,G:1|A:0.25,G:0.75"),
+                    None,
+                    // scientific notation, then five absent populations
+                    Some("T:2.682e-05|||||"),
+                    None,
+                    Some("C:0.5|C:0.5|C:0.5|C:0.5|C:0.5|C:0.5"),
+                ],
+            ),
+            (
+                "af_gnomade",
+                vec![
+                    None,
+                    Some(
+                        "A:9.911e-05|A:0.4253|A:0.006912|A:0.9969|A:0.0367|A:0.08806|A:4.248e-06|A:5.896e-05|A:1|A:0",
+                    ),
+                    None,
+                    // deletion allele and a long insertion allele
+                    Some("-:9.47e-05,AAAAAAAAAA:0.0003568|-:0.5,AAAAAAAAAA:0.25||||||||"),
+                    None,
+                    None,
+                ],
+            ),
+            (
+                "af_gnomadg",
+                vec![
+                    Some(
+                        "A:0.08806|A:0.0367|A:2.682e-05||A:0.9969|A:0.5|A:0.006912||A:9.911e-05|A:0.4253|A:1",
+                    ),
+                    Some("C:0.0003994,G:0.0001997|C:0.001,G:0.002|||||||||C:1.47e-05,G:2.412e-05"),
+                    None,
+                    Some("||||||||||T:0.01"),
+                    Some("G:0|G:0|G:0|G:0|G:0|G:0|G:0|G:0|G:0|G:0|G:0"),
+                    None,
+                ],
+            ),
+        ];
+        let n = 6usize;
+        let starts: Vec<u32> = (0..n).map(|i| (i as u32) * 10 + 5).collect();
+        let mut fields = vec![
+            Field::new("start", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("failed", DataType::Boolean, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("dbsnp_ids", DataType::Utf8, true),
+        ];
+        let failed = presence_boolean(
+            &Int8Array::from((0..n).map(|_| None::<i8>).collect::<Vec<_>>()),
+            "failed",
+        )
+        .unwrap();
+        let mut cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt32Array::from(starts.clone())),
+            Arc::new(StringArray::from(vec!["A/G"; n])),
+            Arc::new(failed),
+            Arc::new(StringArray::from(vec![None::<&str>; n])),
+            Arc::new(StringArray::from(
+                (0..n).map(|i| Some(format!("rs{i}"))).collect::<Vec<_>>(),
+            )),
+        ];
+        for (grp, rows) in &groups {
+            let width = AF_GROUPS.iter().find(|(g, _)| g == grp).unwrap().1.len();
+            let af = encode_af_2array(&StringArray::from(rows.clone()), width).unwrap();
+            fields.push(Field::new(
+                format!("{grp}_alleles"),
+                af.alleles.data_type().clone(),
+                true,
+            ));
+            fields.push(Field::new(
+                format!("{grp}_freqs"),
+                af.freqs.data_type().clone(),
+                true,
+            ));
+            cols.push(Arc::new(af.alleles));
+            cols.push(Arc::new(af.freqs));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_variation_parquet(tmp.path(), &[batch]).unwrap();
+        (tmp, starts, groups)
+    }
+
+    /// Pins the whole logical batch, not one or two columns of it: the 27 AF
+    /// members must come out in `AF_GROUPS` order after the non-AF columns, as
+    /// nullable `Utf8` with NO nulls (an absent group or population is `""` --
+    /// a NULL here would surface as NULL in `lookup_variants()` output), and
+    /// every cell must equal its segment of the source text exactly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn logical_batch_pins_all_27_af_members_byte_for_byte() {
+        let (tmp, starts, groups) = af_shape_fixture();
+        let mut projection: Vec<String> = crate::cache::af_bundle::af_column_order()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        projection.extend(["variation_name", "allele_string", "failed"].map(str::to_string));
+        let lookup = SinglePathParquetVariationLookup::open(tmp.path(), projection)
+            .await
+            .unwrap();
+        let taken = lookup.resolve_and_take(&starts).await.unwrap();
+        let out = &taken.batch;
+        assert_eq!(out.num_rows(), starts.len());
+
+        let names: Vec<String> = out
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let af_order = crate::cache::af_bundle::af_column_order();
+        let (non_af, af) = names.split_at(names.len() - af_order.len());
+        assert_eq!(
+            non_af,
+            [
+                "start",
+                "allele_string",
+                "failed",
+                "variation_name",
+                "dbsnp_ids"
+            ],
+            "non-AF columns keep the file's order"
+        );
+        assert_eq!(
+            af,
+            af_order.as_slice(),
+            "AF members in AF_GROUPS order, last"
+        );
+        assert_eq!(out.schema().metadata(), lookup.meta.schema().metadata());
+
+        for (grp, rows) in &groups {
+            let members = AF_GROUPS.iter().find(|(g, _)| g == grp).unwrap().1;
+            for (p, member) in members.iter().enumerate() {
+                let field = out.schema().field_with_name(member).unwrap().clone();
+                assert_eq!(field.data_type(), &DataType::Utf8, "{member}");
+                assert!(field.is_nullable(), "{member}");
+                assert!(field.metadata().is_empty(), "{member}");
+                let col = out
+                    .column_by_name(member)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(col.null_count(), 0, "{member} must hold \"\", never NULL");
+                for (r, src) in rows.iter().enumerate() {
+                    let expected = src.map_or("", |s| s.split('|').nth(p).unwrap());
+                    assert_eq!(col.value(r), expected, "{member} row {r}");
+                }
+            }
+        }
+    }
+
+    /// Asking for one member still materialises its whole group and nothing
+    /// else: `physical_columns` pulls the group's list pair, and downstream
+    /// resolves the members by name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn logical_batch_emits_the_full_group_for_a_single_projected_member() {
+        let (tmp, starts, _) = af_shape_fixture();
+        let lookup =
+            SinglePathParquetVariationLookup::open(tmp.path(), vec!["gnomADg_NFE".to_string()])
+                .await
+                .unwrap();
+        let taken = lookup.resolve_and_take(&starts).await.unwrap();
+        let schema = taken.batch.schema();
+        let af_order = crate::cache::af_bundle::af_column_order();
+        let af: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .filter(|n| af_order.contains(n))
+            .collect();
+        let gnomadg = AF_GROUPS
+            .iter()
+            .find(|(g, _)| *g == "af_gnomadg")
+            .unwrap()
+            .1;
+        assert_eq!(af, gnomadg);
+    }
+
+    /// Probes that hit nothing still return every AF member, in order. (The
+    /// non-AF part of an empty batch is the file's unprojected schema today --
+    /// `take_payload` builds it from the reader builder -- so only the AF tail is
+    /// pinned here; consumers resolve columns by name.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn logical_batch_keeps_the_af_members_when_nothing_matches() {
+        let (tmp, starts, _) = af_shape_fixture();
+        let af_order = crate::cache::af_bundle::af_column_order();
+        let projection: Vec<String> = af_order.iter().map(|c| c.to_string()).collect();
+        let lookup = SinglePathParquetVariationLookup::open(tmp.path(), projection)
+            .await
+            .unwrap();
+        let miss = lookup.resolve_and_take(&[starts[0] + 1]).await.unwrap();
+        assert_eq!(miss.batch.num_rows(), 0);
+        assert_eq!(miss.resolved.matched_positions, 0);
+        let schema = miss.batch.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(&names[names.len() - af_order.len()..], af_order.as_slice());
+        for member in &af_order {
+            assert_eq!(
+                schema.field_with_name(member).unwrap().data_type(),
+                &DataType::Utf8
+            );
+        }
+    }
 }
