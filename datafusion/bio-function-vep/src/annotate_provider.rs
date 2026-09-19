@@ -154,6 +154,10 @@ impl EngineAnnotationProfile {
 }
 
 use async_trait::async_trait;
+// Hot, function-local maps keyed by short strings. std's SipHash was ~15% of the
+// annotation stage on a chr1 profile; these are hashbrown with DataFusion's
+// default (non-cryptographic) hasher. Only for maps that are never iterated
+// into output: both hashers leave iteration order unspecified.
 use datafusion::arrow::array::{
     Array, AsArray, BinaryArray, BooleanArray, Float32Array, Float32Builder, Float64Array,
     Int8Array, Int8Builder, Int16Array, Int32Array, Int64Array, Int64Builder, LargeBinaryArray,
@@ -164,6 +168,7 @@ use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{HashMap as FastHashMap, HashSet as FastHashSet};
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -2294,8 +2299,8 @@ impl ColocatedData {
             // are `&str`), so the per-(entry x column) `to_string()` storm that
             // dominated colocated churn is gone; only the 4f-formatted and the
             // interpolated values still allocate.
-            let mut freq_data: HashMap<&str, Cow<str>> = HashMap::new();
-            let mut remaining: HashSet<&str> = HashSet::new();
+            let mut freq_data: FastHashMap<&str, Cow<str>> = FastHashMap::new();
+            let mut remaining: FastHashSet<&str> = FastHashSet::new();
 
             for (idx, column) in AF_COLUMNS.iter().enumerate() {
                 let should_process = flags.max_af || flags.af_group_enabled(column.flag_group);
@@ -8562,7 +8567,7 @@ fn hydrate_refseq_translation_cds_from_reference<R>(
 where
     R: BufRead + Seek,
 {
-    let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
+    let mut exons_by_tx: FastHashMap<&str, Vec<&ExonFeature>> = FastHashMap::new();
     for exon in exons {
         exons_by_tx
             .entry(exon.transcript_id.as_str())
@@ -8678,7 +8683,7 @@ fn hydrate_transcript_cdna_from_reference<R>(
 where
     R: BufRead + Seek,
 {
-    let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
+    let mut exons_by_tx: FastHashMap<&str, Vec<&ExonFeature>> = FastHashMap::new();
     for exon in exons {
         exons_by_tx
             .entry(exon.transcript_id.as_str())
