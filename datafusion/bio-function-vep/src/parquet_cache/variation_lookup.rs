@@ -25,10 +25,11 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::cache::af_bundle::AF_GROUPS;
 use crate::cache::variation_runtime::{
-    ResolvedRowIds, TakenVariationRows, ensure_runtime_projection,
+    ResolvedRowIds, TakeTiming, TakenVariationRows, ensure_runtime_projection,
 };
 use crate::parquet_cache::encode::reconstruct_af_members;
 use crate::parquet_cache::page_dir::{
@@ -124,13 +125,21 @@ impl SinglePathParquetVariationLookup {
         let ranges = self.page_dir.resolve_ranges(&probes64);
 
         // Phase 2: start-only read of the candidate pages -> exact row offsets.
+        let started = Instant::now();
         let offsets = self.exact_offsets(&ranges, &probe_set, &counters).await?;
+        let offsets_done = Instant::now();
 
         // Phase 3: projected payload take at the exact offsets.
         let phys = self.take_payload(&offsets, &counters).await?;
+        let payload_done = Instant::now();
 
         // Post-process to the Parquet-equivalent logical batch.
         let batch = self.to_logical_batch(&phys)?;
+        let timing = TakeTiming {
+            offsets: offsets_done - started,
+            payload: payload_done - offsets_done,
+            af_rebuild: payload_done.elapsed(),
+        };
 
         // matched positions = distinct requested starts present in the result.
         let matched = distinct_matched(&batch, &probe_set)?;
@@ -139,7 +148,11 @@ impl SinglePathParquetVariationLookup {
             matched_positions: matched,
             row_ids: offsets,
         };
-        Ok(TakenVariationRows { resolved, batch })
+        Ok(TakenVariationRows {
+            resolved,
+            batch,
+            timing,
+        })
     }
 
     async fn exact_offsets(

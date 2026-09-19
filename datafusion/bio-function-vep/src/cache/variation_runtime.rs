@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use datafusion::arrow::record_batch::RecordBatch;
 
 use crate::cache::schema::VARIATION_FORBIDDEN_COLUMNS;
@@ -19,6 +21,21 @@ pub struct ResolvedRowIds {
 pub struct TakenVariationRows {
     pub resolved: ResolvedRowIds,
     pub batch: RecordBatch,
+    /// Where the take spent its time; feeds `VEP_LOOKUP_PROFILE_DETAILED`.
+    pub timing: TakeTiming,
+}
+
+/// Wall time of the three parts of one variation take. Always measured: it is
+/// four clock reads per lookup call, and a lookup call covers thousands of rows.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TakeTiming {
+    /// `start`-only read of the candidate pages, to find the exact row offsets.
+    pub offsets: Duration,
+    /// Projected payload read at those offsets.
+    pub payload: Duration,
+    /// Rebuilding the logical batch from the physical one -- almost entirely
+    /// the 27 AF columns.
+    pub af_rebuild: Duration,
 }
 
 /// Sanitize a requested variation projection: drop build-only/forbidden columns
