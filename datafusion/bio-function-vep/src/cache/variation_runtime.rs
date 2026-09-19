@@ -25,17 +25,22 @@ pub struct TakenVariationRows {
     pub timing: TakeTiming,
 }
 
-/// Wall time of the three parts of one variation take. Always measured: it is
-/// four clock reads per lookup call, and a lookup call covers thousands of rows.
+/// Wall time of one variation take, split so the parts add up to the whole
+/// `resolve_and_take` call (everything but returning the result). Always
+/// measured: it is five clock reads per lookup call, and a lookup call covers
+/// thousands of rows.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TakeTiming {
-    /// `start`-only read of the candidate pages, to find the exact row offsets.
+    /// Finding the exact row offsets: the probe set, the footer `PageDir`
+    /// resolution, and the `start`-only read of the candidate pages.
     pub offsets: Duration,
     /// Projected payload read at those offsets.
     pub payload: Duration,
     /// Rebuilding the logical batch from the physical one -- almost entirely
     /// the 27 AF columns.
     pub af_rebuild: Duration,
+    /// Counting the distinct requested positions present in the result.
+    pub matched: Duration,
 }
 
 /// Sanitize a requested variation projection: drop build-only/forbidden columns

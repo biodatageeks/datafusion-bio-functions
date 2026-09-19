@@ -116,6 +116,7 @@ impl SinglePathParquetVariationLookup {
         &self,
         sorted_unique_starts: &[u32],
     ) -> Result<TakenVariationRows> {
+        let started = Instant::now();
         let probe_set: HashSet<u32> = sorted_unique_starts.iter().copied().collect();
         let counters = IoCounters::new();
 
@@ -125,7 +126,6 @@ impl SinglePathParquetVariationLookup {
         let ranges = self.page_dir.resolve_ranges(&probes64);
 
         // Phase 2: start-only read of the candidate pages -> exact row offsets.
-        let started = Instant::now();
         let offsets = self.exact_offsets(&ranges, &probe_set, &counters).await?;
         let offsets_done = Instant::now();
 
@@ -135,14 +135,16 @@ impl SinglePathParquetVariationLookup {
 
         // Post-process to the Parquet-equivalent logical batch.
         let batch = self.to_logical_batch(&phys)?;
-        let timing = TakeTiming {
-            offsets: offsets_done - started,
-            payload: payload_done - offsets_done,
-            af_rebuild: payload_done.elapsed(),
-        };
+        let rebuild_done = Instant::now();
 
         // matched positions = distinct requested starts present in the result.
         let matched = distinct_matched(&batch, &probe_set)?;
+        let timing = TakeTiming {
+            offsets: offsets_done - started,
+            payload: payload_done - offsets_done,
+            af_rebuild: rebuild_done - payload_done,
+            matched: rebuild_done.elapsed(),
+        };
         let resolved = ResolvedRowIds {
             requested_positions: sorted_unique_starts.len(),
             matched_positions: matched,

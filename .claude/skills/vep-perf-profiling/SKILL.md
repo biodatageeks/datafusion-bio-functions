@@ -38,7 +38,8 @@ Profile knobs (each prints to stderr, aggregated per batch):
 - `VEP_LOOKUP_PROFILE` / `VEP_LOOKUP_PROFILE_DETAILED` → `[vep-lookup-profile]` totals per lookup stream
   (batches, probes, stage split) and `[vep-lookup-profile-detail]` lines (`stages`, `match`, `variation`:
   probes, matches, rows scanned, shard opens, `variation_take` time; `take`: what `variation_take` is made
-  of -- `offsets` start-only page scan, `payload` projected read, `af_rebuild` logical-batch rebuild).
+  of -- `offsets` probe set + PageDir + start-only page scan, `payload` projected read, `af_rebuild`
+  logical-batch rebuild, `matched` distinct-position count; the four add up to `variation_take`).
 - `VEP_ENGINE_PROFILE` → per-batch engine stages (`evaluate_prepared`, `colocated_fields`, `csq_format`, `collapse_pick_sort`, …).
 - `VEP_TX_ENGINE_PROFILE` → transcript-engine stages (`tx_query_total`, `transcript_output_materialize`, `transcript_hgvsc`, `transcript_overlap_eval`, …).
 - `VEP_ENGINE_PROFILE_HGVSC` → extra HGVSc sub-timers (coord_map/simple_fast/fallback); 0 if off.

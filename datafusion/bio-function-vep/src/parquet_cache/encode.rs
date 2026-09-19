@@ -282,8 +282,10 @@ pub fn reconstruct_af_group_string(
     Ok(b.finish())
 }
 
-/// Longest string the fast path of [`write_g4`] produces: `0.000dddd` and
-/// `d.ddde-NN` are both nine bytes.
+/// Capacity of the fast path's output buffer and of a memo entry. The longest
+/// string the fast path of [`write_g4`] produces is nine bytes (`0.000dddd` and
+/// `d.ddde-NN`); the three spare bytes are deliberate slack, and running out is
+/// an error that falls back to [`format_g4`], never a panic.
 const G4_FAST_MAX: usize = 12;
 
 /// A fixed-capacity `fmt::Write` sink on the stack, so formatting a frequency
@@ -301,9 +303,11 @@ impl<const N: usize> StackBuf<N> {
         }
     }
 
-    fn push(&mut self, byte: u8) {
-        self.bytes[self.len] = byte;
+    fn push(&mut self, byte: u8) -> fmt::Result {
+        let slot = self.bytes.get_mut(self.len).ok_or(fmt::Error)?;
+        *slot = byte;
         self.len += 1;
+        Ok(())
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -379,45 +383,60 @@ fn write_g4<W: fmt::Write>(out: &mut W, f: f32) -> fmt::Result {
     }
 
     let mut text = StackBuf::<G4_FAST_MAX>::new();
+    match place_g4_digits(&mut text, digits, kept, e, magnitude) {
+        Ok(()) => out.write_str(text.as_str()),
+        Err(_) => out.write_str(&format_g4(f)),
+    }
+}
+
+/// Lay the significant `digits` of a positive value with decimal exponent `e`
+/// (`magnitude == e.abs()`, `e < 4`) out as `%.4g` text.
+fn place_g4_digits(
+    text: &mut StackBuf<G4_FAST_MAX>,
+    digits: [u8; 4],
+    kept: usize,
+    e: i32,
+    magnitude: i32,
+) -> fmt::Result {
     if e < -4 {
         // Scientific: `d[.ddd]e-NN`. The exponent is negative here by
         // construction, and an f32 never needs a third exponent digit.
-        text.push(digits[0]);
+        text.push(digits[0])?;
         if kept > 1 {
-            text.push(b'.');
+            text.push(b'.')?;
             for &d in &digits[1..kept] {
-                text.push(d);
+                text.push(d)?;
             }
         }
-        text.push(b'e');
-        text.push(b'-');
-        text.push(b'0' + (magnitude / 10) as u8);
-        text.push(b'0' + (magnitude % 10) as u8);
+        text.push(b'e')?;
+        text.push(b'-')?;
+        text.push(b'0' + (magnitude / 10) as u8)?;
+        text.push(b'0' + (magnitude % 10) as u8)?;
     } else if e < 0 {
         // `0.` + leading zeros + the significant digits.
-        text.push(b'0');
-        text.push(b'.');
+        text.push(b'0')?;
+        text.push(b'.')?;
         for _ in 0..(-e - 1) {
-            text.push(b'0');
+            text.push(b'0')?;
         }
         for &d in &digits[..kept] {
-            text.push(d);
+            text.push(d)?;
         }
     } else {
         // `e + 1` integer digits (never trimmed: `1200` keeps its zeros), then
         // whatever significant digits are left after the point.
         let int_digits = (e + 1) as usize;
         for &d in &digits[..int_digits] {
-            text.push(d);
+            text.push(d)?;
         }
         if kept > int_digits {
-            text.push(b'.');
+            text.push(b'.')?;
             for &d in &digits[int_digits..kept] {
-                text.push(d);
+                text.push(d)?;
             }
         }
     }
-    out.write_str(text.as_str())
+    Ok(())
 }
 
 /// Formatted frequencies seen so far, keyed on the float's bits.
