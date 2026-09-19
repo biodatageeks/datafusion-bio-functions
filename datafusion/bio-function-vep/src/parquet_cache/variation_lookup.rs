@@ -7,11 +7,11 @@
 //! projected payload take at those offsets via the [`CoalescingAsyncReader`].
 //!
 //! The physical AF columns are the 2-array struct-of-arrays
-//! (`<grp>_alleles`/`<grp>_freqs`); on read they are reconstructed to the 3
-//! pipe-joined group strings and then expanded to the 27 logical AF columns via
-//! [`unbundle_af_columns`] — byte-identical to the Parquet path. `variation_name`
-//! is reconstructed via `coalesce(variation_name, dbsnp_ids)`. Binary flags stay
-//! `Boolean` (downstream reads them through the `batch_i64_value` Boolean arm).
+//! (`<grp>_alleles`/`<grp>_freqs`); on read each group is rebuilt straight into
+//! its per-population columns by [`reconstruct_af_members`], giving the 27
+//! logical AF columns with the exact CSQ text. `variation_name` is reconstructed
+//! via `coalesce(variation_name, dbsnp_ids)`. Binary flags stay `Boolean`
+//! (downstream reads them through the `batch_i64_value` Boolean arm).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,11 +26,11 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use std::sync::Arc;
 
-use crate::cache::af_bundle::{AF_GROUPS, unbundle_af_columns};
+use crate::cache::af_bundle::AF_GROUPS;
 use crate::cache::variation_runtime::{
     ResolvedRowIds, TakenVariationRows, ensure_runtime_projection,
 };
-use crate::parquet_cache::encode::reconstruct_af_group_string;
+use crate::parquet_cache::encode::reconstruct_af_members;
 use crate::parquet_cache::page_dir::{
     CoalescingAsyncReader, IoCounters, PageDir, selection_from_offsets, selection_from_ranges,
 };
@@ -233,8 +233,8 @@ impl SinglePathParquetVariationLookup {
         })
     }
 
-    /// Reconstruct the group AF strings + unbundle to 27 logical columns, and
-    /// coalesce `variation_name`. Non-AF columns pass through unchanged.
+    /// Rebuild the 27 logical AF columns from the 2-array groups, and coalesce
+    /// `variation_name`. Non-AF columns pass through unchanged.
     fn to_logical_batch(&self, phys: &RecordBatch) -> Result<RecordBatch> {
         let schema = phys.schema();
         let dbsnp = phys
@@ -246,7 +246,7 @@ impl SinglePathParquetVariationLookup {
 
         for (i, f) in schema.fields().iter().enumerate() {
             let name = f.name();
-            // The 2-array AF columns are replaced by reconstructed group strings.
+            // The 2-array AF columns are replaced by their per-population members.
             if name.ends_with("_alleles") || name.ends_with("_freqs") {
                 let base = name.trim_end_matches("_alleles").trim_end_matches("_freqs");
                 if AF_GROUPS.iter().any(|(g, _)| *g == base) {
@@ -269,7 +269,9 @@ impl SinglePathParquetVariationLookup {
             }
         }
 
-        // Append reconstructed group string columns for each present group.
+        // Append every member of each present group, in `AF_GROUPS` order. The
+        // whole group is emitted even when one member was projected: downstream
+        // resolves the members by name and reads an absent one as "".
         for (grp, members) in AF_GROUPS {
             let alleles = phys
                 .column_by_name(&format!("{grp}_alleles"))
@@ -278,18 +280,19 @@ impl SinglePathParquetVariationLookup {
                 .column_by_name(&format!("{grp}_freqs"))
                 .and_then(|c| c.as_any().downcast_ref::<ListArray>());
             if let (Some(alleles), Some(freqs)) = (alleles, freqs) {
-                let s = reconstruct_af_group_string(alleles, freqs, members.len())?;
-                fields.push(Arc::new(Field::new(*grp, DataType::Utf8, true)));
-                cols.push(Arc::new(s) as ArrayRef);
+                let arrays = reconstruct_af_members(alleles, freqs, members.len())?;
+                for (member, array) in members.iter().zip(arrays) {
+                    fields.push(Arc::new(Field::new(*member, DataType::Utf8, true)));
+                    cols.push(Arc::new(array) as ArrayRef);
+                }
             }
         }
 
-        let bundled = RecordBatch::try_new(
+        RecordBatch::try_new(
             Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
             cols,
         )
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        unbundle_af_columns(&bundled)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
