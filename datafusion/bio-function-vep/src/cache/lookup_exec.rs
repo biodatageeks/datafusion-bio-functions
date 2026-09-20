@@ -572,6 +572,14 @@ struct LookupProfile {
     variation_rows_scanned: u64,
     /// Time spent in the per-batch Parquet take (`resolve_and_take`).
     variation_take: Duration,
+    /// The parts of `variation_take`, as the lookup reports them; they add up
+    /// to it, less the call overhead. They are a breakdown of that stage, not
+    /// further stages, so they stay out of `detail_known()` and get a line of
+    /// their own.
+    take_offsets: Duration,
+    take_payload: Duration,
+    take_af_rebuild: Duration,
+    take_matched: Duration,
 }
 
 impl LookupProfile {
@@ -638,6 +646,13 @@ impl LookupProfile {
                 self.variation_not_covered,
                 self.variation_rows_scanned,
                 self.shard_opens,
+            ),
+            format!(
+                "[vep-lookup-profile-detail] take offsets={:.3}s payload={:.3}s af_rebuild={:.3}s matched={:.3}s",
+                self.take_offsets.as_secs_f64(),
+                self.take_payload.as_secs_f64(),
+                self.take_af_rebuild.as_secs_f64(),
+                self.take_matched.as_secs_f64(),
             ),
         ]
     }
@@ -1406,6 +1421,10 @@ impl VariationLookupStream {
                 };
                 if let Some(t0) = take_started {
                     self.profile.variation_take += t0.elapsed();
+                    self.profile.take_offsets += taken.timing.offsets;
+                    self.profile.take_payload += taken.timing.payload;
+                    self.profile.take_af_rebuild += taken.timing.af_rebuild;
+                    self.profile.take_matched += taken.timing.matched;
                 }
                 let row_map = start_row_map(&taken.batch)?;
                 taken_by_chrom.insert(chrom, (taken.batch, row_map));
@@ -2278,6 +2297,10 @@ mod tests {
         profile.null_append += Duration::from_millis(11);
         profile.shard_open += Duration::from_millis(12);
         profile.variation_take += Duration::from_millis(13);
+        profile.take_offsets += Duration::from_millis(3);
+        profile.take_payload += Duration::from_millis(4);
+        profile.take_af_rebuild += Duration::from_millis(5);
+        profile.take_matched += Duration::from_millis(1);
         profile.primary_allele_rows = 19;
         profile.exact_match_calls = 22;
         profile.primary_matches = 23;
@@ -2293,7 +2316,7 @@ mod tests {
 
         let lines = profile.detail_lines();
 
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 4);
         assert!(lines[0].contains("probe_build=0.001s"));
         assert!(lines[0].contains("shard_open=0.012s"));
         assert!(lines[0].contains("variation_take=0.013s"));
@@ -2305,6 +2328,10 @@ mod tests {
         assert!(lines[2].contains("position_misses=2"));
         assert!(lines[2].contains("rows_scanned=38"));
         assert!(lines[2].contains("shard_opens=1"));
+        assert_eq!(
+            lines[3],
+            "[vep-lookup-profile-detail] take offsets=0.003s payload=0.004s af_rebuild=0.005s matched=0.001s"
+        );
     }
 
     #[cfg(feature = "parquet-cache")]

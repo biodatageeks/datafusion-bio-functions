@@ -154,6 +154,10 @@ impl EngineAnnotationProfile {
 }
 
 use async_trait::async_trait;
+// Hot, function-local maps keyed by short strings. std's SipHash was ~15% of the
+// annotation stage on a chr1 profile; these are hashbrown with DataFusion's
+// default (non-cryptographic) hasher. Only for maps that are never iterated
+// into output: both hashers leave iteration order unspecified.
 use datafusion::arrow::array::{
     Array, AsArray, BinaryArray, BooleanArray, Float32Array, Float32Builder, Float64Array,
     Int8Array, Int8Builder, Int16Array, Int32Array, Int64Array, Int64Builder, LargeBinaryArray,
@@ -164,6 +168,7 @@ use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{HashMap as FastHashMap, HashSet as FastHashSet};
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -2294,8 +2299,8 @@ impl ColocatedData {
             // are `&str`), so the per-(entry x column) `to_string()` storm that
             // dominated colocated churn is gone; only the 4f-formatted and the
             // interpolated values still allocate.
-            let mut freq_data: HashMap<&str, Cow<str>> = HashMap::new();
-            let mut remaining: HashSet<&str> = HashSet::new();
+            let mut freq_data: FastHashMap<&str, Cow<str>> = FastHashMap::new();
+            let mut remaining: FastHashSet<&str> = FastHashSet::new();
 
             for (idx, column) in AF_COLUMNS.iter().enumerate() {
                 let should_process = flags.max_af || flags.af_group_enabled(column.flag_group);
@@ -8550,10 +8555,30 @@ fn edited_refseq_translation_cds_from_spliced_seq(tx: &TranscriptFeature) -> Opt
     Some(spliced_seq[start..end].to_ascii_uppercase())
 }
 
+/// One transcript's exons in genomic order, through the per-contig index.
+///
+/// The HGVS hydration helpers used to rebuild a transcript -> exons map from
+/// every exon of the contig on every window, only to look up the few transcripts
+/// the window touches. `SharedContextIndexes` already holds that map, built once
+/// per contig, in input order; the `(start, end, exon_number)` order the helpers
+/// rely on is applied here, to one transcript's handful of exons, with the same
+/// stable sort over the same input order as before.
+fn sorted_transcript_exons<'a>(
+    exons: &'a [ExonFeature],
+    exons_by_transcript: &HashMap<String, Vec<usize>>,
+    tx: &TranscriptFeature,
+) -> Option<Vec<&'a ExonFeature>> {
+    let indices = exons_by_transcript.get(tx.transcript_id.as_str())?;
+    let mut tx_exons: Vec<&ExonFeature> = indices.iter().map(|&idx| &exons[idx]).collect();
+    tx_exons.sort_by_key(|exon| (exon.start, exon.end, exon.exon_number));
+    Some(tx_exons)
+}
+
 fn hydrate_refseq_translation_cds_from_reference<R>(
     reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
     transcripts: &[TranscriptFeature],
     exons: &[ExonFeature],
+    exons_by_transcript: &HashMap<String, Vec<usize>>,
     translations: &mut [TranslationFeature],
     translateable_seq_by_tx: &HashMap<String, String>,
     input_variant_intervals: &HashMap<String, Vec<(i64, i64)>>,
@@ -8562,16 +8587,6 @@ fn hydrate_refseq_translation_cds_from_reference<R>(
 where
     R: BufRead + Seek,
 {
-    let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
-    for exon in exons {
-        exons_by_tx
-            .entry(exon.transcript_id.as_str())
-            .or_default()
-            .push(exon);
-    }
-    for tx_exons in exons_by_tx.values_mut() {
-        tx_exons.sort_by_key(|exon| (exon.start, exon.end, exon.exon_number));
-    }
     let translation_ids: HashSet<&str> = translations
         .iter()
         .map(|translation| translation.transcript_id.as_str())
@@ -8608,11 +8623,11 @@ where
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             continue;
         };
-        let Some(tx_exons) = exons_by_tx.get(tx.transcript_id.as_str()) else {
+        let Some(tx_exons) = sorted_transcript_exons(exons, exons_by_transcript, tx) else {
             continue;
         };
         let mut genomic_cds = String::new();
-        for exon in tx_exons {
+        for exon in &tx_exons {
             let seg_start = exon.start.max(cds_start);
             let seg_end = exon.end.min(cds_end);
             if seg_start > seg_end {
@@ -8671,6 +8686,7 @@ fn hydrate_transcript_cdna_from_reference<R>(
     reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
     transcripts: &mut [TranscriptFeature],
     exons: &[ExonFeature],
+    exons_by_transcript: &HashMap<String, Vec<usize>>,
     indel_intervals: &HashMap<String, Vec<(i64, i64)>>,
     all_intervals: &HashMap<String, Vec<(i64, i64)>>,
     cache_source_type: CacheSourceType,
@@ -8678,19 +8694,8 @@ fn hydrate_transcript_cdna_from_reference<R>(
 where
     R: BufRead + Seek,
 {
-    let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
-    for exon in exons {
-        exons_by_tx
-            .entry(exon.transcript_id.as_str())
-            .or_default()
-            .push(exon);
-    }
-    for tx_exons in exons_by_tx.values_mut() {
-        tx_exons.sort_by_key(|exon| (exon.start, exon.end, exon.exon_number));
-    }
-
     for tx in transcripts.iter_mut() {
-        let Some(tx_exons) = exons_by_tx.get(tx.transcript_id.as_str()) else {
+        let Some(tx_exons) = sorted_transcript_exons(exons, exons_by_transcript, tx) else {
             continue;
         };
 
@@ -8707,7 +8712,7 @@ where
         if tx.spliced_seq.is_some() {
             if should_infer_implicit_refseq_deletions {
                 let Some(genomic_cdna) =
-                    read_spliced_transcript_cdna_from_reference(reader, tx, tx_exons)?
+                    read_spliced_transcript_cdna_from_reference(reader, tx, &tx_exons)?
                 else {
                     continue;
                 };
@@ -8762,7 +8767,7 @@ where
         if total_exonic <= coding_end {
             continue;
         }
-        let Some(cdna) = read_spliced_transcript_cdna_from_reference(reader, tx, tx_exons)? else {
+        let Some(cdna) = read_spliced_transcript_cdna_from_reference(reader, tx, &tx_exons)? else {
             continue;
         };
         tx.cdna_seq = Some(cdna);
@@ -12429,6 +12434,7 @@ impl RecordBatchStream for ContigAnnotationStream {
 fn hydrate_window(
     transcripts: &mut [TranscriptFeature],
     exons: &[ExonFeature],
+    exons_by_transcript: &HashMap<String, Vec<usize>>,
     translations: &mut [TranslationFeature],
     translateable_seq_by_tx: &HashMap<String, String>,
     hgvs_reader: &mut Option<FastaReader>,
@@ -12448,6 +12454,7 @@ fn hydrate_window(
         reader,
         transcripts,
         exons,
+        exons_by_transcript,
         translations,
         translateable_seq_by_tx,
         &input_intervals,
@@ -12465,6 +12472,7 @@ fn hydrate_window(
         reader,
         transcripts,
         exons,
+        exons_by_transcript,
         &indel_intervals,
         &input_intervals,
         cache_source_type,
@@ -12770,6 +12778,7 @@ fn hydrate_worker_window(
     hydrate_window(
         &mut window_transcripts,
         &shared.exons,
+        &shared.indexes.exons_by_transcript,
         &mut window_translations,
         &shared.translateable_seq_by_tx,
         &mut worker.hgvs_reader,
