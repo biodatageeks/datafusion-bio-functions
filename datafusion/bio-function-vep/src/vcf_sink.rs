@@ -188,6 +188,34 @@ pub(crate) struct VcfShardContext {
     pub(crate) contig_done_tx: std::sync::mpsc::Sender<ContigShardRange>,
 }
 
+/// The name each projected field is written under: the input's own name for a
+/// column the engine renamed, unless the projection already holds a column of
+/// that name.
+///
+/// The exception is an input FORMAT field called `CSQ`. The engine carries it
+/// as `fmt_CSQ` and the projection also holds the engine's `CSQ`, so giving it
+/// its name back would put two `CSQ` columns in one batch. It keeps the alias;
+/// the serializer resolves a FORMAT column through `bio.vcf.field.format_id`,
+/// and the record still says `CSQ`.
+fn writer_field_names(fields: &datafusion::arrow::datatypes::Fields) -> Vec<String> {
+    let own_names: HashSet<&str> = fields
+        .iter()
+        .filter(|field| !field.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY))
+        .map(|field| field.name().as_str())
+        .collect();
+    fields
+        .iter()
+        .map(|field| {
+            let source = source_field_name(field);
+            if own_names.contains(source) {
+                field.name().clone()
+            } else {
+                source.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Hands the writer the input's columns under the input's own names.
 ///
 /// The engine renames an input column whose name it uses itself (`AF` becomes
@@ -224,17 +252,14 @@ fn restore_input_columns(batch: RecordBatch) -> Result<RecordBatch> {
     let fields: Vec<Arc<Field>> = schema
         .fields()
         .iter()
-        .map(|field| {
+        .zip(writer_field_names(schema.fields()))
+        .map(|(field, name)| {
             if field.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY) {
                 let mut metadata = field.metadata().clone();
                 metadata.remove(VEP_SOURCE_FIELD_NAME_KEY);
                 Arc::new(
-                    Field::new(
-                        source_field_name(field),
-                        field.data_type().clone(),
-                        field.is_nullable(),
-                    )
-                    .with_metadata(metadata),
+                    Field::new(name, field.data_type().clone(), field.is_nullable())
+                        .with_metadata(metadata),
                 )
             } else {
                 Arc::clone(field)
@@ -892,6 +917,15 @@ fn sanitize_unstructured_header_value(value: &str) -> String {
 ///
 /// Exact-key matching on both this module's fixed key and Ensembl VEP's, so no
 /// source metadata can be deleted by resembling provenance.
+/// The input's own `##INFO=<ID=CSQ,...>` line, in any case: Ensembl VEP's test is
+/// `/ID=$fieldname,/i`. Anchored to an INFO declaration of exactly that id, which
+/// VEP's is not, so that `ID=myCSQ,` and a FORMAT field called CSQ are kept.
+fn is_input_csq_declaration(line: &str) -> bool {
+    const PREFIX: &str = "##INFO=<ID=CSQ,";
+    line.get(..PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+}
+
 fn is_stale_provenance_line(line: &str) -> bool {
     [
         format!("##{PROVENANCE_KEY}="),
@@ -925,7 +959,7 @@ fn merge_annotation_header_lines(
             // The input's own CSQ declaration describes the field this run
             // replaces. Ensembl VEP drops it with the provenance
             // (`OutputFactory/VCF.pm`: `unless /ID=$fieldname,/i || /^##VEP/`).
-            if is_stale_provenance_line(line) || line.starts_with("##INFO=<ID=CSQ,") {
+            if is_stale_provenance_line(line) || is_input_csq_declaration(line) {
                 return false;
             }
             let Some((key, value)) = line
@@ -1691,9 +1725,12 @@ pub async fn annotate_to_vcf(
     let output_fields: Vec<datafusion::arrow::datatypes::Field> = df_schema
         .fields()
         .iter()
-        .map(|df_field| {
-            // The writer sees the input's own names; see `restore_input_columns`.
-            let name = source_field_name(df_field);
+        .zip(writer_field_names(df_schema.fields()))
+        .map(|(df_field, name)| {
+            // The writer sees the names `restore_input_columns` gives each
+            // batch; the input's declaration is found under its input name.
+            let name = name.as_str();
+            let source = source_field_name(df_field);
             let arrow_field = datafusion::arrow::datatypes::Field::new(
                 name,
                 df_field.data_type().clone(),
@@ -1711,7 +1748,7 @@ pub async fn annotate_to_vcf(
                 meta.insert("bio.vcf.field.number".to_string(), ".".to_string());
                 meta.insert("bio.vcf.field.type".to_string(), "String".to_string());
                 arrow_field.with_metadata(meta)
-            } else if let Ok(input_field) = vcf_schema.field_with_name(name) {
+            } else if let Ok(input_field) = vcf_schema.field_with_name(source) {
                 let mut merged_metadata = input_field.metadata().clone();
                 for (k, v) in arrow_field.metadata() {
                     merged_metadata.insert(k.clone(), v.clone());
@@ -2076,6 +2113,55 @@ mod tests {
             .unwrap();
         let keys: Vec<Option<&str>> = keys.iter().collect();
         assert_eq!(keys, [Some("DP;AF"), Some(""), Some("myCSQ;DP"), None]);
+    }
+
+    /// An input FORMAT field called CSQ is carried as `fmt_CSQ`, and the
+    /// projection also holds the engine's CSQ: restoring the name would put two
+    /// CSQ columns in one batch.
+    #[test]
+    fn a_format_field_named_csq_keeps_its_alias_beside_the_engines_csq() {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use std::collections::HashMap;
+
+        let format_csq =
+            Field::new("fmt_CSQ", DataType::Utf8, true).with_metadata(HashMap::from([
+                ("bio.vcf.field.field_type".to_string(), "FORMAT".to_string()),
+                ("bio.vcf.field.format_id".to_string(), "CSQ".to_string()),
+                (VEP_SOURCE_FIELD_NAME_KEY.to_string(), "CSQ".to_string()),
+            ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("CSQ", DataType::Utf8, true),
+                format_csq,
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"])),
+                Arc::new(StringArray::from(vec!["G|missense_variant"])),
+                Arc::new(StringArray::from(vec!["sample-value"])),
+            ],
+        )
+        .unwrap();
+
+        let restored = restore_input_columns(batch).unwrap();
+        let schema = restored.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["chrom", "CSQ", "fmt_CSQ"]);
+        assert_eq!(schema.field(2).metadata()["bio.vcf.field.format_id"], "CSQ");
+    }
+
+    #[test]
+    fn the_inputs_csq_declaration_is_recognised_in_any_case() {
+        assert!(is_input_csq_declaration(
+            "##INFO=<ID=CSQ,Number=.,Type=String>"
+        ));
+        assert!(is_input_csq_declaration(
+            "##info=<id=csq,Number=.,Type=String>"
+        ));
+        assert!(!is_input_csq_declaration("##INFO=<ID=myCSQ,Number=1>"));
+        assert!(!is_input_csq_declaration("##FORMAT=<ID=CSQ,Number=1>"));
+        assert!(!is_input_csq_declaration("##INFO"));
     }
 
     #[test]
