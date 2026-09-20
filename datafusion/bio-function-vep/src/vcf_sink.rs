@@ -21,6 +21,7 @@ use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use crate::annotate_provider::{VEP_SOURCE_FIELD_NAME_KEY, source_field_name};
 use crate::cache_source::CacheSourceType;
 use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
 
@@ -187,6 +188,89 @@ pub(crate) struct VcfShardContext {
     pub(crate) contig_done_tx: std::sync::mpsc::Sender<ContigShardRange>,
 }
 
+/// Hands the writer the input's columns under the input's own names.
+///
+/// The engine renames an input column whose name it uses itself (`AF` becomes
+/// `INFO_AF`), and the VCF serializer keys everything on the column name: the
+/// lookup, the emitted `KEY=` and the carried per-record order. The projection
+/// this sink asks for holds no typed annotation column, so inside it the input
+/// names are free again and the record is written as the source wrote it.
+///
+/// An input that already carried `CSQ` had it replaced, not kept: Ensembl VEP
+/// removes the existing key and appends its own last
+/// (`OutputFactory/VCF.pm`, "nuke existing CSQ field"). The key is therefore
+/// taken out of the carried order, which would otherwise pin the new `CSQ` to
+/// where the old one stood.
+fn restore_input_columns(batch: RecordBatch) -> Result<RecordBatch> {
+    use datafusion::arrow::array::{Array, ArrayRef, StringArray};
+    use datafusion::arrow::datatypes::{Field, Schema};
+
+    let schema = batch.schema();
+    let renamed = schema
+        .fields()
+        .iter()
+        .any(|field| field.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY));
+    let carried_csq = schema.index_of(VCF_INFO_KEYS_COLUMN).ok().filter(|&idx| {
+        batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .is_some_and(|keys| keys.iter().flatten().any(has_csq_key))
+    });
+    if !renamed && carried_csq.is_none() {
+        return Ok(batch);
+    }
+
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if field.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY) {
+                let mut metadata = field.metadata().clone();
+                metadata.remove(VEP_SOURCE_FIELD_NAME_KEY);
+                Arc::new(
+                    Field::new(
+                        source_field_name(field),
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                    )
+                    .with_metadata(metadata),
+                )
+            } else {
+                Arc::clone(field)
+            }
+        })
+        .collect();
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    if let Some(idx) = carried_csq {
+        let keys = columns[idx]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("checked above");
+        let stripped: StringArray = keys
+            .iter()
+            .map(|keys| {
+                keys.map(|keys| {
+                    keys.split(';')
+                        .filter(|key| *key != "CSQ")
+                        .collect::<Vec<_>>()
+                        .join(";")
+                })
+            })
+            .collect();
+        columns[idx] = Arc::new(stripped);
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+    )?)
+}
+
+/// Whether a carried `;`-separated INFO key list names `CSQ`.
+fn has_csq_key(keys: &str) -> bool {
+    keys.split(';').any(|key| key == "CSQ")
+}
+
 fn format_vcf_body_chunk(
     batch_id: usize,
     batch: RecordBatch,
@@ -205,6 +289,7 @@ fn format_vcf_body_chunk(
             ("rows", TraceValue::Usize(input_rows)),
         ],
     );
+    let batch = restore_input_columns(batch)?;
     let lines = batch_to_vcf_lines(
         &batch,
         vcf_info_fields.as_slice(),
@@ -834,7 +919,10 @@ fn merge_annotation_header_lines(
     let mut lines: Vec<String> = existing
         .into_iter()
         .filter(|line| {
-            if is_stale_provenance_line(line) {
+            // The input's own CSQ declaration describes the field this run
+            // replaces. Ensembl VEP drops it with the provenance
+            // (`OutputFactory/VCF.pm`: `unless /ID=$fieldname,/i || /^##VEP/`).
+            if is_stale_provenance_line(line) || line.starts_with("##INFO=<ID=CSQ,") {
                 return false;
             }
             let Some((key, value)) = line
@@ -1492,7 +1580,20 @@ pub async fn annotate_to_vcf(
     }
 
     let unique_format_tags: Vec<String> = if sample_names.len() <= 1 {
-        format_fields.clone()
+        // The FORMAT id, not the column name: the reader renames a FORMAT
+        // column whose id an INFO field also uses (`fmt_DP`), and the key
+        // written to the record is the id.
+        format_fields
+            .iter()
+            .map(|name| {
+                vcf_schema
+                    .field_with_name(name)
+                    .ok()
+                    .and_then(|field| field.metadata().get("bio.vcf.field.format_id"))
+                    .unwrap_or(name)
+                    .clone()
+            })
+            .collect()
     } else {
         let mut tags = Vec::new();
         for name in &format_fields {
@@ -1542,21 +1643,40 @@ pub async fn annotate_to_vcf(
     // The serial path SELECTs these columns and the sharded path projects the
     // annotation plan by them. They must name the same columns in the same
     // order, so both come from one list.
-    let projection_names = annotation_output_columns(
-        &core_vcf,
-        &info_fields,
-        &format_fields,
-        config.preserve_record_layout,
-    );
-    let select_list = annotation_select_list(&projection_names);
-
     let options_json = config.to_options_json_with_cache_format();
     let opts_clause = format!(", '{}'", options_json.replace('\'', "''"));
-    let sql = format!(
-        "SELECT {select_list} FROM annotate_vep('{vcf_table}', '{}', '{}'{opts_clause})",
+    let annotate_call = format!(
+        "annotate_vep('{vcf_table}', '{}', '{}'{opts_clause})",
         cache_source.replace('\'', "''"),
         backend.replace('\'', "''"),
     );
+
+    // An input that already carries CSQ has it replaced, as Ensembl VEP does
+    // (`OutputFactory/VCF.pm`: the existing key is removed and the new one
+    // appended). Its column is simply not asked for.
+    info_fields.retain(|name| name != "CSQ");
+
+    // The engine renames an input column whose name it uses itself, so the
+    // columns are asked for by the names its schema gives them. Planning the
+    // call is what builds that schema; nothing is executed.
+    let engine_names: std::collections::HashMap<String, String> = ctx
+        .sql(&format!("SELECT * FROM {annotate_call}"))
+        .await?
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| field.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY))
+        .map(|field| (source_field_name(field).to_string(), field.name().clone()))
+        .collect();
+    let engine_name = |name: &String| engine_names.get(name).unwrap_or(name).clone();
+    let projection_names = annotation_output_columns(
+        &core_vcf,
+        &info_fields.iter().map(engine_name).collect::<Vec<_>>(),
+        &format_fields.iter().map(engine_name).collect::<Vec<_>>(),
+        config.preserve_record_layout,
+    );
+    let select_list = annotation_select_list(&projection_names);
+    let sql = format!("SELECT {select_list} FROM {annotate_call}");
 
     let mut vcf_info_fields = info_fields;
     vcf_info_fields.push("CSQ".to_string());
@@ -1569,19 +1689,16 @@ pub async fn annotate_to_vcf(
         .fields()
         .iter()
         .map(|df_field| {
-            let name = df_field.name();
+            // The writer sees the input's own names; see `restore_input_columns`.
+            let name = source_field_name(df_field);
             let arrow_field = datafusion::arrow::datatypes::Field::new(
                 name,
                 df_field.data_type().clone(),
                 df_field.is_nullable(),
             );
-            if let Ok(input_field) = vcf_schema.field_with_name(name) {
-                let mut merged_metadata = input_field.metadata().clone();
-                for (k, v) in arrow_field.metadata() {
-                    merged_metadata.insert(k.clone(), v.clone());
-                }
-                arrow_field.with_metadata(merged_metadata)
-            } else if name == "CSQ" {
+            // CSQ first: an input that already declared CSQ must not lend its
+            // description to the field this run writes.
+            if name == "CSQ" {
                 let mut meta = std::collections::HashMap::new();
                 meta.insert("bio.vcf.field.field_type".to_string(), "INFO".to_string());
                 meta.insert(
@@ -1591,6 +1708,12 @@ pub async fn annotate_to_vcf(
                 meta.insert("bio.vcf.field.number".to_string(), ".".to_string());
                 meta.insert("bio.vcf.field.type".to_string(), "String".to_string());
                 arrow_field.with_metadata(meta)
+            } else if let Ok(input_field) = vcf_schema.field_with_name(name) {
+                let mut merged_metadata = input_field.metadata().clone();
+                for (k, v) in arrow_field.metadata() {
+                    merged_metadata.insert(k.clone(), v.clone());
+                }
+                arrow_field.with_metadata(merged_metadata)
             } else {
                 arrow_field
             }
@@ -1824,6 +1947,7 @@ pub async fn annotate_to_vcf(
                     ("rows", TraceValue::Usize(input_rows)),
                 ],
             );
+            let batch = restore_input_columns(batch)?;
             let lines = batch_to_vcf_lines(
                 &batch,
                 &vcf_info_fields,
@@ -1888,6 +2012,108 @@ pub async fn annotate_to_vcf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restore_fixture(info_keys: Vec<Option<&str>>) -> RecordBatch {
+        use datafusion::arrow::array::{Float32Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use std::collections::HashMap;
+
+        let renamed =
+            Field::new("INFO_AF", DataType::Float32, true).with_metadata(HashMap::from([
+                ("bio.vcf.field.field_type".to_string(), "INFO".to_string()),
+                (VEP_SOURCE_FIELD_NAME_KEY.to_string(), "AF".to_string()),
+            ]));
+        let rows = info_keys.len();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                renamed,
+                Field::new("CSQ", DataType::Utf8, true),
+                Field::new(VCF_INFO_KEYS_COLUMN, DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"; rows])),
+                Arc::new(Float32Array::from(vec![0.5; rows])),
+                Arc::new(StringArray::from(vec!["G|missense_variant"; rows])),
+                Arc::new(StringArray::from(info_keys)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_renamed_input_column_reaches_the_writer_under_its_own_name() {
+        let batch = restore_input_columns(restore_fixture(vec![Some("DP;AF")])).unwrap();
+        let schema = batch.schema();
+
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["chrom", "AF", "CSQ", VCF_INFO_KEYS_COLUMN]);
+        let restored = schema.field_with_name("AF").unwrap();
+        assert_eq!(restored.metadata()["bio.vcf.field.field_type"], "INFO");
+        assert!(!restored.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY));
+    }
+
+    /// Ensembl VEP removes an existing CSQ key and appends its own last, so the
+    /// old key must not keep its place in the carried order.
+    #[test]
+    fn an_input_csq_key_leaves_the_carried_order() {
+        use datafusion::arrow::array::StringArray;
+
+        let batch = restore_input_columns(restore_fixture(vec![
+            Some("DP;CSQ;AF"),
+            Some("CSQ"),
+            Some("myCSQ;DP"),
+            None,
+        ]))
+        .unwrap();
+        let keys = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let keys: Vec<Option<&str>> = keys.iter().collect();
+        assert_eq!(keys, [Some("DP;AF"), Some(""), Some("myCSQ;DP"), None]);
+    }
+
+    #[test]
+    fn a_batch_with_nothing_to_restore_is_returned_as_is() {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new(VCF_INFO_KEYS_COLUMN, DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"])),
+                Arc::new(StringArray::from(vec![Some("DP;platforms")])),
+            ],
+        )
+        .unwrap();
+        let restored = restore_input_columns(batch.clone()).unwrap();
+        assert!(Arc::ptr_eq(&restored.schema(), &batch.schema()));
+        assert!(Arc::ptr_eq(restored.column(1), batch.column(1)));
+    }
+
+    #[test]
+    fn the_inputs_csq_declaration_is_dropped_from_the_header() {
+        let existing = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##INFO=<ID=CSQ,Number=.,Type=String,Description=\"old. Format: Allele\">".to_string(),
+            "##INFO=<ID=CSQ_EXTRA,Number=1,Type=String,Description=\"not ours\">".to_string(),
+            "##INFO=<ID=AF,Number=A,Type=Float,Description=\"cohort\">".to_string(),
+        ];
+        let merged = merge_annotation_header_lines(existing, &[], &[], vec![]);
+        assert_eq!(
+            merged,
+            vec![
+                "##fileformat=VCFv4.2",
+                "##INFO=<ID=CSQ_EXTRA,Number=1,Type=String,Description=\"not ours\">",
+                "##INFO=<ID=AF,Number=A,Type=Float,Description=\"cohort\">",
+            ]
+        );
+    }
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
