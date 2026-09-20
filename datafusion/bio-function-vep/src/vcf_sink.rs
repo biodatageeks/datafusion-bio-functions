@@ -267,8 +267,11 @@ fn restore_input_columns(batch: RecordBatch) -> Result<RecordBatch> {
 }
 
 /// Whether a carried `;`-separated INFO key list names `CSQ`.
+///
+/// Runs on every record of every input, and almost none carries the key: the
+/// substring test settles those without splitting the list.
 fn has_csq_key(keys: &str) -> bool {
-    keys.split(';').any(|key| key == "CSQ")
+    keys.contains("CSQ") && keys.split(';').any(|key| key == "CSQ")
 }
 
 fn format_vcf_body_chunk(
