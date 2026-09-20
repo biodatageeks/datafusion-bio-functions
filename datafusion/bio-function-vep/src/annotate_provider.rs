@@ -891,8 +891,10 @@ pub(crate) fn source_field_name(field: &Field) -> &str {
 ///
 /// A renamed field records its input name under [`VEP_SOURCE_FIELD_NAME_KEY`],
 /// which is how the VCF sink writes it back under its own key. Input fields
-/// that collide with nothing are returned untouched, and a schema that was
-/// already renamed comes back unchanged.
+/// that collide with nothing are returned untouched. The marker is this
+/// provider's own bookkeeping: one inherited from the input is dropped, and the
+/// renames are a pure function of the input's names, so
+/// [`input_schema_of_output`] followed by this function reproduces the fields.
 pub(crate) fn input_fields_for_output(
     vcf_schema: &Schema,
     reserved: &HashSet<&str>,
@@ -912,8 +914,19 @@ pub(crate) fn input_fields_for_output(
             // identifies a carried record-layout column, and rebuilding the
             // fields bare made the sink reconstruct the first by name and lose
             // the second entirely.
+            // A marker on an input field was put there by an earlier
+            // annotation whose output is being annotated again. It named a
+            // column of THAT input; here the field is simply a column called
+            // what it is called.
+            let field = if field.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY) {
+                let mut metadata = field.metadata().clone();
+                metadata.remove(VEP_SOURCE_FIELD_NAME_KEY);
+                Arc::new(field.as_ref().clone().with_metadata(metadata))
+            } else {
+                Arc::clone(field)
+            };
             if !reserved.contains(field.name().as_str()) {
-                return Arc::clone(field);
+                return field;
             }
             let prefix = match field
                 .metadata()
@@ -938,6 +951,34 @@ pub(crate) fn input_fields_for_output(
             )
         })
         .collect()
+}
+
+/// The input schema an output schema's first `vcf_field_count` fields came
+/// from: every field under its input name and without the rename marker.
+///
+/// The streaming path builds a helper provider for the same input. Handing it
+/// the input's names, not the renamed ones, makes it derive the same renames
+/// and read the same lookup columns as its parent.
+pub(crate) fn input_schema_of_output(output: &Schema, vcf_field_count: usize) -> Schema {
+    let fields: Vec<Arc<Field>> = output.fields()[..vcf_field_count]
+        .iter()
+        .map(|field| {
+            if !field.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY) {
+                return Arc::clone(field);
+            }
+            let mut metadata = field.metadata().clone();
+            metadata.remove(VEP_SOURCE_FIELD_NAME_KEY);
+            Arc::new(
+                Field::new(
+                    source_field_name(field),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+                .with_metadata(metadata),
+            )
+        })
+        .collect();
+    Schema::new_with_metadata(fields, output.metadata().clone())
 }
 
 fn annotation_column_defs_for_selection(
@@ -14889,12 +14930,10 @@ async fn prepare_contig_data(
         .fields()
         .len()
         .saturating_sub(config.annotation_column_count);
-    // With the input's schema-level metadata: the helper provider's schema is
-    // the one emitted batches are built from, and it has to match the plan's.
-    let vcf_only_schema = Schema::new_with_metadata(
-        full_schema.fields()[..vcf_field_count].to_vec(),
-        full_schema.metadata().clone(),
-    );
+    // Under the input's names and with its schema-level metadata: the helper
+    // provider re-derives the parent's renames from them, and its schema is
+    // the one emitted batches are built from, so it has to match the plan's.
+    let vcf_only_schema = input_schema_of_output(&full_schema, vcf_field_count);
 
     // Parquet loads variation + context directly; no ephemeral tables are
     // registered, but the field is retained for the cleanup state machine.
@@ -16370,22 +16409,58 @@ mod tests {
         );
     }
 
-    /// The streaming path builds a helper provider from the VCF slice of an
-    /// output schema, so the rename runs on its own result.
+    /// The streaming path builds a helper provider for the same input from the
+    /// parent's output schema; it has to end up with the parent's fields.
     #[test]
-    fn renaming_an_already_renamed_schema_changes_nothing() {
+    fn the_helper_provider_reproduces_its_parents_fields() {
         let mut fields = core_input_fields();
         fields.push(vcf_input_field("AF", DataType::Float32, Some("INFO")));
-        let first = provider_for_input(fields).schema();
-        let vcf_slice: Vec<Field> = first.fields()[..6]
+        fields.push(vcf_input_field("INFO_AF", DataType::Float32, Some("INFO")));
+        let parent = provider_for_input(fields).schema();
+
+        let input = input_schema_of_output(&parent, 7);
+        let names: Vec<&str> = input.fields()[5..]
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, ["AF", "INFO_AF"]);
+        assert!(
+            input
+                .fields()
+                .iter()
+                .all(|f| !f.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY))
+        );
+
+        let helper =
+            provider_for_input(input.fields().iter().map(|f| f.as_ref().clone()).collect());
+        assert_eq!(&helper.schema().fields()[..7], &parent.fields()[..7]);
+        assert_eq!(helper.vcf_source_field_names()[5..], ["AF", "INFO_AF"]);
+    }
+
+    /// Annotating the output of an earlier annotation: its `INFO_AF` is a real
+    /// column of this input, and its generated `AF` is now an input column that
+    /// collides. A marker inherited from the first pass must not redirect either.
+    #[test]
+    fn an_inherited_marker_does_not_redirect_a_second_annotation() {
+        let mut first_input = core_input_fields();
+        first_input.push(vcf_input_field("AF", DataType::Float32, Some("INFO")));
+        let first = provider_for_input(first_input).schema();
+        let first_af = first.index_of("AF").unwrap();
+        // The second input: the first pass's input columns plus its typed AF.
+        let mut second_input: Vec<Field> = first.fields()[..6]
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        let provider = provider_for_input(vcf_slice);
-        let second = provider.schema();
+        second_input.push(first.field(first_af).as_ref().clone());
 
-        assert_eq!(&second.fields()[..6], &first.fields()[..6]);
-        assert_eq!(provider.vcf_source_field_names()[5], "AF");
+        let provider = provider_for_input(second_input);
+        let schema = provider.schema();
+        let names: Vec<&str> = schema.fields()[5..7]
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, ["INFO_AF", "INFO_AF_2"]);
+        assert_eq!(provider.vcf_source_field_names()[5..], ["INFO_AF", "AF"]);
     }
 
     #[test]
