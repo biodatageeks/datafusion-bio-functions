@@ -14889,7 +14889,12 @@ async fn prepare_contig_data(
         .fields()
         .len()
         .saturating_sub(config.annotation_column_count);
-    let vcf_only_schema = Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
+    // With the input's schema-level metadata: the helper provider's schema is
+    // the one emitted batches are built from, and it has to match the plan's.
+    let vcf_only_schema = Schema::new_with_metadata(
+        full_schema.fields()[..vcf_field_count].to_vec(),
+        full_schema.metadata().clone(),
+    );
 
     // Parquet loads variation + context directly; no ephemeral tables are
     // registered, but the field is retained for the cleanup state machine.
