@@ -2187,13 +2187,16 @@ mod tests {
         )
         .unwrap();
 
+        // The layout is "not carried" because the batch has no layout columns;
+        // the flag below only says that `start` is zero-based.
+        let coordinate_zero_based = true;
         let formatted = format_vcf_body_chunk(
             0,
             batch,
             Arc::new(Vec::new()),
             Arc::new(vec!["DP".to_string(), "GT".to_string()]),
             Arc::new(vec!["SAMPLE1".to_string()]),
-            true,
+            coordinate_zero_based,
         )
         .unwrap();
         let body = String::from_utf8(formatted.bytes).unwrap();
