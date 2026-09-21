@@ -17,14 +17,14 @@ datafusion.workspace = true
 tokio.workspace = true
 futures.workspace = true
 log.workspace = true
-# Must name the same datafusion-bio-formats revision as the pins in
+# Must name the same datafusion-bio-formats tag as the pins in
 # ../bio-function-vep/Cargo.toml (see the note there): a different one resolves
 # a second copy of datafusion-bio-format-core.
-datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "42ae1cd26c8dbfc5667d9421f3bf89dec05302f8", optional = true }
+datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.13.0", optional = true }
 async-trait = "0.1.88"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "42ae1cd26c8dbfc5667d9421f3bf89dec05302f8" }
+datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.13.0" }

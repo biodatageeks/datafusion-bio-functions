@@ -34,16 +34,15 @@ noodles-csi = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3
 noodles-tabix = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-bgzf = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
-# datafusion-bio-formats is pinned to a master commit, 42ae1cd, rather than a
-# release tag: it carries the GT-first FORMAT fix (datafusion-bio-formats#254),
-# which no tag includes yet. Every formats crate in this workspace, the pileup
-# crate's included, has to name the same revision, or the lockfile resolves two
-# copies of datafusion-bio-format-core. Move back to a tag once one is cut.
-datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "42ae1cd26c8dbfc5667d9421f3bf89dec05302f8" }
-datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "42ae1cd26c8dbfc5667d9421f3bf89dec05302f8" }
-datafusion-bio-format-gff = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "42ae1cd26c8dbfc5667d9421f3bf89dec05302f8" }
-datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "42ae1cd26c8dbfc5667d9421f3bf89dec05302f8" }
-datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "42ae1cd26c8dbfc5667d9421f3bf89dec05302f8", optional = true }
+# datafusion-bio-formats v1.13.0 is the first release with the GT-first FORMAT
+# fix (datafusion-bio-formats#254). Every formats crate in this workspace, the
+# pileup crate's included, has to name the same tag, or the lockfile resolves
+# two copies of datafusion-bio-format-core.
+datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.13.0" }
+datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.13.0" }
+datafusion-bio-format-gff = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.13.0" }
+datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.13.0" }
+datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", tag = "v1.13.0", optional = true }
 indicatif = "0.18.4"
 
 # `libc` is only used by `peak_rss_mb()` (getrusage) on UNIX; scoping it here
