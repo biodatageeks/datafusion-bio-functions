@@ -864,6 +864,123 @@ fn refseq_annotation_column_defs(
     defs
 }
 
+/// Field metadata key naming the input column a renamed output field came
+/// from. Set only on a field the engine renamed; see [`input_fields_for_output`].
+pub(crate) const VEP_SOURCE_FIELD_NAME_KEY: &str = "bio.vep.source_field_name";
+
+/// The input column an output field is read from: its own name, unless the
+/// engine renamed it.
+pub(crate) fn source_field_name(field: &Field) -> &str {
+    field
+        .metadata()
+        .get(VEP_SOURCE_FIELD_NAME_KEY)
+        .map_or(field.name().as_str(), String::as_str)
+}
+
+/// The input's fields as they appear in the output schema.
+///
+/// The engine appends `CSQ`, `most_severe_consequence` and the typed annotation
+/// columns to the input's own columns, and an input may already use one of
+/// those names: INFO/AF is declared by gnomAD, 1000 Genomes and any `bcftools
+/// +fill-tags` output, INFO/CSQ by every VEP-annotated file. DataFusion rejects
+/// a scan whose schema repeats a name, so the input column gives way: an INFO
+/// field becomes `INFO_<id>` and a FORMAT field `fmt_<id>`, the prefix the VCF
+/// reader already uses for a FORMAT id that clashes with an INFO id. The
+/// engine's columns keep their names, so `AF` means the same thing for every
+/// input.
+///
+/// A renamed field records its input name under [`VEP_SOURCE_FIELD_NAME_KEY`],
+/// which is how the VCF sink writes it back under its own key. Input fields
+/// that collide with nothing are returned untouched. The marker is this
+/// provider's own bookkeeping: one inherited from the input is dropped, and the
+/// renames are a pure function of the input's names, so
+/// [`input_schema_of_output`] followed by this function reproduces the fields.
+pub(crate) fn input_fields_for_output(
+    vcf_schema: &Schema,
+    reserved: &HashSet<&str>,
+) -> Vec<Arc<Field>> {
+    let mut taken: HashSet<String> = vcf_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .chain(reserved.iter().map(|name| (*name).to_string()))
+        .collect();
+    vcf_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            // The input fields keep their metadata: it carries the VCF typing
+            // the writer needs (`bio.vcf.field.*`) and the marker that
+            // identifies a carried record-layout column, and rebuilding the
+            // fields bare made the sink reconstruct the first by name and lose
+            // the second entirely.
+            // A marker on an input field was put there by an earlier
+            // annotation whose output is being annotated again. It named a
+            // column of THAT input; here the field is simply a column called
+            // what it is called.
+            let field = if field.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY) {
+                let mut metadata = field.metadata().clone();
+                metadata.remove(VEP_SOURCE_FIELD_NAME_KEY);
+                Arc::new(field.as_ref().clone().with_metadata(metadata))
+            } else {
+                Arc::clone(field)
+            };
+            if !reserved.contains(field.name().as_str()) {
+                return field;
+            }
+            let prefix = match field
+                .metadata()
+                .get("bio.vcf.field.field_type")
+                .map(String::as_str)
+            {
+                Some("FORMAT") => "fmt_",
+                _ => "INFO_",
+            };
+            let mut candidate = format!("{prefix}{}", field.name());
+            let mut suffix = 2;
+            while taken.contains(&candidate) {
+                candidate = format!("{prefix}{}_{suffix}", field.name());
+                suffix += 1;
+            }
+            taken.insert(candidate.clone());
+            let mut metadata = field.metadata().clone();
+            metadata.insert(VEP_SOURCE_FIELD_NAME_KEY.to_string(), field.name().clone());
+            Arc::new(
+                Field::new(candidate, field.data_type().clone(), field.is_nullable())
+                    .with_metadata(metadata),
+            )
+        })
+        .collect()
+}
+
+/// The input schema an output schema's first `vcf_field_count` fields came
+/// from: every field under its input name and without the rename marker.
+///
+/// The streaming path builds a helper provider for the same input. Handing it
+/// the input's names, not the renamed ones, makes it derive the same renames
+/// and read the same lookup columns as its parent.
+pub(crate) fn input_schema_of_output(output: &Schema, vcf_field_count: usize) -> Schema {
+    let fields: Vec<Arc<Field>> = output.fields()[..vcf_field_count]
+        .iter()
+        .map(|field| {
+            if !field.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY) {
+                return Arc::clone(field);
+            }
+            let mut metadata = field.metadata().clone();
+            metadata.remove(VEP_SOURCE_FIELD_NAME_KEY);
+            Arc::new(
+                Field::new(
+                    source_field_name(field),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+                .with_metadata(metadata),
+            )
+        })
+        .collect();
+    Schema::new_with_metadata(fields, output.metadata().clone())
+}
+
 fn annotation_column_defs_for_selection(
     transcript_selection: TranscriptSelectionFlags,
     include_pick_output: bool,
@@ -3785,21 +3902,12 @@ impl AnnotateProvider {
         let plugin_names =
             Self::parse_json_string_array_option(options_json.as_deref(), "plugins")?;
         // Output schema starts with all VCF columns and appends annotation
-        // fields. The input fields keep their metadata: it carries the VCF
-        // typing the writer needs (`bio.vcf.field.*`) and the marker that
-        // identifies a carried record-layout column, and rebuilding the fields
-        // bare made the sink reconstruct the first by name and lose the second
-        // entirely.
-        let mut fields: Vec<Arc<Field>> = vcf_schema
-            .fields()
-            .iter()
-            .map(|field| {
-                Arc::new(
-                    Field::new(field.name(), field.data_type().clone(), field.is_nullable())
-                        .with_metadata(field.metadata().clone()),
-                )
-            })
+        // fields. An input column named like one of those gives way to it.
+        let reserved: HashSet<&str> = ["CSQ", "most_severe_consequence"]
+            .into_iter()
+            .chain(annotation_column_defs.iter().map(|col_def| col_def.name))
             .collect();
+        let mut fields = input_fields_for_output(&vcf_schema, &reserved);
 
         fields.push(Arc::new(Field::new("CSQ", DataType::Utf8, true)));
         fields.push(Arc::new(Field::new(
@@ -3828,7 +3936,13 @@ impl AnnotateProvider {
             include_pick_output,
             csq_field_projection,
             annotation_column_defs,
-            schema: Arc::new(Schema::new(fields)),
+            // The input's schema-level metadata travels with its columns: it
+            // is the VCF header (contigs, filters, samples, file format) that a
+            // consumer of the annotated batches needs to write them back.
+            schema: Arc::new(Schema::new_with_metadata(
+                fields,
+                vcf_schema.metadata().clone(),
+            )),
             vcf_shard_ctx: None,
             #[cfg(feature = "parquet-cache")]
             plugin_cache_root: None,
@@ -3877,9 +3991,11 @@ impl AnnotateProvider {
         self.annotation_column_defs.len() + 2
     }
 
-    fn vcf_field_names(&self) -> Vec<String> {
+    /// The input column each VCF output field is read from. Differs from the
+    /// output name only for a field the engine renamed.
+    fn vcf_source_field_names(&self) -> Vec<String> {
         (0..self.vcf_field_count())
-            .map(|idx| self.schema.field(idx).name().clone())
+            .map(|idx| source_field_name(self.schema.field(idx)).to_string())
             .collect()
     }
 
@@ -7833,7 +7949,7 @@ impl AnnotateProvider {
         let finish_builders_started = engine_profile_enabled.then(Instant::now);
         let mut out_cols =
             Vec::with_capacity(self.vcf_field_count() + self.annotation_column_count());
-        for name in self.vcf_field_names() {
+        for name in self.vcf_source_field_names() {
             let idx = schema.index_of(&name).map_err(|_| {
                 DataFusionError::Execution(format!(
                     "annotate_vep(): expected VCF output column '{name}' missing from intermediate lookup output"
@@ -14814,7 +14930,10 @@ async fn prepare_contig_data(
         .fields()
         .len()
         .saturating_sub(config.annotation_column_count);
-    let vcf_only_schema = Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
+    // Under the input's names and with its schema-level metadata: the helper
+    // provider re-derives the parent's renames from them, and its schema is
+    // the one emitted batches are built from, so it has to match the plan's.
+    let vcf_only_schema = input_schema_of_output(&full_schema, vcf_field_count);
 
     // Parquet loads variation + context directly; no ephemeral tables are
     // registered, but the field is retained for the cleanup state machine.
@@ -16176,6 +16295,209 @@ mod tests {
         assert_eq!(
             empty.variant_fields("GGAGGA", None, "C", false).clin_sig,
             "benign"
+        );
+    }
+
+    /// An input field as the VCF reader declares it: INFO and FORMAT columns
+    /// carry their kind in `bio.vcf.field.field_type`.
+    fn vcf_input_field(name: &str, data_type: DataType, kind: Option<&str>) -> Field {
+        let field = Field::new(name, data_type, true);
+        match kind {
+            Some(kind) => field.with_metadata(HashMap::from([
+                ("bio.vcf.field.field_type".to_string(), kind.to_string()),
+                ("bio.vcf.field.number".to_string(), "A".to_string()),
+            ])),
+            None => field,
+        }
+    }
+
+    fn provider_for_input(fields: Vec<Field>) -> AnnotateProvider {
+        let tmp = tempfile::tempdir().unwrap();
+        AnnotateProvider::new(
+            Arc::new(SessionContext::new()),
+            "vcf".to_string(),
+            tmp.path().to_string_lossy().to_string(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Merged,
+            Some(r#"{"everything":true}"#.to_string()),
+            Schema::new(fields),
+        )
+        .unwrap()
+    }
+
+    fn core_input_fields() -> Vec<Field> {
+        vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::UInt32, false),
+            Field::new("end", DataType::UInt32, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]
+    }
+
+    /// gnomAD, 1000 Genomes and any `bcftools +fill-tags` output declare
+    /// INFO/AF; a VEP-annotated input declares INFO/CSQ. Both are names the
+    /// engine adds itself, and DataFusion rejects a scan whose schema repeats one.
+    #[test]
+    fn an_input_field_named_like_an_output_column_still_plans() {
+        let mut fields = core_input_fields();
+        fields.push(vcf_input_field("AF", DataType::Float32, Some("INFO")));
+        fields.push(vcf_input_field("CSQ", DataType::Utf8, Some("INFO")));
+        let schema = provider_for_input(fields).schema();
+
+        datafusion::common::DFSchema::try_from_qualified_schema("annotate_vep()", &schema)
+            .expect("output schema must not repeat a column name");
+    }
+
+    #[test]
+    fn a_colliding_input_field_gives_way_and_keeps_its_vcf_typing() {
+        let mut fields = core_input_fields();
+        fields.push(vcf_input_field("DP", DataType::Int32, Some("INFO")));
+        fields.push(vcf_input_field("AF", DataType::Float32, Some("INFO")));
+        fields.push(vcf_input_field("SOURCE", DataType::Utf8, Some("FORMAT")));
+        let provider = provider_for_input(fields);
+        let schema = provider.schema();
+
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            &names[..9],
+            &[
+                "chrom",
+                "start",
+                "end",
+                "ref",
+                "alt",
+                "DP",
+                "INFO_AF",
+                "fmt_SOURCE",
+                "CSQ"
+            ]
+        );
+        // The engine's own columns keep their names, after the input's.
+        assert!(
+            schema.index_of("AF").unwrap() > schema.index_of("most_severe_consequence").unwrap()
+        );
+
+        let renamed = schema.field_with_name("INFO_AF").unwrap();
+        assert_eq!(renamed.data_type(), &DataType::Float32);
+        assert_eq!(renamed.metadata()["bio.vcf.field.field_type"], "INFO");
+        assert_eq!(renamed.metadata()["bio.vcf.field.number"], "A");
+        assert_eq!(source_field_name(renamed), "AF");
+        assert_eq!(
+            source_field_name(schema.field_with_name("DP").unwrap()),
+            "DP"
+        );
+        assert_eq!(
+            provider.vcf_source_field_names(),
+            ["chrom", "start", "end", "ref", "alt", "DP", "AF", "SOURCE"]
+        );
+    }
+
+    /// No HG002 input declares a colliding id, and their output is gated byte
+    /// for byte: an input that collides with nothing must come through as is.
+    #[test]
+    fn an_input_without_collisions_is_carried_unchanged() {
+        let mut fields = core_input_fields();
+        fields.push(vcf_input_field("DP", DataType::Int32, Some("INFO")));
+        fields.push(vcf_input_field("GT", DataType::Utf8, Some("FORMAT")));
+        let input = Schema::new(fields.clone());
+        let schema = provider_for_input(fields).schema();
+
+        assert_eq!(
+            &schema.fields()[..input.fields().len()],
+            &input.fields()[..]
+        );
+    }
+
+    /// The streaming path builds a helper provider for the same input from the
+    /// parent's output schema; it has to end up with the parent's fields.
+    #[test]
+    fn the_helper_provider_reproduces_its_parents_fields() {
+        let mut fields = core_input_fields();
+        fields.push(vcf_input_field("AF", DataType::Float32, Some("INFO")));
+        fields.push(vcf_input_field("INFO_AF", DataType::Float32, Some("INFO")));
+        let parent = provider_for_input(fields).schema();
+
+        let input = input_schema_of_output(&parent, 7);
+        let names: Vec<&str> = input.fields()[5..]
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, ["AF", "INFO_AF"]);
+        assert!(
+            input
+                .fields()
+                .iter()
+                .all(|f| !f.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY))
+        );
+
+        let helper =
+            provider_for_input(input.fields().iter().map(|f| f.as_ref().clone()).collect());
+        assert_eq!(&helper.schema().fields()[..7], &parent.fields()[..7]);
+        assert_eq!(helper.vcf_source_field_names()[5..], ["AF", "INFO_AF"]);
+    }
+
+    /// Annotating the output of an earlier annotation: its `INFO_AF` is a real
+    /// column of this input, and its generated `AF` is now an input column that
+    /// collides. A marker inherited from the first pass must not redirect either.
+    #[test]
+    fn an_inherited_marker_does_not_redirect_a_second_annotation() {
+        let mut first_input = core_input_fields();
+        first_input.push(vcf_input_field("AF", DataType::Float32, Some("INFO")));
+        let first = provider_for_input(first_input).schema();
+        let first_af = first.index_of("AF").unwrap();
+        // The second input: the first pass's input columns plus its typed AF.
+        let mut second_input: Vec<Field> = first.fields()[..6]
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        second_input.push(first.field(first_af).as_ref().clone());
+
+        let provider = provider_for_input(second_input);
+        let schema = provider.schema();
+        let names: Vec<&str> = schema.fields()[5..7]
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, ["INFO_AF", "INFO_AF_2"]);
+        assert_eq!(provider.vcf_source_field_names()[5..], ["INFO_AF", "AF"]);
+    }
+
+    #[test]
+    fn a_prefixed_name_the_input_already_uses_gets_a_suffix() {
+        let mut fields = core_input_fields();
+        fields.push(vcf_input_field("AF", DataType::Float32, Some("INFO")));
+        fields.push(vcf_input_field("INFO_AF", DataType::Float32, Some("INFO")));
+        let schema = provider_for_input(fields).schema();
+
+        let names: Vec<&str> = schema.fields()[5..7]
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, ["INFO_AF_2", "INFO_AF"]);
+    }
+
+    #[test]
+    fn the_input_schema_metadata_is_carried() {
+        let input = Schema::new_with_metadata(
+            core_input_fields(),
+            HashMap::from([("bio.vcf.file_format".to_string(), "VCFv4.2".to_string())]),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = AnnotateProvider::new(
+            Arc::new(SessionContext::new()),
+            "vcf".to_string(),
+            tmp.path().to_string_lossy().to_string(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Merged,
+            Some(r#"{"everything":true}"#.to_string()),
+            input,
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider.schema().metadata()["bio.vcf.file_format"],
+            "VCFv4.2"
         );
     }
 
