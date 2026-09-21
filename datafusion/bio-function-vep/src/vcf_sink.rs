@@ -946,6 +946,7 @@ fn is_stale_provenance_line(line: &str) -> bool {
 /// first, including fields whose new manifest intentionally has no description,
 /// while preserving arbitrary structured source declarations; then append the
 /// current descriptions and provenance exactly once.
+///
 /// Merges this run's plugin field lines and provenance into a source header.
 ///
 /// Public so that a caller writing the VCF itself gets the same header the sink
@@ -1109,6 +1110,9 @@ pub(crate) fn provenance_header_lines(
 /// after the input's own lines, and any provenance or plugin lines left by an
 /// earlier annotation removed, since they describe a `CSQ` that is being
 /// replaced. A caller that writes the VCF itself passes `output_vcf: None`.
+///
+/// `cache_source` has to be an existing cache: its type (Ensembl, RefSeq or
+/// merged) is read from it and recorded, and an unreadable cache is an error.
 pub fn annotation_header_lines(
     existing: Vec<String>,
     input_vcf: &str,
@@ -3094,6 +3098,53 @@ mod tests {
                 .all(|pair| position(pair[0]) < position(pair[1])),
             "{line}"
         );
+    }
+
+    /// What outside callers get. The public entry point is the cache-type
+    /// lookup followed by this body, which the sink calls as well.
+    #[test]
+    fn a_caller_with_no_output_gets_the_inputs_lines_then_provenance() {
+        let existing = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##fileDate=20160824".to_string(),
+        ];
+        let build = |output: Option<&str>| {
+            annotation_header_lines_for(
+                existing.clone(),
+                "/in.vcf",
+                "/caches/116_GRCh38_merged",
+                output,
+                &AnnotateVcfConfig::default(),
+                CacheSourceType::Ensembl,
+            )
+            .unwrap()
+        };
+        let lines = build(None);
+        assert_eq!(&lines[..2], &existing[..], "the input's lines come first");
+        assert_eq!(lines.len(), 4);
+        assert!(lines[2].starts_with(&format!("##{PROVENANCE_KEY}=")));
+        assert!(lines[3].starts_with(&format!("##{PROVENANCE_KEY}-command-line='")));
+        assert!(!lines[3].contains("\"output\"") && !lines[3].contains("\"compression\""));
+
+        // The sink's call differs from it only in those two facts.
+        let sunk = build(Some("/out.vcf"));
+        assert_eq!(sunk[..3], lines[..3]);
+        assert!(sunk[3].contains("\"output\":\"/out.vcf\""));
+    }
+
+    /// The cache type is read from the cache, so the cache has to exist: a
+    /// caller gets an error naming it, never provenance for a guessed type.
+    #[test]
+    fn the_public_entry_point_refuses_a_cache_it_cannot_read() {
+        let error = annotation_header_lines(
+            vec!["##fileformat=VCFv4.2".to_string()],
+            "/in.vcf",
+            "/no/such/cache",
+            None,
+            &AnnotateVcfConfig::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("/no/such/cache"), "{error}");
     }
 
     #[test]
