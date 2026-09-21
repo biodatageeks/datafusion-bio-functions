@@ -946,7 +946,12 @@ fn is_stale_provenance_line(line: &str) -> bool {
 /// first, including fields whose new manifest intentionally has no description,
 /// while preserving arbitrary structured source declarations; then append the
 /// current descriptions and provenance exactly once.
-fn merge_annotation_header_lines(
+///
+/// Merges this run's plugin field lines and provenance into a source header.
+///
+/// Public so that a caller writing the VCF itself gets the same header the sink
+/// writes; see [`annotation_header_lines`] for the whole step.
+pub fn merge_annotation_header_lines(
     existing: Vec<String>,
     plugin_field_names: &[String],
     plugin_field_descriptions: &[(String, String)],
@@ -989,10 +994,23 @@ fn merge_annotation_header_lines(
     lines
 }
 
-fn provenance_header_lines(
+/// The two provenance header lines of an annotated VCF: which engine, cache and
+/// options produced its `CSQ`.
+///
+/// `output_vcf` is `None` for a caller that hands the annotated batches on
+/// instead of writing a file here. The command line then records neither
+/// `output` nor `compression`, which such a caller does not have, rather than
+/// invented values. Everything else is identical to what the sink writes.
+///
+/// The provenance key is fixed to this crate's name and is not configurable, so
+/// no caller can make the lines claim to be another tool's.
+///
+/// Crate-private because it takes the resolved cache type; outside callers go
+/// through [`annotation_header_lines`], which resolves it from the cache.
+pub(crate) fn provenance_header_lines(
     input_vcf: &str,
     cache_source: &str,
-    output_vcf: &str,
+    output_vcf: Option<&str>,
     config: &AnnotateVcfConfig,
     cache_source_type: CacheSourceType,
 ) -> Vec<String> {
@@ -1045,26 +1063,118 @@ fn provenance_header_lines(
         VcfCompressionType::Bgzf => "bgzf",
     };
 
-    let invocation = serde_json::json!({
-        "engine": env!("CARGO_PKG_NAME"),
-        "compression": compression,
-        "input": input_vcf,
-        "output": output_vcf,
-        "cache": cache_source,
-        "reference_fasta": config.reference_fasta_path,
-        "plugin_cache_root": config.plugin_cache_root
-            .as_ref()
-            .map(|p| p.display().to_string()),
-        "options": serde_json::from_str::<serde_json::Value>(
-            &config.to_options_json_with_cache_format(),
-        )
-        .unwrap_or(serde_json::Value::Null),
-    });
+    // Built key by key, in the order the sink has always written them: this
+    // serde_json keeps insertion order, and the line is part of a header that
+    // has to stay byte-reproducible. `compression` and `output` are sink-only
+    // facts and are left out, not invented, for a caller with no output file.
+    let mut invocation = serde_json::Map::new();
+    invocation.insert("engine".into(), env!("CARGO_PKG_NAME").into());
+    if output_vcf.is_some() {
+        invocation.insert("compression".into(), compression.into());
+    }
+    invocation.insert("input".into(), input_vcf.into());
+    if let Some(output_vcf) = output_vcf {
+        invocation.insert("output".into(), output_vcf.into());
+    }
+    invocation.insert("cache".into(), cache_source.into());
+    invocation.insert(
+        "reference_fasta".into(),
+        serde_json::json!(config.reference_fasta_path),
+    );
+    invocation.insert(
+        "plugin_cache_root".into(),
+        serde_json::json!(
+            config
+                .plugin_cache_root
+                .as_ref()
+                .map(|p| p.display().to_string())
+        ),
+    );
+    invocation.insert(
+        "options".into(),
+        serde_json::from_str::<serde_json::Value>(&config.to_options_json_with_cache_format())
+            .unwrap_or(serde_json::Value::Null),
+    );
+    let invocation = serde_json::Value::Object(invocation);
 
     vec![
         identity,
         format!("##{PROVENANCE_KEY}-command-line='{invocation}'"),
     ]
+}
+
+/// The header lines of an annotated VCF, given the source's own `##` lines.
+///
+/// This is everything the sink does to the header before the writer re-declares
+/// `CSQ`: plugin field lines as Ensembl VEP writes them, this run's provenance
+/// after the input's own lines, and any provenance or plugin lines left by an
+/// earlier annotation removed, since they describe a `CSQ` that is being
+/// replaced. A caller that writes the VCF itself passes `output_vcf: None`.
+///
+/// `cache_source` has to be an existing cache: its type (Ensembl, RefSeq or
+/// merged) is read from it and recorded, and an unreadable cache is an error.
+pub fn annotation_header_lines(
+    existing: Vec<String>,
+    input_vcf: &str,
+    cache_source: &str,
+    output_vcf: Option<&str>,
+    config: &AnnotateVcfConfig,
+) -> Result<Vec<String>> {
+    let cache_source_type = cache_source_type_from_cache_source(cache_source)?;
+    annotation_header_lines_for(
+        existing,
+        input_vcf,
+        cache_source,
+        output_vcf,
+        config,
+        cache_source_type,
+    )
+}
+
+/// [`annotation_header_lines`] for a caller that already resolved the cache type.
+fn annotation_header_lines_for(
+    existing: Vec<String>,
+    input_vcf: &str,
+    cache_source: &str,
+    output_vcf: Option<&str>,
+    config: &AnnotateVcfConfig,
+    cache_source_type: CacheSourceType,
+) -> Result<Vec<String>> {
+    // Ensembl VEP writes one `##<FIELD>=<description>` line per plugin field
+    // (from the plugin's `get_header_info()`), ahead of its provenance.
+    #[cfg(feature = "parquet-cache")]
+    let (plugin_field_names, plugin_field_descriptions) =
+        if let Some(root) = config.plugin_cache_root.as_ref() {
+            (
+                // Clean up declarations from every cached plugin, not only
+                // the selected subset. Otherwise re-annotating A+B with B
+                // leaves A's stale unstructured header lines behind.
+                crate::plugin_cache::registry::PluginRegistry::field_names_for_cleanup(root),
+                crate::plugin_cache::registry::PluginRegistry::field_descriptions(
+                    root,
+                    config.plugins.as_deref(),
+                )?,
+            )
+        } else {
+            Default::default()
+        };
+    #[cfg(not(feature = "parquet-cache"))]
+    let (plugin_field_names, plugin_field_descriptions): (Vec<String>, Vec<(String, String)>) =
+        Default::default();
+
+    let lines = merge_annotation_header_lines(
+        existing,
+        &plugin_field_names,
+        &plugin_field_descriptions,
+        provenance_header_lines(
+            input_vcf,
+            cache_source,
+            output_vcf,
+            config,
+            cache_source_type,
+        ),
+    );
+    Ok(lines)
 }
 
 fn csq_header_description(
@@ -1769,42 +1879,14 @@ pub async fn annotate_to_vcf(
     if let Some(raw_json) = write_metadata.get(VCF_HEADER_RAW_LINES_KEY)
         && let Ok(existing) = serde_json::from_str::<Vec<String>>(raw_json)
     {
-        // Ensembl VEP writes one `##<FIELD>=<description>` line per plugin field
-        // (from the plugin's `get_header_info()`), ahead of its provenance.
-        #[cfg(feature = "parquet-cache")]
-        let (plugin_field_names, plugin_field_descriptions) =
-            if let Some(root) = config.plugin_cache_root.as_ref() {
-                (
-                    // Clean up declarations from every cached plugin, not only
-                    // the selected subset. Otherwise re-annotating A+B with B
-                    // leaves A's stale unstructured header lines behind.
-                    crate::plugin_cache::registry::PluginRegistry::field_names_for_cleanup(root),
-                    crate::plugin_cache::registry::PluginRegistry::field_descriptions(
-                        root,
-                        config.plugins.as_deref(),
-                    )?,
-                )
-            } else {
-                Default::default()
-            };
-        #[cfg(not(feature = "parquet-cache"))]
-        let (plugin_field_names, plugin_field_descriptions): (
-            Vec<String>,
-            Vec<(String, String)>,
-        ) = Default::default();
-
-        let lines = merge_annotation_header_lines(
+        let lines = annotation_header_lines_for(
             existing,
-            &plugin_field_names,
-            &plugin_field_descriptions,
-            provenance_header_lines(
-                input_vcf,
-                cache_source,
-                output_vcf,
-                config,
-                cache_source_type,
-            ),
-        );
+            input_vcf,
+            cache_source,
+            Some(output_vcf),
+            config,
+            cache_source_type,
+        )?;
         if let Ok(json) = serde_json::to_string(&lines) {
             write_metadata.insert(VCF_HEADER_RAW_LINES_KEY.to_string(), json);
         }
@@ -2826,7 +2908,7 @@ mod tests {
         provenance_header_lines(
             "/in/sample.vcf.gz",
             cache,
-            "/out/sample.annotated.vcf",
+            Some("/out/sample.annotated.vcf"),
             config,
             CacheSourceType::Merged,
         )
@@ -2862,7 +2944,7 @@ mod tests {
         provenance_header_lines(
             "/in/sample.vcf.gz",
             "/caches/116_GRCh38_merged",
-            "/out/sample.annotated.vcf",
+            Some("/out/sample.annotated.vcf"),
             config,
             CacheSourceType::Merged,
         )
@@ -2910,7 +2992,7 @@ mod tests {
         let lines = provenance_header_lines(
             "/in.vcf",
             "/cache",
-            "/out.vcf",
+            Some("/out.vcf"),
             &AnnotateVcfConfig::default(),
             CacheSourceType::Merged,
         );
@@ -2950,6 +3032,119 @@ mod tests {
             "{}",
             provenance_for(&bgzf)[1]
         );
+    }
+
+    /// A caller that hands the annotated batches on has no output file. Its
+    /// provenance must say so by omission, not by an invented value, and must
+    /// otherwise be the sink's.
+    #[test]
+    fn provenance_without_an_output_omits_only_the_sink_facts() {
+        let config = AnnotateVcfConfig::default();
+        let with = provenance_header_lines(
+            "/in.vcf",
+            "/cache",
+            Some("/out.vcf"),
+            &config,
+            CacheSourceType::Ensembl,
+        );
+        let without =
+            provenance_header_lines("/in.vcf", "/cache", None, &config, CacheSourceType::Ensembl);
+        assert_eq!(
+            with[0], without[0],
+            "the identity line does not depend on the output"
+        );
+
+        let parse = |line: &str| -> serde_json::Value {
+            let json = line
+                .split_once("-command-line='")
+                .unwrap()
+                .1
+                .strip_suffix('\'')
+                .unwrap();
+            serde_json::from_str(json).unwrap()
+        };
+        let (mut with, without) = (parse(&with[1]), parse(&without[1]));
+        assert!(without.get("output").is_none() && without.get("compression").is_none());
+        let object = with.as_object_mut().unwrap();
+        assert_eq!(object.remove("output").unwrap(), "/out.vcf");
+        assert_eq!(object.remove("compression").unwrap(), "plain");
+        assert_eq!(with, without, "everything else is identical");
+    }
+
+    /// Adding the sink facts after the fact must not change the line the sink
+    /// has always written: key order is part of byte reproducibility.
+    #[test]
+    fn provenance_with_an_output_keeps_its_key_order() {
+        let line = &provenance_header_lines(
+            "/in.vcf",
+            "/cache",
+            Some("/out.vcf"),
+            &AnnotateVcfConfig::default(),
+            CacheSourceType::Ensembl,
+        )[1];
+        let position = |key: &str| line.find(&format!("\"{key}\":")).unwrap();
+        let keys = [
+            "engine",
+            "compression",
+            "input",
+            "output",
+            "cache",
+            "reference_fasta",
+            "plugin_cache_root",
+            "options",
+        ];
+        assert!(
+            keys.windows(2)
+                .all(|pair| position(pair[0]) < position(pair[1])),
+            "{line}"
+        );
+    }
+
+    /// What outside callers get. The public entry point is the cache-type
+    /// lookup followed by this body, which the sink calls as well.
+    #[test]
+    fn a_caller_with_no_output_gets_the_inputs_lines_then_provenance() {
+        let existing = vec![
+            "##fileformat=VCFv4.2".to_string(),
+            "##fileDate=20160824".to_string(),
+        ];
+        let build = |output: Option<&str>| {
+            annotation_header_lines_for(
+                existing.clone(),
+                "/in.vcf",
+                "/caches/116_GRCh38_merged",
+                output,
+                &AnnotateVcfConfig::default(),
+                CacheSourceType::Ensembl,
+            )
+            .unwrap()
+        };
+        let lines = build(None);
+        assert_eq!(&lines[..2], &existing[..], "the input's lines come first");
+        assert_eq!(lines.len(), 4);
+        assert!(lines[2].starts_with(&format!("##{PROVENANCE_KEY}=")));
+        assert!(lines[3].starts_with(&format!("##{PROVENANCE_KEY}-command-line='")));
+        assert!(!lines[3].contains("\"output\"") && !lines[3].contains("\"compression\""));
+
+        // The sink's call differs from it only in those two facts.
+        let sunk = build(Some("/out.vcf"));
+        assert_eq!(sunk[..3], lines[..3]);
+        assert!(sunk[3].contains("\"output\":\"/out.vcf\""));
+    }
+
+    /// The cache type is read from the cache, so the cache has to exist: a
+    /// caller gets an error naming it, never provenance for a guessed type.
+    #[test]
+    fn the_public_entry_point_refuses_a_cache_it_cannot_read() {
+        let error = annotation_header_lines(
+            vec!["##fileformat=VCFv4.2".to_string()],
+            "/in.vcf",
+            "/no/such/cache",
+            None,
+            &AnnotateVcfConfig::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("/no/such/cache"), "{error}");
     }
 
     #[test]

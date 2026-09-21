@@ -19,7 +19,10 @@ chrono = "0.4"
 smallvec = { version = "1.15.1", optional = true }
 flate2 = "1.1.0"
 coitrees = "0.4.0"
-serde_json = "1"
+# preserve_order is load-bearing: the provenance command line is written with its
+# keys in insertion order, and that line is part of a byte-reproducible header.
+# Declared here rather than left to feature unification with another crate.
+serde_json = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 # Streaming MD5 of plugin build inputs (`plugin_cache::source_verify`).
