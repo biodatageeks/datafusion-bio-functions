@@ -2151,6 +2151,55 @@ mod tests {
         assert_eq!(schema.field(2).metadata()["bio.vcf.field.format_id"], "CSQ");
     }
 
+    /// With no carried record layout the writer falls back to the header's
+    /// FORMAT order, which need not start with GT (GIAB HG002 declares DP
+    /// first). VCF 4.x requires GT first when it is present.
+    #[test]
+    fn the_body_formatter_writes_gt_first_when_the_layout_is_not_carried() {
+        use datafusion::arrow::array::{Float64Array, Int32Array, StringArray, UInt32Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+                Field::new("id", DataType::Utf8, true),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+                Field::new("qual", DataType::Float64, true),
+                Field::new("filter", DataType::Utf8, true),
+                Field::new("DP", DataType::Int32, true),
+                Field::new("GT", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"])),
+                Arc::new(UInt32Array::from(vec![99u32])),
+                Arc::new(UInt32Array::from(vec![100u32])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+                Arc::new(Float64Array::from(vec![Some(30.0)])),
+                Arc::new(StringArray::from(vec![Some("PASS")])),
+                Arc::new(Int32Array::from(vec![Some(25)])),
+                Arc::new(StringArray::from(vec![Some("0/1")])),
+            ],
+        )
+        .unwrap();
+
+        let formatted = format_vcf_body_chunk(
+            0,
+            batch,
+            Arc::new(Vec::new()),
+            Arc::new(vec!["DP".to_string(), "GT".to_string()]),
+            Arc::new(vec!["SAMPLE1".to_string()]),
+            true,
+        )
+        .unwrap();
+        let body = String::from_utf8(formatted.bytes).unwrap();
+        assert!(body.contains("\tGT:DP\t0/1:25"), "got: {body}");
+    }
+
     #[test]
     fn the_inputs_csq_declaration_is_recognised_in_any_case() {
         assert!(is_input_csq_declaration(
