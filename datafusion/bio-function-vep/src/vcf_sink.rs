@@ -648,11 +648,6 @@ impl ColocatedOptions {
             ("pubmed", self.pubmed),
         ]
     }
-
-    /// Whether any switch is on.
-    pub fn any(&self) -> bool {
-        self.as_pairs().iter().any(|(_, enabled)| *enabled)
-    }
 }
 
 impl Default for AnnotateVcfConfig {
@@ -2799,7 +2794,6 @@ mod tests {
         for (key, _) in ColocatedOptions::default().as_pairs() {
             assert!(json.get(key).is_none(), "{key} should be absent");
         }
-        assert!(!ColocatedOptions::default().any());
     }
 
     #[test]
