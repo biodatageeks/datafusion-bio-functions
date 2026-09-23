@@ -599,6 +599,60 @@ pub struct AnnotateVcfConfig {
     /// record is written with its original line and no `CSQ` key, matching
     /// `OutputFactory/VCF.pm:341-353`. False by default, matching VEP.
     pub allow_non_variant: bool,
+    /// The co-located variant lookup, as Ensembl VEP's `--check_existing`,
+    /// `--af`, `--af_1kg`, `--af_gnomade`, `--af_gnomadg`, `--max_af` and
+    /// `--pubmed` switch it on.
+    ///
+    /// `everything` implies all of them, so these only matter on their own.
+    /// Without them the config could not express a co-located run that was not
+    /// an `everything` run: the annotation options JSON is built from this
+    /// struct, so a caller asking for `af` alone got neither the lookup nor a
+    /// provenance line saying it had asked.
+    pub colocated: ColocatedOptions,
+}
+
+/// Ensembl VEP's co-located variant switches, each off by default.
+///
+/// Grouped rather than spread over [`AnnotateVcfConfig`] because they travel
+/// together: `everything` turns on the lot, and the annotation engine reads
+/// them under these names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ColocatedOptions {
+    /// `--check_existing`: known variant ids for each input variant.
+    pub check_existing: bool,
+    /// `--af`: the 1000 Genomes global allele frequency.
+    pub af: bool,
+    /// `--af_1kg`: the 1000 Genomes continental allele frequencies.
+    pub af_1kg: bool,
+    /// `--af_gnomade`: gnomAD exome allele frequencies.
+    pub af_gnomade: bool,
+    /// `--af_gnomadg`: gnomAD genome allele frequencies.
+    pub af_gnomadg: bool,
+    /// `--max_af`: the highest allele frequency across the populations.
+    pub max_af: bool,
+    /// `--pubmed`: PubMed ids citing each co-located variant.
+    pub pubmed: bool,
+}
+
+impl ColocatedOptions {
+    /// Each switch with the name the annotation options JSON uses, in the
+    /// order Ensembl VEP documents them.
+    fn as_pairs(&self) -> [(&'static str, bool); 7] {
+        [
+            ("check_existing", self.check_existing),
+            ("af", self.af),
+            ("af_1kg", self.af_1kg),
+            ("af_gnomade", self.af_gnomade),
+            ("af_gnomadg", self.af_gnomadg),
+            ("max_af", self.max_af),
+            ("pubmed", self.pubmed),
+        ]
+    }
+
+    /// Whether any switch is on.
+    pub fn any(&self) -> bool {
+        self.as_pairs().iter().any(|(_, enabled)| *enabled)
+    }
 }
 
 impl Default for AnnotateVcfConfig {
@@ -644,6 +698,7 @@ impl Default for AnnotateVcfConfig {
             provenance_tool_version: None,
             preserve_record_layout: false,
             allow_non_variant: false,
+            colocated: ColocatedOptions::default(),
         }
     }
 }
@@ -681,6 +736,16 @@ impl AnnotateVcfConfig {
         ] {
             if enabled {
                 opts.insert(key.into(), serde_json::Value::Bool(true));
+            }
+        }
+        // `everything` already implies the lot, so they are written only when
+        // asked for on their own. A run that sets none emits what it always
+        // did, which keeps existing headers byte-reproducible.
+        if !self.everything {
+            for (key, enabled) in self.colocated.as_pairs() {
+                if enabled {
+                    opts.insert(key.into(), serde_json::Value::Bool(true));
+                }
             }
         }
         if let Some(ref pick_order) = self.pick_order {
@@ -2680,6 +2745,61 @@ mod tests {
         assert!(json.get("forks").is_none());
         assert!(json.get("contig_parallelism").is_none());
         assert!(json.get("inline_lookup").is_none());
+    }
+
+    #[test]
+    fn to_options_json_emits_the_colocated_switches_asked_for() {
+        let config = AnnotateVcfConfig {
+            colocated: ColocatedOptions {
+                af: true,
+                pubmed: true,
+                ..ColocatedOptions::default()
+            },
+            ..AnnotateVcfConfig::default()
+        };
+        let json: serde_json::Value = serde_json::from_str(&config.to_options_json()).unwrap();
+        assert_eq!(json["af"], true);
+        assert_eq!(json["pubmed"], true);
+        // Only the ones asked for: the rest stay absent rather than false.
+        for key in [
+            "check_existing",
+            "af_1kg",
+            "af_gnomade",
+            "af_gnomadg",
+            "max_af",
+        ] {
+            assert!(json.get(key).is_none(), "{key} should be absent");
+        }
+    }
+
+    #[test]
+    fn everything_leaves_the_colocated_switches_implied() {
+        // `everything` turns them on anyway, and a header that has always read
+        // `{"everything": true}` has to keep reading exactly that.
+        let implied = AnnotateVcfConfig {
+            everything: true,
+            colocated: ColocatedOptions {
+                af: true,
+                check_existing: true,
+                ..ColocatedOptions::default()
+            },
+            ..AnnotateVcfConfig::default()
+        };
+        let plain = AnnotateVcfConfig {
+            everything: true,
+            ..AnnotateVcfConfig::default()
+        };
+        assert_eq!(implied.to_options_json(), plain.to_options_json());
+    }
+
+    #[test]
+    fn a_run_without_colocated_switches_serialises_as_it_always_did() {
+        let config = AnnotateVcfConfig::default();
+        let json: serde_json::Value = serde_json::from_str(&config.to_options_json()).unwrap();
+        for (key, _) in ColocatedOptions::default().as_pairs() {
+            assert!(json.get(key).is_none(), "{key} should be absent");
+        }
+        assert!(!ColocatedOptions::default().any());
     }
 
     #[test]
