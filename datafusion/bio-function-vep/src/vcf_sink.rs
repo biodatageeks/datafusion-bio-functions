@@ -1173,15 +1173,25 @@ pub(crate) fn provenance_header_lines(
 ///
 /// `cache_source` has to be an existing cache: its type (Ensembl, RefSeq or
 /// merged) is read from it and recorded, and an unreadable cache is an error.
+///
+/// Returns the lines and, beside them, the `CSQ` description the sink would
+/// write. A caller writing its own VCF has to declare `CSQ` itself and cannot
+/// derive the field list: it follows `everything`, the cache source type, the
+/// pick options and the selected plugins' manifests. Handing over the same
+/// string [`annotate_to_vcf`] uses keeps the two paths from describing one run
+/// differently.
+///
+/// The lines do **not** include the `CSQ` line: the sink places it itself, and
+/// returning it here would have that path declare it twice.
 pub fn annotation_header_lines(
     existing: Vec<String>,
     input_vcf: &str,
     cache_source: &str,
     output_vcf: Option<&str>,
     config: &AnnotateVcfConfig,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, String)> {
     let cache_source_type = cache_source_type_from_cache_source(cache_source)?;
-    annotation_header_lines_for(
+    annotation_header_lines_with_csq_for(
         existing,
         input_vcf,
         cache_source,
@@ -1189,6 +1199,28 @@ pub fn annotation_header_lines(
         config,
         cache_source_type,
     )
+}
+
+/// [`annotation_header_lines`] for a caller that already resolved the cache
+/// type.
+fn annotation_header_lines_with_csq_for(
+    existing: Vec<String>,
+    input_vcf: &str,
+    cache_source: &str,
+    output_vcf: Option<&str>,
+    config: &AnnotateVcfConfig,
+    cache_source_type: CacheSourceType,
+) -> Result<(Vec<String>, String)> {
+    let lines = annotation_header_lines_for(
+        existing,
+        input_vcf,
+        cache_source,
+        output_vcf,
+        config,
+        cache_source_type,
+    )?;
+    let description = csq_header_description(config, cache_source_type)?;
+    Ok((lines, description))
 }
 
 /// [`annotation_header_lines`] for a caller that already resolved the cache type.
@@ -3244,6 +3276,47 @@ mod tests {
         let sunk = build(Some("/out.vcf"));
         assert_eq!(sunk[..3], lines[..3]);
         assert!(sunk[3].contains("\"output\":\"/out.vcf\""));
+    }
+
+    /// A caller writing its own VCF has to declare `CSQ` itself, and cannot
+    /// derive the field list: it depends on `everything`, the cache source and
+    /// the pick options, and on the plugin manifests. So the entry point hands
+    /// over the description the sink would have written.
+    #[test]
+    fn a_caller_with_no_output_is_given_the_csq_description() {
+        let partial = AnnotateVcfConfig {
+            hgvs: true,
+            ..AnnotateVcfConfig::default()
+        };
+        let (_lines, description) = annotation_header_lines_with_csq_for(
+            vec!["##fileformat=VCFv4.2".to_string()],
+            "/in.vcf",
+            "/caches/116_GRCh38_merged",
+            None,
+            &partial,
+            CacheSourceType::Ensembl,
+        )
+        .unwrap();
+
+        // Exactly the string the sink puts in its own CSQ line.
+        assert_eq!(
+            description,
+            csq_header_description(&partial, CacheSourceType::Ensembl).unwrap()
+        );
+        assert!(description.starts_with("Consequence annotations from Ensembl VEP. Format: "));
+
+        // And it is the partial layout, not the `everything` one: the whole
+        // point is that a caller cannot guess this.
+        let everything = AnnotateVcfConfig {
+            everything: true,
+            ..AnnotateVcfConfig::default()
+        };
+        let full = csq_header_description(&everything, CacheSourceType::Ensembl).unwrap();
+        assert_ne!(description, full);
+        assert!(
+            description.matches('|').count() < full.matches('|').count(),
+            "a partial flag set declares fewer fields\n  partial: {description}\n  full: {full}"
+        );
     }
 
     /// The cache type is read from the cache, so the cache has to exist: a
