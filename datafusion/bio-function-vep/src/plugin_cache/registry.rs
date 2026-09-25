@@ -77,6 +77,40 @@ fn plugin_profile_line(
     )
 }
 
+/// The process-wide pool the per-buffer plugin takes run on, created on first
+/// use: a multi-thread runtime of `VEP_PLUGIN_TAKE_THREADS` workers (default
+/// `min(4, available_parallelism)`), threads named `vep-plugin-take`.
+///
+/// Dedicated rather than the caller's runtime because the caller holds its
+/// own worker while it waits (`lookup_exec::block_on` is `block_in_place` +
+/// `block_on`): on a one-worker runtime the takes would still run one after
+/// another. Tasks on this pool only read shards; they never call back into
+/// the caller's runtime, so awaiting them from any context cannot deadlock.
+fn plugin_take_pool() -> Result<&'static tokio::runtime::Handle> {
+    static POOL: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("VEP_PLUGIN_TAKE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(4)
+            });
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(threads)
+            .thread_name("vep-plugin-take")
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+    })
+    .as_ref()
+    .map(|rt| rt.handle())
+    .map_err(|e| DataFusionError::Execution(format!("build plugin take pool: {e}")))
+}
+
 /// Indices into a plugin's `value_columns`, in the order its CSQ fields are
 /// emitted: declaration order, or sorted by field name when the plugin's
 /// Ensembl counterpart sorts its own fields ([`FieldOrder::Alphabetical`]).
@@ -328,14 +362,16 @@ impl PluginRegistry {
     /// page-scoped [`PluginLookup::take_buffer`] per plugin — into per-plugin
     /// [`PluginBufferSlice`]s. `sorted_unique_starts` must be sorted+deduped.
     ///
-    /// The Point takes run concurrently, one spawned task per plugin, so their
-    /// Parquet decode spreads over the runtime's workers instead of running
-    /// back to back on the caller's thread. Each task also builds its slice.
+    /// The Point takes run concurrently, one task per plugin on the dedicated
+    /// [`plugin_take_pool`], so their Parquet decode runs in parallel whatever
+    /// the caller's runtime (a one-worker runtime included) instead of back
+    /// to back on the caller's thread. Each task also builds its slice.
     /// Results are awaited in plugin order, so the entries, and on failure
     /// the error returned (the first failing plugin in that order), are the
     /// same as a serial loop's.
     pub async fn take_buffer_all(&self, sorted_unique_starts: &[u32]) -> Result<BufferSlices> {
         let starts: Arc<[u32]> = Arc::from(sorted_unique_starts);
+        let pool = plugin_take_pool()?;
         let mut tasks = AbortOnDrop(
             self.plugins
                 .iter()
@@ -344,7 +380,7 @@ impl PluginRegistry {
                         let lk = Arc::clone(lk);
                         let starts = Arc::clone(&starts);
                         let (n_match, n_values) = (p.n_match, p.n_values);
-                        Some(tokio::spawn(async move {
+                        Some(pool.spawn(async move {
                             let started = Instant::now();
                             let (batch, stats) = lk.take_buffer_with_stats(&starts).await?;
                             let elapsed = started.elapsed();
@@ -1289,17 +1325,60 @@ mod tests {
         }
     }
 
+    /// vepyr's `workers=1` setup: a one-worker multi-thread runtime whose only
+    /// worker is held by the annotation task while it `block_on`s the take.
+    fn one_worker_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn take_buffer_all_matches_serial_one_worker_runtime() {
+        let rt = one_worker_runtime();
+        rt.block_on(async {
+            // Spawned, so the take is driven from the runtime's only worker,
+            // as the annotation stream is.
+            tokio::spawn(run_multi_plugin_buffers(true)).await.unwrap();
+            tokio::spawn(run_multi_plugin_buffers(false)).await.unwrap();
+        });
+    }
+
+    /// The pre-pool behaviour: every Point take awaited in turn on the
+    /// calling task. Reference for the bench only.
+    async fn take_all_serial(reg: &PluginRegistry, starts: &[u32]) -> usize {
+        let mut rows = 0;
+        for p in &reg.plugins {
+            if let Some(LookupHandle::Point(lk)) = &p.lookup {
+                let (batch, _) = lk.take_buffer_with_stats(starts).await.unwrap();
+                rows += PluginBufferSlice::from_batch(&batch, p.n_match, p.n_values)
+                    .unwrap()
+                    .len();
+            }
+        }
+        rows
+    }
+
     /// Real-cache timing probe, not a correctness test. Set
     /// `VEP_PLUGIN_BENCH_ROOT` (a plugin cache root), `VEP_PLUGIN_BENCH_CHROM`
     /// and `VEP_PLUGIN_BENCH_STARTS` (a TSV of `buffer<TAB>start`), plus
     /// `VEP_ENGINE_PROFILE=1` for the per-plugin lines, then run with
-    /// `--ignored --nocapture`, ideally in `--release`.
-    #[tokio::test(flavor = "multi_thread")]
+    /// `--ignored --nocapture`, ideally in `--release`. Runs in vepyr's
+    /// `workers=1` setup: a one-worker runtime whose worker is held by the
+    /// task that `block_on`s the take. Compares the serial takes with
+    /// `take_buffer_all`, `VEP_PLUGIN_BENCH_REPS` times each (default 3).
+    #[test]
     #[ignore = "needs a real plugin cache; set VEP_PLUGIN_BENCH_*"]
-    async fn bench_take_buffer_all_real_cache() {
+    fn bench_take_buffer_all_real_cache() {
         let root = std::env::var("VEP_PLUGIN_BENCH_ROOT").expect("VEP_PLUGIN_BENCH_ROOT");
         let chrom = std::env::var("VEP_PLUGIN_BENCH_CHROM").unwrap_or_else(|_| "22".into());
         let tsv = std::env::var("VEP_PLUGIN_BENCH_STARTS").expect("VEP_PLUGIN_BENCH_STARTS");
+        let reps: usize = std::env::var("VEP_PLUGIN_BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
         let mut buffers: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
         for line in std::fs::read_to_string(tsv).unwrap().lines() {
             let (b, s) = line.split_once('\t').unwrap();
@@ -1308,24 +1387,57 @@ mod tests {
                 .or_default()
                 .push(s.parse().unwrap());
         }
-        let reg = PluginRegistry::open(Path::new(&root), &chrom, None)
-            .await
-            .unwrap();
-        let started = Instant::now();
-        for starts in buffers.values_mut() {
-            starts.sort_unstable();
-            starts.dedup();
-            let t = Instant::now();
-            crate::cache::lookup_exec::block_on(reg.take_buffer_all(starts)).unwrap();
-            eprintln!(
-                "[VEP_PLUGIN_BENCH] buffer probes={} take_buffer_all={:.6}s",
-                starts.len(),
-                t.elapsed().as_secs_f64()
-            );
-        }
-        eprintln!(
-            "[VEP_PLUGIN_BENCH] total take_buffer_all={:.6}s",
-            started.elapsed().as_secs_f64()
+        let buffers: Vec<Vec<u32>> = buffers
+            .into_values()
+            .map(|mut b| {
+                b.sort_unstable();
+                b.dedup();
+                b
+            })
+            .collect();
+        let rt = one_worker_runtime();
+        let reg = Arc::new(
+            rt.block_on(PluginRegistry::open(Path::new(&root), &chrom, None))
+                .unwrap(),
         );
+        let n_buffers = buffers.len();
+        let buffers = Arc::new(buffers);
+        for rep in 0..reps {
+            for mode in ["serial", "take_buffer_all"] {
+                let (reg, buffers) = (Arc::clone(&reg), Arc::clone(&buffers));
+                let (secs, rows) = rt.block_on(async move {
+                    tokio::spawn(async move {
+                        let started = Instant::now();
+                        let mut rows = 0;
+                        for starts in buffers.iter() {
+                            rows += if mode == "serial" {
+                                crate::cache::lookup_exec::block_on(async {
+                                    Ok(take_all_serial(&reg, starts).await)
+                                })
+                                .unwrap()
+                            } else {
+                                let slices = crate::cache::lookup_exec::block_on(
+                                    reg.take_buffer_all(starts),
+                                )
+                                .unwrap();
+                                slices
+                                    .entries
+                                    .iter()
+                                    .filter_map(|e| e.slice.as_ref())
+                                    .map(PluginBufferSlice::len)
+                                    .sum()
+                            };
+                        }
+                        (started.elapsed().as_secs_f64(), rows)
+                    })
+                    .await
+                    .unwrap()
+                });
+                eprintln!(
+                    "[VEP_PLUGIN_BENCH] rep={rep} runtime=1-worker mode={mode} buffers={} rows={rows} total={secs:.6}s",
+                    n_buffers
+                );
+            }
+        }
     }
 }
