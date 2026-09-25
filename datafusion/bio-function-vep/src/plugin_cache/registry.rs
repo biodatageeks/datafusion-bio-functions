@@ -21,7 +21,8 @@ use crate::plugin_cache::template::CompiledTemplate;
 
 /// The per-chrom shard handle of one plugin, by lookup kind.
 enum LookupHandle {
-    Point(Box<PluginLookup>),
+    /// `Arc` so each buffer's take can run as its own spawned task.
+    Point(Arc<PluginLookup>),
     Interval(Arc<IntervalLookup>),
 }
 
@@ -223,7 +224,7 @@ impl PluginRegistry {
                         )));
                     }
                     Some(match m.lookup {
-                        LookupKind::Point => LookupHandle::Point(Box::new(
+                        LookupKind::Point => LookupHandle::Point(Arc::new(
                             PluginLookup::open(&shard, match_columns, value_columns).await?,
                         )),
                         LookupKind::Interval => LookupHandle::Interval(Arc::new(
@@ -326,30 +327,56 @@ impl PluginRegistry {
     /// Take the candidate rows for one buffer from every plugin shard — one
     /// page-scoped [`PluginLookup::take_buffer`] per plugin — into per-plugin
     /// [`PluginBufferSlice`]s. `sorted_unique_starts` must be sorted+deduped.
+    ///
+    /// The Point takes run concurrently, one spawned task per plugin, so their
+    /// Parquet decode spreads over the runtime's workers instead of running
+    /// back to back on the caller's thread. Each task also builds its slice.
+    /// Results are awaited in plugin order, so the entries, and on failure
+    /// the error returned (the first failing plugin in that order), are the
+    /// same as a serial loop's.
     pub async fn take_buffer_all(&self, sorted_unique_starts: &[u32]) -> Result<BufferSlices> {
+        let starts: Arc<[u32]> = Arc::from(sorted_unique_starts);
+        let mut tasks = AbortOnDrop(
+            self.plugins
+                .iter()
+                .map(|p| match &p.lookup {
+                    Some(LookupHandle::Point(lk)) => {
+                        let lk = Arc::clone(lk);
+                        let starts = Arc::clone(&starts);
+                        let (n_match, n_values) = (p.n_match, p.n_values);
+                        Some(tokio::spawn(async move {
+                            let started = Instant::now();
+                            let (batch, stats) = lk.take_buffer_with_stats(&starts).await?;
+                            let elapsed = started.elapsed();
+                            let slice = PluginBufferSlice::from_batch(&batch, n_match, n_values)?;
+                            Ok::<_, DataFusionError>((slice, stats, elapsed))
+                        }))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        );
         let mut entries = Vec::with_capacity(self.plugins.len());
-        for p in &self.plugins {
+        for (i, p) in self.plugins.iter().enumerate() {
             let (slice, interval) = match &p.lookup {
-                Some(LookupHandle::Point(lk)) => {
-                    let started = Instant::now();
-                    let (batch, stats) = lk.take_buffer_with_stats(sorted_unique_starts).await?;
+                Some(LookupHandle::Point(_)) => {
+                    let handle = tasks.0[i]
+                        .as_mut()
+                        .expect("a take task is spawned for every Point plugin");
+                    let (slice, stats, elapsed) = handle.await.map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "plugin '{}' take task failed: {e}",
+                            p.name
+                        ))
+                    })??;
+                    tasks.0[i] = None;
                     if plugin_profile_enabled() {
                         eprintln!(
                             "{}",
-                            plugin_profile_line(
-                                &p.name,
-                                sorted_unique_starts.len(),
-                                started.elapsed(),
-                                &stats
-                            )
+                            plugin_profile_line(&p.name, starts.len(), elapsed, &stats)
                         );
                     }
-                    (
-                        Some(PluginBufferSlice::from_batch(
-                            &batch, p.n_match, p.n_values,
-                        )?),
-                        None,
-                    )
+                    (Some(slice), None)
                 }
                 // Interval shards are resident for the whole contig; nothing
                 // to take per buffer.
@@ -366,6 +393,20 @@ impl PluginRegistry {
             });
         }
         Ok(BufferSlices { entries })
+    }
+}
+
+/// The per-plugin take tasks of one [`PluginRegistry::take_buffer_all`] call,
+/// by plugin index. Aborts whatever is still pending when dropped, so an
+/// early error return, or a caller dropping the future, does not leave shard
+/// reads running detached.
+struct AbortOnDrop<T>(Vec<Option<tokio::task::JoinHandle<T>>>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        for handle in self.0.iter().flatten() {
+            handle.abort();
+        }
     }
 }
 
@@ -1222,6 +1263,30 @@ mod tests {
             total += rt.block_on(assert_all_matches_serial(&reg, slices, starts));
         }
         assert!(total > 1_000, "only {total} rows taken");
+    }
+
+    /// With the takes running concurrently, the error returned is still the
+    /// first failing plugin's in plugin order, as with a serial loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn take_buffer_all_returns_first_error_in_plugin_order() {
+        let (dir, names, _) = multi_plugin_fixture();
+        let reg = PluginRegistry::open(dir.path(), "22", Some(&names))
+            .await
+            .unwrap();
+        // Shards are reopened per take, so removing them after open makes
+        // those plugins' takes fail. "dense" precedes "ints" in plugin order.
+        for name in ["ints", "dense"] {
+            std::fs::remove_file(dir.path().join("plugin").join(name).join("chr22.parquet"))
+                .unwrap();
+        }
+        let starts: Vec<u32> = (1_000..1_050).collect();
+        for _ in 0..20 {
+            let err = match reg.take_buffer_all(&starts).await {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("expected the take to fail"),
+            };
+            assert!(err.contains("/dense/chr22.parquet"), "{err}");
+        }
     }
 
     /// Real-cache timing probe, not a correctness test. Set
