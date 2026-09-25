@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::{
     Array, Float32Array, Int32Array, LargeStringArray, StringArray, StringViewArray, UInt32Array,
@@ -40,6 +41,23 @@ pub enum PluginScalar {
     F32(f32),
     I32(i32),
     Null,
+}
+
+/// What one [`PluginLookup::take_buffer_with_stats`] cost: rows returned, the
+/// shard bytes/read ops it issued (an [`IoCounters`] snapshot), and wall time
+/// split into the file opens, the phase-2 `start` scan and the phase-3 payload
+/// read. Only consumed by the `VEP_ENGINE_PROFILE` per-plugin lines.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TakeStats {
+    pub rows: usize,
+    pub bytes: u64,
+    pub ops: u64,
+    /// Summed wall time of the per-take `open_async` calls.
+    pub open: Duration,
+    /// Phase 2 (start-only read → exact offsets), excluding its open.
+    pub starts_read: Duration,
+    /// Phase 3 (projected payload take + concat), excluding its open.
+    pub payload_read: Duration,
 }
 
 /// A per-chrom plugin shard handle: footer metadata + a [`PageDir`] over the
@@ -158,8 +176,18 @@ impl PluginLookup {
     /// positions fall on. Returns a batch with columns
     /// `[start, allele_string, <match cols…>, <value cols…>]`.
     pub async fn take_buffer(&self, sorted_unique_starts: &[u32]) -> Result<RecordBatch> {
+        Ok(self.take_buffer_with_stats(sorted_unique_starts).await?.0)
+    }
+
+    /// [`Self::take_buffer`] plus the [`TakeStats`] of the take. Reads exactly
+    /// the same pages and columns; the stats cost a few `Instant::now` calls.
+    pub async fn take_buffer_with_stats(
+        &self,
+        sorted_unique_starts: &[u32],
+    ) -> Result<(RecordBatch, TakeStats)> {
+        let mut stats = TakeStats::default();
         if sorted_unique_starts.is_empty() {
-            return Ok(RecordBatch::new_empty(self.projected_schema()));
+            return Ok((RecordBatch::new_empty(self.projected_schema()), stats));
         }
 
         let counters = IoCounters::new();
@@ -169,12 +197,12 @@ impl PluginLookup {
 
         // Phase 2: start-only read over candidate pages → exact row offsets.
         let start_mask = ProjectionMask::leaves(self.meta.parquet_schema(), [self.start_leaf]);
+        let t_open = Instant::now();
+        let start_file = self.open_async().await?;
+        stats.open += t_open.elapsed();
+        let t_starts = Instant::now();
         let mut start_stream = ParquetRecordBatchStreamBuilder::new_with_metadata(
-            CoalescingAsyncReader::new(
-                self.open_async().await?,
-                counters.clone(),
-                COALESCE_GAP_BYTES,
-            ),
+            CoalescingAsyncReader::new(start_file, counters.clone(), COALESCE_GAP_BYTES),
             self.meta.clone(),
         )
         .with_projection(start_mask)
@@ -204,13 +232,15 @@ impl PluginLookup {
             }
         }
 
+        stats.starts_read = t_starts.elapsed();
+
         // Phase 3: projected payload take at the exact offsets.
+        let t_open = Instant::now();
+        let payload_file = self.open_async().await?;
+        stats.open += t_open.elapsed();
+        let t_payload = Instant::now();
         let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
-            CoalescingAsyncReader::new(
-                self.open_async().await?,
-                counters.clone(),
-                COALESCE_GAP_BYTES,
-            ),
+            CoalescingAsyncReader::new(payload_file, counters.clone(), COALESCE_GAP_BYTES),
             self.meta.clone(),
         )
         .with_projection(self.payload_mask())
@@ -228,11 +258,16 @@ impl PluginLookup {
         {
             taken.push(b);
         }
-        if taken.is_empty() {
-            return Ok(RecordBatch::new_empty(proj_schema));
-        }
-        datafusion::arrow::compute::concat_batches(&taken[0].schema(), &taken)
-            .map_err(|e| DataFusionError::Execution(format!("concat payload: {e}")))
+        let batch = if taken.is_empty() {
+            RecordBatch::new_empty(proj_schema)
+        } else {
+            datafusion::arrow::compute::concat_batches(&taken[0].schema(), &taken)
+                .map_err(|e| DataFusionError::Execution(format!("concat payload: {e}")))?
+        };
+        stats.payload_read = t_payload.elapsed();
+        stats.rows = batch.num_rows();
+        (stats.bytes, stats.ops) = counters.snapshot();
+        Ok((batch, stats))
     }
 }
 
@@ -241,6 +276,7 @@ type SliceKey = (u32, String, Vec<Option<String>>);
 
 /// The in-memory working set for one buffer × one plugin, built from a
 /// [`PluginLookup::take_buffer`] batch. Sync-probed per transcript.
+#[derive(Debug, PartialEq)]
 pub struct PluginBufferSlice {
     rows: HashMap<SliceKey, Vec<PluginScalar>>,
 }
@@ -272,6 +308,12 @@ impl PluginBufferSlice {
             rows.insert((start.value(r), allele, match_vals), values);
         }
         Ok(Self { rows })
+    }
+
+    /// Number of distinct keyed rows held (tests only).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
     }
 
     /// Probe for `(start, allele_string, match_values)`; `None` on any miss.
