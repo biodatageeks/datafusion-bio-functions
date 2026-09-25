@@ -86,29 +86,46 @@ fn plugin_profile_line(
 /// `block_on`): on a one-worker runtime the takes would still run one after
 /// another. Tasks on this pool only read shards; they never call back into
 /// the caller's runtime, so awaiting them from any context cannot deadlock.
-fn plugin_take_pool() -> Result<&'static tokio::runtime::Handle> {
-    static POOL: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let threads = std::env::var("VEP_PLUGIN_TAKE_THREADS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-                    .min(4)
-            });
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(threads)
-            .thread_name("vep-plugin-take")
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())
-    })
-    .as_ref()
-    .map(|rt| rt.handle())
-    .map_err(|e| DataFusionError::Execution(format!("build plugin take pool: {e}")))
+///
+/// The pool is tied to the process that built it. A `fork()` child (e.g. a
+/// Python `multiprocessing` worker forked after an annotation) inherits the
+/// static but none of the pool's threads, so spawning onto it would wait
+/// forever. When the pid differs, a fresh pool is built for this process.
+fn plugin_take_pool() -> Result<&'static tokio::runtime::Runtime> {
+    plugin_take_pool_for(std::process::id())
+}
+
+/// [`plugin_take_pool`] keyed by an explicit pid (tests simulate a fork).
+fn plugin_take_pool_for(pid: u32) -> Result<&'static tokio::runtime::Runtime> {
+    static POOL: std::sync::Mutex<Option<(u32, &'static tokio::runtime::Runtime)>> =
+        std::sync::Mutex::new(None);
+    let mut slot = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((owner, rt)) = *slot
+        && owner == pid
+    {
+        return Ok(rt);
+    }
+    let threads = std::env::var("VEP_PLUGIN_TAKE_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(4)
+        });
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(threads)
+        .thread_name("vep-plugin-take")
+        .enable_all()
+        .build()
+        .map_err(|e| DataFusionError::Execution(format!("build plugin take pool: {e}")))?;
+    // Leaked, never dropped: a pool inherited across a fork has no threads to
+    // join, so dropping it in the child could block. One pool per process.
+    let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt));
+    *slot = Some((pid, rt));
+    Ok(rt)
 }
 
 /// Indices into a plugin's `value_columns`, in the order its CSQ fields are
@@ -362,8 +379,8 @@ impl PluginRegistry {
     /// page-scoped [`PluginLookup::take_buffer`] per plugin — into per-plugin
     /// [`PluginBufferSlice`]s. `sorted_unique_starts` must be sorted+deduped.
     ///
-    /// The Point takes run concurrently, one task per plugin on the dedicated
-    /// [`plugin_take_pool`], so their Parquet decode runs in parallel whatever
+    /// The Point takes run concurrently, one task per plugin on a dedicated
+    /// process-wide pool (see `plugin_take_pool`), so their Parquet decode runs in parallel whatever
     /// the caller's runtime (a one-worker runtime included) instead of back
     /// to back on the caller's thread. Each task also builds its slice.
     /// Results are awaited in plugin order, so the entries, and on failure
@@ -371,12 +388,23 @@ impl PluginRegistry {
     /// same as a serial loop's.
     pub async fn take_buffer_all(&self, sorted_unique_starts: &[u32]) -> Result<BufferSlices> {
         let starts: Arc<[u32]> = Arc::from(sorted_unique_starts);
-        let pool = plugin_take_pool()?;
+        // Only a non-empty buffer with a Point plugin needs the pool; an empty
+        // take returns at once, so it runs inline below.
+        let needs_pool = !starts.is_empty()
+            && self
+                .plugins
+                .iter()
+                .any(|p| matches!(p.lookup, Some(LookupHandle::Point(_))));
+        let pool = if needs_pool {
+            Some(plugin_take_pool()?)
+        } else {
+            None
+        };
         let mut tasks = AbortOnDrop(
             self.plugins
                 .iter()
-                .map(|p| match &p.lookup {
-                    Some(LookupHandle::Point(lk)) => {
+                .map(|p| match (&p.lookup, pool) {
+                    (Some(LookupHandle::Point(lk)), Some(pool)) => {
                         let lk = Arc::clone(lk);
                         let starts = Arc::clone(&starts);
                         let (n_match, n_values) = (p.n_match, p.n_values);
@@ -395,17 +423,24 @@ impl PluginRegistry {
         let mut entries = Vec::with_capacity(self.plugins.len());
         for (i, p) in self.plugins.iter().enumerate() {
             let (slice, interval) = match &p.lookup {
-                Some(LookupHandle::Point(_)) => {
-                    let handle = tasks.0[i]
-                        .as_mut()
-                        .expect("a take task is spawned for every Point plugin");
-                    let (slice, stats, elapsed) = handle.await.map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "plugin '{}' take task failed: {e}",
-                            p.name
-                        ))
-                    })??;
-                    tasks.0[i] = None;
+                Some(LookupHandle::Point(lk)) => {
+                    let (slice, stats, elapsed) = if let Some(handle) = tasks.0[i].as_mut() {
+                        let taken = handle.await.map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "plugin '{}' take task failed: {e}",
+                                p.name
+                            ))
+                        })??;
+                        tasks.0[i] = None;
+                        taken
+                    } else {
+                        // Empty buffer: no read happens, so no task either.
+                        let started = Instant::now();
+                        let (batch, stats) = lk.take_buffer_with_stats(&starts).await?;
+                        let elapsed = started.elapsed();
+                        let slice = PluginBufferSlice::from_batch(&batch, p.n_match, p.n_values)?;
+                        (slice, stats, elapsed)
+                    };
                     if plugin_profile_enabled() {
                         eprintln!(
                             "{}",
@@ -1323,6 +1358,23 @@ mod tests {
             };
             assert!(err.contains("/dense/chr22.parquet"), "{err}");
         }
+    }
+
+    /// A pool built by another pid (what a fork child inherits) is replaced,
+    /// not reused; the same pid keeps its pool; and the fresh pool runs tasks.
+    #[test]
+    fn plugin_take_pool_is_rebuilt_for_a_new_pid() {
+        let me = std::process::id();
+        let a = plugin_take_pool_for(me).unwrap();
+        assert!(std::ptr::eq(a, plugin_take_pool_for(me).unwrap()));
+        let other = me.wrapping_add(1);
+        let b = plugin_take_pool_for(other).unwrap();
+        assert!(!std::ptr::eq(a, b));
+        assert_eq!(b.block_on(b.spawn(async { 7 })).unwrap(), 7);
+        // Back to the real pid: rebuilt again, and usable.
+        let c = plugin_take_pool_for(me).unwrap();
+        assert!(!std::ptr::eq(b, c));
+        assert!(std::ptr::eq(c, plugin_take_pool().unwrap()));
     }
 
     /// vepyr's `workers=1` setup: a one-worker multi-thread runtime whose only
