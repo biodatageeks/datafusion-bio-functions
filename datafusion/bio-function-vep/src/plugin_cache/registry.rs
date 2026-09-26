@@ -5,7 +5,8 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use datafusion::common::{DataFusionError, Result};
 
@@ -13,18 +14,23 @@ use crate::cache::manifest::canonical_chrom_label;
 use crate::plugin_cache::cache_manifest::{
     AlleleMatch, CacheManifest, FieldOrder, LookupKind, discover_plugins,
 };
-use crate::plugin_cache::lookup::{IntervalLookup, PluginBufferSlice, PluginLookup, PluginScalar};
+use crate::plugin_cache::lookup::{
+    IntervalLookup, PluginBufferSlice, PluginLookup, PluginScalar, TakeStats,
+};
 use crate::plugin_cache::template::CompiledTemplate;
 
 /// The per-chrom shard handle of one plugin, by lookup kind.
 enum LookupHandle {
-    Point(Box<PluginLookup>),
+    /// `Arc` so each buffer's take can run as its own spawned task.
+    Point(Arc<PluginLookup>),
     Interval(Arc<IntervalLookup>),
 }
 
 /// One enabled plugin, with its per-chrom lookup (absent if this plugin has no
 /// shard for the current chrom).
 struct PluginEntry {
+    /// Plugin name, for the `VEP_ENGINE_PROFILE` per-plugin take lines.
+    name: String,
     csq_fields: Vec<String>,
     /// Indices into the shard's value columns, in emitted-field order.
     emit_order: Vec<usize>,
@@ -41,6 +47,85 @@ struct PluginEntry {
 /// plugin-name order when no selection was supplied).
 pub struct PluginRegistry {
     plugins: Vec<PluginEntry>,
+}
+
+/// True when `VEP_ENGINE_PROFILE` is set; read once per process, since
+/// [`PluginRegistry::take_buffer_all`] runs once per buffer.
+fn plugin_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VEP_ENGINE_PROFILE").is_some())
+}
+
+/// One `[VEP_PLUGIN_PROFILE]` line: a single plugin's take for one buffer.
+/// `elapsed` is the take's own wall time; the split fields come from
+/// [`TakeStats`].
+fn plugin_profile_line(
+    name: &str,
+    probes: usize,
+    elapsed: std::time::Duration,
+    stats: &TakeStats,
+) -> String {
+    format!(
+        "[VEP_PLUGIN_PROFILE] plugin={name} probes={probes} rows={} elapsed={:.6}s bytes={} ops={} open={:.6}s starts_read={:.6}s payload_read={:.6}s",
+        stats.rows,
+        elapsed.as_secs_f64(),
+        stats.bytes,
+        stats.ops,
+        stats.open.as_secs_f64(),
+        stats.starts_read.as_secs_f64(),
+        stats.payload_read.as_secs_f64(),
+    )
+}
+
+/// The process-wide pool the per-buffer plugin takes run on, created on first
+/// use: a multi-thread runtime of `VEP_PLUGIN_TAKE_THREADS` workers (default
+/// `min(4, available_parallelism)`), threads named `vep-plugin-take`.
+///
+/// Dedicated rather than the caller's runtime because the caller holds its
+/// own worker while it waits (`lookup_exec::block_on` is `block_in_place` +
+/// `block_on`): on a one-worker runtime the takes would still run one after
+/// another. Tasks on this pool only read shards; they never call back into
+/// the caller's runtime, so awaiting them from any context cannot deadlock.
+///
+/// The pool is tied to the process that built it. A `fork()` child (e.g. a
+/// Python `multiprocessing` worker forked after an annotation) inherits the
+/// static but none of the pool's threads, so spawning onto it would wait
+/// forever. When the pid differs, a fresh pool is built for this process.
+fn plugin_take_pool() -> Result<&'static tokio::runtime::Runtime> {
+    plugin_take_pool_for(std::process::id())
+}
+
+/// [`plugin_take_pool`] keyed by an explicit pid (tests simulate a fork).
+fn plugin_take_pool_for(pid: u32) -> Result<&'static tokio::runtime::Runtime> {
+    static POOL: std::sync::Mutex<Option<(u32, &'static tokio::runtime::Runtime)>> =
+        std::sync::Mutex::new(None);
+    let mut slot = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((owner, rt)) = *slot
+        && owner == pid
+    {
+        return Ok(rt);
+    }
+    let threads = std::env::var("VEP_PLUGIN_TAKE_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(4)
+        });
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(threads)
+        .thread_name("vep-plugin-take")
+        .enable_all()
+        .build()
+        .map_err(|e| DataFusionError::Execution(format!("build plugin take pool: {e}")))?;
+    // Leaked, never dropped: a pool inherited across a fork has no threads to
+    // join, so dropping it in the child could block. One pool per process.
+    let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt));
+    *slot = Some((pid, rt));
+    Ok(rt)
 }
 
 /// Indices into a plugin's `value_columns`, in the order its CSQ fields are
@@ -190,7 +275,7 @@ impl PluginRegistry {
                         )));
                     }
                     Some(match m.lookup {
-                        LookupKind::Point => LookupHandle::Point(Box::new(
+                        LookupKind::Point => LookupHandle::Point(Arc::new(
                             PluginLookup::open(&shard, match_columns, value_columns).await?,
                         )),
                         LookupKind::Interval => LookupHandle::Interval(Arc::new(
@@ -201,6 +286,7 @@ impl PluginRegistry {
                 _ => None,
             };
             plugins.push(PluginEntry {
+                name: m.plugin_name.clone(),
                 csq_fields,
                 emit_order: order,
                 allele_match: m.allele_match,
@@ -292,18 +378,76 @@ impl PluginRegistry {
     /// Take the candidate rows for one buffer from every plugin shard — one
     /// page-scoped [`PluginLookup::take_buffer`] per plugin — into per-plugin
     /// [`PluginBufferSlice`]s. `sorted_unique_starts` must be sorted+deduped.
+    ///
+    /// The Point takes run concurrently, one task per plugin on a dedicated
+    /// process-wide pool (see `plugin_take_pool`), so their Parquet decode runs in parallel whatever
+    /// the caller's runtime (a one-worker runtime included) instead of back
+    /// to back on the caller's thread. Each task also builds its slice.
+    /// Results are awaited in plugin order, so the entries, and on failure
+    /// the error returned (the first failing plugin in that order), are the
+    /// same as a serial loop's.
     pub async fn take_buffer_all(&self, sorted_unique_starts: &[u32]) -> Result<BufferSlices> {
+        let starts: Arc<[u32]> = Arc::from(sorted_unique_starts);
+        // Only a non-empty buffer with a Point plugin needs the pool; an empty
+        // take returns at once, so it runs inline below.
+        let needs_pool = !starts.is_empty()
+            && self
+                .plugins
+                .iter()
+                .any(|p| matches!(p.lookup, Some(LookupHandle::Point(_))));
+        let pool = if needs_pool {
+            Some(plugin_take_pool()?)
+        } else {
+            None
+        };
+        let mut tasks = AbortOnDrop(
+            self.plugins
+                .iter()
+                .map(|p| match (&p.lookup, pool) {
+                    (Some(LookupHandle::Point(lk)), Some(pool)) => {
+                        let lk = Arc::clone(lk);
+                        let starts = Arc::clone(&starts);
+                        let (n_match, n_values) = (p.n_match, p.n_values);
+                        Some(pool.spawn(async move {
+                            let started = Instant::now();
+                            let (batch, stats) = lk.take_buffer_with_stats(&starts).await?;
+                            let elapsed = started.elapsed();
+                            let slice = PluginBufferSlice::from_batch(&batch, n_match, n_values)?;
+                            Ok::<_, DataFusionError>((slice, stats, elapsed))
+                        }))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        );
         let mut entries = Vec::with_capacity(self.plugins.len());
-        for p in &self.plugins {
+        for (i, p) in self.plugins.iter().enumerate() {
             let (slice, interval) = match &p.lookup {
                 Some(LookupHandle::Point(lk)) => {
-                    let batch = lk.take_buffer(sorted_unique_starts).await?;
-                    (
-                        Some(PluginBufferSlice::from_batch(
-                            &batch, p.n_match, p.n_values,
-                        )?),
-                        None,
-                    )
+                    let (slice, stats, elapsed) = if let Some(handle) = tasks.0[i].as_mut() {
+                        let taken = handle.await.map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "plugin '{}' take task failed: {e}",
+                                p.name
+                            ))
+                        })??;
+                        tasks.0[i] = None;
+                        taken
+                    } else {
+                        // Empty buffer: no read happens, so no task either.
+                        let started = Instant::now();
+                        let (batch, stats) = lk.take_buffer_with_stats(&starts).await?;
+                        let elapsed = started.elapsed();
+                        let slice = PluginBufferSlice::from_batch(&batch, p.n_match, p.n_values)?;
+                        (slice, stats, elapsed)
+                    };
+                    if plugin_profile_enabled() {
+                        eprintln!(
+                            "{}",
+                            plugin_profile_line(&p.name, starts.len(), elapsed, &stats)
+                        );
+                    }
+                    (Some(slice), None)
                 }
                 // Interval shards are resident for the whole contig; nothing
                 // to take per buffer.
@@ -320,6 +464,20 @@ impl PluginRegistry {
             });
         }
         Ok(BufferSlices { entries })
+    }
+}
+
+/// The per-plugin take tasks of one [`PluginRegistry::take_buffer_all`] call,
+/// by plugin index. Aborts whatever is still pending when dropped, so an
+/// early error return, or a caller dropping the future, does not leave shard
+/// reads running detached.
+struct AbortOnDrop<T>(Vec<Option<tokio::task::JoinHandle<T>>>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        for handle in self.0.iter().flatten() {
+            handle.abort();
+        }
     }
 }
 
@@ -937,6 +1095,401 @@ mod tests {
                 "error should name the missing shard, got: {e}"
             ),
             Ok(_) => panic!("expected error on missing non-empty shard"),
+        }
+    }
+
+    /// A Point plugin shard of `n` rows at `base + i * stride`, two alleles
+    /// per position, with an optional per-transcript match column and a value
+    /// column of type `ty`. Rows are written sorted by `(tier, start)`.
+    fn write_point_plugin(
+        cache_root: &Path,
+        name: &str,
+        base: u32,
+        stride: u32,
+        n: usize,
+        with_match: bool,
+        ty: ValueType,
+    ) {
+        use datafusion::arrow::array::{ArrayRef, Int32Array};
+        let plugin_dir = cache_root.join("plugin").join(name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let matches: Vec<MatchColumn> = if with_match {
+            vec![MatchColumn {
+                column: "protein_variant".into(),
+                template: "{ref_aa}{Protein_position}{alt_aa}".into(),
+            }]
+        } else {
+            vec![]
+        };
+        let value_col = format!("{name}_score");
+        let vals = vec![ValueColumn {
+            column: value_col.clone(),
+            csq_field: value_col.clone(),
+            ty,
+            description: None,
+        }];
+        let schema = plugin_output_schema(LookupKind::Point, &matches, &vals);
+        let rows = 2 * n;
+        let starts: Vec<u32> = (0..rows).map(|r| base + (r / 2) as u32 * stride).collect();
+        let alleles: Vec<&str> = (0..rows)
+            .map(|r| if r % 2 == 0 { "A/G" } else { "A/T" })
+            .collect();
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["22"; rows])),
+            Arc::new(UInt32Array::from(starts.clone())),
+            Arc::new(UInt32Array::from(starts)),
+            Arc::new(StringArray::from(alleles)),
+        ];
+        if with_match {
+            columns.push(Arc::new(StringArray::from(
+                (0..rows).map(|r| format!("R{r}G")).collect::<Vec<_>>(),
+            )));
+        }
+        columns.push(match ty {
+            ValueType::Float32 => Arc::new(Float32Array::from(
+                (0..rows).map(|r| r as f32 * 0.001).collect::<Vec<_>>(),
+            )),
+            ValueType::Int32 => Arc::new(Int32Array::from(
+                (0..rows).map(|r| r as i32).collect::<Vec<_>>(),
+            )),
+            ValueType::Utf8 => Arc::new(StringArray::from(
+                (0..rows).map(|r| format!("{name}-{r}")).collect::<Vec<_>>(),
+            )),
+        });
+        columns.push(Arc::new(Int8Array::from(vec![1i8; rows])));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let mut w = PluginShardWriter::create(&plugin_dir.join("chr22.parquet"), schema).unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+
+        CacheManifest {
+            plugin_name: name.into(),
+            source_manifest: format!("{name}.source.toml"),
+            key_columns: vec![
+                "chrom".into(),
+                "start".into(),
+                "end".into(),
+                "allele_string".into(),
+            ],
+            match_columns: matches
+                .iter()
+                .map(|m| MatchColumnRecord {
+                    column: m.column.clone(),
+                    template: m.template.clone(),
+                })
+                .collect(),
+            value_columns: vec![ValueColumnRecord {
+                column: value_col.clone(),
+                csq_field: value_col,
+                ty: format!("{ty:?}"),
+                description: None,
+            }],
+            chroms: vec![ChromEntry {
+                chrom: "chr22".into(),
+                file: "chr22.parquet".into(),
+                rows,
+                warm: 0,
+                cold: rows,
+            }],
+            sources: vec![],
+            cache_source_version: None,
+            allele_match: Default::default(),
+            field_order: Default::default(),
+            assume_unique: None,
+            lookup: Default::default(),
+        }
+        .write(&plugin_dir)
+        .unwrap();
+    }
+
+    /// Four plugins over chr22 — three Point shards with different densities,
+    /// match layouts and value types, plus one with no chr22 shard — and the
+    /// buffers of sorted, deduped starts to take for them.
+    fn multi_plugin_fixture() -> (tempfile::TempDir, Vec<String>, Vec<Vec<u32>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_point_plugin(root, "dense", 1_000, 1, 6_000, false, ValueType::Float32);
+        write_point_plugin(root, "sparse", 1_000, 7, 3_000, true, ValueType::Utf8);
+        write_point_plugin(root, "ints", 2_500, 3, 4_000, false, ValueType::Int32);
+        write_empty_manifest(root, "absent", "absent_score");
+        // Caller order, deliberately not alphabetical.
+        let names: Vec<String> = ["sparse", "absent", "dense", "ints"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut buffers: Vec<Vec<u32>> = vec![
+            vec![],
+            (1_000..1_050).collect(),
+            (0..400).map(|i| 1_000 + i * 13).collect(),
+            vec![1, 999, 30_000, 40_000],
+            (0..2_000).map(|i| 2_000 + i * 5).collect(),
+            vec![6_999, 7_000, 14_503, 21_997, 22_000],
+        ];
+        for b in &mut buffers {
+            b.sort_unstable();
+            b.dedup();
+        }
+        (dir, names, buffers)
+    }
+
+    /// Assert that [`PluginRegistry::take_buffer_all`]'s entries equal, per
+    /// plugin and in plugin order, a serial [`PluginLookup::take_buffer`] per
+    /// plugin. Returns the total number of rows taken across Point plugins.
+    async fn assert_all_matches_serial(
+        reg: &PluginRegistry,
+        slices: &BufferSlices,
+        starts: &[u32],
+    ) -> usize {
+        assert_eq!(slices.entries.len(), reg.plugins.len());
+        let mut total = 0;
+        for (p, e) in reg.plugins.iter().zip(&slices.entries) {
+            assert_eq!(e.csq_fields_len, p.csq_fields.len(), "plugin {}", p.name);
+            assert_eq!(e.emit_order, p.emit_order, "plugin {}", p.name);
+            assert_eq!(e.allele_match, p.allele_match, "plugin {}", p.name);
+            assert_eq!(
+                e.match_templates.len(),
+                p.match_templates.len(),
+                "plugin {}",
+                p.name
+            );
+            match &p.lookup {
+                Some(LookupHandle::Point(lk)) => {
+                    let serial = PluginBufferSlice::from_batch(
+                        &lk.take_buffer(starts).await.unwrap(),
+                        p.n_match,
+                        p.n_values,
+                    )
+                    .unwrap();
+                    total += serial.len();
+                    assert_eq!(e.slice.as_ref(), Some(&serial), "plugin {}", p.name);
+                    assert!(e.interval.is_none());
+                }
+                Some(LookupHandle::Interval(_)) => panic!("fixture has no interval plugin"),
+                None => {
+                    assert!(e.slice.is_none(), "plugin {}", p.name);
+                    assert!(e.interval.is_none(), "plugin {}", p.name);
+                }
+            }
+        }
+        total
+    }
+
+    async fn run_multi_plugin_buffers(via_block_on: bool) {
+        let (dir, names, buffers) = multi_plugin_fixture();
+        let reg = PluginRegistry::open(dir.path(), "22", Some(&names))
+            .await
+            .unwrap();
+        assert_eq!(
+            reg.plugins
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sparse", "absent", "dense", "ints"]
+        );
+        let mut total = 0;
+        for starts in &buffers {
+            let slices = if via_block_on {
+                crate::cache::lookup_exec::block_on(reg.take_buffer_all(starts)).unwrap()
+            } else {
+                reg.take_buffer_all(starts).await.unwrap()
+            };
+            total += assert_all_matches_serial(&reg, &slices, starts).await;
+        }
+        // The buffers must actually hit rows, or the equality proves nothing.
+        assert!(total > 1_000, "only {total} rows taken");
+    }
+
+    #[tokio::test]
+    async fn take_buffer_all_matches_serial_current_thread() {
+        run_multi_plugin_buffers(false).await;
+        // Through the engine's `block_on`, which on a current-thread runtime
+        // drives the take on a fresh runtime in a scoped thread.
+        run_multi_plugin_buffers(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn take_buffer_all_matches_serial_multi_thread() {
+        run_multi_plugin_buffers(false).await;
+        // `block_on` here is `block_in_place` + `handle.block_on`, the path
+        // the annotation provider takes.
+        run_multi_plugin_buffers(true).await;
+    }
+
+    #[test]
+    fn take_buffer_all_matches_serial_without_runtime() {
+        let (dir, names, buffers) = multi_plugin_fixture();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let reg = rt
+            .block_on(PluginRegistry::open(dir.path(), "22", Some(&names)))
+            .unwrap();
+        drop(rt);
+        // No runtime on this thread: `block_on` builds its own.
+        let all: Vec<BufferSlices> = buffers
+            .iter()
+            .map(|starts| crate::cache::lookup_exec::block_on(reg.take_buffer_all(starts)).unwrap())
+            .collect();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut total = 0;
+        for (starts, slices) in buffers.iter().zip(&all) {
+            total += rt.block_on(assert_all_matches_serial(&reg, slices, starts));
+        }
+        assert!(total > 1_000, "only {total} rows taken");
+    }
+
+    /// With the takes running concurrently, the error returned is still the
+    /// first failing plugin's in plugin order, as with a serial loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn take_buffer_all_returns_first_error_in_plugin_order() {
+        let (dir, names, _) = multi_plugin_fixture();
+        let reg = PluginRegistry::open(dir.path(), "22", Some(&names))
+            .await
+            .unwrap();
+        // Shards are reopened per take, so removing them after open makes
+        // those plugins' takes fail. "dense" precedes "ints" in plugin order.
+        for name in ["ints", "dense"] {
+            std::fs::remove_file(dir.path().join("plugin").join(name).join("chr22.parquet"))
+                .unwrap();
+        }
+        let starts: Vec<u32> = (1_000..1_050).collect();
+        for _ in 0..20 {
+            let err = match reg.take_buffer_all(&starts).await {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("expected the take to fail"),
+            };
+            assert!(err.contains("/dense/chr22.parquet"), "{err}");
+        }
+    }
+
+    /// A pool built by another pid (what a fork child inherits) is replaced,
+    /// not reused; the same pid keeps its pool; and the fresh pool runs tasks.
+    #[test]
+    fn plugin_take_pool_is_rebuilt_for_a_new_pid() {
+        let me = std::process::id();
+        let a = plugin_take_pool_for(me).unwrap();
+        assert!(std::ptr::eq(a, plugin_take_pool_for(me).unwrap()));
+        let other = me.wrapping_add(1);
+        let b = plugin_take_pool_for(other).unwrap();
+        assert!(!std::ptr::eq(a, b));
+        assert_eq!(b.block_on(b.spawn(async { 7 })).unwrap(), 7);
+        // Back to the real pid: rebuilt again, and usable.
+        let c = plugin_take_pool_for(me).unwrap();
+        assert!(!std::ptr::eq(b, c));
+        assert!(std::ptr::eq(c, plugin_take_pool().unwrap()));
+    }
+
+    /// vepyr's `workers=1` setup: a one-worker multi-thread runtime whose only
+    /// worker is held by the annotation task while it `block_on`s the take.
+    fn one_worker_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn take_buffer_all_matches_serial_one_worker_runtime() {
+        let rt = one_worker_runtime();
+        rt.block_on(async {
+            // Spawned, so the take is driven from the runtime's only worker,
+            // as the annotation stream is.
+            tokio::spawn(run_multi_plugin_buffers(true)).await.unwrap();
+            tokio::spawn(run_multi_plugin_buffers(false)).await.unwrap();
+        });
+    }
+
+    /// The pre-pool behaviour: every Point take awaited in turn on the
+    /// calling task. Reference for the bench only.
+    async fn take_all_serial(reg: &PluginRegistry, starts: &[u32]) -> usize {
+        let mut rows = 0;
+        for p in &reg.plugins {
+            if let Some(LookupHandle::Point(lk)) = &p.lookup {
+                let (batch, _) = lk.take_buffer_with_stats(starts).await.unwrap();
+                rows += PluginBufferSlice::from_batch(&batch, p.n_match, p.n_values)
+                    .unwrap()
+                    .len();
+            }
+        }
+        rows
+    }
+
+    /// Real-cache timing probe, not a correctness test. Set
+    /// `VEP_PLUGIN_BENCH_ROOT` (a plugin cache root), `VEP_PLUGIN_BENCH_CHROM`
+    /// and `VEP_PLUGIN_BENCH_STARTS` (a TSV of `buffer<TAB>start`), plus
+    /// `VEP_ENGINE_PROFILE=1` for the per-plugin lines, then run with
+    /// `--ignored --nocapture`, ideally in `--release`. Runs in vepyr's
+    /// `workers=1` setup: a one-worker runtime whose worker is held by the
+    /// task that `block_on`s the take. Compares the serial takes with
+    /// `take_buffer_all`, `VEP_PLUGIN_BENCH_REPS` times each (default 3).
+    #[test]
+    #[ignore = "needs a real plugin cache; set VEP_PLUGIN_BENCH_*"]
+    fn bench_take_buffer_all_real_cache() {
+        let root = std::env::var("VEP_PLUGIN_BENCH_ROOT").expect("VEP_PLUGIN_BENCH_ROOT");
+        let chrom = std::env::var("VEP_PLUGIN_BENCH_CHROM").unwrap_or_else(|_| "22".into());
+        let tsv = std::env::var("VEP_PLUGIN_BENCH_STARTS").expect("VEP_PLUGIN_BENCH_STARTS");
+        let reps: usize = std::env::var("VEP_PLUGIN_BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let mut buffers: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+        for line in std::fs::read_to_string(tsv).unwrap().lines() {
+            let (b, s) = line.split_once('\t').unwrap();
+            buffers
+                .entry(b.parse().unwrap())
+                .or_default()
+                .push(s.parse().unwrap());
+        }
+        let buffers: Vec<Vec<u32>> = buffers
+            .into_values()
+            .map(|mut b| {
+                b.sort_unstable();
+                b.dedup();
+                b
+            })
+            .collect();
+        let rt = one_worker_runtime();
+        let reg = Arc::new(
+            rt.block_on(PluginRegistry::open(Path::new(&root), &chrom, None))
+                .unwrap(),
+        );
+        let n_buffers = buffers.len();
+        let buffers = Arc::new(buffers);
+        for rep in 0..reps {
+            for mode in ["serial", "take_buffer_all"] {
+                let (reg, buffers) = (Arc::clone(&reg), Arc::clone(&buffers));
+                let (secs, rows) = rt.block_on(async move {
+                    tokio::spawn(async move {
+                        let started = Instant::now();
+                        let mut rows = 0;
+                        for starts in buffers.iter() {
+                            rows += if mode == "serial" {
+                                crate::cache::lookup_exec::block_on(async {
+                                    Ok(take_all_serial(&reg, starts).await)
+                                })
+                                .unwrap()
+                            } else {
+                                let slices = crate::cache::lookup_exec::block_on(
+                                    reg.take_buffer_all(starts),
+                                )
+                                .unwrap();
+                                slices
+                                    .entries
+                                    .iter()
+                                    .filter_map(|e| e.slice.as_ref())
+                                    .map(PluginBufferSlice::len)
+                                    .sum()
+                            };
+                        }
+                        (started.elapsed().as_secs_f64(), rows)
+                    })
+                    .await
+                    .unwrap()
+                });
+                eprintln!(
+                    "[VEP_PLUGIN_BENCH] rep={rep} runtime=1-worker mode={mode} buffers={} rows={rows} total={secs:.6}s",
+                    n_buffers
+                );
+            }
         }
     }
 }

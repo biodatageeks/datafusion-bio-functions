@@ -104,6 +104,8 @@ struct EngineAnnotationProfile {
     append_scalars: Duration,
     typed_columns: Duration,
     finish_builders: Duration,
+    /// The per-buffer plugin shard takes (`take_buffer_all`), all plugins.
+    plugin_take: Duration,
 }
 
 impl EngineAnnotationProfile {
@@ -119,7 +121,7 @@ impl EngineAnnotationProfile {
 
     fn summary_line(&self) -> String {
         format!(
-            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} non_variant_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s",
+            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} non_variant_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s plugin_take={:.6}s",
             self.rows,
             self.null_chrom_rows,
             self.null_alt_rows,
@@ -149,6 +151,7 @@ impl EngineAnnotationProfile {
             self.append_scalars.as_secs_f64(),
             self.typed_columns.as_secs_f64(),
             self.finish_builders.as_secs_f64(),
+            self.plugin_take.as_secs_f64(),
         )
     }
 }
@@ -6036,6 +6039,11 @@ impl AnnotateProvider {
         let plugin_n_fields = plugin_registry.map(|r| r.csq_fields().len()).unwrap_or(0);
         #[cfg(not(feature = "parquet-cache"))]
         let plugin_n_fields = 0usize;
+        let engine_profile_enabled = engine_profiling_enabled();
+        #[cfg(feature = "parquet-cache")]
+        let mut plugin_take = Duration::ZERO;
+        #[cfg(not(feature = "parquet-cache"))]
+        let plugin_take = Duration::ZERO;
         #[cfg(feature = "parquet-cache")]
         let plugin_slices = if let Some(reg) = plugin_registry.filter(|r| !r.is_empty()) {
             // Key plugin lookups on the VEP-normalized start (matches the
@@ -6068,9 +6076,12 @@ impl AnnotateProvider {
                 .collect();
             starts.sort_unstable();
             starts.dedup();
-            Some(crate::cache::lookup_exec::block_on(
-                reg.take_buffer_all(&starts),
-            )?)
+            let take_started = engine_profile_enabled.then(Instant::now);
+            let slices = crate::cache::lookup_exec::block_on(reg.take_buffer_all(&starts))?;
+            if let Some(started) = take_started {
+                plugin_take = started.elapsed();
+            }
+            Some(slices)
         } else {
             None
         };
@@ -6283,13 +6294,13 @@ impl AnnotateProvider {
             transcript_selection,
             include_pick_output,
         );
-        let engine_profile_enabled = engine_profiling_enabled();
         let mut engine_profile = EngineAnnotationProfile::new(
             batch.num_rows(),
             skip_csq,
             skip_typed_cols,
             flags.everything,
         );
+        engine_profile.plugin_take = plugin_take;
         let mut tx_engine_profile = engine_profile_enabled.then(TranscriptEngineProfile::default);
         // Rows to remove after the loop (`ALT=.` without --allow_non_variant).
         // `Vec::new` does not allocate, so this costs nothing on a batch that
