@@ -10885,17 +10885,24 @@ fn build_grid_slices(
 /// the ordered release does not idle on one straggler, few enough that the
 /// per-run lookup activation and (on stateful sources) warm-up stay small.
 const STREAM_RUNS_PER_WORKER: usize = 4;
-/// Every seam on Merged/RefSeq replays about `overlap_width_bp` of input
-/// (about one buffer at whole-genome density); four-buffer runs keep that
-/// replay a small share of the run's own work.
+/// Floor on a Merged/RefSeq run's length in buffers. Every seam replays about
+/// `overlap_width_bp` of input (about one buffer at whole-genome density), and
+/// four-buffer runs keep that replay a small share of the run's own work. It
+/// gives way on inputs too small to give every worker a four-buffer run: chr22
+/// has 11 buffers, which a fixed floor cut into 3 runs, so no worker count
+/// above 3 could help. Idle workers cost more than the extra replay.
 const STREAM_MIN_RUN_BUFFERS_STATEFUL: usize = 4;
 
-/// Run length in whole buffers for a contig of `buffers` buffers. `env` is
-/// `VEP_STREAM_RUN_BUFFERS`; it overrides the formula but never the stateful
-/// floor. Scheduling only: the run cut never changes output.
+/// Run length in whole buffers for a contig or region of `buffers` buffers.
+/// `env` is `VEP_STREAM_RUN_BUFFERS`; it overrides the formula but never the
+/// stateful floor, `min(STREAM_MIN_RUN_BUFFERS_STATEFUL, ceil(buffers /
+/// workers))`. Scheduling only: the run cut never changes output.
 fn stream_run_buffers(buffers: usize, workers: usize, stateful: bool, env: Option<&str>) -> usize {
+    let workers = workers.max(1);
     let floor = if stateful {
         STREAM_MIN_RUN_BUFFERS_STATEFUL
+            .min(buffers.div_ceil(workers))
+            .max(1)
     } else {
         1
     };
@@ -10903,10 +10910,20 @@ fn stream_run_buffers(buffers: usize, workers: usize, stateful: bool, env: Optio
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0);
     let chosen = from_env.unwrap_or_else(|| {
-        let target_runs = workers.max(1) * STREAM_RUNS_PER_WORKER;
+        let target_runs = workers * STREAM_RUNS_PER_WORKER;
         buffers.div_ceil(target_runs).max(1)
     });
     chosen.max(floor)
+}
+
+/// Buffers the planned ranges cover: the whole contig when nothing was pushed
+/// down, only the regions' buffers otherwise, so a small region on a large
+/// contig is still cut into enough runs.
+fn covered_buffers(ranges: &[(Vec<RunBounds>, (usize, usize))]) -> usize {
+    ranges
+        .iter()
+        .map(|(_, (bk, bk1))| bk1.saturating_sub(*bk))
+        .sum()
 }
 
 /// Extra runs the pool may start beyond the `workers` running ones, so a
@@ -15255,8 +15272,9 @@ async fn prepare_contig_data(
                 })
                 .collect(),
         };
+        let covered = covered_buffers(&ranges);
         let run_buffers = stream_run_buffers(
-            b,
+            covered,
             config.annotation_workers,
             stateful,
             std::env::var("VEP_STREAM_RUN_BUFFERS").ok().as_deref(),
@@ -15268,6 +15286,7 @@ async fn prepare_contig_data(
             &[
                 ("chrom", TraceValue::Str(&chrom)),
                 ("buffers", TraceValue::Usize(b)),
+                ("covered", TraceValue::Usize(covered)),
                 ("run_buffers", TraceValue::Usize(run_buffers)),
                 ("runs", TraceValue::Usize(planned.len())),
                 ("warm_up", TraceValue::Usize(usize::from(overlap > 0))),
@@ -18559,19 +18578,45 @@ mod tests {
 
     #[test]
     fn stream_run_buffers_default_and_floor() {
-        // 65 buffers, 8 workers: ceil(65 / 32) = 3, floored to 4 on stateful.
+        // 65 buffers (chr1), 8 workers: ceil(65 / 32) = 3, floored to 4 on stateful.
         assert_eq!(stream_run_buffers(65, 8, true, None), 4);
         assert_eq!(stream_run_buffers(65, 8, false, None), 3);
-        // Small contig: at least one buffer per run.
+        // Small stateful contig: the floor gives way so every worker gets a run.
+        // chr22 has 11 buffers: 6 runs at 8 workers, 4 runs at 4 workers.
+        assert_eq!(stream_run_buffers(11, 8, true, None), 2);
+        assert_eq!(stream_run_buffers(11, 4, true, None), 3);
+        // One worker, or workers=0 treated as one, keeps the full floor.
+        assert_eq!(stream_run_buffers(11, 1, true, None), 4);
+        assert_eq!(stream_run_buffers(11, 0, true, None), 4);
+        // Fewer buffers than workers: one buffer per run.
         assert_eq!(stream_run_buffers(3, 8, false, None), 1);
-        assert_eq!(stream_run_buffers(3, 8, true, None), 4);
-        // Override wins but not below the stateful floor.
+        assert_eq!(stream_run_buffers(3, 8, true, None), 1);
+        // An empty contig or region never yields a zero-length run.
+        assert_eq!(stream_run_buffers(0, 8, true, None), 1);
+        // Override wins but not below the effective stateful floor.
         assert_eq!(stream_run_buffers(65, 8, false, Some("2")), 2);
         assert_eq!(stream_run_buffers(65, 8, true, Some("2")), 4);
         assert_eq!(stream_run_buffers(65, 8, true, Some("9")), 9);
+        assert_eq!(stream_run_buffers(11, 8, true, Some("1")), 2);
         // Garbage override is ignored.
         assert_eq!(stream_run_buffers(65, 8, false, Some("x")), 3);
         assert_eq!(stream_run_buffers(65, 8, false, Some("0")), 3);
+    }
+
+    #[test]
+    fn covered_buffers_sums_planned_ranges() {
+        assert_eq!(covered_buffers(&[]), 0);
+        assert_eq!(covered_buffers(&[(vec![RunBounds::OPEN], (0, 65))]), 65);
+        // Two pushed-down regions on a large contig: only their buffers count.
+        assert_eq!(
+            covered_buffers(&[
+                (vec![RunBounds::OPEN], (10, 13)),
+                (vec![RunBounds::OPEN], (40, 42)),
+            ]),
+            5
+        );
+        // An empty range contributes nothing rather than underflowing.
+        assert_eq!(covered_buffers(&[(vec![RunBounds::OPEN], (7, 7))]), 0);
     }
 
     #[test]
