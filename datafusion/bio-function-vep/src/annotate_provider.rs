@@ -11913,16 +11913,26 @@ pub(crate) struct ShardResult {
 }
 
 const MIB: usize = 1 << 20;
-/// Default byte budget (MiB) for annotated batches queued by runs behind the
-/// head of the streaming run pool (`VEP_STREAM_BUFFER_MB`).
+/// Floor (MiB) of the byte budget for annotated batches queued by runs behind
+/// the head of the streaming run pool (`VEP_STREAM_BUFFER_MB`).
 const STREAM_BUFFER_MB_DEFAULT: usize = 1024;
+/// Per-worker share of the default budget. A run behind the head holds its
+/// whole output until released, and plugin CSQ runs to ~15 KB a row, so a
+/// 20k-row run queues ~300 MB. With a fixed 1 GiB only ~3 runs fit and the pool
+/// stalls behind its head: chr1 + 5 plugins stopped gaining at 2 GiB for 4
+/// workers and 3 GiB for 8. The budget is a cap, not an allocation; the queue
+/// only grows as far as the head lags.
+const STREAM_BUFFER_MB_PER_WORKER: usize = 512;
 
-/// Byte budget for the streaming run pool's queued output. `env` is
-/// `VEP_STREAM_BUFFER_MB`.
-fn stream_buffer_mb(env: Option<&str>) -> usize {
+/// Byte budget for the streaming run pool's queued output:
+/// `max(STREAM_BUFFER_MB_DEFAULT, STREAM_BUFFER_MB_PER_WORKER * workers)`.
+/// `env` is `VEP_STREAM_BUFFER_MB`; a positive value replaces the default.
+fn stream_buffer_mb(workers: usize, env: Option<&str>) -> usize {
     env.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(STREAM_BUFFER_MB_DEFAULT)
+        .unwrap_or_else(|| {
+            STREAM_BUFFER_MB_DEFAULT.max(STREAM_BUFFER_MB_PER_WORKER * workers.max(1))
+        })
 }
 
 /// Backpressure for the streaming run pool: every batch a run queues behind
@@ -14075,6 +14085,7 @@ impl Stream for ContigAnnotationStream {
                                     workers,
                                     lookahead,
                                     budget: OutputBudget::new(stream_buffer_mb(
+                                        workers,
                                         std::env::var("VEP_STREAM_BUFFER_MB").ok().as_deref(),
                                     )),
                                     run_inputs: ready.run_inputs.clone(),
@@ -18767,10 +18778,17 @@ mod tests {
 
     #[test]
     fn stream_buffer_mb_default_and_override() {
-        assert_eq!(stream_buffer_mb(None), STREAM_BUFFER_MB_DEFAULT);
-        assert_eq!(stream_buffer_mb(Some("256")), 256);
-        assert_eq!(stream_buffer_mb(Some("0")), STREAM_BUFFER_MB_DEFAULT);
-        assert_eq!(stream_buffer_mb(Some("x")), STREAM_BUFFER_MB_DEFAULT);
+        // The default grows with the pool, never below the 1 GiB floor.
+        assert_eq!(stream_buffer_mb(0, None), STREAM_BUFFER_MB_DEFAULT);
+        assert_eq!(stream_buffer_mb(1, None), STREAM_BUFFER_MB_DEFAULT);
+        assert_eq!(stream_buffer_mb(2, None), STREAM_BUFFER_MB_DEFAULT);
+        assert_eq!(stream_buffer_mb(4, None), 2048);
+        assert_eq!(stream_buffer_mb(8, None), 4096);
+        // A positive override replaces it outright, below the default too.
+        assert_eq!(stream_buffer_mb(8, Some("256")), 256);
+        // Zero and garbage fall back to the default.
+        assert_eq!(stream_buffer_mb(8, Some("0")), 4096);
+        assert_eq!(stream_buffer_mb(8, Some("x")), 4096);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
