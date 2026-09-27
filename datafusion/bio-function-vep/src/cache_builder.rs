@@ -60,6 +60,7 @@ pub struct CacheBuilder {
     cache_source_type: BioFormatsCacheSourceType,
     expected_cache_version: Option<String>,
     chrom_filter: Option<Vec<String>>,
+    build_concurrency: usize,
 }
 
 impl CacheBuilder {
@@ -73,11 +74,23 @@ impl CacheBuilder {
             cache_source_type: BioFormatsCacheSourceType::Ensembl,
             expected_cache_version: None,
             chrom_filter: None,
+            build_concurrency: 1,
         }
     }
 
     pub fn with_partitions(mut self, n: usize) -> Self {
         self.partitions = n;
+        self
+    }
+
+    /// Set how many (entity, chromosome) build units may run concurrently
+    /// (LPT-ordered, weighted-semaphore-bounded — see
+    /// [`crate::cache::build::build_all_units`]). `1` (default) keeps the
+    /// original fully-sequential `build_all()` path untouched. Unrelated to
+    /// `partitions`, which only controls DataFusion's per-query internal
+    /// parallelism.
+    pub fn with_build_concurrency(mut self, n: usize) -> Self {
+        self.build_concurrency = n.max(1);
         self
     }
 
@@ -121,6 +134,28 @@ impl CacheBuilder {
 
     /// Build all entities into the Parquet cache.
     pub async fn build_all(&self) -> Result<Vec<EntityStats>> {
+        if self.build_concurrency > 1 {
+            #[cfg(feature = "parquet-cache")]
+            {
+                let cache_version = self.validate_raw_cache_identity(EnsemblEntityKind::Variation)?;
+                let options = crate::cache::build::CacheBuildOptions {
+                    cache_root: self.cache_root.clone(),
+                    output_dir: self.output_dir.clone(),
+                    partitions: self.partitions,
+                    cache_source_type: self.cache_source_type,
+                    cache_version,
+                    overwrite: self.overwrite,
+                    chrom_filter: self.chrom_filter.clone(),
+                };
+                return crate::cache::build::build_all_units(&options, self.build_concurrency)
+                    .await;
+            }
+            #[cfg(not(feature = "parquet-cache"))]
+            return Err(DataFusionError::Execution(
+                "cache builder requires the parquet-cache feature".to_string(),
+            ));
+        }
+
         let entities = [
             "variation",
             "transcript",

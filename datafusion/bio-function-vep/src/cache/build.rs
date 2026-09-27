@@ -129,13 +129,6 @@ pub async fn build_parquet_variation_chrom(
         warm_starts.len(),
     );
 
-    // Warm tier (0) first, then cold (1); a chromosome with no warm positions
-    // writes a single cold tier. Mirrors the Parquet tiered writer's passes.
-    let passes: &[i8] = if warm_starts.is_empty() {
-        &[1]
-    } else {
-        &[0, 1]
-    };
     let ctx = make_ctx_and_register(options, EnsemblEntityKind::Variation, "var")?;
 
     // Derive the output schema once from the source plan schema and reuse it for
@@ -148,21 +141,77 @@ pub async fn build_parquet_variation_chrom(
         &options.cache_version,
     ));
 
-    let mut writer = VariationParquetShardWriter::create(&shard_path, Arc::clone(&out_schema))?;
-    for &keep_tier in passes {
-        let plan = ctx.sql(&query).await?.create_physical_plan().await?;
-        let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+    // Single-pass execution: stream the DataFusion query once instead of multiple passes.
+    // Warm tier batches (rare: ~3-5% of variants, e.g. ~30-40 MB RAM for chr20) are buffered
+    // in memory, while cold tier batches are streamed directly to an Arrow IPC temp file.
+    // Finally, warm batches are written first to the output Parquet, followed by cold batches.
+    let plan = ctx.sql(&query).await?.create_physical_plan().await?;
+    let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+
+    let rows = if warm_starts.is_empty() {
+        // No warm variants: write directly to final parquet shard.
+        let mut writer = VariationParquetShardWriter::create(&shard_path, Arc::clone(&out_schema))?;
         while let Some(batch) = stream.next().await {
-            let tiered =
-                transform_variation_tier_batch(batch?, &source_type, &warm_starts, keep_tier)?;
-            if tiered.num_rows() == 0 {
-                continue;
+            let (_, cold_opt) =
+                transform_variation_split_batch(batch?, &source_type, &warm_starts)?;
+            if let Some(cold) = cold_opt {
+                let encoded = encode_variation_batch(&cold, &out_schema)?;
+                writer.write(&encoded)?;
             }
-            let encoded = encode_variation_batch(&tiered, &out_schema)?;
-            writer.write(&encoded)?;
         }
-    }
-    let rows = writer.finish()?;
+        writer.finish()?
+    } else {
+        use datafusion::arrow::ipc::reader::FileReader;
+        use datafusion::arrow::ipc::writer::FileWriter;
+
+        let cold_tmp_path = shard_path.with_extension("cold_ipc.tmp");
+        let cold_file = std::fs::File::create(&cold_tmp_path).map_err(|err| {
+            DataFusionError::Execution(format!("failed to create '{cold_tmp_path:?}': {err}"))
+        })?;
+        let mut cold_ipc_writer = FileWriter::try_new(cold_file, &out_schema)
+            .map_err(|err| DataFusionError::Execution(format!("open Arrow IPC writer: {err}")))?;
+
+        let mut warm_batches: Vec<RecordBatch> = Vec::new();
+        let mut cold_batches_count: usize = 0;
+
+        while let Some(batch) = stream.next().await {
+            let (warm_opt, cold_opt) =
+                transform_variation_split_batch(batch?, &source_type, &warm_starts)?;
+            if let Some(warm) = warm_opt {
+                let encoded = encode_variation_batch(&warm, &out_schema)?;
+                warm_batches.push(encoded);
+            }
+            if let Some(cold) = cold_opt {
+                let encoded = encode_variation_batch(&cold, &out_schema)?;
+                cold_ipc_writer.write(&encoded).map_err(|err| {
+                    DataFusionError::Execution(format!("write Arrow IPC batch: {err}"))
+                })?;
+                cold_batches_count += 1;
+            }
+        }
+        cold_ipc_writer.finish().map_err(|err| {
+            DataFusionError::Execution(format!("finish Arrow IPC writer: {err}"))
+        })?;
+        drop(cold_ipc_writer);
+
+        let mut writer = VariationParquetShardWriter::create(&shard_path, Arc::clone(&out_schema))?;
+        for warm in warm_batches {
+            writer.write(&warm)?;
+        }
+        if cold_batches_count > 0 {
+            let file = std::fs::File::open(&cold_tmp_path).map_err(|err| {
+                DataFusionError::Execution(format!("open '{cold_tmp_path:?}': {err}"))
+            })?;
+            let reader = FileReader::try_new(file, None)
+                .map_err(|err| DataFusionError::Execution(format!("open Arrow IPC reader: {err}")))?;
+            for batch in reader {
+                let batch = batch.map_err(|err| DataFusionError::Execution(format!("Arrow IPC read: {err}")))?;
+                writer.write(&batch)?;
+            }
+        }
+        let _ = std::fs::remove_file(&cold_tmp_path);
+        writer.finish()?
+    };
     if rows == 0 {
         // The writer is created eagerly (before the stream), so a contig with no
         // variants — e.g. a GL*/KI* scaffold present in the source schema but
@@ -180,7 +229,7 @@ pub async fn build_parquet_variation_chrom(
 async fn collect_warm_starts(
     options: &CacheBuildOptions,
     source_chrom: &str,
-) -> Result<BTreeSet<i64>> {
+) -> Result<HashSet<i64>> {
     let ctx = make_ctx_and_register(options, EnsemblEntityKind::Variation, "var")?;
     // Mixed-case columns must be quoted; DataFusion lowercases bare identifiers.
     let sql = format!(
@@ -193,11 +242,12 @@ async fn collect_warm_starts(
     while let Some(batch) = stream.next().await {
         collect_position_frequencies(&batch?, &mut rows)?;
     }
-    Ok(select_warm_positions(
+    let warm_set = select_warm_positions(
         rows,
         WARM_AF_THRESHOLD,
         WARM_POSITION_RADIUS,
-    ))
+    );
+    Ok(warm_set.into_iter().collect())
 }
 
 fn collect_position_frequencies(
@@ -687,6 +737,609 @@ async fn build_parquet_translation_sift(options: &CacheBuildOptions) -> Result<E
     })
 }
 
+// ---------------------------------------------------------------------------
+// Concurrent build: LPT-ordered, weighted-semaphore-bounded scheduling across
+// every (entity, chrom) build primitive. `build_all()` stays the sequential
+// default (`build_concurrency == 1`); `CacheBuilder::with_build_concurrency`
+// routes here for `> 1`.
+// ---------------------------------------------------------------------------
+
+/// Approximate GRCh38 chromosome lengths (bp), used only to order units
+/// longest-first (LPT) before scheduling. Exact per-unit cost isn't known
+/// upfront; chromosome length is a cheap, good-enough proxy for it.
+fn approx_chrom_length_bp(chrom: &str) -> u64 {
+    let bare = chrom.strip_prefix("chr").unwrap_or(chrom);
+    match bare {
+        "1" => 248_956_422,
+        "2" => 242_193_529,
+        "3" => 198_295_559,
+        "4" => 190_214_555,
+        "5" => 181_538_259,
+        "6" => 170_805_979,
+        "7" => 159_345_973,
+        "8" => 145_138_636,
+        "9" => 138_394_717,
+        "10" => 133_797_422,
+        "11" => 135_086_622,
+        "12" => 133_275_309,
+        "13" => 114_364_328,
+        "14" => 107_043_718,
+        "15" => 101_991_189,
+        "16" => 90_338_345,
+        "17" => 83_257_441,
+        "18" => 80_373_285,
+        "19" => 58_617_616,
+        "20" => 64_444_167,
+        "21" => 46_709_983,
+        "22" => 50_818_468,
+        "X" => 156_040_895,
+        "Y" => 57_227_415,
+        "MT" | "M" => 16_569,
+        _ => 100_000_000, // unknown contig: assume mid-size rather than starve it
+    }
+}
+
+const VARIATION_REGION_CHUNK_BP: i64 = 16_000_000;
+
+/// One independently-schedulable cache-build task.
+enum BuildUnit {
+    VariationRegion {
+        chrom: String,
+        part_idx: usize,
+        total_parts: usize,
+        start_bp: i64,
+        end_bp: i64,
+    },
+    Context(EnsemblEntityKind, String),
+    TranslationCore(String),
+    TranslationSift(String),
+}
+
+pub struct VariationRegionResult {
+    pub chrom: String,
+    pub part_idx: usize,
+    pub total_parts: usize,
+    pub warm_ipc_path: Option<PathBuf>,
+    pub cold_ipc_path: Option<PathBuf>,
+    pub warm_rows: usize,
+    pub cold_rows: usize,
+}
+
+enum UnitRunResult {
+    Completed(&'static str, ChromDatasetEntry),
+    VariationPart(VariationRegionResult),
+}
+
+impl BuildUnit {
+    fn cost(&self) -> u64 {
+        match self {
+            BuildUnit::VariationRegion { start_bp, end_bp, .. } => {
+                let len = if *end_bp == i64::MAX {
+                    VARIATION_REGION_CHUNK_BP as u64
+                } else {
+                    (*end_bp - *start_bp + 1).max(0) as u64
+                };
+                len.saturating_mul(100)
+            }
+            BuildUnit::Context(kind, chrom) => {
+                let chrom_len = approx_chrom_length_bp(chrom);
+                let weight = match kind {
+                    EnsemblEntityKind::Transcript => 10,
+                    EnsemblEntityKind::Exon => 5,
+                    EnsemblEntityKind::RegulatoryFeature => 2,
+                    EnsemblEntityKind::MotifFeature => 1,
+                    _ => 1,
+                };
+                chrom_len.saturating_mul(weight)
+            }
+            BuildUnit::TranslationCore(chrom) => approx_chrom_length_bp(chrom).saturating_mul(2),
+            BuildUnit::TranslationSift(chrom) => approx_chrom_length_bp(chrom).saturating_mul(2),
+        }
+    }
+
+    /// Semaphore permits this unit consumes.
+    fn weight(&self, var_weight: u32) -> u32 {
+        match self {
+            BuildUnit::VariationRegion { .. } => var_weight,
+            _ => 1,
+        }
+    }
+
+    async fn run(
+        self,
+        options: Arc<CacheBuildOptions>,
+        var_out_schema: Option<Arc<Schema>>,
+    ) -> Result<UnitRunResult> {
+        match self {
+            BuildUnit::VariationRegion {
+                chrom,
+                part_idx,
+                total_parts,
+                start_bp,
+                end_bp,
+            } => {
+                let schema = var_out_schema.expect("var_out_schema present for VariationRegion");
+                let res = build_parquet_variation_region(
+                    options,
+                    schema,
+                    chrom,
+                    part_idx,
+                    total_parts,
+                    start_bp,
+                    end_bp,
+                )
+                .await?;
+                Ok(UnitRunResult::VariationPart(res))
+            }
+            BuildUnit::Context(kind, chrom) => {
+                let entity = entity_output_name(kind);
+                let entry = build_parquet_context_entity_chrom(&options, kind, &chrom).await?;
+                Ok(UnitRunResult::Completed(entity, entry))
+            }
+            BuildUnit::TranslationCore(chrom) => {
+                let entry = build_parquet_translation_core_chrom(&options, &chrom).await?;
+                Ok(UnitRunResult::Completed("translation_core", entry))
+            }
+            BuildUnit::TranslationSift(chrom) => {
+                let entry = build_parquet_translation_sift_chrom(&options, &chrom).await?;
+                Ok(UnitRunResult::Completed("translation_sift", entry))
+            }
+        }
+    }
+}
+
+async fn collect_warm_starts_region(
+    options: &CacheBuildOptions,
+    source_chrom: &str,
+    start_bp: i64,
+    end_bp: i64,
+) -> Result<HashSet<i64>> {
+    let ctx = make_ctx_and_register_partitions(options, EnsemblEntityKind::Variation, "var", 1)?;
+    let scan_start = (start_bp - WARM_POSITION_RADIUS as i64).max(1);
+    let scan_end = end_bp.saturating_add(WARM_POSITION_RADIUS as i64);
+    let end_filter = if end_bp < i64::MAX - 20000 {
+        format!(" AND start <= {scan_end} AND end <= {}", scan_end + 10000)
+    } else {
+        String::new()
+    };
+    let sql = format!(
+        "SELECT start, minor_allele_freq, \"AF\", \"gnomADg\", \"gnomADe\" FROM var \
+         WHERE chrom = '{}' AND start >= {scan_start}{end_filter}",
+        sql_escape_literal(source_chrom)
+    );
+    let df = ctx.sql(&sql).await?;
+    let mut stream = df.execute_stream().await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next().await {
+        collect_position_frequencies(&batch?, &mut rows)?;
+    }
+    let warm_set = select_warm_positions(
+        rows,
+        WARM_AF_THRESHOLD,
+        WARM_POSITION_RADIUS,
+    );
+    Ok(warm_set.into_iter().collect())
+}
+
+async fn build_parquet_variation_region(
+    options: Arc<CacheBuildOptions>,
+    out_schema: Arc<Schema>,
+    chrom: String,
+    part_idx: usize,
+    total_parts: usize,
+    start_bp: i64,
+    end_bp: i64,
+) -> Result<VariationRegionResult> {
+    use crate::parquet_cache::write::encode_variation_batch;
+    use datafusion::arrow::ipc::writer::FileWriter;
+
+    let source_chrom = chrom.strip_prefix("chr").unwrap_or(&chrom);
+    let warm_starts = Arc::new(collect_warm_starts_region(&options, source_chrom, start_bp, end_bp).await?);
+
+    let ctx = make_ctx_and_register_partitions(&options, EnsemblEntityKind::Variation, "var", 1)?;
+    let end_filter = if end_bp < i64::MAX - 20000 {
+        format!(" AND start <= {end_bp} AND end <= {}", end_bp + 10000)
+    } else {
+        String::new()
+    };
+    let query = format!(
+        "SELECT * FROM var WHERE chrom = '{}' AND start >= {start_bp}{end_filter}",
+        sql_escape_literal(source_chrom)
+    );
+    let plan = ctx.sql(&query).await?.create_physical_plan().await?;
+    let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+
+    let entity_dir = PathBuf::from(&options.output_dir).join("variation");
+    std::fs::create_dir_all(&entity_dir).map_err(|err| {
+        DataFusionError::Execution(format!("failed to create '{:?}': {err}", entity_dir))
+    })?;
+
+    let warm_tmp_path = entity_dir.join(format!("{chrom}.part_{part_idx}.warm_ipc.tmp"));
+    let cold_tmp_path = entity_dir.join(format!("{chrom}.part_{part_idx}.cold_ipc.tmp"));
+    let _ = std::fs::remove_file(&warm_tmp_path);
+    let _ = std::fs::remove_file(&cold_tmp_path);
+
+    let warm_file = std::fs::File::create(&warm_tmp_path).map_err(|err| {
+        DataFusionError::Execution(format!("create warm IPC {warm_tmp_path:?}: {err}"))
+    })?;
+    let mut warm_ipc_writer = FileWriter::try_new(warm_file, &out_schema)
+        .map_err(|err| DataFusionError::Execution(format!("open warm IPC writer: {err}")))?;
+
+    let cold_file = std::fs::File::create(&cold_tmp_path).map_err(|err| {
+        DataFusionError::Execution(format!("create cold IPC {cold_tmp_path:?}: {err}"))
+    })?;
+    let mut cold_ipc_writer = FileWriter::try_new(cold_file, &out_schema)
+        .map_err(|err| DataFusionError::Execution(format!("open cold IPC writer: {err}")))?;
+
+    let source_type = options.cache_source_type.as_str().to_string();
+    let mut warm_rows = 0usize;
+    let mut cold_rows = 0usize;
+
+    while let Some(batch) = stream.next().await {
+        let (warm_opt, cold_opt) =
+            transform_variation_split_batch(batch?, &source_type, &warm_starts)?;
+        if let Some(warm) = warm_opt {
+            warm_rows += warm.num_rows();
+            let encoded = encode_variation_batch(&warm, &out_schema)?;
+            warm_ipc_writer.write(&encoded).map_err(|err| {
+                DataFusionError::Execution(format!("write warm IPC batch: {err}"))
+            })?;
+        }
+        if let Some(cold) = cold_opt {
+            cold_rows += cold.num_rows();
+            let encoded = encode_variation_batch(&cold, &out_schema)?;
+            cold_ipc_writer.write(&encoded).map_err(|err| {
+                DataFusionError::Execution(format!("write cold IPC batch: {err}"))
+            })?;
+        }
+    }
+
+    warm_ipc_writer.finish().map_err(|err| {
+        DataFusionError::Execution(format!("finish warm IPC writer: {err}"))
+    })?;
+    cold_ipc_writer.finish().map_err(|err| {
+        DataFusionError::Execution(format!("finish cold IPC writer: {err}"))
+    })?;
+
+    let warm_ipc_path = if warm_rows > 0 {
+        Some(warm_tmp_path)
+    } else {
+        let _ = std::fs::remove_file(&warm_tmp_path);
+        None
+    };
+    let cold_ipc_path = if cold_rows > 0 {
+        Some(cold_tmp_path)
+    } else {
+        let _ = std::fs::remove_file(&cold_tmp_path);
+        None
+    };
+
+    Ok(VariationRegionResult {
+        chrom,
+        part_idx,
+        total_parts,
+        warm_ipc_path,
+        cold_ipc_path,
+        warm_rows,
+        cold_rows,
+    })
+}
+
+async fn assemble_variation_shard(
+    options: &CacheBuildOptions,
+    entity_dir: &Path,
+    chrom: &str,
+    mut parts: Vec<VariationRegionResult>,
+    out_schema: Arc<Schema>,
+) -> Result<ChromDatasetEntry> {
+    use crate::parquet_cache::write::VariationParquetShardWriter;
+    use datafusion::arrow::ipc::reader::FileReader;
+
+    parts.sort_by_key(|p| p.part_idx);
+    let manifest_chrom = canonical_chrom_label(chrom);
+    let file_name = format!("{manifest_chrom}.parquet");
+    let shard_path = entity_dir.join(&file_name);
+    remove_existing_parquet_shard(&shard_path, options.overwrite)?;
+
+    let total_rows: usize = parts.iter().map(|p| p.warm_rows + p.cold_rows).sum();
+    if total_rows == 0 {
+        return Ok(ChromDatasetEntry::new(manifest_chrom, file_name, 0));
+    }
+
+    let mut writer = VariationParquetShardWriter::create(&shard_path, Arc::clone(&out_schema))?;
+
+    // Phase 1: Write all warm rows in part order (0, 1, 2, ...)
+    for part in &parts {
+        if let Some(ref warm_path) = part.warm_ipc_path {
+            if warm_path.exists() && part.warm_rows > 0 {
+                let file = std::fs::File::open(warm_path).map_err(|err| {
+                    DataFusionError::Execution(format!("open warm IPC {warm_path:?}: {err}"))
+                })?;
+                let reader = FileReader::try_new(file, None).map_err(|err| {
+                    DataFusionError::Execution(format!("read warm IPC {warm_path:?}: {err}"))
+                })?;
+                for batch in reader {
+                    let batch = batch.map_err(|err| {
+                        DataFusionError::Execution(format!("batch read: {err}"))
+                    })?;
+                    writer.write(&batch)?;
+                }
+            }
+            let _ = std::fs::remove_file(warm_path);
+        }
+    }
+
+    // Phase 2: Write all cold rows in part order (0, 1, 2, ...)
+    for part in &parts {
+        if let Some(ref cold_path) = part.cold_ipc_path {
+            if cold_path.exists() && part.cold_rows > 0 {
+                let file = std::fs::File::open(cold_path).map_err(|err| {
+                    DataFusionError::Execution(format!("open cold IPC {cold_path:?}: {err}"))
+                })?;
+                let reader = FileReader::try_new(file, None).map_err(|err| {
+                    DataFusionError::Execution(format!("read cold IPC {cold_path:?}: {err}"))
+                })?;
+                for batch in reader {
+                    let batch = batch.map_err(|err| {
+                        DataFusionError::Execution(format!("batch read: {err}"))
+                    })?;
+                    writer.write(&batch)?;
+                }
+            }
+            let _ = std::fs::remove_file(cold_path);
+        }
+    }
+
+    let written = writer.finish()?;
+    Ok(ChromDatasetEntry::new(manifest_chrom, file_name, written))
+}
+
+async fn get_variation_out_schema(options: &CacheBuildOptions) -> Result<SchemaRef> {
+    use crate::parquet_cache::write::variation_output_schema;
+    let ctx = make_ctx_and_register_partitions(options, EnsemblEntityKind::Variation, "var", 1)?;
+    let plan = ctx.sql("SELECT * FROM var LIMIT 0").await?.create_physical_plan().await?;
+    let source_type = options.cache_source_type.as_str().to_string();
+    let projected = variation_output_schema(plan.schema().as_ref(), &source_type)?;
+    Ok(Arc::new(with_cache_identity_metadata(
+        projected.as_ref(),
+        &source_type,
+        &options.cache_version,
+    )))
+}
+
+/// Read `VEPYR_VAR_WEIGHT` (default 1): extra semaphore permits a variation
+/// unit consumes, so a memory-constrained host can bound peak RSS by trading
+/// away concurrency for the dominant entity specifically instead of globally.
+fn variation_permit_weight() -> u32 {
+    std::env::var("VEPYR_VAR_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|w| *w >= 1)
+        .unwrap_or(1)
+}
+
+/// Build all entities with cross-unit concurrency: every (entity, chromosome)
+/// build primitive becomes one [`BuildUnit`], sorted longest-first (LPT —
+/// Longest Processing Time first) so the tail (dominated by the `variation`
+/// entity) starts as early as possible, then run through a `JoinSet` bounded
+/// by a weighted `Semaphore`. `build_concurrency` caps how many units run at
+/// once; `options.partitions` is unrelated — it only controls DataFusion's
+/// per-query internal parallelism, not this cross-unit scheduling.
+///
+/// Each entity's manifest is written once, after all of that entity's units
+/// complete, mirroring the sequential path's per-entity
+/// `merge_write_to_entity_dir` call.
+pub async fn build_all_units(
+    options: &CacheBuildOptions,
+    build_concurrency: usize,
+) -> Result<Vec<EntityStats>> {
+    use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
+
+    let build_concurrency = build_concurrency.max(1);
+    let options = Arc::new(options.clone());
+    let var_weight = variation_permit_weight();
+
+    let entity_kinds = [
+        EnsemblEntityKind::Variation,
+        EnsemblEntityKind::Transcript,
+        EnsemblEntityKind::Exon,
+        EnsemblEntityKind::Translation,
+        EnsemblEntityKind::RegulatoryFeature,
+        EnsemblEntityKind::MotifFeature,
+    ];
+
+    // Discovery: cheap, sequential (schema introspection only). Entities
+    // already fully built (overwrite=false) short-circuit to a placeholder
+    // EntityStats exactly like `build_all()`'s per-entity dispatch does.
+    let mut done: Vec<EntityStats> = Vec::new();
+    let mut units: Vec<BuildUnit> = Vec::new();
+    let mut entity_dirs: HashMap<&'static str, PathBuf> = HashMap::new();
+
+    for kind in entity_kinds {
+        match kind {
+            EnsemblEntityKind::Variation => {
+                let entity_dir = parquet_entity_dir(&options, "variation")?;
+                if should_skip_parquet_entity(&entity_dir, options.overwrite) {
+                    info!("variation already exists, skipping (use overwrite to rebuild)");
+                    done.push(EntityStats {
+                        entity: "variation".to_string(),
+                        parquet_files: vec![],
+                    });
+                    continue;
+                }
+                entity_dirs.insert("variation", entity_dir);
+                let chroms =
+                    discover_chroms(&options, EnsemblEntityKind::Variation, "var").await?;
+                for chrom in chroms {
+                    let chrom_len = approx_chrom_length_bp(&chrom) as i64;
+                    let chunk_size = VARIATION_REGION_CHUNK_BP;
+                    let total_parts = ((chrom_len + chunk_size - 1) / chunk_size).max(1) as usize;
+                    for part_idx in 0..total_parts {
+                        let start_bp = (part_idx as i64) * chunk_size + 1;
+                        let end_bp = if part_idx + 1 == total_parts {
+                            i64::MAX
+                        } else {
+                            (part_idx as i64 + 1) * chunk_size
+                        };
+                        units.push(BuildUnit::VariationRegion {
+                            chrom: chrom.clone(),
+                            part_idx,
+                            total_parts,
+                            start_bp,
+                            end_bp,
+                        });
+                    }
+                }
+            }
+            EnsemblEntityKind::Translation => {
+                let core_dir = parquet_entity_dir(&options, "translation_core")?;
+                let sift_dir = parquet_entity_dir(&options, "translation_sift")?;
+                let core_done = should_skip_parquet_entity(&core_dir, options.overwrite);
+                let sift_done = should_skip_parquet_entity(&sift_dir, options.overwrite);
+                if core_done {
+                    info!("translation_core already exists, skipping (use overwrite to rebuild)");
+                    done.push(EntityStats {
+                        entity: "translation_core".to_string(),
+                        parquet_files: vec![],
+                    });
+                } else {
+                    entity_dirs.insert("translation_core", core_dir);
+                }
+                if sift_done {
+                    info!("translation_sift already exists, skipping (use overwrite to rebuild)");
+                    done.push(EntityStats {
+                        entity: "translation_sift".to_string(),
+                        parquet_files: vec![],
+                    });
+                } else {
+                    entity_dirs.insert("translation_sift", sift_dir);
+                }
+                if !core_done || !sift_done {
+                    let chroms =
+                        discover_chroms(&options, EnsemblEntityKind::Translation, "tl").await?;
+                    if !core_done {
+                        units.extend(chroms.iter().cloned().map(BuildUnit::TranslationCore));
+                    }
+                    if !sift_done {
+                        units.extend(chroms.into_iter().map(BuildUnit::TranslationSift));
+                    }
+                }
+            }
+            other => {
+                let entity = entity_output_name(other);
+                let entity_dir = parquet_entity_dir(&options, entity)?;
+                if should_skip_parquet_entity(&entity_dir, options.overwrite) {
+                    info!("{entity} already exists, skipping (use overwrite to rebuild)");
+                    done.push(EntityStats {
+                        entity: entity.to_string(),
+                        parquet_files: vec![],
+                    });
+                    continue;
+                }
+                entity_dirs.insert(entity, entity_dir);
+                let table_name = entity_table_name(other);
+                let chroms = discover_chroms(&options, other, table_name).await?;
+                units.extend(
+                    chroms
+                        .into_iter()
+                        .map(move |chrom| BuildUnit::Context(other, chrom)),
+                );
+            }
+        }
+    }
+
+    // LPT: longest first, so the tail (dominated by `variation`) is in
+    // flight as early as possible instead of starting last.
+    units.sort_by_key(|b| std::cmp::Reverse(b.cost()));
+
+    let var_out_schema = if units.iter().any(|u| matches!(u, BuildUnit::VariationRegion { .. })) {
+        Some(get_variation_out_schema(&options).await?)
+    } else {
+        None
+    };
+
+    let semaphore = Arc::new(Semaphore::new(build_concurrency));
+    let mut join_set: JoinSet<Result<UnitRunResult>> = JoinSet::new();
+    for unit in units {
+        let permits = unit.weight(var_weight).min(build_concurrency as u32);
+        let semaphore = Arc::clone(&semaphore);
+        let options = Arc::clone(&options);
+        let var_out_schema = var_out_schema.clone();
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_many_owned(permits)
+                .await
+                .map_err(|err| DataFusionError::Execution(format!("semaphore closed: {err}")))?;
+            unit.run(options, var_out_schema).await
+        });
+    }
+
+    let mut manifest_entries: HashMap<&'static str, Vec<ChromDatasetEntry>> = HashMap::new();
+    let mut files: HashMap<&'static str, Vec<(String, usize)>> = HashMap::new();
+    let mut variation_parts: HashMap<String, Vec<VariationRegionResult>> = HashMap::new();
+
+    while let Some(joined) = join_set.join_next().await {
+        let result = joined
+            .map_err(|err| DataFusionError::Execution(format!("build task panicked: {err}")))??;
+        match result {
+            UnitRunResult::Completed(entity, entry) => {
+                if entry.rows > 0 {
+                    let entity_dir = entity_dirs
+                        .get(entity)
+                        .expect("entity_dirs populated for every scheduled unit's entity");
+                    let shard_path = entity_dir.join(&entry.dataset);
+                    files
+                        .entry(entity)
+                        .or_default()
+                        .push((shard_path.to_string_lossy().to_string(), entry.rows));
+                    manifest_entries.entry(entity).or_default().push(entry);
+                }
+            }
+            UnitRunResult::VariationPart(part) => {
+                let chrom = part.chrom.clone();
+                let total_parts = part.total_parts;
+                let list = variation_parts.entry(chrom.clone()).or_default();
+                list.push(part);
+                if list.len() == total_parts {
+                    let completed_parts = variation_parts.remove(&chrom).unwrap();
+                    let entity_dir = entity_dirs
+                        .get("variation")
+                        .expect("variation entity_dir exists");
+                    let schema = var_out_schema.as_ref().expect("var_out_schema exists");
+                    let entry = assemble_variation_shard(
+                        &options,
+                        entity_dir,
+                        &chrom,
+                        completed_parts,
+                        Arc::clone(schema),
+                    )
+                    .await?;
+                    if entry.rows > 0 {
+                        let shard_path = entity_dir.join(&entry.dataset);
+                        files
+                            .entry("variation")
+                            .or_default()
+                            .push((shard_path.to_string_lossy().to_string(), entry.rows));
+                        manifest_entries.entry("variation").or_default().push(entry);
+                    }
+                }
+            }
+        }
+    }
+
+    for (entity, entity_dir) in &entity_dirs {
+        let entries = manifest_entries.remove(entity).unwrap_or_default();
+        ChromManifest::new(entries).merge_write_to_entity_dir(entity_dir)?;
+        done.push(EntityStats {
+            entity: entity.to_string(),
+            parquet_files: files.remove(*entity).unwrap_or_default(),
+        });
+    }
+
+    Ok(done)
+}
+
 /// Sort a translation_sift batch ascending by its `key` column.
 fn sort_record_batch_by_key(batch: &RecordBatch) -> Result<RecordBatch> {
     let key_idx = batch.schema().index_of("key")?;
@@ -740,20 +1393,33 @@ fn filter_chroms(chroms: Vec<String>, allow: Option<&[String]>) -> Vec<String> {
         .collect()
 }
 
+fn make_ctx_and_register_partitions(
+    options: &CacheBuildOptions,
+    kind: EnsemblEntityKind,
+    table_name: &str,
+    partitions: usize,
+) -> Result<SessionContext> {
+    let config = SessionConfig::new().with_target_partitions(partitions);
+    let ctx = SessionContext::new_with_config(config);
+    let mut provider_options = EnsemblCacheOptions::new(&options.cache_root)
+        .with_cache_source_type(options.cache_source_type)
+        .with_expected_cache_version(&options.cache_version);
+    provider_options.target_partitions = Some(partitions);
+    let provider = EnsemblCacheTableProvider::for_entity(kind, provider_options)?;
+    ctx.register_table(table_name, provider)?;
+    Ok(ctx)
+}
+
 fn make_ctx_and_register(
     options: &CacheBuildOptions,
     kind: EnsemblEntityKind,
     table_name: &str,
 ) -> Result<SessionContext> {
-    let config = SessionConfig::new().with_target_partitions(options.partitions);
-    let ctx = SessionContext::new_with_config(config);
-    let mut provider_options = EnsemblCacheOptions::new(&options.cache_root)
-        .with_cache_source_type(options.cache_source_type)
-        .with_expected_cache_version(&options.cache_version);
-    provider_options.target_partitions = Some(options.partitions);
-    let provider = EnsemblCacheTableProvider::for_entity(kind, provider_options)?;
-    ctx.register_table(table_name, provider)?;
-    Ok(ctx)
+    let partitions = match kind {
+        EnsemblEntityKind::Variation => options.partitions.max(4),
+        _ => 1,
+    };
+    make_ctx_and_register_partitions(options, kind, table_name, partitions)
 }
 
 /// Project a source variation batch to the Parquet output schema, derive the
@@ -836,6 +1502,112 @@ fn transform_variation_tier_batch(
         ))
     })
 }
+
+fn transform_variation_split_batch(
+    batch: RecordBatch,
+    source_type: &str,
+    warm_starts: &HashSet<i64>,
+) -> Result<(Option<RecordBatch>, Option<RecordBatch>)> {
+    let schema = batch.schema();
+    let target_schema = Arc::new(variation_projected_schema(schema.as_ref(), source_type)?);
+    let mut columns = Vec::new();
+    let forbidden = VARIATION_FORBIDDEN_COLUMNS
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+
+    for name in VARIATION_REQUIRED_COLUMNS {
+        if forbidden.contains(name) {
+            continue;
+        }
+        let (index, _) = schema.column_with_name(name).ok_or_else(|| {
+            DataFusionError::Execution(format!("variation source batch missing column {name}"))
+        })?;
+        if *name == "start" || *name == "end" {
+            columns.push(
+                cast(batch.column(index).as_ref(), &DataType::UInt32).map_err(|err| {
+                    DataFusionError::Execution(format!(
+                        "failed to cast variation {name} to UInt32: {err}"
+                    ))
+                })?,
+            );
+        } else {
+            columns.push(batch.column(index).clone());
+        }
+        if *name == "clin_sig_allele" {
+            for optional_name in VARIATION_OPTIONAL_COLUMNS {
+                if let Some((optional_index, _)) = schema.column_with_name(optional_name) {
+                    columns.push(batch.column(optional_index).clone());
+                }
+            }
+        }
+    }
+
+    let (start_index, _) = schema.column_with_name("start").ok_or_else(|| {
+        DataFusionError::Execution("variation source batch missing column start".to_string())
+    })?;
+    let start = cast(batch.column(start_index).as_ref(), &DataType::Int64).map_err(|err| {
+        DataFusionError::Execution(format!("failed to cast variation start to Int64: {err}"))
+    })?;
+    let start = start
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| DataFusionError::Execution("variation start must be Int64".to_string()))?;
+
+    let mut tier_values = Vec::with_capacity(batch.num_rows());
+    let mut warm_mask = Vec::with_capacity(batch.num_rows());
+    let mut cold_mask = Vec::with_capacity(batch.num_rows());
+    let mut warm_count = 0;
+    let mut cold_count = 0;
+    for row in 0..batch.num_rows() {
+        let is_warm = !start.is_null(row) && warm_starts.contains(&start.value(row));
+        if is_warm {
+            tier_values.push(0i8);
+            warm_mask.push(true);
+            cold_mask.push(false);
+            warm_count += 1;
+        } else {
+            tier_values.push(1i8);
+            warm_mask.push(false);
+            cold_mask.push(true);
+            cold_count += 1;
+        }
+    }
+    columns.push(Arc::new(Int8Array::from(tier_values)) as ArrayRef);
+
+    let full = RecordBatch::try_new(target_schema, columns).map_err(|err| {
+        DataFusionError::Execution(format!("failed to build Lance variation batch: {err}"))
+    })?;
+
+    let warm_batch = if warm_count > 0 {
+        if warm_count == batch.num_rows() {
+            Some(full.clone())
+        } else {
+            let mask = BooleanArray::from(warm_mask);
+            Some(filter_record_batch(&full, &mask).map_err(|err| {
+                DataFusionError::Execution(format!("failed to filter variation warm batch: {err}"))
+            })?)
+        }
+    } else {
+        None
+    };
+
+    let cold_batch = if cold_count > 0 {
+        if cold_count == batch.num_rows() {
+            Some(full)
+        } else {
+            let mask = BooleanArray::from(cold_mask);
+            Some(filter_record_batch(&full, &mask).map_err(|err| {
+                DataFusionError::Execution(format!("failed to filter variation cold batch: {err}"))
+            })?)
+        }
+    } else {
+        None
+    };
+
+    Ok((warm_batch, cold_batch))
+}
+
 
 fn attach_schema_metadata_to_batch(
     batch: RecordBatch,
