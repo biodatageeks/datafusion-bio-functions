@@ -16939,6 +16939,135 @@ mod tests {
         minimal_shared_contig_annotation_context_with_features(Vec::new(), Vec::new())
     }
 
+    fn assert_reference_equal_rows_have_null_annotations(cached: bool) {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+
+        for populated in [false, true] {
+            let transcripts = if populated {
+                vec![make_tx("tx1", None, None, None, None)]
+            } else {
+                Vec::new()
+            };
+            let exons = if populated {
+                vec![ExonFeature {
+                    transcript_id: "tx1".to_string(),
+                    exon_number: 1,
+                    start: 1,
+                    end: 100,
+                }]
+            } else {
+                Vec::new()
+            };
+            let shared = minimal_shared_contig_annotation_context_with_context(
+                transcripts,
+                Vec::new(),
+                exons,
+            );
+            let ctx = PreparedContext::new(
+                &shared.base_transcripts,
+                &shared.exons,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            );
+            let mut fields = vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+            ];
+            let mut columns: Vec<ArrayRef> = vec![
+                Arc::new(StringArray::from(vec!["chr2"; 5])),
+                Arc::new(Int64Array::from(vec![50_i64; 5])),
+                Arc::new(Int64Array::from(vec![50_i64, 50, 51, 50, 51])),
+                Arc::new(StringArray::from(vec!["C", "A", "AC", "C", "AC"])),
+                Arc::new(StringArray::from(vec!["C", "A", "AC", "T", "AT"])),
+            ];
+            if cached {
+                for name in ["cache_most_severe_consequence", "cache_consequence_types"] {
+                    fields.push(Field::new(name, DataType::Utf8, true));
+                    columns.push(Arc::new(StringArray::from(vec!["stop_gained"; 5])));
+                }
+            }
+            let input = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+
+            for allow_non_variant in [false, true] {
+                let mut flags = VepFlags::from_options_json(None);
+                flags.allow_non_variant = allow_non_variant;
+                for (skip_csq, skip_typed_cols) in
+                    [(false, false), (false, true), (true, false), (true, true)]
+                {
+                    let output = shared
+                        .tmp_provider
+                        .annotate_batch_with_transcript_engine(
+                            &input,
+                            &shared.engine,
+                            &ctx,
+                            &HashMap::new(),
+                            &mut SiftPolyphenCache::new(),
+                            &None,
+                            skip_csq,
+                            skip_typed_cols,
+                            &flags,
+                            &HgvsFlags::default(),
+                            TranscriptSelectionFlags::default(),
+                            &PickFlags::default(),
+                            &mut None,
+                            #[cfg(feature = "parquet-cache")]
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(output.num_rows(), 5, "equal alleles must retain their rows");
+                    for col in 0..5 {
+                        assert_eq!(output.column(col).to_data(), input.column(col).to_data());
+                    }
+                    for (field, column) in output
+                        .schema()
+                        .fields()
+                        .iter()
+                        .zip(output.columns())
+                        .skip(5)
+                    {
+                        for row in 0..3 {
+                            assert!(
+                                column.is_null(row),
+                                "{} must be null for equal allele row {row}; cached={cached}, populated={populated}, skip_csq={skip_csq}, skip_typed_cols={skip_typed_cols}",
+                                field.name(),
+                            );
+                        }
+                    }
+                    let most = output
+                        .column_by_name("most_severe_consequence")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    for row in 3..5 {
+                        assert!(!most.is_null(row), "changed allele must still be annotated");
+                        if cached {
+                            // The synthetic noncoding transcript cannot produce this:
+                            // this proves the positive control took the cache fast path.
+                            assert_eq!(most.value(row), "stop_gained");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reference_equal_rows_skip_computed_annotations() {
+        assert_reference_equal_rows_have_null_annotations(false);
+    }
+
+    #[test]
+    fn reference_equal_rows_skip_cached_annotations() {
+        assert_reference_equal_rows_have_null_annotations(true);
+    }
+
     fn minimal_contig_annotation_state(config: ContigAnnotationConfig) -> ContigAnnotationState {
         let mut shared = minimal_shared_contig_annotation_context();
         Arc::get_mut(&mut shared).unwrap().config = config.clone();

@@ -16904,6 +16904,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reference_equal_alleles_have_no_consequences() {
+        // Ensembl VariationFeatureOverlap.pm:481 excludes reference-equal
+        // alleles before creating any transcript, regulatory or motif overlap.
+        let engine = TranscriptConsequenceEngine::default();
+        let transcripts = vec![tx("tx1", "22", 100, 200, 1, "lncRNA", None, None)];
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let regulatory = vec![regulatory("reg1", "22", 120, 180)];
+        let motifs = vec![motif("motif1", "22", 145, 155)];
+        let populated =
+            PreparedContext::new(&transcripts, &exons, &[], &regulatory, &motifs, &[], &[]);
+        let empty = PreparedContext::new(&[], &[], &[], &[], &[], &[], &[]);
+
+        for context in [&empty, &populated] {
+            for reference in ["C", "A", "AC"] {
+                let variant = VariantInput::from_vcf(
+                    "22".to_string(),
+                    150,
+                    149 + reference.len() as i64,
+                    reference.to_string(),
+                    reference.to_string(),
+                );
+                assert!(
+                    engine
+                        .evaluate_variant_prepared(&variant, context)
+                        .is_empty(),
+                    "{reference}>{reference} must have no consequences"
+                );
+                let mut profile = TranscriptEngineProfile::default();
+                assert!(
+                    engine
+                        .evaluate_variant_prepared_profiled(&variant, context, &mut profile)
+                        .is_empty()
+                );
+                assert_eq!(profile.star_rows, 0, "equal alleles are not star alleles");
+            }
+            for (reference, alternate) in [("C", "T"), ("AC", "AT")] {
+                let control = var(
+                    "22",
+                    150,
+                    149 + reference.len() as i64,
+                    reference,
+                    alternate,
+                );
+                assert!(
+                    !engine
+                        .evaluate_variant_prepared(&control, context)
+                        .is_empty(),
+                    "the changed-allele control must still be annotated"
+                );
+            }
+        }
+    }
+
     // ---- star allele filtering ----
 
     #[test]
