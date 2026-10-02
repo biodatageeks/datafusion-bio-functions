@@ -16922,19 +16922,26 @@ mod tests {
         let empty = PreparedContext::new(&[], &[], &[], &[], &[], &[], &[]);
 
         for context in [&empty, &populated] {
-            for reference in ["C", "A", "AC"] {
+            for (reference, alternate) in [
+                ("C", "C"),
+                ("A", "A"),
+                ("AC", "AC"),
+                ("c", "C"),
+                ("C", "c"),
+                ("aC", "Ac"),
+            ] {
                 let variant = VariantInput::from_vcf(
                     "22".to_string(),
                     150,
                     149 + reference.len() as i64,
                     reference.to_string(),
-                    reference.to_string(),
+                    alternate.to_string(),
                 );
                 assert!(
                     engine
                         .evaluate_variant_prepared(&variant, context)
                         .is_empty(),
-                    "{reference}>{reference} must have no consequences"
+                    "{reference}>{alternate} must have no consequences"
                 );
                 let mut profile = TranscriptEngineProfile::default();
                 assert!(

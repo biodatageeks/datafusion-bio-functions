@@ -16992,16 +16992,20 @@ mod tests {
                 Field::new("alt", DataType::Utf8, false),
             ];
             let mut columns: Vec<ArrayRef> = vec![
-                Arc::new(StringArray::from(vec!["chr2"; 5])),
-                Arc::new(Int64Array::from(vec![50_i64; 5])),
-                Arc::new(Int64Array::from(vec![50_i64, 50, 51, 50, 51])),
-                Arc::new(StringArray::from(vec!["C", "A", "AC", "C", "AC"])),
-                Arc::new(StringArray::from(vec!["C", "A", "AC", "T", "AT"])),
+                Arc::new(StringArray::from(vec!["chr2"; 8])),
+                Arc::new(Int64Array::from(vec![50_i64; 8])),
+                Arc::new(Int64Array::from(vec![50_i64, 50, 51, 50, 50, 51, 50, 51])),
+                Arc::new(StringArray::from(vec![
+                    "C", "A", "AC", "c", "C", "aC", "C", "AC",
+                ])),
+                Arc::new(StringArray::from(vec![
+                    "C", "A", "AC", "C", "c", "Ac", "T", "AT",
+                ])),
             ];
             if cached {
                 for name in ["cache_most_severe_consequence", "cache_consequence_types"] {
                     fields.push(Field::new(name, DataType::Utf8, true));
-                    columns.push(Arc::new(StringArray::from(vec!["stop_gained"; 5])));
+                    columns.push(Arc::new(StringArray::from(vec!["stop_gained"; 8])));
                 }
             }
             let input = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
@@ -17032,7 +17036,7 @@ mod tests {
                             None,
                         )
                         .unwrap();
-                    assert_eq!(output.num_rows(), 5, "equal alleles must retain their rows");
+                    assert_eq!(output.num_rows(), 8, "equal alleles must retain their rows");
                     for col in 0..5 {
                         assert_eq!(output.column(col).to_data(), input.column(col).to_data());
                     }
@@ -17043,7 +17047,7 @@ mod tests {
                         .zip(output.columns())
                         .skip(5)
                     {
-                        for row in 0..3 {
+                        for row in 0..6 {
                             assert!(
                                 column.is_null(row),
                                 "{} must be null for equal allele row {row}; cached={cached}, populated={populated}, skip_csq={skip_csq}, skip_typed_cols={skip_typed_cols}",
@@ -17057,7 +17061,7 @@ mod tests {
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .unwrap();
-                    for row in 3..5 {
+                    for row in 6..8 {
                         assert!(!most.is_null(row), "changed allele must still be annotated");
                         if cached {
                             // The synthetic noncoding transcript cannot produce this:
