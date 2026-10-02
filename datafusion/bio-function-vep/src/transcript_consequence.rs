@@ -267,6 +267,9 @@ pub struct TranscriptFeature {
     pub refseq_match: Option<String>,
     /// Parsed `_rna_edit*` transcript attributes used for VEP `REFSEQ_OFFSET`.
     pub refseq_edits: Vec<RefSeqEdit>,
+    /// RNA-edit attribute evidence at cache load, including poly-A edits.
+    /// Unlike `refseq_edits`, this is not changed by inferred alignment edits.
+    pub has_rna_edit: bool,
     /// True when the transcript carries the `gencode_basic` attribute.
     pub is_gencode_basic: bool,
     /// True when the transcript carries the `gencode_primary` attribute.
@@ -6716,11 +6719,13 @@ fn classify_coding_change_with_semantics(
         .filter(|seq| seq.len() == ref_len);
     let effective_ref_tx = edited_ref_tx.as_deref().unwrap_or(ref_tx.as_str());
     let ref_seq_slice = &cds_seq[start_idx..=end_idx];
-    let cds_seq = if ref_seq_slice != effective_ref_tx {
-        if edited_ref_tx.is_none()
-            || !uses_refseq_transcript_reference(tx)
-            || ref_seq_slice.len() != effective_ref_tx.len()
-        {
+    // VEP's reference codon comes from _translateable_seq(), even when the
+    // supplied REF disagrees with it. Only actual _rna_edit attributes replace
+    // that span with reference feature_seq; BAM/mapper state alone does not.
+    // Capture attribute presence before hydration can infer coordinate edits.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L874
+    let cds_seq = if tx.has_rna_edit && ref_seq_slice != effective_ref_tx {
+        if ref_seq_slice.len() != effective_ref_tx.len() {
             return None;
         }
         let mut edited_cds = cds_seq.into_bytes();
@@ -6729,11 +6734,6 @@ fn classify_coding_change_with_semantics(
     } else {
         cds_seq
     };
-    let ref_seq_slice = &cds_seq[start_idx..=end_idx];
-    if ref_seq_slice != effective_ref_tx {
-        return None;
-    }
-
     let mut mutated = Vec::with_capacity(
         cds_seq
             .len()
@@ -7217,8 +7217,9 @@ fn classify_coding_change_with_semantics(
                 let len_diff = alt_len as isize - ref_len as isize;
                 let alt_codon_len = (ref_codon_len as isize + len_diff).max(0) as usize;
                 let alt_codon_end = (codon_nt_start + alt_codon_len).min(mutated.len());
-                if alt_len > ref_len {
-                    // Frameshift insertion: mark inserted bases uppercase
+                if alt_len > 0 {
+                    // VEP display_codon highlights feature_seq for every
+                    // nonempty ALT, including a deletion with replacement.
                     let alt_codon = format_codon_display(
                         &mutated[codon_nt_start..alt_codon_end],
                         start_idx,
@@ -7238,7 +7239,8 @@ fn classify_coding_change_with_semantics(
                 }
             } else if alt_len < ref_len {
                 // Inframe deletion: ref codon with deleted bases uppercase, context lowercase.
-                // Alt codon: remaining bases (all lowercase), or "-" if nothing left.
+                // Highlight replacement bases; pure deletions have only lowercase
+                // context, or "-" if nothing is left (VEP display_codon:914-923).
                 let ref_codon = format_codon_display(
                     &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
                     start_idx,
@@ -7249,12 +7251,19 @@ fn classify_coding_change_with_semantics(
                 let len_diff = alt_len as isize - ref_len as isize;
                 let alt_codon_len = (ref_codon_len as isize + len_diff).max(0) as usize;
                 let alt_codon_end = (codon_nt_start + alt_codon_len).min(mutated.len());
-                let alt_codon: String = mutated
-                    .get(codon_nt_start..alt_codon_end)
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|&b| (b as char).to_ascii_lowercase())
-                    .collect();
+                let alt_codon = if alt_len > 0 {
+                    format_codon_display(
+                        &mutated[codon_nt_start..alt_codon_end],
+                        start_idx,
+                        start_idx + alt_len - 1,
+                        codon_nt_start,
+                    )
+                } else {
+                    mutated[codon_nt_start..alt_codon_end]
+                        .iter()
+                        .map(|&b| (b as char).to_ascii_lowercase())
+                        .collect()
+                };
                 if alt_codon.is_empty() {
                     class.codons = Some(format!("{ref_codon}/-"));
                 } else {
@@ -10131,6 +10140,7 @@ mod tests {
             source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
+            has_rna_edit: false,
             is_gencode_basic: false,
             is_gencode_primary: false,
             bam_edit_status: None,
@@ -14065,6 +14075,204 @@ mod tests {
         assert!(c.synonymous);
         assert_eq!(c.codons, Some("gcT/gcC".to_string()));
         assert_eq!(c.amino_acids, Some("A".to_string()));
+    }
+
+    #[test]
+    fn coding_ref_mismatch_uses_transcript_cds_on_both_strands() {
+        // VEP 116 TranscriptVariationAllele::codon uses _translateable_seq,
+        // not the supplied REF. Allele lengths still define the affected span.
+        let cds = "ATGGCTGAATGA";
+        for strand in [1, -1] {
+            let t = tx(
+                "T1",
+                "22",
+                1000,
+                1011,
+                strand,
+                "protein_coding",
+                Some(1000),
+                Some(1011),
+            );
+            let e = exon("T1", 1, 1000, 1011);
+            let tr = translation("T1", Some(12), Some(4), None, Some(cds));
+            // Exact codon/peptide expectations: tests/oracles/ref_mismatch.tsv,
+            // generated by unmodified Docker VEP methods on both strands.
+            for (offset, wrong_ref, alt, codons, amino_acids) in [
+                (4, "A", "T", "gCt/gTt", "A/V"),
+                (4, "A", "C", "gCt/gCt", "A"), // ALT equals CDS, input REF != ALT
+                (3, "AA", "TT", "GCt/TTt", "A/F"),
+                (3, "A", "-", "Gct/ct", "A/X"),
+                (3, "AAA", "-", "GCT/-", "A/-"),
+                (3, "AA", "T", "GCt/Tt", "A/X"),
+                (3, "AAA", "TTTTTT", "GCT/TTTTTT", "A/FF"),
+                (3, "AAAA", "T", "GCTGaa/Taa", "AE/*"),
+            ] {
+                let length = wrong_ref.len();
+                let reference = &cds[offset..offset + length];
+                let orient = |allele: &str| {
+                    if strand >= 0 || allele == "-" {
+                        allele.to_string()
+                    } else {
+                        reverse_complement(allele).unwrap()
+                    }
+                };
+                let start = 1000
+                    + if strand >= 0 {
+                        offset
+                    } else {
+                        cds.len() - offset - length
+                    } as i64;
+                let end = start + length as i64 - 1;
+                let control = var("22", start, end, &orient(reference), &orient(alt));
+                let mismatch = var("22", start, end, &orient(wrong_ref), &orient(alt));
+                let expected = classify_coding_change(&t, &[&e], Some(&tr), &control).unwrap();
+                let got = classify_coding_change(&t, &[&e], Some(&tr), &mismatch)
+                    .unwrap_or_else(|| panic!("strand {strand}: {wrong_ref}>{alt} must use CDS"));
+                assert_eq!(got.codons.as_deref(), Some(codons));
+                assert_eq!(got.amino_acids.as_deref(), Some(amino_acids));
+                assert_eq!(
+                    (&got.codons, &got.amino_acids, &got.protein_hgvs),
+                    (
+                        &expected.codons,
+                        &expected.amino_acids,
+                        &expected.protein_hgvs
+                    )
+                );
+                assert_eq!(
+                    (
+                        got.cds_position_start,
+                        got.cds_position_end,
+                        got.protein_position_start,
+                        got.protein_position_end
+                    ),
+                    (
+                        expected.cds_position_start,
+                        expected.cds_position_end,
+                        expected.protein_position_start,
+                        expected.protein_position_end
+                    )
+                );
+                assert_eq!(
+                    (
+                        got.synonymous,
+                        got.missense,
+                        got.stop_gained,
+                        got.stop_lost,
+                        got.stop_retained
+                    ),
+                    (
+                        expected.synonymous,
+                        expected.missense,
+                        expected.stop_gained,
+                        expected.stop_lost,
+                        expected.stop_retained
+                    )
+                );
+                if offset == 4 {
+                    assert_eq!(got.cds_position_start, Some(5));
+                    assert_eq!(got.protein_position_start, Some(2));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coding_ref_mismatch_without_rna_edits_ignores_refseq_state() {
+        // The Docker VEP source probe yields gCt/gTt with BAM state alone.
+        // An inferred coordinate edit must not become an _rna_edit attribute.
+        for inferred_edit in [false, true] {
+            let mut t = tx(
+                "NM_NO_EDIT.1",
+                "22",
+                1000,
+                1011,
+                1,
+                "protein_coding",
+                Some(1000),
+                Some(1011),
+            );
+            t.bam_edit_status = Some("ok".to_string());
+            t.cdna_coding_start = Some(1);
+            t.cdna_coding_end = Some(12);
+            t.translateable_seq = Some("ATGGCTTAATGA".to_string());
+            t.spliced_seq = Some("ATGGATTAATGA".to_string());
+            if inferred_edit {
+                t.refseq_edits.push(RefSeqEdit {
+                    start: 12,
+                    end: 12,
+                    replacement_len: None,
+                    skip_refseq_offset: false,
+                });
+            }
+            let e = exon("NM_NO_EDIT.1", 1, 1000, 1011);
+            let tr = translation(
+                "NM_NO_EDIT.1",
+                Some(12),
+                Some(4),
+                None,
+                Some("ATGGCTTAATGA"),
+            );
+            let v = var("22", 1004, 1004, "A", "T");
+            let got = classify_coding_change(&t, &[&e], Some(&tr), &v).expect("classification");
+            assert_eq!(got.codons.as_deref(), Some("gCt/gTt"));
+            assert_eq!(got.amino_acids.as_deref(), Some("A/V"));
+        }
+    }
+
+    #[test]
+    fn coding_ref_mismatch_rna_edit_uses_transcript_reference() {
+        let mut t = tx(
+            "NM_EDIT.1",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        t.has_rna_edit = true;
+        t.bam_edit_status = Some("ok".to_string());
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(12);
+        t.translateable_seq = Some("ATGGCTTAATGA".to_string());
+        t.spliced_seq = Some("ATGGATTAATGA".to_string());
+        let e = exon("NM_EDIT.1", 1, 1000, 1011);
+        let tr = translation("NM_EDIT.1", Some(12), Some(4), None, Some("ATGGCTTAATGA"));
+        // Supplied REF C matches CDS, but feature_seq comes from edited cDNA A.
+        let got = classify_coding_change(&t, &[&e], Some(&tr), &var("22", 1004, 1004, "C", "T"))
+            .expect("RNA edit transcript reference classification");
+        assert_eq!(got.codons.as_deref(), Some("gAt/gTt"));
+        assert_eq!(got.amino_acids.as_deref(), Some("D/V"));
+    }
+
+    #[test]
+    fn coding_ref_mismatch_rna_edit_uses_given_reference() {
+        // VEP's RNA-edit predicate is independent of transcript source. When
+        // no transcript-reference allele is available, feature_seq is given REF.
+        let mut t = tx(
+            "T_EDIT",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        t.has_rna_edit = true;
+        t.refseq_edits.push(RefSeqEdit {
+            start: 5,
+            end: 5,
+            replacement_len: Some(1),
+            skip_refseq_offset: true,
+        });
+        let e = exon("T_EDIT", 1, 1000, 1011);
+        let tr = translation("T_EDIT", Some(12), Some(4), None, Some("ATGGCTTAATGA"));
+        let got = classify_coding_change(&t, &[&e], Some(&tr), &var("22", 1004, 1004, "A", "T"))
+            .expect("RNA edit reference classification");
+        assert_eq!(got.codons.as_deref(), Some("gAt/gTt"));
+        assert_eq!(got.amino_acids.as_deref(), Some("D/V"));
     }
 
     // ---- classify_coding_change: deletion codons/amino acids ----

@@ -4480,6 +4480,7 @@ impl AnnotateProvider {
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                     .unwrap_or(false);
+                let has_rna_edit = !refseq_edits.is_empty() || has_non_polya_rna_edit;
                 let cdna_seq =
                     cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let spliced_seq = spliced_seq_idx
@@ -4552,6 +4553,7 @@ impl AnnotateProvider {
                     source_cache,
                     refseq_match,
                     refseq_edits,
+                    has_rna_edit,
                     is_gencode_basic,
                     is_gencode_primary,
                     bam_edit_status,
@@ -5181,6 +5183,11 @@ impl AnnotateProvider {
                 let transcript_uid =
                     transcript_uid_idx.and_then(|idx| uint32_at(batch.column(idx).as_ref(), row));
 
+                let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let has_rna_edit = !refseq_edits.is_empty() || has_non_polya_rna_edit;
+
                 out.push(TranscriptFeature {
                     transcript_id,
                     transcript_uid,
@@ -5210,6 +5217,7 @@ impl AnnotateProvider {
                     refseq_match: refseq_match_idx
                         .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
                     refseq_edits,
+                    has_rna_edit,
                     is_gencode_basic: is_gencode_basic_idx
                         .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                         .unwrap_or(false),
@@ -5218,9 +5226,7 @@ impl AnnotateProvider {
                         .unwrap_or(false),
                     bam_edit_status: bam_edit_status_idx
                         .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
-                    has_non_polya_rna_edit: has_non_polya_rna_edit_idx
-                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
-                        .unwrap_or(false),
+                    has_non_polya_rna_edit,
                     spliced_seq,
                     five_prime_utr_seq,
                     three_prime_utr_seq,
@@ -17172,6 +17178,12 @@ mod tests {
         let other_tx = make_tx("tx2", Some("gene2"), Some("GENE2"), Some("HGNC"), Some("2"));
         let mut hydrated_tx = base_tx.clone();
         hydrated_tx.spliced_seq = Some("ACGT".to_string());
+        hydrated_tx.refseq_edits = vec![RefSeqEdit {
+            start: 12,
+            end: 12,
+            replacement_len: Some(0),
+            skip_refseq_offset: false,
+        }];
         let mut transcript_overrides = HashMap::new();
         transcript_overrides.insert(
             hydrated_tx.transcript_id.clone(),
@@ -17182,6 +17194,8 @@ mod tests {
         apply_partition_transcript_overrides(&mut buffer_transcripts, &transcript_overrides);
 
         assert_eq!(buffer_transcripts[0].spliced_seq.as_deref(), Some("ACGT"));
+        assert_eq!(buffer_transcripts[0].refseq_edits.len(), 1);
+        assert!(!buffer_transcripts[0].has_rna_edit);
         assert!(buffer_transcripts[1].spliced_seq.is_none());
 
         let base_translation = make_translation("tx1", Vec::new());
@@ -17415,6 +17429,100 @@ mod tests {
         }
 
         Arc::new(list_builder.finish())
+    }
+
+    #[tokio::test]
+    async fn transcript_loaders_preserve_rna_edit_attribute_evidence() {
+        // Poly-A-only attributes must count. Null/missing columns and BAM state
+        // alone must not; hydration may later populate inferred coordinate edits.
+        for include_columns in [false, true] {
+            let mut fields = vec![
+                Field::new("transcript_id", DataType::Utf8, false),
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("strand", DataType::Int64, false),
+                Field::new("biotype", DataType::Utf8, false),
+                Field::new("bam_edit_status", DataType::Utf8, true),
+            ];
+            let mut columns: Vec<Arc<dyn Array>> = vec![
+                Arc::new(StringArray::from(vec![
+                    "poly_a",
+                    "non_poly_a",
+                    "empty",
+                    "null",
+                ])),
+                Arc::new(StringArray::from(vec!["1"; 4])),
+                Arc::new(Int64Array::from(vec![100_i64; 4])),
+                Arc::new(Int64Array::from(vec![200_i64; 4])),
+                Arc::new(Int64Array::from(vec![1_i64; 4])),
+                Arc::new(StringArray::from(vec!["protein_coding"; 4])),
+                Arc::new(StringArray::from(vec![Some("ok"); 4])),
+            ];
+            if include_columns {
+                fields.extend([
+                    Field::new("refseq_edits", refseq_edit_list_data_type(), true),
+                    Field::new("has_non_polya_rna_edit", DataType::Boolean, true),
+                ]);
+                columns.extend([
+                    refseq_edit_array(vec![
+                        Some(vec![RefSeqEdit {
+                            start: 13,
+                            end: 12,
+                            replacement_len: Some(20),
+                            skip_refseq_offset: true,
+                        }]),
+                        Some(vec![]),
+                        Some(vec![]),
+                        None,
+                    ]),
+                    Arc::new(BooleanArray::from(vec![
+                        Some(false),
+                        Some(true),
+                        Some(false),
+                        None,
+                    ])) as Arc<dyn Array>,
+                ]);
+            }
+            let schema = Arc::new(Schema::new(fields));
+            let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+            let (parsed, _) =
+                AnnotateProvider::parse_transcript_batches("tx", std::slice::from_ref(&batch))
+                    .unwrap();
+            let session = Arc::new(SessionContext::new());
+            session
+                .register_table(
+                    "tx",
+                    Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+                )
+                .unwrap();
+            let provider = AnnotateProvider::new(
+                session,
+                "vcf".to_string(),
+                String::new(),
+                AnnotationBackend::Parquet,
+                CacheSourceType::Ensembl,
+                None,
+                Schema::new(Vec::<Field>::new()),
+            )
+            .unwrap();
+            let (loaded, _) = provider
+                .load_transcripts("tx", &MissWorklist::for_chrom("1"))
+                .await
+                .unwrap();
+            for transcripts in [parsed, loaded] {
+                assert_eq!(transcripts.len(), 4);
+                for tx in transcripts {
+                    assert_eq!(
+                        tx.has_rna_edit,
+                        include_columns
+                            && matches!(tx.transcript_id.as_str(), "poly_a" | "non_poly_a"),
+                        "{}",
+                        tx.transcript_id
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -18503,6 +18611,7 @@ mod tests {
             source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
+            has_rna_edit: false,
             is_gencode_basic: false,
             is_gencode_primary: false,
             bam_edit_status: None,
