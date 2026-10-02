@@ -1,0 +1,20 @@
+1	5	A	T	gCt/gTt	A/V
+1	5	A	C	gCt/gCt	A
+1	4	AA	TT	GCt/TTt	A/F
+1	4	A	-	Gct/ct	A/X
+1	4	AAA	-	GCT/-	A/-
+1	4	AA	T	GCt/Tt	A/X
+1	4	AAA	TTTTTT	GCT/TTTTTT	A/FF
+1	4	AAAA	T	GCTGaa/Taa	AE/*
+-1	5	A	T	gCt/gTt	A/V
+-1	5	A	C	gCt/gCt	A
+-1	4	AA	TT	GCt/TTt	A/F
+-1	4	A	-	Gct/ct	A/X
+-1	4	AAA	-	GCT/-	A/-
+-1	4	AA	T	GCt/Tt	A/X
+-1	4	AAA	TTTTTT	GCT/TTTTTT	A/FF
+-1	4	AAAA	T	GCTGaa/Taa	AE/*
+ordinary	GCT	GTT	gCt	gTt
+bam_state_only	GCT	GTT	gCt	gTt
+rna_edit	GAT	GTT	gAt	gTt
+polya_edit	GAT	GTT	gAt	gTt
