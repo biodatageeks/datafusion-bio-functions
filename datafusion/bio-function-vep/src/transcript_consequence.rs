@@ -1204,6 +1204,11 @@ impl TranscriptConsequenceEngine {
         if let Some(profile) = profile.as_deref_mut() {
             profile.rows += 1;
         }
+        // Ensembl VariationFeatureOverlap.pm:481 creates no alternate overlap
+        // allele when it equals REF, regardless of the surrounding features.
+        if variant.ref_allele == variant.alt_allele {
+            return Vec::new();
+        }
         // VEP skips star alleles entirely — they represent upstream deletions
         // that remove the variant site, not real alternate sequences.
         if variant.alt_allele == "*" {
@@ -12202,7 +12207,7 @@ mod tests {
     }
 
     #[test]
-    fn start_retained_and_incomplete_terminal_codon_terms() {
+    fn unchanged_start_is_skipped_and_incomplete_terminal_codon_is_annotated() {
         let engine = TranscriptConsequenceEngine::default();
         let tx_complete = tx(
             "pc",
@@ -12226,16 +12231,15 @@ mod tests {
         );
         let exons = vec![exon("pc", 1, 100, 350), exon("pc2", 1, 100, 350)];
 
-        let start_retained = engine.evaluate_variant(
+        let unchanged_start = engine.evaluate_variant(
             &var("22", 151, 153, "ATG", "ATG"),
             std::slice::from_ref(&tx_complete),
             &exons,
         );
-        assert!(
-            start_retained[0]
-                .terms
-                .contains(&SoTerm::StartRetainedVariant)
-        );
+        // ATG>ATG is no alternate allele at all; VEP skips it before
+        // evaluating start-codon effects. Real start-preserving changes are
+        // covered by the indel start-retained tests below.
+        assert!(unchanged_start.is_empty());
 
         // Variant must fall IN the incomplete codon (the last 1 base).
         // Use evaluate_variant_with_context with CDS sequence so

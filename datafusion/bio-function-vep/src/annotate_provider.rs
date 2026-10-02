@@ -6376,6 +6376,18 @@ impl AnnotateProvider {
 
             // VEP-style allele minimization: strip shared prefix and suffix between REF and ALT.
             let ref_al = string_at(batch.column(ref_idx).as_ref(), row).unwrap_or_default();
+            // Ensembl VariationFeatureOverlap.pm:481 skips reference-equal
+            // alleles. Keep the input row, but emit no annotations, including
+            // cached consequences that would otherwise bypass the engine.
+            if ref_al == alt_allele {
+                if let Some(started) = row_setup_started {
+                    engine_profile.row_setup += started.elapsed();
+                }
+                csq_builder.append_null();
+                most_builder.append_null();
+                append_null_annotation_row!();
+                continue;
+            }
             let (vep_ref, vep_allele) = vcf_to_vep_allele(&ref_al, &alt_allele);
             let variant_class = classify_variant(&vep_ref, &vep_allele);
 
