@@ -6376,10 +6376,11 @@ impl AnnotateProvider {
 
             // VEP-style allele minimization: strip shared prefix and suffix between REF and ALT.
             let ref_al = string_at(batch.column(ref_idx).as_ref(), row).unwrap_or_default();
-            // Ensembl VariationFeatureOverlap.pm:481 skips reference-equal
-            // alleles. Keep the input row, but emit no annotations, including
-            // cached consequences that would otherwise bypass the engine.
-            if ref_al == alt_allele {
+            // VEP 116 Parser::validate_vf uppercases alleles before
+            // VariationFeatureOverlap skips reference-equal alleles.
+            // Mirror evaluate_variant_prepared_inner here to also skip cached
+            // consequences, while retaining the original row and allele case.
+            if ref_al.eq_ignore_ascii_case(&alt_allele) {
                 if let Some(started) = row_setup_started {
                     engine_profile.row_setup += started.elapsed();
                 }

@@ -1204,9 +1204,10 @@ impl TranscriptConsequenceEngine {
         if let Some(profile) = profile.as_deref_mut() {
             profile.rows += 1;
         }
-        // Ensembl VariationFeatureOverlap.pm:481 creates no alternate overlap
-        // allele when it equals REF, regardless of the surrounding features.
-        if variant.ref_allele == variant.alt_allele {
+        // VEP 116 Parser::validate_vf uppercases alleles before
+        // VariationFeatureOverlap excludes reference-equal overlap alleles.
+        // Keep in sync with AnnotateProvider's guard before its cache fast path.
+        if variant.ref_allele.eq_ignore_ascii_case(&variant.alt_allele) {
             return Vec::new();
         }
         // VEP skips star alleles entirely — they represent upstream deletions
