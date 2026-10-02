@@ -1204,6 +1204,12 @@ impl TranscriptConsequenceEngine {
         if let Some(profile) = profile.as_deref_mut() {
             profile.rows += 1;
         }
+        // VEP 116 Parser::validate_vf uppercases alleles before
+        // VariationFeatureOverlap excludes reference-equal overlap alleles.
+        // Keep in sync with AnnotateProvider's guard before its cache fast path.
+        if variant.ref_allele.eq_ignore_ascii_case(&variant.alt_allele) {
+            return Vec::new();
+        }
         // VEP skips star alleles entirely — they represent upstream deletions
         // that remove the variant site, not real alternate sequences.
         if variant.alt_allele == "*" {
@@ -12202,7 +12208,7 @@ mod tests {
     }
 
     #[test]
-    fn start_retained_and_incomplete_terminal_codon_terms() {
+    fn unchanged_start_is_skipped_and_incomplete_terminal_codon_is_annotated() {
         let engine = TranscriptConsequenceEngine::default();
         let tx_complete = tx(
             "pc",
@@ -12226,16 +12232,15 @@ mod tests {
         );
         let exons = vec![exon("pc", 1, 100, 350), exon("pc2", 1, 100, 350)];
 
-        let start_retained = engine.evaluate_variant(
+        let unchanged_start = engine.evaluate_variant(
             &var("22", 151, 153, "ATG", "ATG"),
             std::slice::from_ref(&tx_complete),
             &exons,
         );
-        assert!(
-            start_retained[0]
-                .terms
-                .contains(&SoTerm::StartRetainedVariant)
-        );
+        // ATG>ATG is no alternate allele at all; VEP skips it before
+        // evaluating start-codon effects. Real start-preserving changes are
+        // covered by the indel start-retained tests below.
+        assert!(unchanged_start.is_empty());
 
         // Variant must fall IN the incomplete codon (the last 1 base).
         // Use evaluate_variant_with_context with CDS sequence so
@@ -16902,6 +16907,67 @@ mod tests {
             parts[0], "-",
             "Frameshift insertion within codon ref should NOT be '-': {codons}"
         );
+    }
+
+    #[test]
+    fn reference_equal_alleles_have_no_consequences() {
+        // Ensembl VariationFeatureOverlap.pm:481 excludes reference-equal
+        // alleles before creating any transcript, regulatory or motif overlap.
+        let engine = TranscriptConsequenceEngine::default();
+        let transcripts = vec![tx("tx1", "22", 100, 200, 1, "lncRNA", None, None)];
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let regulatory = vec![regulatory("reg1", "22", 120, 180)];
+        let motifs = vec![motif("motif1", "22", 145, 155)];
+        let populated =
+            PreparedContext::new(&transcripts, &exons, &[], &regulatory, &motifs, &[], &[]);
+        let empty = PreparedContext::new(&[], &[], &[], &[], &[], &[], &[]);
+
+        for context in [&empty, &populated] {
+            for (reference, alternate) in [
+                ("C", "C"),
+                ("A", "A"),
+                ("AC", "AC"),
+                ("c", "C"),
+                ("C", "c"),
+                ("aC", "Ac"),
+            ] {
+                let variant = VariantInput::from_vcf(
+                    "22".to_string(),
+                    150,
+                    149 + reference.len() as i64,
+                    reference.to_string(),
+                    alternate.to_string(),
+                );
+                assert!(
+                    engine
+                        .evaluate_variant_prepared(&variant, context)
+                        .is_empty(),
+                    "{reference}>{alternate} must have no consequences"
+                );
+                let mut profile = TranscriptEngineProfile::default();
+                assert!(
+                    engine
+                        .evaluate_variant_prepared_profiled(&variant, context, &mut profile)
+                        .is_empty()
+                );
+                assert_eq!(profile.star_rows, 0, "equal alleles are not star alleles");
+            }
+            for (reference, alternate) in [("C", "T"), ("AC", "AT")] {
+                let control = var(
+                    "22",
+                    150,
+                    149 + reference.len() as i64,
+                    reference,
+                    alternate,
+                );
+                assert!(
+                    !engine
+                        .evaluate_variant_prepared(&control, context)
+                        .is_empty(),
+                    "the changed-allele control must still be annotated"
+                );
+            }
+        }
     }
 
     // ---- star allele filtering ----
