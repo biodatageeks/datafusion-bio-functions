@@ -72,6 +72,8 @@ impl ChromosomeSynonyms {
 #[cfg(feature = "cache-builder")]
 pub(crate) fn preserve_chromosome_synonyms(raw: &Path, output: &Path) -> Result<()> {
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     let source = raw.join(CHROM_SYNONYMS_FILE);
     let destination = output.join(CHROM_SYNONYMS_FILE);
     let bytes = match std::fs::read(&source) {
@@ -94,13 +96,24 @@ pub(crate) fn preserve_chromosome_synonyms(raw: &Path, output: &Path) -> Result<
             )));
         }
     };
+    #[cfg(unix)]
+    let source_permissions = std::fs::metadata(&source)?.permissions();
     if std::fs::read(&destination).is_ok_and(|existing| existing == bytes) {
+        #[cfg(unix)]
+        if std::fs::metadata(&destination)?.permissions().mode() != source_permissions.mode() {
+            // Also repair files copied by older builds with tempfile's 0600 mode.
+            std::fs::set_permissions(&destination, source_permissions)?;
+        }
         return Ok(());
     }
     std::fs::create_dir_all(output)?;
     // Readers must never see a partly written map during a resumed conversion.
     let mut temporary = tempfile::NamedTempFile::new_in(output)?;
     temporary.write_all(&bytes)?;
+    // NamedTempFile defaults to 0600 on Unix; shared caches need the source's
+    // read permissions before the completed file becomes visible to readers.
+    #[cfg(unix)]
+    temporary.as_file().set_permissions(source_permissions)?;
     temporary.persist(&destination).map_err(|error| {
         DataFusionError::Execution(format!(
             "failed to preserve chromosome synonyms at {}: {error}",
@@ -108,4 +121,42 @@ pub(crate) fn preserve_chromosome_synonyms(raw: &Path, output: &Path) -> Result<
         ))
     })?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "cache-builder", unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn copied_synonyms_preserve_source_permissions_and_repair_existing_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("raw");
+        let output = tmp.path().join("output");
+        std::fs::create_dir(&raw).unwrap();
+        let source = raw.join(CHROM_SYNONYMS_FILE);
+        let destination = output.join(CHROM_SYNONYMS_FILE);
+        std::fs::write(&source, b"21 NC_000021.9\n").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for existing in [false, true] {
+            if existing {
+                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            preserve_chromosome_synonyms(&raw, &output).unwrap();
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644,
+                "existing={existing}"
+            );
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                std::fs::read(&source).unwrap()
+            );
+        }
+    }
 }
