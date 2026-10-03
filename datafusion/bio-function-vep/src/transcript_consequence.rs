@@ -5620,10 +5620,14 @@ fn shifted_insertion_cdna_flank(
     // https://github.com/Ensembl/ensembl/blob/release/116/modules/Bio/EnsEMBL/TranscriptMapper.pm#L170-L220
     let raw_cdna = i64::try_from(genomic_to_cdna_index(tx_exons, tx.strand, pos)?).ok()?;
     let mut offset = 0i64;
+    // SeqEdit starts use original cDNA coordinates. For non-overlapping
+    // edits this sum is independent of cache encounter order.
     for edit in &tx.refseq_edits {
         if raw_cdna < edit.start {
             continue;
         }
+        // This helper returns None for skipped or zero-delta edits, not an
+        // unknown replacement length (which it decodes as a deletion).
         let delta = refseq_mapper_edit_offset_delta(edit).unwrap_or(0);
         if delta < 0 && raw_cdna < edit.start.checked_sub(delta)? {
             return None;
@@ -5722,7 +5726,7 @@ fn shifted_tva_coords_from_mapper(
         .saturating_add(1)
         .saturating_add(leading_n_offset);
     let edited_insertion_gap =
-        is_insertion && cdna_start <= cdna_end && !tx.refseq_edits.is_empty();
+        is_insertion && cdna_start <= cdna_end && refseq_has_edited_sequence_state(tx);
     let cds_start = if edited_insertion_gap {
         raw_cds_start
     } else {
@@ -5866,7 +5870,8 @@ fn shifted_tva_peptide_window(
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L826-L876>
     if is_reference
         && (coords.edited_insertion_gap || !uses_canonical_reference_for_hgvsp(Some(translation)))
-        && !tx.refseq_edits.is_empty()
+        && (!tx.refseq_edits.is_empty()
+            || (coords.edited_insertion_gap && tx.has_non_polya_rna_edit))
         && vf_nt_len > 0
     {
         let downstream_start = cds_end_idx.saturating_add(1).min(cds.len());
@@ -6315,6 +6320,12 @@ fn protein_hgvs_for_output_with_semantics(
         && refseq_uses_transcript_shift_for_hgvsp(tx)
         && shifted.as_ref().is_some_and(|protein| {
             !protein.frameshift && protein.ref_peptide == protein.alt_peptide
+        })
+        && tx_translation.is_some_and(|translation| {
+            let shifted_variant =
+                protein_hgvs_shifted_variant_for_reference(tx, Some(translation), variant, shift);
+            shifted_tva_coords_from_mapper(tx, tx_exons, translation, &shifted_variant)
+                .is_some_and(|coords| coords.edited_insertion_gap)
         })
     {
         return shifted;
@@ -11492,6 +11503,51 @@ mod tests {
         );
 
         assert_eq!(formatted.as_deref(), Some("NP_055935.4:p.GluGlu25="));
+
+        // Legacy caches can retain the actual mapper and RNA-edit flag while
+        // omitting the optional parsed edit list. The gap still exists.
+        let mut legacy = transcript.clone();
+        legacy.refseq_edits.clear();
+        legacy.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 73385758,
+                genomic_end: 73385942,
+                cdna_start: 1,
+                cdna_end: 185,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 73385943,
+                genomic_end: 73386108,
+                cdna_start: 189,
+                cdna_end: 354,
+                ori: 1,
+            },
+        ];
+        let legacy_protein = protein_hgvs_for_output(
+            &legacy,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            true,
+            original.protein_position_start.zip(
+                original
+                    .protein_position_end
+                    .or(original.protein_position_start),
+            ),
+            original.protein_hgvs.as_ref(),
+            true,
+        )
+        .expect("legacy edited-mapper protein HGVS");
+        assert_eq!(
+            crate::hgvs::format_hgvsp(
+                &translation_for_hgvsp(&legacy, &translation),
+                &legacy_protein,
+                true
+            )
+            .as_deref(),
+            Some("NP_055935.4:p.GluGlu25=")
+        );
     }
 
     #[test]
@@ -18762,6 +18818,39 @@ mod tests {
                     expected,
                     "strand {strand}, unedited cDNA {raw_cdna}"
                 );
+                t.refseq_edits.reverse();
+                assert_eq!(shifted_insertion_cdna_flank(&t, &refs, pos), expected);
+            }
+            t.cdna_coding_start = Some(1);
+            t.cdna_coding_end = Some(21);
+            t.translateable_seq = Some("ATG".repeat(7));
+            let mut tr = translation(
+                &t.transcript_id,
+                Some(21),
+                Some(7),
+                Some("MMMMMMM"),
+                Some(&"ATG".repeat(7)),
+            );
+            tr.cds_sequence_canonical = Some("ATG".repeat(7));
+            for (raw_cdna, cds_start, cds_end, edited_insertion_gap) in
+                [(3, 3, 2, false), (4, 4, 6, true)]
+            {
+                let start = if strand > 0 {
+                    99 + raw_cdna
+                } else {
+                    121 - raw_cdna
+                };
+                let v = var("1", start, start - 1, "-", "GGA");
+                let coords = shifted_tva_coords_from_mapper(&t, &refs, &tr, &v).unwrap();
+                assert_eq!(
+                    (
+                        coords.cds_start,
+                        coords.cds_end,
+                        coords.edited_insertion_gap
+                    ),
+                    (cds_start, cds_end, edited_insertion_gap),
+                    "strand {strand}"
+                );
             }
         }
     }
@@ -18929,7 +19018,7 @@ mod tests {
                     cds_end,
                     protein_start: 2,
                     protein_end: if cds_end == 6 { 2 } else { 1 },
-                    edited_insertion_gap: false,
+                    edited_insertion_gap: cds_end == 6,
                 },
                 "{name}"
             );
