@@ -378,7 +378,6 @@ struct VariationLookupStream {
     schema: SchemaRef,
     cache_columns: Vec<String>,
     exact_matcher: AlleleMatcher,
-    vcf_has_chr: bool,
     vcf_zero_based: bool,
     cache_zero_based: bool,
     extended_probes: bool,
@@ -1016,7 +1015,7 @@ impl VariationLookupStream {
         schema: SchemaRef,
         cache_columns: Vec<String>,
         exact_matcher: AlleleMatcher,
-        vcf_has_chr: bool,
+        _vcf_has_chr: bool,
         vcf_zero_based: bool,
         cache_zero_based: bool,
         extended_probes: bool,
@@ -1043,7 +1042,6 @@ impl VariationLookupStream {
             schema,
             cache_columns,
             exact_matcher,
-            vcf_has_chr,
             vcf_zero_based,
             cache_zero_based,
             extended_probes,
@@ -1086,9 +1084,9 @@ impl VariationLookupStream {
             }
         }
         if self.parquet_lookup_cell.get().is_none() {
-            let cache = crate::parquet_cache::detect::PartitionedParquetCache::detect(
+            let cache = crate::parquet_cache::detect::PartitionedParquetCache::try_detect(
                 cache_root.to_string_lossy().as_ref(),
-            )
+            )?
             .ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "parquet variation lookup but no variation manifest under {}",
@@ -1292,11 +1290,10 @@ impl VariationLookupStream {
 
         for row in 0..num_rows {
             let raw_chrom = chroms.value_or_empty(row);
-            let chrom = if self.vcf_has_chr {
-                raw_chrom.strip_prefix("chr").unwrap_or(raw_chrom)
-            } else {
-                raw_chrom
-            };
+            // Prefix style can differ between records in the same input. Keep
+            // these keys consistent with annotation's per-row normalization,
+            // regardless of the first-row hint retained by the public exec API.
+            let chrom = raw_chrom.strip_prefix("chr").unwrap_or(raw_chrom);
 
             let vcf_start = starts[row];
             let vcf_end = ends[row];

@@ -94,13 +94,24 @@ impl ChromManifest {
     /// (transcript/exon/translation/regulatory/motif/SIFT) resolve the same way
     /// instead of silently loading empty.
     pub fn path_for_chrom(&self, chrom: &str) -> Option<&str> {
+        self.index_for_chrom(chrom)
+            .map(|idx| self.entries[idx].dataset.as_str())
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    pub(crate) fn chrom_for_alias(&self, chrom: &str) -> Option<&str> {
+        self.index_for_chrom(chrom)
+            .map(|idx| self.entries[idx].chrom.as_str())
+    }
+
+    fn index_for_chrom(&self, chrom: &str) -> Option<usize> {
         if let Some(idx) = self.by_chrom.get(chrom) {
-            return Some(self.entries[*idx].dataset.as_str());
+            return Some(*idx);
         }
         contig_alias_set(chrom)
             .iter()
             .find_map(|alias| self.by_chrom.get(alias))
-            .map(|idx| self.entries[*idx].dataset.as_str())
+            .copied()
     }
 
     pub fn available_chroms(&self) -> Vec<&str> {
