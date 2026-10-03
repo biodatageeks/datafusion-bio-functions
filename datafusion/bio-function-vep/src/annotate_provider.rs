@@ -3843,6 +3843,9 @@ fn compute_max_af(af_entries: &[(&str, &str)]) -> (String, String) {
 
 /// Table provider implementing `annotate_vep(...)`.
 pub struct AnnotateProvider {
+    /// Per-contig annotation source name. Input columns and lookup keys retain
+    /// their original spelling; only explicit cache synonyms need an override.
+    annotation_chrom: Option<String>,
     session: Arc<SessionContext>,
     vcf_table: String,
     cache_source: String,
@@ -3928,6 +3931,7 @@ impl AnnotateProvider {
 
         Ok(Self {
             session,
+            annotation_chrom: None,
             vcf_table,
             cache_source,
             backend,
@@ -5854,14 +5858,11 @@ impl AnnotateProvider {
                 )))
             }
         };
-        // Build expanded cache chrom set with all equivalent spellings (bare,
-        // chr-prefixed, and mitochondrial M/MT/chrM/chrMT) so that e.g. VCF
-        // "chr1" matches cache "1" and VCF "M"/"chrM" matches cache "chrMT".
-        let mut cache_chroms: HashSet<String> = HashSet::new();
         let available_chroms = cache.available_chroms();
-        for c in &available_chroms {
-            cache_chroms.extend(crate::cache::manifest::contig_alias_set(c));
-        }
+        #[cfg(feature = "parquet-cache")]
+        let cache_chroms = cache.as_parquet().accepted_chroms();
+        #[cfg(not(feature = "parquet-cache"))]
+        let cache_chroms = HashSet::new();
         let contigs = select_cache_backed_contigs(&vcf_contigs, &cache_chroms, cache.base_dir())?;
         let contigs = match contig_runs.as_deref() {
             Some(runs) => crate::regions::restrict_contigs(contigs, runs),
@@ -6574,8 +6575,11 @@ impl AnnotateProvider {
                     continue;
                 };
 
+                // Co-located keys above use the original input name on both
+                // sides. Transcript and FASTA sources use the resolved name.
+                let annotation_chrom = self.annotation_chrom.as_deref().unwrap_or(&chrom);
                 let mut variant = VariantInput::from_vcf(
-                    chrom.clone(),
+                    annotation_chrom.to_owned(),
                     start,
                     end,
                     ref_allele,
@@ -6589,7 +6593,9 @@ impl AnnotateProvider {
                 let hgvs_shift_started = engine_profile_enabled.then(Instant::now);
                 if let Some(reader) = hgvs_reference_reader.as_mut() {
                     if ref_al.len() != alt_allele.len() {
-                        let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
+                        let chrom_norm = annotation_chrom
+                            .strip_prefix("chr")
+                            .unwrap_or(annotation_chrom);
                         let (vep_ref_norm, vep_alt_norm) = vcf_to_vep_allele(&ref_al, &alt_allele);
                         let vep_start = vep_norm_start(start, &ref_al, &alt_allele);
                         let vep_end = vep_norm_end(start, &ref_al, &alt_allele);
@@ -12771,13 +12777,22 @@ fn prepare_buffer_annotation_context(
     let shared = Arc::clone(&worker.shared);
     let profile = shared.profile.clone();
     let config = &shared.config;
+    let context_batches = annotation_context_batches(
+        buffer_batches,
+        shared.tmp_provider.annotation_chrom.as_deref(),
+    )?;
+    let chrom = shared
+        .tmp_provider
+        .annotation_chrom
+        .as_deref()
+        .unwrap_or(chrom);
 
     let tx_window_started = Instant::now();
     let mut transcripts = build_stateful_buffer_local_transcripts_cow(
         &shared.base_transcripts,
         &shared.transcript_cache_regions,
         &mut worker.persisted_buffer_transcripts,
-        buffer_batches,
+        &context_batches,
         chrom,
         min_start,
         max_end,
@@ -12906,6 +12921,11 @@ fn hydrate_worker_window(
         return Ok(());
     }
     let shared = Arc::clone(&worker.shared);
+    let context_batches = annotation_context_batches(
+        window_batches,
+        shared.tmp_provider.annotation_chrom.as_deref(),
+    )?;
+    let window_batches = context_batches.as_ref();
     let Some((chrom, min_start, max_end)) = buffer_variant_bounds(window_batches)? else {
         return Ok(());
     };
@@ -12989,6 +13009,42 @@ fn hydrate_worker_window(
     }
 
     Ok(())
+}
+
+/// Context calculations see the cache name, while annotation/output still
+/// consume the original batches. Canonical input borrows without copying.
+fn annotation_context_batches<'a>(
+    batches: &'a [RecordBatch],
+    annotation_chrom: Option<&str>,
+) -> Result<Cow<'a, [RecordBatch]>> {
+    let Some(chrom) = annotation_chrom else {
+        return Ok(Cow::Borrowed(batches));
+    };
+    let resolved = batches
+        .iter()
+        .map(|batch| {
+            let schema = batch.schema();
+            let index = schema.index_of("chrom")?;
+            let input = batch.column(index);
+            let names = StringArray::from_iter(
+                (0..batch.num_rows()).map(|row| (!input.is_null(row)).then_some(chrom)),
+            );
+            let mut columns = batch.columns().to_vec();
+            columns[index] = Arc::new(names);
+            let mut fields = schema.fields().to_vec();
+            fields[index] = Arc::new(
+                fields[index]
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Utf8),
+            );
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+                columns,
+            )?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Cow::Owned(resolved))
 }
 
 fn buffer_variant_bounds(batches: &[RecordBatch]) -> Result<Option<(String, i64, i64)>> {
@@ -15157,6 +15213,13 @@ async fn prepare_contig_data(
     // SIFT source: a shared per-contig prediction store loaded from the Parquet
     // translation_sift shard.
     #[cfg(feature = "parquet-cache")]
+    let tmp_provider = {
+        let mut provider = tmp_provider;
+        provider.annotation_chrom = cache.as_parquet().annotation_chrom_override(&chrom);
+        provider
+    };
+
+    #[cfg(feature = "parquet-cache")]
     let use_lookup_sift = config.cache_root.is_some();
     #[cfg(not(feature = "parquet-cache"))]
     let use_lookup_sift = false;
@@ -15376,7 +15439,7 @@ async fn prepare_contig_data(
         Some(root) => {
             let reg = crate::plugin_cache::registry::PluginRegistry::open(
                 root,
-                &chrom,
+                cache.as_parquet().resolve_chrom(&chrom).unwrap_or(&chrom),
                 config.plugin_names.as_deref(),
             )
             .await?;

@@ -158,6 +158,10 @@ impl CacheBuilder {
         #[cfg(feature = "parquet-cache")]
         {
             let cache_version = self.validate_raw_cache_identity(kind)?;
+            crate::cache::synonyms::preserve_chromosome_synonyms(
+                std::path::Path::new(&self.cache_root),
+                std::path::Path::new(&self.output_dir),
+            )?;
             let options = crate::cache::build::CacheBuildOptions {
                 cache_root: self.cache_root.clone(),
                 output_dir: self.output_dir.clone(),
@@ -322,5 +326,47 @@ mod tests {
         let builder = CacheBuilder::new("/cache", "/output");
         let err = builder.build_entity("nonsense").await.unwrap_err();
         assert!(err.to_string().contains("Unknown entity"));
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    #[tokio::test]
+    async fn resumed_cache_build_preserves_chromosome_synonyms_without_rebuilding_shards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("raw");
+        let output = tmp.path().join("converted");
+        std::fs::create_dir_all(raw.join("21")).unwrap();
+        std::fs::write(
+            raw.join("info.txt"),
+            "cache_version\t116\nvariation_cols\tvariation_name,start,end,allele_string,strand\n",
+        )
+        .unwrap();
+        std::fs::write(raw.join("21/1_var.gz"), b"not read during a resumed build").unwrap();
+        let synonyms = b"21 NC_000021.9 custom_accession\n";
+        std::fs::write(raw.join("chr_synonyms.txt"), synonyms).unwrap();
+        let entity = output.join("variation");
+        crate::cache::manifest::ChromManifest::new(vec![
+            crate::cache::manifest::ChromDatasetEntry::new("chr21", "chr21.parquet", 1),
+        ])
+        .write_to_entity_dir(&entity)
+        .unwrap();
+        let shard = entity.join("chr21.parquet");
+        std::fs::write(&shard, b"completed shard must stay unchanged").unwrap();
+        let original_modified = std::fs::metadata(&shard).unwrap().modified().unwrap();
+        let builder = CacheBuilder::new(raw.to_str().unwrap(), output.to_str().unwrap())
+            .with_expected_cache_version("116");
+        let results = builder.build_entity("variation").await.unwrap();
+        assert!(results.iter().all(|result| result.parquet_files.is_empty()));
+        assert_eq!(
+            std::fs::read(output.join("chr_synonyms.txt")).unwrap(),
+            synonyms
+        );
+        assert_eq!(
+            std::fs::read(&shard).unwrap(),
+            b"completed shard must stay unchanged"
+        );
+        assert_eq!(
+            std::fs::metadata(&shard).unwrap().modified().unwrap(),
+            original_modified
+        );
     }
 }

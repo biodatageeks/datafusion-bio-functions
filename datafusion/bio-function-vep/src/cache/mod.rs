@@ -4,4 +4,6 @@ pub mod build;
 pub mod lookup_exec;
 pub mod manifest;
 pub mod schema;
+#[cfg(feature = "parquet-cache")]
+pub(crate) mod synonyms;
 pub mod variation_runtime;
