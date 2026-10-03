@@ -6445,7 +6445,7 @@ impl AnnotateProvider {
                     data.variant_fields(
                         &vep_allele,
                         data.variant_match_output_allele(&vep_allele),
-                        &ref_al,
+                        &crate::allele::annotation_allele(&ref_al, &alt_allele),
                         flags.pubmed,
                     )
                 } else {
@@ -16956,6 +16956,115 @@ mod tests {
 
     fn minimal_shared_contig_annotation_context() -> Arc<SharedContigAnnotationContext> {
         minimal_shared_contig_annotation_context_with_features(Vec::new(), Vec::new())
+    }
+
+    #[test]
+    fn lowercase_snv_annotations_preserve_source_columns_and_colocated_fields() {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        let shared = minimal_shared_contig_annotation_context();
+        let ctx = PreparedContext::new(&[], &[], &[], &[], &[], &[], &[]);
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["21"; 4])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![25_585_733; 4])),
+                Arc::new(Int64Array::from(vec![25_585_733; 4])),
+                Arc::new(StringArray::from(vec!["C", "c", "c", "C"])),
+                Arc::new(StringArray::from(vec!["T", "t", "T", "t"])),
+            ],
+        )
+        .unwrap();
+        let af = AfColumns::new(
+            (0..AF_COLUMNS.len())
+                .map(|index| {
+                    Arc::new(StringArray::from(vec![match index {
+                        0 => "T:0.0010",
+                        16 => "T:0.001307",
+                        17 => "T:0.004669",
+                        _ => "",
+                    }])) as Arc<dyn Array>
+                })
+                .collect(),
+        );
+        let entry = ColocatedCacheEntry {
+            variation_name: "rs142513484".into(),
+            allele_string: "C/T".into(),
+            matched_alleles: vec![MatchedVariantAllele {
+                a_allele: "T".into(),
+                a_index: 0,
+                b_allele: "T".into(),
+                b_index: 0,
+            }],
+            somatic: 0,
+            pheno: 0,
+            clin_sig: None,
+            clin_sig_allele: Some("T:benign".into()),
+            clin_sig_ref_allele: Some("C".into()),
+            pubmed: None,
+            af,
+            af_row: 0,
+        };
+        let sink = HashMap::from([(
+            ("21".into(), 25_585_733, 25_585_733, "C/T".into()),
+            ColocatedSinkValue {
+                entries: vec![entry],
+                compare_output_allele: Some("T".into()),
+                unshifted_output_allele: None,
+            },
+        )]);
+        let colocated = build_colocated_map_from_sink(&sink);
+        let flags = VepFlags::from_options_json(Some(r#"{"everything":true}"#));
+        for skip_typed_cols in [false, true] {
+            let output = shared
+                .tmp_provider
+                .annotate_batch_with_transcript_engine(
+                    &input,
+                    &shared.engine,
+                    &ctx,
+                    &colocated,
+                    &mut SiftPolyphenCache::new(),
+                    &None,
+                    false,
+                    skip_typed_cols,
+                    &flags,
+                    &HgvsFlags::default(),
+                    TranscriptSelectionFlags::default(),
+                    &PickFlags::default(),
+                    &mut None,
+                    #[cfg(feature = "parquet-cache")]
+                    None,
+                )
+                .unwrap();
+            for col in 0..5 {
+                assert_eq!(output.column(col).to_data(), input.column(col).to_data());
+            }
+            let csq = output
+                .column_by_name("CSQ")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let fields = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
+                true, false, false, false,
+            );
+            let index = |name: &str| fields.iter().position(|field| *field == name).unwrap();
+            let control: Vec<_> = csq.value(0).split('|').collect();
+            assert_eq!(control[index("Allele")], "T");
+            assert_eq!(control[index("Existing_variation")], "rs142513484");
+            assert_eq!(control[index("AF")], "0.0010");
+            assert_eq!(control[index("MAX_AF")], "0.004669");
+            assert_eq!(control[index("MAX_AF_POPS")], "gnomADg_AFR");
+            assert_eq!(control[index("CLIN_SIG")], "benign");
+            for row in 1..4 {
+                assert_eq!(csq.value(row), csq.value(0), "annotation row {row}");
+            }
+        }
     }
 
     fn assert_reference_equal_rows_have_null_annotations(cached: bool) {

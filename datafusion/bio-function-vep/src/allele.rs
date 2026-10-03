@@ -5,6 +5,7 @@ use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, String
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -352,6 +353,22 @@ pub fn alt_kind(alt: &str) -> AltKind {
     AltKind::Sequence
 }
 
+/// VEP validates sequence alleles after case-sensitive parser trimming.
+/// Keep structural tokens verbatim, including embedded breakend contig names.
+/// Borrow unchanged inputs so the usual uppercase path needs no allocation.
+///
+/// Ensembl VEP 116.2 `Parser::next` calls `create_VariationFeatures` (which
+/// post-processes/minimizes) before `validate_vf` uppercases `allele_string`:
+/// <https://github.com/Ensembl/ensembl-vep/blob/2cb0bbe216bb31c75de8f8000e2da7ff4fb7b451/modules/Bio/EnsEMBL/VEP/Parser.pm#L180-L188>
+/// <https://github.com/Ensembl/ensembl-vep/blob/2cb0bbe216bb31c75de8f8000e2da7ff4fb7b451/modules/Bio/EnsEMBL/VEP/Parser.pm#L551-L554>
+pub(crate) fn annotation_allele<'a>(allele: &'a str, original_alt: &str) -> Cow<'a, str> {
+    if allele.bytes().any(|base| base.is_ascii_lowercase()) && !is_structural_alt(original_alt) {
+        Cow::Owned(allele.to_ascii_uppercase())
+    } else {
+        Cow::Borrowed(allele)
+    }
+}
+
 ///
 /// Convert VCF REF/ALT pair to VEP allele format.
 ///
@@ -388,7 +405,10 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
     //
     // This also covers SNVs, which are the one-base case of "same length".
     if ref_allele.len() == alt_allele.len() {
-        return (ref_allele.to_string(), alt_allele.to_string());
+        return (
+            annotation_allele(ref_allele, alt_allele).into_owned(),
+            annotation_allele(alt_allele, alt_allele).into_owned(),
+        );
     }
 
     let ref_bytes = ref_allele.as_bytes();
@@ -422,12 +442,12 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
     let vep_ref = if ref_trimmed.is_empty() {
         "-".to_string()
     } else {
-        ref_trimmed.to_string()
+        annotation_allele(ref_trimmed, alt_allele).into_owned()
     };
     let vep_alt = if alt_trimmed.is_empty() {
         "-".to_string()
     } else {
-        alt_trimmed.to_string()
+        annotation_allele(alt_trimmed, alt_allele).into_owned()
     };
 
     (vep_ref, vep_alt)
@@ -463,18 +483,22 @@ pub fn vcf_to_vep_input_allele(
             if ref_trimmed.is_empty() {
                 "-".to_string()
             } else {
-                ref_trimmed.to_string()
+                annotation_allele(ref_trimmed, alt_allele).into_owned()
             },
             if alt_trimmed.is_empty() {
                 "-".to_string()
             } else {
-                alt_trimmed.to_string()
+                annotation_allele(alt_trimmed, alt_allele).into_owned()
             },
             pos + 1,
         );
     }
 
-    (ref_allele.to_string(), alt_allele.to_string(), pos)
+    (
+        annotation_allele(ref_allele, alt_allele).into_owned(),
+        annotation_allele(alt_allele, alt_allele).into_owned(),
+        pos,
+    )
 }
 
 /// Plugin-cache probe key spelling, deliberately frozen at the pre-vepyr#95
@@ -509,18 +533,22 @@ pub fn plugin_probe_input_allele(
             if ref_trimmed.is_empty() {
                 "-".to_string()
             } else {
-                ref_trimmed.to_string()
+                annotation_allele(ref_trimmed, alt_allele).into_owned()
             },
             if alt_trimmed.is_empty() {
                 "-".to_string()
             } else {
-                alt_trimmed.to_string()
+                annotation_allele(alt_trimmed, alt_allele).into_owned()
             },
             pos + 1,
         );
     }
 
-    (ref_allele.to_string(), alt_allele.to_string(), pos)
+    (
+        annotation_allele(ref_allele, alt_allele).into_owned(),
+        annotation_allele(alt_allele, alt_allele).into_owned(),
+        pos,
+    )
 }
 
 /// Reduce an allele pair to the minimal representation Ensembl probes a plugin
@@ -565,7 +593,7 @@ pub fn plugin_probe_allele(pos: i64, ref_allele: &str, alt_allele: &str) -> (Str
         if b.is_empty() {
             "-".to_string()
         } else {
-            String::from_utf8_lossy(b).into_owned()
+            annotation_allele(&String::from_utf8_lossy(b), alt_allele).into_owned()
         }
     };
     (to_allele(r), to_allele(a), start)
@@ -1770,5 +1798,86 @@ mod tests {
             vcf_to_vep_allele("ACGT", "A"),
             ("CGT".to_string(), "-".to_string())
         );
+    }
+
+    #[test]
+    fn lowercase_snv_annotation_and_lookup_alleles_are_uppercase() {
+        // VEP 116.2 Parser.pm:554 validates the annotation allele string;
+        // OutputFactory/VCF.pm:314 keeps the source record independently.
+        for (reference, alternate) in [("C", "T"), ("c", "t"), ("c", "T"), ("C", "t")] {
+            assert_eq!(
+                vcf_to_vep_allele(reference, alternate),
+                ("C".into(), "T".into())
+            );
+            assert_eq!(
+                vcf_to_vep_input_allele(100, reference, alternate),
+                ("C".into(), "T".into(), 100)
+            );
+            assert_eq!(
+                plugin_probe_input_allele(100, reference, alternate),
+                ("C".into(), "T".into(), 100)
+            );
+            assert_eq!(
+                plugin_probe_allele(100, reference, alternate),
+                ("C".into(), "T".into(), 100)
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_casing_preserves_structural_tokens_and_uppercase_borrows() {
+        for alternate in ["<del>", "a]chrUn_KI270442v1:100]", ".a", "a.", "*"] {
+            assert_eq!(annotation_allele(alternate, alternate), alternate);
+            assert_eq!(annotation_allele("a", alternate), "a");
+        }
+        assert!(matches!(annotation_allele("ACGT", "T"), Cow::Borrowed(_)));
+        let variant = crate::transcript_consequence::VariantInput::from_vcf(
+            "21".into(),
+            100,
+            100,
+            "c".into(),
+            "t".into(),
+        );
+        assert_eq!(variant.ref_allele, "C");
+        assert_eq!(variant.alt_allele, "T");
+        assert_eq!(variant.parser_ref_allele, "C");
+        assert_eq!(variant.parser_alt_allele, "T");
+    }
+
+    #[test]
+    fn lowercase_indels_are_trimmed_before_annotation_case_conversion() {
+        // create_VariationFeatures -> post_process_vfs -> next -> validate_vf:
+        // VEP 116.2 Parser/VCF.pm:378, Parser.pm:881,188,554. In particular
+        // c>Ct becomes C/CT, not -/T. A 116.2 Docker oracle confirms this.
+        for (reference, alternate, expected_ref, expected_alt, start) in [
+            ("c", "ct", "-", "T", 101),
+            ("c", "Ct", "C", "CT", 100),
+            ("C", "cT", "C", "CT", 100),
+            ("ct", "c", "T", "-", 101),
+            ("cT", "C", "CT", "C", 100),
+            ("ctt", "TttAt", "CT", "TTTA", 100),
+            ("aC", "At", "AC", "AT", 100),
+        ] {
+            assert_eq!(
+                vcf_to_vep_allele(reference, alternate),
+                (expected_ref.into(), expected_alt.into())
+            );
+            assert_eq!(vep_norm_start(100, reference, alternate), start);
+            let variant = crate::transcript_consequence::VariantInput::from_vcf(
+                "21".into(),
+                100,
+                100 + reference.len() as i64 - 1,
+                reference.into(),
+                alternate.into(),
+            );
+            assert_eq!(
+                (
+                    variant.ref_allele.as_str(),
+                    variant.alt_allele.as_str(),
+                    variant.start
+                ),
+                (expected_ref, expected_alt, start)
+            );
+        }
     }
 }

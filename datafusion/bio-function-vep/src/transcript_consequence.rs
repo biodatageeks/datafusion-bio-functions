@@ -57,6 +57,12 @@ impl VariantInput {
         // still need suffix trimming even when prefix_len==0, e.g.
         // T->AGTAAATTTTTTTTCT suffix-trims to ""->AGTAAATTTTTTTTC (insertion).
         if ref_bytes.len() == alt_bytes.len() {
+            let mut ref_allele = ref_allele;
+            let mut alt_allele = alt_allele;
+            if !crate::allele::is_structural_alt(&alt_allele) {
+                ref_allele.make_ascii_uppercase();
+                alt_allele.make_ascii_uppercase();
+            }
             return Self {
                 chrom,
                 start: pos,
@@ -106,12 +112,14 @@ impl VariantInput {
             ref_allele: if final_ref.is_empty() {
                 "-".to_string()
             } else {
-                String::from_utf8_lossy(final_ref).to_string()
+                crate::allele::annotation_allele(&String::from_utf8_lossy(final_ref), &alt_allele)
+                    .into_owned()
             },
             alt_allele: if final_alt.is_empty() {
                 "-".to_string()
             } else {
-                String::from_utf8_lossy(final_alt).to_string()
+                crate::allele::annotation_allele(&String::from_utf8_lossy(final_alt), &alt_allele)
+                    .into_owned()
             },
             parser_start,
             parser_end: end,
