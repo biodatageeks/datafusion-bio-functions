@@ -6472,11 +6472,10 @@ fn protein_hgvs_for_output_with_semantics(
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1257-L1284>
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1593-L1758>
 ///
-/// We already persist the genomic shift length, but our previous HGVSp replay
-/// rebuilt a new normalized insertion/deletion-only variant from
-/// `shifted_output_allele`. That is sufficient for transcript HGVS, but it is
-/// too narrow for protein HGVS because Ensembl's peptide/codon path still sees
-/// the original raw ref/alt allele strings after `shift_feature_seqs()`.
+/// Insertion replay uses the effective minimized FV, which VEP creates before
+/// TVA construction. Its original alleles differ from the pre-minimization
+/// parser fields retained here for output. Deletion replay uses the normalized
+/// shifted span, retaining the existing transcript-HGVS deletion handling.
 fn protein_hgvs_shifted_variant(
     variant: &VariantInput,
     shift: &crate::hgvs::HgvsGenomicShift,
@@ -6504,17 +6503,35 @@ fn protein_hgvs_shifted_variant(
         };
     }
 
-    let shifted_ref =
-        rotate_hgvs_protein_allele(&variant.parser_ref_allele, shift.shift_length, strand);
-    let shifted_alt =
-        rotate_hgvs_protein_allele(&variant.parser_alt_allele, shift.shift_length, strand);
+    // VEP Parser::post_process_vfs minimizes unequal-length alleles even
+    // without --minimal. The TVA therefore replays the effective insertion,
+    // not the anchor-only parser span retained for output elsewhere here.
+    // Pair its coordinate origin and alleles before applying the shift:
+    // https://github.com/Ensembl/ensembl-vep/blob/release/116.2/modules/Bio/EnsEMBL/VEP/Parser.pm#L860-L881
+    let (start, end, ref_allele, alt_allele) = if ref_norm.is_empty() && !alt_norm.is_empty() {
+        (
+            variant.start,
+            variant.start - 1,
+            variant.ref_allele.as_str(),
+            variant.alt_allele.as_str(),
+        )
+    } else {
+        (
+            variant.parser_start,
+            variant.parser_end,
+            variant.parser_ref_allele.as_str(),
+            variant.parser_alt_allele.as_str(),
+        )
+    };
+    let shifted_ref = rotate_hgvs_protein_allele(ref_allele, shift.shift_length, strand);
+    let shifted_alt = rotate_hgvs_protein_allele(alt_allele, shift.shift_length, strand);
     let shift_delta = if strand >= 0 {
         shift.shift_length as i64
     } else {
         -(shift.shift_length as i64)
     };
-    let shifted_start = variant.parser_start + shift_delta;
-    let shifted_end = variant.parser_end + shift_delta;
+    let shifted_start = start + shift_delta;
+    let shifted_end = end + shift_delta;
     VariantInput {
         chrom: variant.chrom.clone(),
         start: shifted_start,
@@ -19026,8 +19043,14 @@ mod tests {
     }
 
     #[test]
-    fn protein_hgvs_shifted_variant_replays_original_alleles() {
-        let original = var("4", 3074876, 3074882, "CCAGCAG", "CCAGCAGCAGCAGCAGCAGCAG");
+    fn protein_hgvs_shifted_variant_replays_minimized_insertion_alleles() {
+        let original = VariantInput::from_vcf(
+            "4".into(),
+            3074876,
+            3074882,
+            "CCAGCAG".into(),
+            "CCAGCAGCAGCAGCAGCAGCAG".into(),
+        );
         // This test only exercises the protein-space replay logic, so keep it
         // self-contained instead of depending on a machine-local reference
         // FASTA. These values match the VEP-normalized insertion shift for the
@@ -19035,11 +19058,11 @@ mod tests {
         let shift = crate::hgvs::HgvsGenomicShift {
             strand: 1,
             shift_length: 53,
-            start: 3_074_929,
+            start: 3_074_936,
             end: 3_074_935,
-            shifted_allele_string: "CAGCAGCAGCAGCAG".to_string(),
-            shifted_compare_allele: "CAGCAGCAGCAGCAG".to_string(),
-            shifted_output_allele: "CAGCAGCAGCAGCAG".to_string(),
+            shifted_allele_string: "GCAGCAGCAGCAGCA".to_string(),
+            shifted_compare_allele: "GCAGCAGCAGCAGCA".to_string(),
+            shifted_output_allele: "GCAGCAGCAGCAGCA".to_string(),
             ref_orig_allele_string: "-".to_string(),
             alt_orig_allele_string: "CAGCAGCAGCAGCAG".to_string(),
             five_prime_flanking_seq: String::new(),
@@ -19049,19 +19072,15 @@ mod tests {
         };
 
         let shifted = protein_hgvs_shifted_variant(&original, &shift, 1);
-        assert_eq!(shifted.start, 3074929);
+        assert_eq!(shifted.start, 3074936);
         assert_eq!(shifted.end, 3074935);
-        assert_eq!(shifted.parser_start, 3074929);
+        assert_eq!(shifted.parser_start, 3074936);
         assert_eq!(shifted.parser_end, 3074935);
         // The shift stores the VEP-normalized alleles passed to build_hgvs_genomic_shift.
         assert_eq!(shift.ref_orig_allele_string, "-");
         assert_eq!(shift.alt_orig_allele_string, "CAGCAGCAGCAGCAG");
-        // The rotated parser alleles depend on the computed shift_length.
-        let expected_ref = rotate_hgvs_protein_allele("CCAGCAG", shift.shift_length, 1);
-        let expected_alt =
-            rotate_hgvs_protein_allele("CCAGCAGCAGCAGCAGCAGCAG", shift.shift_length, 1);
-        assert_eq!(shifted.ref_allele, expected_ref);
-        assert_eq!(shifted.alt_allele, expected_alt);
+        assert_eq!(shifted.ref_allele, "-");
+        assert_eq!(shifted.alt_allele, "GCAGCAGCAGCAGCA");
     }
 
     #[test]
@@ -19183,7 +19202,7 @@ mod tests {
     }
 
     #[test]
-    fn protein_hgvs_shifted_variant_for_reference_trims_refseq_edit_prefix_on_canonical_cds() {
+    fn protein_hgvs_shifted_variant_for_reference_preserves_minimized_insertion_on_canonical_cds() {
         let mut transcript = tx(
             "NM_002111.8",
             "4",
@@ -19219,15 +19238,12 @@ mod tests {
         };
         let shift = crate::hgvs::HgvsGenomicShift {
             strand: 1,
-            shift_length: 59,
+            shift_length: 53,
             start: 3074936,
-            end: 3074941,
-            shifted_allele_string: "GCAGCAGCAGCAGCAGCAGCA".to_string(),
-            shifted_compare_allele: "GCAGCAGCAGCAGCAGCAGCA".to_string(),
-            shifted_output_allele: "GCAGCAGCAGCAGCAGCAGCA".to_string(),
-            // build_hgvs_genomic_shift stores VEP-normalized insertion alleles,
-            // not the raw parser alleles. The canonical HGVSp trim therefore has
-            // to derive from the rotated shifted allele length itself.
+            end: 3074935,
+            shifted_allele_string: "GCAGCAGCAGCAGCA".to_string(),
+            shifted_compare_allele: "GCAGCAGCAGCAGCA".to_string(),
+            shifted_output_allele: "GCAGCAGCAGCAGCA".to_string(),
             ref_orig_allele_string: "-".to_string(),
             alt_orig_allele_string: "CAGCAGCAGCAGCAG".to_string(),
             five_prime_flanking_seq: String::new(),
@@ -19244,6 +19260,8 @@ mod tests {
             &variant,
             &shift,
         );
+        assert_eq!((shifted.start, shifted.end), (3074936, 3074935));
+        assert_eq!(shifted.ref_allele, "-");
         assert_eq!(shifted.alt_allele, "GCAGCAGCAGCAGCA");
         assert_eq!(shifted.parser_alt_allele, "GCAGCAGCAGCAGCA");
     }
@@ -19510,25 +19528,12 @@ mod tests {
         );
     }
 
-    // Requires a locally-regenerated `.tmp_chr4_nm002111_*.txt` dump; see the `dev_fixtures`
-    // cfg flag (enabled via `RUSTFLAGS=--cfg dev_fixtures`) for the opt-in.
-    #[cfg(dev_fixtures)]
     #[test]
     fn chr4_3074876_htt_cag_insertion_hgvsp_matches_vep() {
-        // chr4:3074876 CCAGCAG>CCAGCAGCAGCAGCAGCAGCAG on NM_002111.8 (HTT).
-        //
-        // Ground truth from VEP 115.2 (ensembl-variation pinned at b7c2637)
-        // run on HG002 in merged mode:
-        //   Ensembl ENST00000355072 / ENSP00000347184.5 → p.Gln34_Gln38dup
-        //   RefSeq  NM_002111.8  / NP_002102.4          → p.Pro39delinsGlnGlnGlnGln
-        //
-        // The remaining divergence for this site is the RefSeq edited
-        // mid-codon boundary path: generic shifted-TVA replay lands on the
-        // BAM-edited polyQ duplication window (`Gln36_Gln40dup`), while VEP
-        // resolves the shifted RefSeq boundary to a literal protein delins
-        // window (`Pro39delinsGlnGlnGlnGln`). The selector below prefers that
-        // literal shifted window over the generic dup for edited RefSeq
-        // insertions when the two disagree.
+        // Actual VEP 116.2 merged-cache trace for the normalized HG002 record.
+        // Parser::post_process_vfs minimizes CCAGCAG/CCAGCAGCAGCAGCAGCAGCAG
+        // to -/CAGx5 at 3074883..3074882 before the 53-base HGVS shift.
+        // The six-base RNA edit splits its flanks: CDS 111..116, peptide 37..39.
         let mut t = tx(
             "NM_002111.8",
             "4",
@@ -19575,26 +19580,10 @@ mod tests {
         t.translation_stable_id = Some("NP_002102.4".to_string());
         t.cdna_coding_start = Some(146);
         t.cdna_coding_end = Some(9580);
-        t.spliced_seq = Some(
-            include_str!("../../../.tmp_chr4_nm002111_spliced_seq.txt")
-                .trim()
-                .to_string(),
-        );
-        t.translateable_seq = Some(
-            include_str!("../../../.tmp_chr4_nm002111_translateable_seq.txt")
-                .trim()
-                .to_string(),
-        );
-        t.five_prime_utr_seq = Some(
-            include_str!("../../../.tmp_chr4_nm002111_five_prime_utr_seq.txt")
-                .trim()
-                .to_string(),
-        );
-        t.three_prime_utr_seq = Some(
-            include_str!("../../../.tmp_chr4_nm002111_three_prime_utr_seq.txt")
-                .trim()
-                .to_string(),
-        );
+        // Native first-exon sequence slices; later exons cannot affect this window.
+        t.spliced_seq = Some("GCTGCCGGGACGGGTCCAAGATGGACGGCCGCTCAGGTTCTGCTTTTACCTGCGGCCCAGAGCCCCATTCATTGCCCCGGTGCTGAGCGGCGCCGCGAGTCGGCCCGAGGCCTCCGGGGACTGCCGTGCCGGGCGGGAGACCGCCATGGCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTCAAGTCCTTCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAACAGCCGCCACCGCCGCCGCCGCCGCCGCCGCCTCCTCAGCTTCCTCAGCCGCCGCCGCAGGCACAGCCGCTGCTGCCTCAGCCGCAGCCGCCCCCGCCGCCGCCCCCGCCGCCACCCGGCCCGGCTGTGGCTGAGGAGCCGCTGCACCGACC".to_string());
+        t.translateable_seq = Some("ATGGCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTCAAGTCCTTCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAACAGCCGCCACCGCCGCCGCCGCCGCCGCCGCCTCCTCAGCTTCCTCAGCCGCCGCCGCAGGCACAGCCGCTGCTGCCTCAGCCGCAGCCGCCCCCGCCGCCGCCCCCGCCGCCACCCGGCCCGGCTGTGGCTGAGGAGCCGCTGCACCGACC".to_string());
+        t.five_prime_utr_seq = Some("GCTGCCGGGACGGGTCCAAGATGGACGGCCGCTCAGGTTCTGCTTTTACCTGCGGCCCAGAGCCCCATTCATTGCCCCGGTGCTGAGCGGCGCCGCGAGTCGGCCCGAGGCCTCCGGGGACTGCCGTGCCGGGCGGGAGACCGCC".to_string());
 
         let exons = vec![exon("NM_002111.8", 1, 3074681, 3075088)];
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
@@ -19605,43 +19594,52 @@ mod tests {
             "CCAGCAG".into(),
             "CCAGCAGCAGCAGCAGCAGCAG".into(),
         );
-        let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
-            .build_from_path(
-                "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
-            )
-            .unwrap();
-        let original_ref = "CCAGCAG".to_string();
-        let original_alt = "CCAGCAGCAGCAGCAGCAGCAG".to_string();
-        let (vep_ref, vep_alt) = crate::allele::vcf_to_vep_allele(&original_ref, &original_alt);
-        let vep_start = crate::allele::vep_norm_start(3074876, &original_ref, &original_alt);
-        let vep_end = crate::allele::vep_norm_end(3074876, &original_ref, &original_alt);
-        v.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
-            &mut reader,
-            "4",
-            &vep_ref,
-            &vep_alt,
-            vep_start,
-            vep_end,
-            1,
-        )
-        .unwrap();
-
+        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 53,
+            start: 3074936,
+            end: 3074935,
+            shifted_allele_string: "GCAGCAGCAGCAGCA".to_string(),
+            shifted_compare_allele: "GCAGCAGCAGCAGCA".to_string(),
+            shifted_output_allele: "GCAGCAGCAGCAGCA".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "CAGCAGCAGCAGCAG".to_string(),
+            five_prime_flanking_seq: "GCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTCAAGTCCTTCCAGCAG"
+                .to_string(),
+            three_prime_flanking_seq: "CAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAA"
+                .to_string(),
+            five_prime_context: "GCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTCAAGTCCTTCCAGCAG"
+                .to_string(),
+            three_prime_context: "CAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAA"
+                .to_string(),
+        });
         let mut tr = translation(
             "NM_002111.8",
             Some(9435),
             Some(3144),
-            Some(include_str!("../../../.tmp_chr4_nm002111_translation_seq.txt").trim()),
-            Some(include_str!("../../../.tmp_chr4_nm002111_translateable_seq.txt").trim()),
+            Some(
+                "MATLEKLMKAFESLKSFQQQQQQQQQQQQQQQQQQQQQQQPPPPPPPPPPPQLPQPPPQAQPLLPQPQPPPPPPPPPPGPAVAEEPLHR",
+            ),
+            Some(
+                "ATGGCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTCAAGTCCTTCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAACAGCCGCCACCGCCGCCGCCGCCGCCGCCGCCTCCTCAGCTTCCTCAGCCGCCGCCGCAGGCACAGCCGCTGCTGCCTCAGCCGCAGCCGCCCCCGCCGCCGCCCCCGCCGCCACCCGGCCCGGCTGTGGCTGAGGAGCCGCTGCACCGACC",
+            ),
         );
-        // HTT has two polyQ runs: 23 Qs in the BAM-edited peptide (what VEP
-        // uses for Amino_acids / Codons) and 21 Qs in the canonical
-        // translation.primary_seq (what VEP's HGVSp formats against).
-        // Mirror upstream d26e370's split so HGVSp sees Pro at pos 39.
-        tr.translation_seq_canonical = Some(
-            include_str!("../../../.tmp_chr4_nm002111_translation_seq_canonical.txt")
-                .trim()
-                .to_string(),
-        );
+        tr.translation_seq_canonical = Some("MATLEKLMKAFESLKSFQQQQQQQQQQQQQQQQQQQQQPPPPPPPPPPPQLPQPPPQAQPLLPQPQPPPPPPPPPPGPAVAEEPLHR".to_string());
+        tr.cds_sequence_canonical = Some("ATGGCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTCAAGTCCTTCCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAACAGCCGCCACCGCCGCCGCCGCCGCCGCCGCCTCCTCAGCTTCCTCAGCCGCCGCCGCAGGCACAGCCGCTGCTGCCTCAGCCGCAGCCGCCCCCGCCGCCGCCCCCGCCGCCACCCGGCCCGGCTGTGGCTGAGGAGCCGCTGCACCGACC".to_string());
+        let shift = refseq_transcript_shift_for_hgvs_protein(&t, &exons_ref, &v).unwrap();
+        assert_eq!(shift.shift_length, 53);
+        let shifted = protein_hgvs_shifted_variant_for_reference(&t, Some(&tr), &v, &shift);
+        assert_eq!((shifted.start, shifted.end), (3074936, 3074935));
+        assert_eq!(shifted.ref_allele, "-");
+        assert_eq!(shifted.alt_allele, "GCAGCAGCAGCAGCA");
+        let coords = shifted_tva_coords_from_mapper(&t, &exons_ref, &tr, &shifted).unwrap();
+        assert_eq!((coords.cds_start, coords.cds_end), (111, 116));
+        assert_eq!((coords.protein_start, coords.protein_end), (37, 39));
+        assert!(coords.edited_insertion_gap);
+        let replay =
+            shifted_tva_protein_hgvs_data(&t, &exons_ref, Some(&tr), &v, &shift, None).unwrap();
+        assert_eq!(replay.ref_peptide, "QQP");
+        assert_eq!(replay.alt_peptide, "QQQQQQ");
 
         let class = classify_coding_change(&t, &exons_ref, Some(&tr), &v).expect("classification");
         let protein = protein_hgvs_for_output(
@@ -19661,8 +19659,7 @@ mod tests {
         assert_eq!(
             formatted.as_deref(),
             Some("NP_002102.4:p.Pro39delinsGlnGlnGlnGln"),
-            "RefSeq edited boundary handling should prefer the literal shifted \
-             protein delins window over the generic shifted dup window."
+            "The minimized insertion must replace the edited mapper gap."
         );
     }
 
