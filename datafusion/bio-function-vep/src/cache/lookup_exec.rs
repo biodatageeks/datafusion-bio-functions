@@ -2429,4 +2429,67 @@ mod tests {
         assert_eq!(sink_value.entries[0].af_value(16), "AAAAAAAAAAAAAAA:0.1017");
         assert_eq!(sink_value.entries[0].af_value(21), "AAAAAAAAAAAAAAA:0.2402");
     }
+
+    #[cfg(feature = "parquet-cache")]
+    #[test]
+    fn lowercase_snv_probe_retains_known_variant_and_frequencies() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("start", DataType::UInt32, false),
+            Field::new("end", DataType::UInt32, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("failed", DataType::Int8, false),
+            Field::new("AF", DataType::Utf8, true),
+            Field::new("gnomADg", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            cache_schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![25_585_733])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![25_585_733])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["rs142513484"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["C/T"])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![0])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["T:0.0010"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["T:0.001307"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let row_map = start_row_map(&batch).unwrap();
+        for (reference, alternate) in [("C", "T"), ("c", "t"), ("c", "T"), ("C", "t")] {
+            let mut coloc = HashMap::new();
+            let (result, metrics) = probe_taken_batch_position(
+                &batch,
+                row_map.get(&25_585_733).unwrap(),
+                allele_matches as fn(&str, &str, &str) -> bool,
+                0,
+                true,
+                "21",
+                25_585_733,
+                reference,
+                alternate,
+                25_585_733,
+                25_585_733,
+                false,
+                0,
+                &[],
+                &[],
+                &mut [],
+                &mut Vec::new(),
+                Some(&mut coloc),
+            )
+            .unwrap();
+            assert_eq!(result, ProbeResult::Match, "{reference}>{alternate}");
+            assert_eq!(metrics.colocated_entries, 1);
+            let key = ("21".into(), 25_585_733, 25_585_733, "C/T".into());
+            let value = coloc
+                .get(&key)
+                .expect("normalized parser key must reach the annotation consumer");
+            assert_eq!(value.entries.len(), 1);
+            assert_eq!(value.entries[0].variation_name, "rs142513484");
+            assert_eq!(value.entries[0].af_value(0), "T:0.0010");
+            assert_eq!(value.entries[0].af_value(16), "T:0.001307");
+        }
+    }
 }
