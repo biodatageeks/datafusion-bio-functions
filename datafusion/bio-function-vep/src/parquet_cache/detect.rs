@@ -17,6 +17,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use datafusion::common::Result;
+
 use crate::cache::manifest::ChromManifest;
 use crate::cache::synonyms::ChromosomeSynonyms;
 
@@ -37,16 +39,24 @@ impl PartitionedParquetCache {
     /// Detect a Parquet cache layout at `cache_source`.
     ///
     /// Returns `Some` when `variation/chrom_manifest.json` can be read.
+    /// For diagnostics and annotation, use `try_detect` to retain metadata errors.
     pub fn detect(cache_source: &str) -> Option<Self> {
+        Self::try_detect(cache_source).ok().flatten()
+    }
+
+    /// Detect the layout, propagating errors in optional metadata when present.
+    pub fn try_detect(cache_source: &str) -> Result<Option<Self>> {
         let base_dir = PathBuf::from(cache_source);
         let variation_dir = base_dir.join(entity_dir_name("variation"));
-        let variation_manifest = ChromManifest::read_from_entity_dir(&variation_dir).ok()?;
-        let synonyms = Arc::new(ChromosomeSynonyms::read(&base_dir).ok()?);
-        Some(Self {
+        let Ok(variation_manifest) = ChromManifest::read_from_entity_dir(&variation_dir) else {
+            return Ok(None);
+        };
+        let synonyms = Arc::new(ChromosomeSynonyms::read(&base_dir)?);
+        Ok(Some(Self {
             base_dir,
             variation_manifest,
             synonyms,
-        })
+        }))
     }
 
     pub fn base_dir(&self) -> &Path {
@@ -145,6 +155,19 @@ mod tests {
     fn detect_returns_none_without_variation_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(PartitionedParquetCache::detect(tmp.path().to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn detects_invalid_synonym_metadata_with_its_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_entity(tmp.path(), "variation", "chr1", "chr1.parquet");
+        let path = tmp.path().join("chr_synonyms.txt");
+        std::fs::write(&path, b"1 \xff\n").unwrap();
+        let error = PartitionedParquetCache::try_detect(tmp.path().to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to read chromosome synonyms"));
+        assert!(error.contains(path.to_str().unwrap()));
     }
 
     #[test]

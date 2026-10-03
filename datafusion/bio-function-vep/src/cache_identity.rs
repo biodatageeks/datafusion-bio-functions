@@ -56,7 +56,7 @@ pub async fn validate_partitioned_cache_contig(
     chrom: &str,
     expected_cache_version: Option<String>,
 ) -> Result<ValidatedCacheIdentity> {
-    let cache = PartitionedParquetCache::detect(cache_source).ok_or_else(|| {
+    let cache = PartitionedParquetCache::try_detect(cache_source)?.ok_or_else(|| {
         DataFusionError::Execution(format!(
             "no partitioned Parquet VEP cache found at '{cache_source}'"
         ))

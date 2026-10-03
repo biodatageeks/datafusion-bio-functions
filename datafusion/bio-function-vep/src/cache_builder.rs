@@ -368,5 +368,14 @@ mod tests {
             std::fs::metadata(&shard).unwrap().modified().unwrap(),
             original_modified
         );
+
+        std::fs::remove_file(raw.join("chr_synonyms.txt")).unwrap();
+        let results = builder.build_entity("variation").await.unwrap();
+        assert!(results.iter().all(|result| result.parquet_files.is_empty()));
+        assert!(!output.join("chr_synonyms.txt").exists());
+        assert_eq!(
+            std::fs::metadata(&shard).unwrap().modified().unwrap(),
+            original_modified
+        );
     }
 }

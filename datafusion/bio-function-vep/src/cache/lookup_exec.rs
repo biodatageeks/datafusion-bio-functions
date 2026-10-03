@@ -1084,9 +1084,9 @@ impl VariationLookupStream {
             }
         }
         if self.parquet_lookup_cell.get().is_none() {
-            let cache = crate::parquet_cache::detect::PartitionedParquetCache::detect(
+            let cache = crate::parquet_cache::detect::PartitionedParquetCache::try_detect(
                 cache_root.to_string_lossy().as_ref(),
-            )
+            )?
             .ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "parquet variation lookup but no variation manifest under {}",

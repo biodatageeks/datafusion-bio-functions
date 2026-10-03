@@ -73,9 +73,20 @@ impl ChromosomeSynonyms {
 pub(crate) fn preserve_chromosome_synonyms(raw: &Path, output: &Path) -> Result<()> {
     use std::io::Write;
     let source = raw.join(CHROM_SYNONYMS_FILE);
+    let destination = output.join(CHROM_SYNONYMS_FILE);
     let bytes = match std::fs::read(&source) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Absence is authoritative too: never reuse an older source's map.
+            return match std::fs::remove_file(&destination) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(DataFusionError::Execution(format!(
+                    "failed to remove obsolete chromosome synonyms {}: {error}",
+                    destination.display()
+                ))),
+            };
+        }
         Err(error) => {
             return Err(DataFusionError::Execution(format!(
                 "failed to read chromosome synonyms {}: {error}",
@@ -83,7 +94,6 @@ pub(crate) fn preserve_chromosome_synonyms(raw: &Path, output: &Path) -> Result<
             )));
         }
     };
-    let destination = output.join(CHROM_SYNONYMS_FILE);
     if std::fs::read(&destination).is_ok_and(|existing| existing == bytes) {
         return Ok(());
     }

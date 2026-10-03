@@ -15906,8 +15906,9 @@ impl TableProvider for AnnotateProvider {
             let identity_validator = Arc::new(
                 crate::cache_identity::LazyCacheIdentityValidator::new(expected_cache_version)?,
             );
-            match crate::parquet_cache::detect::PartitionedParquetCache::detect(&self.cache_source)
-            {
+            match crate::parquet_cache::detect::PartitionedParquetCache::try_detect(
+                &self.cache_source,
+            )? {
                 Some(cache) => Some(PartitionedAnnotationCache::Parquet {
                     cache,
                     identity_validator,
