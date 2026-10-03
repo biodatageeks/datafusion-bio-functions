@@ -88,6 +88,17 @@ pub struct CacheBuildOptions {
     pub chrom_filter: Option<Vec<String>>,
 }
 
+/// Every public build entry point refreshes root metadata, including standalone
+/// chromosome builds and entity resumes that will skip their completed shards.
+fn prepare_build_metadata(options: &CacheBuildOptions, kind: EnsemblEntityKind) -> Result<()> {
+    // Validate the requested source identity before changing shared metadata.
+    provider_output_schema(options, kind)?;
+    crate::cache::synonyms::preserve_chromosome_synonyms(
+        Path::new(&options.cache_root),
+        Path::new(&options.output_dir),
+    )
+}
+
 /// Build one chromosome's
 /// variation shard as a single no-dictionary, page-indexed `.parquet` file under
 /// `variation/<chrom>.parquet`.
@@ -107,6 +118,7 @@ pub async fn build_parquet_variation_chrom(
         VariationParquetShardWriter, encode_variation_batch, variation_output_schema,
     };
 
+    prepare_build_metadata(options, EnsemblEntityKind::Variation)?;
     let entity_dir = PathBuf::from(&options.output_dir).join("variation");
     std::fs::create_dir_all(&entity_dir).map_err(|err| {
         DataFusionError::Execution(format!(
@@ -308,6 +320,7 @@ pub async fn build_parquet_translation_sift_chrom(
     options: &CacheBuildOptions,
     chrom: &str,
 ) -> Result<ChromDatasetEntry> {
+    prepare_build_metadata(options, EnsemblEntityKind::Translation)?;
     let entity_dir = PathBuf::from(&options.output_dir).join("translation_sift");
     std::fs::create_dir_all(&entity_dir).map_err(|err| {
         DataFusionError::Execution(format!(
@@ -482,6 +495,7 @@ pub async fn build_parquet_context_entity_chrom(
     kind: EnsemblEntityKind,
     chrom: &str,
 ) -> Result<ChromDatasetEntry> {
+    prepare_build_metadata(options, kind)?;
     let entity = entity_output_name(kind);
     let entity_dir = PathBuf::from(&options.output_dir).join(entity);
     std::fs::create_dir_all(&entity_dir).map_err(|err| {
@@ -545,6 +559,7 @@ pub async fn build_parquet_translation_core_chrom(
     options: &CacheBuildOptions,
     chrom: &str,
 ) -> Result<ChromDatasetEntry> {
+    prepare_build_metadata(options, EnsemblEntityKind::Translation)?;
     let entity_dir = PathBuf::from(&options.output_dir).join("translation_core");
     std::fs::create_dir_all(&entity_dir).map_err(|err| {
         DataFusionError::Execution(format!(
@@ -612,6 +627,7 @@ pub async fn build_parquet_entity(
     options: &CacheBuildOptions,
     kind: EnsemblEntityKind,
 ) -> Result<Vec<EntityStats>> {
+    prepare_build_metadata(options, kind)?;
     match kind {
         EnsemblEntityKind::Variation => build_parquet_variation(options).await,
         EnsemblEntityKind::Translation => build_parquet_translation(options).await,
@@ -1283,6 +1299,78 @@ fn sql_escape_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn assert_chrom_builder_preserves_synonyms(entity: &str) {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("raw");
+        let output = tmp.path().join("converted");
+        std::fs::create_dir_all(raw.join("21")).unwrap();
+        std::fs::write(
+            raw.join("info.txt"),
+            format!("cache_version\t116\nsource_ClinVar\t202502\nsource_COSMIC\t101\nsource_dbSNP\t156\nvariation_cols\t{}\n", VARIATION_REQUIRED_COLUMNS.iter().copied().filter(|name| !["chrom", "clinvar_ids", "cosmic_ids", "dbsnp_ids"].contains(name)).chain(["strand", "var_synonyms"]).collect::<Vec<_>>().join(",")),
+        )
+        .unwrap();
+        let synonyms = b"21 NC_000021.9\n";
+        std::fs::write(raw.join("chr_synonyms.txt"), synonyms).unwrap();
+        for (file, bytes) in [
+            ("1_var.gz", b"".as_slice()),
+            // Network-order Storable empty hash (nstore({})); no Perl needed.
+            (
+                "1-1000000.gz",
+                b"pst0\x05\x0b\x03\x00\x00\x00\x00".as_slice(),
+            ),
+        ] {
+            let file = std::fs::File::create(raw.join("21").join(file)).unwrap();
+            let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            encoder.write_all(bytes).unwrap();
+            encoder.finish().unwrap();
+        }
+        let options = CacheBuildOptions {
+            cache_root: raw.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            partitions: 1,
+            cache_source_type: BioFormatsCacheSourceType::Ensembl,
+            cache_version: "116".to_owned(),
+            overwrite: false,
+            chrom_filter: None,
+        };
+        let entry = match entity {
+            "variation" => build_parquet_variation_chrom(&options, "21").await,
+            "exon" => {
+                build_parquet_context_entity_chrom(&options, EnsemblEntityKind::Exon, "21").await
+            }
+            "translation_core" => build_parquet_translation_core_chrom(&options, "21").await,
+            "translation_sift" => build_parquet_translation_sift_chrom(&options, "21").await,
+            _ => unreachable!(),
+        }
+        .unwrap();
+        assert_eq!(entry.rows, 0);
+        assert_eq!(
+            std::fs::read(output.join("chr_synonyms.txt")).unwrap(),
+            synonyms
+        );
+    }
+
+    #[tokio::test]
+    async fn variation_chrom_builder_preserves_synonyms() {
+        assert_chrom_builder_preserves_synonyms("variation").await;
+    }
+
+    #[tokio::test]
+    async fn context_chrom_builder_preserves_synonyms() {
+        assert_chrom_builder_preserves_synonyms("exon").await;
+    }
+
+    #[tokio::test]
+    async fn translation_core_chrom_builder_preserves_synonyms() {
+        assert_chrom_builder_preserves_synonyms("translation_core").await;
+    }
+
+    #[tokio::test]
+    async fn translation_sift_chrom_builder_preserves_synonyms() {
+        assert_chrom_builder_preserves_synonyms("translation_sift").await;
+    }
 
     /// Transcripts synthesised for the dedup determinism tests.
     const DEDUP_TEST_TRANSCRIPTS: usize = 400;

@@ -158,10 +158,6 @@ impl CacheBuilder {
         #[cfg(feature = "parquet-cache")]
         {
             let cache_version = self.validate_raw_cache_identity(kind)?;
-            crate::cache::synonyms::preserve_chromosome_synonyms(
-                std::path::Path::new(&self.cache_root),
-                std::path::Path::new(&self.output_dir),
-            )?;
             let options = crate::cache::build::CacheBuildOptions {
                 cache_root: self.cache_root.clone(),
                 output_dir: self.output_dir.clone(),
