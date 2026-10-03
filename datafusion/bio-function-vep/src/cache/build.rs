@@ -92,7 +92,12 @@ pub struct CacheBuildOptions {
 /// chromosome builds and entity resumes that will skip their completed shards.
 fn prepare_build_metadata(options: &CacheBuildOptions, kind: EnsemblEntityKind) -> Result<()> {
     // Validate the requested source identity before changing shared metadata.
-    provider_output_schema(options, kind)?;
+    let schema = provider_output_schema(options, kind)?;
+    crate::cache::reference_policy::CacheReferencePolicy::preserve(
+        schema.as_ref(),
+        Path::new(&options.cache_root),
+        Path::new(&options.output_dir),
+    )?;
     crate::cache::synonyms::preserve_chromosome_synonyms(
         Path::new(&options.cache_root),
         Path::new(&options.output_dir),
@@ -1078,9 +1083,12 @@ fn transform_translation_sift_position_batch(
         )?;
     }
 
-    let target_schema = Arc::new(compact_translation_sift_position_schema(
-        source_type,
-        cache_version,
+    let target_schema = compact_translation_sift_position_schema(source_type, cache_version);
+    let mut metadata = batch.schema().metadata().clone();
+    metadata.extend(target_schema.metadata().clone());
+    let target_schema = Arc::new(Schema::new_with_metadata(
+        target_schema.fields().clone(),
+        metadata,
     ));
     RecordBatch::try_new(
         target_schema,
@@ -1159,13 +1167,23 @@ fn drop_row_number_batch(batch: RecordBatch) -> Result<RecordBatch> {
         .filter(|(_, field)| field.name() != "_rn")
         .map(|(index, _)| batch.column(index).clone())
         .collect::<Vec<_>>();
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|err| {
+    RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+    )
+    .map_err(|err| {
         DataFusionError::Execution(format!("failed to drop translation row number: {err}"))
     })
 }
 
 fn project_batch_to_schema(batch: RecordBatch, target_schema: SchemaRef) -> Result<RecordBatch> {
     let source_schema = batch.schema();
+    let mut metadata = source_schema.metadata().clone();
+    metadata.extend(target_schema.metadata().clone());
+    let target_schema = Arc::new(Schema::new_with_metadata(
+        target_schema.fields().clone(),
+        metadata,
+    ));
     let mut columns = Vec::<ArrayRef>::with_capacity(target_schema.fields().len());
     for field in target_schema.fields() {
         let (index, _) = source_schema
@@ -1300,7 +1318,7 @@ fn sql_escape_literal(value: &str) -> String {
 mod tests {
     use super::*;
 
-    async fn assert_chrom_builder_preserves_synonyms(entity: &str) {
+    async fn assert_chrom_builder_preserves_synonyms(entity: &str, bam_edited: bool) {
         use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
         let raw = tmp.path().join("raw");
@@ -1311,6 +1329,13 @@ mod tests {
             format!("cache_version\t116\nsource_ClinVar\t202502\nsource_COSMIC\t101\nsource_dbSNP\t156\nvariation_cols\t{}\n", VARIATION_REQUIRED_COLUMNS.iter().copied().filter(|name| !["chrom", "clinvar_ids", "cosmic_ids", "dbsnp_ids"].contains(name)).chain(["strand", "var_synonyms"]).collect::<Vec<_>>().join(",")),
         )
         .unwrap();
+        if bam_edited {
+            let mut info = std::fs::OpenOptions::new()
+                .append(true)
+                .open(raw.join("info.txt"))
+                .unwrap();
+            info.write_all(b"bam\t/path.bam\n").unwrap();
+        }
         let synonyms = b"21 NC_000021.9\n";
         std::fs::write(raw.join("chr_synonyms.txt"), synonyms).unwrap();
         for (file, bytes) in [
@@ -1350,26 +1375,101 @@ mod tests {
             std::fs::read(output.join("chr_synonyms.txt")).unwrap(),
             synonyms
         );
+        let policy = crate::cache::reference_policy::CacheReferencePolicy::read(&output)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            policy
+                .reconcile(
+                    provider_output_schema(&options, EnsemblEntityKind::Variation)
+                        .unwrap()
+                        .as_ref()
+                )
+                .unwrap(),
+            bam_edited
+        );
     }
 
     #[tokio::test]
     async fn variation_chrom_builder_preserves_synonyms() {
-        assert_chrom_builder_preserves_synonyms("variation").await;
+        for bam in [false, true] {
+            assert_chrom_builder_preserves_synonyms("variation", bam).await;
+        }
     }
 
     #[tokio::test]
     async fn context_chrom_builder_preserves_synonyms() {
-        assert_chrom_builder_preserves_synonyms("exon").await;
+        for bam in [false, true] {
+            assert_chrom_builder_preserves_synonyms("exon", bam).await;
+        }
     }
 
     #[tokio::test]
     async fn translation_core_chrom_builder_preserves_synonyms() {
-        assert_chrom_builder_preserves_synonyms("translation_core").await;
+        for bam in [false, true] {
+            assert_chrom_builder_preserves_synonyms("translation_core", bam).await;
+        }
     }
 
     #[tokio::test]
     async fn translation_sift_chrom_builder_preserves_synonyms() {
-        assert_chrom_builder_preserves_synonyms("translation_sift").await;
+        for bam in [false, true] {
+            assert_chrom_builder_preserves_synonyms("translation_sift", bam).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_entity_resume_refreshes_reference_policy_without_rewriting_shards() {
+        use crate::cache::reference_policy::{CacheReferencePolicy, REFERENCE_POLICY_FILE};
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("raw");
+        let output = tmp.path().join("converted");
+        std::fs::create_dir_all(raw.join("21")).unwrap();
+        std::fs::write(raw.join("info.txt"), "cache_version\t116\nbam\t/path.bam\nvariation_cols\tchr,start,end,variation_name,allele_string\n").unwrap();
+        // Source discovery succeeds, but decoding this sentinel would fail:
+        // a completed-entity resume must not reach the biological conversion.
+        std::fs::write(raw.join("21/1_var.gz"), b"must not decode during resume").unwrap();
+        let options = CacheBuildOptions {
+            cache_root: raw.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            partitions: 1,
+            cache_source_type: BioFormatsCacheSourceType::Merged,
+            cache_version: "116".into(),
+            overwrite: false,
+            chrom_filter: None,
+        };
+        let schema = provider_output_schema(&options, EnsemblEntityKind::Variation).unwrap();
+        let mut metadata = schema.metadata().clone();
+        metadata.remove(crate::cache::reference_policy::BAM_EDITED_METADATA_KEY);
+        let schema = Arc::new(Schema::new_with_metadata(schema.fields().clone(), metadata));
+        let dir = output.join("variation");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shard = dir.join("chr21.parquet");
+        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&shard).unwrap(), schema, None)
+            .unwrap()
+            .close()
+            .unwrap();
+        ChromManifest::new(vec![ChromDatasetEntry::new("chr21", "chr21.parquet", 0)])
+            .write_to_entity_dir(&dir)
+            .unwrap();
+        let before = std::fs::read(&shard).unwrap();
+        assert!(!output.join(REFERENCE_POLICY_FILE).exists());
+        let stats = build_parquet_entity(&options, EnsemblEntityKind::Variation)
+            .await
+            .unwrap();
+        assert!(stats.iter().all(|entity| entity.parquet_files.is_empty()));
+        assert_eq!(std::fs::read(&shard).unwrap(), before);
+        assert!(
+            CacheReferencePolicy::read(&output)
+                .unwrap()
+                .unwrap()
+                .reconcile(
+                    provider_output_schema(&options, EnsemblEntityKind::Variation)
+                        .unwrap()
+                        .as_ref()
+                )
+                .unwrap()
+        );
     }
 
     /// Transcripts synthesised for the dedup determinism tests.

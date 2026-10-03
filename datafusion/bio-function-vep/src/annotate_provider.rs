@@ -196,7 +196,7 @@ use crate::allele::{
 use crate::annotation_store::AnnotationBackend;
 #[cfg(feature = "parquet-cache")]
 use crate::cache::lookup_exec::ParquetVariationLookupCell;
-use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
+use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheMetadata, CacheSourceType};
 use crate::colocated::{
     AfColumns, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
 };
@@ -988,11 +988,29 @@ fn annotation_column_defs_for_selection(
     transcript_selection: TranscriptSelectionFlags,
     include_pick_output: bool,
 ) -> Vec<AnnotationColumnDef> {
-    if transcript_selection.refseq_fields() {
+    let mut defs = if transcript_selection.refseq_fields() {
         refseq_annotation_column_defs(transcript_selection.source_field(), include_pick_output)
     } else {
         annotation_column_defs(include_pick_output)
+    };
+    if !transcript_selection.reference_fields() {
+        defs.retain(|def| !matches!(def.name, "GIVEN_REF" | "USED_REF"));
+    } else if !transcript_selection.refseq_fields() {
+        let position = defs
+            .iter()
+            .position(|def| def.name == "GENE_PHENO")
+            .unwrap_or(defs.len());
+        defs.splice(
+            position..position,
+            ["GIVEN_REF", "USED_REF"].map(|name| AnnotationColumnDef {
+                name,
+                data_type: list_utf8_data_type(),
+                category: AnnotationCategory::Transcript,
+                cache_col: None,
+            }),
+        );
     }
+    defs
 }
 
 /// Returns the list of cache column names needed for the variation lookup query.
@@ -1649,6 +1667,7 @@ impl HgvsFlags {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct TranscriptSelectionFlags {
     cache_source_type: CacheSourceType,
+    bam_edited: Option<bool>,
     gencode_basic: bool,
     gencode_primary: bool,
     all_refseq: bool,
@@ -1691,6 +1710,7 @@ impl TranscriptSelectionFlags {
 
         Ok(Self {
             cache_source_type,
+            bam_edited: None,
             gencode_basic,
             gencode_primary,
             all_refseq,
@@ -1707,6 +1727,10 @@ impl TranscriptSelectionFlags {
             self.cache_source_type,
             CacheSourceType::RefSeq | CacheSourceType::Merged
         )
+    }
+
+    fn reference_fields(self) -> bool {
+        self.bam_edited.unwrap_or(self.refseq_fields())
     }
 
     fn source_field(self) -> bool {
@@ -1806,11 +1830,12 @@ impl CsqPlaceholderLayout {
         transcript_selection: TranscriptSelectionFlags,
         include_pick: bool,
     ) -> Self {
-        let fields = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
+        let fields = crate::golden_benchmark::csq_field_names_with_reference_policy(
             everything,
             transcript_selection.cache_source_type == CacheSourceType::RefSeq,
             transcript_selection.cache_source_type == CacheSourceType::Merged,
             include_pick,
+            transcript_selection.bam_edited,
         )
         .into_iter()
         .map(CsqPlaceholderField::from_name)
@@ -1895,18 +1920,21 @@ impl CsqFieldProjection {
         include_pick: bool,
         requested: &[String],
     ) -> Result<Self> {
-        let (selected_names, indices) = crate::golden_benchmark::resolve_csq_field_selection(
+        let (selected_names, indices) =
+            crate::golden_benchmark::resolve_csq_field_selection_with_reference_policy(
+                everything,
+                transcript_selection.cache_source_type == CacheSourceType::RefSeq,
+                transcript_selection.cache_source_type == CacheSourceType::Merged,
+                include_pick,
+                transcript_selection.bam_edited,
+                requested,
+            )?;
+        let full_base_field_count = crate::golden_benchmark::csq_field_names_with_reference_policy(
             everything,
             transcript_selection.cache_source_type == CacheSourceType::RefSeq,
             transcript_selection.cache_source_type == CacheSourceType::Merged,
             include_pick,
-            requested,
-        )?;
-        let full_base_field_count = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
-            everything,
-            transcript_selection.cache_source_type == CacheSourceType::RefSeq,
-            transcript_selection.cache_source_type == CacheSourceType::Merged,
-            include_pick,
+            transcript_selection.bam_edited,
         )
         .len();
         let mut output_position_by_input = vec![None; full_base_field_count];
@@ -3878,14 +3906,17 @@ impl AnnotateProvider {
         vcf_table: String,
         cache_source: String,
         backend: AnnotationBackend,
-        cache_source_type: CacheSourceType,
+        cache_metadata: impl Into<CacheMetadata>,
         options_json: Option<String>,
         vcf_schema: Schema,
     ) -> Result<Self> {
-        let transcript_selection = TranscriptSelectionFlags::from_options_json(
+        let cache_metadata = cache_metadata.into();
+        let cache_source_type = cache_metadata.source_type;
+        let mut transcript_selection = TranscriptSelectionFlags::from_options_json(
             cache_source_type,
             options_json.as_deref(),
         )?;
+        transcript_selection.bam_edited = cache_metadata.bam_edited;
         let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
         let include_pick_output = pick_flags.include_pick_output();
         let regions = crate::regions::parse_regions_option(options_json.as_deref())?;
@@ -3915,7 +3946,16 @@ impl AnnotateProvider {
             .collect();
         let mut fields = input_fields_for_output(&vcf_schema, &reserved);
 
-        fields.push(Arc::new(Field::new("CSQ", DataType::Utf8, true)));
+        fields.push(Arc::new(
+            Field::new("CSQ", DataType::Utf8, true).with_metadata(
+                [(
+                    crate::cache_source::ANNOTATION_CACHE_LAYOUT_KEY.to_string(),
+                    cache_metadata.layout_identity(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        ));
         fields.push(Arc::new(Field::new(
             "most_severe_consequence",
             DataType::Utf8,
@@ -6182,6 +6222,7 @@ impl AnnotateProvider {
         let mut b_cosmic_ids = ListBuilder::new(StringBuilder::new());
         let mut b_dbsnp_ids = ListBuilder::new(StringBuilder::new());
         let include_refseq_fields = transcript_selection.refseq_fields();
+        let include_reference_fields = transcript_selection.reference_fields();
         let include_source_field = transcript_selection.source_field();
         let needs_sift_polyphen = output_needs_sift_polyphen(
             skip_csq,
@@ -6246,8 +6287,12 @@ impl AnnotateProvider {
                             b_source.append(false);
                         }
                         b_refseq_offset.append(false);
+                    }
+                    if include_reference_fields {
                         b_given_ref.append(false);
                         b_used_ref.append(false);
+                    }
+                    if include_refseq_fields {
                         b_bam_edit.append(false);
                     }
                     b_gene_pheno.append(false);
@@ -6588,9 +6633,34 @@ impl AnnotateProvider {
                 if let Some(started) = variant_construct_started {
                     engine_profile.variant_construct += started.elapsed();
                 }
+                let hgvs_shift_started = engine_profile_enabled.then(Instant::now);
+                // Genomic HGVSc REF and transcript USED_REF have independent
+                // rules. Read the normalized reference interval once per row,
+                // only when an overlapping transcript can consume it.
+                let genomic_reference = if variant.ref_allele != "-"
+                    && (hgvs_flags.hgvsc || transcript_selection.bam_edited == Some(true))
+                    && variant
+                        .end
+                        .checked_sub(variant.start)
+                        .and_then(|span| span.checked_add(1))
+                        == i64::try_from(variant.ref_allele.len()).ok()
+                    && ctx.overlaps_transcript(annotation_chrom, variant.start, variant.end)
+                {
+                    hgvs_reference_reader.as_mut().map(|reader| {
+                        let sequence = read_reference_sequence(reader, annotation_chrom.strip_prefix("chr").unwrap_or(annotation_chrom), variant.start, variant.end)?;
+                        if sequence.len() != variant.ref_allele.len() {
+                            return Err(DataFusionError::Execution(format!(
+                                "annotate_vep(): incomplete genomic reference for {}:{}-{}: expected {} bases, got {}",
+                                annotation_chrom, variant.start, variant.end, variant.ref_allele.len(), sequence.len()
+                            )));
+                        }
+                        Ok(sequence.to_ascii_uppercase())
+                    }).transpose()?
+                } else {
+                    None
+                };
                 // Only compute genomic shift for indels (ref != alt length).
                 // SNVs/MNVs don't shift and skipping avoids allele normalization overhead.
-                let hgvs_shift_started = engine_profile_enabled.then(Instant::now);
                 if let Some(reader) = hgvs_reference_reader.as_mut() {
                     if ref_al.len() != alt_allele.len() {
                         let chrom_norm = annotation_chrom
@@ -6643,11 +6713,12 @@ impl AnnotateProvider {
                     engine_profile,
                     evaluate_prepared,
                     {
-                        if let Some(profile) = tx_engine_profile.as_mut() {
-                            engine.evaluate_variant_prepared_profiled(&variant, ctx, profile)
-                        } else {
-                            engine.evaluate_variant_prepared(&variant, ctx)
-                        }
+                        engine.evaluate_variant_prepared_with_reference(
+                            &variant,
+                            ctx,
+                            genomic_reference.as_deref(),
+                            tx_engine_profile.as_mut(),
+                        )
                     }
                 );
                 if engine_profile_enabled {
@@ -7060,15 +7131,16 @@ impl AnnotateProvider {
                              {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}"
                             );
                             if include_source_field {
-                                let _ = write!(
-                                    csq_buf,
-                                    "|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                );
+                                let _ =
+                                    write!(csq_buf, "|{refseq_match}|{source_val}|{refseq_offset}");
                             } else if include_refseq_fields {
-                                let _ = write!(
-                                    csq_buf,
-                                    "|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                );
+                                let _ = write!(csq_buf, "|{refseq_match}|{refseq_offset}");
+                            }
+                            if include_reference_fields {
+                                let _ = write!(csq_buf, "|{given_ref}|{used_ref}");
+                            }
+                            if include_refseq_fields {
+                                let _ = write!(csq_buf, "|{bam_edit}");
                             }
                             let _ = write!(
                                 csq_buf,
@@ -7090,18 +7162,20 @@ impl AnnotateProvider {
                                 let _ = write!(csq_buf, "|{pick_str}");
                             }
                             let _ = write!(csq_buf, "|{symbol_source}|{hgnc_id}|");
+                            csq_buf.push_str("||||");
                             if include_source_field {
-                                let _ = write!(
-                                    csq_buf,
-                                    "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                );
+                                let _ =
+                                    write!(csq_buf, "|{refseq_match}|{source_val}|{refseq_offset}");
                             } else if include_refseq_fields {
-                                let _ = write!(
-                                    csq_buf,
-                                    "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                );
+                                let _ = write!(csq_buf, "|{refseq_match}|{refseq_offset}");
+                            }
+                            if include_reference_fields {
+                                let _ = write!(csq_buf, "|{given_ref}|{used_ref}");
+                            }
+                            if include_refseq_fields {
+                                let _ = write!(csq_buf, "|{bam_edit}");
                             } else {
-                                let _ = write!(csq_buf, "|||||{source_val}");
+                                let _ = write!(csq_buf, "|{source_val}");
                             }
                             let _ = write!(
                                 csq_buf,
@@ -7569,8 +7643,12 @@ impl AnnotateProvider {
                                 Some(offset) => b_refseq_offset.values().append_value(offset),
                                 None => b_refseq_offset.values().append_null(),
                             }
+                        }
+                        if include_reference_fields {
                             append_opt_str(b_given_ref.values(), Some(given_ref));
                             append_opt_str(b_used_ref.values(), Some(used_ref));
+                        }
+                        if include_refseq_fields {
                             append_opt_str(b_bam_edit.values(), Some(bam_edit.as_str()));
                         }
 
@@ -7736,8 +7814,12 @@ impl AnnotateProvider {
                             b_source.append(true);
                         }
                         b_refseq_offset.append(true);
+                    }
+                    if include_reference_fields {
                         b_given_ref.append(true);
                         b_used_ref.append(true);
+                    }
+                    if include_refseq_fields {
                         b_bam_edit.append(true);
                     }
                     b_gene_pheno.append(true);
@@ -7793,8 +7875,12 @@ impl AnnotateProvider {
                             b_source.append(false);
                         }
                         b_refseq_offset.append(false);
+                    }
+                    if include_reference_fields {
                         b_given_ref.append(false);
                         b_used_ref.append(false);
+                    }
+                    if include_refseq_fields {
                         b_bam_edit.append(false);
                     }
                     b_gene_pheno.append(false);
@@ -8048,8 +8134,12 @@ impl AnnotateProvider {
                     out_cols.push(Arc::new(b_source.finish()));
                 }
                 out_cols.push(Arc::new(b_refseq_offset.finish()));
+            }
+            if include_reference_fields {
                 out_cols.push(Arc::new(b_given_ref.finish()));
                 out_cols.push(Arc::new(b_used_ref.finish()));
+            }
+            if include_refseq_fields {
                 out_cols.push(Arc::new(b_bam_edit.finish()));
             }
             out_cols.push(Arc::new(b_gene_pheno.finish()));
@@ -12352,11 +12442,14 @@ impl AnnotationWorkerState {
             .config
             .reference_fasta_path
             .as_deref()
-            .and_then(|path| {
+            .map(|path| {
                 fasta::io::indexed_reader::Builder::default()
                     .build_from_path(path)
-                    .ok()
-            });
+                    .map_err(|error| DataFusionError::Execution(format!(
+                        "annotate_vep(): failed to open indexed reference FASTA '{path}': {error}"
+                    )))
+            })
+            .transpose()?;
 
         let state = Self {
             shared,
@@ -15036,6 +15129,12 @@ async fn prepare_contig_data(
                 identity.source_type.as_str()
             )));
         }
+        if identity.bam_edited != config.transcript_selection.bam_edited {
+            return Err(DataFusionError::Execution(format!(
+                "annotate_vep(): cache BAM reference policy changed after planning at contig '{chrom}': planned {:?}, contig {:?}",
+                config.transcript_selection.bam_edited, identity.bam_edited
+            )));
+        }
         config.vep_semantics = identity.target.semantics;
     }
 
@@ -15199,7 +15298,10 @@ async fn prepare_contig_data(
         config.vcf_table.clone(),
         String::new(),
         AnnotationBackend::Parquet,
-        config.cache_source_type,
+        CacheMetadata {
+            source_type: config.cache_source_type,
+            bam_edited: config.transcript_selection.bam_edited,
+        },
         config.options_json.clone(),
         vcf_only_schema,
     )?;
@@ -15208,7 +15310,8 @@ async fn prepare_contig_data(
         config.downstream_distance,
         config.hgvs_flags.shift_hgvs,
         config.vep_semantics,
-    );
+    )
+    .with_reference_policy(config.transcript_selection.bam_edited);
 
     // SIFT source: a shared per-contig prediction store loaded from the Parquet
     // translation_sift shard.
@@ -16447,6 +16550,172 @@ mod tests {
             Schema::new(fields),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reference_policy_keeps_typed_columns_csq_and_null_rows_aligned() {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        let input_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, true),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let input = RecordBatch::try_new(
+            Arc::new(input_schema.clone()),
+            vec![
+                Arc::new(StringArray::from(vec![Some("2"), Some("2"), None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 10000, 20])),
+                Arc::new(Int64Array::from(vec![10, 10000, 20])),
+                Arc::new(StringArray::from(vec!["A"; 3])),
+                Arc::new(StringArray::from(vec!["G"; 3])),
+            ],
+        )
+        .unwrap();
+        let mut tx = make_tx("ENST_POLICY", None, None, None, None);
+        tx.spliced_seq = Some("A".repeat(100));
+        let transcripts = [tx];
+        let exons = [ExonFeature {
+            transcript_id: "ENST_POLICY".into(),
+            exon_number: 1,
+            start: 1,
+            end: 100,
+        }];
+        let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+        for source in [
+            CacheSourceType::Ensembl,
+            CacheSourceType::RefSeq,
+            CacheSourceType::Merged,
+        ] {
+            for bam_edited in [None, Some(false), Some(true)] {
+                for everything in [false, true] {
+                    let metadata = CacheMetadata {
+                        source_type: source,
+                        bam_edited,
+                    };
+                    let options = serde_json::json!({"everything": everything}).to_string();
+                    let provider = AnnotateProvider::new(
+                        Arc::new(SessionContext::new()),
+                        "vcf".into(),
+                        String::new(),
+                        AnnotationBackend::Parquet,
+                        metadata,
+                        Some(options.clone()),
+                        input_schema.clone(),
+                    )
+                    .unwrap();
+                    let expected_refs = bam_edited.unwrap_or(source != CacheSourceType::Ensembl);
+                    assert_eq!(
+                        provider.schema().field_with_name("USED_REF").is_ok(),
+                        expected_refs
+                    );
+                    assert_eq!(
+                        provider.schema().field_with_name("GIVEN_REF").is_ok(),
+                        expected_refs
+                    );
+                    assert_eq!(
+                        provider.schema().field_with_name("BAM_EDIT").is_ok(),
+                        source != CacheSourceType::Ensembl
+                    );
+                    let output = provider
+                        .annotate_batch_with_transcript_engine(
+                            &input,
+                            &TranscriptConsequenceEngine::default()
+                                .with_reference_policy(bam_edited),
+                            &context,
+                            &HashMap::new(),
+                            &mut SiftPolyphenCache::new(),
+                            &None,
+                            false,
+                            false,
+                            &VepFlags::from_options_json(Some(&options)),
+                            &HgvsFlags::default(),
+                            provider.transcript_selection,
+                            &PickFlags::default(),
+                            &mut None,
+                            #[cfg(feature = "parquet-cache")]
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(output.num_rows(), 3);
+                    let csq = output
+                        .column_by_name("CSQ")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    assert!(csq.is_null(2));
+                    let fields = crate::golden_benchmark::csq_field_names_with_reference_policy(
+                        everything,
+                        source == CacheSourceType::RefSeq,
+                        source == CacheSourceType::Merged,
+                        false,
+                        bam_edited,
+                    );
+                    for row in 0..2 {
+                        assert_eq!(
+                            csq.value(row).split('|').count(),
+                            fields.len(),
+                            "{metadata:?} everything={everything} row={row}"
+                        );
+                    }
+                    if expected_refs {
+                        let index = fields
+                            .iter()
+                            .position(|field| *field == "USED_REF")
+                            .unwrap();
+                        assert_eq!(csq.value(0).split('|').nth(index), Some("A"));
+                        assert_eq!(csq.value(1).split('|').nth(index), Some(""));
+                        let used = output
+                            .column_by_name("USED_REF")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .unwrap();
+                        assert!(used.is_null(2));
+                        let value = used.value(0);
+                        assert_eq!(
+                            value
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap()
+                                .value(0),
+                            "A"
+                        );
+                        let requested = vec!["USED_REF".into(), "Feature".into()];
+                        let projection = CsqFieldProjection::for_mode(
+                            everything,
+                            provider.transcript_selection,
+                            false,
+                            &requested,
+                        )
+                        .unwrap();
+                        let mut projected = String::new();
+                        projection
+                            .project_entries(
+                                &format!("{}|plugin-sentinel", csq.value(0)),
+                                1,
+                                &mut projected,
+                            )
+                            .unwrap();
+                        assert_eq!(projected, "A|ENST_POLICY|plugin-sentinel");
+                    } else {
+                        assert!(
+                            CsqFieldProjection::for_mode(
+                                everything,
+                                provider.transcript_selection,
+                                false,
+                                &["USED_REF".into()]
+                            )
+                            .unwrap_err()
+                            .to_string()
+                            .contains("unknown CSQ field 'USED_REF'")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn core_input_fields() -> Vec<Field> {

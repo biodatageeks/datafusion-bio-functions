@@ -3,6 +3,8 @@ pub mod af_bundle;
 pub mod build;
 pub mod lookup_exec;
 pub mod manifest;
+#[cfg(feature = "parquet-cache")]
+pub(crate) mod reference_policy;
 pub mod schema;
 #[cfg(feature = "parquet-cache")]
 pub(crate) mod synonyms;

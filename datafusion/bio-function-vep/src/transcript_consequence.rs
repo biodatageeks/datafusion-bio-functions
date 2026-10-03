@@ -980,6 +980,15 @@ impl<'a, T> PreparedFeatureIndex<'a, T> {
 }
 
 impl<'a> PreparedContext<'a> {
+    pub(crate) fn overlaps_transcript(&self, chrom: &str, start: i64, end: i64) -> bool {
+        let Some(tree) = self.tx_trees.get(normalize_chrom(chrom)) else {
+            return false;
+        };
+        let mut found = false;
+        tree.query(start as i32, end as i32, |_| found = true);
+        found
+    }
+
     pub fn new(
         transcripts: &'a [TranscriptFeature],
         exons: &'a [ExonFeature],
@@ -1099,6 +1108,7 @@ pub struct TranscriptConsequenceEngine {
     downstream_distance: i64,
     shift_hgvs: bool,
     semantics: crate::vep_semantics::VepSemantics,
+    bam_edited: Option<bool>,
 }
 
 impl Default for TranscriptConsequenceEngine {
@@ -1114,6 +1124,7 @@ impl TranscriptConsequenceEngine {
             downstream_distance,
             shift_hgvs: false,
             semantics: crate::vep_semantics::VepSemantics::V115,
+            bam_edited: None,
         }
     }
 
@@ -1132,6 +1143,7 @@ impl TranscriptConsequenceEngine {
             downstream_distance,
             shift_hgvs,
             semantics: crate::vep_semantics::VepSemantics::V115,
+            bam_edited: None,
         }
     }
 
@@ -1146,7 +1158,13 @@ impl TranscriptConsequenceEngine {
             downstream_distance,
             shift_hgvs,
             semantics,
+            bam_edited: None,
         }
+    }
+
+    pub(crate) fn with_reference_policy(mut self, bam_edited: Option<bool>) -> Self {
+        self.bam_edited = bam_edited;
+        self
     }
 
     pub fn semantics(&self) -> crate::vep_semantics::VepSemantics {
@@ -1193,7 +1211,7 @@ impl TranscriptConsequenceEngine {
         variant: &VariantInput,
         ctx: &PreparedContext<'_>,
     ) -> Vec<TranscriptConsequence> {
-        self.evaluate_variant_prepared_inner(variant, ctx, None)
+        self.evaluate_variant_prepared_inner(variant, ctx, None, None)
     }
 
     pub fn evaluate_variant_prepared_profiled(
@@ -1202,13 +1220,24 @@ impl TranscriptConsequenceEngine {
         ctx: &PreparedContext<'_>,
         profile: &mut TranscriptEngineProfile,
     ) -> Vec<TranscriptConsequence> {
-        self.evaluate_variant_prepared_inner(variant, ctx, Some(profile))
+        self.evaluate_variant_prepared_inner(variant, ctx, None, Some(profile))
+    }
+
+    pub(crate) fn evaluate_variant_prepared_with_reference(
+        &self,
+        variant: &VariantInput,
+        ctx: &PreparedContext<'_>,
+        genomic_reference: Option<&str>,
+        profile: Option<&mut TranscriptEngineProfile>,
+    ) -> Vec<TranscriptConsequence> {
+        self.evaluate_variant_prepared_inner(variant, ctx, genomic_reference, profile)
     }
 
     fn evaluate_variant_prepared_inner(
         &self,
         variant: &VariantInput,
         ctx: &PreparedContext<'_>,
+        genomic_reference: Option<&str>,
         mut profile: Option<&mut TranscriptEngineProfile>,
     ) -> Vec<TranscriptConsequence> {
         let profiling = profile.is_some();
@@ -1355,12 +1384,14 @@ impl TranscriptConsequenceEngine {
                                 original_allows_protein_hgvs,
                                 self.shift_hgvs,
                             );
-                        let used_ref = used_ref_for_transcript_variant(
+                        let used_ref = used_ref_with_cache_policy(
                             variant,
                             tx,
                             tx_exons,
                             hgvs_shift,
                             shifted_deletion_uses_protein_hgvs_reference,
+                            self.bam_edited,
+                            genomic_reference,
                         );
                         if let (Some(started), Some(profile)) =
                             (reference_started, profile.as_deref_mut())
@@ -1450,8 +1481,15 @@ impl TranscriptConsequenceEngine {
                         {
                             profile.transcript_flags += started.elapsed();
                         }
-                        let hgvsc_ref_allele =
-                            used_ref.as_deref().unwrap_or(variant.ref_allele.as_str());
+                        // VEP builds ordinary HGVSc from the genomic feature
+                        // slice, independently of USED_REF's transcript mapping.
+                        // Actual native RNA edits restore the feature reference.
+                        let feature_reference = used_ref.as_deref().unwrap_or(&variant.ref_allele);
+                        let hgvsc_ref_allele = if tx.has_rna_edit {
+                            feature_reference
+                        } else {
+                            genomic_reference.unwrap_or(feature_reference)
+                        };
                         // Compute HGVSc notation.
                         let hgvsc_started = profiling.then(Instant::now);
                         if let Some(profile) = profile.as_deref_mut() {
@@ -1694,7 +1732,7 @@ impl TranscriptConsequenceEngine {
                         }
                         let materialize_started = profiling.then(Instant::now);
                         let given_ref = given_ref_for_output(variant);
-                        let used_ref = used_ref_for_transcript_variant(
+                        let used_ref = used_ref_with_cache_policy(
                             variant,
                             tx,
                             tx_exons,
@@ -1704,6 +1742,8 @@ impl TranscriptConsequenceEngine {
                                 None
                             },
                             false,
+                            self.bam_edited,
+                            genomic_reference,
                         );
                         out.push(TranscriptConsequence {
                             transcript_id: Some(tx.transcript_id.clone()),
@@ -9177,6 +9217,151 @@ fn given_ref_for_output(variant: &VariantInput) -> Option<String> {
     (!allele.is_empty()).then_some(allele)
 }
 
+fn used_ref_with_cache_policy(
+    variant: &VariantInput,
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    genomic_shift: Option<&HgvsGenomicShift>,
+    use_shifted_deleted_ref: bool,
+    bam_edited: Option<bool>,
+    genomic_reference: Option<&str>,
+) -> Option<String> {
+    // Missing metadata is an explicit legacy compatibility path. Native false
+    // disables global use_feature_ref; neither case is inferred from source.
+    if bam_edited != Some(true) {
+        return if bam_edited == Some(false) {
+            given_ref_for_output(variant)
+        } else {
+            used_ref_for_transcript_variant(
+                variant,
+                tx,
+                tx_exons,
+                genomic_shift,
+                use_shifted_deleted_ref,
+            )
+        };
+    }
+    let given = given_ref_for_output(variant)?;
+    if use_shifted_deleted_ref
+        && variant.alt_allele == "-"
+        && let Some(shifted) = genomic_shift.and_then(shifted_deleted_ref_for_used_ref)
+        && shifted.len() == given.len()
+    {
+        return Some(shifted);
+    }
+    // Keep the established edit-aware sequence path; genomic exon sequence is
+    // not equivalent to a BAM/RNA-edited transcript sequence.
+    if tx.has_rna_edit
+        || tx.has_non_polya_rna_edit
+        || !tx.refseq_edits.is_empty()
+        || tx.bam_edit_status.is_some()
+    {
+        let Some(reference) = mapped_transcript_reference_allele(variant, tx, tx_exons, true)
+            .filter(|reference| reference.len() == given.len())
+        else {
+            return Some(given);
+        };
+        return if tx.strand >= 0 {
+            Some(reference)
+        } else {
+            reverse_complement(&reference).map(|seq| seq.to_ascii_uppercase())
+        };
+    }
+    let Some(indices) = complete_unedited_reference_mapping(variant, tx, tx_exons) else {
+        return Some(given);
+    };
+    // Loader synthesis may contain only CDS. Its length must cover the entire
+    // unedited transcript before cDNA indices establish the sequence origin.
+    let full_len: Option<usize> = tx_exons.iter().try_fold(0usize, |length, exon| {
+        let exon_len = usize::try_from(exon.end.checked_sub(exon.start)?.checked_add(1)?).ok()?;
+        length.checked_add(exon_len)
+    });
+    let sequence = tx
+        .spliced_seq
+        .as_deref()
+        .or(tx.cdna_seq.as_deref())
+        .filter(|seq| Some(seq.len()) == full_len);
+    if let Some(sequence) = sequence {
+        let (first, last) = if tx.strand >= 0 {
+            (*indices.first()?, *indices.last()?)
+        } else {
+            (*indices.last()?, *indices.first()?)
+        };
+        if let Some(reference) = sequence.get(first.checked_sub(1)?..last) {
+            return if tx.strand >= 0 {
+                Some(reference.to_ascii_uppercase())
+            } else {
+                reverse_complement(reference).map(|seq| seq.to_ascii_uppercase())
+            };
+        }
+    }
+    // core116 Transcript::spliced_seq concatenates Exon::seq before RNA edits.
+    // With every base mapped consecutively and no edited sequence state, this
+    // forward genomic substring equals the transcript substring reversed back
+    // to variant orientation (variation116 TranscriptVariation.pm:448–467).
+    Some(
+        genomic_reference
+            .filter(|seq| seq.len() == given.len())
+            .unwrap_or(&given)
+            .to_ascii_uppercase(),
+    )
+}
+
+fn complete_unedited_reference_mapping(
+    variant: &VariantInput,
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+) -> Option<Vec<usize>> {
+    let length = variant.end.checked_sub(variant.start)?.checked_add(1)?;
+    if usize::try_from(length).ok()? != normalize_allele_seq(&variant.ref_allele).len() {
+        return None;
+    }
+    let mut indices: Vec<usize> = Vec::with_capacity(length as usize);
+    for position in variant.start..=variant.end {
+        // Require actual exon coverage, even if a malformed mapper supplies a
+        // coordinate for an intronic/gap position.
+        if !tx_exons
+            .iter()
+            .any(|exon| exon.start <= position && exon.end >= position)
+        {
+            return None;
+        }
+        let index = if tx.cdna_mapper_segments.is_empty() {
+            genomic_to_cdna_index_for_transcript(tx, tx_exons, position)?
+        } else {
+            // Do not let the general-coordinate helper's exon fallback conceal
+            // a gap or duplicate coordinate in a supplied native mapper.
+            let mut segments = tx.cdna_mapper_segments.iter().filter(|segment| {
+                segment.genomic_start <= position && segment.genomic_end >= position
+            });
+            let segment = segments.next()?;
+            if segments.next().is_some()
+                || segment.ori != tx.strand
+                || segment.genomic_end.checked_sub(segment.genomic_start)?
+                    != i64::try_from(segment.cdna_end.checked_sub(segment.cdna_start)?).ok()?
+            {
+                return None;
+            }
+            mapper_segment_cdna_index(segment, position)?
+        };
+        if index == 0 {
+            return None;
+        }
+        if let Some(&previous) = indices.last() {
+            let next = if tx.strand >= 0 {
+                previous.checked_add(1)
+            } else {
+                previous.checked_sub(1)
+            };
+            if next != Some(index) {
+                return None;
+            }
+        }
+        indices.push(index);
+    }
+    (!indices.is_empty()).then_some(indices)
+}
+
 fn used_ref_for_transcript_variant(
     variant: &VariantInput,
     tx: &TranscriptFeature,
@@ -9300,6 +9485,15 @@ fn edited_transcript_reference_allele(
     if !uses_refseq_transcript_reference(tx) {
         return None;
     }
+    mapped_transcript_reference_allele(variant, tx, tx_exons, false)
+}
+
+fn mapped_transcript_reference_allele(
+    variant: &VariantInput,
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    require_consecutive: bool,
+) -> Option<String> {
     let ref_len = normalize_allele_seq(&variant.ref_allele).len();
     if ref_len == 0 {
         return None;
@@ -9309,7 +9503,7 @@ fn edited_transcript_reference_allele(
     if genomic_positions.len() != ref_len {
         return None;
     }
-    let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
+    let mut cdna_positions: Vec<usize> = Vec::with_capacity(genomic_positions.len());
     for pos in genomic_positions {
         let cdna = edited_transcript_sequence_cdna_index(
             tx,
@@ -9317,6 +9511,16 @@ fn edited_transcript_reference_allele(
         )?;
         if cdna == 0 || cdna > transcript_seq.len() {
             return None;
+        }
+        if require_consecutive && let Some(&previous) = cdna_positions.last() {
+            let next = if tx.strand >= 0 {
+                previous.checked_add(1)
+            } else {
+                previous.checked_sub(1)
+            };
+            if next != Some(cdna) {
+                return None;
+            }
         }
         cdna_positions.push(cdna);
     }
@@ -10104,6 +10308,195 @@ fn translate_codon(codon: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_reference_policy_selects_complete_noncoding_reference_on_both_strands() {
+        for strand in [1, -1] {
+            let transcript = tx(
+                "ENST_REFERENCE",
+                "21",
+                100,
+                199,
+                strand,
+                "miRNA",
+                None,
+                None,
+            );
+            let exons = [exon("ENST_REFERENCE", 1, 100, 199)];
+            let refs = exons.iter().collect::<Vec<_>>();
+            let variant = var("21", 105, 105, "C", "T");
+            for (policy, expected) in [(Some(true), "A"), (Some(false), "C"), (None, "C")] {
+                assert_eq!(
+                    used_ref_with_cache_policy(
+                        &variant,
+                        &transcript,
+                        &refs,
+                        None,
+                        false,
+                        policy,
+                        Some("A")
+                    )
+                    .as_deref(),
+                    Some(expected)
+                );
+                let transcripts = [transcript.clone()];
+                let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+                let engine = TranscriptConsequenceEngine::default().with_reference_policy(policy);
+                let result = engine.evaluate_variant_prepared_with_reference(
+                    &variant,
+                    &context,
+                    Some("A"),
+                    None,
+                );
+                assert_eq!(result[0].given_ref.as_deref(), Some("C"));
+                assert_eq!(result[0].used_ref.as_deref(), Some(expected));
+                // Genomic HGVSc remains independent even with known-false or
+                // UNKNOWN transcript-reference policy.
+                let expected_hgvs = if strand == 1 {
+                    "ENST_REFERENCE:n.6A>T"
+                } else {
+                    "ENST_REFERENCE:n.95T>A"
+                };
+                assert_eq!(result[0].hgvsc.as_deref(), Some(expected_hgvs));
+            }
+        }
+    }
+
+    #[test]
+    fn cache_reference_policy_rejects_incomplete_and_nonconsecutive_mapping() {
+        let mut transcript = tx("ENST_REFERENCE", "21", 100, 199, 1, "lncRNA", None, None);
+        let variant = var("21", 100, 102, "CCC", "TTT");
+        let exons = [
+            exon("ENST_REFERENCE", 1, 100, 100),
+            exon("ENST_REFERENCE", 2, 102, 199),
+        ];
+        assert_eq!(
+            used_ref_with_cache_policy(
+                &variant,
+                &transcript,
+                &exons.iter().collect::<Vec<_>>(),
+                None,
+                false,
+                Some(true),
+                Some("AAA")
+            )
+            .as_deref(),
+            Some("CCC")
+        );
+
+        let exons = [exon("ENST_REFERENCE", 1, 100, 199)];
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 100,
+                cdna_start: 1,
+                cdna_end: 1,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 101,
+                genomic_end: 199,
+                cdna_start: 3,
+                cdna_end: 101,
+                ori: 1,
+            },
+        ];
+        assert_eq!(
+            used_ref_with_cache_policy(
+                &variant,
+                &transcript,
+                &exons.iter().collect::<Vec<_>>(),
+                None,
+                false,
+                Some(true),
+                Some("AAA")
+            )
+            .as_deref(),
+            Some("CCC")
+        );
+        transcript.cdna_mapper_segments[1].cdna_start = 1;
+        transcript.cdna_mapper_segments[1].cdna_end = 99;
+        assert_eq!(
+            used_ref_with_cache_policy(
+                &variant,
+                &transcript,
+                &exons.iter().collect::<Vec<_>>(),
+                None,
+                false,
+                Some(true),
+                Some("AAA")
+            )
+            .as_deref(),
+            Some("CCC")
+        );
+    }
+
+    #[test]
+    fn cache_reference_policy_does_not_trust_partial_cds_as_full_spliced_sequence() {
+        let mut transcript = tx(
+            "ENST_REFERENCE",
+            "21",
+            100,
+            199,
+            1,
+            "protein_coding",
+            Some(150),
+            Some(152),
+        );
+        let exons = [exon("ENST_REFERENCE", 1, 100, 199)];
+        let refs = exons.iter().collect::<Vec<_>>();
+        let variant = var("21", 101, 101, "C", "T");
+        transcript.spliced_seq = Some("GGG".into());
+        assert_eq!(
+            used_ref_with_cache_policy(
+                &variant,
+                &transcript,
+                &refs,
+                None,
+                false,
+                Some(true),
+                Some("A")
+            )
+            .as_deref(),
+            Some("A")
+        );
+        transcript.spliced_seq = Some("G".repeat(100));
+        // Trustworthy complete cached sequence wins over a differing FASTA.
+        assert_eq!(
+            used_ref_with_cache_policy(
+                &variant,
+                &transcript,
+                &refs,
+                None,
+                false,
+                Some(true),
+                Some("A")
+            )
+            .as_deref(),
+            Some("G")
+        );
+    }
+
+    #[test]
+    fn cache_reference_policy_preserves_actual_rna_edit_reference_for_hgvs() {
+        for id in ["NR_REFERENCE.1", "ENST_REFERENCE"] {
+            let mut transcript = tx(id, "21", 100, 199, 1, "lncRNA", None, None);
+            transcript.has_rna_edit = true;
+            transcript.spliced_seq = Some("G".repeat(100));
+            let transcripts = [transcript];
+            let exons = [exon(id, 1, 100, 199)];
+            let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+            let variant = var("21", 105, 105, "C", "T");
+            let result = TranscriptConsequenceEngine::default()
+                .with_reference_policy(Some(true))
+                .evaluate_variant_prepared_with_reference(&variant, &context, Some("A"), None);
+            assert_eq!(result[0].used_ref.as_deref(), Some("G"));
+            assert_eq!(
+                result[0].hgvsc.as_deref(),
+                Some(format!("{id}:n.6G>T").as_str())
+            );
+        }
+    }
 
     #[test]
     fn test_profile_summary_line_includes_hgvsc_subtimers() {

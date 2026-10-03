@@ -664,6 +664,16 @@ pub fn csq_field_names_for_mode_with_pick(
     merged: bool,
     include_pick: bool,
 ) -> Vec<&'static str> {
+    csq_field_names_with_reference_policy(everything, refseq, merged, include_pick, None)
+}
+
+pub(crate) fn csq_field_names_with_reference_policy(
+    everything: bool,
+    refseq: bool,
+    merged: bool,
+    include_pick: bool,
+    bam_edited: Option<bool>,
+) -> Vec<&'static str> {
     let mut fields = if everything {
         CSQ_FIELD_NAMES_EVERYTHING.to_vec()
     } else {
@@ -703,7 +713,7 @@ pub fn csq_field_names_for_mode_with_pick(
                 );
             }
         }
-        return fields;
+        return reference_policy_fields(fields, everything, refseq, merged, bam_edited);
     }
 
     if let Some(source_idx) = fields.iter().position(|field| *field == "SOURCE") {
@@ -733,17 +743,58 @@ pub fn csq_field_names_for_mode_with_pick(
         }
     }
 
+    reference_policy_fields(fields, everything, refseq, merged, bam_edited)
+}
+
+fn reference_policy_fields(
+    mut fields: Vec<&'static str>,
+    everything: bool,
+    refseq: bool,
+    merged: bool,
+    bam_edited: Option<bool>,
+) -> Vec<&'static str> {
+    match bam_edited {
+        Some(false) => fields.retain(|name| !matches!(*name, "GIVEN_REF" | "USED_REF")),
+        Some(true) if !refseq && !merged => {
+            let before = if everything { "GENE_PHENO" } else { "SOURCE" };
+            let position = fields
+                .iter()
+                .position(|name| *name == before)
+                .unwrap_or(fields.len());
+            fields.splice(position..position, ["GIVEN_REF", "USED_REF"]);
+        }
+        _ => {}
+    }
     fields
 }
 
 /// Resolve an ordered VEP-style `--fields` selection against the active CSQ
 /// layout. The returned indices address the full base layout; custom-plugin
 /// fields are deliberately outside this selection and are always appended.
+#[cfg(test)]
 pub(crate) fn resolve_csq_field_selection(
     everything: bool,
     refseq: bool,
     merged: bool,
     include_pick: bool,
+    requested: &[String],
+) -> Result<(Vec<&'static str>, Vec<usize>)> {
+    resolve_csq_field_selection_with_reference_policy(
+        everything,
+        refseq,
+        merged,
+        include_pick,
+        None,
+        requested,
+    )
+}
+
+pub(crate) fn resolve_csq_field_selection_with_reference_policy(
+    everything: bool,
+    refseq: bool,
+    merged: bool,
+    include_pick: bool,
+    bam_edited: Option<bool>,
     requested: &[String],
 ) -> Result<(Vec<&'static str>, Vec<usize>)> {
     if requested.is_empty() {
@@ -752,7 +803,8 @@ pub(crate) fn resolve_csq_field_selection(
         ));
     }
 
-    let available = csq_field_names_for_mode_with_pick(everything, refseq, merged, include_pick);
+    let available =
+        csq_field_names_with_reference_policy(everything, refseq, merged, include_pick, bam_edited);
     let positions: HashMap<&str, usize> = available
         .iter()
         .enumerate()

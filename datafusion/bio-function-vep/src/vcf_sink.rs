@@ -22,7 +22,7 @@ use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::annotate_provider::{VEP_SOURCE_FIELD_NAME_KEY, source_field_name};
-use crate::cache_source::CacheSourceType;
+use crate::cache_source::{CacheMetadata, CacheSourceType};
 use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
 
 /// Callback invoked after each batch is written to VCF.
@@ -876,10 +876,10 @@ impl AnnotateVcfConfig {
 /// The only cache format; recorded in provenance and passed to the engine.
 const CACHE_FORMAT: &str = "parquet";
 
-fn cache_source_type_from_cache_source(cache_source: &str) -> Result<CacheSourceType> {
+fn cache_metadata_from_cache_source(cache_source: &str) -> Result<CacheMetadata> {
     #[cfg(feature = "parquet-cache")]
     {
-        CacheSourceType::from_partitioned_parquet_cache_source(cache_source)
+        CacheMetadata::from_partitioned_cache(cache_source)
     }
     #[cfg(not(feature = "parquet-cache"))]
     {
@@ -1190,14 +1190,14 @@ pub fn annotation_header_lines(
     output_vcf: Option<&str>,
     config: &AnnotateVcfConfig,
 ) -> Result<(Vec<String>, String)> {
-    let cache_source_type = cache_source_type_from_cache_source(cache_source)?;
+    let cache_metadata = cache_metadata_from_cache_source(cache_source)?;
     annotation_header_lines_with_csq_for(
         existing,
         input_vcf,
         cache_source,
         output_vcf,
         config,
-        cache_source_type,
+        cache_metadata,
     )
 }
 
@@ -1209,17 +1209,18 @@ fn annotation_header_lines_with_csq_for(
     cache_source: &str,
     output_vcf: Option<&str>,
     config: &AnnotateVcfConfig,
-    cache_source_type: CacheSourceType,
+    cache_metadata: impl Into<CacheMetadata>,
 ) -> Result<(Vec<String>, String)> {
+    let cache_metadata = cache_metadata.into();
     let lines = annotation_header_lines_for(
         existing,
         input_vcf,
         cache_source,
         output_vcf,
         config,
-        cache_source_type,
+        cache_metadata.source_type,
     )?;
-    let description = csq_header_description(config, cache_source_type)?;
+    let description = csq_header_description(config, cache_metadata)?;
     Ok((lines, description))
 }
 
@@ -1269,25 +1270,46 @@ fn annotation_header_lines_for(
     Ok(lines)
 }
 
+fn validate_planned_cache_layout(
+    schema: &datafusion::arrow::datatypes::Schema,
+    expected: CacheMetadata,
+) -> Result<()> {
+    let actual = schema
+        .field_with_name("CSQ")?
+        .metadata()
+        .get(crate::cache_source::ANNOTATION_CACHE_LAYOUT_KEY);
+    if actual.map(String::as_str) != Some(expected.layout_identity().as_str()) {
+        return Err(DataFusionError::Plan(format!(
+            "annotate_to_vcf(): cache reference layout changed while planning: expected {}, got {actual:?}",
+            expected.layout_identity()
+        )));
+    }
+    Ok(())
+}
+
 fn csq_header_description(
     config: &AnnotateVcfConfig,
-    cache_source_type: CacheSourceType,
+    cache_metadata: impl Into<CacheMetadata>,
 ) -> Result<String> {
-    let full_field_names = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
+    let cache_metadata = cache_metadata.into();
+    let cache_source_type = cache_metadata.source_type;
+    let full_field_names = crate::golden_benchmark::csq_field_names_with_reference_policy(
         config.everything,
         cache_source_type == CacheSourceType::RefSeq,
         cache_source_type == CacheSourceType::Merged,
         config.include_pick_output(),
+        cache_metadata.bam_edited,
     );
     let selected_field_names = config
         .fields
         .as_deref()
         .map(|requested| {
-            crate::golden_benchmark::resolve_csq_field_selection(
+            crate::golden_benchmark::resolve_csq_field_selection_with_reference_policy(
                 config.everything,
                 cache_source_type == CacheSourceType::RefSeq,
                 cache_source_type == CacheSourceType::Merged,
                 config.include_pick_output(),
+                cache_metadata.bam_edited,
                 requested,
             )
             .map(|(names, _)| names)
@@ -1574,7 +1596,7 @@ async fn drive_sharded_vcf_annotation(
     vcf_table: &str,
     cache_source: &str,
     backend: &str,
-    cache_source_type: CacheSourceType,
+    cache_metadata: CacheMetadata,
     options_json: String,
     vcf_schema: &Arc<datafusion::arrow::datatypes::Schema>,
     projection_names: &[String],
@@ -1596,7 +1618,7 @@ async fn drive_sharded_vcf_annotation(
         vcf_table.to_string(),
         cache_source.to_string(),
         backend_enum,
-        cache_source_type,
+        cache_metadata,
         Some(options_json),
         (**vcf_schema).clone(),
     )?
@@ -1731,7 +1753,8 @@ pub async fn annotate_to_vcf(
              bgzip + tabix the VCF, or run with workers=1"
         )));
     }
-    let cache_source_type = cache_source_type_from_cache_source(cache_source)?;
+    let cache_metadata = cache_metadata_from_cache_source(cache_source)?;
+    let cache_source_type = cache_metadata.source_type;
     let concurrency_plan = VepConcurrencyPlan::from_config(config);
     if sink_profile_enabled() {
         eprintln!(
@@ -1898,9 +1921,9 @@ pub async fn annotate_to_vcf(
     // The engine renames an input column whose name it uses itself, so the
     // columns are asked for by the names its schema gives them. Planning the
     // call is what builds that schema; nothing is executed.
-    let engine_names: std::collections::HashMap<String, String> = ctx
-        .sql(&format!("SELECT * FROM {annotate_call}"))
-        .await?
+    let planned = ctx.sql(&format!("SELECT * FROM {annotate_call}")).await?;
+    validate_planned_cache_layout(planned.schema().as_arrow(), cache_metadata)?;
+    let engine_names: std::collections::HashMap<String, String> = planned
         .schema()
         .fields()
         .iter()
@@ -1923,7 +1946,8 @@ pub async fn annotate_to_vcf(
     // 5. Build output schema with merged metadata for VCF header.
     let df = ctx.sql(&sql).await?;
     let df_schema = df.schema();
-    let csq_description = csq_header_description(config, cache_source_type)?;
+    validate_planned_cache_layout(df_schema.as_arrow(), cache_metadata)?;
+    let csq_description = csq_header_description(config, cache_metadata)?;
     let output_fields: Vec<datafusion::arrow::datatypes::Field> = df_schema
         .fields()
         .iter()
@@ -2088,7 +2112,7 @@ pub async fn annotate_to_vcf(
             vcf_table,
             cache_source,
             backend,
-            cache_source_type,
+            cache_metadata,
             options_json.clone(),
             &vcf_schema,
             &projection_names,
@@ -2226,6 +2250,53 @@ pub async fn annotate_to_vcf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_policy_headers_keep_reference_fields_independent_of_source() {
+        for source_type in [
+            CacheSourceType::Ensembl,
+            CacheSourceType::RefSeq,
+            CacheSourceType::Merged,
+        ] {
+            for bam_edited in [None, Some(false), Some(true)] {
+                for everything in [false, true] {
+                    let metadata = CacheMetadata {
+                        source_type,
+                        bam_edited,
+                    };
+                    let mut config = AnnotateVcfConfig {
+                        everything,
+                        ..Default::default()
+                    };
+                    let description = csq_header_description(&config, metadata).unwrap();
+                    let fields = description
+                        .split("Format: ")
+                        .nth(1)
+                        .unwrap()
+                        .split('|')
+                        .collect::<Vec<_>>();
+                    let refs = bam_edited.unwrap_or(source_type != CacheSourceType::Ensembl);
+                    assert_eq!(fields.contains(&"GIVEN_REF"), refs);
+                    assert_eq!(fields.contains(&"USED_REF"), refs);
+                    assert_eq!(
+                        fields.contains(&"BAM_EDIT"),
+                        source_type != CacheSourceType::Ensembl
+                    );
+                    config.fields = Some(vec!["USED_REF".into(), "Feature".into()]);
+                    match csq_header_description(&config, metadata) {
+                        Ok(header) => {
+                            assert!(refs);
+                            assert!(header.ends_with("Format: USED_REF|Feature"));
+                        }
+                        Err(error) => {
+                            assert!(!refs);
+                            assert!(error.to_string().contains("unknown CSQ field 'USED_REF'"));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn restore_fixture(info_keys: Vec<Option<&str>>) -> RecordBatch {
         use datafusion::arrow::array::{Float32Array, StringArray};
