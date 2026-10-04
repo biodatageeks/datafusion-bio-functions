@@ -6049,6 +6049,7 @@ impl AnnotateProvider {
         >,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
+        let mut genomic_reference_window = GenomicReferenceWindow::default();
         let include_pick_output = self.include_pick_output;
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
             DataFusionError::Execution(
@@ -6647,7 +6648,7 @@ impl AnnotateProvider {
                     && ctx.overlaps_transcript(annotation_chrom, variant.start, variant.end)
                 {
                     hgvs_reference_reader.as_mut().map(|reader| {
-                        let sequence = read_reference_sequence(reader, annotation_chrom.strip_prefix("chr").unwrap_or(annotation_chrom), variant.start, variant.end)?;
+                        let sequence = genomic_reference_window.read(reader, annotation_chrom.strip_prefix("chr").unwrap_or(annotation_chrom), variant.start, variant.end)?;
                         if sequence.len() != variant.ref_allele.len() {
                             return Err(DataFusionError::Execution(format!(
                                 "annotate_vep(): incomplete genomic reference for {}:{}-{}: expected {} bases, got {}",
@@ -9104,6 +9105,68 @@ fn is_refseq_transcript_for_hydration(
     row_source_is_refseq(tx)
         || is_standard_refseq_accession(&tx.transcript_id)
         || cache_source_type == CacheSourceType::RefSeq && is_default_refseq_transcript_id(tx)
+}
+
+/// A bounded window for the new per-row reference reads. Nearby variants in a
+/// batch share one indexed FASTA query instead of repeatedly seeking the file.
+/// This is local to a batch/worker and never changes transcript/indel hydration.
+#[derive(Default)]
+struct GenomicReferenceWindow {
+    chrom: String,
+    start: i64,
+    sequence: String,
+}
+
+impl GenomicReferenceWindow {
+    const BASES: i64 = 64 * 1024;
+
+    fn read<R>(
+        &mut self,
+        reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
+        chrom: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<String>
+    where
+        R: BufRead + Seek,
+    {
+        if chrom == self.chrom
+            && start >= self.start
+            && end >= start
+            && end < self.start.saturating_add(self.sequence.len() as i64)
+            && let (Ok(first), Ok(last)) = (
+                usize::try_from(start - self.start),
+                usize::try_from(end - self.start + 1),
+            )
+            && let Some(sequence) = self.sequence.get(first..last)
+        {
+            return Ok(sequence.to_owned());
+        }
+        let contig_end = reader
+            .index()
+            .as_ref()
+            .iter()
+            .find(|record| record.name() == chrom.as_bytes())
+            .and_then(|record| i64::try_from(record.length()).ok());
+        // Keep long variants and invalid intervals on the original exact-read
+        // path; never retain an unbounded sequence or hide a reader error.
+        let Some(contig_end) = contig_end.filter(|length| {
+            start > 0 && end >= start && end <= *length && end - start < Self::BASES
+        }) else {
+            return read_reference_sequence(reader, chrom, start, end);
+        };
+        let window_end = start.saturating_add(Self::BASES - 1).min(contig_end);
+        let sequence = read_reference_sequence(reader, chrom, start, window_end)?;
+        self.chrom = chrom.to_owned();
+        self.start = start;
+        self.sequence = sequence;
+        // The caller checks exact requested length, including truncated FASTA.
+        Ok(self
+            .sequence
+            .get(..(end - start + 1) as usize)
+            .unwrap_or(&self.sequence)
+            .to_owned())
+    }
 }
 
 fn read_reference_sequence<R>(
@@ -16127,6 +16190,91 @@ mod tests {
     use crate::transcript_consequence::{
         CachedPredictions, FeatureType, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
     };
+
+    #[test]
+    fn genomic_reference_window_reuses_reads_without_changing_sequence() {
+        use std::io::{Cursor, Read, SeekFrom};
+
+        struct CountingReader {
+            cursor: Cursor<Vec<u8>>,
+            seeks: usize,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.cursor.read(buf)
+            }
+        }
+        impl BufRead for CountingReader {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                self.cursor.fill_buf()
+            }
+            fn consume(&mut self, amount: usize) {
+                self.cursor.consume(amount);
+            }
+        }
+        impl Seek for CountingReader {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.seeks += 1;
+                self.cursor.seek(position)
+            }
+        }
+
+        let sequence = "acgt".repeat(20_000);
+        let data = format!(">21\n{sequence}\n>22\nTGCA\n");
+        let index = fasta::fai::Index::from(vec![
+            fasta::fai::Record::new("21", 80_000, 4, 80_000, 80_001),
+            fasta::fai::Record::new("22", 4, 80_009, 4, 5),
+        ]);
+        let mut reader = fasta::io::indexed_reader::IndexedReader::new(
+            CountingReader {
+                cursor: Cursor::new(data.into_bytes()),
+                seeks: 0,
+            },
+            index,
+        );
+        let mut window = GenomicReferenceWindow::default();
+        for (start, end) in [(1, 1), (5, 6), (1024, 1027), (65_534, 65_536)] {
+            assert_eq!(
+                window.read(&mut reader, "21", start, end).unwrap(),
+                sequence[(start - 1) as usize..end as usize]
+            );
+        }
+        assert_eq!(
+            reader.get_ref().seeks,
+            1,
+            "nearby SNVs/MNVs share one query"
+        );
+        assert_eq!(window.sequence.len(), 65_536);
+        assert_eq!(
+            window.read(&mut reader, "21", 65_535, 65_540).unwrap(),
+            &sequence[65_534..65_540]
+        );
+        assert_eq!(
+            reader.get_ref().seeks,
+            2,
+            "window crossing refills and clips at contig end"
+        );
+        assert_eq!(window.read(&mut reader, "21", 80_000, 80_000).unwrap(), "t");
+        assert_eq!(reader.get_ref().seeks, 2);
+        assert_eq!(window.read(&mut reader, "22", 1, 4).unwrap(), "TGCA");
+        assert_eq!(
+            reader.get_ref().seeks,
+            3,
+            "chromosome is part of the cache key"
+        );
+        assert_eq!(
+            window.read(&mut reader, "21", 1, 70_000).unwrap(),
+            &sequence[..70_000]
+        );
+        assert!(window.sequence.len() <= GenomicReferenceWindow::BASES as usize);
+        assert!(
+            window
+                .read(&mut reader, "missing", 1, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
+        );
+    }
 
     // Regression: the serial (workers==1) AnnotatingContig loop truncated a
     // contig at ~one buffer when a lookup stall arrived mid-buffer-fill after the

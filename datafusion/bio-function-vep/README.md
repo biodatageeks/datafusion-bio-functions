@@ -95,6 +95,11 @@ The policy is resolved before output planning so typed columns, CSQ headers,
 selected CSQ fields, and worker output share the same field order. Every loaded
 entity and contig is checked against that policy.
 
+Per-row genomic reference reads share a bounded 64 KiB FASTA window within each
+annotation batch. Nearby SNVs and small indels reuse one indexed read; contig
+changes and window crossings refill it, and long variants use an exact read.
+Transcript hydration and HGVS indel-shift reads keep their existing paths.
+
 ### Cache Source Modes and Transcript Filtering
 
 Transcript filtering follows Ensembl VEP release/115 source-mode behavior. The
