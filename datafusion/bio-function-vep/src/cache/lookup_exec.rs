@@ -806,7 +806,7 @@ fn probe_taken_batch_position(
     }
     let indices = BatchProbeIndices::new(batch)?;
     let mut coloc_buf = coloc_buf;
-    let (prepared_coloc, additional_coloc) = if coloc_buf.is_some() {
+    let (prepared_coloc, additional_coloc, joined_coloc) = if coloc_buf.is_some() {
         let prepare_started = Instant::now();
         let prepare = |alt: &str| {
             let (input_ref, input_alt, input_start) =
@@ -830,15 +830,21 @@ fn probe_taken_batch_position(
         // Keep the common single-ALT value inline. The empty additional vector
         // allocates nothing; only multiallelic probes need extra storage.
         let first = alts.next().map(&prepare);
-        let additional = alts.map(prepare).collect::<Vec<_>>();
+        let additional = alts.map(&prepare).collect::<Vec<_>>();
+        // The annotation consumer still retains an unsplit reader-joined row.
+        // Keep its original key for coordinate-only/unknown cache matches.
+        // Per-ALT keys serve decomposed inputs; full VCF parity requires input
+        // normalization until the annotation engine also decomposes raw ALTs.
+        let joined = vcf_alt.contains(['|', ',']).then(|| prepare(vcf_alt));
         metrics.colocated_prepare_elapsed += prepare_started.elapsed();
-        (first, additional)
+        (first, additional, joined)
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), None)
     };
     let coloc_visible = prepared_coloc
         .iter()
         .chain(&additional_coloc)
+        .chain(&joined_coloc)
         .any(|prepared| {
             probe_start_visible_to_window(probe_start, prepared.vep_start, prepared.vep_end)
         });
@@ -881,7 +887,11 @@ fn probe_taken_batch_position(
                 metrics.colocated_allele_rows += 1;
             }
 
-            for prepared in prepared_coloc.iter().chain(&additional_coloc) {
+            for prepared in prepared_coloc
+                .iter()
+                .chain(&additional_coloc)
+                .chain(&joined_coloc)
+            {
                 if !probe_start_visible_to_window(probe_start, prepared.vep_start, prepared.vep_end)
                 {
                     continue;

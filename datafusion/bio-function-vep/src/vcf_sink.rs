@@ -2186,9 +2186,14 @@ pub async fn annotate_to_vcf(
                 profile.rows += input_rows;
                 profile.lines += lines.len();
             }
-            total_rows += lines.len();
+            let line_count = lines.len();
+            total_rows += line_count;
             let write_started = Instant::now();
-            writer.write_records(&lines)?;
+            // Match the existing multi-worker sink: write one ordered chunk
+            // per batch instead of dispatching every record through an 8KiB
+            // buffer. Include chunk assembly in the write-phase measurement.
+            let (bytes, _) = vcf_lines_to_body_chunk(lines);
+            write_vcf_body_chunk(&mut writer, &bytes)?;
             let write_elapsed = write_started.elapsed();
             pipeline_trace::emit(
                 "vcf_write",
@@ -2196,16 +2201,17 @@ pub async fn annotate_to_vcf(
                 &[
                     ("batch_id", TraceValue::Usize(batch_id)),
                     ("rows", TraceValue::Usize(input_rows)),
-                    ("lines", TraceValue::Usize(lines.len())),
+                    ("lines", TraceValue::Usize(line_count)),
                     ("elapsed", TraceValue::Duration(write_elapsed)),
                 ],
             );
             if let Some(profile) = sink_profile.as_mut() {
                 profile.write_records += write_elapsed;
+                profile.body_chunk_bytes += bytes.len();
             }
-            pb.inc(lines.len() as u64);
+            pb.inc(line_count as u64);
             if let Some(ref cb) = config.on_batch_written {
-                cb(lines.len(), total_rows, total_input);
+                cb(line_count, total_rows, total_input);
             }
         }
         let finish_started = Instant::now();
