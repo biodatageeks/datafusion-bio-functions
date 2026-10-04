@@ -949,20 +949,27 @@ fn probe_taken_batch_position(
         let exact_match = if existing_strand == 1 {
             exact_matcher(vcf_ref, vcf_alt, &allele_string)
         } else {
-            let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
-            !get_matched_variant_alleles(
-                VariantAlleleInput {
-                    allele_string: &format!("{compare_ref}/{compare_alt}"),
-                    pos: vep_norm_start(vcf_iv_start, vcf_ref, vcf_alt),
-                    strand: 1,
-                },
-                VariantAlleleInput {
-                    allele_string: &allele_string,
-                    pos: probe_start,
-                    strand: existing_strand,
-                },
-            )
-            .is_empty()
+            // Match each input ALT independently, as the forward matcher
+            // does. Their normalized starts can differ (SNV/MNV vs indel).
+            vcf_alt
+                .split(['|', ','])
+                .filter(|alt| !alt.is_empty())
+                .any(|alt| {
+                    let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, alt);
+                    !get_matched_variant_alleles(
+                        VariantAlleleInput {
+                            allele_string: &format!("{compare_ref}/{compare_alt}"),
+                            pos: vep_norm_start(vcf_iv_start, vcf_ref, alt),
+                            strand: 1,
+                        },
+                        VariantAlleleInput {
+                            allele_string: &allele_string,
+                            pos: probe_start,
+                            strand: existing_strand,
+                        },
+                    )
+                    .is_empty()
+                })
         };
         if exact_match {
             if emit_output {
@@ -2478,11 +2485,18 @@ mod tests {
 
     #[cfg(feature = "parquet-cache")]
     #[test]
-    fn reverse_strand_mnv_and_deletion_attach_primary_rows_without_colocated_sink() {
+    fn reverse_strand_primary_matches_each_alt_at_its_normalized_start() {
         use datafusion::arrow::datatypes::{Field, Schema};
-        for (vcf_ref, vcf_alt, cache_alleles, cache_start, cache_end) in
-            [("AA", "CC", "TT/GG", 10, 11), ("AT", "A", "A/-", 11, 11)]
-        {
+        for (vcf_ref, vcf_alt, cache_alleles, cache_start, cache_end) in [
+            ("AA", "CC", "TT/GG", 10, 11),
+            ("AT", "A", "A/-", 11, 11),
+            ("ATT", "A", "AA/-", 11, 12),
+            ("A", "T,G", "T/C", 10, 10),
+            ("A", "T|G", "T/C", 10, 10),
+            ("A", ",G,", "T/C", 10, 10),
+            ("AT", "GT,A", "A/-", 11, 11),
+            ("AT", "GT|A", "A/-", 11, 11),
+        ] {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("start", DataType::UInt32, false),
                 Field::new("end", DataType::UInt32, false),
