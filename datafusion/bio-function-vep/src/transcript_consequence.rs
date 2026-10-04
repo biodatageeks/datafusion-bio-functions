@@ -1590,34 +1590,20 @@ impl TranscriptConsequenceEngine {
                         let mut hgvsc_detail_profile = (profiling
                             && hgvsc_detail_profile_enabled())
                         .then(HgvscProfile::default);
-                        let hgvsc = if let Some(detail_profile) = hgvsc_detail_profile.as_mut() {
-                            crate::hgvs::format_hgvsc_profiled_with_semantics(
-                                tx,
-                                tx_exons_for_hgvsc,
-                                hgvsc_cdna_position.as_deref(),
-                                hgvsc_cds_position.as_deref(),
-                                hgvsc_ref_allele,
-                                hgvsc_alt_allele,
-                                hgvsc_start,
-                                hgvsc_end,
-                                hgvs_shift,
-                                detail_profile,
-                                self.semantics,
-                            )
-                        } else {
-                            crate::hgvs::format_hgvsc_with_semantics(
-                                tx,
-                                tx_exons_for_hgvsc,
-                                hgvsc_cdna_position.as_deref(),
-                                hgvsc_cds_position.as_deref(),
-                                hgvsc_ref_allele,
-                                hgvsc_alt_allele,
-                                hgvsc_start,
-                                hgvsc_end,
-                                hgvs_shift,
-                                self.semantics,
-                            )
-                        };
+                        let hgvsc = crate::hgvs::format_hgvsc_with_reference_policy(
+                            tx,
+                            tx_exons_for_hgvsc,
+                            hgvsc_cdna_position.as_deref(),
+                            hgvsc_cds_position.as_deref(),
+                            hgvsc_ref_allele,
+                            hgvsc_alt_allele,
+                            hgvsc_start,
+                            hgvsc_end,
+                            hgvs_shift,
+                            hgvsc_detail_profile.as_mut(),
+                            self.semantics,
+                            self.bam_edited != Some(false),
+                        );
                         if let (Some(started), Some(profile)) =
                             (hgvsc_started, profile.as_deref_mut())
                         {
@@ -10484,6 +10470,12 @@ mod tests {
             let mut transcript = tx(id, "21", 100, 199, 1, "lncRNA", None, None);
             transcript.has_rna_edit = true;
             transcript.spliced_seq = Some("G".repeat(100));
+            transcript.refseq_edits = vec![RefSeqEdit {
+                start: 101,
+                end: 100,
+                replacement_len: Some(26),
+                skip_refseq_offset: false,
+            }];
             let transcripts = [transcript];
             let exons = [exon(id, 1, 100, 199)];
             let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
