@@ -2411,7 +2411,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs_strand_probe"])) as ArrayRef,
                 Arc::new(StringArray::from(vec![alleles])) as ArrayRef,
                 Arc::new(Int8Array::from(vec![0])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["C:0.23&A:0.71&G:0.41"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["C:0.23,A:0.71,G:0.41"])) as ArrayRef,
             ];
             if let Some(strand) = strand {
                 fields.push(Field::new("strand", DataType::Int8, true));
@@ -2470,9 +2470,73 @@ mod tests {
                         entry.matched_alleles[0].b_allele,
                         if strand == Some(Some(-1)) { "C" } else { "G" }
                     );
-                    assert_eq!(entry.af_value(0), "C:0.23&A:0.71&G:0.41");
+                    assert_eq!(entry.af_value(0), "C:0.23,A:0.71,G:0.41");
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    #[test]
+    fn reverse_strand_mnv_and_deletion_attach_primary_rows_without_colocated_sink() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        for (vcf_ref, vcf_alt, cache_alleles, cache_start, cache_end) in
+            [("AA", "CC", "TT/GG", 10, 11), ("AT", "A", "A/-", 11, 11)]
+        {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+                Field::new("variation_name", DataType::Utf8, false),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("failed", DataType::Int8, false),
+                Field::new("strand", DataType::Int8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt32Array::from(vec![cache_start])),
+                    Arc::new(UInt32Array::from(vec![cache_end])),
+                    Arc::new(StringArray::from(vec!["rs_reverse_primary"])),
+                    Arc::new(StringArray::from(vec![cache_alleles])),
+                    Arc::new(Int8Array::from(vec![0])),
+                    Arc::new(Int8Array::from(vec![-1])),
+                ],
+            )
+            .unwrap();
+            let mut builders = vec![make_builder(&DataType::Utf8, 1).unwrap()];
+            let mut input_rows = Vec::new();
+            let (result, _) = probe_taken_batch_position(
+                &batch,
+                &[0],
+                allele_matches as fn(&str, &str, &str) -> bool,
+                0,
+                true,
+                "1",
+                i64::from(cache_start),
+                vcf_ref,
+                vcf_alt,
+                10,
+                i64::from(cache_end),
+                true,
+                0,
+                &["variation_name".into()],
+                &[0],
+                &mut builders,
+                &mut input_rows,
+                None,
+            )
+            .unwrap();
+            assert_eq!(result, ProbeResult::Match, "{vcf_ref}>{vcf_alt}");
+            assert_eq!(input_rows, vec![0]);
+            let output = builders[0].finish();
+            assert_eq!(
+                output
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "rs_reverse_primary"
+            );
         }
     }
 
