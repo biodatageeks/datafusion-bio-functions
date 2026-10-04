@@ -2506,15 +2506,21 @@ mod tests {
     #[test]
     fn reverse_strand_primary_matches_each_alt_at_its_normalized_start() {
         use datafusion::arrow::datatypes::{Field, Schema};
-        for (vcf_ref, vcf_alt, cache_alleles, cache_start, cache_end) in [
-            ("AA", "CC", "TT/GG", 10, 11),
-            ("AT", "A", "A/-", 11, 11),
-            ("ATT", "A", "AA/-", 11, 12),
-            ("A", "T,G", "T/C", 10, 10),
-            ("A", "T|G", "T/C", 10, 10),
-            ("A", ",G,", "T/C", 10, 10),
-            ("AT", "GT,A", "A/-", 11, 11),
-            ("AT", "GT|A", "A/-", 11, 11),
+        for (vcf_ref, vcf_alt, cache_alleles, cache_start, cache_end, expected_matches) in [
+            ("AA", "CC", "TT/GG", 10, 11, vec![("CC", "GG")]),
+            ("AT", "A", "A/-", 11, 11, vec![("A", "-")]),
+            ("ATT", "A", "AA/-", 11, 12, vec![("A", "-")]),
+            ("A", "T,G", "T/C", 10, 10, vec![("G", "C")]),
+            ("A", "T|G", "T/C", 10, 10, vec![("G", "C")]),
+            ("A", ",G,", "T/C", 10, 10, vec![("G", "C")]),
+            ("AT", "GT,A", "A/-", 11, 11, vec![("A", "-")]),
+            ("AT", "GT|A", "A/-", 11, 11, vec![("A", "-")]),
+            // First ALT only, both ALTs, and neither ALT: each sink key is independent.
+            ("A", "G,T", "T/C", 10, 10, vec![("G", "C")]),
+            ("A", "T,G", "T/A/C", 10, 10, vec![("T", "A"), ("G", "C")]),
+            ("A", "T|G", "T/A/C", 10, 10, vec![("T", "A"), ("G", "C")]),
+            ("A", "T,C", "T/C", 10, 10, vec![]),
+            ("A", "T|C", "T/C", 10, 10, vec![]),
         ] {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("start", DataType::UInt32, false),
@@ -2561,24 +2567,35 @@ mod tests {
                     with_colocated.then_some(&mut colocated),
                 )
                 .unwrap();
-                assert_eq!(result, ProbeResult::Match, "{vcf_ref}>{vcf_alt}");
-                assert_eq!(input_rows, vec![0]);
-                let output = builders[0].finish();
+                let expected_primary = !expected_matches.is_empty();
                 assert_eq!(
-                    output
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .unwrap()
-                        .value(0),
-                    "rs_reverse_primary"
+                    result == ProbeResult::Match,
+                    expected_primary,
+                    "{vcf_ref}>{vcf_alt}"
                 );
-                assert_eq!(colocated.len(), usize::from(with_colocated));
-                if with_colocated {
-                    let alt = vcf_alt
-                        .split(['|', ','])
-                        .filter(|alt| !alt.is_empty())
-                        .next_back()
-                        .unwrap();
+                assert_eq!(input_rows.len(), usize::from(expected_primary));
+                let output = builders[0].finish();
+                assert_eq!(output.len(), usize::from(expected_primary));
+                if expected_primary {
+                    assert_eq!(input_rows, vec![0]);
+                    assert_eq!(
+                        output
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(0),
+                        "rs_reverse_primary"
+                    );
+                }
+                assert_eq!(
+                    colocated.len(),
+                    if with_colocated {
+                        expected_matches.len()
+                    } else {
+                        0
+                    }
+                );
+                for &(alt, cache_alt) in expected_matches.iter().filter(|_| with_colocated) {
                     let (input_ref, input_alt, input_start) =
                         vcf_to_vep_input_allele(10, vcf_ref, alt);
                     let key = (
@@ -2592,10 +2609,7 @@ mod tests {
                     let entry = &value.entries[0];
                     assert_eq!(entry.allele_string, cache_alleles);
                     assert_eq!(entry.matched_alleles.len(), 1);
-                    assert_eq!(
-                        entry.matched_alleles[0].b_allele,
-                        cache_alleles.split_once('/').unwrap().1
-                    );
+                    assert_eq!(entry.matched_alleles[0].b_allele, cache_alt);
                     assert_eq!(entry.matched_alleles[0].a_allele, input_alt);
                 }
             }

@@ -10087,14 +10087,15 @@ async fn load_contig_context_rest(
     chrom: &str,
     profile: &Option<SharedContigPipelineProfile>,
     tx_ids: &HashSet<String>,
+    annotation_workers: usize,
 ) -> Result<ContigContextRest> {
-    // The four scans are mutually independent and the parses are CPU-bound, so
-    // they CAN run concurrently — but the default is the original strictly
-    // serial order: `enabled_from_env_value(None)` is false, so concurrency is
-    // opt-in via VEP_CTX_PARALLEL=1. Serial-by-default keeps the A/B honest and
-    // avoids contending with the rest of the pipeline unless asked.
-    let concurrent =
-        pipeline_trace::enabled_from_env_value(std::env::var("VEP_CTX_PARALLEL").ok().as_deref());
+    // These independent scans and owned parses overlap for multi-worker runs.
+    // Keep serial execution at one worker and retain the explicit diagnostic
+    // override. At most four existing blocking parses run concurrently.
+    let concurrent = context_parallel_enabled(
+        annotation_workers,
+        std::env::var("VEP_CTX_PARALLEL").ok().as_deref(),
+    );
 
     async fn timed_scan(
         cache: &crate::parquet_cache::detect::PartitionedParquetCache,
@@ -15253,8 +15254,14 @@ async fn prepare_contig_data(
         .map(|tx| tx.transcript_id.clone())
         .collect();
     let t_rest = Instant::now();
-    let rest =
-        load_contig_context_rest(cache.as_parquet(), &chrom, &pipeline_profile, &tx_ids).await;
+    let rest = load_contig_context_rest(
+        cache.as_parquet(),
+        &chrom,
+        &pipeline_profile,
+        &tx_ids,
+        config.annotation_workers,
+    )
+    .await;
     let rest_elapsed = t_rest.elapsed();
     pipeline_trace::emit(
         "context",
@@ -16017,6 +16024,14 @@ fn contig_prefetch_enabled(annotation_workers: usize, env: Option<&str>) -> bool
     }
 }
 
+/// Context loading uses the existing concurrent path only when annotation has
+/// more than one worker. Explicit environment values preserve diagnostic A/Bs.
+fn context_parallel_enabled(annotation_workers: usize, env: Option<&str>) -> bool {
+    env.map_or(annotation_workers > 1, |value| {
+        pipeline_trace::enabled_from_env_value(Some(value))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16063,6 +16078,19 @@ mod tests {
             select_cache_backed_contigs(&["chr2".to_string()], &cache_chroms, Path::new("/cache"))
                 .unwrap_err();
         assert!(error.to_string().contains("none of the VCF"));
+    }
+
+    #[test]
+    fn context_parallel_gate_respects_workers_and_explicit_override() {
+        assert!(!context_parallel_enabled(1, None));
+        assert!(context_parallel_enabled(2, None));
+        assert!(context_parallel_enabled(8, None));
+        assert!(context_parallel_enabled(1, Some("1")));
+        assert!(context_parallel_enabled(1, Some("true")));
+        assert!(!context_parallel_enabled(8, Some("0")));
+        // Preserve the existing override convention, including an empty value.
+        assert!(!context_parallel_enabled(8, Some("false")));
+        assert!(context_parallel_enabled(8, Some("")));
     }
 
     #[test]
