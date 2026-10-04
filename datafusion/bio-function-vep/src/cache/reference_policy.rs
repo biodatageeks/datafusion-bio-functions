@@ -118,12 +118,20 @@ impl CacheReferencePolicy {
                 DataFusionError::Execution("native cache schema is missing BAM policy".to_string())
             })?,
         };
-        if Self::read(output)?.as_ref() == Some(&policy) {
-            return Ok(());
-        }
+        let needs_write = match Self::read(output)? {
+            Some(existing) if existing == policy => false,
+            Some(existing) => {
+                return Err(DataFusionError::Execution(format!(
+                    "cannot resume cache '{}': existing reference policy {existing:?} conflicts with native cache '{}' policy {policy:?}; use the original native cache or rebuild into a new destination",
+                    output.display(),
+                    native_root.display()
+                )));
+            }
+            None => true,
+        };
         // A resume must not relabel an older destination from a different raw
-        // cache. Inspect existing biological shards only when root policy needs
-        // refresh; the normal per-chromosome build path does not rescan them.
+        // cache. Validate shards even when the root policy already agrees: a
+        // copied or replaced shard may contradict that declaration.
         for entity in [
             "variation",
             "transcript",
@@ -153,6 +161,9 @@ impl CacheReferencePolicy {
                     ))
                 })?;
             }
+        }
+        if !needs_write {
+            return Ok(());
         }
         std::fs::create_dir_all(output)?;
         let destination = output.join(REFERENCE_POLICY_FILE);
@@ -392,6 +403,54 @@ mod tests {
 
     #[cfg(feature = "cache-builder")]
     #[test]
+    fn reference_policy_resume_rejects_conflicting_root_without_modifying_files() {
+        let root = tempfile::tempdir().unwrap();
+        let native = root.path().join("native");
+        let output = root.path().join("output");
+        std::fs::create_dir(&native).unwrap();
+        std::fs::write(native.join("info.txt"), b"bam\t/path.bam\n").unwrap();
+        // Legacy shards cannot identify the BAM policy on their own. The saved
+        // root declaration is authoritative and must not be silently replaced.
+        write_shard(
+            &output,
+            "transcript",
+            "chr21",
+            schema("merged", "116", None),
+        );
+        let shard = output.join("transcript/chr21.parquet");
+        let original_shard = std::fs::read(&shard).unwrap();
+        for incoming_bam in [false, true] {
+            let native_schema = schema("merged", "116", Some(incoming_bam));
+            for existing in [
+                policy(!incoming_bam),
+                CacheReferencePolicy {
+                    cache_source_type: "ensembl".to_string(),
+                    ..policy(incoming_bam)
+                },
+                CacheReferencePolicy {
+                    cache_version: "115".to_string(),
+                    ..policy(incoming_bam)
+                },
+            ] {
+                let saved = serde_json::to_vec_pretty(&existing).unwrap();
+                std::fs::write(output.join(REFERENCE_POLICY_FILE), &saved).unwrap();
+                let error = CacheReferencePolicy::preserve(&native_schema, &native, &output)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("existing reference policy"), "{error}");
+                assert!(error.contains("conflicts with native cache"), "{error}");
+                assert!(error.contains("rebuild into a new destination"), "{error}");
+                assert_eq!(
+                    std::fs::read(output.join(REFERENCE_POLICY_FILE)).unwrap(),
+                    saved
+                );
+                assert_eq!(std::fs::read(&shard).unwrap(), original_shard);
+            }
+        }
+    }
+
+    #[cfg(feature = "cache-builder")]
+    #[test]
     fn reference_policy_refresh_validates_existing_shards_before_atomic_write() {
         let root = tempfile::tempdir().unwrap();
         let native = root.path().join("native");
@@ -430,6 +489,26 @@ mod tests {
             assert!(error.contains("chr21.parquet"), "{error}");
             assert!(!output.join(REFERENCE_POLICY_FILE).exists());
             std::fs::write(output.join(REFERENCE_POLICY_FILE), &saved).unwrap();
+        }
+
+        // A matching root must not hide a conflicting shard on resume either.
+        for conflicting in [
+            schema("ensembl", "116", None),
+            schema("merged", "115", None),
+            schema("merged", "116", Some(false)),
+        ] {
+            write_shard(&output, "transcript", "chr21", conflicting);
+            let shard = output.join("transcript/chr21.parquet");
+            let shard_bytes = std::fs::read(&shard).unwrap();
+            let error = CacheReferencePolicy::preserve(&native_schema, &native, &output)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("chr21.parquet"), "{error}");
+            assert_eq!(std::fs::read(&shard).unwrap(), shard_bytes);
+            assert_eq!(
+                std::fs::read(output.join(REFERENCE_POLICY_FILE)).unwrap(),
+                saved
+            );
         }
     }
 }

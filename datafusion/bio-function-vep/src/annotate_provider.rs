@@ -6027,6 +6027,33 @@ impl AnnotateProvider {
         Ok(Arc::new(exec))
     }
 
+    /// Only HGVSc and USED_REF consume the per-variant genomic sequence.
+    /// VCF `fields` and SQL projection can independently omit both consumers.
+    fn output_needs_genomic_reference(
+        &self,
+        projection: Option<&[usize]>,
+        hgvs_flags: &HgvsFlags,
+    ) -> bool {
+        let csq_index = self.vcf_field_count();
+        let emits = |name: &str| {
+            let typed = self
+                .annotation_column_defs
+                .iter()
+                .position(|field| field.name == name)
+                .is_some_and(|index| {
+                    projection.is_none_or(|columns| columns.contains(&(csq_index + 2 + index)))
+                });
+            let csq = projection.is_none_or(|columns| columns.contains(&csq_index))
+                && self
+                    .csq_field_projection
+                    .as_ref()
+                    .is_none_or(|fields| fields.emits(name));
+            typed || csq
+        };
+        (hgvs_flags.hgvsc && emits("HGVSc"))
+            || (self.transcript_selection.bam_edited == Some(true) && emits("USED_REF"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn annotate_batch_with_transcript_engine(
         &self,
@@ -6039,6 +6066,7 @@ impl AnnotateProvider {
         #[cfg(not(feature = "parquet-cache"))] _sift_kv: &Option<()>,
         skip_csq: bool,
         skip_typed_cols: bool,
+        needs_genomic_reference: bool,
         flags: &VepFlags,
         hgvs_flags: &HgvsFlags,
         transcript_selection: TranscriptSelectionFlags,
@@ -6639,7 +6667,7 @@ impl AnnotateProvider {
                 // rules. Read the normalized reference interval once per row,
                 // only when an overlapping transcript can consume it.
                 let genomic_reference = if variant.ref_allele != "-"
-                    && (hgvs_flags.hgvsc || transcript_selection.bam_edited == Some(true))
+                    && needs_genomic_reference
                     && variant
                         .end
                         .checked_sub(variant.start)
@@ -13850,6 +13878,7 @@ fn annotate_worker_window(
                 &sift_kv,
                 skip_csq,
                 skip_typed_cols,
+                tmp_provider.output_needs_genomic_reference(projection, &config.hgvs_flags),
                 &config.flags,
                 &config.hgvs_flags,
                 config.transcript_selection,
@@ -16702,6 +16731,116 @@ mod tests {
     }
 
     #[test]
+    fn projected_reference_consumers_control_actual_fasta_queries() {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        let input_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, true),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let input = RecordBatch::try_new(
+            Arc::new(input_schema.clone()),
+            vec![
+                Arc::new(StringArray::from(vec!["2"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10])),
+                Arc::new(Int64Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let mut tx = make_tx("ENST_PROJECTED_REF", None, None, None, None);
+        tx.chrom = "2".into();
+        tx.spliced_seq = Some("A".repeat(100));
+        let transcripts = [tx];
+        let exons = [ExonFeature {
+            transcript_id: "ENST_PROJECTED_REF".into(),
+            exon_number: 1,
+            start: 1,
+            end: 100,
+        }];
+        let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+        let tmp = tempfile::tempdir().unwrap();
+        let fasta = tmp.path().join("reference.fa");
+        // Opening this FASTA succeeds, but any read of the input's chromosome
+        // fails. A passing no-consumer query therefore proves the I/O was skipped.
+        std::fs::write(&fasta, b">1\nA\n").unwrap();
+        std::fs::write(tmp.path().join("reference.fa.fai"), b"1\t1\t3\t1\t2\n").unwrap();
+        for (columns, fields, expects_read) in [
+            (vec!["most_severe_consequence"], None, false),
+            (vec!["Feature"], None, false),
+            (vec!["GIVEN_REF"], None, false),
+            (vec!["BAM_EDIT"], None, false),
+            (vec!["USED_REF"], None, true),
+            (vec!["HGVSc"], None, true),
+            (vec!["CSQ"], Some("Allele,Consequence"), false),
+            (vec!["CSQ"], Some("Allele,GIVEN_REF,BAM_EDIT"), false),
+            (vec!["CSQ"], Some("Allele,USED_REF"), true),
+            (vec!["CSQ"], Some("Allele,HGVSc"), true),
+            (vec!["CSQ"], None, true),
+        ] {
+            let mut options = serde_json::json!({"everything": true});
+            if let Some(fields) = fields {
+                options["fields"] = serde_json::json!(fields.split(',').collect::<Vec<_>>());
+            }
+            let options = options.to_string();
+            let provider = AnnotateProvider::new(
+                Arc::new(SessionContext::new()),
+                "vcf".into(),
+                String::new(),
+                AnnotationBackend::Parquet,
+                CacheMetadata {
+                    source_type: CacheSourceType::Merged,
+                    bam_edited: Some(true),
+                },
+                Some(options.clone()),
+                input_schema.clone(),
+            )
+            .unwrap();
+            let projection: Vec<_> = columns
+                .iter()
+                .map(|name| provider.schema().index_of(name).unwrap())
+                .collect();
+            let hgvs_flags = HgvsFlags {
+                hgvsc: true,
+                ..Default::default()
+            };
+            let needs_reference =
+                provider.output_needs_genomic_reference(Some(&projection), &hgvs_flags);
+            let output = provider.annotate_batch_with_transcript_engine(
+                &input,
+                &TranscriptConsequenceEngine::default().with_reference_policy(Some(true)),
+                &context,
+                &HashMap::new(),
+                &mut SiftPolyphenCache::new(),
+                &None,
+                !columns.contains(&"CSQ"),
+                columns == ["CSQ"] || columns == ["most_severe_consequence"],
+                needs_reference,
+                &VepFlags::from_options_json(Some(&options)),
+                &hgvs_flags,
+                provider.transcript_selection,
+                &PickFlags::default(),
+                &mut Some(
+                    fasta::io::indexed_reader::Builder::default()
+                        .build_from_path(&fasta)
+                        .unwrap(),
+                ),
+                #[cfg(feature = "parquet-cache")]
+                None,
+            );
+            if expects_read {
+                let error = output.unwrap_err().to_string();
+                assert!(error.contains("querying FASTA"), "{columns:?}: {error}");
+            } else {
+                assert_eq!(output.unwrap().num_rows(), 1, "{columns:?}");
+            }
+        }
+    }
+
+    #[test]
     fn reference_policy_keeps_typed_columns_csq_and_null_rows_aligned() {
         use datafusion::arrow::array::{ArrayRef, Int64Array};
         let input_schema = Schema::new(vec![
@@ -16778,6 +16917,7 @@ mod tests {
                             &None,
                             false,
                             false,
+                            true,
                             &VepFlags::from_options_json(Some(&options)),
                             &HgvsFlags::default(),
                             provider.transcript_selection,
@@ -17514,6 +17654,7 @@ mod tests {
                     &None,
                     false,
                     skip_typed_cols,
+                    true,
                     &flags,
                     &HgvsFlags::default(),
                     TranscriptSelectionFlags::default(),
@@ -17625,6 +17766,7 @@ mod tests {
                             &None,
                             skip_csq,
                             skip_typed_cols,
+                            true,
                             &flags,
                             &HgvsFlags::default(),
                             TranscriptSelectionFlags::default(),

@@ -75,10 +75,12 @@ tables.
 
 Native cache conversion preserves `info.txt`'s BAM reference policy in Arrow
 metadata (`bio.vep.cache_bam_edited`) and a versioned root
-`reference_policy.json`. Resuming a completed conversion refreshes this small
-metadata file without rewriting biological shards. Existing shard source,
-version, and explicit BAM metadata must agree with the native cache; conflicting
-or malformed metadata is rejected with the offending path.
+`reference_policy.json`. Resuming a completed legacy conversion can add this
+small metadata file without rewriting biological shards. An existing root
+policy must match the native cache and is never overwritten with a conflicting
+value. Every resume validates existing shard source, version and explicit BAM
+metadata, including when the root policy already matches. Conflicting or
+malformed metadata is rejected with the offending path.
 
 A known policy controls `GIVEN_REF`, `USED_REF` and `BAM_EDIT` independently of cache source
 mode. When enabled, fully mapped transcript alleles use the cached transcript
@@ -99,6 +101,8 @@ Per-row genomic reference reads share a bounded 64 KiB FASTA window within each
 annotation batch. Nearby SNVs and small indels reuse one indexed read; contig
 changes and window crossings refill it, and long variants use an exact read.
 Transcript hydration and HGVS indel-shift reads keep their existing paths.
+Queries that project neither HGVSc nor USED_REF skip these per-row reads;
+both typed-column projection and a custom CSQ `fields` list are respected.
 
 ### Cache Source Modes and Transcript Filtering
 
