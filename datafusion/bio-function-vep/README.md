@@ -80,13 +80,16 @@ metadata file without rewriting biological shards. Existing shard source,
 version, and explicit BAM metadata must agree with the native cache; conflicting
 or malformed metadata is rejected with the offending path.
 
-A known policy controls `GIVEN_REF` and `USED_REF` independently of cache source
+A known policy controls `GIVEN_REF`, `USED_REF` and `BAM_EDIT` independently of cache source
 mode. When enabled, fully mapped transcript alleles use the cached transcript
 sequence, or the supplied genomic FASTA for ordinary unedited transcripts.
 Intronic and incomplete mappings keep the submitted allele. Ordinary HGVSc
 uses the genomic reference; transcripts with actual RNA edits retain their
 feature reference. Legacy caches without either form of policy metadata keep
-their previous behavior: missing metadata is unknown, not evidence of BAM edits.
+their previous transcript-reference behavior: missing metadata is unknown, not
+evidence of BAM edits. Genomic HGVSc reference selection also applies to known
+false and unknown policies; only actual RNA edits restore the reference TVA
+feature allele, which itself follows the transcript-reference policy.
 
 The policy is resolved before output planning so typed columns, CSQ headers,
 selected CSQ fields, and worker output share the same field order. Every loaded

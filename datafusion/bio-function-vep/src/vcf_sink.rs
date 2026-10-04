@@ -2278,10 +2278,7 @@ mod tests {
                     let refs = bam_edited.unwrap_or(source_type != CacheSourceType::Ensembl);
                     assert_eq!(fields.contains(&"GIVEN_REF"), refs);
                     assert_eq!(fields.contains(&"USED_REF"), refs);
-                    assert_eq!(
-                        fields.contains(&"BAM_EDIT"),
-                        source_type != CacheSourceType::Ensembl
-                    );
+                    assert_eq!(fields.contains(&"BAM_EDIT"), refs);
                     config.fields = Some(vec!["USED_REF".into(), "Feature".into()]);
                     match csq_header_description(&config, metadata) {
                         Ok(header) => {

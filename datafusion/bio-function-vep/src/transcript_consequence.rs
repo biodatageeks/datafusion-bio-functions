@@ -9307,6 +9307,7 @@ fn used_ref_with_cache_policy(
     )
 }
 
+/// Return a complete, consecutive sequence of 1-based cDNA indices in genomic order.
 fn complete_unedited_reference_mapping(
     variant: &VariantInput,
     tx: &TranscriptFeature,
@@ -10487,14 +10488,20 @@ mod tests {
             let exons = [exon(id, 1, 100, 199)];
             let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
             let variant = var("21", 105, 105, "C", "T");
-            let result = TranscriptConsequenceEngine::default()
-                .with_reference_policy(Some(true))
-                .evaluate_variant_prepared_with_reference(&variant, &context, Some("A"), None);
-            assert_eq!(result[0].used_ref.as_deref(), Some("G"));
-            assert_eq!(
-                result[0].hgvsc.as_deref(),
-                Some(format!("{id}:n.6G>T").as_str())
-            );
+            for (policy, reference) in [(true, "G"), (false, "C")] {
+                // The RNA-edit override restores the reference TVA's feature
+                // allele, not unconditionally the cached edited sequence. With
+                // use_feature_ref=false and no_ref_check=true VEP constructs
+                // that TVA from the supplied REF (VFO.pm:368-395,424).
+                let result = TranscriptConsequenceEngine::default()
+                    .with_reference_policy(Some(policy))
+                    .evaluate_variant_prepared_with_reference(&variant, &context, Some("A"), None);
+                assert_eq!(result[0].used_ref.as_deref(), Some(reference));
+                assert_eq!(
+                    result[0].hgvsc.as_deref(),
+                    Some(format!("{id}:n.6{reference}>T").as_str())
+                );
+            }
         }
     }
 

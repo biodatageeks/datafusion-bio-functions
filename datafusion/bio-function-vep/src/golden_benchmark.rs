@@ -754,14 +754,16 @@ fn reference_policy_fields(
     bam_edited: Option<bool>,
 ) -> Vec<&'static str> {
     match bam_edited {
-        Some(false) => fields.retain(|name| !matches!(*name, "GIVEN_REF" | "USED_REF")),
+        Some(false) => {
+            fields.retain(|name| !matches!(*name, "GIVEN_REF" | "USED_REF" | "BAM_EDIT"))
+        }
         Some(true) if !refseq && !merged => {
             let before = if everything { "GENE_PHENO" } else { "SOURCE" };
             let position = fields
                 .iter()
                 .position(|name| *name == before)
                 .unwrap_or(fields.len());
-            fields.splice(position..position, ["GIVEN_REF", "USED_REF"]);
+            fields.splice(position..position, ["GIVEN_REF", "USED_REF", "BAM_EDIT"]);
         }
         _ => {}
     }

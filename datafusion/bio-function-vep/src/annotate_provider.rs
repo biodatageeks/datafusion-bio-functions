@@ -994,7 +994,7 @@ fn annotation_column_defs_for_selection(
         annotation_column_defs(include_pick_output)
     };
     if !transcript_selection.reference_fields() {
-        defs.retain(|def| !matches!(def.name, "GIVEN_REF" | "USED_REF"));
+        defs.retain(|def| !matches!(def.name, "GIVEN_REF" | "USED_REF" | "BAM_EDIT"));
     } else if !transcript_selection.refseq_fields() {
         let position = defs
             .iter()
@@ -1002,7 +1002,7 @@ fn annotation_column_defs_for_selection(
             .unwrap_or(defs.len());
         defs.splice(
             position..position,
-            ["GIVEN_REF", "USED_REF"].map(|name| AnnotationColumnDef {
+            ["GIVEN_REF", "USED_REF", "BAM_EDIT"].map(|name| AnnotationColumnDef {
                 name,
                 data_type: list_utf8_data_type(),
                 category: AnnotationCategory::Transcript,
@@ -6292,7 +6292,7 @@ impl AnnotateProvider {
                         b_given_ref.append(false);
                         b_used_ref.append(false);
                     }
-                    if include_refseq_fields {
+                    if include_reference_fields {
                         b_bam_edit.append(false);
                     }
                     b_gene_pheno.append(false);
@@ -7139,7 +7139,7 @@ impl AnnotateProvider {
                             if include_reference_fields {
                                 let _ = write!(csq_buf, "|{given_ref}|{used_ref}");
                             }
-                            if include_refseq_fields {
+                            if include_reference_fields {
                                 let _ = write!(csq_buf, "|{bam_edit}");
                             }
                             let _ = write!(
@@ -7172,9 +7172,10 @@ impl AnnotateProvider {
                             if include_reference_fields {
                                 let _ = write!(csq_buf, "|{given_ref}|{used_ref}");
                             }
-                            if include_refseq_fields {
+                            if include_reference_fields {
                                 let _ = write!(csq_buf, "|{bam_edit}");
-                            } else {
+                            }
+                            if !include_refseq_fields {
                                 let _ = write!(csq_buf, "|{source_val}");
                             }
                             let _ = write!(
@@ -7648,7 +7649,7 @@ impl AnnotateProvider {
                             append_opt_str(b_given_ref.values(), Some(given_ref));
                             append_opt_str(b_used_ref.values(), Some(used_ref));
                         }
-                        if include_refseq_fields {
+                        if include_reference_fields {
                             append_opt_str(b_bam_edit.values(), Some(bam_edit.as_str()));
                         }
 
@@ -7819,7 +7820,7 @@ impl AnnotateProvider {
                         b_given_ref.append(true);
                         b_used_ref.append(true);
                     }
-                    if include_refseq_fields {
+                    if include_reference_fields {
                         b_bam_edit.append(true);
                     }
                     b_gene_pheno.append(true);
@@ -7880,7 +7881,7 @@ impl AnnotateProvider {
                         b_given_ref.append(false);
                         b_used_ref.append(false);
                     }
-                    if include_refseq_fields {
+                    if include_reference_fields {
                         b_bam_edit.append(false);
                     }
                     b_gene_pheno.append(false);
@@ -8139,7 +8140,7 @@ impl AnnotateProvider {
                 out_cols.push(Arc::new(b_given_ref.finish()));
                 out_cols.push(Arc::new(b_used_ref.finish()));
             }
-            if include_refseq_fields {
+            if include_reference_fields {
                 out_cols.push(Arc::new(b_bam_edit.finish()));
             }
             out_cols.push(Arc::new(b_gene_pheno.finish()));
@@ -16616,7 +16617,7 @@ mod tests {
                     );
                     assert_eq!(
                         provider.schema().field_with_name("BAM_EDIT").is_ok(),
-                        source != CacheSourceType::Ensembl
+                        expected_refs
                     );
                     let output = provider
                         .annotate_batch_with_transcript_engine(
