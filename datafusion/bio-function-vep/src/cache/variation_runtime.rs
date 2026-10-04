@@ -48,7 +48,7 @@ pub struct TakeTiming {
 /// into annotation output) and always include the coordinate/matcher columns the
 /// read seam needs.
 pub fn ensure_runtime_projection(projection: Vec<String>) -> Vec<String> {
-    let mut sanitized = Vec::with_capacity(projection.len() + 4);
+    let mut sanitized = Vec::with_capacity(projection.len() + 5);
     for column in projection {
         // `tier` is a build-only clustering column: it is stored in the dataset
         // (so it is no longer in VARIATION_FORBIDDEN_COLUMNS) but must never be
@@ -61,7 +61,9 @@ pub fn ensure_runtime_projection(projection: Vec<String>) -> Vec<String> {
             sanitized.push(column);
         }
     }
-    for required in ["start", "end", "allele_string", "failed"] {
+    // The physical reader omits absent columns in legacy files. Such batches
+    // default to forward strand in the matcher; explicit negative rows survive.
+    for required in ["start", "end", "allele_string", "failed", "strand"] {
         if !sanitized.iter().any(|column| column == required) {
             sanitized.push(required.to_string());
         }

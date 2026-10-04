@@ -38,13 +38,14 @@ pub(crate) fn variation_projected_schema(
         if *name == "clin_sig_allele" {
             for optional_name in VARIATION_OPTIONAL_COLUMNS {
                 if let Some((_, optional_field)) = source_schema.column_with_name(optional_name) {
-                    if optional_field.data_type() != &DataType::Utf8 {
+                    let expected_type = optional_variation_type(optional_name);
+                    if optional_field.data_type() != &expected_type {
                         return Err(DataFusionError::Execution(format!(
-                            "optional variation field {optional_name} must be Utf8, got {:?}",
+                            "optional variation field {optional_name} must be {expected_type:?}, got {:?}",
                             optional_field.data_type()
                         )));
                     }
-                    fields.push(Field::new(*optional_name, DataType::Utf8, true));
+                    fields.push(Field::new(*optional_name, expected_type, true));
                 }
             }
         }
@@ -65,7 +66,6 @@ pub const VARIATION_FORBIDDEN_COLUMNS: &[&str] = &[
     "variant_keys",
     "region_bin",
     "var_synonyms",
-    "strand",
     "source_cache_path",
     "source_file",
 ];
@@ -117,10 +117,16 @@ pub const VARIATION_REQUIRED_COLUMNS: &[&str] = &[
     "dbsnp_ids",
 ];
 
-/// Release-specific variation fields that are preserved when present but are
-/// not required. VEP cache 116 added `clin_sig_ref_allele`; cache 115 does not
-/// contain it and must retain its existing physical schema and behavior.
-pub const VARIATION_OPTIONAL_COLUMNS: &[&str] = &["clin_sig_ref_allele"];
+/// Fields preserved when present but not required of legacy converted caches.
+/// VEP 116 added `clin_sig_ref_allele`; older exports also discarded `strand`.
+pub const VARIATION_OPTIONAL_COLUMNS: &[&str] = &["clin_sig_ref_allele", "strand"];
+
+fn optional_variation_type(name: &str) -> DataType {
+    match name {
+        "strand" => DataType::Int8,
+        _ => DataType::Utf8,
+    }
+}
 
 pub fn validate_variation_schema(schema: &Schema) -> Result<()> {
     for name in VARIATION_FORBIDDEN_COLUMNS {
@@ -142,6 +148,11 @@ pub fn validate_variation_schema(schema: &Schema) -> Result<()> {
     // source table, so it is appended by the writer rather than listed in
     // VARIATION_REQUIRED_COLUMNS.
     require_type(schema, "tier", &DataType::Int8)?;
+    for name in VARIATION_OPTIONAL_COLUMNS {
+        if schema.index_of(name).is_ok() {
+            require_type(schema, name, &optional_variation_type(name))?;
+        }
+    }
     Ok(())
 }
 
@@ -195,7 +206,10 @@ mod tests {
         assert!(!VARIATION_REQUIRED_COLUMNS.contains(&"variant_keys"));
         assert!(!VARIATION_REQUIRED_COLUMNS.contains(&"tier"));
         assert!(!VARIATION_REQUIRED_COLUMNS.contains(&"clin_sig_ref_allele"));
-        assert_eq!(VARIATION_OPTIONAL_COLUMNS, &["clin_sig_ref_allele"]);
+        assert_eq!(
+            VARIATION_OPTIONAL_COLUMNS,
+            &["clin_sig_ref_allele", "strand"]
+        );
     }
 
     #[test]
@@ -210,6 +224,55 @@ mod tests {
             Field::new("tier", DataType::Int8, false),
         ]);
         validate_variation_schema(&schema).unwrap();
+    }
+
+    #[test]
+    fn variation_projection_preserves_optional_strand_without_requiring_legacy_column() {
+        let base: Vec<Field> = VARIATION_REQUIRED_COLUMNS
+            .iter()
+            .map(|name| {
+                let ty = match *name {
+                    "start" | "end" => DataType::UInt32,
+                    "failed" => DataType::Int8,
+                    _ => DataType::Utf8,
+                };
+                Field::new(*name, ty, true)
+            })
+            .collect();
+        let legacy = variation_projected_schema(&Schema::new(base.clone()), "merged").unwrap();
+        assert!(legacy.field_with_name("strand").is_err());
+        validate_variation_schema(&legacy).unwrap();
+        for ty in [DataType::Int8, DataType::Int32, DataType::Utf8] {
+            let mut fields = base.clone();
+            fields.push(Field::new("strand", ty.clone(), true));
+            let projected = variation_projected_schema(&Schema::new(fields), "merged");
+            if ty == DataType::Int8 {
+                let projected = projected.unwrap();
+                let strand = projected.field_with_name("strand").unwrap();
+                assert_eq!(strand.data_type(), &DataType::Int8);
+                assert!(strand.is_nullable());
+                validate_variation_schema(&projected).unwrap();
+            } else {
+                assert!(
+                    projected
+                        .unwrap_err()
+                        .to_string()
+                        .contains("strand must be Int8")
+                );
+                let mut invalid: Vec<Field> = legacy
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect();
+                invalid.push(Field::new("strand", ty, true));
+                assert!(
+                    validate_variation_schema(&Schema::new(invalid))
+                        .unwrap_err()
+                        .to_string()
+                        .contains("strand must be Int8")
+                );
+            }
+        }
     }
 
     #[test]

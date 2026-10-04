@@ -244,7 +244,14 @@ pub(crate) fn compare_existing_variant_alleles(
     existing_allele_string: &str,
     existing_start: i64,
     existing_end: i64,
+    existing_strand: i8,
 ) -> Option<Vec<MatchedVariantAllele>> {
+    // VEP BaseCacheVariation defaults missing/zero strand to the forward strand.
+    let existing_strand = if existing_strand == 0 {
+        1
+    } else {
+        existing_strand
+    };
     if !existing_allele_string.contains('/') {
         return (existing_start == compare_start && existing_end == compare_end)
             .then_some(Vec::new());
@@ -259,7 +266,7 @@ pub(crate) fn compare_existing_variant_alleles(
         VariantAlleleInput {
             allele_string: existing_allele_string,
             pos: existing_start,
-            strand: 1,
+            strand: existing_strand,
         },
     );
 
@@ -274,7 +281,7 @@ pub(crate) fn compare_existing_variant_alleles(
             VariantAlleleInput {
                 allele_string: existing_allele_string,
                 pos: existing_start,
-                strand: 1,
+                strand: existing_strand,
             },
         ) {
             if seen.insert(matched.clone()) {
@@ -347,6 +354,44 @@ mod tests {
     }
 
     #[test]
+    fn reverse_strand_matching_keeps_original_allele_labels_and_unshifted_state() {
+        for (input, cached, input_alt, cached_alt) in [
+            ("A/G", "T/C", "G", "C"),
+            ("AC/GT", "GT/AC", "GT", "AC"),
+            ("AC/A", "GT/T", "A", "T"),
+        ] {
+            let matched = compare_existing_variant_alleles(
+                input, 10, 11, None, None, None, cached, 10, 11, -1,
+            )
+            .unwrap();
+            assert_eq!(matched[0].a_allele, input_alt);
+            assert_eq!(matched[0].b_allele, cached_alt);
+        }
+        let matched = compare_existing_variant_alleles(
+            "A/T",
+            20,
+            20,
+            Some("A/G"),
+            Some(10),
+            Some(10),
+            "T/C",
+            10,
+            10,
+            -1,
+        )
+        .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].a_allele, "G");
+        assert_eq!(matched[0].b_allele, "C");
+        assert_eq!(
+            compare_existing_variant_alleles(
+                "A/G", 10, 10, None, None, None, "UNKNOWN", 10, 10, -1,
+            ),
+            Some(vec![])
+        );
+    }
+
+    #[test]
     fn compare_existing_variant_alleles_matches_unknown_on_active_coords_only() {
         assert_eq!(
             compare_existing_variant_alleles(
@@ -359,6 +404,7 @@ mod tests {
                 "COSMIC_MUTATION",
                 1735009,
                 1735008,
+                1,
             ),
             None
         );
@@ -377,6 +423,7 @@ mod tests {
                 "COSMIC_MUTATION",
                 1735007,
                 1735006,
+                1,
             ),
             None
         );
