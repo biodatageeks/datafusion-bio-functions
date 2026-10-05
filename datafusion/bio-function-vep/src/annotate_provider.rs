@@ -10045,6 +10045,43 @@ const MOTIF_CONTEXT_COLUMNS: &[&str] = &[
     "motif_seq",
 ];
 
+/// Sets a shared flag when dropped, so blocking context parses spawned by a
+/// future that is then dropped stop instead of finishing a whole contig.
+#[derive(Default)]
+struct ContextParseCancel(Arc<std::sync::atomic::AtomicBool>);
+
+impl ContextParseCancel {
+    fn flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Drop for ContextParseCancel {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Parse context batches one at a time, stopping once `cancelled` is set. The
+/// context parsers carry no state across batches, so the result is identical to
+/// one call over all batches; each batch is released as soon as it is parsed.
+fn parse_context_batches<T>(
+    batches: Vec<RecordBatch>,
+    cancelled: &std::sync::atomic::AtomicBool,
+    parse: impl Fn(&[RecordBatch]) -> Result<Vec<T>>,
+) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    for batch in batches {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(DataFusionError::Execution(
+                "context parse cancelled".to_string(),
+            ));
+        }
+        out.extend(parse(std::slice::from_ref(&batch))?);
+    }
+    Ok(out)
+}
+
 async fn join_parse<T: Send + 'static>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
     handle
         .await
@@ -10145,23 +10182,41 @@ async fn load_contig_context_rest(
     let (ex_batches, tl_batches, rg_batches, mt_batches) = (ex_s.0, tl_s.0, rg_s.0, mt_s.0);
 
     let (ex_raw, ex_d, tl_raw, tl_d, rg, rg_d, mt, mt_d) = if concurrent {
+        // Dropping this future (an aborted prefetch or a cancelled query)
+        // cannot stop a running blocking task, so the guard flags the parses
+        // to stop at their next batch and drop the batches they still hold.
+        let cancel = ContextParseCancel::default();
+        let ex_c = cancel.flag();
         let ex_h = tokio::task::spawn_blocking(move || {
             let t = Instant::now();
-            AnnotateProvider::parse_exon_batches("exon", &ex_batches).map(|v| (v, t.elapsed()))
+            parse_context_batches(ex_batches, &ex_c, |b| {
+                AnnotateProvider::parse_exon_batches("exon", b)
+            })
+            .map(|v| (v, t.elapsed()))
         });
+        let tl_c = cancel.flag();
         let tl_h = tokio::task::spawn_blocking(move || {
             let t = Instant::now();
-            AnnotateProvider::parse_translation_batches("translation_core", &tl_batches)
-                .map(|v| (v, t.elapsed()))
+            parse_context_batches(tl_batches, &tl_c, |b| {
+                AnnotateProvider::parse_translation_batches("translation_core", b)
+            })
+            .map(|v| (v, t.elapsed()))
         });
+        let rg_c = cancel.flag();
         let rg_h = tokio::task::spawn_blocking(move || {
             let t = Instant::now();
-            AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)
-                .map(|v| (v, t.elapsed()))
+            parse_context_batches(rg_batches, &rg_c, |b| {
+                AnnotateProvider::parse_regulatory_batches("regulatory", b)
+            })
+            .map(|v| (v, t.elapsed()))
         });
+        let mt_c = cancel.flag();
         let mt_h = tokio::task::spawn_blocking(move || {
             let t = Instant::now();
-            AnnotateProvider::parse_motif_batches("motif", &mt_batches).map(|v| (v, t.elapsed()))
+            parse_context_batches(mt_batches, &mt_c, |b| {
+                AnnotateProvider::parse_motif_batches("motif", b)
+            })
+            .map(|v| (v, t.elapsed()))
         });
         let (ex_raw, ex_d) = join_parse(ex_h).await?;
         let (tl_raw, tl_d) = join_parse(tl_h).await?;
@@ -16078,6 +16133,50 @@ mod tests {
             select_cache_backed_contigs(&["chr2".to_string()], &cache_chroms, Path::new("/cache"))
                 .unwrap_err();
         assert!(error.to_string().contains("none of the VCF"));
+    }
+
+    #[test]
+    fn context_parse_by_batch_matches_whole_parse_and_stops_when_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let batch = |ids: &[&str], starts: &[i64]| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("transcript_id", DataType::Utf8, false),
+                    Field::new("exon_number", DataType::Int64, false),
+                    Field::new("start", DataType::Int64, false),
+                    Field::new("end", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(ids.to_vec())),
+                    Arc::new(Int64Array::from(vec![1; ids.len()])),
+                    Arc::new(Int64Array::from(starts.to_vec())),
+                    Arc::new(Int64Array::from(
+                        starts.iter().map(|s| s + 10).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        let batches = vec![batch(&["T1", "T2"], &[100, 200]), batch(&["T3"], &[300])];
+        let parse = |b: &[RecordBatch]| AnnotateProvider::parse_exon_batches("exon", b);
+        let key = |v: Vec<ExonFeature>| {
+            v.into_iter()
+                .map(|e| (e.transcript_id, e.start, e.end))
+                .collect::<Vec<_>>()
+        };
+
+        let whole = key(parse(&batches).unwrap());
+        let not_cancelled = AtomicBool::new(false);
+        let by_batch = key(parse_context_batches(batches.clone(), &not_cancelled, parse).unwrap());
+        assert_eq!(by_batch, whole);
+        assert_eq!(by_batch.len(), 3);
+
+        let cancel = ContextParseCancel::default();
+        let flag = cancel.flag();
+        assert!(!flag.load(Ordering::Relaxed));
+        drop(cancel);
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(parse_context_batches(batches, &flag, parse).is_err());
     }
 
     #[test]
