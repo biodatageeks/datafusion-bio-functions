@@ -16474,6 +16474,63 @@ mod tests {
     }
 
     #[test]
+    fn context_parse_by_batch_matches_whole_parse_and_stops_when_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let batch = |ids: &[&str], starts: &[i64]| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("transcript_id", DataType::Utf8, false),
+                    Field::new("exon_number", DataType::Int64, false),
+                    Field::new("start", DataType::Int64, false),
+                    Field::new("end", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(ids.to_vec())),
+                    Arc::new(Int64Array::from(vec![1; ids.len()])),
+                    Arc::new(Int64Array::from(starts.to_vec())),
+                    Arc::new(Int64Array::from(
+                        starts.iter().map(|s| s + 10).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        let batches = vec![batch(&["T1", "T2"], &[100, 200]), batch(&["T3"], &[300])];
+        let parse = |b: &[RecordBatch]| AnnotateProvider::parse_exon_batches("exon", b);
+        let key = |v: Vec<ExonFeature>| {
+            v.into_iter()
+                .map(|e| (e.transcript_id, e.start, e.end))
+                .collect::<Vec<_>>()
+        };
+
+        let whole = key(parse(&batches).unwrap());
+        let not_cancelled = AtomicBool::new(false);
+        let by_batch = key(parse_context_batches(batches.clone(), &not_cancelled, parse).unwrap());
+        assert_eq!(by_batch, whole);
+        assert_eq!(by_batch.len(), 3);
+
+        let cancel = ContextParseCancel::default();
+        let flag = cancel.flag();
+        assert!(!flag.load(Ordering::Relaxed));
+        drop(cancel);
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(parse_context_batches(batches, &flag, parse).is_err());
+    }
+
+    #[test]
+    fn context_parallel_gate_respects_workers_and_explicit_override() {
+        assert!(!context_parallel_enabled(1, None));
+        assert!(context_parallel_enabled(2, None));
+        assert!(context_parallel_enabled(8, None));
+        assert!(context_parallel_enabled(1, Some("1")));
+        assert!(context_parallel_enabled(1, Some("true")));
+        assert!(!context_parallel_enabled(8, Some("0")));
+        // Preserve the existing override convention, including an empty value.
+        assert!(!context_parallel_enabled(8, Some("false")));
+        assert!(context_parallel_enabled(8, Some("")));
+    }
+
+    #[test]
     fn contig_prefetch_gate_decision_table() {
         // unset: on only for workers>1
         assert!(!contig_prefetch_enabled(1, None));

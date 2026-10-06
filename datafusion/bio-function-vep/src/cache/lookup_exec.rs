@@ -475,7 +475,7 @@ fn push_unique_column(columns: &mut Vec<String>, name: &str) {
 /// Columns to project from the Parquet variation shard for a probe.
 fn variation_projection_columns(cache_columns: &[String], include_colocated: bool) -> Vec<String> {
     let mut columns = Vec::with_capacity(cache_columns.len() + 16);
-    for name in ["allele_string", "end", "failed"] {
+    for name in ["allele_string", "end", "failed", "strand"] {
         push_unique_column(&mut columns, name);
     }
     for name in cache_columns {
@@ -806,32 +806,48 @@ fn probe_taken_batch_position(
     }
     let indices = BatchProbeIndices::new(batch)?;
     let mut coloc_buf = coloc_buf;
-    let prepared_coloc = if coloc_buf.is_some() {
+    let (prepared_coloc, additional_coloc, joined_coloc) = if coloc_buf.is_some() {
         let prepare_started = Instant::now();
-        let (input_ref, input_alt, input_start) =
-            vcf_to_vep_input_allele(vcf_iv_start, vcf_ref, vcf_alt);
-        let input_allele_string = format!("{input_ref}/{input_alt}");
-        let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
-        let compare_allele_string = format!("{compare_ref}/{compare_alt}");
-        let prepared = PreparedColoc {
-            chrom_norm: chrom.to_string(),
-            input_start,
-            input_allele_string,
-            compare_output_allele: output_allele_from_allele_string(&compare_allele_string)
-                .map(str::to_string),
-            unshifted_output_allele: None,
-            compare_allele_string,
-            vep_start: vep_norm_start(vcf_iv_start, vcf_ref, vcf_alt),
-            vep_end: vep_norm_end(vcf_iv_start, vcf_ref, vcf_alt),
+        let prepare = |alt: &str| {
+            let (input_ref, input_alt, input_start) =
+                vcf_to_vep_input_allele(vcf_iv_start, vcf_ref, alt);
+            let input_allele_string = format!("{input_ref}/{input_alt}");
+            let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, alt);
+            let compare_allele_string = format!("{compare_ref}/{compare_alt}");
+            PreparedColoc {
+                chrom_norm: chrom.to_string(),
+                input_start,
+                input_allele_string,
+                compare_output_allele: output_allele_from_allele_string(&compare_allele_string)
+                    .map(str::to_string),
+                unshifted_output_allele: None,
+                compare_allele_string,
+                vep_start: vep_norm_start(vcf_iv_start, vcf_ref, alt),
+                vep_end: vep_norm_end(vcf_iv_start, vcf_ref, alt),
+            }
         };
+        let mut alts = vcf_alt.split(['|', ',']).filter(|alt| !alt.is_empty());
+        // Keep the common single-ALT value inline. The empty additional vector
+        // allocates nothing; only multiallelic probes need extra storage.
+        let first = alts.next().map(&prepare);
+        let additional = alts.map(&prepare).collect::<Vec<_>>();
+        // The annotation consumer still retains an unsplit reader-joined row.
+        // Keep its original key for coordinate-only/unknown cache matches.
+        // Per-ALT keys serve decomposed inputs; full VCF parity requires input
+        // normalization until the annotation engine also decomposes raw ALTs.
+        let joined = vcf_alt.contains(['|', ',']).then(|| prepare(vcf_alt));
         metrics.colocated_prepare_elapsed += prepare_started.elapsed();
-        Some(prepared)
+        (first, additional, joined)
     } else {
-        None
+        (None, Vec::new(), None)
     };
-    let coloc_visible = prepared_coloc.as_ref().is_some_and(|prepared| {
-        probe_start_visible_to_window(probe_start, prepared.vep_start, prepared.vep_end)
-    });
+    let coloc_visible = prepared_coloc
+        .iter()
+        .chain(&additional_coloc)
+        .chain(&joined_coloc)
+        .any(|prepared| {
+            probe_start_visible_to_window(probe_start, prepared.vep_start, prepared.vep_end)
+        });
     let coloc_indices = if coloc_visible {
         resolve_batch_coloc_indices(batch)
     } else {
@@ -853,14 +869,16 @@ fn probe_taken_batch_position(
         };
 
         metrics.rows_scanned += 1;
+        let existing_strand = batch_i64_value(batch, indices.strand, row_usize)
+            .filter(|&strand| strand != 0)
+            .unwrap_or(1) as i8;
         if profile_detailed {
             metrics.primary_allele_rows += 1;
             metrics.exact_match_calls += 1;
         }
 
-        if let (Some(buf), Some(prepared), Some(ci), Some(af_cols)) = (
+        if let (Some(buf), Some(ci), Some(af_cols)) = (
             coloc_buf.as_deref_mut(),
-            prepared_coloc.as_ref(),
             coloc_indices.as_ref(),
             af_columns.as_ref(),
         ) {
@@ -869,55 +887,70 @@ fn probe_taken_batch_position(
                 metrics.colocated_allele_rows += 1;
             }
 
-            let failed = batch_i64_value(batch, ci.failed, row_usize).unwrap_or(0);
-            if failed <= allowed_failed
-                && let Some(var_name) =
-                    batch_string_value(batch, Some(ci.variation_name), row_usize)?
-                && !var_name.is_empty()
+            for prepared in prepared_coloc
+                .iter()
+                .chain(&additional_coloc)
+                .chain(&joined_coloc)
             {
-                let existing_end =
-                    batch_i64_value(batch, ci.end_col, row_usize).unwrap_or(probe_start);
-                if let Some(matched_alleles) = compare_existing_variant_alleles(
-                    &prepared.compare_allele_string,
-                    prepared.vep_start,
-                    prepared.vep_end,
-                    None,
-                    None,
-                    None,
-                    &allele_string,
-                    probe_start,
-                    existing_end,
-                ) {
-                    let key: ColocatedKey = (
-                        prepared.chrom_norm.clone(),
-                        prepared.input_start,
-                        vcf_iv_end,
-                        prepared.input_allele_string.clone(),
-                    );
-                    let sink_value = buf.entry(key).or_insert_with(|| ColocatedSinkValue {
-                        entries: Vec::new(),
-                        compare_output_allele: prepared.compare_output_allele.clone(),
-                        unshifted_output_allele: prepared.unshifted_output_allele.clone(),
-                    });
-                    sink_value.entries.push(ColocatedCacheEntry {
-                        variation_name: var_name,
-                        allele_string: allele_string.clone(),
-                        matched_alleles,
-                        somatic: batch_i64_value(batch, ci.somatic, row_usize).unwrap_or(0),
-                        pheno: batch_i64_value(batch, ci.pheno, row_usize).unwrap_or(0),
-                        clin_sig: batch_string_value(batch, ci.clin_sig, row_usize)?,
-                        clin_sig_allele: batch_string_value(batch, ci.clin_sig_allele, row_usize)?,
-                        clin_sig_ref_allele: batch_string_value(
-                            batch,
-                            ci.clin_sig_ref_allele,
-                            row_usize,
-                        )?,
-                        pubmed: batch_string_value(batch, ci.pubmed, row_usize)?,
-                        af: af_cols.clone(),
-                        af_row: row,
-                    });
-                    if profile_detailed {
-                        metrics.colocated_entries += 1;
+                if !probe_start_visible_to_window(probe_start, prepared.vep_start, prepared.vep_end)
+                {
+                    continue;
+                }
+                let failed = batch_i64_value(batch, ci.failed, row_usize).unwrap_or(0);
+                if failed <= allowed_failed
+                    && let Some(var_name) =
+                        batch_string_value(batch, Some(ci.variation_name), row_usize)?
+                    && !var_name.is_empty()
+                {
+                    let existing_end =
+                        batch_i64_value(batch, ci.end_col, row_usize).unwrap_or(probe_start);
+                    if let Some(matched_alleles) = compare_existing_variant_alleles(
+                        &prepared.compare_allele_string,
+                        prepared.vep_start,
+                        prepared.vep_end,
+                        None,
+                        None,
+                        None,
+                        &allele_string,
+                        probe_start,
+                        existing_end,
+                        existing_strand,
+                    ) {
+                        let key: ColocatedKey = (
+                            prepared.chrom_norm.clone(),
+                            prepared.input_start,
+                            vcf_iv_end,
+                            prepared.input_allele_string.clone(),
+                        );
+                        let sink_value = buf.entry(key).or_insert_with(|| ColocatedSinkValue {
+                            entries: Vec::new(),
+                            compare_output_allele: prepared.compare_output_allele.clone(),
+                            unshifted_output_allele: prepared.unshifted_output_allele.clone(),
+                        });
+                        sink_value.entries.push(ColocatedCacheEntry {
+                            variation_name: var_name,
+                            allele_string: allele_string.clone(),
+                            matched_alleles,
+                            somatic: batch_i64_value(batch, ci.somatic, row_usize).unwrap_or(0),
+                            pheno: batch_i64_value(batch, ci.pheno, row_usize).unwrap_or(0),
+                            clin_sig: batch_string_value(batch, ci.clin_sig, row_usize)?,
+                            clin_sig_allele: batch_string_value(
+                                batch,
+                                ci.clin_sig_allele,
+                                row_usize,
+                            )?,
+                            clin_sig_ref_allele: batch_string_value(
+                                batch,
+                                ci.clin_sig_ref_allele,
+                                row_usize,
+                            )?,
+                            pubmed: batch_string_value(batch, ci.pubmed, row_usize)?,
+                            af: af_cols.clone(),
+                            af_row: row,
+                        });
+                        if profile_detailed {
+                            metrics.colocated_entries += 1;
+                        }
                     }
                 }
             }
@@ -940,7 +973,34 @@ fn probe_taken_batch_position(
             continue;
         }
 
-        if exact_matcher(vcf_ref, vcf_alt, &allele_string) {
+        // Preserve the common forward fast path. Negative cache rows need the
+        // same oriented coordinate comparison even without a co-located sink.
+        let exact_match = if existing_strand == 1 {
+            exact_matcher(vcf_ref, vcf_alt, &allele_string)
+        } else {
+            // Match each input ALT independently, as the forward matcher
+            // does. Their normalized starts can differ (SNV/MNV vs indel).
+            vcf_alt
+                .split(['|', ','])
+                .filter(|alt| !alt.is_empty())
+                .any(|alt| {
+                    let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, alt);
+                    !get_matched_variant_alleles(
+                        VariantAlleleInput {
+                            allele_string: &format!("{compare_ref}/{compare_alt}"),
+                            pos: vep_norm_start(vcf_iv_start, vcf_ref, alt),
+                            strand: 1,
+                        },
+                        VariantAlleleInput {
+                            allele_string: &allele_string,
+                            pos: probe_start,
+                            strand: existing_strand,
+                        },
+                    )
+                    .is_empty()
+                })
+        };
+        if exact_match {
             if emit_output {
                 let append_started = Instant::now();
                 let Some(output_indices) = batch_output_indices(batch, cache_columns, col_map)
@@ -970,6 +1030,7 @@ struct BatchProbeIndices {
     allele_string: usize,
     end: Option<usize>,
     failed: Option<usize>,
+    strand: Option<usize>,
 }
 
 #[cfg(feature = "parquet-cache")]
@@ -982,6 +1043,7 @@ impl BatchProbeIndices {
             })?,
             end: schema.index_of("end").ok(),
             failed: schema.index_of("failed").ok(),
+            strand: schema.index_of("strand").ok(),
         })
     }
 }
@@ -2357,6 +2419,213 @@ mod tests {
         let lengths = queue.iter().map(RecordBatch::num_rows).collect::<Vec<_>>();
         assert_eq!(lengths, vec![5_000, 5_000, 2_001]);
     }
+    #[cfg(feature = "parquet-cache")]
+    #[test]
+    fn reverse_strand_matches_both_primary_and_colocated_paths() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        // None means legacy absent column; Some(None) is a nullable strand.
+        for (strand, alleles, expected) in [
+            (Some(Some(-1)), "T/C/A", true),
+            (Some(Some(-1)), "T/G", false),
+            (Some(Some(-1)), "A/G", false),
+            (Some(Some(1)), "A/G", true),
+            (Some(Some(0)), "A/G", true),
+            (Some(None), "A/G", true),
+            (None, "A/G", true),
+        ] {
+            let mut fields = vec![
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+                Field::new("variation_name", DataType::Utf8, false),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("failed", DataType::Int8, false),
+                Field::new("AF", DataType::Utf8, false),
+            ];
+            let mut columns = vec![
+                Arc::new(UInt32Array::from(vec![10])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![10])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["rs_strand_probe"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![alleles])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![0])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["C:0.23,A:0.71,G:0.41"])) as ArrayRef,
+            ];
+            if let Some(strand) = strand {
+                fields.push(Field::new("strand", DataType::Int8, true));
+                columns.push(Arc::new(Int8Array::from(vec![strand])));
+            }
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            for with_colocated in [false, true] {
+                let mut colocated = HashMap::new();
+                let mut builders = vec![make_builder(&DataType::Utf8, 1).unwrap()];
+                let mut input_rows = Vec::new();
+                let (result, _) = probe_taken_batch_position(
+                    &batch,
+                    &[0],
+                    allele_matches as fn(&str, &str, &str) -> bool,
+                    0,
+                    true,
+                    "1",
+                    10,
+                    "A",
+                    "G",
+                    10,
+                    10,
+                    true,
+                    0,
+                    &["variation_name".into()],
+                    &[0],
+                    &mut builders,
+                    &mut input_rows,
+                    with_colocated.then_some(&mut colocated),
+                )
+                .unwrap();
+                assert_eq!(
+                    result == ProbeResult::Match,
+                    expected,
+                    "{strand:?} {alleles}"
+                );
+                assert_eq!(input_rows.len(), usize::from(expected));
+                let output = builders[0].finish();
+                assert_eq!(output.len(), usize::from(expected));
+                if expected {
+                    assert_eq!(
+                        output
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(0),
+                        "rs_strand_probe"
+                    );
+                }
+                assert_eq!(colocated.len(), usize::from(expected && with_colocated));
+                if expected && with_colocated {
+                    let entry = &colocated.values().next().unwrap().entries[0];
+                    assert_eq!(entry.allele_string, alleles);
+                    assert_eq!(entry.matched_alleles[0].a_allele, "G");
+                    assert_eq!(
+                        entry.matched_alleles[0].b_allele,
+                        if strand == Some(Some(-1)) { "C" } else { "G" }
+                    );
+                    assert_eq!(entry.af_value(0), "C:0.23,A:0.71,G:0.41");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "parquet-cache")]
+    #[test]
+    fn reverse_strand_primary_matches_each_alt_at_its_normalized_start() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        for (vcf_ref, vcf_alt, cache_alleles, cache_start, cache_end, expected_matches) in [
+            ("AA", "CC", "TT/GG", 10, 11, vec![("CC", "GG")]),
+            ("AT", "A", "A/-", 11, 11, vec![("A", "-")]),
+            ("ATT", "A", "AA/-", 11, 12, vec![("A", "-")]),
+            ("A", "T,G", "T/C", 10, 10, vec![("G", "C")]),
+            ("A", "T|G", "T/C", 10, 10, vec![("G", "C")]),
+            ("A", ",G,", "T/C", 10, 10, vec![("G", "C")]),
+            ("AT", "GT,A", "A/-", 11, 11, vec![("A", "-")]),
+            ("AT", "GT|A", "A/-", 11, 11, vec![("A", "-")]),
+            // First ALT only, both ALTs, and neither ALT: each sink key is independent.
+            ("A", "G,T", "T/C", 10, 10, vec![("G", "C")]),
+            ("A", "T,G", "T/A/C", 10, 10, vec![("T", "A"), ("G", "C")]),
+            ("A", "T|G", "T/A/C", 10, 10, vec![("T", "A"), ("G", "C")]),
+            ("A", "T,C", "T/C", 10, 10, vec![]),
+            ("A", "T|C", "T/C", 10, 10, vec![]),
+        ] {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+                Field::new("variation_name", DataType::Utf8, false),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("failed", DataType::Int8, false),
+                Field::new("strand", DataType::Int8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt32Array::from(vec![cache_start])),
+                    Arc::new(UInt32Array::from(vec![cache_end])),
+                    Arc::new(StringArray::from(vec!["rs_reverse_primary"])),
+                    Arc::new(StringArray::from(vec![cache_alleles])),
+                    Arc::new(Int8Array::from(vec![0])),
+                    Arc::new(Int8Array::from(vec![-1])),
+                ],
+            )
+            .unwrap();
+            for with_colocated in [false, true] {
+                let mut colocated = HashMap::new();
+                let mut builders = vec![make_builder(&DataType::Utf8, 1).unwrap()];
+                let mut input_rows = Vec::new();
+                let (result, _) = probe_taken_batch_position(
+                    &batch,
+                    &[0],
+                    allele_matches as fn(&str, &str, &str) -> bool,
+                    0,
+                    true,
+                    "1",
+                    i64::from(cache_start),
+                    vcf_ref,
+                    vcf_alt,
+                    10,
+                    i64::from(cache_end),
+                    true,
+                    0,
+                    &["variation_name".into()],
+                    &[0],
+                    &mut builders,
+                    &mut input_rows,
+                    with_colocated.then_some(&mut colocated),
+                )
+                .unwrap();
+                let expected_primary = !expected_matches.is_empty();
+                assert_eq!(
+                    result == ProbeResult::Match,
+                    expected_primary,
+                    "{vcf_ref}>{vcf_alt}"
+                );
+                assert_eq!(input_rows.len(), usize::from(expected_primary));
+                let output = builders[0].finish();
+                assert_eq!(output.len(), usize::from(expected_primary));
+                if expected_primary {
+                    assert_eq!(input_rows, vec![0]);
+                    assert_eq!(
+                        output
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(0),
+                        "rs_reverse_primary"
+                    );
+                }
+                assert_eq!(
+                    colocated.len(),
+                    if with_colocated {
+                        expected_matches.len()
+                    } else {
+                        0
+                    }
+                );
+                for &(alt, cache_alt) in expected_matches.iter().filter(|_| with_colocated) {
+                    let (input_ref, input_alt, input_start) =
+                        vcf_to_vep_input_allele(10, vcf_ref, alt);
+                    let key = (
+                        "1".to_string(),
+                        input_start,
+                        i64::from(cache_end),
+                        format!("{input_ref}/{input_alt}"),
+                    );
+                    let value = &colocated[&key];
+                    assert_eq!(value.entries.len(), 1);
+                    let entry = &value.entries[0];
+                    assert_eq!(entry.allele_string, cache_alleles);
+                    assert_eq!(entry.matched_alleles.len(), 1);
+                    assert_eq!(entry.matched_alleles[0].b_allele, cache_alt);
+                    assert_eq!(entry.matched_alleles[0].a_allele, input_alt);
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "parquet-cache")]
     #[test]
     fn colocated_probe_matches_chr1_homopolymer_deletion() {
