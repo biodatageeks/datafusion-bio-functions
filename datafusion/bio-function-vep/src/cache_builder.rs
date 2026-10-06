@@ -346,7 +346,36 @@ mod tests {
         .write_to_entity_dir(&entity)
         .unwrap();
         let shard = entity.join("chr21.parquet");
-        std::fs::write(&shard, b"completed shard must stay unchanged").unwrap();
+        // A resume now verifies the destination's identity before refreshing
+        // native reference policy. Keep a real footer rather than arbitrary
+        // sentinel bytes; its biological payload must still remain untouched.
+        let schema = datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "sentinel",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+        ])
+        .with_metadata(
+            [
+                (
+                    "bio.vep.cache_source_type".to_string(),
+                    "ensembl".to_string(),
+                ),
+                ("bio.vep.cache_version".to_string(), "116".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&shard).unwrap(),
+            std::sync::Arc::new(schema),
+            None,
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+        let original_bytes = std::fs::read(&shard).unwrap();
         let original_modified = std::fs::metadata(&shard).unwrap().modified().unwrap();
         let builder = CacheBuilder::new(raw.to_str().unwrap(), output.to_str().unwrap())
             .with_expected_cache_version("116");
@@ -356,10 +385,7 @@ mod tests {
             std::fs::read(output.join("chr_synonyms.txt")).unwrap(),
             synonyms
         );
-        assert_eq!(
-            std::fs::read(&shard).unwrap(),
-            b"completed shard must stay unchanged"
-        );
+        assert_eq!(std::fs::read(&shard).unwrap(), original_bytes);
         assert_eq!(
             std::fs::metadata(&shard).unwrap().modified().unwrap(),
             original_modified

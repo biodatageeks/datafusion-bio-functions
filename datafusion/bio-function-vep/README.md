@@ -71,6 +71,39 @@ Cache source mode is read from Arrow schema metadata
 exporter on variation, transcript, exon, translation, regulatory, and motif
 tables.
 
+### Transcript reference policy
+
+Native cache conversion preserves `info.txt`'s BAM reference policy in Arrow
+metadata (`bio.vep.cache_bam_edited`) and a versioned root
+`reference_policy.json`. Resuming a completed legacy conversion can add this
+small metadata file without rewriting biological shards. An existing root
+policy must match the native cache and is never overwritten with a conflicting
+value. Every resume validates existing shard source, version and explicit BAM
+metadata, including when the root policy already matches. Conflicting or
+malformed metadata is rejected with the offending path.
+
+A known policy controls `GIVEN_REF`, `USED_REF` and `BAM_EDIT` independently of cache source
+mode. When enabled, fully mapped transcript alleles use the cached transcript
+sequence, or the supplied genomic FASTA for ordinary unedited transcripts.
+Intronic and incomplete mappings keep the submitted allele. Ordinary HGVSc
+uses the genomic reference; transcripts with actual RNA edits retain their
+feature reference. Legacy caches without either form of policy metadata keep
+their previous transcript-reference behavior: missing metadata is unknown, not
+evidence of BAM edits. Genomic HGVSc reference selection also applies to known
+false and unknown policies; only actual RNA edits restore the reference TVA
+feature allele, which itself follows the transcript-reference policy.
+
+The policy is resolved before output planning so typed columns, CSQ headers,
+selected CSQ fields, and worker output share the same field order. Every loaded
+entity and contig is checked against that policy.
+
+Per-row genomic reference reads share a bounded 64 KiB FASTA window within each
+annotation batch. Nearby SNVs and small indels reuse one indexed read; contig
+changes and window crossings refill it, and long variants use an exact read.
+Transcript hydration and HGVS indel-shift reads keep their existing paths.
+Queries that project neither HGVSc nor USED_REF skip these per-row reads;
+both typed-column projection and a custom CSQ `fields` list are respected.
+
 ### Cache Source Modes and Transcript Filtering
 
 Transcript filtering follows Ensembl VEP release/115 source-mode behavior. The

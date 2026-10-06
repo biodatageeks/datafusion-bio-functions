@@ -20,6 +20,7 @@ use std::sync::Arc;
 use datafusion::common::Result;
 
 use crate::cache::manifest::ChromManifest;
+use crate::cache::reference_policy::CacheReferencePolicy;
 use crate::cache::synonyms::ChromosomeSynonyms;
 
 /// Directory name for a Parquet cache entity (e.g. `variation`).
@@ -33,6 +34,7 @@ pub struct PartitionedParquetCache {
     base_dir: PathBuf,
     variation_manifest: ChromManifest,
     synonyms: Arc<ChromosomeSynonyms>,
+    reference_policy: Option<CacheReferencePolicy>,
 }
 
 impl PartitionedParquetCache {
@@ -52,15 +54,21 @@ impl PartitionedParquetCache {
             return Ok(None);
         };
         let synonyms = Arc::new(ChromosomeSynonyms::read(&base_dir)?);
+        let reference_policy = CacheReferencePolicy::read(&base_dir)?;
         Ok(Some(Self {
             base_dir,
             variation_manifest,
             synonyms,
+            reference_policy,
         }))
     }
 
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
+    }
+
+    pub(crate) fn reference_policy(&self) -> Option<&CacheReferencePolicy> {
+        self.reference_policy.as_ref()
     }
 
     pub fn available_chroms(&self) -> Vec<&str> {

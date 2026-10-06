@@ -31,6 +31,7 @@ pub(crate) struct CacheIdentity {
     pub(crate) source_type: CacheSourceType,
     pub(crate) cache_version: String,
     pub(crate) target: &'static SupportedVepTarget,
+    pub(crate) bam_edited: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,8 +112,22 @@ impl LazyCacheIdentityValidator {
 
         let shards = participating_shards(cache, chrom)?;
         let mut first: Option<(String, PathBuf, CacheSourceType, String)> = None;
+        let mut bam_edited = None;
         for (entity, path) in shards {
             let schema = read_parquet_shard_schema(&path).await?;
+            if let Some(shard_policy) = crate::cache::reference_policy::resolved_bam_policy(
+                &schema,
+                cache.reference_policy(),
+                &path,
+            )? {
+                if bam_edited.is_some_and(|prior| prior != shard_policy) {
+                    return Err(DataFusionError::Execution(format!(
+                        "annotate_vep(): conflicting BAM reference policy for contig '{chrom}', entity '{entity}', shard '{}'",
+                        path.display()
+                    )));
+                }
+                bam_edited = Some(shard_policy);
+            }
             let source_type = CacheSourceType::from_schema(&schema).map_err(|error| {
                 DataFusionError::Execution(format!(
                     "annotate_vep(): cache identity validation failed for contig \
@@ -175,6 +190,7 @@ impl LazyCacheIdentityValidator {
 
         let identity = CacheIdentity {
             source_type,
+            bam_edited,
             target: target_for_cache_version(&cache_version)?,
             cache_version,
         };
@@ -182,6 +198,7 @@ impl LazyCacheIdentityValidator {
         if let Some(invocation) = &state.invocation_identity {
             if invocation.source_type != identity.source_type
                 || invocation.cache_version != identity.cache_version
+                || invocation.bam_edited != identity.bam_edited
             {
                 return Err(DataFusionError::Execution(format!(
                     "annotate_vep(): cache identity changed within one invocation at \

@@ -196,7 +196,7 @@ use crate::allele::{
 use crate::annotation_store::AnnotationBackend;
 #[cfg(feature = "parquet-cache")]
 use crate::cache::lookup_exec::ParquetVariationLookupCell;
-use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
+use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheMetadata, CacheSourceType};
 use crate::colocated::{
     AfColumns, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
 };
@@ -988,11 +988,29 @@ fn annotation_column_defs_for_selection(
     transcript_selection: TranscriptSelectionFlags,
     include_pick_output: bool,
 ) -> Vec<AnnotationColumnDef> {
-    if transcript_selection.refseq_fields() {
+    let mut defs = if transcript_selection.refseq_fields() {
         refseq_annotation_column_defs(transcript_selection.source_field(), include_pick_output)
     } else {
         annotation_column_defs(include_pick_output)
+    };
+    if !transcript_selection.reference_fields() {
+        defs.retain(|def| !matches!(def.name, "GIVEN_REF" | "USED_REF" | "BAM_EDIT"));
+    } else if !transcript_selection.refseq_fields() {
+        let position = defs
+            .iter()
+            .position(|def| def.name == "GENE_PHENO")
+            .unwrap_or(defs.len());
+        defs.splice(
+            position..position,
+            ["GIVEN_REF", "USED_REF", "BAM_EDIT"].map(|name| AnnotationColumnDef {
+                name,
+                data_type: list_utf8_data_type(),
+                category: AnnotationCategory::Transcript,
+                cache_col: None,
+            }),
+        );
     }
+    defs
 }
 
 /// Returns the list of cache column names needed for the variation lookup query.
@@ -1649,6 +1667,7 @@ impl HgvsFlags {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct TranscriptSelectionFlags {
     cache_source_type: CacheSourceType,
+    bam_edited: Option<bool>,
     gencode_basic: bool,
     gencode_primary: bool,
     all_refseq: bool,
@@ -1691,6 +1710,7 @@ impl TranscriptSelectionFlags {
 
         Ok(Self {
             cache_source_type,
+            bam_edited: None,
             gencode_basic,
             gencode_primary,
             all_refseq,
@@ -1707,6 +1727,10 @@ impl TranscriptSelectionFlags {
             self.cache_source_type,
             CacheSourceType::RefSeq | CacheSourceType::Merged
         )
+    }
+
+    fn reference_fields(self) -> bool {
+        self.bam_edited.unwrap_or(self.refseq_fields())
     }
 
     fn source_field(self) -> bool {
@@ -1806,11 +1830,12 @@ impl CsqPlaceholderLayout {
         transcript_selection: TranscriptSelectionFlags,
         include_pick: bool,
     ) -> Self {
-        let fields = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
+        let fields = crate::golden_benchmark::csq_field_names_with_reference_policy(
             everything,
             transcript_selection.cache_source_type == CacheSourceType::RefSeq,
             transcript_selection.cache_source_type == CacheSourceType::Merged,
             include_pick,
+            transcript_selection.bam_edited,
         )
         .into_iter()
         .map(CsqPlaceholderField::from_name)
@@ -1895,18 +1920,21 @@ impl CsqFieldProjection {
         include_pick: bool,
         requested: &[String],
     ) -> Result<Self> {
-        let (selected_names, indices) = crate::golden_benchmark::resolve_csq_field_selection(
+        let (selected_names, indices) =
+            crate::golden_benchmark::resolve_csq_field_selection_with_reference_policy(
+                everything,
+                transcript_selection.cache_source_type == CacheSourceType::RefSeq,
+                transcript_selection.cache_source_type == CacheSourceType::Merged,
+                include_pick,
+                transcript_selection.bam_edited,
+                requested,
+            )?;
+        let full_base_field_count = crate::golden_benchmark::csq_field_names_with_reference_policy(
             everything,
             transcript_selection.cache_source_type == CacheSourceType::RefSeq,
             transcript_selection.cache_source_type == CacheSourceType::Merged,
             include_pick,
-            requested,
-        )?;
-        let full_base_field_count = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
-            everything,
-            transcript_selection.cache_source_type == CacheSourceType::RefSeq,
-            transcript_selection.cache_source_type == CacheSourceType::Merged,
-            include_pick,
+            transcript_selection.bam_edited,
         )
         .len();
         let mut output_position_by_input = vec![None; full_base_field_count];
@@ -3878,14 +3906,17 @@ impl AnnotateProvider {
         vcf_table: String,
         cache_source: String,
         backend: AnnotationBackend,
-        cache_source_type: CacheSourceType,
+        cache_metadata: impl Into<CacheMetadata>,
         options_json: Option<String>,
         vcf_schema: Schema,
     ) -> Result<Self> {
-        let transcript_selection = TranscriptSelectionFlags::from_options_json(
+        let cache_metadata = cache_metadata.into();
+        let cache_source_type = cache_metadata.source_type;
+        let mut transcript_selection = TranscriptSelectionFlags::from_options_json(
             cache_source_type,
             options_json.as_deref(),
         )?;
+        transcript_selection.bam_edited = cache_metadata.bam_edited;
         let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
         let include_pick_output = pick_flags.include_pick_output();
         let regions = crate::regions::parse_regions_option(options_json.as_deref())?;
@@ -3915,7 +3946,16 @@ impl AnnotateProvider {
             .collect();
         let mut fields = input_fields_for_output(&vcf_schema, &reserved);
 
-        fields.push(Arc::new(Field::new("CSQ", DataType::Utf8, true)));
+        fields.push(Arc::new(
+            Field::new("CSQ", DataType::Utf8, true).with_metadata(
+                [(
+                    crate::cache_source::ANNOTATION_CACHE_LAYOUT_KEY.to_string(),
+                    cache_metadata.layout_identity(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        ));
         fields.push(Arc::new(Field::new(
             "most_severe_consequence",
             DataType::Utf8,
@@ -5987,6 +6027,33 @@ impl AnnotateProvider {
         Ok(Arc::new(exec))
     }
 
+    /// Only HGVSc and USED_REF consume the per-variant genomic sequence.
+    /// VCF `fields` and SQL projection can independently omit both consumers.
+    fn output_needs_genomic_reference(
+        &self,
+        projection: Option<&[usize]>,
+        hgvs_flags: &HgvsFlags,
+    ) -> bool {
+        let csq_index = self.vcf_field_count();
+        let emits = |name: &str| {
+            let typed = self
+                .annotation_column_defs
+                .iter()
+                .position(|field| field.name == name)
+                .is_some_and(|index| {
+                    projection.is_none_or(|columns| columns.contains(&(csq_index + 2 + index)))
+                });
+            let csq = projection.is_none_or(|columns| columns.contains(&csq_index))
+                && self
+                    .csq_field_projection
+                    .as_ref()
+                    .is_none_or(|fields| fields.emits(name));
+            typed || csq
+        };
+        (hgvs_flags.hgvsc && emits("HGVSc"))
+            || (self.transcript_selection.bam_edited == Some(true) && emits("USED_REF"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn annotate_batch_with_transcript_engine(
         &self,
@@ -5999,6 +6066,7 @@ impl AnnotateProvider {
         #[cfg(not(feature = "parquet-cache"))] _sift_kv: &Option<()>,
         skip_csq: bool,
         skip_typed_cols: bool,
+        needs_genomic_reference: bool,
         flags: &VepFlags,
         hgvs_flags: &HgvsFlags,
         transcript_selection: TranscriptSelectionFlags,
@@ -6009,6 +6077,7 @@ impl AnnotateProvider {
         >,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
+        let mut genomic_reference_window = GenomicReferenceWindow::default();
         let include_pick_output = self.include_pick_output;
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
             DataFusionError::Execution(
@@ -6182,6 +6251,7 @@ impl AnnotateProvider {
         let mut b_cosmic_ids = ListBuilder::new(StringBuilder::new());
         let mut b_dbsnp_ids = ListBuilder::new(StringBuilder::new());
         let include_refseq_fields = transcript_selection.refseq_fields();
+        let include_reference_fields = transcript_selection.reference_fields();
         let include_source_field = transcript_selection.source_field();
         let needs_sift_polyphen = output_needs_sift_polyphen(
             skip_csq,
@@ -6246,8 +6316,12 @@ impl AnnotateProvider {
                             b_source.append(false);
                         }
                         b_refseq_offset.append(false);
+                    }
+                    if include_reference_fields {
                         b_given_ref.append(false);
                         b_used_ref.append(false);
+                    }
+                    if include_reference_fields {
                         b_bam_edit.append(false);
                     }
                     b_gene_pheno.append(false);
@@ -6588,9 +6662,34 @@ impl AnnotateProvider {
                 if let Some(started) = variant_construct_started {
                     engine_profile.variant_construct += started.elapsed();
                 }
+                let hgvs_shift_started = engine_profile_enabled.then(Instant::now);
+                // Genomic HGVSc REF and transcript USED_REF have independent
+                // rules. Read the normalized reference interval once per row,
+                // only when an overlapping transcript can consume it.
+                let genomic_reference = if variant.ref_allele != "-"
+                    && needs_genomic_reference
+                    && variant
+                        .end
+                        .checked_sub(variant.start)
+                        .and_then(|span| span.checked_add(1))
+                        == i64::try_from(variant.ref_allele.len()).ok()
+                    && ctx.overlaps_transcript(annotation_chrom, variant.start, variant.end)
+                {
+                    hgvs_reference_reader.as_mut().map(|reader| {
+                        let sequence = genomic_reference_window.read(reader, annotation_chrom.strip_prefix("chr").unwrap_or(annotation_chrom), variant.start, variant.end)?;
+                        if sequence.len() != variant.ref_allele.len() {
+                            return Err(DataFusionError::Execution(format!(
+                                "annotate_vep(): incomplete genomic reference for {}:{}-{}: expected {} bases, got {}",
+                                annotation_chrom, variant.start, variant.end, variant.ref_allele.len(), sequence.len()
+                            )));
+                        }
+                        Ok(sequence.to_ascii_uppercase())
+                    }).transpose()?
+                } else {
+                    None
+                };
                 // Only compute genomic shift for indels (ref != alt length).
                 // SNVs/MNVs don't shift and skipping avoids allele normalization overhead.
-                let hgvs_shift_started = engine_profile_enabled.then(Instant::now);
                 if let Some(reader) = hgvs_reference_reader.as_mut() {
                     if ref_al.len() != alt_allele.len() {
                         let chrom_norm = annotation_chrom
@@ -6643,11 +6742,12 @@ impl AnnotateProvider {
                     engine_profile,
                     evaluate_prepared,
                     {
-                        if let Some(profile) = tx_engine_profile.as_mut() {
-                            engine.evaluate_variant_prepared_profiled(&variant, ctx, profile)
-                        } else {
-                            engine.evaluate_variant_prepared(&variant, ctx)
-                        }
+                        engine.evaluate_variant_prepared_with_reference(
+                            &variant,
+                            ctx,
+                            genomic_reference.as_deref(),
+                            tx_engine_profile.as_mut(),
+                        )
                     }
                 );
                 if engine_profile_enabled {
@@ -7060,15 +7160,16 @@ impl AnnotateProvider {
                              {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}"
                             );
                             if include_source_field {
-                                let _ = write!(
-                                    csq_buf,
-                                    "|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                );
+                                let _ =
+                                    write!(csq_buf, "|{refseq_match}|{source_val}|{refseq_offset}");
                             } else if include_refseq_fields {
-                                let _ = write!(
-                                    csq_buf,
-                                    "|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                );
+                                let _ = write!(csq_buf, "|{refseq_match}|{refseq_offset}");
+                            }
+                            if include_reference_fields {
+                                let _ = write!(csq_buf, "|{given_ref}|{used_ref}");
+                            }
+                            if include_reference_fields {
+                                let _ = write!(csq_buf, "|{bam_edit}");
                             }
                             let _ = write!(
                                 csq_buf,
@@ -7090,18 +7191,21 @@ impl AnnotateProvider {
                                 let _ = write!(csq_buf, "|{pick_str}");
                             }
                             let _ = write!(csq_buf, "|{symbol_source}|{hgnc_id}|");
+                            csq_buf.push_str("||||");
                             if include_source_field {
-                                let _ = write!(
-                                    csq_buf,
-                                    "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                );
+                                let _ =
+                                    write!(csq_buf, "|{refseq_match}|{source_val}|{refseq_offset}");
                             } else if include_refseq_fields {
-                                let _ = write!(
-                                    csq_buf,
-                                    "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                );
-                            } else {
-                                let _ = write!(csq_buf, "|||||{source_val}");
+                                let _ = write!(csq_buf, "|{refseq_match}|{refseq_offset}");
+                            }
+                            if include_reference_fields {
+                                let _ = write!(csq_buf, "|{given_ref}|{used_ref}");
+                            }
+                            if include_reference_fields {
+                                let _ = write!(csq_buf, "|{bam_edit}");
+                            }
+                            if !include_refseq_fields {
+                                let _ = write!(csq_buf, "|{source_val}");
                             }
                             let _ = write!(
                                 csq_buf,
@@ -7569,8 +7673,12 @@ impl AnnotateProvider {
                                 Some(offset) => b_refseq_offset.values().append_value(offset),
                                 None => b_refseq_offset.values().append_null(),
                             }
+                        }
+                        if include_reference_fields {
                             append_opt_str(b_given_ref.values(), Some(given_ref));
                             append_opt_str(b_used_ref.values(), Some(used_ref));
+                        }
+                        if include_reference_fields {
                             append_opt_str(b_bam_edit.values(), Some(bam_edit.as_str()));
                         }
 
@@ -7736,8 +7844,12 @@ impl AnnotateProvider {
                             b_source.append(true);
                         }
                         b_refseq_offset.append(true);
+                    }
+                    if include_reference_fields {
                         b_given_ref.append(true);
                         b_used_ref.append(true);
+                    }
+                    if include_reference_fields {
                         b_bam_edit.append(true);
                     }
                     b_gene_pheno.append(true);
@@ -7793,8 +7905,12 @@ impl AnnotateProvider {
                             b_source.append(false);
                         }
                         b_refseq_offset.append(false);
+                    }
+                    if include_reference_fields {
                         b_given_ref.append(false);
                         b_used_ref.append(false);
+                    }
+                    if include_reference_fields {
                         b_bam_edit.append(false);
                     }
                     b_gene_pheno.append(false);
@@ -8048,8 +8164,12 @@ impl AnnotateProvider {
                     out_cols.push(Arc::new(b_source.finish()));
                 }
                 out_cols.push(Arc::new(b_refseq_offset.finish()));
+            }
+            if include_reference_fields {
                 out_cols.push(Arc::new(b_given_ref.finish()));
                 out_cols.push(Arc::new(b_used_ref.finish()));
+            }
+            if include_reference_fields {
                 out_cols.push(Arc::new(b_bam_edit.finish()));
             }
             out_cols.push(Arc::new(b_gene_pheno.finish()));
@@ -9013,6 +9133,68 @@ fn is_refseq_transcript_for_hydration(
     row_source_is_refseq(tx)
         || is_standard_refseq_accession(&tx.transcript_id)
         || cache_source_type == CacheSourceType::RefSeq && is_default_refseq_transcript_id(tx)
+}
+
+/// A bounded window for the new per-row reference reads. Nearby variants in a
+/// batch share one indexed FASTA query instead of repeatedly seeking the file.
+/// This is local to a batch/worker and never changes transcript/indel hydration.
+#[derive(Default)]
+struct GenomicReferenceWindow {
+    chrom: String,
+    start: i64,
+    sequence: String,
+}
+
+impl GenomicReferenceWindow {
+    const BASES: i64 = 64 * 1024;
+
+    fn read<R>(
+        &mut self,
+        reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
+        chrom: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<String>
+    where
+        R: BufRead + Seek,
+    {
+        if chrom == self.chrom
+            && start >= self.start
+            && end >= start
+            && end < self.start.saturating_add(self.sequence.len() as i64)
+            && let (Ok(first), Ok(last)) = (
+                usize::try_from(start - self.start),
+                usize::try_from(end - self.start + 1),
+            )
+            && let Some(sequence) = self.sequence.get(first..last)
+        {
+            return Ok(sequence.to_owned());
+        }
+        let contig_end = reader
+            .index()
+            .as_ref()
+            .iter()
+            .find(|record| record.name() == chrom.as_bytes())
+            .and_then(|record| i64::try_from(record.length()).ok());
+        // Keep long variants and invalid intervals on the original exact-read
+        // path; never retain an unbounded sequence or hide a reader error.
+        let Some(contig_end) = contig_end.filter(|length| {
+            start > 0 && end >= start && end <= *length && end - start < Self::BASES
+        }) else {
+            return read_reference_sequence(reader, chrom, start, end);
+        };
+        let window_end = start.saturating_add(Self::BASES - 1).min(contig_end);
+        let sequence = read_reference_sequence(reader, chrom, start, window_end)?;
+        self.chrom = chrom.to_owned();
+        self.start = start;
+        self.sequence = sequence;
+        // The caller checks exact requested length, including truncated FASTA.
+        Ok(self
+            .sequence
+            .get(..(end - start + 1) as usize)
+            .unwrap_or(&self.sequence)
+            .to_owned())
+    }
 }
 
 fn read_reference_sequence<R>(
@@ -10045,6 +10227,43 @@ const MOTIF_CONTEXT_COLUMNS: &[&str] = &[
     "motif_seq",
 ];
 
+/// Sets a shared flag when dropped, so blocking context parses spawned by a
+/// future that is then dropped stop instead of finishing a whole contig.
+#[derive(Default)]
+struct ContextParseCancel(Arc<std::sync::atomic::AtomicBool>);
+
+impl ContextParseCancel {
+    fn flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Drop for ContextParseCancel {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Parse context batches one at a time, stopping once `cancelled` is set. The
+/// context parsers carry no state across batches, so the result is identical to
+/// one call over all batches; each batch is released as soon as it is parsed.
+fn parse_context_batches<T>(
+    batches: Vec<RecordBatch>,
+    cancelled: &std::sync::atomic::AtomicBool,
+    parse: impl Fn(&[RecordBatch]) -> Result<Vec<T>>,
+) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    for batch in batches {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(DataFusionError::Execution(
+                "context parse cancelled".to_string(),
+            ));
+        }
+        out.extend(parse(std::slice::from_ref(&batch))?);
+    }
+    Ok(out)
+}
+
 async fn join_parse<T: Send + 'static>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
     handle
         .await
@@ -10087,14 +10306,15 @@ async fn load_contig_context_rest(
     chrom: &str,
     profile: &Option<SharedContigPipelineProfile>,
     tx_ids: &HashSet<String>,
+    annotation_workers: usize,
 ) -> Result<ContigContextRest> {
-    // The four scans are mutually independent and the parses are CPU-bound, so
-    // they CAN run concurrently — but the default is the original strictly
-    // serial order: `enabled_from_env_value(None)` is false, so concurrency is
-    // opt-in via VEP_CTX_PARALLEL=1. Serial-by-default keeps the A/B honest and
-    // avoids contending with the rest of the pipeline unless asked.
-    let concurrent =
-        pipeline_trace::enabled_from_env_value(std::env::var("VEP_CTX_PARALLEL").ok().as_deref());
+    // These independent scans and owned parses overlap for multi-worker runs.
+    // Keep serial execution at one worker and retain the explicit diagnostic
+    // override. At most four existing blocking parses run concurrently.
+    let concurrent = context_parallel_enabled(
+        annotation_workers,
+        std::env::var("VEP_CTX_PARALLEL").ok().as_deref(),
+    );
 
     async fn timed_scan(
         cache: &crate::parquet_cache::detect::PartitionedParquetCache,
@@ -10144,23 +10364,41 @@ async fn load_contig_context_rest(
     let (ex_batches, tl_batches, rg_batches, mt_batches) = (ex_s.0, tl_s.0, rg_s.0, mt_s.0);
 
     let (ex_raw, ex_d, tl_raw, tl_d, rg, rg_d, mt, mt_d) = if concurrent {
+        // Dropping this future (an aborted prefetch or a cancelled query)
+        // cannot stop a running blocking task, so the guard flags the parses
+        // to stop at their next batch and drop the batches they still hold.
+        let cancel = ContextParseCancel::default();
+        let ex_c = cancel.flag();
         let ex_h = tokio::task::spawn_blocking(move || {
             let t = Instant::now();
-            AnnotateProvider::parse_exon_batches("exon", &ex_batches).map(|v| (v, t.elapsed()))
+            parse_context_batches(ex_batches, &ex_c, |b| {
+                AnnotateProvider::parse_exon_batches("exon", b)
+            })
+            .map(|v| (v, t.elapsed()))
         });
+        let tl_c = cancel.flag();
         let tl_h = tokio::task::spawn_blocking(move || {
             let t = Instant::now();
-            AnnotateProvider::parse_translation_batches("translation_core", &tl_batches)
-                .map(|v| (v, t.elapsed()))
+            parse_context_batches(tl_batches, &tl_c, |b| {
+                AnnotateProvider::parse_translation_batches("translation_core", b)
+            })
+            .map(|v| (v, t.elapsed()))
         });
+        let rg_c = cancel.flag();
         let rg_h = tokio::task::spawn_blocking(move || {
             let t = Instant::now();
-            AnnotateProvider::parse_regulatory_batches("regulatory", &rg_batches)
-                .map(|v| (v, t.elapsed()))
+            parse_context_batches(rg_batches, &rg_c, |b| {
+                AnnotateProvider::parse_regulatory_batches("regulatory", b)
+            })
+            .map(|v| (v, t.elapsed()))
         });
+        let mt_c = cancel.flag();
         let mt_h = tokio::task::spawn_blocking(move || {
             let t = Instant::now();
-            AnnotateProvider::parse_motif_batches("motif", &mt_batches).map(|v| (v, t.elapsed()))
+            parse_context_batches(mt_batches, &mt_c, |b| {
+                AnnotateProvider::parse_motif_batches("motif", b)
+            })
+            .map(|v| (v, t.elapsed()))
         });
         let (ex_raw, ex_d) = join_parse(ex_h).await?;
         let (tl_raw, tl_d) = join_parse(tl_h).await?;
@@ -12352,11 +12590,14 @@ impl AnnotationWorkerState {
             .config
             .reference_fasta_path
             .as_deref()
-            .and_then(|path| {
+            .map(|path| {
                 fasta::io::indexed_reader::Builder::default()
                     .build_from_path(path)
-                    .ok()
-            });
+                    .map_err(|error| DataFusionError::Execution(format!(
+                        "annotate_vep(): failed to open indexed reference FASTA '{path}': {error}"
+                    )))
+            })
+            .transpose()?;
 
         let state = Self {
             shared,
@@ -13693,6 +13934,7 @@ fn annotate_worker_window(
                 &sift_kv,
                 skip_csq,
                 skip_typed_cols,
+                tmp_provider.output_needs_genomic_reference(projection, &config.hgvs_flags),
                 &config.flags,
                 &config.hgvs_flags,
                 config.transcript_selection,
@@ -15036,6 +15278,12 @@ async fn prepare_contig_data(
                 identity.source_type.as_str()
             )));
         }
+        if identity.bam_edited != config.transcript_selection.bam_edited {
+            return Err(DataFusionError::Execution(format!(
+                "annotate_vep(): cache BAM reference policy changed after planning at contig '{chrom}': planned {:?}, contig {:?}",
+                config.transcript_selection.bam_edited, identity.bam_edited
+            )));
+        }
         config.vep_semantics = identity.target.semantics;
     }
 
@@ -15199,7 +15447,10 @@ async fn prepare_contig_data(
         config.vcf_table.clone(),
         String::new(),
         AnnotationBackend::Parquet,
-        config.cache_source_type,
+        CacheMetadata {
+            source_type: config.cache_source_type,
+            bam_edited: config.transcript_selection.bam_edited,
+        },
         config.options_json.clone(),
         vcf_only_schema,
     )?;
@@ -15208,7 +15459,8 @@ async fn prepare_contig_data(
         config.downstream_distance,
         config.hgvs_flags.shift_hgvs,
         config.vep_semantics,
-    );
+    )
+    .with_reference_policy(config.transcript_selection.bam_edited);
 
     // SIFT source: a shared per-contig prediction store loaded from the Parquet
     // translation_sift shard.
@@ -15253,8 +15505,14 @@ async fn prepare_contig_data(
         .map(|tx| tx.transcript_id.clone())
         .collect();
     let t_rest = Instant::now();
-    let rest =
-        load_contig_context_rest(cache.as_parquet(), &chrom, &pipeline_profile, &tx_ids).await;
+    let rest = load_contig_context_rest(
+        cache.as_parquet(),
+        &chrom,
+        &pipeline_profile,
+        &tx_ids,
+        config.annotation_workers,
+    )
+    .await;
     let rest_elapsed = t_rest.elapsed();
     pipeline_trace::emit(
         "context",
@@ -16017,12 +16275,162 @@ fn contig_prefetch_enabled(annotation_workers: usize, env: Option<&str>) -> bool
     }
 }
 
+/// Context loading uses the existing concurrent path only when annotation has
+/// more than one worker. Explicit environment values preserve diagnostic A/Bs.
+fn context_parallel_enabled(annotation_workers: usize, env: Option<&str>) -> bool {
+    env.map_or(annotation_workers > 1, |value| {
+        pipeline_trace::enabled_from_env_value(Some(value))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transcript_consequence::{
         CachedPredictions, FeatureType, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
     };
+
+    #[test]
+    fn context_parse_by_batch_matches_whole_parse_and_stops_when_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let batch = |ids: &[&str], starts: &[i64]| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("transcript_id", DataType::Utf8, false),
+                    Field::new("exon_number", DataType::Int64, false),
+                    Field::new("start", DataType::Int64, false),
+                    Field::new("end", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(ids.to_vec())),
+                    Arc::new(Int64Array::from(vec![1; ids.len()])),
+                    Arc::new(Int64Array::from(starts.to_vec())),
+                    Arc::new(Int64Array::from(
+                        starts.iter().map(|s| s + 10).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        let batches = vec![batch(&["T1", "T2"], &[100, 200]), batch(&["T3"], &[300])];
+        let parse = |b: &[RecordBatch]| AnnotateProvider::parse_exon_batches("exon", b);
+        let key = |v: Vec<ExonFeature>| {
+            v.into_iter()
+                .map(|e| (e.transcript_id, e.start, e.end))
+                .collect::<Vec<_>>()
+        };
+
+        let whole = key(parse(&batches).unwrap());
+        let not_cancelled = AtomicBool::new(false);
+        let by_batch = key(parse_context_batches(batches.clone(), &not_cancelled, parse).unwrap());
+        assert_eq!(by_batch, whole);
+        assert_eq!(by_batch.len(), 3);
+
+        let cancel = ContextParseCancel::default();
+        let flag = cancel.flag();
+        assert!(!flag.load(Ordering::Relaxed));
+        drop(cancel);
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(parse_context_batches(batches, &flag, parse).is_err());
+    }
+
+    #[test]
+    fn context_parallel_gate_respects_workers_and_explicit_override() {
+        assert!(!context_parallel_enabled(1, None));
+        assert!(context_parallel_enabled(2, None));
+        assert!(context_parallel_enabled(8, None));
+        assert!(context_parallel_enabled(1, Some("1")));
+        assert!(context_parallel_enabled(1, Some("true")));
+        assert!(!context_parallel_enabled(8, Some("0")));
+        // Preserve the existing override convention, including an empty value.
+        assert!(!context_parallel_enabled(8, Some("false")));
+        assert!(context_parallel_enabled(8, Some("")));
+    }
+
+    #[test]
+    fn genomic_reference_window_reuses_reads_without_changing_sequence() {
+        use std::io::{Cursor, Read, SeekFrom};
+
+        struct CountingReader {
+            cursor: Cursor<Vec<u8>>,
+            seeks: usize,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.cursor.read(buf)
+            }
+        }
+        impl BufRead for CountingReader {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                self.cursor.fill_buf()
+            }
+            fn consume(&mut self, amount: usize) {
+                self.cursor.consume(amount);
+            }
+        }
+        impl Seek for CountingReader {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.seeks += 1;
+                self.cursor.seek(position)
+            }
+        }
+
+        let sequence = "acgt".repeat(20_000);
+        let data = format!(">21\n{sequence}\n>22\nTGCA\n");
+        let index = fasta::fai::Index::from(vec![
+            fasta::fai::Record::new("21", 80_000, 4, 80_000, 80_001),
+            fasta::fai::Record::new("22", 4, 80_009, 4, 5),
+        ]);
+        let mut reader = fasta::io::indexed_reader::IndexedReader::new(
+            CountingReader {
+                cursor: Cursor::new(data.into_bytes()),
+                seeks: 0,
+            },
+            index,
+        );
+        let mut window = GenomicReferenceWindow::default();
+        for (start, end) in [(1, 1), (5, 6), (1024, 1027), (65_534, 65_536)] {
+            assert_eq!(
+                window.read(&mut reader, "21", start, end).unwrap(),
+                sequence[(start - 1) as usize..end as usize]
+            );
+        }
+        assert_eq!(
+            reader.get_ref().seeks,
+            1,
+            "nearby SNVs/MNVs share one query"
+        );
+        assert_eq!(window.sequence.len(), 65_536);
+        assert_eq!(
+            window.read(&mut reader, "21", 65_535, 65_540).unwrap(),
+            &sequence[65_534..65_540]
+        );
+        assert_eq!(
+            reader.get_ref().seeks,
+            2,
+            "window crossing refills and clips at contig end"
+        );
+        assert_eq!(window.read(&mut reader, "21", 80_000, 80_000).unwrap(), "t");
+        assert_eq!(reader.get_ref().seeks, 2);
+        assert_eq!(window.read(&mut reader, "22", 1, 4).unwrap(), "TGCA");
+        assert_eq!(
+            reader.get_ref().seeks,
+            3,
+            "chromosome is part of the cache key"
+        );
+        assert_eq!(
+            window.read(&mut reader, "21", 1, 70_000).unwrap(),
+            &sequence[..70_000]
+        );
+        assert!(window.sequence.len() <= GenomicReferenceWindow::BASES as usize);
+        assert!(
+            window
+                .read(&mut reader, "missing", 1, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
+        );
+    }
 
     // Regression: the serial (workers==1) AnnotatingContig loop truncated a
     // contig at ~one buffer when a lookup stall arrived mid-buffer-fill after the
@@ -16447,6 +16855,283 @@ mod tests {
             Schema::new(fields),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn projected_reference_consumers_control_actual_fasta_queries() {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        let input_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, true),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let input = RecordBatch::try_new(
+            Arc::new(input_schema.clone()),
+            vec![
+                Arc::new(StringArray::from(vec!["2"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10])),
+                Arc::new(Int64Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let mut tx = make_tx("ENST_PROJECTED_REF", None, None, None, None);
+        tx.chrom = "2".into();
+        tx.spliced_seq = Some("A".repeat(100));
+        let transcripts = [tx];
+        let exons = [ExonFeature {
+            transcript_id: "ENST_PROJECTED_REF".into(),
+            exon_number: 1,
+            start: 1,
+            end: 100,
+        }];
+        let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+        let tmp = tempfile::tempdir().unwrap();
+        let fasta = tmp.path().join("reference.fa");
+        // Opening this FASTA succeeds, but any read of the input's chromosome
+        // fails. A passing no-consumer query therefore proves the I/O was skipped.
+        std::fs::write(&fasta, b">1\nA\n").unwrap();
+        std::fs::write(tmp.path().join("reference.fa.fai"), b"1\t1\t3\t1\t2\n").unwrap();
+        for (columns, fields, expects_read) in [
+            (vec!["most_severe_consequence"], None, false),
+            (vec!["Feature"], None, false),
+            (vec!["GIVEN_REF"], None, false),
+            (vec!["BAM_EDIT"], None, false),
+            (vec!["USED_REF"], None, true),
+            (vec!["HGVSc"], None, true),
+            (vec!["CSQ"], Some("Allele,Consequence"), false),
+            (vec!["CSQ"], Some("Allele,GIVEN_REF,BAM_EDIT"), false),
+            (vec!["CSQ"], Some("Allele,USED_REF"), true),
+            (vec!["CSQ"], Some("Allele,HGVSc"), true),
+            (vec!["CSQ"], None, true),
+        ] {
+            let mut options = serde_json::json!({"everything": true});
+            if let Some(fields) = fields {
+                options["fields"] = serde_json::json!(fields.split(',').collect::<Vec<_>>());
+            }
+            let options = options.to_string();
+            let provider = AnnotateProvider::new(
+                Arc::new(SessionContext::new()),
+                "vcf".into(),
+                String::new(),
+                AnnotationBackend::Parquet,
+                CacheMetadata {
+                    source_type: CacheSourceType::Merged,
+                    bam_edited: Some(true),
+                },
+                Some(options.clone()),
+                input_schema.clone(),
+            )
+            .unwrap();
+            let projection: Vec<_> = columns
+                .iter()
+                .map(|name| provider.schema().index_of(name).unwrap())
+                .collect();
+            let hgvs_flags = HgvsFlags {
+                hgvsc: true,
+                ..Default::default()
+            };
+            let needs_reference =
+                provider.output_needs_genomic_reference(Some(&projection), &hgvs_flags);
+            let output = provider.annotate_batch_with_transcript_engine(
+                &input,
+                &TranscriptConsequenceEngine::default().with_reference_policy(Some(true)),
+                &context,
+                &HashMap::new(),
+                &mut SiftPolyphenCache::new(),
+                &None,
+                !columns.contains(&"CSQ"),
+                columns == ["CSQ"] || columns == ["most_severe_consequence"],
+                needs_reference,
+                &VepFlags::from_options_json(Some(&options)),
+                &hgvs_flags,
+                provider.transcript_selection,
+                &PickFlags::default(),
+                &mut Some(
+                    fasta::io::indexed_reader::Builder::default()
+                        .build_from_path(&fasta)
+                        .unwrap(),
+                ),
+                #[cfg(feature = "parquet-cache")]
+                None,
+            );
+            if expects_read {
+                let error = output.unwrap_err().to_string();
+                assert!(error.contains("querying FASTA"), "{columns:?}: {error}");
+            } else {
+                assert_eq!(output.unwrap().num_rows(), 1, "{columns:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn reference_policy_keeps_typed_columns_csq_and_null_rows_aligned() {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        let input_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, true),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let input = RecordBatch::try_new(
+            Arc::new(input_schema.clone()),
+            vec![
+                Arc::new(StringArray::from(vec![Some("2"), Some("2"), None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 10000, 20])),
+                Arc::new(Int64Array::from(vec![10, 10000, 20])),
+                Arc::new(StringArray::from(vec!["A"; 3])),
+                Arc::new(StringArray::from(vec!["G"; 3])),
+            ],
+        )
+        .unwrap();
+        let mut tx = make_tx("ENST_POLICY", None, None, None, None);
+        tx.spliced_seq = Some("A".repeat(100));
+        let transcripts = [tx];
+        let exons = [ExonFeature {
+            transcript_id: "ENST_POLICY".into(),
+            exon_number: 1,
+            start: 1,
+            end: 100,
+        }];
+        let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+        for source in [
+            CacheSourceType::Ensembl,
+            CacheSourceType::RefSeq,
+            CacheSourceType::Merged,
+        ] {
+            for bam_edited in [None, Some(false), Some(true)] {
+                for everything in [false, true] {
+                    let metadata = CacheMetadata {
+                        source_type: source,
+                        bam_edited,
+                    };
+                    let options = serde_json::json!({"everything": everything}).to_string();
+                    let provider = AnnotateProvider::new(
+                        Arc::new(SessionContext::new()),
+                        "vcf".into(),
+                        String::new(),
+                        AnnotationBackend::Parquet,
+                        metadata,
+                        Some(options.clone()),
+                        input_schema.clone(),
+                    )
+                    .unwrap();
+                    let expected_refs = bam_edited.unwrap_or(source != CacheSourceType::Ensembl);
+                    assert_eq!(
+                        provider.schema().field_with_name("USED_REF").is_ok(),
+                        expected_refs
+                    );
+                    assert_eq!(
+                        provider.schema().field_with_name("GIVEN_REF").is_ok(),
+                        expected_refs
+                    );
+                    assert_eq!(
+                        provider.schema().field_with_name("BAM_EDIT").is_ok(),
+                        expected_refs
+                    );
+                    let output = provider
+                        .annotate_batch_with_transcript_engine(
+                            &input,
+                            &TranscriptConsequenceEngine::default()
+                                .with_reference_policy(bam_edited),
+                            &context,
+                            &HashMap::new(),
+                            &mut SiftPolyphenCache::new(),
+                            &None,
+                            false,
+                            false,
+                            true,
+                            &VepFlags::from_options_json(Some(&options)),
+                            &HgvsFlags::default(),
+                            provider.transcript_selection,
+                            &PickFlags::default(),
+                            &mut None,
+                            #[cfg(feature = "parquet-cache")]
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(output.num_rows(), 3);
+                    let csq = output
+                        .column_by_name("CSQ")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    assert!(csq.is_null(2));
+                    let fields = crate::golden_benchmark::csq_field_names_with_reference_policy(
+                        everything,
+                        source == CacheSourceType::RefSeq,
+                        source == CacheSourceType::Merged,
+                        false,
+                        bam_edited,
+                    );
+                    for row in 0..2 {
+                        assert_eq!(
+                            csq.value(row).split('|').count(),
+                            fields.len(),
+                            "{metadata:?} everything={everything} row={row}"
+                        );
+                    }
+                    if expected_refs {
+                        let index = fields
+                            .iter()
+                            .position(|field| *field == "USED_REF")
+                            .unwrap();
+                        assert_eq!(csq.value(0).split('|').nth(index), Some("A"));
+                        assert_eq!(csq.value(1).split('|').nth(index), Some(""));
+                        let used = output
+                            .column_by_name("USED_REF")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .unwrap();
+                        assert!(used.is_null(2));
+                        let value = used.value(0);
+                        assert_eq!(
+                            value
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap()
+                                .value(0),
+                            "A"
+                        );
+                        let requested = vec!["USED_REF".into(), "Feature".into()];
+                        let projection = CsqFieldProjection::for_mode(
+                            everything,
+                            provider.transcript_selection,
+                            false,
+                            &requested,
+                        )
+                        .unwrap();
+                        let mut projected = String::new();
+                        projection
+                            .project_entries(
+                                &format!("{}|plugin-sentinel", csq.value(0)),
+                                1,
+                                &mut projected,
+                            )
+                            .unwrap();
+                        assert_eq!(projected, "A|ENST_POLICY|plugin-sentinel");
+                    } else {
+                        assert!(
+                            CsqFieldProjection::for_mode(
+                                everything,
+                                provider.transcript_selection,
+                                false,
+                                &["USED_REF".into()]
+                            )
+                            .unwrap_err()
+                            .to_string()
+                            .contains("unknown CSQ field 'USED_REF'")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn core_input_fields() -> Vec<Field> {
@@ -17096,6 +17781,7 @@ mod tests {
                     &None,
                     false,
                     skip_typed_cols,
+                    true,
                     &flags,
                     &HgvsFlags::default(),
                     TranscriptSelectionFlags::default(),
@@ -17207,6 +17893,7 @@ mod tests {
                             &None,
                             skip_csq,
                             skip_typed_cols,
+                            true,
                             &flags,
                             &HgvsFlags::default(),
                             TranscriptSelectionFlags::default(),

@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::annotate_provider::AnnotateProvider;
 use crate::annotation_store::AnnotationBackend;
-use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
+use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheMetadata};
 
 /// Table function implementing
 /// `annotate_vep(vcf_table, cache_source, backend [, options_json])`.
@@ -83,10 +83,9 @@ impl TableFunctionImpl for AnnotateFunction {
         // The cache is always the partitioned Parquet cache; read its source-type
         // metadata off the first variation shard.
         #[cfg(feature = "parquet-cache")]
-        let cache_source_type =
-            CacheSourceType::from_partitioned_parquet_cache_source(&cache_source)?;
+        let cache_metadata = CacheMetadata::from_partitioned_cache(&cache_source)?;
         #[cfg(not(feature = "parquet-cache"))]
-        let cache_source_type: CacheSourceType = {
+        let cache_metadata: CacheMetadata = {
             return Err(DataFusionError::Plan(
                 "annotate_vep(): Parquet cache source metadata requires the parquet-cache feature"
                     .to_string(),
@@ -112,7 +111,7 @@ impl TableFunctionImpl for AnnotateFunction {
                 vcf_table,
                 cache_source,
                 backend,
-                cache_source_type,
+                cache_metadata,
                 options_json,
                 vcf_schema,
             )?

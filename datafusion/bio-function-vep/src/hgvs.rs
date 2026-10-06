@@ -207,7 +207,7 @@ pub fn format_hgvsc_with_semantics(
     genomic_shift: Option<&HgvsGenomicShift>,
     semantics: VepSemantics,
 ) -> Option<String> {
-    format_hgvsc_inner(
+    format_hgvsc_with_reference_policy(
         tx,
         tx_exons,
         cdna_position,
@@ -219,6 +219,7 @@ pub fn format_hgvsc_with_semantics(
         genomic_shift,
         None,
         semantics,
+        true,
     )
 }
 
@@ -264,7 +265,7 @@ pub fn format_hgvsc_profiled_with_semantics(
     profile: &mut HgvscProfile,
     semantics: VepSemantics,
 ) -> Option<String> {
-    format_hgvsc_inner(
+    format_hgvsc_with_reference_policy(
         tx,
         tx_exons,
         cdna_position,
@@ -276,11 +277,12 @@ pub fn format_hgvsc_profiled_with_semantics(
         genomic_shift,
         Some(profile),
         semantics,
+        true,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn format_hgvsc_inner(
+pub(crate) fn format_hgvsc_with_reference_policy(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     cdna_position: Option<&str>,
@@ -292,6 +294,7 @@ fn format_hgvsc_inner(
     genomic_shift: Option<&HgvsGenomicShift>,
     mut profile: Option<&mut HgvscProfile>,
     semantics: VepSemantics,
+    use_transcript_ref: bool,
 ) -> Option<String> {
     // Traceability:
     // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
@@ -346,6 +349,7 @@ fn format_hgvsc_inner(
         genomic_shift,
         profile.as_deref_mut(),
         semantics,
+        use_transcript_ref,
     );
     if let (Some(started), Some(profile)) = (fallback_started, profile.as_deref_mut()) {
         profile.fallback += started.elapsed();
@@ -366,6 +370,7 @@ fn format_hgvsc_fallback(
     genomic_shift: Option<&HgvsGenomicShift>,
     mut profile: Option<&mut HgvscProfile>,
     semantics: VepSemantics,
+    use_transcript_ref: bool,
 ) -> Option<String> {
     let tx_id = versioned_id(&tx.transcript_id, tx.version);
     let numbering = if tx.cds_start.is_some() && tx.cds_end.is_some() {
@@ -425,13 +430,20 @@ fn format_hgvsc_fallback(
         };
     let (mut feature_ref, feature_alt) = hgvs_feature_strand_alleles(tx, ref_allele, alt_allele)?;
     let refseq_edit_started = profile.is_some().then(Instant::now);
-    let transcript_ref = edited_transcript_reference_allele_for_hgvsc(
-        tx,
-        tx_exons,
-        ref_allele,
-        variant_start,
-        variant_end,
-    );
+    // The engine may already have selected the submitted reference TVA allele
+    // because native use_feature_ref is disabled. A legacy sequence fallback
+    // must not replace that choice with the edited transcript sequence.
+    let transcript_ref = use_transcript_ref
+        .then(|| {
+            edited_transcript_reference_allele_for_hgvsc(
+                tx,
+                tx_exons,
+                ref_allele,
+                variant_start,
+                variant_end,
+            )
+        })
+        .flatten();
     if let (Some(started), Some(profile)) = (refseq_edit_started, profile.as_deref_mut()) {
         profile.refseq_edit += started.elapsed();
     }

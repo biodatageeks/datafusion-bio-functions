@@ -8,6 +8,49 @@ use datafusion::arrow::datatypes::Schema;
 use datafusion::common::{DataFusionError, Result};
 
 pub(crate) const CACHE_SOURCE_METADATA_KEY: &str = "bio.vep.cache_source_type";
+pub(crate) const ANNOTATION_CACHE_LAYOUT_KEY: &str = "bio.vep.annotation_cache_layout";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheMetadata {
+    pub(crate) source_type: CacheSourceType,
+    /// None is the explicitly retained legacy export behavior.
+    pub(crate) bam_edited: Option<bool>,
+}
+
+impl From<CacheSourceType> for CacheMetadata {
+    fn from(source_type: CacheSourceType) -> Self {
+        Self {
+            source_type,
+            bam_edited: None,
+        }
+    }
+}
+
+impl CacheMetadata {
+    pub(crate) fn layout_identity(self) -> String {
+        let bam = match self.bam_edited {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        };
+        format!("{}:{bam}", self.source_type.as_str())
+    }
+    #[cfg(feature = "parquet-cache")]
+    pub(crate) fn from_partitioned_cache(cache_source: &str) -> Result<Self> {
+        let shard = first_present_variation_parquet_shard(cache_source)?;
+        let schema = read_parquet_shard_schema_sync(&shard)?;
+        let policy =
+            crate::cache::reference_policy::CacheReferencePolicy::read(Path::new(cache_source))?;
+        Ok(Self {
+            source_type: CacheSourceType::from_schema(&schema)?,
+            bam_edited: crate::cache::reference_policy::resolved_bam_policy(
+                &schema,
+                policy.as_ref(),
+                &shard,
+            )?,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CacheSourceType {
@@ -43,11 +86,9 @@ impl CacheSourceType {
     /// by presence rather than by manifest position keeps a per-contig download
     /// usable: it ships the published whole-cache manifest (463 contigs, `chr1`
     /// first) alongside only the shards the user fetched.
-    #[cfg(feature = "parquet-cache")]
+    #[cfg(all(test, feature = "parquet-cache"))]
     pub(crate) fn from_partitioned_parquet_cache_source(cache_source: &str) -> Result<Self> {
-        let shard = first_present_variation_parquet_shard(cache_source)?;
-        let schema = read_parquet_shard_schema_sync(&shard)?;
-        Self::from_schema(&schema)
+        Ok(CacheMetadata::from_partitioned_cache(cache_source)?.source_type)
     }
 }
 
@@ -88,7 +129,7 @@ fn first_present_variation_parquet_shard(cache_source: &str) -> Result<PathBuf> 
 /// Read the Arrow schema (including key-value metadata) of a `.parquet` shard
 /// synchronously from its footer.
 #[cfg(feature = "parquet-cache")]
-fn read_parquet_shard_schema_sync(shard_path: &Path) -> Result<Schema> {
+pub(crate) fn read_parquet_shard_schema_sync(shard_path: &Path) -> Result<Schema> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let file = std::fs::File::open(shard_path).map_err(|err| {
         DataFusionError::Execution(format!(
