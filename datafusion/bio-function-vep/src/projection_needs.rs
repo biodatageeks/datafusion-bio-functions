@@ -50,6 +50,26 @@ pub(crate) const EVERYTHING_ONLY_COLUMNS: &[&str] = &[
     "gnomADg_NFE_AF",
     "gnomADg_REMAINING_AF",
     "gnomADg_SAS_AF",
+    // The same populations as CSQ `fields` spell them (no `_AF` suffix).
+    "gnomADe_AFR",
+    "gnomADe_AMR",
+    "gnomADe_ASJ",
+    "gnomADe_EAS",
+    "gnomADe_FIN",
+    "gnomADe_MID",
+    "gnomADe_NFE",
+    "gnomADe_REMAINING",
+    "gnomADe_SAS",
+    "gnomADg_AFR",
+    "gnomADg_AMI",
+    "gnomADg_AMR",
+    "gnomADg_ASJ",
+    "gnomADg_EAS",
+    "gnomADg_FIN",
+    "gnomADg_MID",
+    "gnomADg_NFE",
+    "gnomADg_REMAINING",
+    "gnomADg_SAS",
 ];
 
 /// Columns whose value depends on the HGVS computation, `everything` or not:
@@ -91,6 +111,25 @@ pub(crate) const COLOCATED_COLUMNS: &[&str] = &[
     "SAS_AF",
     "gnomADe_AF",
     "gnomADg_AF",
+    "gnomADe_AFR",
+    "gnomADe_AMR",
+    "gnomADe_ASJ",
+    "gnomADe_EAS",
+    "gnomADe_FIN",
+    "gnomADe_MID",
+    "gnomADe_NFE",
+    "gnomADe_REMAINING",
+    "gnomADe_SAS",
+    "gnomADg_AFR",
+    "gnomADg_AMI",
+    "gnomADg_AMR",
+    "gnomADg_ASJ",
+    "gnomADg_EAS",
+    "gnomADg_FIN",
+    "gnomADg_MID",
+    "gnomADg_NFE",
+    "gnomADg_REMAINING",
+    "gnomADg_SAS",
     "MAX_AF",
     "MAX_AF_POPS",
     "CLIN_SIG",
@@ -544,6 +583,17 @@ mod tests {
                 .hgvs_dependent()
         );
         assert!(needs(&["CSQ"]).with_csq_fields(["HGVSc".into()]).is_all());
+    }
+
+    #[test]
+    fn csq_spelled_population_fields_keep_everything() {
+        // The CSQ layout spells gnomAD populations without the `_AF` suffix.
+        for field in ["gnomADe_AFR", "gnomADg_AMI", "gnomADg_REMAINING"] {
+            let fields = ["Allele".to_string(), field.to_string()];
+            let projected = KEY.iter().chain(&["CSQ"]).map(|s| s.to_string()).collect();
+            let n = OutputNeeds::from_projection(Some(projected), Some(&fields));
+            assert_eq!(n.narrow_options(Some(EVERYTHING)), None, "{field}");
+        }
     }
 
     #[test]
