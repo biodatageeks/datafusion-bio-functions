@@ -244,6 +244,8 @@ pub struct TranscriptFeature {
     /// `db_id` column. Part of VEP's transcript ordering key; see
     /// [`vep_transcript_order`]. `None` for caches without the column.
     pub db_id: Option<i64>,
+    /// Genetic code for this transcript's translations; see [`CodonTable`].
+    pub codon_table: CodonTable,
     pub chrom: String,
     pub start: i64,
     pub end: i64,
@@ -4371,7 +4373,7 @@ fn mutated_cds_stop_preserved(
     let codon_at_stop = std::str::from_utf8(&mutated[stop_pos..stop_pos + 3])
         .unwrap_or("")
         .to_ascii_uppercase();
-    is_stop_codon(&codon_at_stop)
+    is_stop_codon_in(tx.codon_table, &codon_at_stop)
 }
 
 /// VEP 116 `_overlaps_stop_codon_cil()` uses genomic coordinates and, for an
@@ -4846,7 +4848,7 @@ fn vep116_ambiguous_terminal_hgvsp_alleles(
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L888>
 /// - Ensembl Variation `TranscriptVariationAllele::peptide()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L700-L797>
-fn local_peptide_from_codon_window(codon: &[u8]) -> Option<String> {
+fn local_peptide_from_codon_window(table: CodonTable, codon: &[u8]) -> Option<String> {
     if codon.is_empty() {
         return Some("-".to_string());
     }
@@ -4856,7 +4858,9 @@ fn local_peptide_from_codon_window(codon: &[u8]) -> Option<String> {
     let mut peptide = if whole.is_empty() {
         String::new()
     } else {
-        translate_protein_from_cds(whole)?.into_iter().collect()
+        translate_protein_from_cds_in(table, whole)?
+            .into_iter()
+            .collect()
     };
     if !partial.is_empty() && peptide != "*" {
         peptide.push('X');
@@ -4936,7 +4940,7 @@ fn reference_aas_for_consequence(
     translation: Option<&TranslationFeature>,
     cds_seq: &str,
 ) -> Option<Vec<char>> {
-    let translated = translate_protein_from_cds(cds_seq.as_bytes())?;
+    let translated = translate_protein_from_cds_in(tx.codon_table, cds_seq.as_bytes())?;
     if !failed_refseq_uses_cached_translation_for_consequence(tx, translation, cds_seq) {
         return Some(translated);
     }
@@ -4968,7 +4972,7 @@ fn failed_refseq_uses_cached_translation_for_consequence(
         return false;
     };
 
-    let Some(translated) = translate_protein_from_cds(cds_seq.as_bytes()) else {
+    let Some(translated) = translate_protein_from_cds_in(tx.codon_table, cds_seq.as_bytes()) else {
         return false;
     };
     let translated_without_terminal_stop: String = translated
@@ -4987,7 +4991,7 @@ fn amino_acids_for_output(
     let codon_amino_acids = class
         .codons
         .as_deref()
-        .and_then(pep_allele_string_from_codon_allele_string);
+        .and_then(|codons| pep_allele_string_from_codon_allele_string_in(tx.codon_table, codons));
     let prefer_classified_amino_acids = translation
         .and_then(|translation| translation.cds_sequence.as_deref())
         .is_some_and(|cds_seq| {
@@ -5010,7 +5014,8 @@ fn edited_ref_translation_for_hgvsp(
         .and_then(|translation| translation.translation_seq.clone())
         .or_else(|| {
             reference_translateable_seq_for_vep(tx, translation).and_then(|seq| {
-                translate_protein_from_cds(seq.as_bytes()).map(|aas| aas.into_iter().collect())
+                translate_protein_from_cds_in(tx.codon_table, seq.as_bytes())
+                    .map(|aas| aas.into_iter().collect())
             })
         })
         .unwrap_or(fallback)
@@ -5390,8 +5395,8 @@ fn literal_indel_protein_hgvs_data(
     };
     let alt_codon = &mutated[codon_start_idx..alt_end_idx];
 
-    let ref_peptide = local_peptide_from_codon_window(ref_codon)?;
-    let alt_peptide = local_peptide_from_codon_window(alt_codon)?;
+    let ref_peptide = local_peptide_from_codon_window(tx.codon_table, ref_codon)?;
+    let alt_peptide = local_peptide_from_codon_window(tx.codon_table, alt_codon)?;
     let (start, end) = if ref_peptide == "-" && raw_start != raw_end {
         (raw_end, raw_start)
     } else {
@@ -5571,8 +5576,8 @@ fn literal_shifted_indel_protein_hgvs_data(
     };
     let alt_codon = &alternate_seq.as_bytes()[codon_start_idx..alt_end_idx];
 
-    let ref_peptide = local_peptide_from_codon_window(ref_codon)?;
-    let alt_peptide = local_peptide_from_codon_window(alt_codon)?;
+    let ref_peptide = local_peptide_from_codon_window(tx.codon_table, ref_codon)?;
+    let alt_peptide = local_peptide_from_codon_window(tx.codon_table, alt_codon)?;
     let (start, end) = if ref_peptide == "-" && raw_start != raw_end {
         (raw_end, raw_start)
     } else {
@@ -5586,7 +5591,7 @@ fn literal_shifted_indel_protein_hgvs_data(
         alt_peptide,
         ref_translation: canonical_ref_translation_for_hgvsp(
             Some(translation),
-            translate_protein_from_cds(reference_cds_seq.as_bytes())?
+            translate_protein_from_cds_in(tx.codon_table, reference_cds_seq.as_bytes())?
                 .iter()
                 .collect(),
         ),
@@ -5981,7 +5986,7 @@ fn shifted_tva_peptide_window(
         .saturating_add(codon_window_len)
         .min(cds.len());
     let codon = &cds.as_bytes()[codon_start_idx..codon_end_idx];
-    let peptide = local_peptide_from_codon_window(codon)?;
+    let peptide = local_peptide_from_codon_window(tx.codon_table, codon)?;
     let alt_translation = (!is_reference).then(|| {
         translated_alt_protein_for_hgvs(tx, cds.as_bytes()).unwrap_or_else(|| {
             translate_protein_from_cds(cds.as_bytes())
@@ -6070,7 +6075,7 @@ fn shifted_tva_protein_hgvs_data(
     )?;
     let canonical_ref_translation: String = canonical_ref_translation_for_hgvsp(
         Some(translation),
-        translate_protein_from_cds(reference_cds_seq.as_bytes())?
+        translate_protein_from_cds_in(tx.codon_table, reference_cds_seq.as_bytes())?
             .iter()
             .collect(),
     );
@@ -6920,7 +6925,7 @@ fn classify_coding_change_with_semantics(
     mutated.extend_from_slice(&cds_seq.as_bytes()[end_idx + 1..]);
 
     let old_aas = reference_aas_for_consequence(tx, tx_translation, cds_seq.as_str())?;
-    let new_aas = translate_protein_from_cds(&mutated)?;
+    let new_aas = translate_protein_from_cds_in(tx.codon_table, &mutated)?;
     let mut class = CodingClassification::default();
 
     // Start codon logic: gate on cds_start_nf flag. VEP's
@@ -7116,8 +7121,8 @@ fn classify_coding_change_with_semantics(
         .saturating_add(local_alt_len)
         .min(mutated.len());
     let local_alt_codon = &mutated[local_codon_start..local_alt_end];
-    class.affected_ref_peptide = local_peptide_from_codon_window(local_ref_codon);
-    class.affected_alt_peptide = local_peptide_from_codon_window(local_alt_codon);
+    class.affected_ref_peptide = local_peptide_from_codon_window(tx.codon_table, local_ref_codon);
+    class.affected_alt_peptide = local_peptide_from_codon_window(tx.codon_table, local_alt_codon);
     if skip_global_stop_compare {
         // Failed RefSeq BAM edits can leave the genomic codon representation
         // different from the trusted cached protein. VEP exposes that split
@@ -7477,7 +7482,12 @@ fn classify_coding_change_with_semantics(
         if class
             .codons
             .as_deref()
-            .and_then(frameshift_deletion_partial_stop_lost_from_codon_allele_string)
+            .and_then(|codons| {
+                frameshift_deletion_partial_stop_lost_from_codon_allele_string_in(
+                    tx.codon_table,
+                    codons,
+                )
+            })
             .unwrap_or(false)
         {
             class.stop_lost = true;
@@ -7522,10 +7532,9 @@ fn classify_coding_change_with_semantics(
     let hgvs_amino_acids = vep116_ambiguous_terminal_hgvsp_alleles(&class, semantics)
         .or_else(|| class.amino_acids.clone())
         .or_else(|| {
-            class
-                .codons
-                .as_deref()
-                .and_then(pep_allele_string_from_codon_allele_string)
+            class.codons.as_deref().and_then(|codons| {
+                pep_allele_string_from_codon_allele_string_in(tx.codon_table, codons)
+            })
         });
     class.protein_hgvs = build_protein_hgvs_data(
         &class,
@@ -7704,7 +7713,7 @@ fn classify_insertion_with_semantics(
         tx_translation,
         std::str::from_utf8(effective_cds).ok()?,
     )?;
-    let new_aas = translate_protein_from_cds(&mutated)?;
+    let new_aas = translate_protein_from_cds_in(tx.codon_table, &mutated)?;
     let mut class = CodingClassification::default();
 
     // CDS position: insertion between cds_idx and cds_idx+1 in 0-based,
@@ -7854,7 +7863,7 @@ fn classify_insertion_with_semantics(
         let window_len = 3 + alt_len;
         let window_end = (codon_start + window_len).min(mutated.len());
         let local_window = &mutated[codon_start..window_end];
-        translate_protein_from_cds(local_window).unwrap_or_default()
+        translate_protein_from_cds_in(tx.codon_table, local_window).unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -7863,9 +7872,9 @@ fn classify_insertion_with_semantics(
         let ref_end = (codon_start + 3).min(effective_cds.len());
         let alt_end = (codon_start + 3 + alt_len).min(mutated.len());
         class.affected_ref_peptide =
-            local_peptide_from_codon_window(&effective_cds[codon_start..ref_end]);
+            local_peptide_from_codon_window(tx.codon_table, &effective_cds[codon_start..ref_end]);
         class.affected_alt_peptide =
-            local_peptide_from_codon_window(&mutated[codon_start..alt_end]);
+            local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
     }
     let partial_terminal_codon = {
         let codon_start = codon_at.saturating_mul(3);
@@ -8067,10 +8076,9 @@ fn classify_insertion_with_semantics(
     let hgvs_amino_acids = vep116_ambiguous_terminal_hgvsp_alleles(&class, semantics)
         .or_else(|| class.amino_acids.clone())
         .or_else(|| {
-            class
-                .codons
-                .as_deref()
-                .and_then(pep_allele_string_from_codon_allele_string)
+            class.codons.as_deref().and_then(|codons| {
+                pep_allele_string_from_codon_allele_string_in(tx.codon_table, codons)
+            })
         });
     class.protein_hgvs = build_protein_hgvs_data(
         &class,
@@ -10008,10 +10016,18 @@ fn format_coords_ensembl(start: Option<usize>, end: Option<usize>) -> Option<Str
 ///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L618-L629>
 /// - Ensembl Variation `TranscriptVariationAllele::peptide()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L692-L777>
+#[cfg(test)]
 fn pep_allele_string_from_codon_allele_string(codon_allele_string: &str) -> Option<String> {
+    pep_allele_string_from_codon_allele_string_in(CodonTable::Standard, codon_allele_string)
+}
+
+fn pep_allele_string_from_codon_allele_string_in(
+    table: CodonTable,
+    codon_allele_string: &str,
+) -> Option<String> {
     let (ref_codon, alt_codon) = codon_allele_string.split_once('/')?;
-    let ref_pep = peptide_from_codon_allele(ref_codon)?;
-    let alt_pep = peptide_from_codon_allele(alt_codon)?;
+    let ref_pep = peptide_from_codon_allele_in(table, ref_codon)?;
+    let alt_pep = peptide_from_codon_allele_in(table, alt_codon)?;
     if ref_pep == alt_pep {
         Some(ref_pep)
     } else {
@@ -10024,7 +10040,7 @@ fn pep_allele_string_from_codon_allele_string(codon_allele_string: &str) -> Opti
 ///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L618-L629>
 /// - Ensembl Variation `TranscriptVariationAllele::peptide()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L692-L777>
-fn peptide_from_codon_allele(codon: &str) -> Option<String> {
+fn peptide_from_codon_allele_in(table: CodonTable, codon: &str) -> Option<String> {
     if codon == "-" {
         return Some("-".to_string());
     }
@@ -10042,7 +10058,7 @@ fn peptide_from_codon_allele(codon: &str) -> Option<String> {
         triplet[triplet_len] = base.to_ascii_uppercase();
         triplet_len += 1;
         if triplet_len == 3 {
-            peptide.push(translate_codon_bytes(triplet)?);
+            peptide.push(translate_codon_bytes_in(table, triplet)?);
             triplet_len = 0;
         }
     }
@@ -10060,12 +10076,23 @@ fn peptide_from_codon_allele(codon: &str) -> Option<String> {
     Some(peptide)
 }
 
+#[cfg(test)]
 fn frameshift_deletion_partial_stop_lost_from_codon_allele_string(
     codon_allele_string: &str,
 ) -> Option<bool> {
+    frameshift_deletion_partial_stop_lost_from_codon_allele_string_in(
+        CodonTable::Standard,
+        codon_allele_string,
+    )
+}
+
+fn frameshift_deletion_partial_stop_lost_from_codon_allele_string_in(
+    table: CodonTable,
+    codon_allele_string: &str,
+) -> Option<bool> {
     let (ref_codon, alt_codon) = codon_allele_string.split_once('/')?;
-    let ref_pep = peptide_from_codon_allele(ref_codon)?;
-    let alt_pep = peptide_from_codon_allele(alt_codon)?;
+    let ref_pep = peptide_from_codon_allele_in(table, ref_codon)?;
+    let alt_pep = peptide_from_codon_allele_in(table, alt_codon)?;
     Some(ref_pep.contains('*') && !alt_pep.contains('*') && alt_pep.contains('X'))
 }
 
@@ -10393,15 +10420,108 @@ fn three_prime_utr_seq(tx: &TranscriptFeature) -> Option<String> {
     }
 }
 
+/// Translation with the standard genetic code (NCBI table 1).
+///
+/// Use it only where VEP translates without a codon table: BioPerl's
+/// `translate()` then defaults to table 1, even on mitochondrial transcripts.
+/// That is the case for the alternate proteins behind frameshift, deletion and
+/// stop-loss HGVSp (`_get_fs_peptides`, `_get_del_peptides`,
+/// `_stop_loss_extra_AA`, `_check_for_peptide_duplication`). Everything VEP
+/// derives from `TranscriptVariationAllele::peptide()` goes through
+/// [`translate_protein_from_cds_in`] with the transcript's table.
 fn translate_protein_from_cds(cds: &[u8]) -> Option<Vec<char>> {
+    translate_protein_from_cds_in(CodonTable::Standard, cds)
+}
+
+fn translate_protein_from_cds_in(table: CodonTable, cds: &[u8]) -> Option<Vec<char>> {
     let codon_count = cds.len() / 3;
     let mut out = Vec::with_capacity(codon_count);
     for codon_idx in 0..codon_count {
         let base = codon_idx * 3;
         let codon = std::str::from_utf8(&cds[base..base + 3]).ok()?;
-        out.push(translate_codon(codon)?);
+        out.push(translate_codon_in(table, codon)?);
     }
     Some(out)
+}
+
+/// Genetic code a transcript is translated with, as VEP's
+/// `BaseTranscriptVariation::_codon_table` resolves it: the cached
+/// `_variation_effect_feature_cache->{codon_table}`, else 1.
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1146-L1164>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodonTable {
+    /// NCBI table 1.
+    #[default]
+    Standard,
+    /// NCBI table 2, vertebrate mitochondrial: TGA is Trp, ATA is Met, and
+    /// AGA/AGG are stops. Every human MT transcript in the VEP caches.
+    VertebrateMitochondrial,
+}
+
+impl CodonTable {
+    /// Table for an NCBI genetic-code id. Ids other than 1 and 2 never occur in
+    /// the supported human caches and fall back to the standard code.
+    pub fn from_ncbi_id(id: i64) -> Self {
+        match id {
+            2 => Self::VertebrateMitochondrial,
+            _ => Self::Standard,
+        }
+    }
+
+    /// Table for a transcript loaded from a cache. Caches converted before the
+    /// reader picked `codon_table` up from `_variation_effect_feature_cache`
+    /// have it null for every transcript; every human MT transcript carries 2
+    /// in the raw cache, and VEP's GFF/GTF path assigns table 2 to `MT` by name
+    /// (ensembl-vep `AnnotationSource/File/BaseGXF.pm`), so a null on a
+    /// mitochondrial contig resolves to table 2.
+    pub fn for_cached_transcript(cached_id: Option<i64>, chrom: &str) -> Self {
+        match cached_id {
+            Some(id) => Self::from_ncbi_id(id),
+            None if is_mitochondrial_contig(chrom) => Self::VertebrateMitochondrial,
+            None => Self::Standard,
+        }
+    }
+}
+
+pub(crate) fn is_mitochondrial_contig(chrom: &str) -> bool {
+    matches!(
+        chrom.strip_prefix("chr").unwrap_or(chrom),
+        "M" | "MT" | "m" | "mt"
+    )
+}
+
+fn translate_codon_in(table: CodonTable, codon: &str) -> Option<char> {
+    if table == CodonTable::VertebrateMitochondrial {
+        match codon {
+            "TGA" => return Some('W'),
+            "ATA" => return Some('M'),
+            "AGA" | "AGG" => return Some('*'),
+            _ => {}
+        }
+    }
+    translate_codon(codon)
+}
+
+fn translate_codon_bytes_in(table: CodonTable, codon: [u8; 3]) -> Option<char> {
+    if table == CodonTable::VertebrateMitochondrial {
+        match codon {
+            [b'T', b'G', b'A'] => return Some('W'),
+            [b'A', b'T', b'A'] => return Some('M'),
+            [b'A', b'G', b'A'] | [b'A', b'G', b'G'] => return Some('*'),
+            _ => {}
+        }
+    }
+    translate_codon_bytes(codon)
+}
+
+fn is_stop_codon_in(table: CodonTable, allele: &str) -> bool {
+    match table {
+        CodonTable::Standard => is_stop_codon(allele),
+        CodonTable::VertebrateMitochondrial => matches!(
+            allele.to_ascii_uppercase().as_str(),
+            "TAA" | "TAG" | "AGA" | "AGG" | "*"
+        ),
+    }
 }
 
 fn translate_codon(codon: &str) -> Option<char> {
@@ -10660,6 +10780,7 @@ mod tests {
             transcript_id: id.to_string(),
             transcript_uid: None,
             db_id: None,
+            codon_table: CodonTable::Standard,
             chrom: chrom.to_string(),
             start,
             end,
@@ -21199,6 +21320,119 @@ mod tests {
         assert!(FeatureType::Transcript.rank() < FeatureType::RegulatoryFeature.rank());
         assert!(FeatureType::RegulatoryFeature.rank() < FeatureType::MotifFeature.rank());
         assert!(FeatureType::MotifFeature.rank() < FeatureType::None.rank());
+    }
+
+    #[test]
+    fn vertebrate_mitochondrial_table_differs_from_standard_only_on_four_codons() {
+        let bases = [b'T', b'C', b'A', b'G'];
+        for a in bases {
+            for b in bases {
+                for c in bases {
+                    let codon = [a, b, c];
+                    let text = std::str::from_utf8(&codon).unwrap();
+                    let mito = translate_codon_in(CodonTable::VertebrateMitochondrial, text);
+                    assert_eq!(
+                        translate_codon_bytes_in(CodonTable::VertebrateMitochondrial, codon),
+                        mito
+                    );
+                    let expected = match text {
+                        "TGA" => Some('W'),
+                        "ATA" => Some('M'),
+                        "AGA" | "AGG" => Some('*'),
+                        _ => translate_codon(text),
+                    };
+                    assert_eq!(mito, expected, "{text}");
+                    assert_eq!(
+                        translate_codon_in(CodonTable::Standard, text),
+                        translate_codon(text)
+                    );
+                    assert_eq!(
+                        is_stop_codon_in(CodonTable::VertebrateMitochondrial, text),
+                        expected == Some('*'),
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_transcript_codon_table_falls_back_to_table_2_on_mt() {
+        use CodonTable::{Standard, VertebrateMitochondrial};
+        // Converted caches carry `codon_table` null until the reader takes it
+        // from `_variation_effect_feature_cache`; MT then resolves to table 2.
+        for chrom in ["MT", "chrM", "chrMT", "M"] {
+            assert_eq!(
+                CodonTable::for_cached_transcript(None, chrom),
+                VertebrateMitochondrial
+            );
+        }
+        assert_eq!(CodonTable::for_cached_transcript(None, "1"), Standard);
+        assert_eq!(CodonTable::for_cached_transcript(None, "chr22"), Standard);
+        // A value in the cache wins over the contig name.
+        assert_eq!(CodonTable::for_cached_transcript(Some(1), "MT"), Standard);
+        assert_eq!(
+            CodonTable::for_cached_transcript(Some(2), "MT"),
+            VertebrateMitochondrial
+        );
+    }
+
+    /// A 12 bp MT-style coding transcript at MT:1000-1011, translated with
+    /// table 2. The cases mirror ClinVar chrMT records VEP 116.0 and 116.2
+    /// annotate with the vertebrate mitochondrial code.
+    fn classify_mt_snv(cds: &str, pos: i64, r: &str, a: &str) -> CodingClassification {
+        let mut t = tx(
+            "ENST_MT",
+            "MT",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        t.codon_table = CodonTable::VertebrateMitochondrial;
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(12);
+        t.translateable_seq = Some(cds.to_string());
+        let e = exon("ENST_MT", 1, 1000, 1011);
+        let tr = translation("ENST_MT", Some(12), Some(4), None, Some(cds));
+        classify_coding_change(&t, &[&e], Some(&tr), &var("MT", pos, pos, r, a))
+            .expect("MT classification")
+    }
+
+    #[test]
+    fn mt_ata_start_codon_is_met_under_table_2() {
+        // MT:3307 A>T in ND1 (ATA start): VEP writes M/L and start_lost.
+        let got = classify_mt_snv("ATAGCTCCCTAA", 1000, "A", "T");
+        assert_eq!(got.amino_acids.as_deref(), Some("M/L"));
+        assert!(got.start_lost);
+        // MT:3399-like third-base change ATA>ATT: M/I, still start_lost.
+        let got = classify_mt_snv("ATAGCTCCCTAA", 1002, "A", "T");
+        assert_eq!(got.amino_acids.as_deref(), Some("M/I"));
+        assert!(got.start_lost);
+    }
+
+    #[test]
+    fn mt_aga_is_a_stop_under_table_2() {
+        // MT:3308 T>G in ND1 (ATA>AGA): VEP writes M/* and stop_gained&start_lost.
+        let got = classify_mt_snv("ATAGCTCCCTAA", 1001, "T", "G");
+        assert_eq!(got.amino_acids.as_deref(), Some("M/*"));
+        assert!(got.stop_gained);
+        assert!(got.start_lost);
+        // An AGA terminal stop (COX1 ends in AGA) mutated to AGC is stop_lost.
+        let got = classify_mt_snv("ATGGCTCCCAGA", 1011, "A", "C");
+        assert_eq!(got.amino_acids.as_deref(), Some("*/S"));
+        assert!(got.stop_lost);
+    }
+
+    #[test]
+    fn mt_tga_is_trp_under_table_2() {
+        // MT:3669 A>G in ND1 (TGA>TGG): VEP writes W, synonymous.
+        let got = classify_mt_snv("ATGTGAGCTTAA", 1005, "A", "G");
+        assert_eq!(got.amino_acids.as_deref(), Some("W"));
+        assert!(got.synonymous);
+        assert!(!got.stop_lost);
     }
 
     fn tx_with_db_id(id: &str, db_id: Option<i64>, start: i64, end: i64) -> TranscriptFeature {

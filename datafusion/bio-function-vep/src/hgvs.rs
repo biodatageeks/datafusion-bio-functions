@@ -2582,6 +2582,7 @@ mod tests {
             transcript_id: "ENSTHGVS000001".to_string(),
             transcript_uid: None,
             db_id: None,
+            codon_table: crate::transcript_consequence::CodonTable::Standard,
             chrom: "1".to_string(),
             start: 90,
             end: 140,
