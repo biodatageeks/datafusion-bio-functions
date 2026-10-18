@@ -2581,6 +2581,7 @@ mod tests {
         TranscriptFeature {
             transcript_id: "ENSTHGVS000001".to_string(),
             transcript_uid: None,
+            db_id: None,
             chrom: "1".to_string(),
             start: 90,
             end: 140,
