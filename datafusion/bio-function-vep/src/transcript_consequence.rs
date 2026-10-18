@@ -3164,8 +3164,8 @@ impl TranscriptConsequenceEngine {
         // substitution where alt is a stop codon but ref is not).
         if ref_len == alt_len
             && ref_len % 3 == 0
-            && !is_stop_codon(&variant.ref_allele)
-            && is_stop_codon(&variant.alt_allele)
+            && !is_stop_codon_in(tx.codon_table, &variant.ref_allele)
+            && is_stop_codon_in(tx.codon_table, &variant.alt_allele)
         {
             terms.insert(SoTerm::StopGained);
         }
@@ -3258,7 +3258,9 @@ impl TranscriptConsequenceEngine {
             }
         }
         if self.overlaps_stop_codon(variant, tx) {
-            if is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele) {
+            if is_stop_codon_in(tx.codon_table, &variant.ref_allele)
+                && is_stop_codon_in(tx.codon_table, &variant.alt_allele)
+            {
                 terms.insert(SoTerm::StopRetainedVariant);
             } else {
                 let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
@@ -3272,7 +3274,8 @@ impl TranscriptConsequenceEngine {
                     } else {
                         terms.insert(SoTerm::StopLost);
                     }
-                } else if !is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele)
+                } else if !is_stop_codon_in(tx.codon_table, &variant.ref_allele)
+                    && is_stop_codon_in(tx.codon_table, &variant.alt_allele)
                 {
                     terms.insert(SoTerm::StopGained);
                 } else {
@@ -18082,6 +18085,33 @@ mod tests {
     }
 
     // ---- start_retained heuristic for indels ----
+
+    #[test]
+    fn stop_heuristic_uses_the_transcript_codon_table() {
+        // Without CDS data the engine falls back to allele-pattern stop checks;
+        // under table 2 AGA is a stop, so AGA>TAA at the stop codon is retained.
+        let engine = TranscriptConsequenceEngine::default();
+        let mut t = tx(
+            "tx_mt",
+            "MT",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
+        let v = var("MT", 198, 200, "AGA", "TAA");
+        let exons_ref: Vec<&ExonFeature> = vec![];
+        t.codon_table = CodonTable::VertebrateMitochondrial;
+        let mut terms = BTreeSet::new();
+        engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons_ref, None);
+        assert!(terms.contains(&SoTerm::StopRetainedVariant), "{terms:?}");
+        t.codon_table = CodonTable::Standard;
+        let mut terms = BTreeSet::new();
+        engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons_ref, None);
+        assert!(!terms.contains(&SoTerm::StopRetainedVariant), "{terms:?}");
+    }
 
     #[test]
     fn start_retained_heuristic_indel_after_start_codon() {
