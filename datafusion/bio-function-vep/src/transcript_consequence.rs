@@ -240,6 +240,10 @@ pub struct TranscriptFeature {
     /// lookup key `(transcript_uid << 32) | protein_position`. `None` for legacy
     /// caches that predate the column.
     pub transcript_uid: Option<u32>,
+    /// Ensembl `dbID` of the transcript, carried from the `transcript` table's
+    /// `db_id` column. Part of VEP's transcript ordering key; see
+    /// [`vep_transcript_order`]. `None` for caches without the column.
+    pub db_id: Option<i64>,
     pub chrom: String,
     pub start: i64,
     pub end: i64,
@@ -329,6 +333,61 @@ pub struct TranscriptFeature {
     /// Lazily-built cDNA coordinate table, memoized once per transcript and
     /// reused across all overlapping variants/alleles. Not part of identity.
     pub cdna_coords_cache: GeometryCache,
+}
+
+/// Ensembl VEP's transcript order, used for CSQ entry order and as the final
+/// pick-mode tie-break.
+///
+/// VEP returns transcript variations by `sort keys` over
+/// `BaseVariationFeature::_get_transcript_key`, which is the stable ID with
+/// `"_" . dbID` appended when the dbID is true (non-zero):
+/// <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseVariationFeature.pm#L310-L321>
+/// <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L666>
+///
+/// This is a byte comparison of the whole key, not a `(stable_id, db_id)`
+/// tuple comparison: `ND4L_8378488` sorts before `ND4_8361687` because `L`
+/// (0x4C) < `_` (0x5F), and dbIDs compare as text (`X_10` < `X_9`).
+pub fn vep_transcript_order(a: &TranscriptFeature, b: &TranscriptFeature) -> std::cmp::Ordering {
+    vep_transcript_key_cmp(&a.transcript_id, a.db_id, &b.transcript_id, b.db_id)
+}
+
+fn vep_transcript_key_cmp(
+    a_id: &str,
+    a_db_id: Option<i64>,
+    b_id: &str,
+    b_db_id: Option<i64>,
+) -> std::cmp::Ordering {
+    let (a, b) = (a_id.as_bytes(), b_id.as_bytes());
+    let common = a.len().min(b.len());
+    // The dbID suffix only matters when one stable ID is a prefix of the other.
+    match a[..common].cmp(&b[..common]) {
+        std::cmp::Ordering::Equal => {}
+        unequal => return unequal,
+    }
+    let mut a_buf = [0u8; 21];
+    let mut b_buf = [0u8; 21];
+    let a_rest = a[common..]
+        .iter()
+        .chain(vep_db_id_suffix(a_db_id, &mut a_buf));
+    let b_rest = b[common..]
+        .iter()
+        .chain(vep_db_id_suffix(b_db_id, &mut b_buf));
+    a_rest.cmp(b_rest)
+}
+
+/// `"_" . dbID` as VEP appends it, written into `buf`; empty when the dbID is
+/// absent or zero (Perl false).
+fn vep_db_id_suffix(db_id: Option<i64>, buf: &mut [u8; 21]) -> &[u8] {
+    use std::io::Write;
+    match db_id {
+        Some(id) if id != 0 => {
+            let mut cursor = std::io::Cursor::new(&mut buf[..]);
+            write!(cursor, "_{id}").expect("an i64 with its prefix fits in 21 bytes");
+            let len = cursor.position() as usize;
+            &buf[..len]
+        }
+        _ => &[],
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1036,12 +1095,12 @@ impl<'a> PreparedContext<'a> {
             .into_iter()
             .map(|t| (t.transcript_id.as_str(), t))
             .collect();
-        // Sort transcripts by transcript_id so that source-array index order
-        // equals lexicographic feature-ID order.  The downstream CSQ sort can
-        // then compare lightweight `transcript_idx` integers instead of heap-
-        // allocated transcript_id strings.
+        // Sort transcripts in VEP order (`vep_transcript_order`) so that
+        // source-array index order equals VEP's transcript order. The
+        // downstream CSQ sort and the pick tie-break can then compare
+        // lightweight `transcript_idx` integers instead of building keys.
         let mut tx_refs = transcripts;
-        tx_refs.sort_unstable_by(|a, b| a.transcript_id.cmp(&b.transcript_id));
+        tx_refs.sort_unstable_by(|a, b| vep_transcript_order(a, b));
 
         // Build per-chromosome COITree for fast interval overlap queries.
         let mut chrom_intervals: HashMap<String, Vec<Interval<usize>>> = HashMap::new();
@@ -10599,6 +10658,7 @@ mod tests {
         TranscriptFeature {
             transcript_id: id.to_string(),
             transcript_uid: None,
+            db_id: None,
             chrom: chrom.to_string(),
             start,
             end,
@@ -21138,6 +21198,99 @@ mod tests {
         assert!(FeatureType::Transcript.rank() < FeatureType::RegulatoryFeature.rank());
         assert!(FeatureType::RegulatoryFeature.rank() < FeatureType::MotifFeature.rank());
         assert!(FeatureType::MotifFeature.rank() < FeatureType::None.rank());
+    }
+
+    fn tx_with_db_id(id: &str, db_id: Option<i64>, start: i64, end: i64) -> TranscriptFeature {
+        let mut t = tx(id, "MT", start, end, 1, "protein_coding", None, None);
+        t.db_id = db_id;
+        t
+    }
+
+    #[test]
+    fn vep_transcript_order_compares_the_stable_id_db_id_key_as_bytes() {
+        use std::cmp::Ordering::{Greater, Less};
+        // Release 116 merged cache, chrMT RefSeq: VEP writes ND4L before ND4.
+        let nd4 = tx_with_db_id("ND4", Some(8_361_687), 10_760, 12_137);
+        let nd4l = tx_with_db_id("ND4L", Some(8_378_488), 10_470, 10_766);
+        assert_eq!(vep_transcript_order(&nd4l, &nd4), Less);
+        assert_eq!(vep_transcript_order(&nd4, &nd4l), Greater);
+        // The 115 cache has the dbIDs the other way round; order is the same.
+        let nd4 = tx_with_db_id("ND4", Some(8_130_648), 10_760, 12_137);
+        let nd4l = tx_with_db_id("ND4L", Some(8_077_147), 10_470, 10_766);
+        assert_eq!(vep_transcript_order(&nd4l, &nd4), Less);
+    }
+
+    #[test]
+    fn vep_transcript_order_compares_db_ids_as_text_and_skips_false_ones() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let key = |id: &str, db: Option<i64>| tx_with_db_id(id, db, 1, 10);
+        // Same stable ID: dbIDs compare as text, "X_10" < "X_9".
+        assert_eq!(
+            vep_transcript_order(&key("X", Some(10)), &key("X", Some(9))),
+            Less
+        );
+        // A missing or zero dbID adds no suffix (Perl false), so the shorter key
+        // sorts first and `None` ties with `Some(0)`.
+        assert_eq!(
+            vep_transcript_order(&key("X", None), &key("X", Some(5))),
+            Less
+        );
+        assert_eq!(
+            vep_transcript_order(&key("X", None), &key("X", Some(0))),
+            Equal
+        );
+        // Without dbIDs a prefix still sorts first, as plain string order.
+        assert_eq!(
+            vep_transcript_order(&key("ND4", None), &key("ND4L", None)),
+            Less
+        );
+        // A continuation byte above '_' does not flip: "ab_1" < "abc_2".
+        assert_eq!(
+            vep_transcript_order(&key("ab", Some(1)), &key("abc", Some(2))),
+            Less
+        );
+        // Negative dbIDs are Perl-true and print with their sign.
+        assert_eq!(
+            vep_transcript_order(&key("X", Some(-1)), &key("X", Some(1))),
+            Less
+        );
+        // IDs that differ before either ends ignore the dbID entirely.
+        assert_eq!(
+            vep_transcript_order(
+                &key("ENST00000361335", Some(9)),
+                &key("ENST00000361381", Some(1))
+            ),
+            Less
+        );
+        assert_eq!(
+            vep_transcript_order(&key("TRBV5-2", Some(1)), &key("TRB", Some(2))),
+            Less
+        );
+        assert_eq!(
+            vep_transcript_order(&key("TRB", Some(2)), &key("TRBV5-2", Some(1))),
+            Greater
+        );
+    }
+
+    #[test]
+    fn prepared_context_indexes_transcripts_in_vep_order() {
+        // CSQ entries and pick ties follow `transcript_idx`, i.e. this order.
+        let transcripts = vec![
+            tx_with_db_id("ND4", Some(8_361_687), 10_760, 12_137),
+            tx_with_db_id("ND4L", Some(8_378_488), 10_470, 10_766),
+            tx_with_db_id("ENST00000361381", Some(1_642), 10_760, 12_137),
+            tx_with_db_id("ENST00000361335", Some(1_637), 10_470, 10_766),
+        ];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let ids: Vec<&str> = ctx
+            .transcripts
+            .iter()
+            .map(|t| t.transcript_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["ENST00000361335", "ENST00000361381", "ND4L", "ND4"]
+        );
     }
 
     #[test]

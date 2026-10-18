@@ -2982,6 +2982,28 @@ fn pick_assignment_feature_id<'a>(
         .unwrap_or("")
 }
 
+/// VEP feature order between two pick candidates of the same feature type.
+/// Transcripts follow `vep_transcript_order`, which `PreparedContext` already
+/// applied to the transcript array, so their indices compare in that order.
+fn pick_assignment_vep_order(
+    a: usize,
+    b: usize,
+    assignments: &[TranscriptConsequence],
+    ctx: &PreparedContext<'_>,
+) -> std::cmp::Ordering {
+    let (ta, tb) = (&assignments[a], &assignments[b]);
+    if ta.feature_type == FeatureType::Transcript && tb.feature_type == FeatureType::Transcript {
+        if let (Some(ia), Some(ib)) = (ta.transcript_idx, tb.transcript_idx) {
+            return ia.cmp(&ib);
+        }
+    }
+    pick_assignment_feature_id(a, assignments, ctx).cmp(pick_assignment_feature_id(
+        b,
+        assignments,
+        ctx,
+    ))
+}
+
 fn pick_assignment_source_rank(tx: Option<&TranscriptFeature>, wanted: &str) -> u8 {
     let Some(tx) = tx else {
         return 1;
@@ -3122,13 +3144,7 @@ fn sort_pick_candidates_by_vep_order(
             .feature_type
             .rank()
             .cmp(&assignments[b].feature_type.rank())
-            .then_with(|| {
-                pick_assignment_feature_id(a, assignments, ctx).cmp(pick_assignment_feature_id(
-                    b,
-                    assignments,
-                    ctx,
-                ))
-            })
+            .then_with(|| pick_assignment_vep_order(a, b, assignments, ctx))
             .then_with(|| a.cmp(&b))
     });
 }
@@ -4268,6 +4284,7 @@ impl AnnotateProvider {
             &[
                 "transcript_id",
                 "stable_id",
+                "db_id",
                 "chrom",
                 "start",
                 "\"end\"",
@@ -4401,6 +4418,7 @@ impl AnnotateProvider {
             let appris_idx = schema.index_of("appris").ok();
             let ncrna_structure_idx = schema.index_of("ncrna_structure").ok();
             let transcript_uid_idx = schema.index_of("transcript_uid").ok();
+            let db_id_idx = schema.index_of("db_id").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -4572,10 +4590,12 @@ impl AnnotateProvider {
                     ncrna_structure_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let transcript_uid =
                     transcript_uid_idx.and_then(|idx| uint32_at(batch.column(idx).as_ref(), row));
+                let db_id = db_id_idx.and_then(|idx| int64_at(batch.column(idx).as_ref(), row));
 
                 out.push(TranscriptFeature {
                     transcript_id,
                     transcript_uid,
+                    db_id,
                     chrom,
                     start,
                     end,
@@ -5123,6 +5143,7 @@ impl AnnotateProvider {
             let appris_idx = schema.index_of("appris").ok();
             let ncrna_structure_idx = schema.index_of("ncrna_structure").ok();
             let transcript_uid_idx = schema.index_of("transcript_uid").ok();
+            let db_id_idx = schema.index_of("db_id").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -5226,6 +5247,7 @@ impl AnnotateProvider {
                 });
                 let transcript_uid =
                     transcript_uid_idx.and_then(|idx| uint32_at(batch.column(idx).as_ref(), row));
+                let db_id = db_id_idx.and_then(|idx| int64_at(batch.column(idx).as_ref(), row));
 
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
@@ -5235,6 +5257,7 @@ impl AnnotateProvider {
                 out.push(TranscriptFeature {
                     transcript_id,
                     transcript_uid,
+                    db_id,
                     chrom,
                     start,
                     end,
@@ -6810,13 +6833,13 @@ impl AnnotateProvider {
                 // so the Nth CSQ entry matches the Nth typed column element.
                 //
                 // Sort order: Transcript → Regulatory → Motif → Intergenic,
-                // then lexicographically by feature stable_id within each
-                // group. See ensembl-variation VariationFeature.pm lines 855-864.
+                // then by VEP feature order within each group. See
+                // ensembl-variation VariationFeature.pm lines 855-864.
                 //
-                // Source arrays are pre-sorted by feature ID in
-                // PreparedContext, so transcript_idx order equals
-                // lexicographic transcript_id order. We compare
-                // integer indices instead of heap-allocated strings.
+                // PreparedContext sorts transcripts by
+                // `vep_transcript_order` (VEP's `stable_id_dbID` key), so
+                // transcript_idx order equals VEP's transcript order. We
+                // compare integer indices instead of building keys.
                 // Non-transcript features (regulatory, motif) are
                 // already emitted in ID order by collect_overlapping_indices.
                 sorted_indices.clear();
@@ -10125,6 +10148,7 @@ fn emit_contig_pipeline_profile(profile: &Option<SharedContigPipelineProfile>, c
 const TRANSCRIPT_CONTEXT_COLUMNS: &[&str] = &[
     "transcript_id",
     "stable_id",
+    "db_id",
     "chrom",
     "start",
     "\"end\"",
@@ -18639,6 +18663,55 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_pick_tie_breaks_by_vep_stable_id_db_id_key() {
+        // VEP's last pick fallback keeps the first tied candidate in
+        // `get_all_TranscriptVariations` order, i.e. `stable_id_dbID` sorted as
+        // strings. chrMT RefSeq, release 116: ND4L_8378488 < ND4_8361687.
+        let mut nd4 = make_tx("ND4", None, Some("ND4"), Some("HGNC"), None);
+        nd4.biotype = "protein_coding".to_string();
+        nd4.db_id = Some(8_361_687);
+        let mut nd4l = make_tx("ND4L", None, Some("ND4L"), Some("HGNC"), None);
+        nd4l.biotype = "protein_coding".to_string();
+        nd4l.db_id = Some(8_378_488);
+
+        let transcripts = vec![nd4, nd4l];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let idx_of = |id: &str| {
+            ctx.transcripts
+                .iter()
+                .position(|t| t.transcript_id == id)
+                .unwrap()
+        };
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(idx_of("ND4")),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::FivePrimeUtrVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(idx_of("ND4L")),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::FivePrimeUtrVariant],
+                ..Default::default()
+            },
+        ];
+
+        let picked = apply_pick_mode(
+            assignments,
+            &ctx,
+            &PickFlags {
+                mode: PickMode::PickAllele,
+                pick_order: vec![PickCriterion::Rank],
+            },
+            "A",
+        );
+
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].transcript_idx, Some(idx_of("ND4L")));
+    }
+
+    #[test]
     fn test_apply_pick_mode_filters_per_gene_modes_and_retains_non_transcripts() {
         let mut tx_a = make_tx("ENST00000061", Some("GENE1"), Some("HGNC"), None, None);
         tx_a.biotype = "protein_coding".to_string();
@@ -19450,6 +19523,7 @@ mod tests {
         TranscriptFeature {
             transcript_id: id.to_string(),
             transcript_uid: None,
+            db_id: None,
             chrom: "chr2".to_string(),
             start: 1,
             end: 100,
