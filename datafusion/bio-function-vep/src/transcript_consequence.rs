@@ -341,8 +341,9 @@ pub struct TranscriptFeature {
 /// VEP returns transcript variations by `sort keys` over
 /// `BaseVariationFeature::_get_transcript_key`, which is the stable ID with
 /// `"_" . dbID` appended when the dbID is true (non-zero):
-/// <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseVariationFeature.pm#L310-L321>
-/// <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L666>
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/BaseVariationFeature.pm#L310-L321>
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L666>
+/// (VEP 116.0; identical at `db7394a`, VEP 116.1/116.2)
 ///
 /// This is a byte comparison of the whole key, not a `(stable_id, db_id)`
 /// tuple comparison: `ND4L_8378488` sorts before `ND4_8361687` because `L`
@@ -1100,7 +1101,7 @@ impl<'a> PreparedContext<'a> {
         // downstream CSQ sort and the pick tie-break can then compare
         // lightweight `transcript_idx` integers instead of building keys.
         let mut tx_refs = transcripts;
-        tx_refs.sort_unstable_by(|a, b| vep_transcript_order(a, b));
+        tx_refs.sort_by(|a, b| vep_transcript_order(a, b));
 
         // Build per-chromosome COITree for fast interval overlap queries.
         let mut chrom_intervals: HashMap<String, Vec<Interval<usize>>> = HashMap::new();
