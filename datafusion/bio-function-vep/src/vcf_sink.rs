@@ -2451,6 +2451,79 @@ mod tests {
         assert!(body.contains("\tGT:DP\t0/1:25"), "got: {body}");
     }
 
+    /// The reader hands out percent-decoded INFO values; the writer must encode
+    /// them again, but leave CSQ — already escaped by the VEP rules, with `,`
+    /// between its blocks — exactly as the engine built it
+    /// (biodatageeks/vepyr#207).
+    #[test]
+    fn the_body_formatter_encodes_input_info_and_writes_csq_verbatim() {
+        use datafusion::arrow::array::{
+            Float64Array, ListBuilder, StringArray, StringBuilder, UInt32Array,
+        };
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let mut clndn = ListBuilder::new(StringBuilder::new());
+        clndn.values().append_value("Lung_disease;");
+        clndn.values().append_value("a,b");
+        clndn.append(true);
+        let csq = "T|synonymous_variant|p.Ala125%3D,T|intron_variant|";
+        let csq_field = Field::new("CSQ", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                datafusion_bio_format_core::metadata::VCF_FIELD_NUMBER_KEY.to_string(),
+                ".".to_string(),
+            )]),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+                Field::new("id", DataType::Utf8, true),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+                Field::new("qual", DataType::Float64, true),
+                Field::new("filter", DataType::Utf8, true),
+                Field::new(
+                    "CLNDN",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    true,
+                ),
+                Field::new("CLNVI", DataType::Utf8, true),
+                csq_field,
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["chr13"])),
+                Arc::new(UInt32Array::from(vec![99u32])),
+                Arc::new(UInt32Array::from(vec![100u32])),
+                Arc::new(StringArray::from(vec![Some("51220")])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+                Arc::new(Float64Array::from(vec![None::<f64>])),
+                Arc::new(StringArray::from(vec![Some(".")])),
+                Arc::new(clndn.finish()),
+                Arc::new(StringArray::from(vec![Some("BIC:base_change=ins")])),
+                Arc::new(StringArray::from(vec![Some(csq)])),
+            ],
+        )
+        .unwrap();
+
+        let formatted = format_vcf_body_chunk(
+            0,
+            batch,
+            Arc::new(vec!["CLNDN".into(), "CLNVI".into(), "CSQ".into()]),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            true,
+        )
+        .unwrap();
+        let body = String::from_utf8(formatted.bytes).unwrap();
+        let info = body.split('\t').nth(7).unwrap().trim_end();
+        assert_eq!(
+            info,
+            format!("CLNDN=Lung_disease%3B,a%2Cb;CLNVI=BIC:base_change%3Dins;CSQ={csq}")
+        );
+    }
+
     #[test]
     fn the_inputs_csq_declaration_is_recognised_in_any_case() {
         assert!(is_input_csq_declaration(

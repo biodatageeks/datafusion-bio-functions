@@ -4020,12 +4020,22 @@ impl AnnotateProvider {
             .collect();
         let mut fields = input_fields_for_output(&vcf_schema, &reserved);
 
+        // CSQ holds the joined VCF value: its blocks are escaped by the VEP
+        // rules and separated by `,`. Declaring Number=. on a scalar string is
+        // what tells the VCF writer to emit it verbatim instead of
+        // percent-encoding it a second time (biodatageeks/vepyr#207).
         fields.push(Arc::new(
             Field::new("CSQ", DataType::Utf8, true).with_metadata(
-                [(
-                    crate::cache_source::ANNOTATION_CACHE_LAYOUT_KEY.to_string(),
-                    cache_metadata.layout_identity(),
-                )]
+                [
+                    (
+                        crate::cache_source::ANNOTATION_CACHE_LAYOUT_KEY.to_string(),
+                        cache_metadata.layout_identity(),
+                    ),
+                    (
+                        datafusion_bio_format_core::metadata::VCF_FIELD_NUMBER_KEY.to_string(),
+                        ".".to_string(),
+                    ),
+                ]
                 .into_iter()
                 .collect(),
             ),
@@ -17499,6 +17509,32 @@ mod tests {
         assert_eq!(
             provider.schema().metadata()["bio.vcf.file_format"],
             "VCFv4.2"
+        );
+    }
+
+    /// CSQ is already joined VCF text. Number=. on the scalar column is what
+    /// keeps the VCF writer from percent-encoding it a second time
+    /// (biodatageeks/vepyr#207).
+    #[test]
+    fn csq_is_declared_as_joined_text_for_the_vcf_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = AnnotateProvider::new(
+            Arc::new(SessionContext::new()),
+            "vcf".to_string(),
+            tmp.path().to_string_lossy().to_string(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Merged,
+            Some(r#"{"everything":true}"#.to_string()),
+            Schema::new(core_input_fields()),
+        )
+        .unwrap();
+
+        let schema = provider.schema();
+        let csq = schema.field_with_name("CSQ").unwrap();
+        assert_eq!(csq.data_type(), &DataType::Utf8);
+        assert_eq!(
+            csq.metadata()[datafusion_bio_format_core::metadata::VCF_FIELD_NUMBER_KEY],
+            "."
         );
     }
 
