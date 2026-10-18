@@ -1431,15 +1431,17 @@ impl VepFlags {
         let af_gnomadg =
             (everything || parse("af_gnomadg")) && (max_af || emits_any(GNOMADG_OUTPUT_NAMES));
         let pubmed = (everything || parse("pubmed")) && emits_any(&["PUBMED"]);
-        // VEP behavior: AF flags imply --check_existing.
+        // VEP behavior: AF flags imply --check_existing (Config.pm). The
+        // implication follows the flags as given, not as pruned: `af` with
+        // only CLIN_SIG read still runs the co-located lookup.
         let check_existing = (everything
             || parse("check_existing")
-            || af
-            || af_1kg
-            || af_gnomade
-            || af_gnomadg
-            || max_af
-            || pubmed)
+            || parse("af")
+            || parse("af_1kg")
+            || parse("af_gnomade")
+            || parse("af_gnomadg")
+            || parse("max_af")
+            || parse("pubmed"))
             && emits_any(&[
                 "Existing_variation",
                 "AF",
@@ -21117,6 +21119,27 @@ mod tests {
             .with_csq_fields(["HGVSc".to_string()]),
         ));
         assert!(provider.output_needs_genomic_reference(Some(&projection), &hgvs_flags));
+    }
+
+    #[test]
+    fn pruned_af_flags_keep_their_check_existing_implication() {
+        for flag in [
+            "af",
+            "af_1kg",
+            "af_gnomade",
+            "af_gnomadg",
+            "max_af",
+            "pubmed",
+        ] {
+            let options = format!(r#"{{"{flag}":true}}"#);
+            let reads = |name: &str| name == "CLIN_SIG";
+            let flags = VepFlags::from_options_json_reading(Some(&options), Some(&reads));
+            assert!(flags.check_existing, "{flag} implies check_existing");
+            assert!(
+                !flags.af && !flags.max_af,
+                "{flag}: unread groups stay pruned"
+            );
+        }
     }
 
     #[test]
