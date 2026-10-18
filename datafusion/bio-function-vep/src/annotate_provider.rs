@@ -15914,9 +15914,6 @@ async fn prepare_contig_data(
     }))
 }
 
-/// Build the filtered lookup for one run and spawn its position-ordered
-/// partition workers. Shared by the first run (from `activate_contig_lookups`)
-/// and every later run of the same contig (from the `ActivatingRun` state).
 /// Whether anything reads the variation lookup: the co-located sink, a
 /// cache-only column, or a shard's precomputed consequences, which the
 /// cached fast path uses in place of the transcript engine.
@@ -15949,7 +15946,9 @@ fn apply_lookup_needs(provider: &mut LookupProvider, config: &ContigAnnotationCo
         config.flags.af_gnomadg,
     ]));
 }
-
+/// Build the filtered lookup for one run and spawn its position-ordered
+/// partition workers. Shared by the first run (from `activate_contig_lookups`)
+/// and every later run of the same contig (from the `ActivatingRun` state).
 async fn activate_run_lookup(
     session: Arc<SessionContext>,
     inputs: RunActivationInputs,
