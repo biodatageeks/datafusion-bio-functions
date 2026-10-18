@@ -4521,7 +4521,7 @@ fn vep116_stop_retained_without_alt_peptide(
     };
     std::str::from_utf8(stop_codon)
         .ok()
-        .is_some_and(is_stop_codon)
+        .is_some_and(|codon| is_stop_codon_in(tx.codon_table, codon))
 }
 
 /// VEP 116 `stop_lost()` falls back to `_ins_del_stop_altered()` when the
@@ -11168,6 +11168,45 @@ mod tests {
         );
         assert!(fallback.stop_lost);
         assert!(!fallback.stop_retained);
+    }
+
+    #[test]
+    fn vep116_cil_stop_slot_uses_the_transcript_codon_table() {
+        // MT CDS ending in the table-2 stop AGA, 3' UTR "A": deleting the last
+        // base shifts the UTR A into the stop slot, which still reads AGA, a
+        // stop under table 2 (VEP's _ins_del_stop_altered_cil uses
+        // _codon_table) but not under table 1.
+        let mut mt = tx(
+            "T_MT",
+            "MT",
+            1000,
+            1006,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1005),
+        );
+        mt.cdna_coding_start = Some(1);
+        mt.cdna_coding_end = Some(6);
+        mt.three_prime_utr_seq = Some("A".to_string());
+        let mt_exon = exon("T_MT", 1, 1000, 1006);
+        let mt_exons = vec![&mt_exon];
+        let mt_translation = translation("T_MT", Some(6), Some(2), None, Some("ATGAGA"));
+        let deletion = var("MT", 1005, 1005, "A", "-");
+        mt.codon_table = CodonTable::VertebrateMitochondrial;
+        assert!(vep116_stop_retained_without_alt_peptide(
+            &mt,
+            &mt_exons,
+            Some(&mt_translation),
+            &deletion,
+        ));
+        mt.codon_table = CodonTable::Standard;
+        assert!(!vep116_stop_retained_without_alt_peptide(
+            &mt,
+            &mt_exons,
+            Some(&mt_translation),
+            &deletion,
+        ));
     }
 
     #[test]
