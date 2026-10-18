@@ -15,7 +15,7 @@ use datafusion::arrow::array::{
     Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch,
     StringArray, StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -112,6 +112,11 @@ pub struct VariationLookupExec {
     /// emitted (1:1 with input rows, which the buffer-boundary arithmetic
     /// depends on), just with null cache columns.
     probe_floor_pos: Option<i64>,
+    /// No output reads the lookup: every row passes through with null cache
+    /// columns, as warm-up rows do, and the variation shard is never opened.
+    skip_probing: bool,
+    /// AF column groups co-located data reads; `None` reads all of them.
+    colocated_af_groups: Option<[bool; 3]>,
     /// Per-contig Parquet variation lookup (shard + footer page directory), built
     /// once and shared across all per-partition streams via the Arc. Single-flight
     /// via OnceCell so simultaneous fan-out probes build it exactly once.
@@ -206,6 +211,8 @@ impl VariationLookupExec {
             colocated_partition_sinks: None,
             target_partitions: 1,
             probe_floor_pos: None,
+            skip_probing: false,
+            colocated_af_groups: None,
             #[cfg(feature = "parquet-cache")]
             parquet_lookup_cell: Arc::new(OnceCell::new()),
         })
@@ -219,6 +226,18 @@ impl VariationLookupExec {
     /// Skip the variation probe for rows below `pos` (see `probe_floor_pos`).
     pub fn with_probe_floor_pos(mut self, pos: Option<i64>) -> Self {
         self.probe_floor_pos = pos;
+        self
+    }
+
+    /// Pass every row through unprobed (see `skip_probing`).
+    pub fn with_skip_probing(mut self, skip: bool) -> Self {
+        self.skip_probing = skip;
+        self
+    }
+
+    /// Read only these AF column groups for co-located data.
+    pub fn with_colocated_af_groups(mut self, groups: Option<[bool; 3]>) -> Self {
+        self.colocated_af_groups = groups;
         self
     }
 
@@ -312,6 +331,8 @@ impl ExecutionPlan for VariationLookupExec {
         }
         exec = exec.with_target_partitions(self.target_partitions);
         exec = exec.with_probe_floor_pos(self.probe_floor_pos);
+        exec = exec.with_skip_probing(self.skip_probing);
+        exec = exec.with_colocated_af_groups(self.colocated_af_groups);
         // Carry the shared per-contig variation lookup forward across re-planning
         // instead of letting new reset it.
         #[cfg(feature = "parquet-cache")]
@@ -352,6 +373,8 @@ impl ExecutionPlan for VariationLookupExec {
             self.probe_floor_pos,
         );
 
+        stream.skip_probing = self.skip_probing;
+        stream.colocated_af_groups = self.colocated_af_groups;
         // Share the exec's single per-contig variation lookup with this stream;
         // new() seeded a placeholder empty cell.
         #[cfg(feature = "parquet-cache")]
@@ -372,6 +395,10 @@ impl ExecutionPlan for VariationLookupExec {
 /// the colocated map.
 struct VariationLookupStream {
     probe_floor_pos: Option<i64>,
+    /// Set by the exec after construction (see `VariationLookupExec::skip_probing`).
+    skip_probing: bool,
+    /// Set by the exec after construction; `None` reads every AF group.
+    colocated_af_groups: Option<[bool; 3]>,
     input: SendableRecordBatchStream,
     variation_storage: VariationLookupStorage,
     cache_schema: SchemaRef,
@@ -472,8 +499,25 @@ fn push_unique_column(columns: &mut Vec<String>, name: &str) {
     }
 }
 
+/// AF column group of a `colocated::AF_COL_NAMES` entry: 0 = 1000 Genomes,
+/// 1 = gnomAD exomes, 2 = gnomAD genomes.
+fn af_column_group(name: &str) -> usize {
+    if name.starts_with("gnomADe") {
+        1
+    } else if name.starts_with("gnomADg") {
+        2
+    } else {
+        0
+    }
+}
+
 /// Columns to project from the Parquet variation shard for a probe.
-fn variation_projection_columns(cache_columns: &[String], include_colocated: bool) -> Vec<String> {
+/// `af_groups` limits the co-located AF columns to the enabled groups.
+fn variation_projection_columns(
+    cache_columns: &[String],
+    include_colocated: bool,
+    af_groups: Option<[bool; 3]>,
+) -> Vec<String> {
     let mut columns = Vec::with_capacity(cache_columns.len() + 16);
     for name in ["allele_string", "end", "failed", "strand"] {
         push_unique_column(&mut columns, name);
@@ -495,7 +539,9 @@ fn variation_projection_columns(cache_columns: &[String], include_colocated: boo
             push_unique_column(&mut columns, name);
         }
         for name in crate::colocated::AF_COL_NAMES {
-            push_unique_column(&mut columns, name);
+            if af_groups.is_none_or(|groups| groups[af_column_group(name)]) {
+                push_unique_column(&mut columns, name);
+            }
         }
     }
     columns
@@ -1033,6 +1079,13 @@ struct BatchProbeIndices {
     strand: Option<usize>,
 }
 
+/// Index of an optional column. Runs per probed batch, so it must not use
+/// `Schema::index_of`, which formats an error listing every field on a miss.
+#[cfg(feature = "parquet-cache")]
+fn optional_column_index(schema: &Schema, name: &str) -> Option<usize> {
+    schema.column_with_name(name).map(|(idx, _)| idx)
+}
+
 #[cfg(feature = "parquet-cache")]
 impl BatchProbeIndices {
     fn new(batch: &RecordBatch) -> Result<Self> {
@@ -1041,9 +1094,9 @@ impl BatchProbeIndices {
             allele_string: schema.index_of("allele_string").map_err(|_| {
                 DataFusionError::Execution("variation batch missing allele_string".into())
             })?,
-            end: schema.index_of("end").ok(),
-            failed: schema.index_of("failed").ok(),
-            strand: schema.index_of("strand").ok(),
+            end: optional_column_index(&schema, "end"),
+            failed: optional_column_index(&schema, "failed"),
+            strand: optional_column_index(&schema, "strand"),
         })
     }
 }
@@ -1112,6 +1165,8 @@ impl VariationLookupStream {
             colocated_sink,
             target_partitions: target_partitions.max(1),
             probe_floor_pos,
+            skip_probing: false,
+            colocated_af_groups: None,
             // Placeholder; execute() overwrites with the exec's shared cell.
             #[cfg(feature = "parquet-cache")]
             parquet_lookup_cell: Arc::new(OnceCell::new()),
@@ -1161,7 +1216,11 @@ impl VariationLookupStream {
                     cache_root.display()
                 ))
             })?;
-            let projection = variation_projection_columns(cache_columns, collect_colocated);
+            let projection = variation_projection_columns(
+                cache_columns,
+                collect_colocated,
+                self.colocated_af_groups,
+            );
             let cell = Arc::clone(&self.parquet_lookup_cell);
             let open_started = Instant::now();
             let open_fut = async {
@@ -1222,7 +1281,35 @@ impl VariationLookupStream {
             .map(|batch| self.process_batch(&batch))
     }
 
+    /// The batch's rows 1:1, in order, with null cache columns: what a probe
+    /// that matches nothing emits, without touching the variation shard.
+    fn unprobed_batch(&mut self, vcf_batch: &RecordBatch) -> Result<RecordBatch> {
+        let num_rows = vcf_batch.num_rows();
+        let num_vcf_cols = vcf_batch.num_columns();
+        if self.profile_enabled {
+            self.profile.batches += 1;
+            self.profile.input_rows += num_rows as u64;
+            self.profile.output_rows += num_rows as u64;
+        }
+        let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
+        for col_idx in 0..num_vcf_cols {
+            output_columns.push(Arc::clone(vcf_batch.column(col_idx)));
+        }
+        for field in self.schema.fields().iter().skip(num_vcf_cols) {
+            output_columns.push(datafusion::arrow::array::new_null_array(
+                field.data_type(),
+                num_rows,
+            ));
+        }
+        RecordBatch::try_new(self.schema.clone(), output_columns)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+
     fn process_batch(&mut self, vcf_batch: &RecordBatch) -> Result<RecordBatch> {
+        // Nothing reads the lookup output: same rows, null cache columns.
+        if self.skip_probing {
+            return self.unprobed_batch(vcf_batch);
+        }
         let vcf_schema = vcf_batch.schema();
         let chrom_idx = vcf_schema.index_of("chrom")?;
         let start_idx = vcf_schema.index_of("start")?;
@@ -1260,24 +1347,9 @@ impl VariationLookupStream {
             let below_floor = num_rows > 0 && starts.iter().all(|&start| (start as i64) < floor);
             if below_floor {
                 if self.profile_enabled {
-                    self.profile.batches += 1;
-                    self.profile.input_rows += num_rows as u64;
-                    self.profile.output_rows += num_rows as u64;
                     self.profile.warm_up_skipped_rows += num_rows as u64;
                 }
-                let mut output_columns: Vec<ArrayRef> =
-                    Vec::with_capacity(num_vcf_cols + num_cache_cols);
-                for col_idx in 0..num_vcf_cols {
-                    output_columns.push(Arc::clone(vcf_batch.column(col_idx)));
-                }
-                for field in self.schema.fields().iter().skip(num_vcf_cols) {
-                    output_columns.push(datafusion::arrow::array::new_null_array(
-                        field.data_type(),
-                        num_rows,
-                    ));
-                }
-                return RecordBatch::try_new(self.schema.clone(), output_columns)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
+                return self.unprobed_batch(vcf_batch);
             }
         }
         if self.profile_enabled {
@@ -1665,7 +1737,7 @@ fn batch_output_indices(
             if *entry_idx == usize::MAX {
                 Some(None)
             } else {
-                batch.schema().index_of(name).ok().map(Some)
+                optional_column_index(&batch.schema(), name).map(Some)
             }
         })
         .collect()
@@ -1774,7 +1846,7 @@ mod batch_i64_boolean_tests {
 #[cfg(feature = "parquet-cache")]
 fn resolve_batch_coloc_indices(batch: &RecordBatch) -> Option<ColocatedColumnIndices> {
     let schema = batch.schema();
-    let find = |name: &str| schema.index_of(name).ok();
+    let find = |name: &str| optional_column_index(&schema, name);
     Some(ColocatedColumnIndices {
         variation_name: find("variation_name")?,
         end_col: find("end"),
@@ -2301,6 +2373,120 @@ impl RecordBatchStream for EmptyLookupInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variation_projection_reads_only_enabled_af_groups() {
+        let cache_columns = vec!["variation_name".to_string()];
+        let all = variation_projection_columns(&cache_columns, true, None);
+        let every_af = variation_projection_columns(&cache_columns, true, Some([true; 3]));
+        assert_eq!(all, every_af);
+        for name in crate::colocated::AF_COL_NAMES {
+            assert!(all.iter().any(|c| c == name), "{name}");
+        }
+
+        let gnomadg =
+            variation_projection_columns(&cache_columns, true, Some([false, false, true]));
+        assert!(gnomadg.iter().any(|c| c == "gnomADg"));
+        assert!(gnomadg.iter().any(|c| c == "gnomADg_NFE"));
+        assert!(!gnomadg.iter().any(|c| c == "AF" || c == "AFR"));
+        assert!(!gnomadg.iter().any(|c| c.starts_with("gnomADe")));
+        // The matching and co-located columns stay whatever the groups.
+        for name in [
+            "allele_string",
+            "end",
+            "failed",
+            "strand",
+            "variation_name",
+            "clin_sig",
+        ] {
+            assert!(gnomadg.iter().any(|c| c == name), "{name}");
+        }
+
+        let none = variation_projection_columns(&cache_columns, true, Some([false; 3]));
+        assert!(
+            !crate::colocated::AF_COL_NAMES
+                .iter()
+                .any(|name| none.iter().any(|c| c == name))
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_probing_passes_rows_through_without_opening_the_shard() {
+        use datafusion::arrow::array::{Int32Array, StringArray};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int32, false),
+            Field::new("end", DataType::Int32, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["22", "22", "22"])),
+                Arc::new(Int32Array::from(vec![300, 100, 200])),
+                Arc::new(Int32Array::from(vec![300, 100, 200])),
+                Arc::new(StringArray::from(vec!["A", "C", "G"])),
+                Arc::new(StringArray::from(vec!["T", "G", "*"])),
+            ],
+        )
+        .unwrap();
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, true),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], vcf_schema, None).unwrap();
+        // No cache exists at this root: probing would fail to open the shard.
+        let exec = VariationLookupExec::new(
+            input,
+            PathBuf::from("/nonexistent/vepyr-cache"),
+            cache_schema,
+            vec!["clin_sig".to_string()],
+            crate::allele::allele_matches,
+            false,
+            false,
+            false,
+            true,
+            0,
+        )
+        .unwrap()
+        .with_skip_probing(true);
+        let ctx = SessionContext::new();
+        let out: Vec<RecordBatch> = exec
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let rows: usize = out.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 3);
+        let first = &out[0];
+        for col in 0..5 {
+            assert_eq!(first.column(col).to_data(), batch.column(col).to_data());
+        }
+        let clin_sig = first.column_by_name("cache_clin_sig").unwrap();
+        assert_eq!(clin_sig.null_count(), 3);
+    }
+
+    #[test]
+    fn af_column_groups_partition_the_af_columns() {
+        let groups: Vec<usize> = crate::colocated::AF_COL_NAMES
+            .iter()
+            .map(|name| af_column_group(name))
+            .collect();
+        assert_eq!(groups.iter().filter(|&&g| g == 0).count(), 6);
+        assert_eq!(af_column_group("AF"), 0);
+        assert_eq!(af_column_group("SAS"), 0);
+        assert_eq!(af_column_group("gnomADe_REMAINING"), 1);
+        assert_eq!(af_column_group("gnomADg"), 2);
+    }
 
     #[test]
     fn output_order_restores_vcf_row_order_after_grouped_cold_replay() {

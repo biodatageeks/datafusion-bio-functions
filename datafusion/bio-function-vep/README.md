@@ -104,6 +104,28 @@ Transcript hydration and HGVS indel-shift reads keep their existing paths.
 Queries that project neither HGVSc nor USED_REF skip these per-row reads;
 both typed-column projection and a custom CSQ `fields` list are respected.
 
+### Projection pushdown
+
+`annotate_vep()` runs only the work its projected columns (and the CSQ
+`fields` they read) need; every returned column keeps its full-run value.
+With no projection, or when the whole CSQ string is read, nothing changes.
+Otherwise:
+
+- `everything` narrows to the flag groups the projection reads (HGVS, the
+  co-located lookup and each AF group), as `src/projection_needs.rs` maps them.
+- The variation lookup passes rows through without opening the shard when no
+  co-located or cache-only column is read (Ensembl VEP builds its variation
+  source only under `check_existing`, `CacheDir.pm:168`), and reads only the
+  AF column groups the enabled frequency flags emit.
+- SIFT/PolyPhen, protein domains (`protein_features`), miRNA structure, the
+  HGVS indel-shift prelude and plugin lookups run only for the outputs that
+  read them.
+- A projection of per-variant columns alone (VCF columns, `Allele`,
+  `VARIANT_CLASS`, `Existing_variation`, frequencies, `CLIN_SIG`, `SOMATIC`,
+  `PHENO`, `PUBMED`, cache-only columns) loads no transcript context and runs
+  no transcript engine; per-consequence typed lists are only filled when one
+  is projected.
+
 ### Cache Source Modes and Transcript Filtering
 
 Transcript filtering follows Ensembl VEP release/115 source-mode behavior. The

@@ -63,6 +63,7 @@ pub mod partitioned_cache;
 pub(crate) mod pipeline_trace;
 #[cfg(feature = "parquet-cache")]
 pub mod plugin_cache;
+pub(crate) mod projection_needs;
 pub(crate) mod regions;
 pub mod schema_contract;
 pub mod sift_decode;
