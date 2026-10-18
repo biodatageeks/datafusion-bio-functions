@@ -21003,6 +21003,22 @@ mod tests {
     }
 
     #[test]
+    fn projection_tables_cover_every_gnomad_spelling() {
+        // Every population name, in either spelling, must keep `everything`
+        // and the co-located group; only the aggregates are not everything-only.
+        use crate::projection_needs::{COLOCATED_COLUMNS, EVERYTHING_ONLY_COLUMNS};
+        for name in GNOMADE_OUTPUT_NAMES.iter().chain(GNOMADG_OUTPUT_NAMES) {
+            assert!(COLOCATED_COLUMNS.contains(name), "{name} not co-located");
+            if *name != "gnomADe_AF" && *name != "gnomADg_AF" {
+                assert!(
+                    EVERYTHING_ONLY_COLUMNS.contains(name),
+                    "{name} not everything-only"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn max_af_alone_keeps_every_af_group() {
         // MAX_AF/MAX_AF_POPS compare all populations, so reading either one
         // must keep all three AF groups (and with them their column pairs).
