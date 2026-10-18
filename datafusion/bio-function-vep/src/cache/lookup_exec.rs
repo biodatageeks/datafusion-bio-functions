@@ -499,16 +499,13 @@ fn push_unique_column(columns: &mut Vec<String>, name: &str) {
     }
 }
 
-/// AF column group of a `colocated::AF_COL_NAMES` entry: 0 = 1000 Genomes,
-/// 1 = gnomAD exomes, 2 = gnomAD genomes.
-fn af_column_group(name: &str) -> usize {
-    if name.starts_with("gnomADe") {
-        1
-    } else if name.starts_with("gnomADg") {
-        2
-    } else {
-        0
-    }
+/// AF column group of a `colocated::AF_COL_NAMES` entry, by the Parquet
+/// cache's own grouping (`af_bundle::AF_GROUPS`): 0 = 1000 Genomes, 1 = gnomAD
+/// exomes, 2 = gnomAD genomes. `None` for a name in no group.
+fn af_column_group(name: &str) -> Option<usize> {
+    crate::cache::af_bundle::AF_GROUPS
+        .iter()
+        .position(|(_, members)| members.contains(&name))
 }
 
 /// Columns to project from the Parquet variation shard for a probe.
@@ -522,8 +519,18 @@ fn variation_projection_columns(
     for name in ["allele_string", "end", "failed", "strand"] {
         push_unique_column(&mut columns, name);
     }
+    // An AF column is read only when its group is enabled; a name in no
+    // known group always is. A cache that stores the logical AF columns lists
+    // them in `cache_columns` too, so the filter applies there as well.
+    let af_read = |name: &str| {
+        !crate::colocated::AF_COL_NAMES.contains(&name)
+            || af_groups
+                .is_none_or(|groups| af_column_group(name).is_none_or(|group| groups[group]))
+    };
     for name in cache_columns {
-        push_unique_column(&mut columns, name);
+        if af_read(name) {
+            push_unique_column(&mut columns, name);
+        }
     }
     if include_colocated {
         for name in [
@@ -539,7 +546,7 @@ fn variation_projection_columns(
             push_unique_column(&mut columns, name);
         }
         for name in crate::colocated::AF_COL_NAMES {
-            if af_groups.is_none_or(|groups| groups[af_column_group(name)]) {
+            if af_read(name) {
                 push_unique_column(&mut columns, name);
             }
         }
@@ -2402,6 +2409,16 @@ mod tests {
             assert!(gnomadg.iter().any(|c| c == name), "{name}");
         }
 
+        // Logical AF names listed as cache columns follow the same groups.
+        let with_af: Vec<String> = ["variation_name", "AF", "gnomADe", "gnomADg"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let only_g = variation_projection_columns(&with_af, false, Some([false, false, true]));
+        assert!(only_g.iter().any(|c| c == "gnomADg"));
+        assert!(!only_g.iter().any(|c| c == "AF" || c == "gnomADe"));
+        assert!(only_g.iter().any(|c| c == "variation_name"));
+
         let none = variation_projection_columns(&cache_columns, true, Some([false; 3]));
         assert!(
             !crate::colocated::AF_COL_NAMES
@@ -2477,15 +2494,20 @@ mod tests {
 
     #[test]
     fn af_column_groups_partition_the_af_columns() {
-        let groups: Vec<usize> = crate::colocated::AF_COL_NAMES
+        let groups: Vec<Option<usize>> = crate::colocated::AF_COL_NAMES
             .iter()
             .map(|name| af_column_group(name))
             .collect();
-        assert_eq!(groups.iter().filter(|&&g| g == 0).count(), 6);
-        assert_eq!(af_column_group("AF"), 0);
-        assert_eq!(af_column_group("SAS"), 0);
-        assert_eq!(af_column_group("gnomADe_REMAINING"), 1);
-        assert_eq!(af_column_group("gnomADg"), 2);
+        assert_eq!(groups.iter().filter(|&&g| g == Some(0)).count(), 6);
+        assert!(
+            groups.iter().all(Option::is_some),
+            "every AF column has a group"
+        );
+        assert_eq!(af_column_group("AF"), Some(0));
+        assert_eq!(af_column_group("SAS"), Some(0));
+        assert_eq!(af_column_group("gnomADe_REMAINING"), Some(1));
+        assert_eq!(af_column_group("gnomADg"), Some(2));
+        assert_eq!(af_column_group("future_AF"), None);
     }
 
     #[test]

@@ -52,16 +52,15 @@ pub(crate) const EVERYTHING_ONLY_COLUMNS: &[&str] = &[
     "gnomADg_SAS_AF",
 ];
 
-/// Columns the HGVS group fills.
-pub(crate) const HGVS_COLUMNS: &[&str] = &["HGVSc", "HGVSp"];
-
 /// Columns whose value depends on the HGVS computation, `everything` or not:
-/// the two notations, the shift they report, and the reference-allele fields
-/// the shift also feeds on RefSeq/BAM-edited transcripts.
+/// the two notations, the shift they report, the RefSeq misalignment offset
+/// (filled only with HGVSc), and the reference-allele fields the shift also
+/// feeds on RefSeq/BAM-edited transcripts.
 const HGVS_DEPENDENT_COLUMNS: &[&str] = &[
     "HGVSc",
     "HGVSp",
     "HGVS_OFFSET",
+    "REFSEQ_OFFSET",
     "USED_REF",
     "GIVEN_REF",
     "BAM_EDIT",
@@ -316,8 +315,9 @@ impl OutputNeeds {
     /// Returns `None` when nothing changes: every output is read, the options
     /// do not set `everything`, or a column only `everything` fills is read.
     /// Otherwise `everything` is replaced by the groups that change column
-    /// values: HGVS when an HGVS column is read, the co-located flags when a
-    /// co-located column is read. Each group alone gives the same values as
+    /// values: HGVS when any column the HGVS computation feeds is read (the
+    /// shift also gives `USED_REF` of a shifted indel), the co-located flags
+    /// when a co-located column is read. Each group alone gives the same values as
     /// `everything` does. `reference_fasta_path` is kept: transcript
     /// hydration reads it for consequence calling, not only for HGVS.
     pub(crate) fn narrow_options(&self, options_json: Option<&str>) -> Option<String> {
@@ -325,7 +325,15 @@ impl OutputNeeds {
             return None;
         }
         let mut options: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(options_json?).ok()?;
+            match serde_json::from_str(options_json?) {
+                Ok(options) => options,
+                Err(error) => {
+                    log::debug!(
+                        "projection pushdown: options not narrowed, unparsable JSON: {error}"
+                    );
+                    return None;
+                }
+            };
         if options.get("everything") != Some(&serde_json::Value::Bool(true)) {
             return None;
         }
@@ -333,7 +341,7 @@ impl OutputNeeds {
             return None;
         }
         options.remove("everything");
-        if self.any_value(HGVS_COLUMNS) {
+        if self.hgvs_dependent() {
             options.insert("hgvs".into(), serde_json::Value::Bool(true));
         } else {
             for key in HGVS_OPTIONS {
@@ -430,6 +438,22 @@ mod tests {
         assert_eq!(json.get("hgvs"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(json.get("check_existing"), None);
         assert!(n.hgvs_dependent());
+    }
+
+    #[test]
+    fn reference_allele_columns_keep_the_hgvs_group() {
+        // USED_REF of a shifted indel is the 3'-shifted reference, which the
+        // HGVS shift computes: narrowing must keep HGVS on for it.
+        for column in ["USED_REF", "GIVEN_REF", "BAM_EDIT", "REFSEQ_OFFSET"] {
+            let n = needs(&["Consequence", column]);
+            let json = narrowed(&n).unwrap();
+            assert_eq!(
+                json.get("hgvs"),
+                Some(&serde_json::Value::Bool(true)),
+                "{column}"
+            );
+            assert_eq!(json.get("everything"), None, "{column}");
+        }
     }
 
     #[test]

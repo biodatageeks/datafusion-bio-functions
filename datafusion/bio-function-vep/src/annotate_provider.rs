@@ -20991,6 +20991,27 @@ mod tests {
     }
 
     #[test]
+    fn max_af_alone_keeps_every_af_group() {
+        // MAX_AF/MAX_AF_POPS compare all populations, so reading either one
+        // must keep all three AF groups (and with them their column pairs).
+        for column in ["MAX_AF", "MAX_AF_POPS"] {
+            let reads = |name: &str| name == column;
+            let flags =
+                VepFlags::from_options_json_reading(Some(r#"{"everything":true}"#), Some(&reads));
+            assert!(flags.check_existing && flags.max_af, "{column}");
+            assert!(flags.af && flags.af_1kg, "{column}");
+            assert!(flags.af_gnomade && flags.af_gnomadg, "{column}");
+            assert!(!flags.pubmed, "{column}");
+        }
+        // A single gnomAD genome population keeps only that group.
+        let reads = |name: &str| name == "gnomADg_NFE_AF";
+        let flags =
+            VepFlags::from_options_json_reading(Some(r#"{"everything":true}"#), Some(&reads));
+        assert!(flags.af_gnomadg && !flags.af_gnomade && !flags.af && !flags.af_1kg);
+        assert!(flags.check_existing);
+    }
+
+    #[test]
     fn test_selected_fields_disable_unemitted_colocated_work() {
         let omitted = VepFlags::from_options_json_with_field_pruning(
             Some(r#"{"everything":true,"fields":["Allele","Gene"]}"#),
