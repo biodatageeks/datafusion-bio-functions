@@ -4275,6 +4275,17 @@ fn translation_for_hgvsp(
     out
 }
 
+/// VEP's `_snp_start_altered` / `start_retained_variant` test: the mutated
+/// CDS still begins with the literal codon `ATG`. Under the standard code this
+/// is the same as "translates to Met"; under table 2 ATA also translates to Met
+/// but is not a retained start.
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1022>
+fn mutated_cds_starts_with_atg(mutated: &[u8]) -> bool {
+    mutated
+        .get(..3)
+        .is_some_and(|codon| codon.eq_ignore_ascii_case(b"ATG"))
+}
+
 fn is_start_codon(allele: &str) -> bool {
     allele.eq_ignore_ascii_case("ATG")
 }
@@ -6952,8 +6963,10 @@ fn classify_coding_change_with_semantics(
     // (the start codon). Unlike the insertion path (cds_idx < 2), SNVs and
     // deletions at position 2 DO overlap the start codon.
     if start_idx < 3 && !tx.cds_start_nf {
-        // 1. Amino acid level (works for SNVs and as fallback for indels)
-        if new_aas.first() == Some(&'M') {
+        // 1. Codon level (works for SNVs and as fallback for indels). VEP
+        //    compares the mutated codon with the literal "ATG", so under
+        //    table 2 an ATA start (also Met) is not start_retained.
+        if mutated_cds_starts_with_atg(&mutated) {
             class.start_retained = true;
         }
         if old_aas.first() != new_aas.first() {
@@ -7761,8 +7774,8 @@ fn classify_insertion_with_semantics(
     // - _overlaps_start_codon overlap gate:
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L965-L985>
     if cds_idx < 2 && !tx.cds_start_nf {
-        // 1. Amino acid level
-        if new_aas.first() == Some(&'M') {
+        // 1. Codon level: the literal "ATG", as in the SNV path.
+        if mutated_cds_starts_with_atg(&mutated) {
             class.start_retained = true;
         }
         if old_aas.first() != new_aas.first() {
@@ -21424,6 +21437,19 @@ mod tests {
         let got = classify_mt_snv("ATGGCTCCCAGA", 1011, "A", "C");
         assert_eq!(got.amino_acids.as_deref(), Some("*/S"));
         assert!(got.stop_lost);
+    }
+
+    #[test]
+    fn mt_atg_to_ata_start_is_synonymous_not_start_retained() {
+        // MT:8529 G>A in ATP6 (ATG>ATA at codon 1): table 2 reads both as Met,
+        // but VEP's start_retained_variant compares the mutated codon with the
+        // literal string "ATG" (_snp_start_altered), so VEP writes M and
+        // synonymous_variant, p.Met1=.
+        let got = classify_mt_snv("ATGGCTCCCTAA", 1002, "G", "A");
+        assert_eq!(got.amino_acids.as_deref(), Some("M"));
+        assert!(got.synonymous);
+        assert!(!got.start_retained);
+        assert!(!got.start_lost);
     }
 
     #[test]
