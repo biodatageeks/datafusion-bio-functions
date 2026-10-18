@@ -6147,7 +6147,12 @@ impl AnnotateProvider {
                     .csq_field_projection
                     .as_ref()
                     .is_none_or(|fields| fields.emits(name));
-            typed || csq
+            // Fields the scan reads implicitly (plugin templates) count too.
+            let implied = self
+                .output_needs
+                .as_deref()
+                .is_some_and(|needs| needs.value(name));
+            typed || csq || implied
         };
         (hgvs_flags.hgvsc && emits("HGVSc"))
             || (self.transcript_selection.bam_edited == Some(true) && emits("USED_REF"))
@@ -15912,15 +15917,30 @@ async fn prepare_contig_data(
 /// Build the filtered lookup for one run and spawn its position-ordered
 /// partition workers. Shared by the first run (from `activate_contig_lookups`)
 /// and every later run of the same contig (from the `ActivatingRun` state).
+/// Whether anything reads the variation lookup: the co-located sink, a
+/// cache-only column, or a shard's precomputed consequences, which the
+/// cached fast path uses in place of the transcript engine.
+fn lookup_has_consumer(
+    needs: &OutputNeeds,
+    check_existing: bool,
+    cache_columns: &[String],
+) -> bool {
+    needs.variation_lookup(check_existing)
+        || cache_columns
+            .iter()
+            .any(|column| column == "most_severe_consequence" || column == "consequence_types")
+}
+
 /// Projection pushdown for the variation lookup: skip probing when no output
 /// reads it (VEP itself creates the variation source only under
 /// `check_existing`, `CacheDir.pm:168`), and read only the AF column groups
 /// the enabled frequency flags emit.
 fn apply_lookup_needs(provider: &mut LookupProvider, config: &ContigAnnotationConfig) {
-    if !config
-        .output_needs
-        .variation_lookup(config.flags.check_existing)
-    {
+    if !lookup_has_consumer(
+        &config.output_needs,
+        config.flags.check_existing,
+        &config.cache_columns,
+    ) {
         provider.set_skip_probing(true);
     }
     provider.set_colocated_af_groups(Some([
@@ -21016,6 +21036,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn precomputed_consequences_keep_the_lookup() {
+        let needs =
+            OutputNeeds::from_projection(Some(vec!["chrom".into(), "Consequence".into()]), None);
+        assert!(!lookup_has_consumer(
+            &needs,
+            false,
+            &["clin_sig".to_string()]
+        ));
+        for column in ["most_severe_consequence", "consequence_types"] {
+            assert!(
+                lookup_has_consumer(&needs, false, &[column.to_string()]),
+                "{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn implied_csq_fields_reach_the_genomic_reference_gate() {
+        let input_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let mut provider = AnnotateProvider::new(
+            Arc::new(SessionContext::new()),
+            "vcf".into(),
+            String::new(),
+            AnnotationBackend::Parquet,
+            CacheMetadata {
+                source_type: CacheSourceType::Merged,
+                bam_edited: Some(true),
+            },
+            Some(r#"{"everything":true,"fields":["Allele"]}"#.to_string()),
+            input_schema,
+        )
+        .unwrap();
+        let projection = vec![
+            provider.schema().index_of("chrom").unwrap(),
+            provider.schema().index_of("CSQ").unwrap(),
+        ];
+        let hgvs_flags = HgvsFlags {
+            hgvsc: true,
+            ..Default::default()
+        };
+        assert!(!provider.output_needs_genomic_reference(Some(&projection), &hgvs_flags));
+        // A plugin template reading {HGVSc} joins the fields the scan reads.
+        provider.output_needs = Some(Arc::new(
+            OutputNeeds::from_projection(
+                Some(vec!["chrom".into(), "CSQ".into()]),
+                Some(&["Allele".to_string()]),
+            )
+            .with_csq_fields(["HGVSc".to_string()]),
+        ));
+        assert!(provider.output_needs_genomic_reference(Some(&projection), &hgvs_flags));
     }
 
     #[test]
