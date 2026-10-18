@@ -143,8 +143,6 @@ fn emit_order(m: &CacheManifest) -> Vec<usize> {
     order
 }
 
-/// Return manifests in caller order when a selection is supplied, otherwise in
-/// the deterministic alphabetical order returned by [`discover_plugins`].
 /// The `{name}` placeholders of a match template, in order.
 fn template_placeholders(template: &str) -> Vec<String> {
     let mut names = Vec::new();
@@ -158,6 +156,8 @@ fn template_placeholders(template: &str) -> Vec<String> {
     names
 }
 
+/// Return manifests in caller order when a selection is supplied, otherwise in
+/// the deterministic alphabetical order returned by [`discover_plugins`].
 fn select_manifests(
     cache_root: &Path,
     plugin_names: Option<&[String]>,
@@ -588,6 +588,8 @@ impl BufferSlices {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn template_placeholders_are_the_braced_names() {
         assert_eq!(
@@ -598,8 +600,6 @@ mod tests {
         assert!(template_placeholders("no_placeholders").is_empty());
         assert_eq!(template_placeholders("x{SYMBOL}y{unterminated"), ["SYMBOL"]);
     }
-
-    use super::*;
     use crate::plugin_cache::cache_manifest::{
         CacheManifest, ChromEntry, MatchColumnRecord, ValueColumnRecord,
     };
