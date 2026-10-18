@@ -56,6 +56,9 @@ pub(crate) const EVERYTHING_ONLY_COLUMNS: &[&str] = &[
 /// the two notations, the shift they report, the RefSeq misalignment offset
 /// (filled only with HGVSc), and the reference-allele fields the shift also
 /// feeds on RefSeq/BAM-edited transcripts.
+/// `HGVS_OFFSET` is also `everything`-only, so narrowing keeps `everything`
+/// for it before this set is consulted; it is listed here for the HGVS
+/// pruning and the shift-prelude gate, which apply with or without it.
 const HGVS_DEPENDENT_COLUMNS: &[&str] = &[
     "HGVSc",
     "HGVSp",
