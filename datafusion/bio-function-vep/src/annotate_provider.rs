@@ -15916,16 +15916,28 @@ async fn prepare_contig_data(
 
 /// Whether anything reads the variation lookup: the co-located sink, a
 /// cache-only column, or a shard's precomputed consequences, which the
-/// cached fast path uses in place of the transcript engine.
+/// cached fast path uses in place of the transcript engine when it runs.
 fn lookup_has_consumer(
     needs: &OutputNeeds,
     check_existing: bool,
     cache_columns: &[String],
+    transcript_context: bool,
 ) -> bool {
     needs.variation_lookup(check_existing)
-        || cache_columns
-            .iter()
-            .any(|column| column == "most_severe_consequence" || column == "consequence_types")
+        || (transcript_context
+            && cache_columns
+                .iter()
+                .any(|column| column == "most_severe_consequence" || column == "consequence_types"))
+}
+
+/// AF column groups the co-located data reads (1000 Genomes, gnomAD exomes,
+/// gnomAD genomes). MAX_AF compares every population, so `max_af` reads all.
+fn lookup_af_groups(flags: &VepFlags) -> [bool; 3] {
+    [
+        flags.af || flags.af_1kg || flags.max_af,
+        flags.af_gnomade || flags.max_af,
+        flags.af_gnomadg || flags.max_af,
+    ]
 }
 
 /// Projection pushdown for the variation lookup: skip probing when no output
@@ -15937,15 +15949,13 @@ fn apply_lookup_needs(provider: &mut LookupProvider, config: &ContigAnnotationCo
         &config.output_needs,
         config.flags.check_existing,
         &config.cache_columns,
+        config.needs_transcript_context,
     ) {
         provider.set_skip_probing(true);
     }
-    provider.set_colocated_af_groups(Some([
-        config.flags.af || config.flags.af_1kg,
-        config.flags.af_gnomade,
-        config.flags.af_gnomadg,
-    ]));
+    provider.set_colocated_af_groups(Some(lookup_af_groups(&config.flags)));
 }
+
 /// Build the filtered lookup for one run and spawn its position-ordered
 /// partition workers. Shared by the first run (from `activate_contig_lookups`)
 /// and every later run of the same contig (from the `ActivatingRun` state).
@@ -21044,14 +21054,27 @@ mod tests {
         assert!(!lookup_has_consumer(
             &needs,
             false,
-            &["clin_sig".to_string()]
+            &["clin_sig".to_string()],
+            true
         ));
         for column in ["most_severe_consequence", "consequence_types"] {
+            let cols = [column.to_string()];
+            assert!(lookup_has_consumer(&needs, false, &cols, true), "{column}");
+            // Without the transcript engine nothing reads the cached consequences.
             assert!(
-                lookup_has_consumer(&needs, false, &[column.to_string()]),
+                !lookup_has_consumer(&needs, false, &cols, false),
                 "{column}"
             );
         }
+    }
+
+    #[test]
+    fn max_af_option_reads_every_af_group() {
+        let flags = VepFlags::from_options_json(Some(r#"{"max_af":true}"#));
+        assert!(flags.max_af && !flags.af && !flags.af_gnomade);
+        assert_eq!(lookup_af_groups(&flags), [true; 3]);
+        let flags = VepFlags::from_options_json(Some(r#"{"af_gnomadg":true}"#));
+        assert_eq!(lookup_af_groups(&flags), [false, false, true]);
     }
 
     #[test]
