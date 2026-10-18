@@ -16368,6 +16368,18 @@ impl TableProvider for AnnotateProvider {
             // selects the corresponding output column (projection pushdown).
             // A `None` projection means "all columns" → keep them.
             let output_needs = self.output_needs_for(projection)?;
+            // The CSQ string carries plugin values, and a plugin's match
+            // template may read a field (`{HGVSc}`) the projection does not.
+            #[cfg(feature = "parquet-cache")]
+            let output_needs = match self.plugin_cache_root.as_ref() {
+                Some(root) if output_needs.csq() => output_needs.with_csq_fields(
+                    crate::plugin_cache::registry::PluginRegistry::template_fields(
+                        root,
+                        self.plugin_names.as_deref(),
+                    )?,
+                ),
+                _ => output_needs,
+            };
             preferred_columns.retain(|name| {
                 !CACHE_ONLY_CSQ_SKIPPABLE_COLUMNS.contains(name) || output_needs.column(name)
             });

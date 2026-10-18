@@ -230,6 +230,16 @@ impl OutputNeeds {
         }
     }
 
+    /// These needs plus CSQ `fields` the CSQ string consumes implicitly: the
+    /// fields custom-plugin match templates read (`{HGVSc}`), which must be
+    /// computed when the string carries those plugins' values.
+    pub(crate) fn with_csq_fields<I: IntoIterator<Item = String>>(mut self, extra: I) -> Self {
+        if let CsqNeed::Fields(fields) = &mut self.csq {
+            fields.extend(extra);
+        }
+        self
+    }
+
     /// Whether every output is read, so no group or stage can be dropped.
     pub(crate) fn is_all(&self) -> bool {
         self.columns.is_none() || self.csq == CsqNeed::Full
@@ -513,6 +523,27 @@ mod tests {
         let n = needs(&["clinvar_ids"]);
         assert!(n.variation_lookup(false));
         assert!(!n.transcript_engine(TYPED));
+    }
+
+    #[test]
+    fn plugin_template_fields_join_the_csq_fields() {
+        let fields = ["Allele".to_string()];
+        let projected = KEY.iter().chain(&["CSQ"]).map(|s| s.to_string()).collect();
+        let n = OutputNeeds::from_projection(Some(projected), Some(&fields));
+        assert!(!n.hgvs_dependent());
+        let n = n.with_csq_fields(["HGVSc".to_string()]);
+        assert!(n.hgvs_dependent(), "a {{HGVSc}} template keeps HGVS");
+        assert_eq!(
+            narrowed(&n).unwrap().get("hgvs"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        // Without CSQ there is nothing to add to; with the whole CSQ, nothing to add.
+        assert!(
+            !needs(&["Consequence"])
+                .with_csq_fields(["HGVSc".into()])
+                .hgvs_dependent()
+        );
+        assert!(needs(&["CSQ"]).with_csq_fields(["HGVSc".into()]).is_all());
     }
 
     #[test]
