@@ -143,6 +143,19 @@ fn emit_order(m: &CacheManifest) -> Vec<usize> {
     order
 }
 
+/// The `{name}` placeholders of a match template, in order.
+fn template_placeholders(template: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else { break };
+        names.push(after[..close].to_string());
+        rest = &after[close + 1..];
+    }
+    names
+}
+
 /// Return manifests in caller order when a selection is supplied, otherwise in
 /// the deterministic alphabetical order returned by [`discover_plugins`].
 fn select_manifests(
@@ -217,6 +230,22 @@ impl PluginRegistry {
     /// input has no data-bearing contigs.
     pub fn validate_selection(cache_root: &Path, plugin_names: Option<&[String]>) -> Result<()> {
         select_manifests(cache_root, plugin_names).map(|_| ())
+    }
+
+    /// The fields the selected plugins' match templates read (`{HGVSc}` ->
+    /// `HGVSc`). Projection pushdown keeps them computed whenever the CSQ
+    /// string carries these plugins' values.
+    pub fn template_fields(
+        cache_root: &Path,
+        plugin_names: Option<&[String]>,
+    ) -> Result<Vec<String>> {
+        let mut fields = Vec::new();
+        for manifest in select_manifests(cache_root, plugin_names)? {
+            for column in &manifest.match_columns {
+                fields.extend(template_placeholders(&column.template));
+            }
+        }
+        Ok(fields)
     }
 
     /// Discover plugins under `cache_root` and open each one's shard for `chrom`.
@@ -560,6 +589,17 @@ impl BufferSlices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_placeholders_are_the_braced_names() {
+        assert_eq!(
+            template_placeholders("{ref_aa}{Protein_position}{alt_aa}"),
+            ["ref_aa", "Protein_position", "alt_aa"]
+        );
+        assert_eq!(template_placeholders("{HGVSc}"), ["HGVSc"]);
+        assert!(template_placeholders("no_placeholders").is_empty());
+        assert_eq!(template_placeholders("x{SYMBOL}y{unterminated"), ["SYMBOL"]);
+    }
     use crate::plugin_cache::cache_manifest::{
         CacheManifest, ChromEntry, MatchColumnRecord, ValueColumnRecord,
     };

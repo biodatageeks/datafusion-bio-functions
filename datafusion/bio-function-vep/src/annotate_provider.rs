@@ -203,6 +203,7 @@ use crate::colocated::{
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::MissWorklist;
 use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
+use crate::projection_needs::OutputNeeds;
 use crate::regions::{RunBounds, RunGate};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
@@ -1299,6 +1300,55 @@ const AF_COLUMNS: &[AfColumn] = &[
     },
 ];
 
+/// Output column and CSQ field names of the gnomAD exome AF group, in both
+/// spellings the layouts use (`gnomADe_AFR_AF` typed, `gnomADe_AFR` CSQ).
+const GNOMADE_OUTPUT_NAMES: &[&str] = &[
+    "gnomADe_AF",
+    "gnomADe_AFR",
+    "gnomADe_AFR_AF",
+    "gnomADe_AMR",
+    "gnomADe_AMR_AF",
+    "gnomADe_ASJ",
+    "gnomADe_ASJ_AF",
+    "gnomADe_EAS",
+    "gnomADe_EAS_AF",
+    "gnomADe_FIN",
+    "gnomADe_FIN_AF",
+    "gnomADe_MID",
+    "gnomADe_MID_AF",
+    "gnomADe_NFE",
+    "gnomADe_NFE_AF",
+    "gnomADe_REMAINING",
+    "gnomADe_REMAINING_AF",
+    "gnomADe_SAS",
+    "gnomADe_SAS_AF",
+];
+
+/// Output column and CSQ field names of the gnomAD genome AF group.
+const GNOMADG_OUTPUT_NAMES: &[&str] = &[
+    "gnomADg_AF",
+    "gnomADg_AFR",
+    "gnomADg_AFR_AF",
+    "gnomADg_AMI",
+    "gnomADg_AMI_AF",
+    "gnomADg_AMR",
+    "gnomADg_AMR_AF",
+    "gnomADg_ASJ",
+    "gnomADg_ASJ_AF",
+    "gnomADg_EAS",
+    "gnomADg_EAS_AF",
+    "gnomADg_FIN",
+    "gnomADg_FIN_AF",
+    "gnomADg_MID",
+    "gnomADg_MID_AF",
+    "gnomADg_NFE",
+    "gnomADg_NFE_AF",
+    "gnomADg_REMAINING",
+    "gnomADg_REMAINING_AF",
+    "gnomADg_SAS",
+    "gnomADg_SAS_AF",
+];
+
 /// Parsed VEP option flags controlling which Batch 3 CSQ fields are emitted.
 ///
 /// Flag names match Ensembl VEP CLI: `--check_existing`, `--af`, `--af_1kg`,
@@ -1333,12 +1383,6 @@ impl VepFlags {
         options_json: Option<&str>,
         prune_unselected_fields: bool,
     ) -> Self {
-        let parse = |key| {
-            options_json
-                .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
-                .unwrap_or(false)
-        };
-        let everything = parse("everything");
         let selected_fields: Option<HashSet<String>> = prune_unselected_fields
             .then(|| {
                 options_json
@@ -1353,36 +1397,51 @@ impl VepFlags {
                     })
             })
             .flatten();
-        let emits_any = |names: &[&str]| {
-            selected_fields
-                .as_ref()
-                .is_none_or(|selected| names.iter().any(|name| selected.contains(*name)))
+        match selected_fields {
+            Some(selected) => {
+                Self::from_options_json_reading(options_json, Some(&|name| selected.contains(name)))
+            }
+            None => Self::from_options_json_reading(options_json, None),
+        }
+    }
+
+    /// Flags as given, less each co-located group whose outputs `reads`
+    /// (an output column or CSQ field name predicate) never reads. `None`
+    /// reads everything, so nothing is pruned. A flag the options do not set
+    /// is never switched on.
+    fn from_options_json_reading(
+        options_json: Option<&str>,
+        reads: Option<&dyn Fn(&str) -> bool>,
+    ) -> Self {
+        let parse = |key| {
+            options_json
+                .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
+                .unwrap_or(false)
         };
+        let everything = parse("everything");
+        let emits_any =
+            |names: &[&str]| reads.is_none_or(|reads| names.iter().any(|name| reads(name)));
         // --everything implies all sub-flags per Config.pm#L346-L374.
         let max_af = (everything || parse("max_af")) && emits_any(&["MAX_AF", "MAX_AF_POPS"]);
         let af = (everything || parse("af")) && (max_af || emits_any(&["AF"]));
         let af_1kg = (everything || parse("af_1kg"))
             && (max_af || emits_any(&["AFR_AF", "AMR_AF", "EAS_AF", "EUR_AF", "SAS_AF"]));
-        let af_gnomade = (everything || parse("af_gnomade"))
-            && (max_af
-                || selected_fields.as_ref().is_none_or(|selected| {
-                    selected.iter().any(|name| name.starts_with("gnomADe_"))
-                }));
-        let af_gnomadg = (everything || parse("af_gnomadg"))
-            && (max_af
-                || selected_fields.as_ref().is_none_or(|selected| {
-                    selected.iter().any(|name| name.starts_with("gnomADg_"))
-                }));
+        let af_gnomade =
+            (everything || parse("af_gnomade")) && (max_af || emits_any(GNOMADE_OUTPUT_NAMES));
+        let af_gnomadg =
+            (everything || parse("af_gnomadg")) && (max_af || emits_any(GNOMADG_OUTPUT_NAMES));
         let pubmed = (everything || parse("pubmed")) && emits_any(&["PUBMED"]);
-        // VEP behavior: AF flags imply --check_existing.
+        // VEP behavior: AF flags imply --check_existing (Config.pm). The
+        // implication follows the flags as given, not as pruned: `af` with
+        // only CLIN_SIG read still runs the co-located lookup.
         let check_existing = (everything
             || parse("check_existing")
-            || af
-            || af_1kg
-            || af_gnomade
-            || af_gnomadg
-            || max_af
-            || pubmed)
+            || parse("af")
+            || parse("af_1kg")
+            || parse("af_gnomade")
+            || parse("af_gnomadg")
+            || parse("max_af")
+            || parse("pubmed"))
             && emits_any(&[
                 "Existing_variation",
                 "AF",
@@ -1661,6 +1720,18 @@ impl HgvsFlags {
 
     fn any(self) -> bool {
         self.hgvsc || self.hgvsp
+    }
+
+    /// These flags less the HGVS computation when no read output depends on
+    /// it (`everything` keeps it on otherwise). The indel shift prelude reads
+    /// the reference FASTA per variant, so this skips that read too.
+    fn pruned_for(mut self, needs: &OutputNeeds) -> Self {
+        if !needs.is_all() && !needs.hgvs_dependent() {
+            self.hgvsc = false;
+            self.hgvsp = false;
+            self.shift_hgvs = false;
+        }
+        self
     }
 }
 
@@ -3891,6 +3962,9 @@ pub struct AnnotateProvider {
     /// Set by the `vcf_sink` sharded-output entry to drive per-worker VCF shard
     /// writing on the `threads>1` path. `None` for the normal scan/SQL path.
     vcf_shard_ctx: Option<Arc<crate::vcf_sink::VcfShardContext>>,
+    /// The outputs the scan reads, set on the per-contig provider that
+    /// annotates batches. `None` reads every output.
+    output_needs: Option<Arc<OutputNeeds>>,
     /// Root of a custom-plugin cache (`<root>/plugin/*`). `None` = no plugins.
     #[cfg(feature = "parquet-cache")]
     plugin_cache_root: Option<std::path::PathBuf>,
@@ -3991,6 +4065,7 @@ impl AnnotateProvider {
                 vcf_schema.metadata().clone(),
             )),
             vcf_shard_ctx: None,
+            output_needs: None,
             #[cfg(feature = "parquet-cache")]
             plugin_cache_root: None,
             #[cfg(feature = "parquet-cache")]
@@ -4088,6 +4163,18 @@ impl AnnotateProvider {
             })
             .collect::<Result<Vec<_>>>()
             .map(Some)
+    }
+
+    /// The outputs a scan with `projection` reads (`None`: every column).
+    fn output_needs_for(&self, projection: Option<&Vec<usize>>) -> Result<OutputNeeds> {
+        let projected = projection.map(|indices| {
+            indices
+                .iter()
+                .map(|&index| self.schema.field(index).name().clone())
+                .collect()
+        });
+        let fields = Self::parse_json_string_array_option(self.options_json.as_deref(), "fields")?;
+        Ok(OutputNeeds::from_projection(projected, fields.as_deref()))
     }
 
     fn parse_json_bool_option(json: &str, key: &str) -> Option<bool> {
@@ -5782,6 +5869,7 @@ impl AnnotateProvider {
         cache: PartitionedAnnotationCache,
         translations_sift_table: Option<&str>,
         fetch_limit: Option<usize>,
+        output_needs: OutputNeeds,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if profiling_enabled() {
             eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned START ======");
@@ -5796,16 +5884,21 @@ impl AnnotateProvider {
                 .iter()
                 .any(|&index| index >= typed_cols_start && index < typed_cols_end)
         });
-        let needs_sift_polyphen = output_needs_sift_polyphen(
-            skip_csq,
-            skip_typed_cols,
-            self.csq_field_projection.as_ref(),
+        // Projection pushdown: `everything` narrows to the flag groups the
+        // projected outputs read, and each group no output reads is pruned.
+        // The narrowed options travel to the per-contig provider, so its CSQ
+        // field projection is built for the same layout.
+        let options_json = output_needs
+            .narrow_options(self.options_json.as_deref())
+            .or_else(|| self.options_json.clone());
+        let needs_sift_polyphen = output_needs.sift_polyphen();
+        let reads = |name: &str| output_needs.value(name);
+        let flags = VepFlags::from_options_json_reading(
+            options_json.as_deref(),
+            (!output_needs.is_all()).then_some(&reads as &dyn Fn(&str) -> bool),
         );
-        let flags = VepFlags::from_options_json_with_field_pruning(
-            self.options_json.as_deref(),
-            skip_typed_cols,
-        );
-        let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
+        let hgvs_flags =
+            HgvsFlags::from_options_json(options_json.as_deref()).pruned_for(&output_needs);
         let transcript_selection = self.transcript_selection;
         let pick_flags = self.pick_flags.clone();
         let allowed_failed = self
@@ -5973,7 +6066,7 @@ impl AnnotateProvider {
 
         let config = ContigAnnotationConfig {
             vcf_table: self.vcf_table.clone(),
-            options_json: self.options_json.clone(),
+            options_json,
             cache_columns,
             extended_probes,
             translations_sift_table: translations_sift_table.map(|s| s.to_string()),
@@ -5995,6 +6088,14 @@ impl AnnotateProvider {
             projection: projection.cloned(),
             annotation_column_count: self.annotation_column_count(),
             needs_sift_polyphen,
+            needs_transcript_context: output_needs.transcript_engine(
+                &self
+                    .annotation_column_defs
+                    .iter()
+                    .map(|def| def.name)
+                    .collect::<Vec<_>>(),
+            ),
+            output_needs: Arc::new(output_needs),
             fetch_limit,
             annotation_workers,
             #[cfg(feature = "parquet-cache")]
@@ -6048,7 +6149,12 @@ impl AnnotateProvider {
                     .csq_field_projection
                     .as_ref()
                     .is_none_or(|fields| fields.emits(name));
-            typed || csq
+            // Fields the scan reads implicitly (plugin templates) count too.
+            let implied = self
+                .output_needs
+                .as_deref()
+                .is_some_and(|needs| needs.value(name));
+            typed || csq || implied
         };
         (hgvs_flags.hgvsc && emits("HGVSc"))
             || (self.transcript_selection.bam_edited == Some(true) && emits("USED_REF"))
@@ -6104,9 +6210,21 @@ impl AnnotateProvider {
                 "annotate_vep(): input VCF row is missing required alt column".to_string(),
             )
         })?;
-        let variation_name_idx = schema.index_of("cache_variation_name").ok();
-        let cached_csq_idx = schema.index_of("cache_consequence_types").ok();
-        let cached_most_idx = schema.index_of("cache_most_severe_consequence").ok();
+        // Optional lookup columns are resolved once per batch, by a lookup that
+        // does not allocate on a miss: `Schema::index_of` formats an error
+        // listing every field, which a projection that drops these columns
+        // would otherwise pay on every row.
+        let optional_idx = |name: &str| schema.column_with_name(name).map(|(idx, _)| idx);
+        let variation_name_idx = optional_idx("cache_variation_name");
+        let cached_csq_idx = optional_idx("cache_consequence_types");
+        let cached_most_idx = optional_idx("cache_most_severe_consequence");
+        let cache_clin_sig_allele_idx = optional_idx("cache_clin_sig_allele");
+        let cache_clinical_impact_idx = optional_idx("cache_clinical_impact");
+        let cache_minor_allele_idx = optional_idx("cache_minor_allele");
+        let cache_minor_allele_freq_idx = optional_idx("cache_minor_allele_freq");
+        let cache_clinvar_ids_idx = optional_idx("cache_clinvar_ids");
+        let cache_cosmic_ids_idx = optional_idx("cache_cosmic_ids");
+        let cache_dbsnp_ids_idx = optional_idx("cache_dbsnp_ids");
 
         // Custom-plugin per-buffer lookup (spec §5.2): one page-scoped take per
         // plugin for this batch's positions; per-transcript probes happen in the
@@ -6121,7 +6239,11 @@ impl AnnotateProvider {
         #[cfg(not(feature = "parquet-cache"))]
         let plugin_take = Duration::ZERO;
         #[cfg(feature = "parquet-cache")]
-        let plugin_slices = if let Some(reg) = plugin_registry.filter(|r| !r.is_empty()) {
+        // Plugin values only reach the CSQ string, so a scan that skips it
+        // takes nothing from the plugin shards.
+        let plugin_slices = if let Some(reg) =
+            plugin_registry.filter(|r| !r.is_empty() && !skip_csq)
+        {
             // Key plugin lookups on the VEP-normalized start (matches the
             // variation cache and the per-transcript probe below). For SNVs this
             // equals the raw POS; for indels with a shared anchor base
@@ -6253,21 +6375,45 @@ impl AnnotateProvider {
         let include_refseq_fields = transcript_selection.refseq_fields();
         let include_reference_fields = transcript_selection.reference_fields();
         let include_source_field = transcript_selection.source_field();
-        let needs_sift_polyphen = output_needs_sift_polyphen(
-            skip_csq,
-            skip_typed_cols,
-            self.csq_field_projection.as_ref(),
-        );
-        let needs_domains = !skip_typed_cols
-            || self
-                .csq_field_projection
-                .as_ref()
-                .is_none_or(|projection| projection.emits("DOMAINS"));
-        let needs_mirna = !skip_typed_cols
-            || self
-                .csq_field_projection
-                .as_ref()
-                .is_none_or(|projection| projection.emits("miRNA"));
+        // Per-consequence typed lists are only filled when one of them is
+        // projected; otherwise every row takes the null-list branch.
+        let transcript_typed_columns = self.output_needs.as_deref().is_none_or(|needs| {
+            needs.transcript_columns(
+                &self
+                    .annotation_column_defs
+                    .iter()
+                    .map(|def| def.name)
+                    .collect::<Vec<_>>(),
+            )
+        });
+        // The indel shift prelude (two flank reads of the reference FASTA) only
+        // feeds HGVS and the reference-allele fields.
+        let shift_prelude_needed = self
+            .output_needs
+            .as_deref()
+            .is_none_or(|needs| needs.is_all() || needs.hgvs_dependent());
+        // With the scan's output needs known, each prediction runs only for
+        // the outputs that read it; without them, for any projected output.
+        let (needs_sift_polyphen, needs_domains, needs_mirna) = match self.output_needs.as_deref() {
+            Some(needs) => (needs.sift_polyphen(), needs.domains(), needs.mirna()),
+            None => (
+                output_needs_sift_polyphen(
+                    skip_csq,
+                    skip_typed_cols,
+                    self.csq_field_projection.as_ref(),
+                ),
+                !skip_typed_cols
+                    || self
+                        .csq_field_projection
+                        .as_ref()
+                        .is_none_or(|projection| projection.emits("DOMAINS")),
+                !skip_typed_cols
+                    || self
+                        .csq_field_projection
+                        .as_ref()
+                        .is_none_or(|projection| projection.emits("miRNA")),
+            ),
+        };
 
         /// Append NULL to all annotation column builders for the selected mode.
         macro_rules! append_null_annotation_row {
@@ -6690,8 +6836,9 @@ impl AnnotateProvider {
                 };
                 // Only compute genomic shift for indels (ref != alt length).
                 // SNVs/MNVs don't shift and skipping avoids allele normalization overhead.
+                // Nor when the scan reads no output the shift feeds.
                 if let Some(reader) = hgvs_reference_reader.as_mut() {
-                    if ref_al.len() != alt_allele.len() {
+                    if ref_al.len() != alt_allele.len() && shift_prelude_needed {
                         let chrom_norm = annotation_chrom
                             .strip_prefix("chr")
                             .unwrap_or(annotation_chrom);
@@ -7393,7 +7540,7 @@ impl AnnotateProvider {
                     b_existing_variation.append(false);
                 }
 
-                if !row_assignments.is_empty() {
+                if transcript_typed_columns && !row_assignments.is_empty() {
                     // Cache-miss: iterate consequence entries in the same
                     // sorted order used for CSQ serialization so that the
                     // Nth typed column element matches the Nth CSQ entry.
@@ -8002,9 +8149,7 @@ impl AnnotateProvider {
                 // -- Cache-only columns (7) --
                 // Read from the intermediate batch's cache_ columns.
                 // clin_sig_allele (List<Utf8>, semicolon-separated)
-                match schema
-                    .index_of("cache_clin_sig_allele")
-                    .ok()
+                match cache_clin_sig_allele_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 {
                     Some(v) if !v.is_empty() => {
@@ -8017,27 +8162,21 @@ impl AnnotateProvider {
                     _ => b_clin_sig_allele.append(false),
                 }
                 // clinical_impact
-                match schema
-                    .index_of("cache_clinical_impact")
-                    .ok()
+                match cache_clinical_impact_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 {
                     Some(v) if !v.is_empty() => b_clinical_impact.append_value(&v),
                     _ => b_clinical_impact.append_null(),
                 }
                 // minor_allele
-                match schema
-                    .index_of("cache_minor_allele")
-                    .ok()
+                match cache_minor_allele_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 {
                     Some(v) if !v.is_empty() => b_minor_allele.append_value(&v),
                     _ => b_minor_allele.append_null(),
                 }
                 // minor_allele_freq (Float32)
-                match schema
-                    .index_of("cache_minor_allele_freq")
-                    .ok()
+                match cache_minor_allele_freq_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 {
                     Some(v) if !v.is_empty() => match v.parse::<f32>() {
@@ -8047,9 +8186,7 @@ impl AnnotateProvider {
                     _ => b_minor_allele_freq.append_null(),
                 }
                 // clinvar_ids (List<Utf8>)
-                match schema
-                    .index_of("cache_clinvar_ids")
-                    .ok()
+                match cache_clinvar_ids_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 {
                     Some(v) if !v.is_empty() => {
@@ -8062,9 +8199,7 @@ impl AnnotateProvider {
                     _ => b_clinvar_ids.append(false),
                 }
                 // cosmic_ids (List<Utf8>)
-                match schema
-                    .index_of("cache_cosmic_ids")
-                    .ok()
+                match cache_cosmic_ids_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 {
                     Some(v) if !v.is_empty() => {
@@ -8077,10 +8212,7 @@ impl AnnotateProvider {
                     _ => b_cosmic_ids.append(false),
                 }
                 // dbsnp_ids (List<Utf8>)
-                match schema
-                    .index_of("cache_dbsnp_ids")
-                    .ok()
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                match cache_dbsnp_ids_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 {
                     Some(v) if !v.is_empty() => {
                         let vals = b_dbsnp_ids.values();
@@ -9640,6 +9772,11 @@ struct ContigAnnotationConfig {
     annotation_column_count: usize,
     /// Whether any projected CSQ or typed annotation output consumes SIFT/PolyPhen.
     needs_sift_polyphen: bool,
+    /// The outputs the scan's projection reads; decides which stages run.
+    output_needs: Arc<OutputNeeds>,
+    /// Whether any read output comes from the transcript engine. Without one,
+    /// no transcript context is loaded: every read value is per variant.
+    needs_transcript_context: bool,
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
     /// Number of parallel window workers for the annotation step within a
@@ -10280,6 +10417,9 @@ async fn load_contig_transcripts(
     config: &ContigAnnotationConfig,
     profile: &Option<SharedContigPipelineProfile>,
 ) -> Result<(Vec<TranscriptFeature>, HashMap<String, String>)> {
+    if !config.needs_transcript_context {
+        return Ok((Vec::new(), HashMap::new()));
+    }
     let scan_started = Instant::now();
     let tx_batches =
         scan_context_entity(cache, "transcript", chrom, TRANSCRIPT_CONTEXT_COLUMNS).await?;
@@ -10307,7 +10447,18 @@ async fn load_contig_context_rest(
     profile: &Option<SharedContigPipelineProfile>,
     tx_ids: &HashSet<String>,
     annotation_workers: usize,
+    needs_transcript_context: bool,
+    read_protein_features: bool,
 ) -> Result<ContigContextRest> {
+    if !needs_transcript_context {
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+    }
+    // `protein_features` only feeds DOMAINS; it is the widest translation column.
+    let translation_columns: Vec<&str> = TRANSLATION_CONTEXT_COLUMNS
+        .iter()
+        .copied()
+        .filter(|column| read_protein_features || *column != "protein_features")
+        .collect();
     // These independent scans and owned parses overlap for multi-worker runs.
     // Keep serial execution at one worker and retain the explicit diagnostic
     // override. At most four existing blocking parses run concurrently.
@@ -10330,25 +10481,14 @@ async fn load_contig_context_rest(
     let (ex_s, tl_s, rg_s, mt_s) = if concurrent {
         tokio::try_join!(
             timed_scan(cache, "exon", chrom, EXON_CONTEXT_COLUMNS),
-            timed_scan(
-                cache,
-                "translation_core",
-                chrom,
-                TRANSLATION_CONTEXT_COLUMNS
-            ),
+            timed_scan(cache, "translation_core", chrom, &translation_columns),
             timed_scan(cache, "regulatory", chrom, REGULATORY_CONTEXT_COLUMNS),
             timed_scan(cache, "motif", chrom, MOTIF_CONTEXT_COLUMNS),
         )?
     } else {
         (
             timed_scan(cache, "exon", chrom, EXON_CONTEXT_COLUMNS).await?,
-            timed_scan(
-                cache,
-                "translation_core",
-                chrom,
-                TRANSLATION_CONTEXT_COLUMNS,
-            )
-            .await?,
+            timed_scan(cache, "translation_core", chrom, &translation_columns).await?,
             timed_scan(cache, "regulatory", chrom, REGULATORY_CONTEXT_COLUMNS).await?,
             timed_scan(cache, "motif", chrom, MOTIF_CONTEXT_COLUMNS).await?,
         )
@@ -15464,6 +15604,11 @@ async fn prepare_contig_data(
 
     // SIFT source: a shared per-contig prediction store loaded from the Parquet
     // translation_sift shard.
+    let tmp_provider = {
+        let mut provider = tmp_provider;
+        provider.output_needs = Some(Arc::clone(&config.output_needs));
+        provider
+    };
     #[cfg(feature = "parquet-cache")]
     let tmp_provider = {
         let mut provider = tmp_provider;
@@ -15511,6 +15656,8 @@ async fn prepare_contig_data(
         &pipeline_profile,
         &tx_ids,
         config.annotation_workers,
+        config.needs_transcript_context,
+        config.output_needs.domains(),
     )
     .await;
     let rest_elapsed = t_rest.elapsed();
@@ -15769,6 +15916,48 @@ async fn prepare_contig_data(
     }))
 }
 
+/// Whether anything reads the variation lookup: the co-located sink, a
+/// cache-only column, or a shard's precomputed consequences, which the
+/// cached fast path uses in place of the transcript engine when it runs.
+fn lookup_has_consumer(
+    needs: &OutputNeeds,
+    check_existing: bool,
+    cache_columns: &[String],
+    transcript_context: bool,
+) -> bool {
+    needs.variation_lookup(check_existing)
+        || (transcript_context
+            && cache_columns
+                .iter()
+                .any(|column| column == "most_severe_consequence" || column == "consequence_types"))
+}
+
+/// AF column groups the co-located data reads (1000 Genomes, gnomAD exomes,
+/// gnomAD genomes). MAX_AF compares every population, so `max_af` reads all.
+fn lookup_af_groups(flags: &VepFlags) -> [bool; 3] {
+    [
+        flags.af || flags.af_1kg || flags.max_af,
+        flags.af_gnomade || flags.max_af,
+        flags.af_gnomadg || flags.max_af,
+    ]
+}
+
+/// Projection pushdown for the variation lookup: skip probing when no output
+/// reads it (VEP itself creates the variation source only under
+/// `check_existing`, `CacheDir.pm:168`), and read only the AF column groups
+/// the enabled frequency flags emit.
+fn apply_lookup_needs(provider: &mut LookupProvider, config: &ContigAnnotationConfig) {
+    if !lookup_has_consumer(
+        &config.output_needs,
+        config.flags.check_existing,
+        &config.cache_columns,
+        config.needs_transcript_context,
+    ) {
+        provider.set_skip_probing(true);
+    }
+    provider.set_colocated_af_groups(Some(lookup_af_groups(&config.flags)));
+}
+
 /// Build the filtered lookup for one run and spawn its position-ordered
 /// partition workers. Shared by the first run (from `activate_contig_lookups`)
 /// and every later run of the same contig (from the `ActivatingRun` state).
@@ -15805,6 +15994,7 @@ async fn activate_run_lookup(
     provider.set_vcf_filter(Some(run.lookup_filter(&chrom)));
     provider.set_probe_floor_pos(run.probe_floor());
     provider.set_target_partitions(config.target_partitions);
+    apply_lookup_needs(&mut provider, &config);
     #[cfg(feature = "parquet-cache")]
     if let Some(root) = &config.cache_root {
         provider.set_cache_root(root.clone());
@@ -16015,6 +16205,7 @@ async fn activate_contig_lookups(
             }
             wprovider.set_vcf_filter(Some(filter));
             wprovider.set_target_partitions(config.target_partitions);
+            apply_lookup_needs(&mut wprovider, &config);
             // Warm-up rows (strictly before this worker's seam) are read only to
             // replay buffer state and are then discarded, so skip their variation
             // probe. Worker 0 has no warm-up. Opt out with VEP_SKIP_WARMUP_LOOKUP=0.
@@ -16207,22 +16398,22 @@ impl TableProvider for AnnotateProvider {
             // read them from the cache when the query's projection actually
             // selects the corresponding output column (projection pushdown).
             // A `None` projection means "all columns" → keep them.
-            let output_schema = self.schema();
-            let cache_only_selected = |name: &str| -> bool {
-                if !CACHE_ONLY_CSQ_SKIPPABLE_COLUMNS.contains(&name) {
-                    return true;
-                }
-                match projection {
-                    None => true,
-                    Some(proj) => match output_schema.index_of(name) {
-                        Ok(idx) => proj.contains(&idx),
-                        // Column not present in the output schema → projection can
-                        // never select it; safe to skip reading it from the cache.
-                        Err(_) => false,
-                    },
-                }
+            let output_needs = self.output_needs_for(projection)?;
+            // The CSQ string carries plugin values, and a plugin's match
+            // template may read a field (`{HGVSc}`) the projection does not.
+            #[cfg(feature = "parquet-cache")]
+            let output_needs = match self.plugin_cache_root.as_ref() {
+                Some(root) if output_needs.csq() => output_needs.with_csq_fields(
+                    crate::plugin_cache::registry::PluginRegistry::template_fields(
+                        root,
+                        self.plugin_names.as_deref(),
+                    )?,
+                ),
+                _ => output_needs,
             };
-            preferred_columns.retain(|name| cache_only_selected(name));
+            preferred_columns.retain(|name| {
+                !CACHE_ONLY_CSQ_SKIPPABLE_COLUMNS.contains(name) || output_needs.column(name)
+            });
 
             let extended_probes = self
                 .options_json
@@ -16244,6 +16435,7 @@ impl TableProvider for AnnotateProvider {
                     cache,
                     translations_sift_table.as_deref(),
                     limit,
+                    output_needs,
                 )
                 .await;
         }
@@ -17623,6 +17815,8 @@ mod tests {
             projection: None,
             annotation_column_count: 0,
             needs_sift_polyphen: false,
+            output_needs: Arc::new(OutputNeeds::all()),
+            needs_transcript_context: true,
             fetch_limit: None,
             annotation_workers: 1,
             pick_flags: PickFlags::default(),
@@ -20837,6 +21031,136 @@ mod tests {
             direct,
             "G|ENSG1|ENST1|Transcript|missense_variant|10|7|3|A/T|Gcc/Acc|rs1"
         );
+    }
+
+    #[test]
+    fn projection_tables_cover_every_gnomad_spelling() {
+        // Every population name, in either spelling, must keep `everything`
+        // and the co-located group; only the aggregates are not everything-only.
+        use crate::projection_needs::{COLOCATED_COLUMNS, EVERYTHING_ONLY_COLUMNS};
+        for name in GNOMADE_OUTPUT_NAMES.iter().chain(GNOMADG_OUTPUT_NAMES) {
+            assert!(COLOCATED_COLUMNS.contains(name), "{name} not co-located");
+            if *name != "gnomADe_AF" && *name != "gnomADg_AF" {
+                assert!(
+                    EVERYTHING_ONLY_COLUMNS.contains(name),
+                    "{name} not everything-only"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn precomputed_consequences_keep_the_lookup() {
+        let needs =
+            OutputNeeds::from_projection(Some(vec!["chrom".into(), "Consequence".into()]), None);
+        assert!(!lookup_has_consumer(
+            &needs,
+            false,
+            &["clin_sig".to_string()],
+            true
+        ));
+        for column in ["most_severe_consequence", "consequence_types"] {
+            let cols = [column.to_string()];
+            assert!(lookup_has_consumer(&needs, false, &cols, true), "{column}");
+            // Without the transcript engine nothing reads the cached consequences.
+            assert!(
+                !lookup_has_consumer(&needs, false, &cols, false),
+                "{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_af_option_reads_every_af_group() {
+        let flags = VepFlags::from_options_json(Some(r#"{"max_af":true}"#));
+        assert!(flags.max_af && !flags.af && !flags.af_gnomade);
+        assert_eq!(lookup_af_groups(&flags), [true; 3]);
+        let flags = VepFlags::from_options_json(Some(r#"{"af_gnomadg":true}"#));
+        assert_eq!(lookup_af_groups(&flags), [false, false, true]);
+    }
+
+    #[test]
+    fn implied_csq_fields_reach_the_genomic_reference_gate() {
+        let input_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let mut provider = AnnotateProvider::new(
+            Arc::new(SessionContext::new()),
+            "vcf".into(),
+            String::new(),
+            AnnotationBackend::Parquet,
+            CacheMetadata {
+                source_type: CacheSourceType::Merged,
+                bam_edited: Some(true),
+            },
+            Some(r#"{"everything":true,"fields":["Allele"]}"#.to_string()),
+            input_schema,
+        )
+        .unwrap();
+        let projection = vec![
+            provider.schema().index_of("chrom").unwrap(),
+            provider.schema().index_of("CSQ").unwrap(),
+        ];
+        let hgvs_flags = HgvsFlags {
+            hgvsc: true,
+            ..Default::default()
+        };
+        assert!(!provider.output_needs_genomic_reference(Some(&projection), &hgvs_flags));
+        // A plugin template reading {HGVSc} joins the fields the scan reads.
+        provider.output_needs = Some(Arc::new(
+            OutputNeeds::from_projection(
+                Some(vec!["chrom".into(), "CSQ".into()]),
+                Some(&["Allele".to_string()]),
+            )
+            .with_csq_fields(["HGVSc".to_string()]),
+        ));
+        assert!(provider.output_needs_genomic_reference(Some(&projection), &hgvs_flags));
+    }
+
+    #[test]
+    fn pruned_af_flags_keep_their_check_existing_implication() {
+        for flag in [
+            "af",
+            "af_1kg",
+            "af_gnomade",
+            "af_gnomadg",
+            "max_af",
+            "pubmed",
+        ] {
+            let options = format!(r#"{{"{flag}":true}}"#);
+            let reads = |name: &str| name == "CLIN_SIG";
+            let flags = VepFlags::from_options_json_reading(Some(&options), Some(&reads));
+            assert!(flags.check_existing, "{flag} implies check_existing");
+            assert!(
+                !flags.af && !flags.max_af,
+                "{flag}: unread groups stay pruned"
+            );
+        }
+    }
+
+    #[test]
+    fn max_af_alone_keeps_every_af_group() {
+        // MAX_AF/MAX_AF_POPS compare all populations, so reading either one
+        // must keep all three AF groups (and with them their column pairs).
+        for column in ["MAX_AF", "MAX_AF_POPS"] {
+            let reads = |name: &str| name == column;
+            let flags =
+                VepFlags::from_options_json_reading(Some(r#"{"everything":true}"#), Some(&reads));
+            assert!(flags.check_existing && flags.max_af, "{column}");
+            assert!(flags.af && flags.af_1kg, "{column}");
+            assert!(flags.af_gnomade && flags.af_gnomadg, "{column}");
+            assert!(!flags.pubmed, "{column}");
+        }
+        // A single gnomAD genome population keeps only that group.
+        let reads = |name: &str| name == "gnomADg_NFE_AF";
+        let flags =
+            VepFlags::from_options_json_reading(Some(r#"{"everything":true}"#), Some(&reads));
+        assert!(flags.af_gnomadg && !flags.af_gnomade && !flags.af && !flags.af_1kg);
+        assert!(flags.check_existing);
     }
 
     #[test]

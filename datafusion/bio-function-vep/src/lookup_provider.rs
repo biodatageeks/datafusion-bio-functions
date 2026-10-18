@@ -88,6 +88,12 @@ pub struct LookupProvider {
     /// Maximum number of independent cold readers used by lookup.
     target_partitions: usize,
     probe_floor_pos: Option<i64>,
+    /// No output reads the lookup: pass every row through with null cache
+    /// columns and never open the variation shard.
+    skip_probing: bool,
+    /// AF column groups the co-located data reads (1000 Genomes, gnomAD
+    /// exomes, gnomAD genomes); `None` reads every group.
+    colocated_af_groups: Option<[bool; 3]>,
     /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
     /// for per-contig partitioned annotation).
     vcf_filter: Option<Expr>,
@@ -164,6 +170,8 @@ impl LookupProvider {
             cache_root: None,
             target_partitions: 1,
             probe_floor_pos: None,
+            skip_probing: false,
+            colocated_af_groups: None,
             vcf_filter: None,
             #[cfg(feature = "parquet-cache")]
             parquet_lookup_cell: None,
@@ -201,6 +209,17 @@ impl LookupProvider {
     /// Skip the variation probe for rows below this position (warm-up rows).
     pub fn set_probe_floor_pos(&mut self, pos: Option<i64>) {
         self.probe_floor_pos = pos;
+    }
+
+    /// Pass rows through without probing: nothing reads the lookup output.
+    pub fn set_skip_probing(&mut self, skip: bool) {
+        self.skip_probing = skip;
+    }
+
+    /// Read only these AF column groups for co-located data
+    /// (1000 Genomes, gnomAD exomes, gnomAD genomes).
+    pub fn set_colocated_af_groups(&mut self, groups: Option<[bool; 3]>) {
+        self.colocated_af_groups = groups;
     }
 
     /// Set an optional filter to apply to VCF input before lookup.
@@ -293,6 +312,8 @@ impl TableProvider for LookupProvider {
             )?;
             exec = exec.with_target_partitions(self.target_partitions);
             exec = exec.with_probe_floor_pos(self.probe_floor_pos);
+            exec = exec.with_skip_probing(self.skip_probing);
+            exec = exec.with_colocated_af_groups(self.colocated_af_groups);
             if let Some(ref sink) = self.colocated_sink {
                 exec = exec.with_colocated_sink(Arc::clone(sink));
             }
