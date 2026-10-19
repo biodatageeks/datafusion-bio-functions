@@ -8540,7 +8540,9 @@ fn normalize_source_label(source: &str) -> Option<String> {
 /// which `three_prime_utr_seq()` reads as no UTR without deriving one; `None`
 /// keeps meaning "no cached state, derive it". A successful BAM edit deletes
 /// the cached key and VEP recomputes it from the edited transcript, so those
-/// rows keep the derivation (vepyr#231).
+/// rows keep the derivation (vepyr#231). This assumes the column is written
+/// for every row whose transcript object carries the key, which is how the
+/// cache producer writes it (VEP stores the key for every transcript).
 ///
 /// Traceability:
 /// - ensembl-vep `AnnotationSource::Database::Transcript::prefetch_transcript_data()`
@@ -18791,7 +18793,7 @@ mod tests {
     /// it from the synthesized `spliced_seq` returned the N phase padding of
     /// `cds_start_NF` transcripts as a fake UTR. Only a successful BAM edit
     /// deletes the cached key so it is recomputed (`AnnotationType/
-    /// Transcript.pm:599-609`).
+    /// Transcript.pm:599-614`).
     #[tokio::test]
     async fn issue_231_null_cached_three_prime_utr_is_cached_undef() {
         for include_utr_column in [true, false] {

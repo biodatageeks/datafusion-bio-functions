@@ -19524,6 +19524,16 @@ mod tests {
     }
 
     #[test]
+    fn issue_230_itc_frameshift_deletion_alt_codon_extends_into_three_prime_utr() {
+        // The same window on an indel: deleting the first base of the partial
+        // codon `Tt` gives `substr(alt_cds . utr, 9, 3 + 0 - 1)` = `T` + the
+        // first UTR base (TVA.pm:877, 2414-2427), displayed lowercase.
+        let (_, codons, _, _) =
+            issue_230_itc_snv(1, "ATGGCTGAATT", "TAGG", var("22", 1009, 1009, "T", "-"));
+        assert_eq!(codons.as_deref(), Some("Tt/tt"));
+    }
+
+    #[test]
     fn issue_230_itc_snv_without_three_prime_utr_keeps_truncated_alt_codon() {
         // VEP appends the UTR only `if (defined $utr)` (TVA.pm:2424); with
         // the cached undef of vepyr#231 the alternate codon stays `At`.
