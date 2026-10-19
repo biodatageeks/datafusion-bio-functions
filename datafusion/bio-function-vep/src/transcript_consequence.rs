@@ -6362,13 +6362,44 @@ fn protein_hgvs_for_output_with_semantics(
         return fallback.cloned();
     };
 
-    // Traceability:
-    // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
-    //   suppresses HGVSp when the insertion produces ref=* alt=* (no protein
-    //   change at the stop codon). This check must run before the shift_length
-    //   == 0 early return so that zero-shift star/star insertions are suppressed.
-    if let Some(original) = fallback {
-        if is_insertion && original.ref_peptide == "*" && original.alt_peptide == "*" {
+    // vepyr#226. VEP's only "outside the translated region" test is the
+    // coordinate guard in `hgvs_protein` (ensembl-variation 116
+    // `TranscriptVariationAllele.pm:1723-1738`), and it runs for every shift
+    // length, before any peptide work:
+    //
+    //     unless (
+    //       ($pre->{coding}) &&
+    //       $tv->translation_start(undef, $shifting_offset) &&
+    //       $tv->translation_end(undef, $shifting_offset)
+    //     ){ ... return undef; }
+    //
+    // `translation_start/end` are the first/last `genomic2pep` pieces of the
+    // VF span plus `$shifting_offset` (`BaseTranscriptVariation.pm:365-381`,
+    // `:540-548`); a Gap at either end is undef, and the test is Perl
+    // truthiness. There is no peptide condition: a stop-keeping insertion
+    // inside the stop codon (`*`/`*`) is formatted as `p.Ter<n>=`. The
+    // `_boundary_shift` fallback needs `$vf->{shifted_flag}`, which neither
+    // ensembl-vep 116.0 nor ensembl-variation 116 sets.
+    //
+    // For insertions the guard is checked here, on VEP's empty interval
+    // `(start, start - 1)` shifted by `strand * shift_length`, through the
+    // shared VEP mapper port. A mapper that cannot place either flank, or
+    // a transcript without cDNA coding bounds, is not a decision: the
+    // engine falls through to its existing paths rather than drop HGVSp.
+    if is_insertion
+        && let Some(translation) = tx_translation
+        && tx.cdna_coding_start.is_some()
+        && tx.cdna_coding_end.is_some()
+    {
+        let shifted_variant = protein_hgvs_shifted_variant(variant, shift, tx.strand);
+        let span = vep_coords::VepSpan::new(shifted_variant.start, shifted_variant.end);
+        let mapper = vep_coords::VepTxMapper::new(
+            tx,
+            tx_exons,
+            Some(translation),
+            vep_coords::CdnaBaseMap::HgvspExact,
+        );
+        if mapper.cdna(span).both().is_some() && mapper.translation(span).both_truthy().is_none() {
             return None;
         }
     }
@@ -19843,56 +19874,14 @@ mod tests {
     }
 
     #[test]
-    fn protein_hgvs_for_output_suppresses_star_equal_insertions() {
-        let t = tx(
-            "ENSTSTARINS0001",
-            "1",
-            100,
-            200,
-            1,
-            "protein_coding",
-            Some(120),
-            Some(180),
-        );
-        let exons = vec![exon("ENSTSTARINS0001", 1, 100, 200)];
+    fn protein_hgvs_for_output_drops_insertion_outside_translation() {
+        // vepyr#226: the insertion at 181^182 lies past the stop (CDS 120..179,
+        // cDNA 21..80), so VEP's `translation_start/end` guard
+        // (`TranscriptVariationAllele.pm:1730-1738`) returns undef. The empty
+        // HGVSp comes from that guard, not from the `*`/`*` peptides.
+        let (t, exons, tr) = star_insertion_fixture();
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
-        let tr = translation(
-            "ENSTSTARINS0001",
-            Some(60),
-            Some(20),
-            Some("MKKKKKKKKKKKKKKKKKK*"),
-            Some("ATGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATGA"),
-        );
-        let fallback = crate::hgvs::ProteinHgvsData {
-            start: 20,
-            end: 20,
-            ref_peptide: "*".into(),
-            alt_peptide: "*".into(),
-            ref_translation: "MKKKKKKKKKKKKKKKKKK*".into(),
-            alt_translation: "MKKKKKKKKKKKKKKKKKK*".into(),
-            alt_translation_extension: None,
-            frameshift: false,
-            start_lost: false,
-            stop_lost: false,
-            native_refseq: false,
-        };
-        let mut v = VariantInput::from_vcf("1".into(), 181, 181, "A".into(), "AT".into());
-        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
-            strand: 1,
-            shift_length: 0,
-            start: 181,
-            end: 180,
-            shifted_allele_string: "T".into(),
-            shifted_compare_allele: "-".into(),
-            shifted_output_allele: "T".into(),
-            ref_orig_allele_string: "-".into(),
-            alt_orig_allele_string: "T".into(),
-            five_prime_flanking_seq: String::new(),
-            three_prime_flanking_seq: String::new(),
-            five_prime_context: String::new(),
-            three_prime_context: String::new(),
-        });
-
+        let v = star_insertion_variant(181, "A", "AT", 0, "T");
         assert_eq!(
             protein_hgvs_for_output(
                 &t,
@@ -19901,11 +19890,152 @@ mod tests {
                 &v,
                 true,
                 None,
-                Some(&fallback),
+                Some(&star_star_fallback()),
                 true,
             ),
             None
         );
+    }
+
+    /// `+` strand, exon 100..200, CDS 120..179 ending in a `TAG` stop at
+    /// 177..179 followed by `GGG`; cDNA coding 21..80, 19 residues + stop.
+    fn star_insertion_fixture() -> (TranscriptFeature, Vec<ExonFeature>, TranslationFeature) {
+        let mut t = tx(
+            "ENSTSTARINS0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(120),
+            Some(179),
+        );
+        t.cdna_coding_start = Some(21);
+        t.cdna_coding_end = Some(80);
+        t.translation_stable_id = Some("ENSPSTARINS0001".to_string());
+        let exons = vec![exon("ENSTSTARINS0001", 1, 100, 200)];
+        let cds = format!("ATG{}TAG", "AAA".repeat(18));
+        let utr5 = "C".repeat(20);
+        let utr3 = format!("GGG{}", "C".repeat(18));
+        t.spliced_seq = Some(format!("{utr5}{cds}{utr3}"));
+        t.cdna_seq = t.spliced_seq.clone();
+        t.five_prime_utr_seq = Some(utr5);
+        t.three_prime_utr_seq = Some(utr3);
+        t.translateable_seq = Some(cds.clone());
+        let mut tr = translation(
+            "ENSTSTARINS0001",
+            Some(60),
+            Some(20),
+            Some(&format!("M{}", "K".repeat(18))),
+            Some(&cds),
+        );
+        tr.stable_id = Some("ENSPSTARINS0001".to_string());
+        tr.version = Some(1);
+        (t, exons, tr)
+    }
+
+    fn star_star_fallback() -> crate::hgvs::ProteinHgvsData {
+        crate::hgvs::ProteinHgvsData {
+            start: 20,
+            end: 20,
+            ref_peptide: "*".into(),
+            alt_peptide: "*".into(),
+            ref_translation: format!("M{}*", "K".repeat(18)),
+            alt_translation: format!("M{}*", "K".repeat(18)),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        }
+    }
+
+    /// VCF `pos REF ALT` insertion with a forward HGVS shift of
+    /// `shift_length` bases; `inserted` is the shifted inserted sequence.
+    fn star_insertion_variant(
+        pos: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+        shift_length: usize,
+        inserted: &str,
+    ) -> VariantInput {
+        let mut v =
+            VariantInput::from_vcf("1".into(), pos, pos, ref_allele.into(), alt_allele.into());
+        let start = pos + 1 + shift_length as i64;
+        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length,
+            start,
+            end: start - 1,
+            shifted_allele_string: inserted.into(),
+            shifted_compare_allele: "-".into(),
+            shifted_output_allele: inserted.into(),
+            ref_orig_allele_string: "-".into(),
+            alt_orig_allele_string: inserted.into(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+        v
+    }
+
+    fn star_insertion_hgvsp(v: &VariantInput) -> Option<String> {
+        let (t, exons, tr) = star_insertion_fixture();
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        protein_hgvs_for_output(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            v,
+            true,
+            Some((20, 20)),
+            Some(&star_star_fallback()),
+            true,
+        )
+        .and_then(|p| crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), &p, true))
+    }
+
+    /// vepyr#226 (a): `TA|G` + `A` keeps the stop (`TAAG`). VEP's guard is
+    /// coordinate-only; the `*`/`*` peptides are formatted by the `=` arm
+    /// (`TranscriptVariationAllele.pm:1911-1913`) as `p.Ter20=`.
+    #[test]
+    fn protein_hgvs_for_output_formats_stop_keeping_insertion_inside_stop() {
+        let v = star_insertion_variant(178, "A", "AA", 0, "A");
+        assert_eq!(
+            star_insertion_hgvsp(&v).as_deref(),
+            Some("ENSPSTARINS0001.1:p.Ter20=")
+        );
+    }
+
+    /// vepyr#226 (b): `T|AG` + `A` (`TAAG`), HGVS-shifted 1 base to `TA|G`,
+    /// still inside the stop codon: the guard passes and the shifted window
+    /// is still `*`/`*` (VEP probe T1).
+    #[test]
+    fn protein_hgvs_for_output_formats_shifted_stop_keeping_insertion_inside_stop() {
+        let v = star_insertion_variant(177, "T", "TA", 1, "A");
+        assert_eq!(
+            star_insertion_hgvsp(&v).as_deref(),
+            Some("ENSPSTARINS0001.1:p.Ter20=")
+        );
+    }
+
+    /// vepyr#226 (c): `TA|G` + `G` (`TAGG`), HGVS-shifted 3 bases through the
+    /// `GGG` run to 182^183, past the stop: VEP's shifted
+    /// `translation_start/end` is a Gap, so no HGVSp (VEP `c.*3dup`).
+    #[test]
+    fn protein_hgvs_for_output_drops_stop_keeping_insertion_shifted_past_stop() {
+        let v = star_insertion_variant(178, "A", "AG", 3, "G");
+        assert_eq!(star_insertion_hgvsp(&v), None);
+    }
+
+    /// vepyr#226 (d): shift 0, inserted between the last stop base and `*1`
+    /// (the HG002 `c.2538dup` shape): the empty interval maps to cDNA
+    /// `(81, 80)`, which `genomic2cds` calls a Gap.
+    #[test]
+    fn protein_hgvs_for_output_drops_insertion_after_last_stop_base() {
+        let v = star_insertion_variant(179, "G", "GG", 0, "G");
+        assert_eq!(star_insertion_hgvsp(&v), None);
     }
 
     #[test]
