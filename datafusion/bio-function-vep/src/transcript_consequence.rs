@@ -1996,16 +1996,23 @@ impl TranscriptConsequenceEngine {
         // span gets every intron and splice flag from VEP's per-region
         // `_intron_effects`, `intron_variant` included (`within_intron` reads
         // its `intronic` flag, VariationEffect.pm:629-634 @ 2fb834b).
-        let multi_region_effects = vep_multi_region_intron_effects(
-            &VariantInput::from_vcf(
-                variant.chrom.clone(),
-                variant.start,
-                variant.end,
-                variant.ref_allele.clone(),
-                variant.alt_allele.clone(),
-            ),
-            tx_exons,
-        );
+        // Trimming never lengthens an allele, so the raw lengths are a cheap
+        // necessary test that keeps SNVs and indels off the allocation.
+        let multi_region_effects =
+            (tx_exons.len() >= 2 && variant.ref_allele.len() > 1 && variant.alt_allele.len() > 1)
+                .then(|| {
+                    vep_multi_region_intron_effects(
+                        &VariantInput::from_vcf(
+                            variant.chrom.clone(),
+                            variant.start,
+                            variant.end,
+                            variant.ref_allele.clone(),
+                            variant.alt_allele.clone(),
+                        ),
+                        tx_exons,
+                    )
+                })
+                .flatten();
         let overlaps_intron = match multi_region_effects.as_ref() {
             Some(effects) => effects.intronic,
             None => self.variant_overlaps_intron(variant, tx_exons),
@@ -4175,9 +4182,13 @@ impl VepIntronEffects {
 }
 
 /// `_intron_effects` for an allele whose differing regions are not its whole
-/// REF span (vepyr#210): an MNV or delins with REF and ALT both longer than
-/// 1 bp and a shared base, or an ALT longer than REF. `None` for every other
-/// allele, which keeps the single-span path.
+/// REF span (vepyr#210). That needs REF and ALT both longer than 1 bp, and
+/// either a base they share or an ALT longer than REF (the overhang). `None`
+/// for every other allele, which keeps the single-span path.
+///
+/// `within_frameshift_intron` is ported for its `next`. VEP reads the flag
+/// itself only in `within_cds`/`within_cdna`, which the engine derives from
+/// the VF span elsewhere.
 ///
 /// A literal port of BaseTranscriptVariationAllele.pm:109-223 @ 2fb834b,
 /// region by region, with two VEP behaviours copied on purpose:
@@ -4206,6 +4217,9 @@ fn vep_multi_region_intron_effects(
     }
     let ref_len = normalize_allele_seq(&sv.ref_allele).len() as i64;
     let alt_len = normalize_allele_seq(&sv.alt_allele).len() as i64;
+    // The span check guards a REF that does not cover the VF span (a
+    // symbolic or otherwise unnormalised allele); VEP's region offsets are
+    // relative to that span, so such an allele keeps the old path.
     if ref_len <= 1 || alt_len <= 1 || sv.end - sv.start + 1 != ref_len {
         return None;
     }
@@ -18728,6 +18742,38 @@ mod tests {
                 terms.contains(&SoTerm::SpliceRegionVariant),
                 "strand {strand}: {terms:?}"
             );
+        }
+    }
+
+    #[test]
+    fn multi_region_allele_inside_frameshift_intron_is_skipped() {
+        // A 10 bp intron (1100-1109) is a frameshift intron: a region that
+        // overlaps it sets within_frameshift_intron and skips that intron
+        // (BaseTranscriptVariationAllele.pm:138-141, :170-174).
+        let engine = TranscriptConsequenceEngine::default();
+        for strand in [1, -1] {
+            let t = tx("T1", "22", 1000, 1300, strand, "lncRNA", None, None);
+            let exons = vec![exon("T1", 1, 1000, 1099), exon("T1", 2, 1110, 1300)];
+            let out = engine.evaluate_variant_with_context(
+                &var("22", 1101, 1104, "ACGT", "TCGA"),
+                &[t],
+                &exons,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            );
+            let terms = &out[0].terms;
+            for term in [
+                SoTerm::SpliceDonorVariant,
+                SoTerm::SpliceAcceptorVariant,
+                SoTerm::SpliceRegionVariant,
+                SoTerm::SpliceDonorRegionVariant,
+                SoTerm::IntronVariant,
+            ] {
+                assert!(!terms.contains(&term), "strand {strand}: {terms:?}");
+            }
         }
     }
 
