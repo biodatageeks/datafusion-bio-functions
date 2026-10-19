@@ -541,6 +541,9 @@ fn format_hgvsc_fallback(
         // `notation_to_hgvsc_coords` returns the genomic order; VEP keeps the
         // transcript-slice order (an `ins` clipped from a clamp has start =
         // end + 1) and sorts it with a guard against an end carrying `*`.
+        // Step 1 restores VEP's slice order. Step 2 is VEP's sort, which
+        // undoes step 1 again unless the end carries `*`; so a reordering
+        // survives only for a clipped `ins` in the 3' UTR (`*159_*158`).
         if (tx.strand >= 0) == (notation.kind == "ins") {
             std::mem::swap(&mut start, &mut end);
         }
@@ -3475,6 +3478,32 @@ mod tests {
         );
         // The same clipped insertion inside the transcript numbering without
         // `*` is sorted as usual (`n.1_2insT` above).
+
+        // - strand: the clamp is at genomic 90 (`*10`). Feature REF GC(T),
+        // ALT GAC clip to an A inserted between `*9` and `*10`, and VEP's
+        // slice order (start = end + 1) is kept: `*10_*9`.
+        let coding_reverse = make_transcript("protein_coding", -1, Some(100), Some(108));
+        assert_eq!(
+            partial_overlap_hgvsc(&coding_reverse, "AGC", "GTC", 89, 91, VepSemantics::V116)
+                .as_deref(),
+            Some("ENSTHGVS000001.1:c.*10_*9insA")
+        );
+    }
+
+    #[test]
+    fn test_vep_hgvs_position_parts_match_the_perl_regex() {
+        // m/(\-?[0-9]+)\+?(\-?[0-9]+)?/ (TranscriptVariationAllele.pm:1525-1526)
+        assert_eq!(vep_hgvs_position_parts("*159"), Some((159, 0)));
+        assert_eq!(vep_hgvs_position_parts("-42"), Some((-42, 0)));
+        assert_eq!(vep_hgvs_position_parts("-5+3"), Some((-5, 3)));
+        assert_eq!(vep_hgvs_position_parts("12-4"), Some((12, -4)));
+        assert_eq!(vep_hgvs_position_parts("253+5128"), Some((253, 5128)));
+        assert_eq!(vep_hgvs_position_parts("*31+5"), Some((31, 5)));
+        // VEP's `end !~ /\*/` guard: `1420_*251` is never swapped.
+        assert!(!vep_hgvs_positions_need_swap("1420", "*251"));
+        assert!(vep_hgvs_positions_need_swap("12", "11"));
+        assert!(vep_hgvs_positions_need_swap("12+5", "12+3"));
+        assert!(!vep_hgvs_positions_need_swap("-42", "253+5128"));
     }
 
     #[test]

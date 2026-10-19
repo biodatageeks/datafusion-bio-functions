@@ -1601,6 +1601,8 @@ impl TranscriptConsequenceEngine {
                         // TranscriptVariationAllele.pm:2719-2729, :1492). Trimming a
                         // shared base that lies outside the transcript first changes
                         // which bases REF loses and what ALT keeps.
+                        // (`minimised_substitution` reduces only same-length pairs,
+                        // so this guard only ever changes an MNV.)
                         let crosses_transcript_end =
                             variant.start < tx.start || variant.end > tx.end;
                         let hgvs_minimised = if tx.refseq_edits.is_empty()
@@ -17232,6 +17234,17 @@ mod tests {
                 .as_deref()
                 .is_some_and(|h| h.ends_with(":n.11_12delinsTCG")),
             "got {crossing:?}"
+        );
+
+        // The same across the transcript start: GAC>GTC at 999-1001 clamps
+        // to AC against GTC, clipping only the shared C: n.1delinsGT, not
+        // the trimmed n.1A>T.
+        let at_start = hgvsc_of(&var("22", 999, 1001, "GAC", "GTC"));
+        assert!(
+            at_start
+                .as_deref()
+                .is_some_and(|h| h.ends_with(":n.1delinsGT")),
+            "got {at_start:?}"
         );
 
         // Inside the transcript the trimmed and clamped orders agree.
