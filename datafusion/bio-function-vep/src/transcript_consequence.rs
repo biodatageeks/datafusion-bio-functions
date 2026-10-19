@@ -298,7 +298,10 @@ pub struct TranscriptFeature {
     pub spliced_seq: Option<String>,
     /// Raw 5' UTR cached on the VEP transcript object.
     pub five_prime_utr_seq: Option<String>,
-    /// Raw 3' UTR cached on the VEP transcript object.
+    /// Raw 3' UTR cached on the VEP transcript object. `Some("")` is VEP's
+    /// cached undef (no 3' UTR; nothing is derived), `None` means the cache
+    /// carries no 3' UTR state and it is derived from the transcript
+    /// sequence (vepyr#231).
     pub three_prime_utr_seq: Option<String>,
     /// Cached transcript `_translateable_seq()` value from the VEP transcript
     /// object, when present.
@@ -19306,6 +19309,89 @@ mod tests {
         t.cdna_coding_end = None;
         t.spliced_seq = Some("ATGATGATGCCC".into());
         assert!(three_prime_utr_seq(&t).is_none());
+    }
+
+    /// HGVSp of a 1-bp deletion in the last codon of an N-padded
+    /// `cds_start_NF&cds_end_NF` transcript (the ENST00000523942 shape of
+    /// vepyr#231), with the cached 3'UTR set to `cached_utr`.
+    ///
+    /// Padded CDS `NNG CTG AAA GGC AAG` (X L K G K) at 1000-1012: 13 real
+    /// bases, `cdna_coding_end = 13`, and the spliced sequence the loader
+    /// synthesizes is the padded 15-nt CDS.
+    fn issue_231_padded_last_codon_deletion_hgvsp(cached_utr: Option<&str>) -> Option<String> {
+        let padded = "NNGCTGAAAGGCAAG";
+        let mut t = tx(
+            "T231",
+            "22",
+            1000,
+            1012,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1012),
+        );
+        t.cds_start_nf = true;
+        t.cds_end_nf = true;
+        t.flags_str = Some("cds_start_NF&cds_end_NF".to_string());
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(13);
+        t.translateable_seq = Some(padded.to_string());
+        t.spliced_seq = Some(padded.to_string());
+        t.three_prime_utr_seq = cached_utr.map(str::to_string);
+        let e = exon("T231", 1, 1000, 1012);
+        let mut tr = translation("T231", Some(15), Some(5), Some("XLKGK"), Some(padded));
+        tr.stable_id = Some("ENSP231".to_string());
+        tr.version = Some(1);
+        let engine = TranscriptConsequenceEngine::default();
+        // Delete the middle A of the last codon AAG (padded index 13).
+        engine
+            .evaluate_variant_with_context(
+                &var("22", 1011, 1011, "A", "-"),
+                &[t],
+                &[e],
+                &[tr],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .into_iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("T231"))
+            .expect("expected a T231 consequence")
+            .hgvsp
+    }
+
+    #[test]
+    fn issue_231_cached_undef_three_prime_utr_adds_no_padding_residue() {
+        // vepyr#231: VEP appends `_three_prime_utr()` to the alternate CDS
+        // only `if (defined $utr)` (TVA.pm:2422-2427), and the offline cache
+        // holds undef for this transcript. The alternate protein ends at
+        // `XLKG` + a partial codon, so residue 5 is deleted.
+        assert_eq!(
+            issue_231_padded_last_codon_deletion_hgvsp(Some("")).as_deref(),
+            Some("ENSP231.1:p.Lys5del")
+        );
+    }
+
+    #[test]
+    fn three_prime_utr_seq_does_not_derive_when_cache_holds_undef() {
+        let mut t = tx(
+            "T231",
+            "22",
+            1000,
+            1012,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1012),
+        );
+        t.cdna_coding_end = Some(13);
+        t.spliced_seq = Some("NNGCTGAAAGGCAAG".to_string());
+        // Column absent (`None`): the derivation returns the padding overhang.
+        assert_eq!(three_prime_utr_seq(&t).as_deref(), Some("AG"));
+        // Cached undef (`Some("")`): no 3'UTR.
+        t.three_prime_utr_seq = Some(String::new());
+        assert_eq!(three_prime_utr_seq(&t), None);
     }
 
     #[test]
