@@ -12705,6 +12705,7 @@ fn spawn_annotation_from_lookup_sharded(
             Arc::clone(&shard_ctx.unique_format_tags),
             Arc::clone(&shard_ctx.sample_names),
             shard_ctx.coordinate_zero_based,
+            Arc::clone(&shard_ctx.file_format),
             shard_ctx.shard_compression,
         )?;
         let mut output = RunOutput::Shard {

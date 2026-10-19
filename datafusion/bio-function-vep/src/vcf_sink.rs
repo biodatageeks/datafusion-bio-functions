@@ -16,7 +16,8 @@ use datafusion::prelude::SessionContext;
 use datafusion_bio_format_core::metadata::{
     VCF_FORMAT_KEYS_COLUMN, VCF_HEADER_RAW_LINES_KEY, VCF_INFO_KEYS_COLUMN,
 };
-use datafusion_bio_format_vcf::serializer::{VcfRecordLine, batch_to_vcf_lines};
+use datafusion_bio_format_vcf::header_builder::header_file_format;
+use datafusion_bio_format_vcf::serializer::{VcfRecordLine, batch_to_vcf_lines_for_file_format};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -173,6 +174,9 @@ pub(crate) struct VcfShardContext {
     pub(crate) unique_format_tags: Arc<Vec<String>>,
     pub(crate) sample_names: Arc<Vec<String>>,
     pub(crate) coordinate_zero_based: bool,
+    /// The `##fileformat` version of the output header, which decides what an
+    /// INFO value has to escape.
+    pub(crate) file_format: Arc<str>,
     pub(crate) tempdir: PathBuf,
     /// Output compression for the per-worker shard files. Only ever `Bgzf`
     /// (bgzf output → parallel per-worker compression + raw block concat) or
@@ -306,6 +310,7 @@ fn format_vcf_body_chunk(
     unique_format_tags: Arc<Vec<String>>,
     sample_names: Arc<Vec<String>>,
     coordinate_zero_based: bool,
+    file_format: &str,
 ) -> Result<FormattedVcfBatch> {
     let input_rows = batch.num_rows();
     let format_started = Instant::now();
@@ -318,12 +323,13 @@ fn format_vcf_body_chunk(
         ],
     );
     let batch = restore_input_columns(batch)?;
-    let lines = batch_to_vcf_lines(
+    let lines = batch_to_vcf_lines_for_file_format(
         &batch,
         vcf_info_fields.as_slice(),
         unique_format_tags.as_slice(),
         sample_names.as_slice(),
         coordinate_zero_based,
+        file_format,
     )?;
     let (bytes, line_count) = vcf_lines_to_body_chunk(lines);
     pipeline_trace::emit(
@@ -419,6 +425,7 @@ pub(crate) struct VcfBodyShardWriter {
     unique_format_tags: Arc<Vec<String>>,
     sample_names: Arc<Vec<String>>,
     coordinate_zero_based: bool,
+    file_format: Arc<str>,
     batch_id: usize,
     pub(crate) lines: usize,
     pub(crate) input_rows: usize,
@@ -432,6 +439,7 @@ impl VcfBodyShardWriter {
         unique_format_tags: Arc<Vec<String>>,
         sample_names: Arc<Vec<String>>,
         coordinate_zero_based: bool,
+        file_format: Arc<str>,
         compression: VcfCompressionType,
     ) -> Result<Self> {
         let writer = VcfLocalWriter::with_compression(path, compression)?;
@@ -441,6 +449,7 @@ impl VcfBodyShardWriter {
             unique_format_tags,
             sample_names,
             coordinate_zero_based,
+            file_format,
             batch_id: 0,
             lines: 0,
             input_rows: 0,
@@ -459,6 +468,7 @@ impl VcfBodyShardWriter {
             Arc::clone(&self.unique_format_tags),
             Arc::clone(&self.sample_names),
             self.coordinate_zero_based,
+            &self.file_format,
         )?;
         self.batch_id += 1;
         self.write_formatted(&formatted)?;
@@ -2011,6 +2021,9 @@ pub async fn annotate_to_vcf(
     let write_schema = Arc::new(
         datafusion::arrow::datatypes::Schema::new(output_fields).with_metadata(write_metadata),
     );
+    // The records are written under the header's version, which decides what
+    // an INFO value has to escape.
+    let file_format: Arc<str> = header_file_format(&write_schema).into();
 
     // 6. Stream annotated batches to VCF file.
     let output_path = Path::new(output_vcf);
@@ -2102,6 +2115,7 @@ pub async fn annotate_to_vcf(
             unique_format_tags: Arc::new(unique_format_tags),
             sample_names: Arc::new(sample_names),
             coordinate_zero_based,
+            file_format: Arc::clone(&file_format),
             shard_compression,
             tempdir: tempdir.path().to_path_buf(),
             rows_done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2186,12 +2200,13 @@ pub async fn annotate_to_vcf(
                 ],
             );
             let batch = restore_input_columns(batch)?;
-            let lines = batch_to_vcf_lines(
+            let lines = batch_to_vcf_lines_for_file_format(
                 &batch,
                 &vcf_info_fields,
                 &unique_format_tags,
                 &sample_names,
                 coordinate_zero_based,
+                &file_format,
             )?;
             let format_elapsed = lines_started.elapsed();
             pipeline_trace::emit(
@@ -2445,6 +2460,7 @@ mod tests {
             Arc::new(vec!["DP".to_string(), "GT".to_string()]),
             Arc::new(vec!["SAMPLE1".to_string()]),
             coordinate_zero_based,
+            "VCFv4.2",
         )
         .unwrap();
         let body = String::from_utf8(formatted.bytes).unwrap();
@@ -2454,7 +2470,8 @@ mod tests {
     /// The reader hands out percent-decoded INFO values; the writer must encode
     /// them again, but leave CSQ — already escaped by the VEP rules, with `,`
     /// between its blocks — exactly as the engine built it
-    /// (biodatageeks/vepyr#207).
+    /// (biodatageeks/vepyr#207). Under ClinVar's `VCFv4.1`, which allows no
+    /// whitespace in INFO, the space goes back as `%20` too.
     #[test]
     fn the_body_formatter_encodes_input_info_and_writes_csq_verbatim() {
         use datafusion::arrow::array::{
@@ -2501,7 +2518,7 @@ mod tests {
                 Arc::new(Float64Array::from(vec![None::<f64>])),
                 Arc::new(StringArray::from(vec![Some(".")])),
                 Arc::new(clndn.finish()),
-                Arc::new(StringArray::from(vec![Some("BIC:base_change=ins")])),
+                Arc::new(StringArray::from(vec![Some("BIC:base_change=ins A")])),
                 Arc::new(StringArray::from(vec![Some(csq)])),
             ],
         )
@@ -2514,13 +2531,14 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             true,
+            "VCFv4.1",
         )
         .unwrap();
         let body = String::from_utf8(formatted.bytes).unwrap();
         let info = body.split('\t').nth(7).unwrap().trim_end();
         assert_eq!(
             info,
-            format!("CLNDN=Lung_disease%3B,a%2Cb;CLNVI=BIC:base_change%3Dins;CSQ={csq}")
+            format!("CLNDN=Lung_disease%3B,a%2Cb;CLNVI=BIC:base_change%3Dins%20A;CSQ={csq}")
         );
     }
 
@@ -2666,6 +2684,7 @@ mod tests {
             Arc::new(vec![]),
             Arc::new(vec![]),
             false,
+            Arc::from("VCFv4.2"),
             VcfCompressionType::Bgzf,
         )
         .unwrap();
