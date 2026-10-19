@@ -489,7 +489,10 @@ impl<'a> VepTxMapper<'a> {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        CodonTable, GeometryCache, RefSeqEdit, TranscriptCdnaMapperSegment, overlaps,
+        CodonTable, GeometryCache, ProteinDomainFeature, RefSeqEdit, ShiftedTvaCoords,
+        TranscriptCdnaMapperSegment, adjust_refseq_cds_sequence_index_for_hgvsp_reference,
+        genomic_range, genomic_to_cds_index_for_hgvsp, overlaps, refseq_has_edited_sequence_state,
+        shifted_tva_coords_from_mapper,
     };
     use super::*;
 
@@ -876,6 +879,213 @@ mod tests {
             }
         }
         // 240 transcripts; guard against a matrix that silently shrank.
+        assert!(compared > 150_000, "compared {compared}");
+        assert!(defined > 50_000, "defined {defined}");
+    }
+
+    /// `shifted_tva_coords_from_mapper` at functions `9936c6e`, verbatim.
+    fn legacy_shifted_tva_coords_from_mapper(
+        tx: &TranscriptFeature,
+        tx_exons: &[&ExonFeature],
+        translation: &TranslationFeature,
+        shifted_variant: &VariantInput,
+    ) -> Option<ShiftedTvaCoords> {
+        let leading_n_offset = reference_translateable_seq_for_hgvsp(tx, Some(translation))?
+            .bytes()
+            .take_while(|&b| b == b'N' || b == b'n')
+            .count();
+        let coding_start = tx.cdna_coding_start?;
+        let coding_end = tx.cdna_coding_end?;
+
+        let is_insertion = shifted_variant.start == shifted_variant.end.saturating_add(1);
+        let (cdna_start, cdna_end) = if is_insertion {
+            // Traceability:
+            // - Ensembl core `Mapper::map_insert()` maps the swapped two-base
+            //   boundary and then adjusts the mapped interval in transcript
+            //   coordinates before downstream `genomic2cds()` / `genomic2pep()`
+            //   consumers read start/end.
+            //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
+            //
+            // Use flanks in transcript order, not genomic order. On the reverse
+            // strand the higher genomic coordinate is upstream. This swaps a
+            // contiguous mapped interval into a zero-length insertion while
+            // retaining any edited-cDNA gap between separate mapped segments.
+            // Do not sort cDNA positions: VEP preserves mapper result order.
+            //
+            // `map_insert` keeps only the flanks that map to a
+            // `Bio::EnsEMBL::Mapper::Coordinate` and silently drops any that map
+            // to a `Gap`; it does not fail when one flank is unmapped. An
+            // insertion abutting a frameshift intron has one intronic flank, so
+            // requiring both to map would discard a window VEP still resolves.
+            let (upstream, downstream) = if tx.strand < 0 {
+                (shifted_variant.start, shifted_variant.end)
+            } else {
+                (shifted_variant.end, shifted_variant.start)
+            };
+            let left = shifted_insertion_cdna_flank(tx, tx_exons, upstream);
+            let right = shifted_insertion_cdna_flank(tx, tx_exons, downstream);
+            match (left, right) {
+                (Some(left), Some(right)) => (left.saturating_add(1), right.saturating_sub(1)),
+                // Only the downstream flank mapped: VEP keeps that coordinate and
+                // decrements its end, leaving the zero-length window (r, r-1).
+                (None, Some(right)) => (right, right.saturating_sub(1)),
+                // Only the upstream flank mapped: VEP increments its start.
+                (Some(left), None) => (left.saturating_add(1), left),
+                (None, None) => return None,
+            }
+        } else {
+            let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
+            let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
+            for pos in genomic_positions {
+                cdna_positions.push(genomic_to_cdna_index_for_hgvsp(tx, tx_exons, pos)?);
+            }
+            cdna_positions.sort_unstable();
+            (*cdna_positions.first()?, *cdna_positions.last()?)
+        };
+
+        if cdna_end < coding_start || cdna_start > coding_end {
+            return None;
+        }
+
+        let raw_cds_start = cdna_start
+            .saturating_sub(coding_start)
+            .saturating_add(1)
+            .saturating_add(leading_n_offset);
+        let raw_cds_end = cdna_end
+            .saturating_sub(coding_start)
+            .saturating_add(1)
+            .saturating_add(leading_n_offset);
+        let edited_insertion_gap =
+            is_insertion && cdna_start <= cdna_end && refseq_has_edited_sequence_state(tx);
+        let cds_start = if edited_insertion_gap {
+            raw_cds_start
+        } else {
+            adjust_refseq_cds_sequence_index_for_hgvsp_reference(
+                tx,
+                Some(translation),
+                raw_cds_start.checked_sub(1)?,
+                leading_n_offset,
+            )
+            .and_then(|idx| idx.checked_add(1))
+            .unwrap_or(raw_cds_start)
+        };
+        let cds_end = if edited_insertion_gap {
+            raw_cds_end
+        } else {
+            adjust_refseq_cds_sequence_index_for_hgvsp_reference(
+                tx,
+                Some(translation),
+                raw_cds_end.checked_sub(1)?,
+                leading_n_offset,
+            )
+            .and_then(|idx| idx.checked_add(1))
+            .unwrap_or(raw_cds_end)
+        };
+        let translateable_pos_1based = |genomic_pos: i64| -> Option<usize> {
+            let raw_idx = genomic_to_cds_index_for_hgvsp(tx, tx_exons, genomic_pos)?
+                .checked_add(leading_n_offset)?;
+            adjust_refseq_cds_sequence_index_for_hgvsp_reference(
+                tx,
+                Some(translation),
+                raw_idx,
+                leading_n_offset,
+            )
+            .and_then(|idx| idx.checked_add(1))
+        };
+
+        let (protein_start, protein_end) = if is_insertion {
+            // TranscriptMapper::genomic2pep() converts the already-mapped CDS
+            // boundaries with int((bound + phase + 2) / 3). The CDS coordinates
+            // above already include leading-N padding and reference adjustment.
+            // Adding another base to the end incorrectly widens codon-boundary
+            // insertions and single-flank windows.
+            // https://github.com/Ensembl/ensembl/blob/release/116/modules/Bio/EnsEMBL/TranscriptMapper.pm#L516-L529
+            (
+                cds_start.saturating_add(2) / 3,
+                cds_end.saturating_add(2) / 3,
+            )
+        } else {
+            let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
+            let mut peptide_positions = Vec::with_capacity(genomic_positions.len());
+            for pos in genomic_positions {
+                let tr_pos = translateable_pos_1based(pos)?;
+                peptide_positions.push(tr_pos.saturating_add(2) / 3);
+            }
+            peptide_positions.sort_unstable();
+            (*peptide_positions.first()?, *peptide_positions.last()?)
+        };
+
+        Some(ShiftedTvaCoords {
+            cds_start,
+            cds_end,
+            protein_start,
+            protein_end,
+            edited_insertion_gap,
+        })
+    }
+
+    fn translation_with_phase(id: &str, coding_len: usize, phase: usize) -> TranslationFeature {
+        let body: String = "ATGC".chars().cycle().take(coding_len).collect();
+        let cds = format!("{}{}", "N".repeat(phase), body);
+        TranslationFeature {
+            transcript_id: id.to_string(),
+            cds_len: Some(cds.len()),
+            protein_len: Some(cds.len() / 3),
+            translation_seq: None,
+            cds_sequence: Some(cds.clone()),
+            translation_seq_canonical: None,
+            cds_sequence_canonical: Some(cds),
+            stable_id: None,
+            version: None,
+            protein_features: Vec::<ProteinDomainFeature>::new(),
+        }
+    }
+
+    /// Commit 2 of F0: the insertion branch of `shifted_tva_coords_from_mapper`
+    /// goes through `VepTxMapper` (HgvspExact). Every shifted insertion span
+    /// `(P, P-1)` and every deletion of length 1..=6 over the matrix, with a
+    /// leading-N phase of 0, 1 and 2, must give the same coordinates.
+    #[test]
+    fn f0_shifted_insertion_matches_legacy() {
+        let mut compared = 0usize;
+        let mut defined = 0usize;
+        for (tx, exons) in matrix() {
+            let refs: Vec<&ExonFeature> = exons.iter().collect();
+            let coding_len = match (tx.cdna_coding_start, tx.cdna_coding_end) {
+                (Some(s), Some(e)) => e - s + 1,
+                _ => 60,
+            };
+            for phase in 0..=2 {
+                let tl = translation_with_phase(&tx.transcript_id, coding_len, phase);
+                for p in tx.start - 3..=tx.end + 3 {
+                    let mut spans = vec![variant(p, p - 1, "-", "C")];
+                    for len in 1..=6i64 {
+                        spans.push(variant(p, p + len - 1, &"A".repeat(len as usize), "-"));
+                    }
+                    for v in spans {
+                        let legacy = legacy_shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
+                        let new = shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
+                        assert_eq!(
+                            new,
+                            legacy,
+                            "shifted coords differ: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{}",
+                            tx.transcript_id,
+                            tx.strand,
+                            tx.cdna_coding_start,
+                            tx.cdna_coding_end,
+                            tx.cdna_mapper_segments,
+                            tx.refseq_edits,
+                            v.start,
+                            v.end,
+                            v.ref_allele,
+                            v.alt_allele
+                        );
+                        compared += 1;
+                        defined += usize::from(legacy.is_some());
+                    }
+                }
+            }
+        }
         assert!(compared > 150_000, "compared {compared}");
         assert!(defined > 50_000, "defined {defined}");
     }
