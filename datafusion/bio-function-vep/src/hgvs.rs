@@ -297,17 +297,15 @@ pub(crate) fn format_hgvsc_with_reference_policy(
     use_transcript_ref: bool,
 ) -> Option<String> {
     // Traceability:
-    // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
-    //   returns undef when `_get_cDNA_position()` can't map a position
-    //   outside the transcript region. For deletions that extend beyond
-    //   the transcript boundaries, VEP's `_slice_start` / coordinate
-    //   mapping fails for the out-of-bounds end, producing empty HGVSc.
-    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1416
-    if ref_allele != "-" && alt_allele == "-" {
-        // Deletion: check if either end extends beyond transcript boundaries.
-        if !semantics.partial_overlap_hgvs() && (variant_start < tx.start || variant_end > tx.end) {
-            return None;
-        }
+    // - Release/115 `_var2transcript_slice_coords` returns undef for any
+    //   allele with an end outside the transcript, whatever its type
+    //   (ensembl-variation origin/release/115 TranscriptVariationAllele.pm:2655-2661).
+    //   Release/116 clamps instead; see `vep116_partial_overlap_clamp`.
+    if ref_allele != "-"
+        && !semantics.partial_overlap_hgvs()
+        && (variant_start < tx.start || variant_end > tx.end)
+    {
+        return None;
     }
     if let Some(profile) = profile.as_deref_mut() {
         profile.simple_fast_calls += 1;
@@ -387,11 +385,15 @@ fn format_hgvsc_fallback(
             && !shift.shifted_output_allele.is_empty()
             && shift.shifted_output_allele != "-"
     });
-    let partial_deletion = (ref_allele != "-"
-        && alt_allele == "-"
-        && (variant_start < tx.start || variant_end > tx.end))
+    // Any allele with a reference span (deletion, delins, MNV) that crosses a
+    // transcript end. Insertions (`ref == "-"`) keep their own path.
+    let partial_overlap = ref_allele != "-" && (variant_start < tx.start || variant_end > tx.end);
+    if partial_overlap && !semantics.partial_overlap_hgvs() {
+        return None;
+    }
+    let partial_clamp = partial_overlap
         .then(|| {
-            vep116_partial_overlap_deletion(
+            vep116_partial_overlap_clamp(
                 tx,
                 ref_allele,
                 variant_start,
@@ -400,16 +402,13 @@ fn format_hgvsc_fallback(
             )
         })
         .flatten();
-    if ref_allele != "-"
-        && alt_allele == "-"
-        && (variant_start < tx.start || variant_end > tx.end)
-        && (!semantics.partial_overlap_hgvs() || partial_deletion.is_none())
-    {
+    if partial_overlap && partial_clamp.is_none() {
         return None;
     }
+    let clamped = partial_clamp.is_some();
     let partial_ref;
     let (ref_allele, alt_allele, variant_start, variant_end) =
-        if let Some((clamped_ref, clamped_start, clamped_end)) = partial_deletion {
+        if let Some((clamped_ref, clamped_start, clamped_end)) = partial_clamp {
             partial_ref = clamped_ref;
             (partial_ref.as_str(), alt_allele, clamped_start, clamped_end)
         } else if let Some(shift) = use_genomic_shift {
@@ -450,6 +449,12 @@ fn format_hgvsc_fallback(
     if let Some(transcript_ref) = transcript_ref {
         feature_ref = transcript_ref;
     }
+    // `hgvs_variant_notation` returns undef when the REF cut from the clamped
+    // slice equals ALT (Utils/Sequence.pm:526-531 @ 2fb834b). The engine's
+    // own helper keeps a 1-base identical pair as `>` for the unclamped path.
+    if clamped && feature_ref.eq_ignore_ascii_case(&feature_alt) {
+        return None;
+    }
     let mut notation =
         hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
     if let Some(shift) = dup_context {
@@ -481,7 +486,15 @@ fn format_hgvsc_fallback(
     }
     let identical_substitution = notation.kind == ">" && notation.ref_allele == notation.alt_allele;
     if notation.kind != "dup" && !identical_substitution {
-        clip_alleles(&mut notation, tx.strand);
+        if clamped {
+            // `hgvs_transcript` sets `numbering` only after `_clip_alleles`
+            // (TranscriptVariationAllele.pm:1548-1553 @ 2fb834b), so the
+            // clip's dup re-typing (:2266-2272) is unreachable there and a
+            // clamp that clips to an empty REF is always `ins`.
+            clip_alleles_with_dup_retyping(&mut notation, tx.strand, false);
+        } else {
+            clip_alleles(&mut notation, tx.strand);
+        }
     }
     // Traceability:
     // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
@@ -493,7 +506,11 @@ fn format_hgvsc_fallback(
         notation.alt_allele = feature_alt.clone();
     }
     let coord_map_started = profile.is_some().then(Instant::now);
-    let (mut start, mut end) = if notation.kind == ">"
+    let (mut start, mut end) = if clamped {
+        // A clamped allele is never VEP's `SNP` class, so `hgvs_transcript`
+        // maps both clipped ends through `_get_cDNA_position` (:1519-1526).
+        notation_to_hgvsc_coords(tx, tx_exons, &notation)?
+    } else if notation.kind == ">"
         && numbering == 'c'
         && cds_position.is_some_and(|value| !value.is_empty() && !value.contains('_'))
     {
@@ -519,7 +536,18 @@ fn format_hgvsc_fallback(
     if let (Some(started), Some(profile)) = (coord_map_started, profile.as_deref_mut()) {
         profile.coord_map += started.elapsed();
     }
-    if matches!(
+    if clamped {
+        // vepyr#244 sub-case, ported on the clamped path only (vepyr#216).
+        // `notation_to_hgvsc_coords` returns the genomic order; VEP keeps the
+        // transcript-slice order (an `ins` clipped from a clamp has start =
+        // end + 1) and sorts it with a guard against an end carrying `*`.
+        if (tx.strand >= 0) == (notation.kind == "ins") {
+            std::mem::swap(&mut start, &mut end);
+        }
+        if vep_hgvs_positions_need_swap(&start, &end) {
+            std::mem::swap(&mut start, &mut end);
+        }
+    } else if matches!(
         compare_hgvs_positions(&start, &end),
         Some(Ordering::Greater)
     ) {
@@ -533,14 +561,25 @@ fn format_hgvsc_fallback(
     hgvsc
 }
 
-/// Reproduce the release/116 `_var2transcript_slice_coords` behavior for a
-/// deletion that overlaps only part of a transcript.
+/// Reproduce the release/116 `_var2transcript_slice_coords` behavior for an
+/// allele with a reference span (deletion, delins or MNV) that overlaps only
+/// part of a transcript.
 ///
-/// VEP clamps the unshifted interval in transcript-slice coordinates and only
-/// then adds the non-negative HGVS 3' offset. In particular, substituting a
-/// precomputed shifted genomic interval before clamping is not equivalent at a
-/// transcript boundary.
-fn vep116_partial_overlap_deletion(
+/// ```perl
+/// # ensembl-variation 2fb834b TranscriptVariationAllele.pm:2725-2727
+/// my $clamped_start = ($vf_start < 1 ? 1 : $vf_start > $tr_length ? $tr_length : $vf_start);
+/// my $clamped_end   = ($vf_end   < 1 ? 1 : $vf_end   > $tr_length ? $tr_length : $vf_end);
+/// ```
+///
+/// There is no allele-type test in that function. VEP clamps the unshifted
+/// interval in transcript-slice coordinates and only then adds the
+/// non-negative HGVS 3' offset. In particular, substituting a precomputed
+/// shifted genomic interval before clamping is not equivalent at a transcript
+/// boundary. Only insertions and deletions are ever shifted (:122-123), so
+/// `genomic_shift` is `None` for a delins or MNV here and the offset is 0.
+/// `hgvs_transcript` then cuts REF from the clamped slice and keeps ALT whole
+/// (:1474-1482), which the caller does with the returned REF.
+fn vep116_partial_overlap_clamp(
     tx: &TranscriptFeature,
     ref_allele: &str,
     variant_start: i64,
@@ -599,8 +638,8 @@ fn vep116_partial_overlap_deletion(
     };
 
     // VEP extracts the reference from the clamped transcript slice. Cache
-    // annotation already carries that sequence as the deletion allele, so
-    // retain only the genomic-overlap portion when its span is exact.
+    // annotation already carries that sequence as the REF allele, so retain
+    // only the genomic-overlap portion when its span is exact.
     let overlap_start = variant_start.max(tx.start);
     let overlap_end = variant_end.min(tx.end);
     let variant_span = variant_end.checked_sub(variant_start)?.checked_add(1)?;
@@ -1305,6 +1344,15 @@ fn reverse_complement(seq: &str) -> Option<String> {
 /// - Ensembl Variation `TranscriptVariationAllele::_clip_alleles()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2232>
 fn clip_alleles(notation: &mut HgvsNotation, strand: i8) {
+    clip_alleles_with_dup_retyping(notation, strand, true);
+}
+
+/// `_clip_alleles` re-types a clip to an empty REF as `dup` only when
+/// `$hgvs_notation->{'numbering'}` is already set and is not `p`
+/// (TranscriptVariationAllele.pm:2264-2272 @ 2fb834b). `hgvs_transcript`
+/// sets it only after the clip, so the transcript path passes `false` where
+/// it ports VEP literally (the release/116 partial-overlap clamp).
+fn clip_alleles_with_dup_retyping(notation: &mut HgvsNotation, strand: i8, retype_dup: bool) {
     let mut ref_allele = notation.ref_allele.clone();
     let mut alt_allele = notation.alt_allele.clone();
     let mut start = notation.start;
@@ -1349,7 +1397,7 @@ fn clip_alleles(notation: &mut HgvsNotation, strand: i8) {
     {
         notation.kind = ">".to_string();
     } else if notation.ref_allele.is_empty() && !notation.alt_allele.is_empty() {
-        if preseq.ends_with(&notation.alt_allele) {
+        if retype_dup && preseq.ends_with(&notation.alt_allele) {
             notation.kind = "dup".to_string();
             notation.start -= notation.alt_allele.len() as i64;
         } else {
@@ -1906,6 +1954,68 @@ fn split_hgvs_coord(value: &str) -> Option<(i64, Option<String>)> {
         (body, None)
     };
     Some((coord_part.parse::<i64>().ok()?, offset_part))
+}
+
+/// VEP's position sort in `hgvs_transcript`, literally:
+///
+/// ```perl
+/// # ensembl-variation 2fb834b TranscriptVariationAllele.pm:1525-1538
+/// my ($exon_start_coord, $intron_start_offset) = $hgvs_notation->{start} =~ m/(\-?[0-9]+)\+?(\-?[0-9]+)?/;
+/// my ($exon_end_coord,   $intron_end_offset)   = $same_pos ? (...) : $hgvs_notation->{end} =~ m/(\-?[0-9]+)\+?(\-?[0-9]+)?/;
+/// $intron_start_offset ||= 0;
+/// $intron_end_offset   ||= 0;
+/// ($hgvs_notation->{start},$hgvs_notation->{end}) = ($hgvs_notation->{end},$hgvs_notation->{start}) if (
+///   (($exon_start_coord  > $exon_end_coord) || ($exon_start_coord  == $exon_end_coord && $intron_start_offset > $intron_end_offset) ) &&
+///   $hgvs_notation->{end} !~/\*/
+/// );
+/// ```
+///
+/// The regex skips a leading `*`, so `*159` reads as 159, and an end carrying
+/// `*` is never swapped: a clipped `ins` in the 3' UTR prints `*159_*158`.
+fn vep_hgvs_positions_need_swap(start: &str, end: &str) -> bool {
+    if end.contains('*') {
+        return false;
+    }
+    match (vep_hgvs_position_parts(start), vep_hgvs_position_parts(end)) {
+        (Some((start_coord, start_offset)), Some((end_coord, end_offset))) => {
+            start_coord > end_coord || (start_coord == end_coord && start_offset > end_offset)
+        }
+        _ => false,
+    }
+}
+
+/// `m/(\-?[0-9]+)\+?(\-?[0-9]+)?/` on an HGVS position: the leftmost signed
+/// integer, then an optional `+` and an optional signed integer right after.
+fn vep_hgvs_position_parts(position: &str) -> Option<(i64, i64)> {
+    fn signed_int_at(bytes: &[u8], at: usize) -> Option<(i64, usize)> {
+        let digits_from = if bytes.get(at) == Some(&b'-') {
+            at + 1
+        } else {
+            at
+        };
+        let digits_to = digits_from
+            + bytes[digits_from.min(bytes.len())..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+        if digits_to == digits_from {
+            return None;
+        }
+        let value = std::str::from_utf8(&bytes[at..digits_to])
+            .ok()?
+            .parse()
+            .ok()?;
+        Some((value, digits_to))
+    }
+    let bytes = position.as_bytes();
+    let (coord, after) = (0..bytes.len()).find_map(|at| signed_int_at(bytes, at))?;
+    let offset_from = if bytes.get(after) == Some(&b'+') {
+        after + 1
+    } else {
+        after
+    };
+    let offset = signed_int_at(bytes, offset_from).map_or(0, |(value, _)| value);
+    Some((coord, offset))
 }
 
 fn compare_hgvs_positions(left: &str, right: &str) -> Option<Ordering> {
@@ -3232,6 +3342,139 @@ mod tests {
             ),
             None
         );
+    }
+
+    // vepyr#216. Release/116 `_var2transcript_slice_coords` clamps every
+    // allele that overlaps part of the transcript, not only deletions
+    // (ensembl-variation 2fb834b TranscriptVariationAllele.pm:2719-2729).
+    // `hgvs_transcript` then cuts REF from the clamped slice, keeps ALT whole
+    // (:1474-1482) and clips the pair (:1492). The toy transcript spans
+    // 90-140 with one exon, so `n.1` is 90 on + and 140 on -.
+    fn partial_overlap_hgvsc(
+        tx: &TranscriptFeature,
+        ref_allele: &str,
+        alt_allele: &str,
+        start: i64,
+        end: i64,
+        semantics: VepSemantics,
+    ) -> Option<String> {
+        let exon = make_exon();
+        format_hgvsc_with_semantics(
+            tx,
+            &[&exon],
+            None,
+            None,
+            ref_allele,
+            alt_allele,
+            start,
+            end,
+            None,
+            semantics,
+        )
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_delins_minus_strand() {
+        // Five of six REF bases lie past the 3' end of a - strand transcript.
+        // The clamped REF is genomic 90 (C, feature G); ALT is kept whole and
+        // reverse-complemented (TACAGG -> CCTGTA).
+        let reverse = make_transcript("lncRNA", -1, None, None);
+        assert_eq!(
+            partial_overlap_hgvsc(&reverse, "ACGTAC", "TACAGG", 85, 90, VepSemantics::V116)
+                .as_deref(),
+            Some("ENSTHGVS000001.1:n.51delinsCCTGTA")
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_mnv_plus_strand() {
+        let forward = make_transcript("lncRNA", 1, None, None);
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "AC", "GT", 89, 90, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:n.1delinsGT")
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_clips_to_substitution() {
+        // Clamped REF AC (139-140) against ALT TC clips the shared C.
+        let forward = make_transcript("lncRNA", 1, None, None);
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "ACT", "TC", 139, 141, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:n.50A>T")
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_clips_to_deletion_and_insertion() {
+        let forward = make_transcript("lncRNA", 1, None, None);
+        // Clamped AC against C: the shared C is clipped, A is deleted.
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "ACT", "C", 139, 141, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:n.50del")
+        );
+        // Clamped ACG (90-92) against ATCG: A and CG are clipped, T inserted.
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "TACG", "ATCG", 89, 92, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:n.1_2insT")
+        );
+        // Clamped AAG against AAAG clips to an inserted A that repeats the
+        // clipped prefix. `hgvs_transcript` sets `numbering` only after the
+        // clip (TVA.pm:1548-1553), so `_clip_alleles`' dup re-typing (:2269)
+        // cannot fire there: VEP prints `ins`, never `dup`.
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "TAAG", "AAAG", 89, 92, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:n.2_3insA")
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_identical_clamped_pair_is_none() {
+        // `hgvs_variant_notation` returns undef when the REF cut from the
+        // slice equals ALT (Utils/Sequence.pm:526-531).
+        let forward = make_transcript("lncRNA", 1, None, None);
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "ACT", "AC", 139, 141, VepSemantics::V116),
+            None
+        );
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "GA", "A", 89, 90, VepSemantics::V116),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_v115_rejects_delins() {
+        // Release/115 returns undef for any partial overlap
+        // (origin/release/115 TranscriptVariationAllele.pm:2655-2661).
+        let forward = make_transcript("lncRNA", 1, None, None);
+        let reverse = make_transcript("lncRNA", -1, None, None);
+        assert_eq!(
+            partial_overlap_hgvsc(&reverse, "ACGTAC", "TACAGG", 85, 90, VepSemantics::V115),
+            None
+        );
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "AC", "GT", 89, 90, VepSemantics::V115),
+            None
+        );
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "TACG", "ATCG", 89, 92, VepSemantics::V115),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_insertion_keeps_unswapped_star_end() {
+        // vepyr#244 sub-case, clamped path only. VEP sorts the clipped
+        // positions unless the end carries `*` (TVA.pm:1535-1538); a clipped
+        // `ins` has start = end + 1, so in the 3' UTR it prints `*32_*31`.
+        let coding = make_transcript("protein_coding", 1, Some(100), Some(108));
+        assert_eq!(
+            partial_overlap_hgvsc(&coding, "GCT", "GAC", 139, 141, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:c.*32_*31insA")
+        );
+        // The same clipped insertion inside the transcript numbering without
+        // `*` is sorted as usual (`n.1_2insT` above).
     }
 
     #[test]

@@ -1593,7 +1593,19 @@ impl TranscriptConsequenceEngine {
                         // one record each -- e.g. chr4:20837686 ATT>TTT on NM_147183.3,
                         // where VEP emits `c.225+12857AAT>AAA` and minimising gave
                         // `c.225+12857T>A`.
-                        let hgvs_minimised = if tx.refseq_edits.is_empty() {
+                        //
+                        // Nor for an MNV crossing a transcript end under release/116.
+                        // VEP does not minimise a same-length pair (ensembl-vep
+                        // release/116.0 Parser.pm:871-881), so it clamps the untrimmed
+                        // span to the transcript and clips afterwards (vepyr#216,
+                        // TranscriptVariationAllele.pm:2719-2729, :1492). Trimming a
+                        // shared base that lies outside the transcript first changes
+                        // which bases REF loses and what ALT keeps.
+                        let crosses_transcript_end =
+                            variant.start < tx.start || variant.end > tx.end;
+                        let hgvs_minimised = if tx.refseq_edits.is_empty()
+                            && !(self.semantics.partial_overlap_hgvs() && crosses_transcript_end)
+                        {
                             minimised_substitution(variant, hgvsc_ref_allele)
                         } else {
                             None
@@ -17179,6 +17191,55 @@ mod tests {
 
         // Nothing shared between the HGVS reference and the alt: no reduction.
         assert!(minimised_substitution(&v, "TCC").is_none());
+    }
+
+    /// vepyr#216. VEP never minimises a same-length pair (ensembl-vep
+    /// release/116.0 Parser.pm:871-881), so release/116 clamps the untrimmed
+    /// MNV to the transcript and only then clips it. Trimming first is
+    /// equivalent inside the transcript, not across one of its ends.
+    #[test]
+    fn partial_overlap_mnv_keeps_untrimmed_alleles_for_hgvs() {
+        let t = tx("T1", "22", 1000, 1011, 1, "lncRNA", None, None);
+        let e = exon("T1", 1, 1000, 1011);
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let hgvsc_of = |v: &VariantInput| -> Option<String> {
+            engine
+                .evaluate_variant_with_context(
+                    v,
+                    std::slice::from_ref(&t),
+                    std::slice::from_ref(&e),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .iter()
+                .find_map(|x| x.hgvsc.clone())
+        };
+
+        // ACG>TCG at 1010-1012 shares CG, but 1012 lies past the transcript
+        // end. VEP clamps REF to AC (1010-1011), keeps ALT TCG whole, and
+        // nothing clips: n.11_12delinsTCG, not the trimmed n.11A>T.
+        let crossing = hgvsc_of(&var("22", 1010, 1012, "ACG", "TCG"));
+        assert!(
+            crossing
+                .as_deref()
+                .is_some_and(|h| h.ends_with(":n.11_12delinsTCG")),
+            "got {crossing:?}"
+        );
+
+        // Inside the transcript the trimmed and clamped orders agree.
+        let inside = hgvsc_of(&var("22", 1005, 1007, "ACG", "TCG"));
+        assert!(
+            inside.as_deref().is_some_and(|h| h.ends_with(":n.6A>T")),
+            "got {inside:?}"
+        );
     }
 
     /// The invariant the minimised-HGVS path has to hold: an MNV that reduces
