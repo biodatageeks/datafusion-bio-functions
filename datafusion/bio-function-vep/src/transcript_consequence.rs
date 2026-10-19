@@ -4176,6 +4176,11 @@ fn transcript_is_ablated(variant: &VariantInput, tx: &TranscriptFeature) -> bool
 /// So under complete overlap `coding_sequence_variant` never fires and
 /// `coding_transcript_variant` always does on a coding transcript. The
 /// translation proxy is the one the coding branch uses: both CDS bounds set.
+///
+/// Callers must have excluded `transcript_is_ablated` first: the deletion
+/// test lives there, and here only an insertion (which can never cover a
+/// transcript) is excluded. Every other coding predicate is evaluated
+/// independently by VEP, so only `coding_sequence_variant` gives way.
 fn transcript_is_completely_covered_coding(variant: &VariantInput, tx: &TranscriptFeature) -> bool {
     variant.ref_allele != "-"
         && variant.start <= tx.start
