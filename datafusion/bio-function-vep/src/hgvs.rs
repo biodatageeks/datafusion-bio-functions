@@ -1981,24 +1981,12 @@ pub fn format_hgvsp(
     shift_hgvs: bool,
 ) -> Option<String> {
     let protein_id = versioned_id(translation.stable_id.as_deref()?, translation.version);
-    if protein.start_lost {
-        let start_ref = if protein.ref_peptide.is_empty() {
-            protein
-                .ref_translation
-                .chars()
-                .next()
-                .map(|aa| aa.to_string())?
-        } else {
-            protein.ref_peptide.clone()
-        };
-        return Some(format!(
-            "{protein_id}:p.{}{}?",
-            peptide_first_three(&start_ref)?,
-            protein.start
-        ));
-    }
 
     let mut notation = ProteinHgvsNotation::from_context(protein);
+    // VEP's `translation_end`. `_get_fs_peptides` moves `start` to the first
+    // differing residue but leaves `end` alone; `resolve_frameshift_hgvs`
+    // overwrites it, so the start_lost range below reads it from here.
+    let translation_end = notation.end;
     if protein.frameshift {
         resolve_frameshift_hgvs(&mut notation, protein)?;
     } else {
@@ -2048,6 +2036,36 @@ pub fn format_hgvsp(
     if !protein.frameshift {
         notation.ref_allele = notation.ref_allele.replace('*', "X");
         notation.alt_allele = notation.alt_allele.replace('*', "X");
+    }
+
+    // vepyr#221. VEP's start_lost override sits at the end of
+    // `_get_hgvs_peptides` (ensembl-variation 116
+    // `TranscriptVariationAllele.pm:2154-2159`), after the fs/ins/del
+    // peptide work above and after a `dup` has already returned (`:2125`):
+    //
+    //     if( start_lost($self) ){
+    //       $hgvs_notation->{alt}  = "?";
+    //       $hgvs_notation->{type} = "";
+    //     }
+    //
+    // `_get_hgvs_protein_format` has no start_lost arm. With type "" the
+    // first arm to match is `start ne end` (`:2024-2026`),
+    // `{ref}{start}_{alt}{end}`, else the default `{ref}{start}{alt}`.
+    // `ne` is a string test and nothing orders the pair, so a frameshift
+    // whose first differing residue lies past `translation_end` prints e.g.
+    // `p.His3_?2`. Deliberate replica: that is not valid HGVS.
+    if protein.start_lost && notation.kind != "dup" {
+        let end = if protein.frameshift {
+            translation_end
+        } else {
+            notation.end
+        };
+        let reference = peptide_to_three_letter(&notation.ref_allele.replace('*', "X"));
+        return Some(if notation.start != end {
+            format!("{protein_id}:p.{reference}{}_?{end}", notation.start)
+        } else {
+            format!("{protein_id}:p.{reference}{}?", notation.start)
+        });
     }
 
     format_hgvsp_notation(&protein_id, &notation, protein)
@@ -2873,6 +2891,103 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Met1?".to_string())
+        );
+    }
+
+    fn start_lost_protein(
+        start: usize,
+        end: usize,
+        ref_peptide: &str,
+        alt_peptide: &str,
+        ref_translation: &str,
+        alt_translation: &str,
+        frameshift: bool,
+    ) -> ProteinHgvsData {
+        ProteinHgvsData {
+            start,
+            end,
+            ref_peptide: ref_peptide.to_string(),
+            alt_peptide: alt_peptide.to_string(),
+            ref_translation: ref_translation.to_string(),
+            alt_translation: alt_translation.to_string(),
+            alt_translation_extension: None,
+            frameshift,
+            start_lost: true,
+            stop_lost: false,
+            native_refseq: false,
+        }
+    }
+
+    /// vepyr#221: VEP's start_lost override (`_get_hgvs_peptides`,
+    /// `TranscriptVariationAllele.pm:2154-2159`) runs after clipping and the
+    /// 3' shift and only sets `alt = "?"`, `type = ""`. The first matching
+    /// format arm is `start ne end` (`:2024-2026`):
+    /// `{ref}{start}_{alt}{end}`, with the whole clipped reference peptide.
+    #[test]
+    fn test_format_hgvsp_start_lost_inframe_deletion_prints_range() {
+        let translation = make_translation();
+        let protein = start_lost_protein(1, 3, "MAG", "-", "MAGKLVWR", "KLVWR", false);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.MetAlaGly1_?3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_start_lost_mnv_prints_range() {
+        let translation = make_translation();
+        let protein = start_lost_protein(1, 2, "MP", "IS", "MPKLVWR", "ISKLVWR", false);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.MetPro1_?2".to_string())
+        );
+    }
+
+    /// vepyr#221: `_get_fs_peptides` (`:2336-2357`) moves `start` to the
+    /// first differing residue and sets `ref` to that one residue, but never
+    /// touches `end`, which stays `translation_end`.
+    #[test]
+    fn test_format_hgvsp_start_lost_frameshift_keeps_translation_end() {
+        let translation = make_translation();
+        let protein = start_lost_protein(1, 4, "MKLV", "IR", "MKLVWRP", "IRW*", true);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Met1_?4".to_string())
+        );
+    }
+
+    /// vepyr#221: when the first differing residue lies past `end`, VEP's
+    /// `ne` string test still prints a range and nothing reorders it:
+    /// `p.His3_?2` (ENST00000399959). Deliberate replica: not valid HGVS.
+    #[test]
+    fn test_format_hgvsp_start_lost_frameshift_past_end_keeps_unordered_range() {
+        let translation = make_translation();
+        let protein = start_lost_protein(2, 2, "A", "A", "MAHKLVW", "MAQRS*", true);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.His3_?2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_start_lost_single_residue_prints_unknown() {
+        let translation = make_translation();
+        let protein = start_lost_protein(1, 1, "M", "T", "MKLV", "TKLV", false);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Met1?".to_string())
+        );
+    }
+
+    /// vepyr#221: a `dup` returns from `_get_hgvs_peptides` (`:2125`) before
+    /// the start_lost override, so it keeps its dup notation.
+    #[test]
+    fn test_format_hgvsp_start_lost_insertion_resolving_to_dup_stays_dup() {
+        let translation = make_translation();
+        let protein = start_lost_protein(2, 1, "-", "M", "MKLV", "MMKLV", false);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Met1dup".to_string())
         );
     }
 
