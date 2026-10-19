@@ -2171,6 +2171,14 @@ fn resolve_frameshift_hgvs(
 
     if start > alt_translation.len() {
         notation.kind = "del".to_string();
+        if protein.start_lost {
+            // Ensembl Variation 116 `_get_fs_peptides()` sets only
+            // `alt = "del"` and `type = "del"` in this branch, then returns.
+            // Preserve its original multi-residue `ref` and `end`; the later
+            // start_lost override changes alt/type but leaves ref/start/end.
+            notation.alt_allele = "del".to_string();
+            return Some(());
+        }
         notation.end = start;
         notation.ref_allele = peptide_char(&ref_translation, start)?.to_string();
         notation.alt_allele.clear();
@@ -2953,6 +2961,20 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Met1_?4".to_string())
+        );
+    }
+
+    /// vepyr#221: when the shifted start is past the alternate translation,
+    /// VEP's `_get_fs_peptides` sets `alt = "del"` and returns without
+    /// replacing the original multi-residue reference peptide. The later
+    /// start_lost override then formats that full reference range.
+    #[test]
+    fn test_format_hgvsp_start_lost_terminal_frameshift_preserves_full_reference() {
+        let translation = make_translation();
+        let protein = start_lost_protein(1, 3, "MAG", "-", "MAGKLVWR", "", true);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.MetAlaGly1_?3".to_string())
         );
     }
 
