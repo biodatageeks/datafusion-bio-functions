@@ -4824,13 +4824,23 @@ fn build_protein_hgvs_data(
     let raw_end = class
         .protein_position_end
         .or(class.protein_position_start)?;
-    let (ref_peptide, alt_peptide) = match peptide_alleles {
-        Some(value) => match value.split_once('/') {
-            Some((left, right)) => (left.to_string(), right.to_string()),
-            None => (value.to_string(), value.to_string()),
-        },
-        None => (String::new(), String::new()),
+    let affected_start_lost_peptides = if class.start_lost && !frameshift {
+        class
+            .affected_ref_peptide
+            .as_deref()
+            .zip(class.affected_alt_peptide.as_deref())
+            .map(|(reference, alternate)| (reference.to_string(), alternate.to_string()))
+    } else {
+        None
     };
+    let (ref_peptide, alt_peptide) =
+        affected_start_lost_peptides.unwrap_or_else(|| match peptide_alleles {
+            Some(value) => match value.split_once('/') {
+                Some((left, right)) => (left.to_string(), right.to_string()),
+                None => (value.to_string(), value.to_string()),
+            },
+            None => (String::new(), String::new()),
+        });
     // Traceability:
     // - VEP's hgvs_protein() uses translation_start() which returns the
     //   FIRST coordinate from genomic2pep. For insertions, genomic2pep
@@ -18530,6 +18540,48 @@ mod tests {
                 terms
             );
         }
+    }
+
+    /// A start-lost deletion keeps the full reference peptide window. The
+    /// consequence Codons are `ATGGAG/-` (ME/-); using the narrower
+    /// classification amino-acid string `ME/E` would clip the shared Glu and
+    /// incorrectly produce `p.Met1?` instead of VEP's `p.MetGlu1_?2`.
+    #[test]
+    fn start_lost_hgvsp_uses_full_affected_peptide_window() {
+        let mut tr = translation(
+            "ENSTSTARTDEL",
+            Some(9),
+            Some(3),
+            Some("MEK"),
+            Some("ATGGAGAAA"),
+        );
+        tr.stable_id = Some("ENSPSTARTDEL".to_string());
+        tr.version = Some(1);
+        let class = CodingClassification {
+            protein_position_start: Some(1),
+            protein_position_end: Some(2),
+            amino_acids: Some("ME/E".to_string()),
+            start_lost: true,
+            affected_ref_peptide: Some("ME".to_string()),
+            affected_alt_peptide: Some("-".to_string()),
+            ..CodingClassification::default()
+        };
+        let data = build_protein_hgvs_data(
+            &class,
+            Some("ME/E"),
+            &['M', 'E', 'K'],
+            &['E', 'K'],
+            false,
+            Some(&tr),
+        )
+        .expect("start_lost HGVSp payload");
+
+        assert_eq!(data.ref_peptide, "ME");
+        assert_eq!(data.alt_peptide, "-");
+        assert_eq!(
+            crate::hgvs::format_hgvsp(&tr, &data, false).as_deref(),
+            Some("ENSPSTARTDEL.1:p.MetGlu1_?2")
+        );
     }
 
     /// vepyr#222: a deletion that starts in the 5'UTR and ends on the start
