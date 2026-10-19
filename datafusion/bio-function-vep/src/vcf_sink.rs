@@ -14,7 +14,8 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_bio_format_core::metadata::{
-    VCF_FORMAT_KEYS_COLUMN, VCF_HEADER_RAW_LINES_KEY, VCF_INFO_KEYS_COLUMN,
+    VCF_HEADER_RAW_LINES_KEY, VCF_INFO_KEYS_COLUMN, VCF_RECORD_LAYOUT_INFO_RAW,
+    VCF_RECORD_LAYOUT_KEY,
 };
 use datafusion_bio_format_vcf::header_builder::header_file_format;
 use datafusion_bio_format_vcf::serializer::{VcfRecordLine, batch_to_vcf_lines_for_file_format};
@@ -232,7 +233,8 @@ fn writer_field_names(fields: &datafusion::arrow::datatypes::Fields) -> Vec<Stri
 /// removes the existing key and appends its own last
 /// (`OutputFactory/VCF.pm`, "nuke existing CSQ field"). The key is therefore
 /// taken out of the carried order, which would otherwise pin the new `CSQ` to
-/// where the old one stood.
+/// where the old one stood, and out of the carried source text, which describes
+/// the old value.
 fn restore_input_columns(batch: RecordBatch) -> Result<RecordBatch> {
     use datafusion::arrow::array::{Array, ArrayRef, StringArray};
     use datafusion::arrow::datatypes::{Field, Schema};
@@ -249,7 +251,23 @@ fn restore_input_columns(batch: RecordBatch) -> Result<RecordBatch> {
             .downcast_ref::<StringArray>()
             .is_some_and(|keys| keys.iter().flatten().any(has_csq_key))
     });
-    if !renamed && carried_csq.is_none() {
+    let raw_csq = schema
+        .fields()
+        .iter()
+        .position(|field| {
+            field
+                .metadata()
+                .get(VCF_RECORD_LAYOUT_KEY)
+                .is_some_and(|role| role == VCF_RECORD_LAYOUT_INFO_RAW)
+        })
+        .filter(|&idx| {
+            batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .is_some_and(|raw| raw.iter().flatten().any(has_csq_entry))
+        });
+    if !renamed && carried_csq.is_none() && raw_csq.is_none() {
         return Ok(batch);
     }
 
@@ -289,6 +307,26 @@ fn restore_input_columns(batch: RecordBatch) -> Result<RecordBatch> {
             .collect();
         columns[idx] = Arc::new(stripped);
     }
+    if let Some(idx) = raw_csq {
+        let raw = columns[idx]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("checked above");
+        let stripped: StringArray = raw
+            .iter()
+            .map(|raw| {
+                raw.and_then(|raw| {
+                    let kept = raw
+                        .split(';')
+                        .filter(|entry| !entry.starts_with("CSQ="))
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    (!kept.is_empty()).then_some(kept)
+                })
+            })
+            .collect();
+        columns[idx] = Arc::new(stripped);
+    }
     Ok(RecordBatch::try_new(
         Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
         columns,
@@ -301,6 +339,12 @@ fn restore_input_columns(batch: RecordBatch) -> Result<RecordBatch> {
 /// substring test settles those without splitting the list.
 fn has_csq_key(keys: &str) -> bool {
     keys.contains("CSQ") && keys.split(';').any(|key| key == "CSQ")
+}
+
+/// Whether a record's carried INFO source text, `key=value` joined with `;`,
+/// holds an entry for `CSQ`. Almost every record carries no text at all.
+fn has_csq_entry(raw: &str) -> bool {
+    raw.contains("CSQ=") && raw.split(';').any(|entry| entry.starts_with("CSQ="))
 }
 
 fn format_vcf_body_chunk(
@@ -603,6 +647,12 @@ pub struct AnnotateVcfConfig {
     /// line and only appending to INFO, so byte-level agreement with it needs
     /// this on. Costs two dictionary-encoded string columns through the
     /// pipeline.
+    ///
+    /// It also carries the source text of the values the writer could not
+    /// reproduce from their parsed value (`with_raw_values`: an escape the
+    /// reader decoded, a literal `%`, `=`, `,` or space), so those come back
+    /// byte for byte too (biodatageeks/vepyr#252). That costs two more string
+    /// columns that are null for almost every record.
     pub preserve_record_layout: bool,
     /// Keep records that carry no alternate allele (`ALT=.`) instead of
     /// dropping them, as Ensembl VEP's `--allow_non_variant` does. A kept
@@ -1561,20 +1611,27 @@ fn annotation_output_columns(
     core_vcf: &[&str],
     info_fields: &[String],
     format_fields: &[String],
-    preserve_record_layout: bool,
+    layout: &[String],
 ) -> Vec<String> {
-    let layout: &[&str] = if preserve_record_layout {
-        &[VCF_INFO_KEYS_COLUMN, VCF_FORMAT_KEYS_COLUMN]
-    } else {
-        &[]
-    };
     core_vcf
         .iter()
         .map(|name| (*name).to_string())
         .chain(info_fields.iter().cloned())
         .chain(std::iter::once("CSQ".to_string()))
         .chain(format_fields.iter().cloned())
-        .chain(layout.iter().map(|name| (*name).to_string()))
+        .chain(layout.iter().cloned())
+        .collect()
+}
+
+/// The carried record-layout columns of the reader's schema, in schema order:
+/// every field the reader marked, so a column the reader adds needs no change
+/// here. Empty for a read that carries no layout.
+fn record_layout_columns(schema: &datafusion::arrow::datatypes::Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .filter(|field| field.metadata().contains_key(VCF_RECORD_LAYOUT_KEY))
+        .map(|field| field.name().clone())
         .collect()
 }
 
@@ -1787,7 +1844,7 @@ pub async fn annotate_to_vcf(
     let open_provider = move |path: String| -> Result<VcfTableProvider> {
         let provider = VcfTableProvider::new(path, None, None, None, false)?;
         if carry_layout {
-            provider.with_record_layout()
+            provider.with_record_layout()?.with_raw_values()
         } else {
             Ok(provider)
         }
@@ -1945,7 +2002,7 @@ pub async fn annotate_to_vcf(
         &core_vcf,
         &info_fields.iter().map(engine_name).collect::<Vec<_>>(),
         &format_fields.iter().map(engine_name).collect::<Vec<_>>(),
-        config.preserve_record_layout,
+        &record_layout_columns(&vcf_schema),
     );
     let select_list = annotation_select_list(&projection_names);
     let sql = format!("SELECT {select_list} FROM {annotate_call}");
@@ -3790,7 +3847,7 @@ mod tests {
             &["chrom", "start"],
             &["DP".to_string()],
             &["SAMPLE1_GT".to_string()],
-            false,
+            &[],
         );
         assert_eq!(names, ["chrom", "start", "DP", "CSQ", "SAMPLE1_GT"]);
         assert_eq!(
@@ -3799,22 +3856,103 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preserving_the_record_layout_carries_its_two_columns() {
-        let names = annotation_output_columns(&["chrom"], &[], &[], true);
+    /// The reader's schema for a one-record VCF, carrying the layout or not.
+    fn reader_schema(tag: &str, carry_layout: bool) -> datafusion::arrow::datatypes::SchemaRef {
+        let path = unique_dir(tag).join("input.vcf");
+        std::fs::write(
+            &path,
+            "##fileformat=VCFv4.2\n##contig=<ID=chr1>\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr1\t1\t.\tA\tG\t.\t.\t.\n",
+        )
+        .unwrap();
+        let provider =
+            VcfTableProvider::new(path.to_string_lossy().into_owned(), None, None, None, false)
+                .unwrap();
+        let provider = if carry_layout {
+            provider
+                .with_record_layout()
+                .unwrap()
+                .with_raw_values()
+                .unwrap()
+        } else {
+            provider
+        };
+        provider.schema()
+    }
+
+    /// The layout columns come from the reader's markers, so the key lists and
+    /// the source text of values (biodatageeks/vepyr#252) all reach the writer,
+    /// and a column the reader adds later needs no change here.
+    #[tokio::test]
+    async fn preserving_the_record_layout_carries_every_column_the_reader_marked() {
+        use datafusion_bio_format_core::metadata::{
+            VCF_FORMAT_KEYS_COLUMN, VCF_FORMAT_RAW_COLUMN, VCF_INFO_RAW_COLUMN,
+        };
+
+        let layout = record_layout_columns(&reader_schema("layout_on", true));
         assert_eq!(
-            names,
-            ["chrom", "CSQ", VCF_INFO_KEYS_COLUMN, VCF_FORMAT_KEYS_COLUMN]
+            layout,
+            [
+                VCF_INFO_KEYS_COLUMN,
+                VCF_FORMAT_KEYS_COLUMN,
+                VCF_INFO_RAW_COLUMN,
+                VCF_FORMAT_RAW_COLUMN
+            ]
         );
+        let names = annotation_output_columns(&["chrom"], &[], &[], &layout);
+        assert_eq!(names[..2], ["chrom", "CSQ"]);
         // Last, matching the reader's schema, and quoted like any other column.
         assert!(annotation_select_list(&names).ends_with(&format!(
-            "`{VCF_INFO_KEYS_COLUMN}`, `{VCF_FORMAT_KEYS_COLUMN}`"
+            "`{VCF_INFO_KEYS_COLUMN}`, `{VCF_FORMAT_KEYS_COLUMN}`, \
+             `{VCF_INFO_RAW_COLUMN}`, `{VCF_FORMAT_RAW_COLUMN}`"
         )));
     }
 
-    #[test]
-    fn not_preserving_the_record_layout_carries_neither_column() {
-        let names = annotation_output_columns(&["chrom"], &[], &[], false);
+    #[tokio::test]
+    async fn not_preserving_the_record_layout_carries_no_layout_column() {
+        let layout = record_layout_columns(&reader_schema("layout_off", false));
+        assert!(layout.is_empty());
+        let names = annotation_output_columns(&["chrom"], &[], &[], &layout);
         assert_eq!(names, ["chrom", "CSQ"]);
+    }
+
+    /// The source text of a replaced input CSQ describes the old value, so it
+    /// leaves the carried text with the key; other entries stay.
+    #[test]
+    fn an_input_csq_entry_leaves_the_carried_source_text() {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use std::collections::HashMap;
+
+        let raw =
+            Field::new("_vcf_info_raw", DataType::Utf8, true).with_metadata(HashMap::from([(
+                VCF_RECORD_LAYOUT_KEY.to_string(),
+                VCF_RECORD_LAYOUT_INFO_RAW.to_string(),
+            )]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("CSQ", DataType::Utf8, true),
+                raw,
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["G|missense_variant"; 4])),
+                Arc::new(StringArray::from(vec![
+                    Some("X=a%2Bb;CSQ=old%3Dcsq"),
+                    Some("CSQ=old%3Dcsq"),
+                    Some("myCSQ=a%20b"),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let batch = restore_input_columns(batch).unwrap();
+        let raw = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let raw: Vec<Option<&str>> = raw.iter().collect();
+        assert_eq!(raw, [Some("X=a%2Bb"), None, Some("myCSQ=a%20b"), None]);
     }
 }
