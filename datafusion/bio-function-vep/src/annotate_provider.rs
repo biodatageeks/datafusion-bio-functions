@@ -207,12 +207,12 @@ use crate::projection_needs::OutputNeeds;
 use crate::regions::{RunBounds, RunGate};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    CachedPredictions, CompactPrediction, ExonFeature, FeatureType, GeometryCache, MirnaFeature,
-    MotifFeature, PreparedContext, ProteinDomainFeature, RefSeqEdit, RegulatoryFeature,
-    SiftPolyphenCache, StructuralFeature, SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment,
-    TranscriptConsequence, TranscriptConsequenceEngine, TranscriptEngineProfile, TranscriptFeature,
-    TranslationFeature, VariantInput, infer_refseq_deletion_edits_from_sequences,
-    refseq_edit_offset_delta,
+    CachedPredictions, CodonTable, CompactPrediction, ExonFeature, FeatureType, GeometryCache,
+    MirnaFeature, MotifFeature, PreparedContext, ProteinDomainFeature, RefSeqEdit,
+    RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind, SvFeatureKind,
+    TranscriptCdnaMapperSegment, TranscriptConsequence, TranscriptConsequenceEngine,
+    TranscriptEngineProfile, TranscriptFeature, TranslationFeature, VariantInput,
+    infer_refseq_deletion_edits_from_sequences, is_mitochondrial_contig, refseq_edit_offset_delta,
 };
 
 #[cfg(feature = "parquet-cache")]
@@ -4382,6 +4382,7 @@ impl AnnotateProvider {
                 "transcript_id",
                 "stable_id",
                 "db_id",
+                "codon_table",
                 "chrom",
                 "start",
                 "\"end\"",
@@ -4516,6 +4517,7 @@ impl AnnotateProvider {
             let ncrna_structure_idx = schema.index_of("ncrna_structure").ok();
             let transcript_uid_idx = schema.index_of("transcript_uid").ok();
             let db_id_idx = schema.index_of("db_id").ok();
+            let codon_table_idx = schema.index_of("codon_table").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -4688,11 +4690,16 @@ impl AnnotateProvider {
                 let transcript_uid =
                     transcript_uid_idx.and_then(|idx| uint32_at(batch.column(idx).as_ref(), row));
                 let db_id = db_id_idx.and_then(|idx| int64_at(batch.column(idx).as_ref(), row));
+                let codon_table = CodonTable::for_cached_transcript(
+                    codon_table_idx.and_then(|idx| int64_at(batch.column(idx).as_ref(), row)),
+                    &chrom,
+                );
 
                 out.push(TranscriptFeature {
                     transcript_id,
                     transcript_uid,
                     db_id,
+                    codon_table,
                     chrom,
                     start,
                     end,
@@ -5241,6 +5248,7 @@ impl AnnotateProvider {
             let ncrna_structure_idx = schema.index_of("ncrna_structure").ok();
             let transcript_uid_idx = schema.index_of("transcript_uid").ok();
             let db_id_idx = schema.index_of("db_id").ok();
+            let codon_table_idx = schema.index_of("codon_table").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -5345,6 +5353,10 @@ impl AnnotateProvider {
                 let transcript_uid =
                     transcript_uid_idx.and_then(|idx| uint32_at(batch.column(idx).as_ref(), row));
                 let db_id = db_id_idx.and_then(|idx| int64_at(batch.column(idx).as_ref(), row));
+                let codon_table = CodonTable::for_cached_transcript(
+                    codon_table_idx.and_then(|idx| int64_at(batch.column(idx).as_ref(), row)),
+                    &chrom,
+                );
 
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
@@ -5355,6 +5367,7 @@ impl AnnotateProvider {
                     transcript_id,
                     transcript_uid,
                     db_id,
+                    codon_table,
                     chrom,
                     start,
                     end,
@@ -8623,20 +8636,13 @@ fn is_predicted_refseq_transcript(tx: &TranscriptFeature) -> bool {
     tx.transcript_id.starts_with("XM_") || tx.transcript_id.starts_with("XR_")
 }
 
-fn is_mitochondrial_chrom(chrom: &str) -> bool {
-    matches!(
-        chrom.strip_prefix("chr").unwrap_or(chrom),
-        "M" | "MT" | "m" | "mt"
-    )
-}
-
 fn is_default_refseq_transcript_id(tx: &TranscriptFeature) -> bool {
     let id = tx.transcript_id.as_str();
     if is_standard_refseq_accession(id) {
         return true;
     }
 
-    if is_mitochondrial_chrom(&tx.chrom) {
+    if is_mitochondrial_contig(&tx.chrom) {
         let is_mt_stable_id = (id.len() == 4 && id.chars().all(|ch| ch.is_ascii_digit()))
             || id
                 .strip_prefix("rna-")
@@ -10296,6 +10302,7 @@ const TRANSCRIPT_CONTEXT_COLUMNS: &[&str] = &[
     "transcript_id",
     "stable_id",
     "db_id",
+    "codon_table",
     "chrom",
     "start",
     "\"end\"",
@@ -19755,6 +19762,7 @@ mod tests {
             transcript_id: id.to_string(),
             transcript_uid: None,
             db_id: None,
+            codon_table: CodonTable::Standard,
             chrom: "chr2".to_string(),
             start: 1,
             end: 100,
