@@ -1730,6 +1730,14 @@ impl TranscriptConsequenceEngine {
                         if transcript_is_ablated(variant, tx) {
                             terms.push(SoTerm::TranscriptAblation);
                             terms.sort_by_key(|t| t.rank());
+                        } else if transcript_is_completely_covered_coding(variant, tx) {
+                            // vepyr#217: under complete overlap `coding_unknown`
+                            // returns 0 and `coding_transcript_variant` fires.
+                            // Swapped here, beside the ablation, for the same
+                            // reason: only the consequence list changes.
+                            terms.retain(|t| *t != SoTerm::CodingSequenceVariant);
+                            terms.push(SoTerm::CodingTranscriptVariant);
+                            terms.sort_by_key(|t| t.rank());
                         }
                         apply_tier_gate(&mut terms);
                         let push_started = profiling.then(Instant::now);
@@ -4137,6 +4145,43 @@ fn transcript_is_ablated(variant: &VariantInput, tx: &TranscriptFeature) -> bool
         && !variant.ref_allele.is_empty()
         && (variant.alt_allele == "-" || variant.alt_allele.len() < variant.ref_allele.len());
     is_deletion && variant.start <= tx.start && variant.end >= tx.end
+}
+
+/// VEP `coding_transcript_variant` for an allele that is not a deletion (a
+/// deletion with the same span is `transcript_ablation`, tier 1, and the tier
+/// gate stops before tier 3): the variant span contains the whole transcript
+/// and the transcript has a translation.
+///
+/// ```perl
+/// # ensembl-variation 2fb834b Utils/VariationEffect.pm:169-177
+/// sub complete_overlap_feature {
+///     ...
+///     return (
+///         ($bvf->{start} <= $feat->{start}) and
+///         ($bvf->{end} >= $feat->{end})
+///     );
+/// }
+/// # :484-493
+/// sub within_coding_gene {
+///     ...
+///     return ( within_transcript(@_) and $feat->translation );
+/// }
+/// sub coding_transcript_variant {
+///     return ( (not coding_unknown(@_)) and complete_overlap_feature(@_) and within_coding_gene(@_) );
+/// }
+/// # :1616-1621, coding_unknown (the coding_sequence_variant predicate)
+///     return 0 if complete_overlap_feature(@_);
+/// ```
+///
+/// So under complete overlap `coding_sequence_variant` never fires and
+/// `coding_transcript_variant` always does on a coding transcript. The
+/// translation proxy is the one the coding branch uses: both CDS bounds set.
+fn transcript_is_completely_covered_coding(variant: &VariantInput, tx: &TranscriptFeature) -> bool {
+    variant.ref_allele != "-"
+        && variant.start <= tx.start
+        && variant.end >= tx.end
+        && tx.cds_start.is_some()
+        && tx.cds_end.is_some()
 }
 
 /// Apply Ensembl's consequence tier gate to a finished term set.
@@ -25895,6 +25940,79 @@ mod tests {
         {
             assert!(!c.terms.contains(&SoTerm::TranscriptAblation));
         }
+    }
+
+    /// vepyr#217. A non-deletion whose span contains a whole protein-coding
+    /// transcript is `coding_transcript_variant` and never
+    /// `coding_sequence_variant` (ensembl-variation 2fb834b
+    /// Utils/VariationEffect.pm:169-177, :484-493, :1621).
+    fn complete_overlap_terms(biotype: &str, coding: bool, alt_extra: usize) -> Vec<SoTerm> {
+        let engine = TranscriptConsequenceEngine::default();
+        let (cds_start, cds_end) = if coding {
+            (Some(1_100), Some(1_900))
+        } else {
+            (None, None)
+        };
+        let transcripts = vec![tx(
+            "tx1", "22", 1_000, 2_000, 1, biotype, cds_start, cds_end,
+        )];
+        let exons = vec![exon("tx1", 1, 1_000, 1_200), exon("tx1", 2, 1_800, 2_000)];
+        let ref_allele = "ACGT".repeat(301)[..1_201].to_string();
+        let alt_allele = format!("{}{}", &"TGCA".repeat(301)[..1_201], "G".repeat(alt_extra));
+        let out = engine.evaluate_variant_with_context(
+            &var("22", 900, 2_100, &ref_allele, &alt_allele),
+            &transcripts,
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        out.iter()
+            .find(|c| c.transcript_id.as_deref() == Some("tx1"))
+            .expect("transcript consequence")
+            .terms
+            .clone()
+    }
+
+    #[test]
+    fn mnv_covering_a_coding_transcript_is_a_coding_transcript_variant() {
+        let terms = complete_overlap_terms("protein_coding", true, 0);
+        assert!(
+            terms.contains(&SoTerm::CodingTranscriptVariant),
+            "{terms:?}"
+        );
+        assert!(!terms.contains(&SoTerm::CodingSequenceVariant), "{terms:?}");
+        assert_eq!(
+            terms.last(),
+            Some(&SoTerm::CodingTranscriptVariant),
+            "{terms:?}"
+        );
+        assert!(!terms.contains(&SoTerm::TranscriptAblation), "{terms:?}");
+    }
+
+    #[test]
+    fn delins_alt_longer_covering_a_coding_transcript_is_a_coding_transcript_variant() {
+        // ALT one base longer: VEP's `deletion()` is false (VariationEffect.pm:192-203),
+        // so no ablation, and the complete overlap gives CTV.
+        let terms = complete_overlap_terms("protein_coding", true, 1);
+        assert!(
+            terms.contains(&SoTerm::CodingTranscriptVariant),
+            "{terms:?}"
+        );
+        assert!(!terms.contains(&SoTerm::CodingSequenceVariant), "{terms:?}");
+        assert!(!terms.contains(&SoTerm::TranscriptAblation), "{terms:?}");
+    }
+
+    #[test]
+    fn mnv_covering_a_noncoding_transcript_has_no_coding_transcript_variant() {
+        // `within_coding_gene` needs a translation.
+        let terms = complete_overlap_terms("lncRNA", false, 0);
+        assert!(
+            !terms.contains(&SoTerm::CodingTranscriptVariant),
+            "{terms:?}"
+        );
     }
 
     /// The gate keeps every term at the assigned tier, drops only higher
