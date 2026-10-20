@@ -5156,36 +5156,37 @@ fn apply_vep116_primary_indel_predicates(
     let ref_peptide = class.affected_ref_peptide.as_deref();
     let alt_peptide = class.affected_alt_peptide.as_deref();
 
-    // VEP 116 VariationEffect.pm:
-    // - inframe_insertion is false when start_lost is true;
-    // - inframe_insertion is false when ref_pep == "*" && alt_pep == "*";
-    // - inframe_deletion is false when ref_pep == "*";
-    // - frameshift is false when the affected reference peptide starts "*".
-    if class.start_lost {
+    // `_get_codon_alleles()` checks frameshift before either in-frame
+    // predicate. Clear the raw length-based term for the VEP stop-family
+    // exceptions before deriving insertion/deletion from the codon alleles.
+    if partial_terminal_codon
+        || class.stop_retained
+        || ref_peptide.is_some_and(|peptide| peptide.starts_with('*'))
+    {
+        terms.remove(&SoTerm::FrameshiftVariant);
+    }
+
+    let frameshift = terms.contains(&SoTerm::FrameshiftVariant);
+    let inframe_insertion = !frameshift && vep116_inframe_insertion(class);
+    if inframe_insertion {
+        terms.insert(SoTerm::InframeInsertion);
+    } else {
         terms.remove(&SoTerm::InframeInsertion);
     }
-    if terms.contains(&SoTerm::InframeInsertion)
-        && (terms.contains(&SoTerm::FrameshiftVariant) || !vep116_inframe_insertion(class))
-    {
-        terms.remove(&SoTerm::InframeInsertion);
-    }
-    if terms.contains(&SoTerm::InframeDeletion)
-        && (terms.contains(&SoTerm::FrameshiftVariant)
-            || !vep116_inframe_deletion(class, partial_terminal_codon))
-    {
+
+    let inframe_deletion = !frameshift && vep116_inframe_deletion(class, partial_terminal_codon);
+    if inframe_deletion {
+        terms.insert(SoTerm::InframeDeletion);
+    } else {
         terms.remove(&SoTerm::InframeDeletion);
     }
+
+    // Keep these guards explicit as they are direct source rules and make the
+    // peptide edge cases easy to audit next to the predicate application.
     if ref_peptide == Some("*") && alt_peptide == Some("*") {
         terms.remove(&SoTerm::InframeInsertion);
     }
     if ref_peptide == Some("*") {
-        terms.remove(&SoTerm::InframeDeletion);
-    }
-    if ref_peptide.is_some_and(|peptide| peptide.starts_with('*')) {
-        terms.remove(&SoTerm::FrameshiftVariant);
-    }
-    if partial_terminal_codon {
-        terms.remove(&SoTerm::FrameshiftVariant);
         terms.remove(&SoTerm::InframeDeletion);
     }
 }
@@ -11734,6 +11735,51 @@ mod tests {
             false,
         );
         assert!(valid_terms.contains(&SoTerm::InframeInsertion));
+    }
+
+    #[test]
+    fn vep116_inframe_insertion_is_recomputed_after_frameshift_veto() {
+        let class = CodingClassification {
+            codons: Some("gct/GCTGCT".to_string()),
+            affected_ref_peptide: Some("A".to_string()),
+            affected_alt_peptide: Some("AA".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::FrameshiftVariant]);
+
+        // VEP's partial_codon predicate vetoes frameshift_variant but does not
+        // veto inframe_insertion. The codon and peptide predicate must still
+        // add the insertion term after clearing the raw length-based term.
+        apply_vep116_primary_indel_predicates(
+            &mut terms,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            true,
+        );
+
+        assert!(!terms.contains(&SoTerm::FrameshiftVariant));
+        assert!(terms.contains(&SoTerm::InframeInsertion));
+    }
+
+    #[test]
+    fn vep116_stop_first_insertion_recomputes_after_frameshift_veto() {
+        let class = CodingClassification {
+            codons: Some("tag/tGTGTGTGAAGag".to_string()),
+            affected_ref_peptide: Some("*".to_string()),
+            affected_alt_peptide: Some("CV*RX".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::FrameshiftVariant]);
+
+        apply_vep116_primary_indel_predicates(
+            &mut terms,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+
+        assert!(!terms.contains(&SoTerm::FrameshiftVariant));
+        assert!(terms.contains(&SoTerm::InframeInsertion));
     }
 
     #[test]
