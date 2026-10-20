@@ -3096,6 +3096,28 @@ impl TranscriptConsequenceEngine {
             terms.insert(SoTerm::IncompleteTerminalCodonVariant);
         }
 
+        // VEP cannot derive a codon when either mapper CDS endpoint is a Gap:
+        // TranscriptVariationAllele::codon() returns undef unless both
+        // cds_start and cds_end are defined. For equal-length alleles, the
+        // peptide-based start/stop predicates then have no peptide to compare;
+        // their nucleotide fallbacks require a length change. Keep the
+        // mapper-derived partial positions without classifying only the
+        // coding-side subset as a complete codon change. Length-changing
+        // alleles retain their separate VEP fallbacks below (including
+        // stop_lost).
+        //
+        // Traceability:
+        // - Ensembl Variation `TranscriptVariationAllele::codon()`:
+        //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L850-L851
+        // - Ensembl Variation `_ins_del_start_altered()` requires a length change:
+        //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1041-L1042
+        // - Ensembl Variation `stop_lost()` falls back to the indel predicate:
+        //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1258-L1263
+        if self.semantics.vep116_stop_predicates() && has_partial_cds_endpoint && ref_len == alt_len
+        {
+            return partial_boundary_classification;
+        }
+
         if ref_len != alt_len {
             // Check if the deletion extends beyond the CDS into UTR.
             // VEP does not emit frameshift_variant for such deletions.
@@ -25365,6 +25387,25 @@ mod tests {
         assert!(classification.protein_hgvs.is_none());
     }
 
+    fn assert_no_partial_boundary_codon_consequences(terms: &[SoTerm]) {
+        assert!(
+            !terms.iter().any(|term| {
+                matches!(
+                    term,
+                    SoTerm::StartLost
+                        | SoTerm::StartRetainedVariant
+                        | SoTerm::StopGained
+                        | SoTerm::StopLost
+                        | SoTerm::StopRetainedVariant
+                        | SoTerm::MissenseVariant
+                        | SoTerm::SynonymousVariant
+                        | SoTerm::ProteinAlteringVariant
+                )
+            }),
+            "an undefined CDS endpoint cannot classify a complete peptide change: {terms:?}"
+        );
+    }
+
     #[test]
     fn partial_cds_boundary_alt_longer_delins_plus_strand_keeps_only_partial_positions() {
         let variant = var("22", 1007, 1010, "GACC", "GACCCC");
@@ -25384,6 +25425,7 @@ mod tests {
         let variant = var("22", 1007, 1010, "GACC", "TTTT");
         let (terms, classification) = cds_boundary_delins_fixture(1, variant);
         assert_partial_cds_boundary_result(&terms, classification, 8);
+        assert_no_partial_boundary_codon_consequences(&terms);
     }
 
     #[test]
@@ -25391,6 +25433,60 @@ mod tests {
         let variant = var("22", 1004, 1010, "GGGGTCA", "TTTTTTT");
         let (terms, classification) = cds_boundary_delins_fixture(-1, variant);
         assert_partial_cds_boundary_result(&terms, classification, 7);
+        assert_no_partial_boundary_codon_consequences(&terms);
+    }
+
+    #[test]
+    fn partial_cds_start_boundary_equal_length_mnv_does_not_infer_start_loss() {
+        let cds = "ATGGAATGA";
+        let mut transcript = tx(
+            "T_CDS_START_BOUNDARY",
+            "22",
+            990,
+            1020,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.cdna_coding_start = Some(11);
+        transcript.cdna_coding_end = Some(19);
+        let cdna = format!("{}{}{}", "A".repeat(10), cds, "C".repeat(12));
+        transcript.spliced_seq = Some(cdna.clone());
+        transcript.cdna_seq = Some(cdna);
+        let exon_feature = exon("T_CDS_START_BOUNDARY", 1, 990, 1020);
+        let exons_ref = [&exon_feature];
+        let translation = translation(
+            "T_CDS_START_BOUNDARY",
+            Some(9),
+            Some(3),
+            Some("ME*"),
+            Some(cds),
+        );
+        let variant = var("22", 998, 1001, "AAAT", "TTTT");
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        let (terms, classification) = engine.evaluate_transcript_overlap(
+            &variant,
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+        );
+
+        let classification = classification.expect("mapped CDS boundary keeps partial positions");
+        assert_eq!(classification.cds_position_start, None);
+        assert_eq!(classification.cds_position_end, Some(2));
+        assert_eq!(classification.protein_position_start, None);
+        assert_eq!(classification.protein_position_end, Some(1));
+        assert!(classification.codons.is_none());
+        assert!(classification.amino_acids.is_none());
+        assert!(classification.protein_hgvs.is_none());
+        assert_no_partial_boundary_codon_consequences(&terms);
     }
 
     #[test]
