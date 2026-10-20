@@ -2103,12 +2103,14 @@ pub fn format_hgvsp(
     if protein.frameshift {
         resolve_frameshift_hgvs(&mut notation, protein)?;
     } else {
-        if !preserve_stop_retaining_delins(&mut notation, protein, None)
-            && notation.ref_allele != notation.alt_allele
-        {
-            clip_protein_alleles(&mut notation);
-        } else if notation.ref_allele == notation.alt_allele {
-            notation.kind = "=".to_string();
+        let stop_retaining_delins = preserve_terminal_stop_retaining_delins(&mut notation, protein)
+            || preserve_stop_retaining_delins(&mut notation, protein, None);
+        if !stop_retaining_delins {
+            if notation.ref_allele != notation.alt_allele {
+                clip_protein_alleles(&mut notation);
+            } else {
+                notation.kind = "=".to_string();
+            }
         }
         if notation.kind.is_empty() {
             notation.kind = protein_event_type(&notation.ref_allele, &notation.alt_allele, false);
@@ -2278,6 +2280,46 @@ fn protein_event_type(ref_allele: &str, alt_allele: &str, frameshift: bool) -> S
     } else {
         "delins".to_string()
     }
+}
+
+/// Preserve a terminal stop codon appended after the reference peptide. The
+/// reference translation omits its terminal Ter, while the local alternate
+/// peptide carries it; Ensembl formats this as a stop-retaining delins.
+fn preserve_terminal_stop_retaining_delins(
+    notation: &mut ProteinHgvsNotation,
+    protein: &ProteinHgvsData,
+) -> bool {
+    if protein.frameshift || protein.stop_lost {
+        return false;
+    }
+    let reference_translation = protein
+        .ref_translation
+        .strip_suffix('*')
+        .unwrap_or(&protein.ref_translation);
+    let ref_peptide = normalize_peptide_allele(&protein.ref_peptide);
+    let alt_peptide = normalize_peptide_allele(&protein.alt_peptide);
+    let Some(alt_tail) = alt_peptide.strip_prefix(&ref_peptide) else {
+        return false;
+    };
+    if ref_peptide.is_empty()
+        || !reference_translation.ends_with(&ref_peptide)
+        || !alt_tail.starts_with('*')
+    {
+        return false;
+    }
+
+    let terminal_stop_position = reference_translation.len().saturating_add(1);
+    notation.kind = "delins".to_string();
+    notation.start = terminal_stop_position;
+    notation.end = terminal_stop_position;
+    notation.ref_allele = "X".to_string();
+    notation.alt_allele = alt_tail.replacen('*', "X", 1);
+    if notation.alt_allele == notation.ref_allele {
+        // Keep the formatter on its delins arm when the only alternate
+        // residue is the retained Ter; it truncates this suffix at that Ter.
+        notation.alt_allele.push('*');
+    }
+    true
 }
 
 /// Preserve stop-retaining edits as delins so the HGVSp formatter can truncate
@@ -3130,6 +3172,30 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ter1322delinsTer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_terminal_stop_retaining_insertion_formats_delins_ter() {
+        let translation = make_translation();
+        let reference = format!("{}R", "A".repeat(69));
+        let protein = ProteinHgvsData {
+            start: 70,
+            end: 70,
+            ref_peptide: "R".to_string(),
+            alt_peptide: "R*".to_string(),
+            ref_translation: reference.clone(),
+            alt_translation: reference,
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter71delinsTer".to_string())
         );
     }
 
