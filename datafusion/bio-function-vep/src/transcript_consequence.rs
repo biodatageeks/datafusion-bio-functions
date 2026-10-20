@@ -11,6 +11,8 @@ use crate::hgvs::{HgvsGenomicShift, HgvscProfile};
 use crate::motif_matrix::{FREQUENCIES_UNIT, MotifMatrix, MotifPlacement, motif_score_delta};
 use crate::so_terms::{ALL_SO_TERMS, SoTerm};
 
+mod vep_coords;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VariantInput {
     pub chrom: String,
@@ -5803,42 +5805,24 @@ fn shifted_tva_coords_from_mapper(
     let coding_start = tx.cdna_coding_start?;
     let coding_end = tx.cdna_coding_end?;
 
-    let is_insertion = shifted_variant.start == shifted_variant.end.saturating_add(1);
-    let (cdna_start, cdna_end) = if is_insertion {
-        // Traceability:
-        // - Ensembl core `Mapper::map_insert()` maps the swapped two-base
-        //   boundary and then adjusts the mapped interval in transcript
-        //   coordinates before downstream `genomic2cds()` / `genomic2pep()`
-        //   consumers read start/end.
-        //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
-        //
-        // Use flanks in transcript order, not genomic order. On the reverse
-        // strand the higher genomic coordinate is upstream. This swaps a
-        // contiguous mapped interval into a zero-length insertion while
-        // retaining any edited-cDNA gap between separate mapped segments.
-        // Do not sort cDNA positions: VEP preserves mapper result order.
-        //
-        // `map_insert` keeps only the flanks that map to a
-        // `Bio::EnsEMBL::Mapper::Coordinate` and silently drops any that map
-        // to a `Gap`; it does not fail when one flank is unmapped. An
-        // insertion abutting a frameshift intron has one intronic flank, so
-        // requiring both to map would discard a window VEP still resolves.
-        let (upstream, downstream) = if tx.strand < 0 {
-            (shifted_variant.start, shifted_variant.end)
-        } else {
-            (shifted_variant.end, shifted_variant.start)
-        };
-        let left = shifted_insertion_cdna_flank(tx, tx_exons, upstream);
-        let right = shifted_insertion_cdna_flank(tx, tx_exons, downstream);
-        match (left, right) {
-            (Some(left), Some(right)) => (left.saturating_add(1), right.saturating_sub(1)),
-            // Only the downstream flank mapped: VEP keeps that coordinate and
-            // decrements its end, leaving the zero-length window (r, r-1).
-            (None, Some(right)) => (right, right.saturating_sub(1)),
-            // Only the upstream flank mapped: VEP increments its start.
-            (Some(left), None) => (left.saturating_add(1), left),
-            (None, None) => return None,
-        }
+    let span = vep_coords::VepSpan::new(shifted_variant.start, shifted_variant.end);
+    let is_insertion = span.is_insertion();
+    let mapper = vep_coords::VepTxMapper::with_phase(
+        tx,
+        tx_exons,
+        vep_coords::CdnaBaseMap::HgvspExact,
+        leading_n_offset,
+    );
+    let (cdna_start, cdna_end, raw_cds_start, raw_cds_end) = if is_insertion {
+        // `Mapper::map_insert()` over the transcript-ordered flanks, keeping
+        // the one that maps when the other is a `Gap`, and the edited-cDNA
+        // gap between two mapped flanks; then the single-piece
+        // `genomic2cds()` gap test and CDS offset with the leading-N phase.
+        // See `vep_coords` for the quoted rules.
+        let cdna = mapper.cdna(span);
+        let (cdna_start, cdna_end) = cdna.both()?;
+        let (raw_cds_start, raw_cds_end) = mapper.cds_of_cdna(cdna, true).both()?;
+        (cdna_start, cdna_end, raw_cds_start, raw_cds_end)
     } else {
         let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
         let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
@@ -5846,21 +5830,20 @@ fn shifted_tva_coords_from_mapper(
             cdna_positions.push(genomic_to_cdna_index_for_hgvsp(tx, tx_exons, pos)?);
         }
         cdna_positions.sort_unstable();
-        (*cdna_positions.first()?, *cdna_positions.last()?)
+        let (cdna_start, cdna_end) = (*cdna_positions.first()?, *cdna_positions.last()?);
+        if cdna_end < coding_start || cdna_start > coding_end {
+            return None;
+        }
+        let raw_cds_start = cdna_start
+            .saturating_sub(coding_start)
+            .saturating_add(1)
+            .saturating_add(leading_n_offset);
+        let raw_cds_end = cdna_end
+            .saturating_sub(coding_start)
+            .saturating_add(1)
+            .saturating_add(leading_n_offset);
+        (cdna_start, cdna_end, raw_cds_start, raw_cds_end)
     };
-
-    if cdna_end < coding_start || cdna_start > coding_end {
-        return None;
-    }
-
-    let raw_cds_start = cdna_start
-        .saturating_sub(coding_start)
-        .saturating_add(1)
-        .saturating_add(leading_n_offset);
-    let raw_cds_end = cdna_end
-        .saturating_sub(coding_start)
-        .saturating_add(1)
-        .saturating_add(leading_n_offset);
     let edited_insertion_gap =
         is_insertion && cdna_start <= cdna_end && refseq_has_edited_sequence_state(tx);
     let cds_start = if edited_insertion_gap {
@@ -5907,8 +5890,8 @@ fn shifted_tva_coords_from_mapper(
         // insertions and single-flank windows.
         // https://github.com/Ensembl/ensembl/blob/release/116/modules/Bio/EnsEMBL/TranscriptMapper.pm#L516-L529
         (
-            cds_start.saturating_add(2) / 3,
-            cds_end.saturating_add(2) / 3,
+            vep_coords::peptide_of_cds(cds_start),
+            vep_coords::peptide_of_cds(cds_end),
         )
     } else {
         let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
@@ -9272,91 +9255,12 @@ fn compute_cdna_position(
     if !in_exon {
         return None;
     }
-    let adjust_output_cdna = |cdna: usize| {
-        if !uses_refseq_transcript_reference(tx) {
-            return Some(cdna);
-        }
-        if tx.cds_start.is_some() && tx.cds_end.is_some() {
-            edited_transcript_cdna_index(tx, cdna)
-        } else {
-            edited_transcript_sequence_cdna_index(tx, cdna)
-        }
-    };
-    if is_ins {
-        if let Some(boundary_cdna) = mapper_insertion_gap_cdna_position(tx, variant.start) {
-            return Some(boundary_cdna.to_string());
-        }
-        let a = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start.saturating_sub(1))
-            .and_then(adjust_output_cdna);
-        let b = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start)
-            .and_then(adjust_output_cdna);
-        match (a, b) {
-            (Some(a), Some(b)) => {
-                let lo = a.min(b);
-                let hi = a.max(b);
-                Some(format!("{lo}-{hi}"))
-            }
-            (None, Some(b)) => {
-                let other = if tx.strand >= 0 {
-                    b.saturating_sub(1)
-                } else {
-                    b + 1
-                };
-                let lo = b.min(other);
-                let hi = b.max(other);
-                Some(format!("{lo}-{hi}"))
-            }
-            (Some(a), None) => {
-                let other = if tx.strand >= 0 {
-                    a + 1
-                } else {
-                    a.saturating_sub(1)
-                };
-                let lo = a.min(other);
-                let hi = a.max(other);
-                Some(format!("{lo}-{hi}"))
-            }
-            (None, None) => None,
-        }
-    } else {
-        // Ensembl VEP `cDNA_position` comes from the live transcript mapper
-        // (`cdna_start` / `cdna_end` via `cdna_coords()`), so edited RefSeq
-        // transcripts must reflect mapper-visible `_rna_edit` shifts here for
-        // non-insertions as well.
-        // https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1631-L1677
-        // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L489
-        let start_cdna = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start)
-            .and_then(adjust_output_cdna);
-        let end_cdna = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.end)
-            .and_then(adjust_output_cdna);
-        match (start_cdna, end_cdna) {
-            (Some(s), Some(e)) if s == e => Some(s.to_string()),
-            (Some(s), Some(e)) => {
-                let lo = s.min(e);
-                let hi = s.max(e);
-                Some(format!("{lo}-{hi}"))
-            }
-            // Boundary-spanning deletions: one end maps, the other extends
-            // beyond the transcript. VEP uses "?" for the unknown boundary.
-            // On negative strand, genomic start maps to higher cDNA pos and
-            // genomic end maps to lower, so we must orient correctly.
-            (Some(s), None) => {
-                if tx.strand < 0 {
-                    Some(format!("?-{s}"))
-                } else {
-                    Some(format!("{s}-?"))
-                }
-            }
-            (None, Some(e)) => {
-                if tx.strand < 0 {
-                    Some(format!("{e}-?"))
-                } else {
-                    Some(format!("?-{e}"))
-                }
-            }
-            (None, None) => None,
-        }
-    }
+    // VEP's `cdna_start` / `cdna_end` (BTV first/last mapper piece) through
+    // `format_coords`.
+    // https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1631-L1677
+    // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L489
+    vep_coords::VepTxMapper::new(tx, tx_exons, None, vep_coords::CdnaBaseMap::Output)
+        .cdna_position(vep_coords::VepSpan::from_variant(variant))
 }
 
 fn mapper_insertion_gap_cdna_position(tx: &TranscriptFeature, variant_start: i64) -> Option<usize> {
