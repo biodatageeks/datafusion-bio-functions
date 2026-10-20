@@ -300,7 +300,10 @@ pub struct TranscriptFeature {
     pub spliced_seq: Option<String>,
     /// Raw 5' UTR cached on the VEP transcript object.
     pub five_prime_utr_seq: Option<String>,
-    /// Raw 3' UTR cached on the VEP transcript object.
+    /// Raw 3' UTR cached on the VEP transcript object. `Some("")` is VEP's
+    /// cached undef (no 3' UTR; nothing is derived), `None` means the cache
+    /// carries no 3' UTR state and it is derived from the transcript
+    /// sequence (vepyr#231).
     pub three_prime_utr_seq: Option<String>,
     /// Cached transcript `_translateable_seq()` value from the VEP transcript
     /// object, when present.
@@ -5264,6 +5267,43 @@ fn local_peptide_from_codon_window(table: CodonTable, codon: &[u8]) -> Option<St
     Some(peptide)
 }
 
+/// VEP's alternate codon: `window_len` bases from `codon_start` of the
+/// alternate CDS with the cached 3'UTR appended.
+///
+/// `window_len` is the unclamped codon span plus the allele length delta, so
+/// a codon window truncated by the CDS end (an incomplete terminal codon)
+/// reads into the 3'UTR, and Perl `substr` stops at the end of the sequence.
+/// `_trim_incomplete_codon()` is a no-op (its condition is an assignment), so
+/// the partial codon stays before the UTR. The UTR is read only when the
+/// window passes the end of `mutated` (vepyr#230).
+///
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::codon()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L841-L877
+/// - Ensembl Variation `TranscriptVariationAllele::_get_alternate_cds()` and
+///   `_trim_incomplete_codon()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2414-L2427
+///   https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2523-L2534
+fn vep_alternate_codon_window(
+    tx: &TranscriptFeature,
+    mutated: &[u8],
+    codon_start: usize,
+    window_len: usize,
+) -> Vec<u8> {
+    let window_end = codon_start.saturating_add(window_len);
+    if window_end <= mutated.len() {
+        return mutated[codon_start..window_end].to_vec();
+    }
+    let utr = three_prime_utr_seq(tx).unwrap_or_default();
+    mutated
+        .iter()
+        .chain(utr.as_bytes())
+        .skip(codon_start)
+        .take(window_len)
+        .copied()
+        .collect()
+}
+
 /// Traceability:
 /// - Ensembl core `Transcript::translateable_seq()`
 ///   builds the sequence from `spliced_seq()` plus `cdna_coding_start/end`,
@@ -7517,19 +7557,26 @@ fn classify_coding_change_with_semantics(
     // Capture the exact local peptide window consumed by VEP's stop-family
     // predicates. The alternate window is widened/narrowed by the allele
     // length delta, and partial codons become `X`.
+    //
+    // VEP's reference codon is cut from `_translateable_seq` and stops at the
+    // CDS end, but the alternate one is cut from the alternate CDS with the
+    // 3'UTR appended, over the unclamped codon span (vepyr#230), so an
+    // incomplete terminal codon reads into the UTR on the alternate side only.
     let local_first_codon = start_idx / 3;
     let local_last_codon = end_idx / 3;
     let local_codon_start = local_first_codon.saturating_mul(3);
-    let local_ref_end = ((local_last_codon + 1) * 3).min(cds_seq.len());
+    let local_codon_span = (local_last_codon + 1 - local_first_codon) * 3;
+    let local_codon_truncated = local_codon_start + local_codon_span > cds_seq.len();
+    let local_ref_end = (local_codon_start + local_codon_span).min(cds_seq.len());
     let local_ref_codon = &cds_seq.as_bytes()[local_codon_start..local_ref_end];
-    let local_alt_len =
-        (local_ref_codon.len() as i64 + alt_len as i64 - ref_len as i64).max(0) as usize;
-    let local_alt_end = local_codon_start
-        .saturating_add(local_alt_len)
-        .min(mutated.len());
-    let local_alt_codon = &mutated[local_codon_start..local_alt_end];
+    let local_alt_codon = vep_alternate_codon_window(
+        tx,
+        &mutated,
+        local_codon_start,
+        (local_codon_span + alt_len).saturating_sub(ref_len),
+    );
     class.affected_ref_peptide = local_peptide_from_codon_window(tx.codon_table, local_ref_codon);
-    class.affected_alt_peptide = local_peptide_from_codon_window(tx.codon_table, local_alt_codon);
+    class.affected_alt_peptide = local_peptide_from_codon_window(tx.codon_table, &local_alt_codon);
     if skip_global_stop_compare {
         // Failed RefSeq BAM edits can leave the genomic codon representation
         // different from the trusted cached protein. VEP exposes that split
@@ -7712,7 +7759,26 @@ fn classify_coding_change_with_semantics(
             (first_codon, (last_codon + 1).min(old_aas.len()))
         };
         let ref_aa: String = old_aas[ref_start..ref_end].iter().collect();
-        if ref_len == alt_len {
+        if ref_len == alt_len && local_codon_truncated && !skip_global_stop_compare {
+            // An incomplete terminal codon: the whole-protein translations
+            // have no residue for it, while VEP's peptides come from the codon
+            // windows (`peptide()`: whole codons, then `X` for a partial one),
+            // the alternate one reading into the 3'UTR (vepyr#230).
+            //
+            // Traceability:
+            // - Ensembl Variation `TranscriptVariationAllele::peptide()`
+            //   https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L722-L778
+            if let (Some(ref_pep), Some(alt_pep)) = (
+                class.affected_ref_peptide.clone(),
+                class.affected_alt_peptide.clone(),
+            ) {
+                class.amino_acids = Some(if ref_pep == alt_pep {
+                    ref_pep
+                } else {
+                    format!("{ref_pep}/{alt_pep}")
+                });
+            }
+        } else if ref_len == alt_len {
             let (alt_start, alt_end) = if skip_global_stop_compare {
                 (
                     display_protein_position_start.saturating_sub(1),
@@ -7777,20 +7843,15 @@ fn classify_coding_change_with_semantics(
         // SNV / MNV: same-length substitution
         let codon_nt_start = first_codon * 3;
         let codon_nt_end = ((last_codon + 1) * 3).min(cds_seq.len());
-        let codon_nt_end_alt = ((last_codon + 1) * 3).min(mutated.len());
-        if codon_nt_end <= cds_seq.len() && codon_nt_end_alt <= mutated.len() {
+        if codon_nt_end <= cds_seq.len() {
             let ref_codon = format_codon_display(
                 &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
                 start_idx,
                 end_idx,
                 codon_nt_start,
             );
-            let alt_codon = format_codon_display(
-                &mutated[codon_nt_start..codon_nt_end_alt],
-                start_idx,
-                end_idx,
-                codon_nt_start,
-            );
+            let alt_codon =
+                format_codon_display(&local_alt_codon, start_idx, end_idx, codon_nt_start);
             class.codons = Some(format!("{ref_codon}/{alt_codon}"));
         }
     } else {
@@ -7809,15 +7870,11 @@ fn classify_coding_change_with_semantics(
                     end_idx,
                     codon_nt_start,
                 );
-                let ref_codon_len = codon_nt_end - codon_nt_start;
-                let len_diff = alt_len as isize - ref_len as isize;
-                let alt_codon_len = (ref_codon_len as isize + len_diff).max(0) as usize;
-                let alt_codon_end = (codon_nt_start + alt_codon_len).min(mutated.len());
                 if alt_len > 0 {
                     // VEP display_codon highlights feature_seq for every
                     // nonempty ALT, including a deletion with replacement.
                     let alt_codon = format_codon_display(
-                        &mutated[codon_nt_start..alt_codon_end],
+                        &local_alt_codon,
                         start_idx,
                         start_idx + alt_len - 1,
                         codon_nt_start,
@@ -7825,9 +7882,7 @@ fn classify_coding_change_with_semantics(
                     class.codons = Some(format!("{ref_codon}/{alt_codon}"));
                 } else {
                     // Frameshift deletion: all alt bases lowercase
-                    let alt_codon: String = mutated
-                        .get(codon_nt_start..alt_codon_end)
-                        .unwrap_or(&[])
+                    let alt_codon: String = local_alt_codon
                         .iter()
                         .map(|&b| (b as char).to_ascii_lowercase())
                         .collect();
@@ -7843,19 +7898,15 @@ fn classify_coding_change_with_semantics(
                     end_idx,
                     codon_nt_start,
                 );
-                let ref_codon_len = codon_nt_end - codon_nt_start;
-                let len_diff = alt_len as isize - ref_len as isize;
-                let alt_codon_len = (ref_codon_len as isize + len_diff).max(0) as usize;
-                let alt_codon_end = (codon_nt_start + alt_codon_len).min(mutated.len());
                 let alt_codon = if alt_len > 0 {
                     format_codon_display(
-                        &mutated[codon_nt_start..alt_codon_end],
+                        &local_alt_codon,
                         start_idx,
                         start_idx + alt_len - 1,
                         codon_nt_start,
                     )
                 } else {
-                    mutated[codon_nt_start..alt_codon_end]
+                    local_alt_codon
                         .iter()
                         .map(|&b| (b as char).to_ascii_lowercase())
                         .collect()
@@ -7875,22 +7926,16 @@ fn classify_coding_change_with_semantics(
                     end_idx,
                     codon_nt_start,
                 );
-                let alt_end_idx = start_idx + alt_len;
-                let alt_last_codon = if alt_end_idx > 0 {
-                    (alt_end_idx - 1) / 3
-                } else {
-                    first_codon
-                };
-                let alt_codon_nt_end = ((alt_last_codon + 1) * 3).min(mutated.len());
-                if alt_codon_nt_end <= mutated.len() {
-                    let alt_codon = format_codon_display(
-                        &mutated[codon_nt_start..alt_codon_nt_end],
-                        start_idx,
-                        start_idx + alt_len - 1,
-                        codon_nt_start,
-                    );
-                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
-                }
+                // In frame, `(start_idx + alt_len - 1) / 3` is the last
+                // alternate codon, so VEP's window ends where it always did
+                // unless it is truncated by the CDS end.
+                let alt_codon = format_codon_display(
+                    &local_alt_codon,
+                    start_idx,
+                    start_idx + alt_len - 1,
+                    codon_nt_start,
+                );
+                class.codons = Some(format!("{ref_codon}/{alt_codon}"));
             }
         }
     }
@@ -19988,6 +20033,222 @@ mod tests {
         t.cdna_coding_end = None;
         t.spliced_seq = Some("ATGATGATGCCC".into());
         assert!(three_prime_utr_seq(&t).is_none());
+    }
+
+    /// HGVSp of a 1-bp deletion in the last codon of an N-padded
+    /// `cds_start_NF&cds_end_NF` transcript (the ENST00000523942 shape of
+    /// vepyr#231), with the cached 3'UTR set to `cached_utr`.
+    ///
+    /// Padded CDS `NNG CTG AAA GGC AAG` (X L K G K) at 1000-1012: 13 real
+    /// bases, `cdna_coding_end = 13`, and the spliced sequence the loader
+    /// synthesizes is the padded 15-nt CDS.
+    fn issue_231_padded_last_codon_deletion_hgvsp(cached_utr: Option<&str>) -> Option<String> {
+        let padded = "NNGCTGAAAGGCAAG";
+        let mut t = tx(
+            "T231",
+            "22",
+            1000,
+            1012,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1012),
+        );
+        t.cds_start_nf = true;
+        t.cds_end_nf = true;
+        t.flags_str = Some("cds_start_NF&cds_end_NF".to_string());
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(13);
+        t.translateable_seq = Some(padded.to_string());
+        t.spliced_seq = Some(padded.to_string());
+        t.three_prime_utr_seq = cached_utr.map(str::to_string);
+        let e = exon("T231", 1, 1000, 1012);
+        let mut tr = translation("T231", Some(15), Some(5), Some("XLKGK"), Some(padded));
+        tr.stable_id = Some("ENSP231".to_string());
+        tr.version = Some(1);
+        let engine = TranscriptConsequenceEngine::default();
+        // Delete the middle A of the last codon AAG (padded index 13).
+        engine
+            .evaluate_variant_with_context(
+                &var("22", 1011, 1011, "A", "-"),
+                &[t],
+                &[e],
+                &[tr],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .into_iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("T231"))
+            .expect("expected a T231 consequence")
+            .hgvsp
+    }
+
+    #[test]
+    fn issue_231_cached_undef_three_prime_utr_adds_no_padding_residue() {
+        // vepyr#231: VEP appends `_three_prime_utr()` to the alternate CDS
+        // only `if (defined $utr)` (TVA.pm:2422-2427), and the offline cache
+        // holds undef for this transcript. The alternate protein ends at
+        // `XLKG` + a partial codon, so residue 5 is deleted.
+        assert_eq!(
+            issue_231_padded_last_codon_deletion_hgvsp(Some("")).as_deref(),
+            Some("ENSP231.1:p.Lys5del")
+        );
+    }
+
+    /// `(Consequence terms, Codons, Amino_acids, HGVSp)` of a variant on a
+    /// single-exon transcript (stable id `T230`, translation `ENSP230.1`)
+    /// whose CDS `cds` (transcript orientation) ends in an incomplete
+    /// terminal codon and is followed by the cached 3'UTR `utr`.
+    fn issue_230_itc_snv(
+        strand: i8,
+        cds: &str,
+        utr: &str,
+        variant: VariantInput,
+    ) -> (Vec<SoTerm>, Option<String>, Option<String>, Option<String>) {
+        let cds_len = cds.len() as i64;
+        let utr_len = utr.len() as i64;
+        let tx_start = 1000;
+        let tx_end = tx_start + cds_len + utr_len - 1;
+        let (cds_start, cds_end) = if strand > 0 {
+            (tx_start, tx_start + cds_len - 1)
+        } else {
+            (tx_end - cds_len + 1, tx_end)
+        };
+        let mut t = tx(
+            "T230",
+            "22",
+            tx_start,
+            tx_end,
+            strand,
+            "protein_coding",
+            Some(cds_start),
+            Some(cds_end),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(cds.len());
+        t.translateable_seq = Some(cds.to_string());
+        t.spliced_seq = Some(format!("{cds}{utr}"));
+        t.three_prime_utr_seq = Some(utr.to_string());
+        let e = exon("T230", 1, tx_start, tx_end);
+        let peptide: String = translate_protein_from_cds(&cds.as_bytes()[..cds.len() / 3 * 3])
+            .unwrap()
+            .into_iter()
+            .collect();
+        let mut tr = translation(
+            "T230",
+            Some(cds.len()),
+            Some(peptide.len()),
+            Some(&peptide),
+            Some(cds),
+        );
+        tr.stable_id = Some("ENSP230".to_string());
+        tr.version = Some(1);
+        let engine = TranscriptConsequenceEngine::default();
+        let entry = engine
+            .evaluate_variant_with_context(&variant, &[t], &[e], &[tr], &[], &[], &[], &[])
+            .into_iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("T230"))
+            .expect("expected a T230 consequence");
+        (entry.terms, entry.codons, entry.amino_acids, entry.hgvsp)
+    }
+
+    fn issue_230_itc_terms() -> Vec<SoTerm> {
+        vec![
+            SoTerm::IncompleteTerminalCodonVariant,
+            SoTerm::CodingSequenceVariant,
+        ]
+    }
+
+    #[test]
+    fn issue_230_itc_snv_alt_codon_extends_into_three_prime_utr() {
+        // vepyr#230. VEP cuts the alternate codon from the alternate CDS with
+        // the 3'UTR appended (`_get_alternate_cds`, TVA.pm:2414-2427) using
+        // the unclamped codon length (`codon()`, TVA.pm:841-843, 877), so
+        // `Tt` becomes `Att` and `peptide()` gives I (TVA.pm:724-778).
+        // CDS ATG GCT GAA TT + UTR TAGG, SNV T>A at CDS 10 (pos 1009).
+        assert_eq!(
+            issue_230_itc_snv(1, "ATGGCTGAATT", "TAGG", var("22", 1009, 1009, "T", "A")),
+            (
+                issue_230_itc_terms(),
+                Some("Tt/Att".to_string()),
+                Some("X/I".to_string()),
+                Some("ENSP230.1:p.Ter4Ile".to_string()),
+            )
+        );
+        // 1-nt partial codon (the 22:20061574 shape): A + UTR AG -> Gag (E).
+        assert_eq!(
+            issue_230_itc_snv(1, "ATGGCTGAAA", "AGGC", var("22", 1009, 1009, "A", "G")),
+            (
+                issue_230_itc_terms(),
+                Some("A/Gag".to_string()),
+                Some("X/E".to_string()),
+                Some("ENSP230.1:p.Ter4Glu".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn issue_230_itc_snv_alt_codon_extends_into_utr_on_minus_strand() {
+        // The chr5 / chr19 shape `Aa/Gag`. Transcript-orientation CDS
+        // ATG GCT GAA AA + UTR GCCC on the minus strand at 1000-1014: CDS
+        // index 9 is genomic 1005, transcript A>G is genomic T>C.
+        assert_eq!(
+            issue_230_itc_snv(-1, "ATGGCTGAAAA", "GCCC", var("22", 1005, 1005, "T", "C")),
+            (
+                issue_230_itc_terms(),
+                Some("Aa/Gag".to_string()),
+                Some("X/E".to_string()),
+                Some("ENSP230.1:p.Ter4Glu".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn issue_230_itc_frameshift_deletion_alt_codon_extends_into_three_prime_utr() {
+        // The same window on an indel: deleting the first base of the partial
+        // codon `Tt` gives `substr(alt_cds . utr, 9, 3 + 0 - 1)` = `T` + the
+        // first UTR base (TVA.pm:877, 2414-2427), displayed lowercase.
+        let (_, codons, _, _) =
+            issue_230_itc_snv(1, "ATGGCTGAATT", "TAGG", var("22", 1009, 1009, "T", "-"));
+        assert_eq!(codons.as_deref(), Some("Tt/tt"));
+    }
+
+    #[test]
+    fn issue_230_itc_snv_without_three_prime_utr_keeps_truncated_alt_codon() {
+        // VEP appends the UTR only `if (defined $utr)` (TVA.pm:2424); with
+        // the cached undef of vepyr#231 the alternate codon stays `At`.
+        assert_eq!(
+            issue_230_itc_snv(1, "ATGGCTGAATT", "", var("22", 1009, 1009, "T", "A")),
+            (
+                issue_230_itc_terms(),
+                Some("Tt/At".to_string()),
+                Some("X".to_string()),
+                Some("ENSP230.1:p.Ter4=".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn three_prime_utr_seq_does_not_derive_when_cache_holds_undef() {
+        let mut t = tx(
+            "T231",
+            "22",
+            1000,
+            1012,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1012),
+        );
+        t.cdna_coding_end = Some(13);
+        t.spliced_seq = Some("NNGCTGAAAGGCAAG".to_string());
+        // Column absent (`None`): the derivation returns the padding overhang.
+        assert_eq!(three_prime_utr_seq(&t).as_deref(), Some("AG"));
+        // Cached undef (`Some("")`): no 3'UTR.
+        t.three_prime_utr_seq = Some(String::new());
+        assert_eq!(three_prime_utr_seq(&t), None);
     }
 
     #[test]
