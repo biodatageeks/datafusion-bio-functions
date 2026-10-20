@@ -3052,6 +3052,38 @@ impl TranscriptConsequenceEngine {
             return classification;
         }
 
+        // A ref-consuming span can begin or end in a mapper Gap at a CDS/UTR
+        // boundary. VEP then has one or both CDS endpoints undefined, so its
+        // frameshift and in-frame predicates cannot use the raw allele-length
+        // delta. Keep the mapper-derived partial positions for OutputFactory.
+        let partial_boundary_classification = if ref_len > 0 && self.overlaps_cds(variant, tx) {
+            // Phase affects the coordinate values, not whether a mapper
+            // endpoint is a coordinate or Gap. Avoid materializing the full
+            // translateable sequence on the common path; the phased mapper is
+            // constructed below only when a partial boundary result is needed.
+            let mapper = vep_coords::VepTxMapper::with_phase(
+                tx,
+                tx_exons,
+                vep_coords::CdnaBaseMap::Output,
+                0,
+            );
+            let span = vep_coords::VepSpan::from_variant(variant);
+            let endpoints = mapper.cds(span);
+            if endpoints.start.is_none() || endpoints.end.is_none() {
+                partial_coding_overlap_classification(tx, tx_exons, tx_translation, variant)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let has_partial_cds_endpoint =
+            partial_boundary_classification
+                .as_ref()
+                .is_some_and(|class| {
+                    class.cds_position_start.is_none() || class.cds_position_end.is_none()
+                });
+
         // VEP partial_codon reads translation_start from the mapper, which
         // is transcript ordered and preserves insertion intervals. Using the
         // lowest genomic coordinate selects the wrong codon on the negative
@@ -3078,9 +3110,11 @@ impl TranscriptConsequenceEngine {
             };
 
             let diff = ref_len.abs_diff(alt_len);
-            if extends_into_utr {
-                // Deletion spans CDS + UTR boundary. VEP does not emit
-                // frameshift/inframe for these — only start/stop terms.
+            let suppress_length_terms = extends_into_utr || has_partial_cds_endpoint;
+            if suppress_length_terms {
+                // A deletion/delins spans CDS + UTR (or has another mapped
+                // endpoint Gap). VEP's defined-CDS/codon guards suppress the
+                // length-based consequences for either allele-length delta.
             } else if diff % 3 == 0 {
                 if alt_len > ref_len {
                     terms.insert(SoTerm::InframeInsertion);
@@ -3161,6 +3195,11 @@ impl TranscriptConsequenceEngine {
                 // classify_coding_change uses per-codon analysis for all
                 // indels, matching VEP's local-peptide approach.
                 apply_codon_classification(terms, &classification);
+                if suppress_length_terms {
+                    terms.remove(&SoTerm::FrameshiftVariant);
+                    terms.remove(&SoTerm::InframeInsertion);
+                    terms.remove(&SoTerm::InframeDeletion);
+                }
                 if self.semantics.vep116_stop_predicates() {
                     terms.remove(&SoTerm::ProteinAlteringVariant);
                     if vep116_protein_altering_variant(
@@ -3183,8 +3222,8 @@ impl TranscriptConsequenceEngine {
                     tx_exons,
                     translateable_seq.as_deref(),
                 );
-                let classification = if extends_into_utr {
-                    partial_coding_overlap_classification(tx, tx_exons, tx_translation, variant)
+                let classification = if suppress_length_terms {
+                    partial_boundary_classification.clone()
                 } else {
                     None
                 };
@@ -3234,6 +3273,17 @@ impl TranscriptConsequenceEngine {
             .and_then(|t| t.cds_sequence.as_deref())
             .is_some()
         {
+            if has_partial_cds_endpoint {
+                let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
+                self.add_start_stop_heuristic_terms(
+                    terms,
+                    variant,
+                    tx,
+                    tx_exons,
+                    translateable_seq.as_deref(),
+                );
+                return partial_boundary_classification;
+            }
             // Translation data exists but classify_coding_change failed
             // (CDS sequence mismatch). Don't fall through to the
             // heuristic — CodingSequenceVariant is already inserted.
@@ -3261,7 +3311,7 @@ impl TranscriptConsequenceEngine {
         {
             terms.insert(SoTerm::StopGained);
         }
-        None
+        partial_boundary_classification
     }
 
     /// Traceability:
@@ -10884,6 +10934,50 @@ fn partial_coding_overlap_classification(
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
 ) -> Option<CodingClassification> {
+    // Older RefSeq cache rows can carry genomic CDS bounds while omitting the
+    // cDNA CDS bounds required by TranscriptMapper. Keep their established
+    // exon-geometry fallback; the mapper is authoritative whenever its bounds
+    // are available.
+    if tx.cdna_coding_start.is_none() || tx.cdna_coding_end.is_none() {
+        return partial_coding_overlap_from_genomic_segments(tx, tx_exons, tx_translation, variant);
+    }
+
+    let mapper = vep_coords::VepTxMapper::new(
+        tx,
+        tx_exons,
+        tx_translation,
+        vep_coords::CdnaBaseMap::Output,
+    );
+    let span = vep_coords::VepSpan::from_variant(variant);
+    // `cds_pieces` walks every genomic base in the allele span. Use the
+    // transcript's exon/CDS intervals here so a large deletion costs O(exons),
+    // independent of its length.
+    let segments = coding_segments(tx, tx_exons)?;
+    let variant_start = variant.start.min(variant.end);
+    let variant_end = variant.start.max(variant.end);
+    let overlaps_cds_segment = segments
+        .iter()
+        .any(|(start, end)| variant_start <= *end && variant_end >= *start);
+    if !overlaps_cds_segment {
+        return None;
+    }
+    let coords = mapper.coords(span);
+    let mut class = CodingClassification::default();
+    class.cds_position_start = coords.cds.start;
+    class.cds_position_end = coords.cds.end;
+    class.protein_position_start = coords.translation.start;
+    class.protein_position_end = coords.translation.end;
+    Some(class)
+}
+
+/// Preserve partial positions for legacy rows with genomic CDS bounds but no
+/// cDNA CDS bounds, which leave the mapper's CDS coordinates undefined.
+fn partial_coding_overlap_from_genomic_segments(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+) -> Option<CodingClassification> {
     let segments = coding_segments(tx, tx_exons)?;
     let variant_start = variant.start.min(variant.end);
     let variant_end = variant.start.max(variant.end);
@@ -10938,10 +11032,8 @@ fn partial_coding_overlap_classification(
         variant_start < first_overlap_genomic
     };
 
-    // VEP prepends N characters to the CDS sequence when the first coding
-    // exon starts mid-codon (non-zero phase).  These Ns align the reading
-    // frame to codon boundaries.  Apply the same offset here so that CDS
-    // and protein positions match those reported by classify_coding_change.
+    // VEP pads the translateable sequence with leading Ns for a partial
+    // start codon. Preserve that phase when these cache rows lack mapper data.
     let leading_n_offset = tx_translation
         .and_then(|t| t.cds_sequence.as_deref())
         .map(|cds| cds.as_bytes().iter().take_while(|&&b| b == b'N').count())
@@ -14768,10 +14860,11 @@ mod tests {
     }
 
     #[test]
-    fn deletion_near_tiny_intron_skips_splice_frameshift_intron() {
+    fn deletion_ending_in_tiny_intron_has_no_length_or_splice_term() {
         // Exon 1: 1000..1200, Exon 2: 1210..2000 (tiny 9bp intron: 1201..1209)
-        // VEP skips splice checks for "frameshift introns" (≤13bp).
-        // The 9bp intron should be skipped — no splice terms emitted.
+        // VEP skips splice checks for "frameshift introns" (≤13bp). Since the
+        // final base is also inside the mapper Gap, cds_end is undefined and
+        // the pinned frameshift predicate cannot emit a length consequence.
         let engine = TranscriptConsequenceEngine::default();
         let t = tx(
             "T1",
@@ -14787,7 +14880,7 @@ mod tests {
         let cds = &"ATG".repeat(67);
         let translations = vec![translation("T1", Some(201), Some(66), None, Some(cds))];
 
-        // Deletion from 1199..1203 spans into the tiny intron
+        // Deletion from 1199..1203 ends inside the tiny intron.
         let assignments = engine.evaluate_variant_with_context(
             &var("22", 1199, 1203, "NNNNN", "-"),
             &[t],
@@ -14805,8 +14898,8 @@ mod tests {
             terms
         );
         assert!(
-            terms.contains(&SoTerm::FrameshiftVariant),
-            "Should still get frameshift from CDS overlap: {:?}",
+            !terms.contains(&SoTerm::FrameshiftVariant),
+            "A Gap endpoint leaves cds_end undefined, suppressing frameshift: {:?}",
             terms
         );
     }
@@ -25164,6 +25257,9 @@ mod tests {
             Some(1000),
             Some(1011),
         );
+        let mut t = t;
+        t.cdna_coding_start = Some(11);
+        t.cdna_coding_end = Some(22);
         let e = exon("T1", 1, 990, 1020);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let tr = translation("T1", Some(14), Some(4), None, Some("NNATGGCTGAATGA"));
@@ -25189,6 +25285,176 @@ mod tests {
             c.protein_position_start,
             Some(5),
             "Protein position should include leading N offset"
+        );
+    }
+
+    fn cds_boundary_delins_fixture(
+        strand: i8,
+        variant: VariantInput,
+    ) -> (Vec<SoTerm>, Option<CodingClassification>) {
+        let cds = "ATGGAATGA";
+        let (tx_start, tx_end, cds_start, cds_end, cdna_coding_start, cdna_coding_end, cdna) =
+            if strand >= 0 {
+                (
+                    990,
+                    1020,
+                    1000,
+                    1008,
+                    11,
+                    19,
+                    format!("{}{}{}", "A".repeat(10), cds, "C".repeat(12)),
+                )
+            } else {
+                (
+                    1000,
+                    1030,
+                    1008,
+                    1016,
+                    15,
+                    23,
+                    format!("{}{}{}", "A".repeat(14), cds, "C".repeat(8)),
+                )
+            };
+        let mut transcript = tx(
+            "T_CDS_BOUNDARY",
+            "22",
+            tx_start,
+            tx_end,
+            strand,
+            "protein_coding",
+            Some(cds_start),
+            Some(cds_end),
+        );
+        transcript.cdna_coding_start = Some(cdna_coding_start);
+        transcript.cdna_coding_end = Some(cdna_coding_end);
+        transcript.spliced_seq = Some(cdna.clone());
+        transcript.cdna_seq = Some(cdna);
+        let exon_feature = exon("T_CDS_BOUNDARY", 1, tx_start, tx_end);
+        let exons_ref = [&exon_feature];
+        let translation = translation("T_CDS_BOUNDARY", Some(9), Some(3), Some("ME*"), Some(cds));
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        engine.evaluate_transcript_overlap(&variant, &transcript, &exons_ref, Some(&translation))
+    }
+
+    fn assert_partial_cds_boundary_result(
+        terms: &[SoTerm],
+        classification: Option<CodingClassification>,
+        cds_start: usize,
+    ) {
+        assert!(
+            !terms.iter().any(|term| {
+                matches!(
+                    term,
+                    SoTerm::FrameshiftVariant | SoTerm::InframeInsertion | SoTerm::InframeDeletion
+                )
+            }),
+            "a CDS/UTR Gap must suppress length-based terms: {terms:?}"
+        );
+        let classification = classification.expect("mapped CDS boundary must keep coordinates");
+        assert_eq!(classification.cds_position_start, Some(cds_start));
+        assert_eq!(classification.cds_position_end, None);
+        assert_eq!(classification.protein_position_start, Some(3));
+        assert_eq!(classification.protein_position_end, None);
+        assert!(classification.codons.is_none());
+        assert!(classification.amino_acids.is_none());
+        assert!(classification.protein_hgvs.is_none());
+    }
+
+    #[test]
+    fn partial_cds_boundary_alt_longer_delins_plus_strand_keeps_only_partial_positions() {
+        let variant = var("22", 1007, 1010, "GACC", "GACCCC");
+        let (terms, classification) = cds_boundary_delins_fixture(1, variant);
+        assert_partial_cds_boundary_result(&terms, classification, 8);
+    }
+
+    #[test]
+    fn partial_cds_boundary_alt_longer_delins_minus_strand_keeps_only_partial_positions() {
+        let variant = var("22", 1004, 1010, "GGGGTCA", "GGGGTCACC");
+        let (terms, classification) = cds_boundary_delins_fixture(-1, variant);
+        assert_partial_cds_boundary_result(&terms, classification, 7);
+    }
+
+    #[test]
+    fn partial_cds_boundary_equal_length_mnv_plus_strand_keeps_only_partial_positions() {
+        let variant = var("22", 1007, 1010, "GACC", "TTTT");
+        let (terms, classification) = cds_boundary_delins_fixture(1, variant);
+        assert_partial_cds_boundary_result(&terms, classification, 8);
+    }
+
+    #[test]
+    fn partial_cds_boundary_equal_length_mnv_minus_strand_keeps_only_partial_positions() {
+        let variant = var("22", 1004, 1010, "GGGGTCA", "TTTTTTT");
+        let (terms, classification) = cds_boundary_delins_fixture(-1, variant);
+        assert_partial_cds_boundary_result(&terms, classification, 7);
+    }
+
+    #[test]
+    fn cds_boundary_deletion_and_fully_coding_delins_controls() {
+        for (strand, variant, cds_start) in [
+            (1, var("22", 1007, 1010, "GACC", "-"), 8),
+            (-1, var("22", 1004, 1010, "GGGGTCA", "-"), 7),
+        ] {
+            let (terms, classification) = cds_boundary_delins_fixture(strand, variant);
+            assert_partial_cds_boundary_result(&terms, classification, cds_start);
+        }
+
+        let fully_coding_delins = var("22", 1000, 1002, "ATG", "ATGGAA");
+        let (terms, classification) = cds_boundary_delins_fixture(1, fully_coding_delins);
+        assert!(terms.contains(&SoTerm::InframeInsertion), "{terms:?}");
+        let classification = classification.expect("fully coding delins has a peptide window");
+        assert!(classification.codons.is_some());
+        assert!(classification.amino_acids.is_some());
+    }
+
+    #[test]
+    fn partial_cds_boundary_delins_refseq_falls_back_without_cdna_bounds() {
+        let cds = "ATGGAATGA";
+        let mut transcript = tx(
+            "NM_000001.1",
+            "22",
+            990,
+            1020,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.spliced_seq = Some(format!("{}{}{}", "A".repeat(10), cds, "C".repeat(12)));
+        let exon_feature = exon("NM_000001.1", 1, 990, 1020);
+        let exons = [&exon_feature];
+        let translation = translation("NM_000001.1", Some(9), Some(3), Some("ME*"), Some(cds));
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let variant = var("22", 1007, 1010, "GACC", "GACCCC");
+
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, Some(&translation));
+
+        let classification =
+            classification.expect("RefSeq mapper fallback keeps partial positions");
+        assert_eq!(classification.cds_position_start, Some(8));
+        assert_eq!(classification.cds_position_end, None);
+        assert_eq!(classification.protein_position_start, Some(3));
+        assert_eq!(classification.protein_position_end, None);
+        assert!(classification.codons.is_none());
+        assert!(classification.amino_acids.is_none());
+        assert!(classification.protein_hgvs.is_none());
+        assert!(
+            !terms.iter().any(|term| matches!(
+                term,
+                SoTerm::FrameshiftVariant | SoTerm::InframeInsertion | SoTerm::InframeDeletion
+            )),
+            "a RefSeq mapper Gap must suppress length-based terms: {terms:?}"
         );
     }
 
@@ -25595,6 +25861,9 @@ mod tests {
             Some(1000),
             Some(1011),
         );
+        let mut t = t;
+        t.cdna_coding_start = Some(11);
+        t.cdna_coding_end = Some(22);
         let e = exon("T1", 1, 990, 1020);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let tr = translation("T1", Some(14), Some(4), None, Some("NNATGGCTGAATGA"));
