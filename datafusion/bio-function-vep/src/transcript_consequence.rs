@@ -5112,9 +5112,13 @@ fn apply_vep116_primary_indel_predicates(
     let alt_peptide = class.affected_alt_peptide.as_deref();
 
     // VEP 116 VariationEffect.pm:
+    // - inframe_insertion is false when start_lost is true;
     // - inframe_insertion is false when ref_pep == "*" && alt_pep == "*";
     // - inframe_deletion is false when ref_pep == "*";
     // - frameshift is false when the affected reference peptide starts "*".
+    if class.start_lost {
+        terms.remove(&SoTerm::InframeInsertion);
+    }
     if ref_peptide == Some("*") && alt_peptide == Some("*") {
         terms.remove(&SoTerm::InframeInsertion);
     }
@@ -11466,6 +11470,27 @@ mod tests {
         );
         assert!(v115.contains(&SoTerm::InframeInsertion));
         assert!(!v116.contains(&SoTerm::InframeInsertion));
+    }
+
+    #[test]
+    fn vep116_inframe_insertion_respects_start_lost_guard() {
+        // VariationEffect::inframe_insertion returns false when start_lost
+        // is true, even if the insertion is in-frame and the peptide alleles
+        // would otherwise satisfy the insertion predicate.
+        let class = CodingClassification {
+            start_lost: true,
+            affected_ref_peptide: Some("M".to_string()),
+            affected_alt_peptide: Some("MA".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::InframeInsertion]);
+        apply_vep116_primary_indel_predicates(
+            &mut terms,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+        assert!(!terms.contains(&SoTerm::InframeInsertion));
     }
 
     #[test]
