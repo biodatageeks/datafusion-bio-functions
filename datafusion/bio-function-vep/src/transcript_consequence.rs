@@ -9321,6 +9321,66 @@ pub(crate) fn genomic_to_cdna_index_for_transcript(
     }
 }
 
+/// Match the first coordinate piece returned by Ensembl Core's
+/// `Mapper::map_insert` for parser-level insertion coordinates
+/// (`variation_start == variation_end + 1`). If the transcript-5' flank is
+/// mapped, the insertion starts immediately after that flank; if only the
+/// transcript-3' flank is mapped, that flank's coordinate is the start.
+/// Unlike `cDNA_position`, this preserves the mapper's first piece when an
+/// RNA edit creates a cDNA gap between the flanks.
+pub(crate) fn mapper_cdna_start_for_insertion(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variation_start: i64,
+    variation_end: i64,
+) -> Option<usize> {
+    if variation_start != variation_end.checked_add(1)? {
+        return None;
+    }
+
+    let (five_prime_flank, three_prime_flank) = if tx.strand < 0 {
+        (variation_start, variation_end)
+    } else {
+        (variation_end, variation_start)
+    };
+    let map_flank = |position| {
+        if tx.cdna_mapper_segments.is_empty() {
+            genomic_to_cdna_index_for_transcript(tx, tx_exons, position)
+        } else {
+            tx.cdna_mapper_segments
+                .iter()
+                .find_map(|segment| mapper_segment_cdna_index(segment, position))
+        }
+    };
+
+    map_flank(five_prime_flank)
+        .and_then(|position| position.checked_add(1))
+        .or_else(|| map_flank(three_prime_flank))
+}
+
+/// The same first-piece rule over unedited exon geometry. RefSeq edit starts
+/// are stored in this original cDNA space, so HGVSc's offset-threshold
+/// comparison needs this coordinate alongside the edit-aware mapper start.
+pub(crate) fn raw_exon_cdna_start_for_insertion(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variation_start: i64,
+    variation_end: i64,
+) -> Option<usize> {
+    if variation_start != variation_end.checked_add(1)? {
+        return None;
+    }
+
+    let (five_prime_flank, three_prime_flank) = if tx.strand < 0 {
+        (variation_start, variation_end)
+    } else {
+        (variation_end, variation_start)
+    };
+    genomic_to_cdna_index(tx_exons, tx.strand, five_prime_flank)
+        .and_then(|position| position.checked_add(1))
+        .or_else(|| genomic_to_cdna_index(tx_exons, tx.strand, three_prime_flank))
+}
+
 /// Genomic→cDNA coordinate table for the transcript, memoized once on the
 /// transcript and reused across every overlapping variant/allele (redundancy C).
 /// The first caller pays the `to_vec()` + sort in [`transcript_cdna_coords_uncached`];
