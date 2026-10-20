@@ -2103,9 +2103,11 @@ pub fn format_hgvsp(
     if protein.frameshift {
         resolve_frameshift_hgvs(&mut notation, protein)?;
     } else {
-        if notation.ref_allele != notation.alt_allele {
+        if !preserve_stop_retaining_delins(&mut notation, protein, None)
+            && notation.ref_allele != notation.alt_allele
+        {
             clip_protein_alleles(&mut notation);
-        } else {
+        } else if notation.ref_allele == notation.alt_allele {
             notation.kind = "=".to_string();
         }
         if notation.kind.is_empty() {
@@ -2278,6 +2280,40 @@ fn protein_event_type(ref_allele: &str, alt_allele: &str, frameshift: bool) -> S
     }
 }
 
+/// Preserve stop-retaining edits as delins so the HGVSp formatter can truncate
+/// the alternate peptide at the first Ter, matching Ensembl Variation 116.
+fn preserve_stop_retaining_delins(
+    notation: &mut ProteinHgvsNotation,
+    protein: &ProteinHgvsData,
+    expected_stop_offset: Option<usize>,
+) -> bool {
+    let Some((ref_stop, alt_stop)) = protein
+        .ref_peptide
+        .find('*')
+        .zip(protein.alt_peptide.find('*'))
+    else {
+        return false;
+    };
+    let has_added_peptide_after_stop = protein
+        .alt_peptide
+        .get(alt_stop + 1..)
+        .is_some_and(|tail| tail.chars().any(|aa| aa != '*'));
+    if ref_stop != alt_stop
+        || expected_stop_offset.is_some_and(|offset| ref_stop != offset)
+        || !has_added_peptide_after_stop
+        || protein.alt_peptide.len() <= protein.ref_peptide.len()
+    {
+        return false;
+    }
+
+    notation.kind = "delins".to_string();
+    notation.start = protein.start;
+    notation.end = protein.end;
+    notation.ref_allele = protein.ref_peptide.replacen('*', "X", 1);
+    notation.alt_allele = protein.alt_peptide.replacen('*', "X", 1);
+    true
+}
+
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_fs_peptides()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2249-L2295>
@@ -2318,29 +2354,11 @@ fn resolve_frameshift_hgvs(
         let ref_aa = peptide_char(&ref_translation, start)?;
         let alt_aa = peptide_char(alt_translation, start)?;
         if ref_aa == '*' && alt_aa == '*' {
-            let shared_stop_has_added_peptide = protein
-                .ref_peptide
-                .find('*')
-                .zip(protein.alt_peptide.find('*'))
-                .is_some_and(|(ref_stop, alt_stop)| {
-                    ref_stop == alt_stop
-                        && ref_stop == start.saturating_sub(protein.start)
-                        && protein.alt_peptide.len() > protein.ref_peptide.len()
-                        && protein
-                            .alt_peptide
-                            .get(alt_stop + 1..)
-                            .is_some_and(|tail| tail.chars().any(|aa| aa != '*'))
-                });
-            if shared_stop_has_added_peptide {
-                // VEP formats the real stop-retaining event as a delins, then
-                // truncates the alternate peptide at the first Ter. Keep the
-                // inserted context until `format_hgvsp_notation` applies that
-                // rule instead of collapsing the shared stop to `=` here.
-                notation.kind = "delins".to_string();
-                notation.start = protein.start;
-                notation.end = protein.end;
-                notation.ref_allele = protein.ref_peptide.replacen('*', "X", 1);
-                notation.alt_allele = protein.alt_peptide.replacen('*', "X", 1);
+            if preserve_stop_retaining_delins(
+                notation,
+                protein,
+                Some(start.saturating_sub(protein.start)),
+            ) {
                 return Some(());
             }
             notation.kind = "=".to_string();
@@ -3088,6 +3106,30 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.His356_Ter357delinsHisTer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_nonframeshift_stop_retaining_insertion_formats_delins_ter() {
+        let translation = make_translation();
+        let reference = format!("{}*", "A".repeat(1321));
+        let protein = ProteinHgvsData {
+            start: 1322,
+            end: 1322,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "*SX".to_string(),
+            ref_translation: reference.clone(),
+            alt_translation: reference,
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter1322delinsTer".to_string())
         );
     }
 
