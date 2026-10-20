@@ -7741,15 +7741,25 @@ fn classify_coding_change_with_semantics(
                 class.amino_acids = Some(format!("{ref_aa}/X"));
             }
         } else {
-            // Inframe indels: show affected ref AAs and alt AAs
+            // Inframe indels: show affected ref AAs and alt AAs.
+            //
+            // VEP cuts the alternate codon at the first affected codon with
+            // length `codon_len + allele_len - vf_nt_len`, and an empty cut
+            // makes the peptide '-' (vepyr#246). This differs from counting
+            // up to the last alternate base only when the deletion starts at
+            // CDS base 1 with nothing inserted, where that last base would be
+            // "before codon 0".
+            //
+            // Traceability:
+            // - Ensembl Variation `TranscriptVariationAllele::codon()`
+            //   https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L841-L881
             let alt_first_codon = first_codon;
-            let alt_last_codon = if mutated.len() >= 3 {
-                (start_idx + alt_len).saturating_sub(1) / 3
-            } else {
-                0
-            };
-            let alt_end = (alt_last_codon + 1).min(new_aas.len());
-            if alt_first_codon < new_aas.len() {
+            let alt_window_nt =
+                ((last_codon - first_codon + 1) * 3 + alt_len).saturating_sub(ref_len);
+            let alt_end = (alt_first_codon + alt_window_nt.div_ceil(3)).min(new_aas.len());
+            if alt_window_nt == 0 {
+                class.amino_acids = Some(format!("{ref_aa}/-"));
+            } else if alt_first_codon < new_aas.len() {
                 let alt_aa: String = new_aas[alt_first_codon..alt_end].iter().collect();
                 if alt_aa.is_empty() {
                     class.amino_acids = Some(format!("{ref_aa}/-"));
@@ -15486,6 +15496,92 @@ mod tests {
         assert_eq!(c.cds_position_end, Some(6));
         assert_eq!(c.protein_position_start, Some(2));
         assert_eq!(c.protein_position_end, Some(2));
+    }
+
+    /// `(Amino_acids, HGVSp)` of a variant on a single-exon `cds_start_NF`
+    /// transcript whose CDS is `ACG CAG CCA GAA TGA` (T Q P E *) at 1000-1014.
+    fn issue_246_cds_start_nf_amino_acids_and_hgvsp(
+        start: i64,
+        end: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+    ) -> (Option<String>, Option<String>) {
+        let cds = "ACGCAGCCAGAATGA";
+        let mut t = tx(
+            "T246",
+            "22",
+            1000,
+            1014,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1014),
+        );
+        t.cds_start_nf = true;
+        t.flags_str = Some("cds_start_NF".to_string());
+        let e = exon("T246", 1, 1000, 1014);
+        let mut tr = translation("T246", Some(15), Some(4), Some("TQPE"), Some(cds));
+        tr.stable_id = Some("ENSP246".to_string());
+        tr.version = Some(1);
+        let engine = TranscriptConsequenceEngine::default();
+        let result = engine.evaluate_variant_with_context(
+            &var("22", start, end, ref_allele, alt_allele),
+            &[t],
+            &[e],
+            &[tr],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let entry = result
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("T246"))
+            .expect("expected a T246 consequence");
+        (entry.amino_acids.clone(), entry.hgvsp.clone())
+    }
+
+    #[test]
+    fn issue_246_inframe_deletion_from_cds_base_1_has_empty_alt_peptide() {
+        // vepyr#246. VEP `TranscriptVariationAllele::codon()` cuts the
+        // alternate codon at the codon start with length
+        // `codon_len + allele_len - vf_nt_len` (TVA.pm:877); deleting CDS 1-6
+        // gives `substr(..., 0, 0)` = '' and so peptide '-' (TVA.pm:878-880).
+        // `_get_hgvs_protein_type` then makes it a `del` (TVA.pm:2060-2061).
+        assert_eq!(
+            issue_246_cds_start_nf_amino_acids_and_hgvsp(1000, 1005, "ACGCAG", "-"),
+            (
+                Some("TQ/-".to_string()),
+                Some("ENSP246.1:p.Thr1_Gln2del".to_string())
+            )
+        );
+        assert_eq!(
+            issue_246_cds_start_nf_amino_acids_and_hgvsp(1000, 1002, "ACG", "-"),
+            (
+                Some("T/-".to_string()),
+                Some("ENSP246.1:p.Thr1del".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn issue_246_controls_keep_their_alternate_peptide() {
+        // Deletion away from CDS base 1: unchanged.
+        assert_eq!(
+            issue_246_cds_start_nf_amino_acids_and_hgvsp(1003, 1008, "CAGCCA", "-"),
+            (
+                Some("QP/-".to_string()),
+                Some("ENSP246.1:p.Gln2_Pro3del".to_string())
+            )
+        );
+        // In-frame delins at CDS base 1 with a non-empty alternate: the window
+        // is 6 + 3 - 6 = 3 nt, one residue (TAC -> Y).
+        assert_eq!(
+            issue_246_cds_start_nf_amino_acids_and_hgvsp(1000, 1005, "ACGCAG", "TAC")
+                .0
+                .as_deref(),
+            Some("TQ/Y")
+        );
     }
 
     // ---- classify_insertion: codons, amino acids, positions ----

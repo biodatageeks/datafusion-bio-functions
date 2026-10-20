@@ -2111,6 +2111,21 @@ pub fn format_hgvsp(
         if notation.kind.is_empty() {
             notation.kind = protein_event_type(&notation.ref_allele, &notation.alt_allele, false);
         }
+        // VEP's `_get_hgvs_protein_type()` rewrites the FIRST `*` of each
+        // clipped peptide to BioPerl's `X` (`s/\*/X/`, no `/g`) before
+        // `_get_hgvs_peptides()` runs the 3' shift and the duplication check.
+        // The duplication check is skipped while the alt still holds a `*`,
+        // so an alt with one stop is compared as `X`: on an N-padded
+        // `cds_start_NF` protein whose residue 1 translates to `X` it can
+        // match upstream (vepyr#246, `p.Xaa1_Pro7dup`).
+        //
+        // Traceability:
+        // - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_type()`
+        //   https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2052-L2055
+        // - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
+        //   https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2118-L2125
+        notation.ref_allele = notation.ref_allele.replacen('*', "X", 1);
+        notation.alt_allele = notation.alt_allele.replacen('*', "X", 1);
         // Traceability:
         // - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
         //   calls `_check_peptides_post_var()` (3' shift) FIRST, then
@@ -2122,6 +2137,7 @@ pub fn format_hgvsp(
             shift_peptides_post_var(&mut notation, &protein.ref_translation);
         }
         if notation.kind == "ins"
+            && !notation.alt_allele.contains('*')
             && check_for_peptide_duplication(&mut notation, &protein.ref_translation)
         {
             // Dup detected — skip flanking.
@@ -2619,21 +2635,25 @@ fn format_hgvsp_notation(
     }
 
     match notation.kind.as_str() {
+        // A duplication returns from `_get_hgvs_peptides()` before its
+        // `s/Xaa/Ter/g`, so an `X` in the duplicated peptide prints as `Xaa`.
+        //
+        // Traceability:
+        // - Ensembl Variation `TranscriptVariationAllele::_check_for_peptide_duplication()`
+        //   and `_get_hgvs_peptides()`
+        //   https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2124-L2125
         "dup" => {
             if notation.start < notation.end {
                 out.push_str(&format!(
                     "{}{}_{}{}dup",
-                    peptide_first_three(&notation.alt_allele)?,
+                    aa_one_to_three(notation.alt_allele.chars().next()?),
                     notation.start,
-                    peptide_last_three(&notation.alt_allele)?,
+                    aa_one_to_three(notation.alt_allele.chars().last()?),
                     notation.end
                 ));
             } else {
-                out.push_str(&format!(
-                    "{}{}dup",
-                    peptide_to_three_letter(&notation.alt_allele),
-                    notation.start
-                ));
+                let alt: String = notation.alt_allele.chars().map(aa_one_to_three).collect();
+                out.push_str(&format!("{alt}{}dup", notation.start));
             }
         }
         ">" => {
@@ -3260,6 +3280,63 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ala3dup".to_string())
+        );
+    }
+
+    fn issue_246_insertion_protein(ref_translation: &str, alt_peptide: &str) -> ProteinHgvsData {
+        ProteinHgvsData {
+            start: 8,
+            end: 8,
+            ref_peptide: "S".to_string(),
+            alt_peptide: alt_peptide.to_string(),
+            ref_translation: ref_translation.to_string(),
+            alt_translation: String::new(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        }
+    }
+
+    #[test]
+    fn test_format_hgvsp_stop_insertion_duplicating_n_padded_residue_1_is_dup() {
+        // vepyr#246, ClinVar 7:19116903 on ENST00000443687 (cds_start_NF, one
+        // `N` of phase padding, so the reference translation starts with X).
+        // VEP: `_get_hgvs_protein_type` rewrites the first `*` of the clipped
+        // alt `*IIPTLP` to `X` (TVA.pm:2053-2054) before `_get_hgvs_peptides`
+        // runs `_check_for_peptide_duplication` (TVA.pm:2124), which matches
+        // `XIIPTLP` upstream and returns before `Xaa` is rewritten to `Ter`
+        // (TVA.pm:2125, 2175-2176).
+        let translation = make_translation();
+        let protein = issue_246_insertion_protein("XIIPTLPSDKLSK", "*IIPTLPS");
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Xaa1_Pro7dup".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_stop_insertion_without_upstream_match_stays_ins() {
+        // Control: same insertion on an unpadded protein; no duplication.
+        let translation = make_translation();
+        let protein = issue_246_insertion_protein("MIIPTLPSDKLSK", "*IIPTLPS");
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Pro7_Ser8insTer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_insertion_with_second_stop_skips_duplication_check() {
+        // `s/\*/X/` rewrites only the first stop (TVA.pm:2054), so an alt with
+        // two stops still matches `/\*/` and VEP skips the duplication check
+        // (TVA.pm:2124) even though `XIIPTLX` would match upstream.
+        let translation = make_translation();
+        let protein = issue_246_insertion_protein("XIIPTLXSDKLSK", "*IIPTL*S");
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter7_Ser8insTer".to_string())
         );
     }
 
