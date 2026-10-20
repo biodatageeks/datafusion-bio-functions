@@ -1923,6 +1923,16 @@ impl TranscriptConsequenceEngine {
     }
 
     pub fn collapse_variant_terms(assignments: &[TranscriptConsequence]) -> Vec<SoTerm> {
+        Self::collapse_variant_terms_with_semantics(
+            assignments,
+            crate::vep_semantics::VepSemantics::V115,
+        )
+    }
+
+    pub fn collapse_variant_terms_with_semantics(
+        assignments: &[TranscriptConsequence],
+        semantics: crate::vep_semantics::VepSemantics,
+    ) -> Vec<SoTerm> {
         let mut set = BTreeSet::new();
         for a in assignments {
             set.extend(a.terms.iter().copied());
@@ -1934,7 +1944,7 @@ impl TranscriptConsequenceEngine {
         // NOTE: only strip coding parents here, NOT intron_variant —
         // intron_variant stripping is per-transcript only (a different
         // transcript may legitimately contribute intron_variant).
-        strip_coding_parent_terms(&mut set);
+        strip_coding_parent_terms(&mut set, semantics);
         let mut v: Vec<SoTerm> = set.into_iter().collect();
         v.sort_by_key(|t| t.rank());
         v
@@ -3115,7 +3125,9 @@ impl TranscriptConsequenceEngine {
                 //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1125>
                 // - VEP protein_altering_variant catch-all:
                 //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L375-L393>
-                if terms.contains(&SoTerm::InframeInsertion) {
+                if terms.contains(&SoTerm::InframeInsertion)
+                    && !self.semantics.vep116_stop_predicates()
+                {
                     if let Some(aa) = &classification.amino_acids {
                         if let Some((ref_pep, alt_pep)) = aa.split_once('/') {
                             // VEP: $alt_pep =~ s/\*.+/\*/; — keeps the first '*',
@@ -3149,7 +3161,18 @@ impl TranscriptConsequenceEngine {
                 // classify_coding_change uses per-codon analysis for all
                 // indels, matching VEP's local-peptide approach.
                 apply_codon_classification(terms, &classification);
-                terms.insert(SoTerm::ProteinAlteringVariant);
+                if self.semantics.vep116_stop_predicates() {
+                    terms.remove(&SoTerm::ProteinAlteringVariant);
+                    if vep116_protein_altering_variant(
+                        Some(&classification),
+                        terms,
+                        partial_terminal_codon_v116,
+                    ) {
+                        terms.insert(SoTerm::ProteinAlteringVariant);
+                    }
+                } else {
+                    terms.insert(SoTerm::ProteinAlteringVariant);
+                }
                 return Some(classification);
             } else {
                 let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
@@ -3160,18 +3183,24 @@ impl TranscriptConsequenceEngine {
                     tx_exons,
                     translateable_seq.as_deref(),
                 );
-                terms.insert(SoTerm::ProteinAlteringVariant);
-                if extends_into_utr {
-                    return partial_coding_overlap_classification(
-                        tx,
-                        tx_exons,
-                        tx_translation,
-                        variant,
-                    );
+                let classification = if extends_into_utr {
+                    partial_coding_overlap_classification(tx, tx_exons, tx_translation, variant)
+                } else {
+                    None
+                };
+                if self.semantics.vep116_stop_predicates() {
+                    if vep116_protein_altering_variant(
+                        classification.as_ref(),
+                        terms,
+                        partial_terminal_codon_v116,
+                    ) {
+                        terms.insert(SoTerm::ProteinAlteringVariant);
+                    }
+                } else {
+                    terms.insert(SoTerm::ProteinAlteringVariant);
                 }
+                return classification;
             }
-            terms.insert(SoTerm::ProteinAlteringVariant);
-            return None;
         }
 
         if ref_len == 0 {
@@ -3187,6 +3216,16 @@ impl TranscriptConsequenceEngine {
         ) {
             let has_any = classification.has_any();
             apply_codon_classification(terms, &classification);
+            if self.semantics.vep116_stop_predicates() {
+                terms.remove(&SoTerm::ProteinAlteringVariant);
+                if vep116_protein_altering_variant(
+                    Some(&classification),
+                    terms,
+                    partial_terminal_codon_v116,
+                ) {
+                    terms.insert(SoTerm::ProteinAlteringVariant);
+                }
+            }
             if has_any {
                 return Some(classification);
             }
@@ -4388,8 +4427,10 @@ fn is_non_coding_biotype(biotype: &str) -> bool {
     )
 }
 
-/// Strip only `protein_altering_variant` when specific children are present.
-/// Used at the cross-transcript collapse level.
+/// Apply release-specific `protein_altering_variant` parent handling at the
+/// cross-transcript collapse level. VEP 115 uses the SO hierarchy cleanup;
+/// VEP 116 evaluates PAV from peptide alleles and retains predicate-valid
+/// co-emissions.
 ///
 /// NOTE: `coding_sequence_variant` is NOT stripped here because it may
 /// legitimately come from a different transcript than the specific coding
@@ -4401,7 +4442,10 @@ fn is_non_coding_biotype(biotype: &str) -> bool {
 /// Traceability:
 /// - Ensembl Variation `BaseVariationFeatureOverlapAllele::_get_cons_term_rank()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749>
-fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
+fn strip_coding_parent_terms(
+    terms: &mut BTreeSet<SoTerm>,
+    semantics: crate::vep_semantics::VepSemantics,
+) {
     let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
         || terms.contains(&SoTerm::StopGained)
@@ -4413,15 +4457,16 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         || terms.contains(&SoTerm::StopRetainedVariant)
         || terms.contains(&SoTerm::StartRetainedVariant);
 
-    if has_specific_coding {
+    if has_specific_coding && !semantics.vep116_stop_predicates() {
         terms.remove(&SoTerm::ProteinAlteringVariant);
     }
 }
 
-/// Remove parent SO terms when more specific children are present.
+/// Remove parent SO terms when their consequence predicates say so.
 /// VEP never emits `coding_sequence_variant` alongside a specific
-/// coding consequence (missense, synonymous, etc.), and never emits
-/// `protein_altering_variant` alongside `missense_variant`.
+/// coding consequence (missense, synonymous, etc.). VEP 115 strips
+/// `protein_altering_variant` by hierarchy; VEP 116 keeps the predicate's
+/// peptide-based result, including allowed co-emissions.
 /// Also strips `splice_polypyrimidine_tract_variant` when more specific
 /// splice-site terms subsume it.
 ///
@@ -4537,7 +4582,7 @@ fn strip_parent_terms_with_semantics(
     {
         terms.remove(&SoTerm::CodingSequenceVariant);
     }
-    if has_specific_child {
+    if has_specific_child && !semantics.vep116_stop_predicates() {
         terms.remove(&SoTerm::ProteinAlteringVariant);
     }
 
@@ -5119,6 +5164,17 @@ fn apply_vep116_primary_indel_predicates(
     if class.start_lost {
         terms.remove(&SoTerm::InframeInsertion);
     }
+    if terms.contains(&SoTerm::InframeInsertion)
+        && (terms.contains(&SoTerm::FrameshiftVariant) || !vep116_inframe_insertion(class))
+    {
+        terms.remove(&SoTerm::InframeInsertion);
+    }
+    if terms.contains(&SoTerm::InframeDeletion)
+        && (terms.contains(&SoTerm::FrameshiftVariant)
+            || !vep116_inframe_deletion(class, partial_terminal_codon))
+    {
+        terms.remove(&SoTerm::InframeDeletion);
+    }
     if ref_peptide == Some("*") && alt_peptide == Some("*") {
         terms.remove(&SoTerm::InframeInsertion);
     }
@@ -5132,6 +5188,160 @@ fn apply_vep116_primary_indel_predicates(
         terms.remove(&SoTerm::FrameshiftVariant);
         terms.remove(&SoTerm::InframeDeletion);
     }
+}
+
+/// Ensembl Variation 116 `inframe_insertion()` predicate.
+fn vep116_inframe_insertion(class: &CodingClassification) -> bool {
+    if class.start_lost {
+        return false;
+    }
+    let Some((ref_codon, alt_codon)) = class
+        .codons
+        .as_deref()
+        .and_then(|codons| codons.split_once('/'))
+    else {
+        return false;
+    };
+    let ref_codon = if ref_codon == "-" {
+        String::new()
+    } else {
+        ref_codon.to_ascii_uppercase()
+    };
+    let alt_codon = if alt_codon == "-" {
+        String::new()
+    } else {
+        alt_codon.to_ascii_uppercase()
+    };
+    if alt_codon.len() <= ref_codon.len() {
+        return false;
+    }
+
+    let (Some(ref_peptide), Some(alt_peptide)) = (
+        class.affected_ref_peptide.as_deref(),
+        class.affected_alt_peptide.as_deref(),
+    ) else {
+        return false;
+    };
+    if ref_peptide.is_empty() || alt_peptide.is_empty() {
+        return false;
+    }
+    let ref_peptide = if ref_peptide == "-" { "" } else { ref_peptide };
+    let mut alt_peptide = if alt_peptide == "-" { "" } else { alt_peptide };
+
+    if class.start_retained && alt_peptide.ends_with(ref_peptide) {
+        return false;
+    }
+    if ref_peptide == "*" && alt_peptide == "*" {
+        return false;
+    }
+    if let Some(stop) = alt_peptide.find('*') {
+        if stop + 1 < alt_peptide.len() {
+            alt_peptide = &alt_peptide[..stop + 1];
+        }
+    }
+    alt_peptide.starts_with(ref_peptide) || alt_peptide.ends_with(ref_peptide)
+}
+
+/// Ensembl Variation 116 `inframe_deletion()` predicate.
+///
+/// The length delta alone is not enough: VEP compares the affected codon
+/// alleles and only reports a deletion when the alternate codon is a
+/// removable block at either end or in-frame from the reference codon.
+fn vep116_inframe_deletion(class: &CodingClassification, partial_codon: bool) -> bool {
+    if partial_codon || class.affected_ref_peptide.as_deref() == Some("*") {
+        return false;
+    }
+    let Some((ref_codon, alt_codon)) = class
+        .codons
+        .as_deref()
+        .and_then(|codons| codons.split_once('/'))
+    else {
+        return false;
+    };
+    let ref_codon = if ref_codon == "-" {
+        String::new()
+    } else {
+        ref_codon.to_ascii_uppercase()
+    };
+    let alt_codon = if alt_codon == "-" {
+        String::new()
+    } else {
+        alt_codon.to_ascii_uppercase()
+    };
+    if alt_codon.len() >= ref_codon.len() {
+        return false;
+    }
+    // VEP's terminal prefix/suffix shortcut has no separate `% 3` check.
+    // `_get_codon_alleles()` skips only while `frameshift()` is true, and
+    // VEP's `frameshift()` returns false when `stop_retained()` is true. Keep
+    // that source-defined stop-retained override behavior here; only the
+    // internal-match path checks that the trimmed reference block is a whole
+    // number of codons.
+    if ref_codon.starts_with(&alt_codon) || ref_codon.ends_with(&alt_codon) {
+        return true;
+    }
+
+    let common_prefix = ref_codon
+        .bytes()
+        .zip(alt_codon.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let ref_after_prefix = &ref_codon[common_prefix..];
+    let alt_after_prefix = &alt_codon[common_prefix..];
+    let common_suffix = ref_after_prefix
+        .bytes()
+        .rev()
+        .zip(alt_after_prefix.bytes().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let ref_middle_end = ref_codon.len().saturating_sub(common_suffix);
+    let alt_middle_end = alt_codon.len().saturating_sub(common_suffix);
+    let ref_middle = &ref_codon[common_prefix..ref_middle_end];
+    let alt_middle = &alt_codon[common_prefix..alt_middle_end];
+    alt_middle.is_empty() && ref_middle.len().is_multiple_of(3)
+}
+
+/// Ensembl Variation 116 `protein_altering_variant()` predicate.
+///
+/// Unlike SO parent-term cleanup, this is evaluated from the peptide alleles
+/// for each transcript. Stop consequences can co-occur when the peptide and
+/// child-predicate guards pass.
+fn vep116_protein_altering_variant(
+    class: Option<&CodingClassification>,
+    terms: &BTreeSet<SoTerm>,
+    partial_codon: bool,
+) -> bool {
+    let Some(class) = class else {
+        return false;
+    };
+    let (Some(ref_peptide), Some(alt_peptide)) = (
+        class.affected_ref_peptide.as_deref(),
+        class.affected_alt_peptide.as_deref(),
+    ) else {
+        return false;
+    };
+    if ref_peptide.is_empty() || alt_peptide.is_empty() {
+        return false;
+    }
+    let ref_peptide = if ref_peptide == "-" { "" } else { ref_peptide };
+    let alt_peptide = if alt_peptide == "-" { "" } else { alt_peptide };
+
+    if alt_peptide.len() == ref_peptide.len()
+        || ref_peptide.starts_with('*')
+        || alt_peptide.starts_with('*')
+        || alt_peptide.starts_with(ref_peptide)
+        || alt_peptide.ends_with(ref_peptide)
+    {
+        return false;
+    }
+    if terms.contains(&SoTerm::StartLost)
+        || class.start_lost
+        || terms.contains(&SoTerm::FrameshiftVariant)
+        || vep116_inframe_deletion(class, partial_codon)
+    {
+        return false;
+    }
+    true
 }
 
 /// VEP 116 `coding_unknown()`: peptide ambiguity can coexist with specific
@@ -11479,8 +11689,60 @@ mod tests {
         // would otherwise satisfy the insertion predicate.
         let class = CodingClassification {
             start_lost: true,
+            codons: Some("gct/GCTGCT".to_string()),
             affected_ref_peptide: Some("M".to_string()),
             affected_alt_peptide: Some("MA".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::InframeInsertion]);
+        apply_vep116_primary_indel_predicates(
+            &mut terms,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+        assert!(!terms.contains(&SoTerm::InframeInsertion));
+    }
+
+    #[test]
+    fn vep116_inframe_insertion_requires_codon_and_peptide_alleles() {
+        let class = CodingClassification {
+            affected_ref_peptide: Some("A".to_string()),
+            affected_alt_peptide: Some("AA".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::InframeInsertion]);
+        apply_vep116_primary_indel_predicates(
+            &mut terms,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+        assert!(!terms.contains(&SoTerm::InframeInsertion));
+
+        let valid = CodingClassification {
+            codons: Some("gct/GCTGCT".to_string()),
+            affected_ref_peptide: Some("A".to_string()),
+            affected_alt_peptide: Some("AA".to_string()),
+            ..Default::default()
+        };
+        let mut valid_terms = BTreeSet::from([SoTerm::InframeInsertion]);
+        apply_vep116_primary_indel_predicates(
+            &mut valid_terms,
+            &valid,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+        assert!(valid_terms.contains(&SoTerm::InframeInsertion));
+    }
+
+    #[test]
+    fn vep116_inframe_insertion_rejects_start_retained_suffix_match() {
+        let class = CodingClassification {
+            start_retained: true,
+            codons: Some("gct/GCTGCT".to_string()),
+            affected_ref_peptide: Some("A".to_string()),
+            affected_alt_peptide: Some("AA".to_string()),
             ..Default::default()
         };
         let mut terms = BTreeSet::from([SoTerm::InframeInsertion]);
@@ -11521,11 +11783,7 @@ mod tests {
     #[test]
     fn vep116_partial_codon_vetoes_only_its_guarded_indel_predicates() {
         let class = CodingClassification::default();
-        let mut terms = BTreeSet::from([
-            SoTerm::FrameshiftVariant,
-            SoTerm::InframeDeletion,
-            SoTerm::InframeInsertion,
-        ]);
+        let mut terms = BTreeSet::from([SoTerm::FrameshiftVariant, SoTerm::InframeDeletion]);
         apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
@@ -11534,7 +11792,22 @@ mod tests {
         );
         assert!(!terms.contains(&SoTerm::FrameshiftVariant));
         assert!(!terms.contains(&SoTerm::InframeDeletion));
-        assert!(terms.contains(&SoTerm::InframeInsertion));
+
+        let insertion = CodingClassification {
+            stop_retained: true,
+            codons: Some("-/GCT".to_string()),
+            affected_ref_peptide: Some("-".to_string()),
+            affected_alt_peptide: Some("A".to_string()),
+            ..Default::default()
+        };
+        let mut insertion_terms = BTreeSet::from([SoTerm::InframeInsertion]);
+        apply_vep116_primary_indel_predicates(
+            &mut insertion_terms,
+            &insertion,
+            crate::vep_semantics::VepSemantics::V116,
+            true,
+        );
+        assert!(insertion_terms.contains(&SoTerm::InframeInsertion));
     }
 
     #[test]
@@ -26042,6 +26315,231 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn r3a_v116_terms(
+        cds: &str,
+        start: i64,
+        end: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+    ) -> (Vec<SoTerm>, Option<CodingClassification>) {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let full_cdna = format!("{cds}CCC");
+        let tx_end = 1000 + full_cdna.len() as i64 - 1;
+        let cds_end = 1000 + cds.len() as i64 - 1;
+        let mut transcript = tx(
+            "T_R3A",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(cds_end),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        transcript.spliced_seq = Some(full_cdna);
+        let exon = exon("T_R3A", 1, 1000, tx_end);
+        let translation = translation(
+            "T_R3A",
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            None,
+            Some(cds),
+        );
+        engine.evaluate_transcript_overlap(
+            &var("22", start, end, ref_allele, alt_allele),
+            &transcript,
+            &[&exon],
+            Some(&translation),
+        )
+    }
+
+    fn r3a_v116_raw_coding_terms(
+        cds: &str,
+        start: i64,
+        end: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+    ) -> (
+        std::collections::BTreeSet<SoTerm>,
+        Option<CodingClassification>,
+    ) {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let full_cdna = format!("{cds}CCC");
+        let tx_end = 1000 + full_cdna.len() as i64 - 1;
+        let cds_end = 1000 + cds.len() as i64 - 1;
+        let mut transcript = tx(
+            "T_R3A",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(cds_end),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        transcript.spliced_seq = Some(full_cdna);
+        let exon = exon("T_R3A", 1, 1000, tx_end);
+        let translation = translation(
+            "T_R3A",
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            None,
+            Some(cds),
+        );
+        let variant = var("22", start, end, ref_allele, alt_allele);
+        let mut terms = std::collections::BTreeSet::new();
+        let classification = engine.add_coding_terms(
+            &mut terms,
+            &variant,
+            &transcript,
+            &[&exon],
+            Some(&translation),
+        );
+        (terms, classification)
+    }
+
+    #[test]
+    fn inframe_delins_term_requires_vep_codon_block_deletion() {
+        // VEP's chr12 anchor: a 5-to-2 nt delins has net -3 bp, but
+        // ATCCT -> TC changes IL to S and is not a removable codon block.
+        let (delins_terms, delins_class) =
+            r3a_v116_terms("ATGATCCTCAAATAA", 1003, 1007, "ATCCT", "TC");
+        assert_eq!(
+            delins_class
+                .as_ref()
+                .and_then(|class| class.amino_acids.as_deref()),
+            Some("IL/S")
+        );
+        assert!(delins_terms.contains(&SoTerm::ProteinAlteringVariant));
+        assert!(!delins_terms.contains(&SoTerm::InframeDeletion));
+
+        // A pure three-base deletion remains the positive control.
+        let (deletion_terms, _) = r3a_v116_terms("ATGATCCTCAAATAA", 1003, 1005, "ATC", "-");
+        assert!(deletion_terms.contains(&SoTerm::InframeDeletion));
+        assert!(!deletion_terms.contains(&SoTerm::ProteinAlteringVariant));
+    }
+
+    #[test]
+    fn vep116_stop_retained_keeps_terminal_codon_match_for_inframe_deletion() {
+        // VEP's frameshift predicate returns false for stop_retained, allowing
+        // inframe_deletion's terminal codon-prefix check to run even when its
+        // local codon allele is shorter by a non-triplet amount.
+        let class = CodingClassification {
+            stop_retained: true,
+            codons: Some("ATG/AT".to_string()),
+            affected_ref_peptide: Some("M".to_string()),
+            affected_alt_peptide: Some("X".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::InframeDeletion]);
+        apply_vep116_primary_indel_predicates(
+            &mut terms,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+        assert!(terms.contains(&SoTerm::InframeDeletion));
+    }
+
+    #[test]
+    fn protein_altering_variant_obeys_defined_peptides_and_stop_coemission() {
+        // A defined E/A* peptide pair passes VEP's PAV checks; the internal
+        // stop does not suppress co-emission when the alternate peptide does
+        // not start with '*'.
+        let (stop_gained_terms, stop_gained_class) =
+            r3a_v116_terms("ATGGAACCCTGA", 1004, 1004, "-", "CTT");
+        assert_eq!(
+            stop_gained_class
+                .as_ref()
+                .and_then(|class| class.affected_ref_peptide.as_deref()),
+            Some("E")
+        );
+        assert_eq!(
+            stop_gained_class
+                .as_ref()
+                .and_then(|class| class.affected_alt_peptide.as_deref()),
+            Some("A*")
+        );
+        assert!(stop_gained_terms.contains(&SoTerm::StopGained));
+        assert!(stop_gained_terms.contains(&SoTerm::ProteinAlteringVariant));
+
+        // If the alternate peptide starts with '*', VEP rejects PAV.
+        let (leading_stop_terms, leading_stop_class) =
+            r3a_v116_terms("ATGACTCCCTCTGAATGA", 1003, 1011, "ACTCCCTCT", "TAA");
+        assert_eq!(
+            leading_stop_class
+                .as_ref()
+                .and_then(|class| class.affected_ref_peptide.as_deref()),
+            Some("TPS")
+        );
+        assert_eq!(
+            leading_stop_class
+                .as_ref()
+                .and_then(|class| class.affected_alt_peptide.as_deref()),
+            Some("*")
+        );
+        assert!(leading_stop_terms.contains(&SoTerm::StopGained));
+        assert!(!leading_stop_terms.contains(&SoTerm::ProteinAlteringVariant));
+        assert!(!leading_stop_terms.contains(&SoTerm::InframeDeletion));
+    }
+
+    #[test]
+    fn protein_altering_variant_requires_defined_boundary_peptides() {
+        // This deletion crosses the CDS end. VEP has a known coding bound but
+        // no complete codon/peptide alleles, so the no-classification fallback
+        // must not insert protein_altering_variant.
+        let (terms, class) = r3a_v116_terms("ATGGCTGAACCC", 1011, 1012, "CC", "-");
+        let class = class.expect("partial CDS overlap coordinates are retained");
+        assert!(class.affected_ref_peptide.is_none());
+        assert!(class.affected_alt_peptide.is_none());
+        assert!(!terms.contains(&SoTerm::ProteinAlteringVariant));
+
+        // Inspect the predicate output before parent-term cleanup. This makes
+        // the regression fail if the fallback inserts PAV without peptide
+        // alleles, even when StopLost would later hide it.
+        let (raw_terms, raw_class) =
+            r3a_v116_raw_coding_terms("ATGGCTGAACCC", 1011, 1012, "CC", "-");
+        let raw_class = raw_class.expect("partial CDS overlap coordinates are retained");
+        assert!(raw_class.affected_ref_peptide.is_none());
+        assert!(raw_class.affected_alt_peptide.is_none());
+        assert!(
+            !raw_terms.contains(&SoTerm::ProteinAlteringVariant),
+            "VEP PAV requires both peptide alleles, got {raw_terms:?}"
+        );
+    }
+
+    #[test]
+    fn v116_collapse_preserves_predicate_valid_pav_with_stop_gained() {
+        let assignments = [TranscriptConsequence {
+            terms: vec![SoTerm::StopGained, SoTerm::ProteinAlteringVariant],
+            ..Default::default()
+        }];
+
+        let legacy = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
+        assert!(!legacy.contains(&SoTerm::ProteinAlteringVariant));
+
+        let v116 = TranscriptConsequenceEngine::collapse_variant_terms_with_semantics(
+            &assignments,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        assert!(v116.contains(&SoTerm::StopGained));
+        assert!(v116.contains(&SoTerm::ProteinAlteringVariant));
     }
 
     // ── Issue #116: stop_gained via local codon window for insertions ────
