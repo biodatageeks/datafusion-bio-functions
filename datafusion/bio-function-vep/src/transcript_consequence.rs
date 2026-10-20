@@ -8392,8 +8392,14 @@ fn classify_insertion_with_semantics(
     //
     // VEP uses this same local window for BOTH stop_retained and
     // stop_gained predicates (both call _get_peptide_alleles).
-    let local_aas = if codon_at < old_aas.len() {
-        let codon_start = codon_at * 3;
+    // The final partial codon has no entry in the full-protein translation,
+    // so `codon_at == old_aas.len()` is still a real VEP peptide window. In
+    // particular, a one-base insertion can complete that window as a stop
+    // codon (X -> *) and VEP's stop_gained predicate has no partial_codon
+    // veto.
+    let codon_start = codon_at.saturating_mul(3);
+    let has_reference_codon_window = codon_start < effective_cds.len();
+    let local_aas = if has_reference_codon_window {
         let window_len = 3 + alt_len;
         let window_end = (codon_start + window_len).min(mutated.len());
         let local_window = &mutated[codon_start..window_end];
@@ -8401,8 +8407,7 @@ fn classify_insertion_with_semantics(
     } else {
         Vec::new()
     };
-    if codon_at < old_aas.len() {
-        let codon_start = codon_at * 3;
+    if has_reference_codon_window {
         let ref_end = (codon_start + 3).min(effective_cds.len());
         let alt_end = (codon_start + 3 + alt_len).min(mutated.len());
         class.affected_ref_peptide =
@@ -26448,6 +26453,96 @@ mod tests {
         );
         assert!(negative_insertion.contains(&SoTerm::IncompleteTerminalCodonVariant));
         assert!(!negative_insertion.contains(&SoTerm::FrameshiftVariant));
+    }
+
+    #[test]
+    fn issue_220_partial_terminal_insertion_can_coemit_stop_gained() {
+        // vepyr#240's X:136206487 anchor. VEP's stop_gained predicate has no
+        // partial_codon guard: this insertion completes the terminal TA as
+        // TAA and must co-emit stop_gained with ITC.
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let cds = "ATGGCGGAGAAGTTTGACTGCCACTACTGCAGGGATCCCTTGCAGGGGAAGAAGTA";
+        let mut transcript = tx(
+            "ENST00000625935",
+            "X",
+            136_167_009,
+            136_206_488,
+            1,
+            "protein_coding",
+            Some(136_206_433),
+            Some(136_206_488),
+        );
+        transcript.cdna_coding_start = Some(361);
+        transcript.cdna_coding_end = Some(416);
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 136_167_009,
+                genomic_end: 136_167_077,
+                cdna_start: 1,
+                cdna_end: 69,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 136_167_845,
+                genomic_end: 136_168_035,
+                cdna_start: 70,
+                cdna_end: 260,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 136_169_907,
+                genomic_end: 136_169_980,
+                cdna_start: 261,
+                cdna_end: 334,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 136_206_407,
+                genomic_end: 136_206_488,
+                cdna_start: 335,
+                cdna_end: 416,
+                ori: 1,
+            },
+        ];
+        transcript.translateable_seq = Some(cds.to_string());
+        transcript.cdna_seq = Some(cds.to_string());
+        transcript.cds_end_nf = true;
+        transcript.flags_str = Some("cds_end_NF".to_string());
+        transcript.translation_stable_id = Some("ENSP00000487360".to_string());
+        let exon_features = [
+            exon("ENST00000625935", 1, 136_167_009, 136_167_077),
+            exon("ENST00000625935", 2, 136_167_845, 136_168_035),
+            exon("ENST00000625935", 3, 136_169_907, 136_169_980),
+            exon("ENST00000625935", 4, 136_206_407, 136_206_488),
+        ];
+        let exons = exon_features.iter().collect::<Vec<_>>();
+        let translation = translation(
+            "ENST00000625935",
+            Some(56),
+            Some(18),
+            Some("MAEKFDCHYCRDPLQGKK"),
+            Some(cds),
+        );
+        // The VCF parser has already converted T>TA to VEP's empty insertion
+        // interval (start = anchor + 1, end = anchor).
+        let variant = var("X", 136_206_488, 136_206_487, "-", "A");
+
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, Some(&translation));
+
+        assert!(terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
+        assert!(
+            terms.contains(&SoTerm::StopGained),
+            "VEP stop_gained must co-emit with ITC when the alternate peptide is a stop: {terms:?}"
+        );
+        let classification = classification.expect("coding insertion should be classified");
+        assert_eq!(classification.affected_ref_peptide.as_deref(), Some("X"));
+        assert_eq!(classification.affected_alt_peptide.as_deref(), Some("*"));
     }
 
     #[test]
