@@ -47,11 +47,11 @@ parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
 # both are PR heads until released.
 # Every formats crate in this workspace, the pileup crate's included, has to name
 # the same tag or rev, or the lockfile resolves two copies of datafusion-bio-format-core.
-datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "64c4001452fecfe9d87d52006ef39fa9cfd7cf9b" }
-datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "64c4001452fecfe9d87d52006ef39fa9cfd7cf9b" }
-datafusion-bio-format-gff = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "64c4001452fecfe9d87d52006ef39fa9cfd7cf9b" }
-datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "64c4001452fecfe9d87d52006ef39fa9cfd7cf9b" }
-datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "64c4001452fecfe9d87d52006ef39fa9cfd7cf9b", optional = true }
+datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "2d94421b760603fb3149ac5dad7448f77a9b96ae" }
+datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "2d94421b760603fb3149ac5dad7448f77a9b96ae" }
+datafusion-bio-format-gff = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "2d94421b760603fb3149ac5dad7448f77a9b96ae" }
+datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "2d94421b760603fb3149ac5dad7448f77a9b96ae" }
+datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "2d94421b760603fb3149ac5dad7448f77a9b96ae", optional = true }
 indicatif = "0.18.4"
 
 # `libc` is only used by `peak_rss_mb()` (getrusage) on UNIX; scoping it here
