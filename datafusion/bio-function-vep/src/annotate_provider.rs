@@ -8667,7 +8667,10 @@ fn refseq_misalignment_offset(tx: &TranscriptFeature, cdna_start: i64) -> Option
 
     let mut offset = 0_i64;
     for edit in &tx.refseq_edits {
-        if edit.end >= cdna_start {
+        // VEP's `get_misalignment_offset` compares the variant start to the
+        // first coordinate in each `_rna_edit` attribute. A deletion affects
+        // its first base too, even though its end lies after that base.
+        if edit.start > cdna_start {
             continue;
         }
         offset += refseq_edit_offset_delta(edit).unwrap_or(0);
@@ -21596,9 +21599,43 @@ mod tests {
             skip_refseq_offset: false,
         }];
 
-        assert_eq!(refseq_misalignment_offset(&tx, 1447), None);
+        assert_eq!(refseq_misalignment_offset(&tx, 1446), None);
+        assert_eq!(refseq_misalignment_offset(&tx, 1447), Some(2));
         assert_eq!(refseq_misalignment_offset(&tx, 1448), Some(2));
         assert_eq!(refseq_misalignment_offset(&tx, 2768), Some(2));
+    }
+
+    #[test]
+    fn test_refseq_misalignment_offset_counts_cumulative_edits_from_edit_start() {
+        for (id, strand) in [("NM_000001.1", 1), ("XM_000001.1", -1)] {
+            let mut tx = make_selection_tx(id, Some("RefSeq"));
+            tx.strand = strand;
+            tx.refseq_edits = vec![
+                RefSeqEdit {
+                    start: 10,
+                    end: 9,
+                    replacement_len: Some(3),
+                    skip_refseq_offset: false,
+                },
+                RefSeqEdit {
+                    start: 30,
+                    end: 31,
+                    replacement_len: None,
+                    skip_refseq_offset: false,
+                },
+            ];
+
+            assert_eq!(refseq_misalignment_offset(&tx, 30), Some(1), "{id}");
+        }
+
+        let mut ensembl = make_selection_tx("ENST000001", Some("Ensembl"));
+        ensembl.refseq_edits = vec![RefSeqEdit {
+            start: 10,
+            end: 9,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        assert_eq!(refseq_misalignment_offset(&ensembl, 30), None);
     }
 
     #[test]
