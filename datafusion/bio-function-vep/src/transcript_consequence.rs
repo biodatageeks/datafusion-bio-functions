@@ -3046,8 +3046,10 @@ impl TranscriptConsequenceEngine {
         // is transcript ordered and preserves insertion intervals. Using the
         // lowest genomic coordinate selects the wrong codon on the negative
         // strand.
-        let partial_terminal_codon = self.semantics.vep116_stop_predicates()
-            && vep116_partial_terminal_codon(tx, tx_exons, tx_translation, variant);
+        let partial_terminal_codon =
+            vep_partial_terminal_codon(tx, tx_exons, tx_translation, variant);
+        let partial_terminal_codon_v116 =
+            self.semantics.vep116_stop_predicates() && partial_terminal_codon;
         if partial_terminal_codon {
             terms.insert(SoTerm::IncompleteTerminalCodonVariant);
         }
@@ -3072,10 +3074,10 @@ impl TranscriptConsequenceEngine {
             } else if diff % 3 == 0 {
                 if alt_len > ref_len {
                     terms.insert(SoTerm::InframeInsertion);
-                } else if !partial_terminal_codon {
+                } else if !partial_terminal_codon_v116 {
                     terms.insert(SoTerm::InframeDeletion);
                 }
-            } else if !partial_terminal_codon {
+            } else if !partial_terminal_codon_v116 {
                 terms.insert(SoTerm::FrameshiftVariant);
             }
 
@@ -3100,7 +3102,7 @@ impl TranscriptConsequenceEngine {
                     terms,
                     &classification,
                     self.semantics,
-                    partial_terminal_codon,
+                    partial_terminal_codon_v116,
                 );
                 // VEP's inframe_insertion requires ref_pep to be an exact
                 // prefix OR suffix of alt_pep (pure insertion in the peptide).
@@ -4606,16 +4608,24 @@ fn cds_is_incomplete(tx: &TranscriptFeature, tx_translation: Option<&Translation
     cds_len % 3 != 0
 }
 
-/// Replay VEP 116 `partial_codon()` using the mapper's translation start.
+/// Replay VEP's `partial_codon()` using the mapper's translation start. This
+/// coordinate predicate is shared by the supported VEP 115 and 116 semantics;
+/// callers version-gate only the stop-family consequences that consume it.
 /// The start is the transcript-5'-most mapped position; for insertions the
 /// mapper keeps VEP's empty interval instead of inventing a genomic base.
-fn vep116_partial_terminal_codon(
+fn vep_partial_terminal_codon(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
 ) -> bool {
-    let cds_len = reference_translateable_seq_for_vep(tx, tx_translation)
+    let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
+    let phase = translateable_seq
+        .as_deref()
+        .map(|sequence| sequence.bytes().take_while(|&base| base == b'N').count())
+        .unwrap_or(0);
+    let cds_len = translateable_seq
+        .as_ref()
         .map(|sequence| sequence.len())
         .or_else(|| tx_translation.and_then(|translation| translation.cds_len))
         .or_else(|| {
@@ -4630,14 +4640,10 @@ fn vep116_partial_terminal_codon(
         return false;
     };
 
-    let mapper = vep_coords::VepTxMapper::new(
-        tx,
-        tx_exons,
-        tx_translation,
-        vep_coords::CdnaBaseMap::Output,
-    );
+    let mapper =
+        vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, phase);
     let Some(translation_start) = mapper
-        .translation(vep_coords::VepSpan::from_variant(variant))
+        .translation_with_genomic_cds_fallback(vep_coords::VepSpan::from_variant(variant))
         .start
         .filter(|&position| position > 0)
     else {
@@ -7666,7 +7672,7 @@ fn classify_coding_change_with_semantics(
             .map(|peptide| peptide.iter().collect());
     }
     let partial_terminal_codon = semantics.vep116_stop_predicates()
-        && vep116_partial_terminal_codon(tx, tx_exons, Some(translation), variant);
+        && vep_partial_terminal_codon(tx, tx_exons, Some(translation), variant);
 
     // Per-codon stop analysis.
     //
@@ -8405,7 +8411,7 @@ fn classify_insertion_with_semantics(
             local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
     }
     let partial_terminal_codon = semantics.vep116_stop_predicates()
-        && vep116_partial_terminal_codon(tx, tx_exons, tx_translation, variant);
+        && vep_partial_terminal_codon(tx, tx_exons, tx_translation, variant);
 
     // stop_retained: VEP's ref_eq_alt_sequence (VariationEffect.pm L1320-1355)
     if !class.stop_retained && codon_at < old_aas.len() {
@@ -10614,6 +10620,17 @@ fn genomic_to_cds_index(
         return cdna.checked_sub(coding_start);
     }
 
+    genomic_to_cds_index_from_segments(tx, tx_exons, pos)
+}
+
+/// Map a genomic base through the transcript's genomic CDS segments, in
+/// transcript order. Used when legacy RefSeq cache rows have genomic CDS
+/// bounds but omit the cDNA CDS bounds needed by the RefSeq mapper path.
+pub(super) fn genomic_to_cds_index_from_segments(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    pos: i64,
+) -> Option<usize> {
     let segments = coding_segments(tx, tx_exons)?;
     let mut offset = 0usize;
     for (seg_start, seg_end) in segments {
@@ -26350,6 +26367,7 @@ mod tests {
     }
 
     fn incomplete_cds_terms(
+        semantics: crate::vep_semantics::VepSemantics,
         strand: i8,
         tx_start: i64,
         variant_start: i64,
@@ -26358,10 +26376,7 @@ mod tests {
         alt_allele: &str,
     ) -> BTreeSet<SoTerm> {
         let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
-            5000,
-            5000,
-            false,
-            crate::vep_semantics::VepSemantics::V116,
+            5000, 5000, false, semantics,
         );
         let cds = "ATGGCTGA"; // two bases in the terminal codon
         let tx_end = tx_start + cds.len() as i64 - 1;
@@ -26393,22 +26408,185 @@ mod tests {
         // complete codon. The lower genomic coordinate is the 3' end, which
         // belongs to the incomplete terminal codon. VEP maps in transcript
         // order, so this event must not be marked ITC.
-        let terms = incomplete_cds_terms(-1, 2000, 2000, 2002, "GCA", "G");
+        let terms = incomplete_cds_terms(
+            crate::vep_semantics::VepSemantics::V116,
+            -1,
+            2000,
+            2000,
+            2002,
+            "GCA",
+            "G",
+        );
         assert!(terms.contains(&SoTerm::FrameshiftVariant));
         assert!(!terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
     }
 
     #[test]
     fn partial_codon_vetoes_frameshift_on_both_strands_but_keeps_itc() {
-        let positive = incomplete_cds_terms(1, 1000, 1007, 1007, "A", "-");
+        let positive = incomplete_cds_terms(
+            crate::vep_semantics::VepSemantics::V116,
+            1,
+            1000,
+            1007,
+            1007,
+            "A",
+            "-",
+        );
         assert!(positive.contains(&SoTerm::IncompleteTerminalCodonVariant));
         assert!(!positive.contains(&SoTerm::FrameshiftVariant));
 
         // Insertion at the negative-strand terminal codon has VEP's empty
         // mapper interval. ITC is allowed to co-emit; frameshift is vetoed.
-        let negative_insertion = incomplete_cds_terms(-1, 2000, 2001, 2001, "-", "A");
+        let negative_insertion = incomplete_cds_terms(
+            crate::vep_semantics::VepSemantics::V116,
+            -1,
+            2000,
+            2001,
+            2001,
+            "-",
+            "A",
+        );
         assert!(negative_insertion.contains(&SoTerm::IncompleteTerminalCodonVariant));
         assert!(!negative_insertion.contains(&SoTerm::FrameshiftVariant));
+    }
+
+    #[test]
+    fn partial_terminal_codon_remains_enabled_for_v115() {
+        let terms = incomplete_cds_terms(
+            crate::vep_semantics::VepSemantics::V115,
+            1,
+            1000,
+            1007,
+            1007,
+            "A",
+            "G",
+        );
+        assert!(terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
+
+        let indel_terms = incomplete_cds_terms(
+            crate::vep_semantics::VepSemantics::V115,
+            1,
+            1000,
+            1007,
+            1007,
+            "A",
+            "-",
+        );
+        assert!(indel_terms.contains(&SoTerm::FrameshiftVariant));
+    }
+
+    #[test]
+    fn partial_terminal_codon_falls_back_for_caches_without_cdna_cds_bounds() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let cds = "ATGGCTGA";
+        let mut transcript = tx(
+            "T1",
+            "22",
+            1000,
+            1007,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1007),
+        );
+        transcript.spliced_seq = Some(cds.to_string());
+        let exon = exon("T1", 1, 1000, 1007);
+        let exons = [&exon];
+        let translation = translation("T1", Some(cds.len()), Some(2), None, Some(cds));
+        let variant = var("22", 1007, 1007, "A", "G");
+        let (terms, _) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, Some(&translation));
+        assert!(terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
+
+        // An insertion immediately before the 2-base terminal codon starts
+        // at the next translation coordinate after its 5' flank.
+        let insertion = var("22", 1006, 1006, "-", "A");
+        let (insertion_terms, _) =
+            engine.evaluate_transcript_overlap(&insertion, &transcript, &exons, Some(&translation));
+        assert!(insertion_terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
+    }
+
+    #[test]
+    fn partial_terminal_codon_fallback_uses_genomic_segments_for_refseq() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let cds = "ATGGCTGA";
+        let mut transcript = tx(
+            "NM_000001.1",
+            "22",
+            1000,
+            1007,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1007),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.spliced_seq = Some(cds.to_string());
+        let exon = exon("NM_000001.1", 1, 1000, 1007);
+        let exons = [&exon];
+        let translation = translation("NM_000001.1", Some(cds.len()), Some(2), None, Some(cds));
+
+        let variant = var("22", 1007, 1007, "A", "G");
+        let (terms, _) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, Some(&translation));
+        assert!(terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
+
+        let insertion = var("22", 1006, 1006, "-", "A");
+        let (insertion_terms, _) =
+            engine.evaluate_transcript_overlap(&insertion, &transcript, &exons, Some(&translation));
+        assert!(insertion_terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
+    }
+
+    #[test]
+    fn partial_terminal_codon_uses_phase_from_vep_cds_sequence() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let cds = "ATGGCTGA";
+        let mut transcript = tx(
+            "T1",
+            "22",
+            1000,
+            1007,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1007),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        transcript.spliced_seq = Some(cds.to_string());
+        let exon = exon("T1", 1, 1000, 1007);
+        let exons = [&exon];
+        let mut translation = translation("T1", Some(10), Some(3), None, Some("NNATGGCTGA"));
+        translation.cds_sequence_canonical = Some(cds.to_string());
+        translation.translation_seq_canonical = Some("MA".to_string());
+        assert_eq!(
+            reference_translateable_seq_for_vep(&transcript, Some(&translation)).as_deref(),
+            Some("NNATGGCTGA")
+        );
+        assert_eq!(
+            reference_translateable_seq_for_hgvsp(&transcript, Some(&translation)).as_deref(),
+            Some(cds)
+        );
+
+        let variant = var("22", 1007, 1007, "A", "G");
+        let (terms, _) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, Some(&translation));
+        assert!(terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
     }
 
     #[test]
