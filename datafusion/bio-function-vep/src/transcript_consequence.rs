@@ -8424,6 +8424,23 @@ fn classify_insertion_with_semantics(
             // Frameshift insertion at codon boundary: VEP uses "-/X" because
             // no existing codon is disrupted — the insertion happens between codons.
             class.amino_acids = Some("-/X".to_string());
+        } else if frameshift
+            && partial_terminal_codon
+            && class
+                .affected_alt_peptide
+                .as_deref()
+                .is_some_and(|peptide| peptide.ends_with('X'))
+            && class.affected_ref_peptide.is_some()
+        {
+            // Keep the full local peptide window when its last codon is
+            // incomplete. VEP exposes that final remainder as X in the
+            // Amino_acids field (the codon window is also retained above).
+            if let (Some(ref_peptide), Some(alt_peptide)) = (
+                class.affected_ref_peptide.as_deref(),
+                class.affected_alt_peptide.as_deref(),
+            ) {
+                class.amino_acids = Some(format!("{ref_peptide}/{alt_peptide}"));
+            }
         } else if frameshift {
             // Frameshifts: VEP uses X for the altered downstream sequence.
             // If the first affected codon's amino acid is preserved, show it
@@ -24590,6 +24607,37 @@ mod tests {
             c.codons.is_some(),
             "Codons should be computed for incomplete terminal codon insertion, got None"
         );
+    }
+
+    #[test]
+    fn test_issue_228_preserves_partial_terminal_codon_in_codons() {
+        // Insert eight bases after the two-base terminal CDS codon. VEP's
+        // local alternate window includes the padded third base and retains
+        // its final incomplete codon as X in Amino_acids.
+        let cds = "ATGGAACT";
+        let mut t = tx(
+            "T228",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1007),
+        );
+        t.cdna_coding_end = Some(cds.len());
+        t.translateable_seq = Some(cds.to_string());
+        t.spliced_seq = Some("ATGGAACTG".to_string());
+        t.three_prime_utr_seq = Some("G".to_string());
+        let e = exon("T228", 1, 1000, 1008);
+        let exons = [&e];
+        let tr = translation("T228", Some(cds.len()), Some(2), Some("ME"), Some(cds));
+        let variant = var("22", 1008, 1008, "-", "GACCCTGG");
+        let classification = classify_insertion(&t, &exons, Some(&tr), cds, &variant, "GACCCTGG")
+            .expect("terminal insertion should classify");
+
+        assert_eq!(classification.codons.as_deref(), Some("ctg/ctGACCCTGGg"));
+        assert_eq!(classification.amino_acids.as_deref(), Some("L/LTLX"));
     }
 
     #[test]

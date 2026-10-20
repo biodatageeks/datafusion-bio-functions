@@ -2318,6 +2318,31 @@ fn resolve_frameshift_hgvs(
         let ref_aa = peptide_char(&ref_translation, start)?;
         let alt_aa = peptide_char(alt_translation, start)?;
         if ref_aa == '*' && alt_aa == '*' {
+            let shared_stop_has_added_peptide = protein
+                .ref_peptide
+                .find('*')
+                .zip(protein.alt_peptide.find('*'))
+                .is_some_and(|(ref_stop, alt_stop)| {
+                    ref_stop == alt_stop
+                        && ref_stop == start.saturating_sub(protein.start)
+                        && protein.alt_peptide.len() > protein.ref_peptide.len()
+                        && protein
+                            .alt_peptide
+                            .get(alt_stop + 1..)
+                            .is_some_and(|tail| tail.chars().any(|aa| aa != '*'))
+                });
+            if shared_stop_has_added_peptide {
+                // VEP formats the real stop-retaining event as a delins, then
+                // truncates the alternate peptide at the first Ter. Keep the
+                // inserted context until `format_hgvsp_notation` applies that
+                // rule instead of collapsing the shared stop to `=` here.
+                notation.kind = "delins".to_string();
+                notation.start = protein.start;
+                notation.end = protein.end;
+                notation.ref_allele = protein.ref_peptide.replacen('*', "X", 1);
+                notation.alt_allele = protein.alt_peptide.replacen('*', "X", 1);
+                return Some(());
+            }
             notation.kind = "=".to_string();
             notation.start = start;
             notation.end = start;
@@ -3019,6 +3044,73 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ter262=".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_stop_retaining_insertion_formats_delins_ter() {
+        let translation = make_translation();
+        let reference = format!("{}*", "A".repeat(411));
+        let alternate = format!("{}*Q", "A".repeat(411));
+        let protein = ProteinHgvsData {
+            start: 412,
+            end: 412,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "*Q".to_string(),
+            ref_translation: reference,
+            alt_translation: alternate,
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter412delinsTer".to_string())
+        );
+
+        let reference = format!("{}H*", "A".repeat(355));
+        let alternate = format!("{}H*Q", "A".repeat(355));
+        let protein = ProteinHgvsData {
+            start: 356,
+            end: 357,
+            ref_peptide: "H*".to_string(),
+            alt_peptide: "H*Q".to_string(),
+            ref_translation: reference,
+            alt_translation: alternate,
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.His356_Ter357delinsHisTer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_recreated_stop_without_added_peptide_stays_synonymous() {
+        let translation = make_translation();
+        let reference = format!("{}*", "A".repeat(411));
+        let protein = ProteinHgvsData {
+            start: 412,
+            end: 412,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "*".to_string(),
+            ref_translation: reference.clone(),
+            alt_translation: reference,
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter412=".to_string())
         );
     }
 
