@@ -2400,6 +2400,15 @@ fn stop_loss_extra_aa(
     ref_var_pos: usize,
     frameshift: bool,
 ) -> Option<usize> {
+    // Deliberate replica of a VEP bug (vepyr#224). `_stop_loss_extra_AA`
+    // opens with `return undef unless $ref_var_pos;`
+    // (ensembl-variation 116 `TranscriptVariationAllele.pm:2477`), and Perl's
+    // 0 is false, so a change at residue 1 (`ref_var_pos` = start - 1 = 0)
+    // never counts the distance to the new stop: every caller then prints
+    // `fsTer?` / `Ter?` or omits `extTer`, even when a stop exists.
+    if ref_var_pos == 0 {
+        return None;
+    }
     let alt_translation = protein
         .alt_translation_extension
         .as_deref()
@@ -6283,6 +6292,57 @@ mod tests {
             native_refseq: false,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 3, true), Some(2));
+    }
+
+    /// vepyr#224: `_stop_loss_extra_AA` opens with
+    /// `return undef unless $ref_var_pos;` (`TranscriptVariationAllele.pm:2477`),
+    /// and Perl's 0 is false, so a change at residue 1 (`ref_var_pos` 0)
+    /// never counts the distance to the new stop, frameshift or not.
+    #[test]
+    fn test_stop_loss_extra_aa_returns_none_at_ref_var_pos_zero() {
+        for frameshift in [true, false] {
+            let protein = ProteinHgvsData {
+                start: 1,
+                end: 1,
+                ref_peptide: "K".into(),
+                alt_peptide: "Q".into(),
+                ref_translation: "MKKK*".into(),
+                alt_translation: "MKQW*".into(),
+                alt_translation_extension: None,
+                frameshift,
+                start_lost: false,
+                stop_lost: false,
+                native_refseq: false,
+            };
+            assert_eq!(stop_loss_extra_aa(&protein, 0, frameshift), None);
+        }
+    }
+
+    /// vepyr#224: a frameshift whose first changed residue is residue 1 (a
+    /// `cds_start_NF` fragment, so no Met and no start_lost) prints `fsTer?`
+    /// in VEP even though the alternate translation has a stop: the fs arm
+    /// passes `start - 1 = 0` to `_stop_loss_extra_AA` (`:2003-2008`).
+    #[test]
+    fn test_format_hgvsp_frameshift_at_residue_one_reports_unknown_stop() {
+        let translation = make_translation();
+        let alt_translation = format!("H{}*", "W".repeat(46));
+        let protein = ProteinHgvsData {
+            start: 1,
+            end: 1,
+            ref_peptide: "P".to_string(),
+            alt_peptide: "H".to_string(),
+            ref_translation: format!("P{}", "K".repeat(60)),
+            alt_translation,
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Pro1HisfsTer?".to_string())
+        );
     }
 
     // ---------------------------------------------------------------
