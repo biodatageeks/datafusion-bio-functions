@@ -4638,6 +4638,11 @@ impl AnnotateProvider {
                     .or_else(|| source_col.as_deref().and_then(normalize_source_label));
                 let bam_edit_status =
                     bam_edit_status_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let three_prime_utr_seq = vep_cached_three_prime_utr_seq(
+                    three_prime_utr_seq_idx.is_some(),
+                    three_prime_utr_seq,
+                    bam_edit_status.as_deref(),
+                );
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                     .unwrap_or(false);
@@ -5309,8 +5314,14 @@ impl AnnotateProvider {
                 }
                 let five_prime_utr_seq = five_prime_utr_seq_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let three_prime_utr_seq = three_prime_utr_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let bam_edit_status =
+                    bam_edit_status_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let three_prime_utr_seq = vep_cached_three_prime_utr_seq(
+                    three_prime_utr_seq_idx.is_some(),
+                    three_prime_utr_seq_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    bam_edit_status.as_deref(),
+                );
                 let cdna_seq =
                     cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let spliced_seq = spliced_seq_idx
@@ -5401,8 +5412,7 @@ impl AnnotateProvider {
                     is_gencode_primary: is_gencode_primary_idx
                         .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                         .unwrap_or(false),
-                    bam_edit_status: bam_edit_status_idx
-                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    bam_edit_status,
                     has_non_polya_rna_edit,
                     spliced_seq,
                     five_prime_utr_seq,
@@ -8529,6 +8539,40 @@ fn normalize_source_label(source: &str) -> Option<String> {
         value if matches!(value, "BestRefSeq" | "RefSeq" | "Gnomon") => Some("RefSeq".to_string()),
         other => Some(other.to_string()),
     }
+}
+
+/// VEP's `_three_prime_utr()` for a transcript row of a cache that carries the
+/// `three_prime_utr_seq` column (`has_column`).
+///
+/// VEP caches every transcript's 3'UTR when the cache is built, undef
+/// included, and `_three_prime_utr()` returns the cached value whenever the
+/// key exists, so a null value is "no 3'UTR". It is returned as `Some("")`,
+/// which `three_prime_utr_seq()` reads as no UTR without deriving one; `None`
+/// keeps meaning "no cached state, derive it". A successful BAM edit deletes
+/// the cached key and VEP recomputes it from the edited transcript, so those
+/// rows keep the derivation (vepyr#231). This assumes the column is written
+/// for every row whose transcript object carries the key, which is how the
+/// cache producer writes it (VEP stores the key for every transcript).
+///
+/// Traceability:
+/// - ensembl-vep `AnnotationSource::Database::Transcript::prefetch_transcript_data()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/116.0/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L354-L356
+/// - Ensembl Variation `BaseTranscriptVariation::_generic_utr()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1101-L1115
+/// - ensembl-vep `AnnotationType::Transcript::apply_edits()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/116.0/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L599-L614
+fn vep_cached_three_prime_utr_seq(
+    has_column: bool,
+    cached: Option<String>,
+    bam_edit_status: Option<&str>,
+) -> Option<String> {
+    if !has_column || cached.is_some() {
+        return cached;
+    }
+    if bam_edit_status.is_some_and(|status| status.eq_ignore_ascii_case("ok")) {
+        return None;
+    }
+    Some(String::new())
 }
 
 fn synthesize_spliced_seq(
@@ -18776,6 +18820,108 @@ mod tests {
                 .map(String::as_str),
             Some("ATG")
         );
+    }
+
+    /// vepyr#231. The offline cache stores VEP's `three_prime_utr` for every
+    /// transcript, undef included (ensembl-vep `AnnotationSource/Database/
+    /// Transcript.pm:355-356`), and `_three_prime_utr()` returns the cached
+    /// value whenever the key exists (`BaseTranscriptVariation.pm:1107-1114`).
+    /// A null cached UTR therefore means "no 3'UTR", not "derive one": deriving
+    /// it from the synthesized `spliced_seq` returned the N phase padding of
+    /// `cds_start_NF` transcripts as a fake UTR. Only a successful BAM edit
+    /// deletes the cached key so it is recomputed (`AnnotationType/
+    /// Transcript.pm:599-614`).
+    #[tokio::test]
+    async fn issue_231_null_cached_three_prime_utr_is_cached_undef() {
+        for include_utr_column in [true, false] {
+            let mut fields = vec![
+                Field::new("transcript_id", DataType::Utf8, false),
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("strand", DataType::Int64, false),
+                Field::new("biotype", DataType::Utf8, false),
+                Field::new("bam_edit_status", DataType::Utf8, true),
+                Field::new("cdna_coding_start", DataType::Int64, true),
+                Field::new("cdna_coding_end", DataType::Int64, true),
+                Field::new("translateable_seq", DataType::Utf8, true),
+                Field::new("spliced_seq", DataType::Utf8, true),
+            ];
+            let mut columns: Vec<Arc<dyn Array>> = vec![
+                Arc::new(StringArray::from(vec!["padded", "bam_ok", "cached"])),
+                Arc::new(StringArray::from(vec!["1"; 3])),
+                Arc::new(Int64Array::from(vec![100_i64; 3])),
+                Arc::new(Int64Array::from(vec![200_i64; 3])),
+                Arc::new(Int64Array::from(vec![1_i64; 3])),
+                Arc::new(StringArray::from(vec!["protein_coding"; 3])),
+                Arc::new(StringArray::from(vec![None, Some("ok"), None])),
+                Arc::new(Int64Array::from(vec![Some(1_i64); 3])),
+                Arc::new(Int64Array::from(vec![Some(15_i64); 3])),
+                Arc::new(StringArray::from(vec![
+                    Some("NNGCTGAAAAAATGA"),
+                    Some("GCTGAAAAAATGA"),
+                    Some("GCTGAAAAAATGA"),
+                ])),
+                Arc::new(StringArray::from(vec![None, Some("GCTGAAAAAATGAGG"), None])),
+            ];
+            if include_utr_column {
+                fields.push(Field::new("three_prime_utr_seq", DataType::Utf8, true));
+                columns.push(Arc::new(StringArray::from(vec![None, None, Some("GGG")])));
+            }
+            let schema = Arc::new(Schema::new(fields));
+            let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+            let (parsed, _) =
+                AnnotateProvider::parse_transcript_batches("tx", std::slice::from_ref(&batch))
+                    .unwrap();
+            let session = Arc::new(SessionContext::new());
+            session
+                .register_table(
+                    "tx",
+                    Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+                )
+                .unwrap();
+            let provider = AnnotateProvider::new(
+                session,
+                "vcf".to_string(),
+                String::new(),
+                AnnotationBackend::Parquet,
+                CacheSourceType::Ensembl,
+                None,
+                Schema::new(Vec::<Field>::new()),
+            )
+            .unwrap();
+            let (loaded, _) = provider
+                .load_transcripts("tx", &MissWorklist::for_chrom("1"))
+                .await
+                .unwrap();
+            for transcripts in [parsed, loaded] {
+                let utr = |id: &str| {
+                    transcripts
+                        .iter()
+                        .find(|tx| tx.transcript_id == id)
+                        .unwrap()
+                        .three_prime_utr_seq
+                        .clone()
+                };
+                if include_utr_column {
+                    // Cached undef: no UTR, and nothing left to derive.
+                    assert_eq!(utr("padded").as_deref(), Some(""));
+                    // BAM edit ok: VEP recomputes, so keep the derivation.
+                    assert_eq!(utr("bam_ok"), None);
+                    assert_eq!(utr("cached").as_deref(), Some("GGG"));
+                } else {
+                    // No column: the cache carries no UTR state; derive.
+                    for id in ["padded", "bam_ok", "cached"] {
+                        assert_eq!(utr(id), None, "{id}");
+                    }
+                }
+                let padded = transcripts
+                    .iter()
+                    .find(|tx| tx.transcript_id == "padded")
+                    .unwrap();
+                assert_eq!(padded.spliced_seq.as_deref(), Some("NNGCTGAAAAAATGA"));
+            }
+        }
     }
 
     #[test]
