@@ -2419,20 +2419,24 @@ impl TranscriptConsequenceEngine {
 
     /// HIGH_INF_POS: whether the variant sits in a high-information position.
     ///
-    /// `in_informative_position` scores true SNVs only — Ensembl returns 0
-    /// unless the variant spans a single base and neither side is an empty
-    /// allele — and every other MotifFeature consequence with a known matrix
-    /// still reports `N`.
+    /// Ensembl's `in_informative_position`
+    /// (`MotifFeatureVariationAllele.pm:160-162`, ensembl-variation 116) is
+    /// commented "true SNPs" but only tests
+    /// `($vf->start == $vf->end) && ($self->variation_feature_seq ne '-')`:
+    /// there is no ALT-length test. After `minimise_alleles`
+    /// (`Parser.pm:876-881`), a one-base REF with a longer ALT that shares
+    /// neither end base (`C>AG`) keeps `start == end` and is scored too
+    /// (vepyr#229). An insertion is VEP's `start == end + 1`; the engine
+    /// keeps it as `start == end` with REF `-`, hence the REF test. Every
+    /// other MotifFeature consequence with a known matrix reports `N`.
     fn motif_high_inf_pos(
         variant: &VariantInput,
         m: &MotifFeature,
         matrix: &MotifMatrix,
     ) -> Option<bool> {
-        let is_snv = variant.start == variant.end
-            && variant.ref_allele != "-"
-            && variant.alt_allele != "-"
-            && variant.alt_allele.len() == 1;
-        if !is_snv {
+        let is_single_base_span =
+            variant.start == variant.end && variant.ref_allele != "-" && variant.alt_allele != "-";
+        if !is_single_base_span {
             return Some(false);
         }
         let Some(position) = Self::motif_position(variant, m) else {
@@ -26036,6 +26040,40 @@ mod tests {
         let consequence = motif_consequence(&out, "ENSM00000588585");
         assert_eq!(consequence.high_inf_pos, Some(false));
         assert_eq!(consequence.motif_score_change, None);
+    }
+
+    /// vepyr#229: a one-base REF whose longer ALT shares neither end base
+    /// (`C>AG`) stays `start == end` after VEP's `minimise_alleles`, and
+    /// `in_informative_position` only asks for `start == end` and a non-`-`
+    /// allele (`MotifFeatureVariationAllele.pm:160-162`), so VEP reads the
+    /// matrix. Same motif and position as the forward-strand SNV above
+    /// (MOTIF_POS 5, informative). The control is `C>AC`, which minimises to
+    /// an insertion and stays `N`.
+    #[test]
+    fn motif_high_inf_pos_scores_a_one_base_ref_delins() {
+        let engine = TranscriptConsequenceEngine::default();
+        let motifs = vec![motif_with_pwm(
+            "ENSM00000588585",
+            17_037_893,
+            17_037_909,
+            1,
+            ENSPFM0042,
+            "ACCTCCACCTCCCGGTT",
+        )];
+        let evaluate = |variant: &VariantInput| {
+            engine.evaluate_variant_with_context(variant, &[], &[], &[], &[], &motifs, &[], &[])
+        };
+
+        let out = evaluate(&var("22", 17_037_897, 17_037_897, "C", "AG"));
+        let consequence = motif_consequence(&out, "ENSM00000588585");
+        assert_eq!(consequence.motif_pos, Some(5));
+        assert_eq!(consequence.high_inf_pos, Some(true));
+
+        // C>AC, already minimised to an insertion of `A` before position
+        // 17_037_897: VEP's `start == end + 1`, so no matrix lookup.
+        let out = evaluate(&var("22", 17_037_897, 17_037_897, "-", "A"));
+        let consequence = motif_consequence(&out, "ENSM00000588585");
+        assert_eq!(consequence.high_inf_pos, Some(false));
     }
 
     /// Caches built before the matrix columns landed leave both fields empty
