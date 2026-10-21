@@ -2025,7 +2025,31 @@ impl TranscriptConsequenceEngine {
         // narrower range in variant_overlaps_intron handles this correctly
         // for both purely-intronic variants and exon-spanning deletions.
         let intron_checks_started = profiling.then(Instant::now);
-        let overlaps_intron = self.variant_overlaps_intron(variant, tx_exons);
+        // vepyr#210: an allele whose differing regions are not its whole REF
+        // span gets every intron and splice flag from VEP's per-region
+        // `_intron_effects`, `intron_variant` included (`within_intron` reads
+        // its `intronic` flag, VariationEffect.pm:629-634 @ 2fb834b).
+        // Trimming never lengthens an allele, so the raw lengths are a cheap
+        // necessary test that keeps SNVs and indels off the allocation.
+        let multi_region_effects =
+            (tx_exons.len() >= 2 && variant.ref_allele.len() > 1 && variant.alt_allele.len() > 1)
+                .then(|| {
+                    vep_multi_region_intron_effects(
+                        &VariantInput::from_vcf(
+                            variant.chrom.clone(),
+                            variant.start,
+                            variant.end,
+                            variant.ref_allele.clone(),
+                            variant.alt_allele.clone(),
+                        ),
+                        tx_exons,
+                    )
+                })
+                .flatten();
+        let overlaps_intron = match multi_region_effects.as_ref() {
+            Some(effects) => effects.intronic,
+            None => self.variant_overlaps_intron(variant, tx_exons),
+        };
         if overlaps_intron {
             terms.insert(SoTerm::IntronVariant);
         }
@@ -2182,7 +2206,13 @@ impl TranscriptConsequenceEngine {
         // This naturally handles both fully-intronic variants AND exon-spanning
         // deletions that reach into splice sites.
         let splice_started = profiling.then(Instant::now);
-        self.add_intron_splice_terms(&mut terms, variant, tx, tx_exons);
+        self.add_intron_splice_terms(
+            &mut terms,
+            variant,
+            tx,
+            tx_exons,
+            multi_region_effects.as_ref(),
+        );
         if let (Some(started), Some(profile)) = (splice_started, profile.as_deref_mut()) {
             profile.overlap_splice_terms += started.elapsed();
         }
@@ -3655,6 +3685,7 @@ impl TranscriptConsequenceEngine {
         variant: &VariantInput,
         tx: &TranscriptFeature,
         tx_exons: &[&ExonFeature],
+        multi_region_effects: Option<&VepIntronEffects>,
     ) {
         if tx_exons.len() < 2 {
             return; // Single-exon transcript has no introns.
@@ -3678,6 +3709,17 @@ impl TranscriptConsequenceEngine {
         };
         let allow_polypyrimidine = self.overlaps_intron_for_consequence_include(sv, tx_exons)
             && !self.overlaps_exon_for_consequence_include(sv, tx_exons);
+
+        // vepyr#210: VEP tests each differing region of an MNV or delins on
+        // its own (`vep_multi_region_intron_effects`). The include gate above
+        // stays on the VF span, as VEP's pre-predicates do.
+        if let Some(effects) = multi_region_effects {
+            effects.add_splice_terms(terms, tx.strand);
+            if !allow_polypyrimidine {
+                terms.remove(&SoTerm::SplicePolypyrimidineTractVariant);
+            }
+            return;
+        }
 
         // Derive introns from sorted exon pairs.
         let sorted_exons = start_sorted(tx_exons);
@@ -4054,6 +4096,246 @@ fn normalize_chrom(chrom: &str) -> &str {
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/116/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85>
 fn overlap_perl(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
     a_start <= b_end && a_end >= b_start
+}
+
+/// The regions VEP tests for splice and intron effects, as genomic
+/// `(r_start, r_end)` pairs: `$vf_start + $region->{s}`, `$vf_start + $region->{e}`
+/// (BaseTranscriptVariationAllele.pm:117-118 @ 2fb834b).
+///
+/// Port of `VariationFeatureOverlapAllele::_get_differing_regions`
+/// (VariationFeatureOverlapAllele.pm:405-460 @ 2fb834b):
+///
+/// ```perl
+/// if($alt_length > 1 && $ref_length > 1) {
+///   ...
+///   $m = $al1 ^ $al2;
+///   push @pos, pos( $m ) while $m =~ m{(?=([^\x00]))}g;
+///   # now we join them into contiguous regions
+///   ...
+/// }
+/// else {
+///   push @diff_regions, { s => 0, e => $ref_length - 1 };
+/// }
+/// ```
+///
+/// Perl's string `^` pads the shorter operand with `\0`, so every offset at or
+/// past the shorter allele's end differs: ALT bases past the REF end are
+/// tested at reference coordinates they do not occupy. `$ref_length` is the
+/// VF span (`_bvf_preds`, BaseVariationFeatureOverlapAllele.pm:446).
+fn vep_differing_regions(
+    vf_start: i64,
+    vf_end: i64,
+    ref_allele: &str,
+    alt_allele: &str,
+) -> Vec<(i64, i64)> {
+    let ref_seq = normalize_allele_seq(ref_allele);
+    let alt_seq = normalize_allele_seq(alt_allele);
+    let ref_length = vf_end - vf_start + 1;
+    if !(alt_seq.len() > 1 && ref_length > 1) {
+        return vec![(vf_start, vf_start + ref_length - 1)];
+    }
+    let (ref_bytes, alt_bytes) = (ref_seq.as_bytes(), alt_seq.as_bytes());
+    let mut regions: Vec<(i64, i64)> = Vec::new();
+    for offset in 0..ref_bytes.len().max(alt_bytes.len()) {
+        if ref_bytes.get(offset) == alt_bytes.get(offset) {
+            continue;
+        }
+        let pos = vf_start + offset as i64;
+        match regions.last_mut() {
+            Some((_, end)) if *end + 1 == pos => *end = pos,
+            _ => regions.push((pos, pos)),
+        }
+    }
+    regions
+}
+
+/// The flags `BaseTranscriptVariationAllele::_intron_effects` caches per
+/// allele (BaseTranscriptVariationAllele.pm:109-223 @ 2fb834b).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct VepIntronEffects {
+    within_frameshift_intron: bool,
+    intronic: bool,
+    start_splice_site: bool,
+    end_splice_site: bool,
+    fifth_base_splice_site: bool,
+    donor_region_splice_site: bool,
+    polypyrimidine_splice_site: bool,
+    fifth_base_splice_site_reverse: bool,
+    donor_region_splice_site_reverse: bool,
+    polypyrimidine_splice_site_reverse: bool,
+    splice_region: bool,
+}
+
+impl VepIntronEffects {
+    /// The splice predicates of `Utils/VariationEffect.pm:560-627 @ 2fb834b`
+    /// over these flags. `within_intron` (`intronic`, :629-634) is read by the
+    /// caller, and the polypyrimidine include gate (`exon => 0, intron => 1`)
+    /// stays with the caller as for every other allele.
+    fn add_splice_terms(&self, terms: &mut BTreeSet<SoTerm>, strand: i8) {
+        let forward = strand >= 0;
+        let donor = if forward {
+            self.start_splice_site
+        } else {
+            self.end_splice_site
+        };
+        let acceptor = if forward {
+            self.end_splice_site
+        } else {
+            self.start_splice_site
+        };
+        let fifth_base = if forward {
+            self.fifth_base_splice_site
+        } else {
+            self.fifth_base_splice_site_reverse
+        };
+        // splice_donor_region_variant: `return 0 if splice_donor_5th_base_variant(@_)`.
+        let donor_region = !fifth_base
+            && if forward {
+                self.donor_region_splice_site
+            } else {
+                self.donor_region_splice_site_reverse
+            };
+        let polypyrimidine = if forward {
+            self.polypyrimidine_splice_site
+        } else {
+            self.polypyrimidine_splice_site_reverse
+        };
+        // splice_region: 0 if donor, acceptor, essential, donor region or 5th base.
+        let splice_region =
+            self.splice_region && !donor && !acceptor && !donor_region && !fifth_base;
+        for (set, term) in [
+            (acceptor, SoTerm::SpliceAcceptorVariant),
+            (donor, SoTerm::SpliceDonorVariant),
+            (fifth_base, SoTerm::SpliceDonor5thBaseVariant),
+            (donor_region, SoTerm::SpliceDonorRegionVariant),
+            (polypyrimidine, SoTerm::SplicePolypyrimidineTractVariant),
+            (splice_region, SoTerm::SpliceRegionVariant),
+        ] {
+            if set {
+                terms.insert(term);
+            }
+        }
+    }
+}
+
+/// `_intron_effects` for an allele whose differing regions are not its whole
+/// REF span (vepyr#210). That needs REF and ALT both longer than 1 bp, and
+/// either a base they share or an ALT longer than REF (the overhang). `None`
+/// for every other allele, which keeps the single-span path.
+///
+/// `within_frameshift_intron` is ported for its `next`. VEP reads the flag
+/// itself only in `within_cds`/`within_cdna`, which the engine derives from
+/// the VF span elsewhere.
+///
+/// A literal port of BaseTranscriptVariationAllele.pm:109-223 @ 2fb834b,
+/// region by region, with two VEP behaviours copied on purpose:
+///
+/// - the candidate introns come from the whole VF span and are cached on
+///   the first call (`_overlapped_introns` / `_overlapped_introns_boundary`,
+///   BaseTranscriptVariation.pm:802-845), so an overhang region only reaches
+///   introns the VF span already found;
+/// - `splice_region` is assigned, not OR-ed, per (region, boundary intron)
+///   pair unless a splice site is already set (:215-216), so the last pair
+///   decides.
+///
+/// The trees store each window shifted by -1 for 0-based half-open
+/// `Set::IntervalTree` intervals (BaseTranscriptVariation.pm:1018-1029) and
+/// are fetched with `($min_vf - 1, $max_vf)` (:812, :834). In 1-based
+/// inclusive terms the intron window is `[intron_start-3, intron_end+3]` and
+/// the boundary windows are `[intron_start-3, intron_start+7]` and
+/// `[intron_end-7, intron_end+3]`, as `_overlapped_introns_and_boundary_no_tree`
+/// spells out for the boundary (:891-895).
+fn vep_multi_region_intron_effects(
+    sv: &VariantInput,
+    tx_exons: &[&ExonFeature],
+) -> Option<VepIntronEffects> {
+    if tx_exons.len() < 2 || sv.ref_allele == "-" || sv.alt_allele == "-" {
+        return None;
+    }
+    let ref_len = normalize_allele_seq(&sv.ref_allele).len() as i64;
+    let alt_len = normalize_allele_seq(&sv.alt_allele).len() as i64;
+    // The span check guards a REF that does not cover the VF span (a
+    // symbolic or otherwise unnormalised allele); VEP's region offsets are
+    // relative to that span, so such an allele keeps the old path.
+    if ref_len <= 1 || alt_len <= 1 || sv.end - sv.start + 1 != ref_len {
+        return None;
+    }
+    let regions = vep_differing_regions(sv.start, sv.end, &sv.ref_allele, &sv.alt_allele);
+    if regions.as_slice() == [(sv.start, sv.end)] {
+        return None;
+    }
+
+    let (min_vf, max_vf) = (sv.start, sv.end);
+    let sorted = start_sorted(tx_exons);
+    let introns: Vec<(i64, i64, bool)> = sorted
+        .windows(2)
+        .map(|pair| (pair[0].end + 1, pair[1].start - 1))
+        .filter(|(start, end)| start <= end)
+        .map(|(start, end)| (start, end, (end - start).abs() <= 12))
+        .collect();
+    let intron_list: Vec<_> = introns
+        .iter()
+        .filter(|(start, end, _)| overlap_perl(min_vf, max_vf, start - 3, end + 3))
+        .collect();
+    let boundary_list: Vec<_> = introns
+        .iter()
+        .filter(|(start, end, _)| {
+            overlap_perl(min_vf, max_vf, start - 3, start + 7)
+                || overlap_perl(min_vf, max_vf, end - 7, end + 3)
+        })
+        .collect();
+
+    let mut ie = VepIntronEffects::default();
+    for &(r_start, r_end) in &regions {
+        for &&(intron_start, intron_end, frameshift) in &intron_list {
+            if frameshift && overlap_perl(r_start, r_end, intron_start, intron_end) {
+                ie.within_frameshift_intron = true;
+                continue;
+            }
+            // No insertion clause: both alleles are longer than 1 bp, and
+            // only insertions and deletions carry a shift_hash
+            // (TranscriptVariationAllele.pm:122-123), so the unshifted
+            // coordinates equal (r_start, r_end).
+            if overlap_perl(r_start, r_end, intron_start + 2, intron_end - 2) {
+                ie.intronic = true;
+            }
+            if overlap_perl(r_start, r_end, intron_end - 16, intron_end - 2) {
+                ie.polypyrimidine_splice_site = true;
+            }
+            if overlap_perl(r_start, r_end, intron_start + 2, intron_start + 16) {
+                ie.polypyrimidine_splice_site_reverse = true;
+            }
+        }
+        for &&(intron_start, intron_end, frameshift) in &boundary_list {
+            if frameshift && overlap_perl(r_start, r_end, intron_start, intron_end) {
+                ie.within_frameshift_intron = true;
+                continue;
+            }
+            ie.start_splice_site |= overlap_perl(r_start, r_end, intron_start, intron_start + 1);
+            ie.end_splice_site |= overlap_perl(r_start, r_end, intron_end - 1, intron_end);
+            ie.fifth_base_splice_site |=
+                overlap_perl(r_start, r_end, intron_start + 4, intron_start + 4);
+            ie.donor_region_splice_site |=
+                overlap_perl(r_start, r_end, intron_start + 2, intron_start + 5);
+            ie.polypyrimidine_splice_site |=
+                overlap_perl(r_start, r_end, intron_end - 16, intron_end - 2);
+            ie.fifth_base_splice_site_reverse |=
+                overlap_perl(r_start, r_end, intron_end - 4, intron_end - 4);
+            ie.donor_region_splice_site_reverse |=
+                overlap_perl(r_start, r_end, intron_end - 5, intron_end - 2);
+            ie.polypyrimidine_splice_site_reverse |=
+                overlap_perl(r_start, r_end, intron_start + 2, intron_start + 16);
+            if !(ie.start_splice_site || ie.end_splice_site) {
+                // `_intron_overlap` (VariationEffect.pm:87-109) without its
+                // insertion clause.
+                ie.splice_region = overlap_perl(r_start, r_end, intron_start + 2, intron_start + 7)
+                    || overlap_perl(r_start, r_end, intron_end - 7, intron_end - 2)
+                    || overlap_perl(r_start, r_end, intron_start - 3, intron_start - 1)
+                    || overlap_perl(r_start, r_end, intron_end + 1, intron_end + 3);
+            }
+        }
+    }
+    Some(ie)
 }
 
 fn overlaps(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
@@ -18338,6 +18620,201 @@ mod tests {
         strip_parent_terms(&mut terms);
         assert!(terms.contains(&SoTerm::SpliceDonorRegionVariant));
         assert!(!terms.contains(&SoTerm::SpliceRegionVariant));
+    }
+
+    // ---- vepyr#210: splice and intron flags per VEP differing region ----
+    //
+    // `_intron_effects` (BaseTranscriptVariationAllele.pm:109-223 @ 2fb834b)
+    // tests each region of `_get_differing_regions`
+    // (VariationFeatureOverlapAllele.pm:405-460) on its own. Toy transcript:
+    // exons 1000-1099 and 1200-1300, intron 1100-1199. On + the donor is
+    // 1100-1101 and the acceptor 1198-1199; on - they swap.
+
+    fn splice_terms_per_region(strand: i8, v: &VariantInput) -> BTreeSet<SoTerm> {
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx("T1", "22", 1000, 1300, strand, "lncRNA", None, None);
+        let exons = vec![exon("T1", 1, 1000, 1099), exon("T1", 2, 1200, 1300)];
+        let assignments =
+            engine.evaluate_variant_with_context(v, &[t], &exons, &[], &[], &[], &[], &[]);
+        assignments[0].terms.iter().copied().collect()
+    }
+
+    #[test]
+    fn vep_differing_regions_mask_overhang_and_single_region() {
+        // Mask: CAGG/TAGA differ at offsets 0 and 3 only.
+        assert_eq!(
+            vep_differing_regions(100, 103, "CAGG", "TAGA"),
+            vec![(100, 100), (103, 103)]
+        );
+        // Overhang: Perl's string `^` pads the shorter operand with \0, so
+        // every ALT base past the REF end is a differing position.
+        assert_eq!(
+            vep_differing_regions(100, 101, "AC", "TATCTTGAA"),
+            vec![(100, 108)]
+        );
+        assert_eq!(
+            vep_differing_regions(100, 101, "CT", "TTA"),
+            vec![(100, 100), (102, 102)]
+        );
+        // One side 1 bp or less: one region, the REF span.
+        assert_eq!(vep_differing_regions(100, 100, "C", "TT"), vec![(100, 100)]);
+        assert_eq!(vep_differing_regions(100, 99, "-", "A"), vec![(100, 99)]);
+        assert_eq!(
+            vep_differing_regions(100, 102, "ACG", "-"),
+            vec![(100, 102)]
+        );
+    }
+
+    #[test]
+    fn mnv_keeping_acceptor_ag_gets_splice_region_not_acceptor() {
+        // CAGG>TAGA at 1197-1200 keeps the AG at 1198-1199 (6:7576291 shape):
+        // regions 1197 and 1200 miss both splice-site bases.
+        let v = var("22", 1197, 1200, "CAGG", "TAGA");
+        let plus = splice_terms_per_region(1, &v);
+        assert!(!plus.contains(&SoTerm::SpliceAcceptorVariant), "{plus:?}");
+        assert!(plus.contains(&SoTerm::SpliceRegionVariant), "{plus:?}");
+        assert!(plus.contains(&SoTerm::IntronVariant), "{plus:?}");
+
+        // On - the same bases are the donor side: 1197 is in the donor
+        // region (intron_end-5 .. intron_end-2), which suppresses
+        // splice_region.
+        let minus = splice_terms_per_region(-1, &v);
+        assert!(!minus.contains(&SoTerm::SpliceDonorVariant), "{minus:?}");
+        assert!(
+            minus.contains(&SoTerm::SpliceDonorRegionVariant),
+            "{minus:?}"
+        );
+        assert!(!minus.contains(&SoTerm::SpliceRegionVariant), "{minus:?}");
+        assert!(minus.contains(&SoTerm::IntronVariant), "{minus:?}");
+    }
+
+    #[test]
+    fn exon_end_delins_overhang_reaching_donor_gets_donor_and_fifth_base() {
+        // AC>TATCTTGAA at 1098-1099 (10:71732373 shape): the region runs
+        // 1098-1106 at reference coordinates, past the REF end into the intron.
+        let v = var("22", 1098, 1099, "AC", "TATCTTGAA");
+        let plus = splice_terms_per_region(1, &v);
+        assert!(plus.contains(&SoTerm::SpliceDonorVariant), "{plus:?}");
+        assert!(
+            plus.contains(&SoTerm::SpliceDonor5thBaseVariant),
+            "{plus:?}"
+        );
+        assert!(
+            !plus.contains(&SoTerm::SpliceDonorRegionVariant),
+            "{plus:?}"
+        );
+        assert!(!plus.contains(&SoTerm::SpliceRegionVariant), "{plus:?}");
+        assert!(plus.contains(&SoTerm::IntronVariant), "{plus:?}");
+
+        let minus = splice_terms_per_region(-1, &v);
+        assert!(minus.contains(&SoTerm::SpliceAcceptorVariant), "{minus:?}");
+        assert!(!minus.contains(&SoTerm::SpliceRegionVariant), "{minus:?}");
+        // PPT on - is intron_start+2 .. +16, but the VF overlaps an exon, so
+        // the `exon => 0` include gate drops it.
+        assert!(
+            !minus.contains(&SoTerm::SplicePolypyrimidineTractVariant),
+            "{minus:?}"
+        );
+        assert!(minus.contains(&SoTerm::IntronVariant), "{minus:?}");
+    }
+
+    #[test]
+    fn overhang_past_vf_boundary_window_adds_nothing() {
+        // The candidate introns come from the VF span and are cached
+        // (BaseTranscriptVariation.pm:802-845). A VF deep in the intron has
+        // an empty boundary list, so an overhang reaching the acceptor sets
+        // only what the intron list allows: intronic and PPT (8:99121157).
+        let alt = format!("T{}", "G".repeat(49));
+        let v = var("22", 1150, 1151, "AC", &alt);
+        let plus = splice_terms_per_region(1, &v);
+        assert!(!plus.contains(&SoTerm::SpliceAcceptorVariant), "{plus:?}");
+        assert!(!plus.contains(&SoTerm::SpliceRegionVariant), "{plus:?}");
+        assert!(
+            plus.contains(&SoTerm::SplicePolypyrimidineTractVariant),
+            "{plus:?}"
+        );
+        assert!(plus.contains(&SoTerm::IntronVariant), "{plus:?}");
+
+        let minus = splice_terms_per_region(-1, &v);
+        assert!(!minus.contains(&SoTerm::SpliceDonorVariant), "{minus:?}");
+        assert!(!minus.contains(&SoTerm::SpliceRegionVariant), "{minus:?}");
+        assert!(minus.contains(&SoTerm::IntronVariant), "{minus:?}");
+    }
+
+    #[test]
+    fn splice_region_last_region_wins() {
+        // `splice_region` is assigned, not OR-ed, per (region, boundary
+        // intron) pair (BaseTranscriptVariationAllele.pm:215-216). CT>TTA at
+        // 1202 has regions 1202 (exonic splice region) and 1204 (outside it):
+        // the last one clears the flag (8:74351328 shape). CT>TT has only the
+        // first region and keeps it.
+        for strand in [1, -1] {
+            let superset = splice_terms_per_region(strand, &var("22", 1202, 1203, "CT", "TTA"));
+            assert!(
+                !superset.contains(&SoTerm::SpliceRegionVariant),
+                "strand {strand}: {superset:?}"
+            );
+            let subset = splice_terms_per_region(strand, &var("22", 1202, 1203, "CT", "TT"));
+            assert!(
+                subset.contains(&SoTerm::SpliceRegionVariant),
+                "strand {strand}: {subset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_region_intron_variant_from_intronic_flag() {
+        // ACGTAC>TCGTAC at 1098-1103 spans the donor and the intron body, but
+        // its only differing base is exonic 1098: `within_intron` reads the
+        // per-region `intronic` flag (VariationEffect.pm:629-634).
+        for strand in [1, -1] {
+            let terms = splice_terms_per_region(strand, &var("22", 1098, 1103, "ACGTAC", "TCGTAC"));
+            assert!(
+                !terms.contains(&SoTerm::IntronVariant),
+                "strand {strand}: {terms:?}"
+            );
+            assert!(
+                !terms.contains(&SoTerm::SpliceDonorVariant)
+                    && !terms.contains(&SoTerm::SpliceAcceptorVariant),
+                "strand {strand}: {terms:?}"
+            );
+            assert!(
+                terms.contains(&SoTerm::SpliceRegionVariant),
+                "strand {strand}: {terms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_region_allele_inside_frameshift_intron_is_skipped() {
+        // A 10 bp intron (1100-1109) is a frameshift intron: a region that
+        // overlaps it sets within_frameshift_intron and skips that intron
+        // (BaseTranscriptVariationAllele.pm:138-141, :170-174).
+        let engine = TranscriptConsequenceEngine::default();
+        for strand in [1, -1] {
+            let t = tx("T1", "22", 1000, 1300, strand, "lncRNA", None, None);
+            let exons = vec![exon("T1", 1, 1000, 1099), exon("T1", 2, 1110, 1300)];
+            let out = engine.evaluate_variant_with_context(
+                &var("22", 1101, 1104, "ACGT", "TCGA"),
+                &[t],
+                &exons,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            );
+            let terms = &out[0].terms;
+            for term in [
+                SoTerm::SpliceDonorVariant,
+                SoTerm::SpliceAcceptorVariant,
+                SoTerm::SpliceRegionVariant,
+                SoTerm::SpliceDonorRegionVariant,
+                SoTerm::IntronVariant,
+            ] {
+                assert!(!terms.contains(&term), "strand {strand}: {terms:?}");
+            }
+        }
     }
 
     // ---- UTR boundary insertion detection ----
