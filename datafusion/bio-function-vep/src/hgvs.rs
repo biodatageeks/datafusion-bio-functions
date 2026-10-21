@@ -297,17 +297,15 @@ pub(crate) fn format_hgvsc_with_reference_policy(
     use_transcript_ref: bool,
 ) -> Option<String> {
     // Traceability:
-    // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
-    //   returns undef when `_get_cDNA_position()` can't map a position
-    //   outside the transcript region. For deletions that extend beyond
-    //   the transcript boundaries, VEP's `_slice_start` / coordinate
-    //   mapping fails for the out-of-bounds end, producing empty HGVSc.
-    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1416
-    if ref_allele != "-" && alt_allele == "-" {
-        // Deletion: check if either end extends beyond transcript boundaries.
-        if !semantics.partial_overlap_hgvs() && (variant_start < tx.start || variant_end > tx.end) {
-            return None;
-        }
+    // - Release/115 `_var2transcript_slice_coords` returns undef for any
+    //   allele with an end outside the transcript, whatever its type
+    //   (ensembl-variation origin/release/115 TranscriptVariationAllele.pm:2655-2661).
+    //   Release/116 clamps instead; see `vep116_partial_overlap_clamp`.
+    if ref_allele != "-"
+        && !semantics.partial_overlap_hgvs()
+        && (variant_start < tx.start || variant_end > tx.end)
+    {
+        return None;
     }
     if let Some(profile) = profile.as_deref_mut() {
         profile.simple_fast_calls += 1;
@@ -387,11 +385,15 @@ fn format_hgvsc_fallback(
             && !shift.shifted_output_allele.is_empty()
             && shift.shifted_output_allele != "-"
     });
-    let partial_deletion = (ref_allele != "-"
-        && alt_allele == "-"
-        && (variant_start < tx.start || variant_end > tx.end))
+    // Any allele with a reference span (deletion, delins, MNV) that crosses a
+    // transcript end. Insertions (`ref == "-"`) keep their own path.
+    let partial_overlap = ref_allele != "-" && (variant_start < tx.start || variant_end > tx.end);
+    if partial_overlap && !semantics.partial_overlap_hgvs() {
+        return None;
+    }
+    let partial_clamp = partial_overlap
         .then(|| {
-            vep116_partial_overlap_deletion(
+            vep116_partial_overlap_clamp(
                 tx,
                 ref_allele,
                 variant_start,
@@ -400,16 +402,13 @@ fn format_hgvsc_fallback(
             )
         })
         .flatten();
-    if ref_allele != "-"
-        && alt_allele == "-"
-        && (variant_start < tx.start || variant_end > tx.end)
-        && (!semantics.partial_overlap_hgvs() || partial_deletion.is_none())
-    {
+    if partial_overlap && partial_clamp.is_none() {
         return None;
     }
+    let clamped = partial_clamp.is_some();
     let partial_ref;
     let (ref_allele, alt_allele, variant_start, variant_end) =
-        if let Some((clamped_ref, clamped_start, clamped_end)) = partial_deletion {
+        if let Some((clamped_ref, clamped_start, clamped_end)) = partial_clamp {
             partial_ref = clamped_ref;
             (partial_ref.as_str(), alt_allele, clamped_start, clamped_end)
         } else if let Some(shift) = use_genomic_shift {
@@ -450,6 +449,12 @@ fn format_hgvsc_fallback(
     if let Some(transcript_ref) = transcript_ref {
         feature_ref = transcript_ref;
     }
+    // `hgvs_variant_notation` returns undef when the REF cut from the clamped
+    // slice equals ALT (Utils/Sequence.pm:526-531 @ 2fb834b). The engine's
+    // own helper keeps a 1-base identical pair as `>` for the unclamped path.
+    if clamped && feature_ref.eq_ignore_ascii_case(&feature_alt) {
+        return None;
+    }
     let mut notation =
         hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
     if let Some(shift) = dup_context {
@@ -481,7 +486,15 @@ fn format_hgvsc_fallback(
     }
     let identical_substitution = notation.kind == ">" && notation.ref_allele == notation.alt_allele;
     if notation.kind != "dup" && !identical_substitution {
-        clip_alleles(&mut notation, tx.strand);
+        if clamped {
+            // `hgvs_transcript` sets `numbering` only after `_clip_alleles`
+            // (TranscriptVariationAllele.pm:1548-1553 @ 2fb834b), so the
+            // clip's dup re-typing (:2266-2272) is unreachable there and a
+            // clamp that clips to an empty REF is always `ins`.
+            clip_alleles_with_dup_retyping(&mut notation, tx.strand, false);
+        } else {
+            clip_alleles(&mut notation, tx.strand);
+        }
     }
     // Traceability:
     // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
@@ -493,7 +506,11 @@ fn format_hgvsc_fallback(
         notation.alt_allele = feature_alt.clone();
     }
     let coord_map_started = profile.is_some().then(Instant::now);
-    let (mut start, mut end) = if notation.kind == ">"
+    let (mut start, mut end) = if clamped {
+        // A clamped allele is never VEP's `SNP` class, so `hgvs_transcript`
+        // maps both clipped ends through `_get_cDNA_position` (:1519-1526).
+        notation_to_hgvsc_coords(tx, tx_exons, &notation)?
+    } else if notation.kind == ">"
         && numbering == 'c'
         && cds_position.is_some_and(|value| !value.is_empty() && !value.contains('_'))
     {
@@ -519,7 +536,21 @@ fn format_hgvsc_fallback(
     if let (Some(started), Some(profile)) = (coord_map_started, profile.as_deref_mut()) {
         profile.coord_map += started.elapsed();
     }
-    if matches!(
+    if clamped {
+        // vepyr#244 sub-case, ported on the clamped path only (vepyr#216).
+        // `notation_to_hgvsc_coords` returns the genomic order; VEP keeps the
+        // transcript-slice order (an `ins` clipped from a clamp has start =
+        // end + 1) and sorts it with a guard against an end carrying `*`.
+        // Step 1 restores VEP's slice order. Step 2 is VEP's sort, which
+        // undoes step 1 again unless the end carries `*`; so a reordering
+        // survives only for a clipped `ins` in the 3' UTR (`*159_*158`).
+        if (tx.strand >= 0) == (notation.kind == "ins") {
+            std::mem::swap(&mut start, &mut end);
+        }
+        if vep_hgvs_positions_need_swap(&start, &end) {
+            std::mem::swap(&mut start, &mut end);
+        }
+    } else if matches!(
         compare_hgvs_positions(&start, &end),
         Some(Ordering::Greater)
     ) {
@@ -533,14 +564,25 @@ fn format_hgvsc_fallback(
     hgvsc
 }
 
-/// Reproduce the release/116 `_var2transcript_slice_coords` behavior for a
-/// deletion that overlaps only part of a transcript.
+/// Reproduce the release/116 `_var2transcript_slice_coords` behavior for an
+/// allele with a reference span (deletion, delins or MNV) that overlaps only
+/// part of a transcript.
 ///
-/// VEP clamps the unshifted interval in transcript-slice coordinates and only
-/// then adds the non-negative HGVS 3' offset. In particular, substituting a
-/// precomputed shifted genomic interval before clamping is not equivalent at a
-/// transcript boundary.
-fn vep116_partial_overlap_deletion(
+/// ```perl
+/// # ensembl-variation 2fb834b TranscriptVariationAllele.pm:2725-2727
+/// my $clamped_start = ($vf_start < 1 ? 1 : $vf_start > $tr_length ? $tr_length : $vf_start);
+/// my $clamped_end   = ($vf_end   < 1 ? 1 : $vf_end   > $tr_length ? $tr_length : $vf_end);
+/// ```
+///
+/// There is no allele-type test in that function. VEP clamps the unshifted
+/// interval in transcript-slice coordinates and only then adds the
+/// non-negative HGVS 3' offset. In particular, substituting a precomputed
+/// shifted genomic interval before clamping is not equivalent at a transcript
+/// boundary. Only insertions and deletions are ever shifted (:122-123), so
+/// `genomic_shift` is `None` for a delins or MNV here and the offset is 0.
+/// `hgvs_transcript` then cuts REF from the clamped slice and keeps ALT whole
+/// (:1474-1482), which the caller does with the returned REF.
+fn vep116_partial_overlap_clamp(
     tx: &TranscriptFeature,
     ref_allele: &str,
     variant_start: i64,
@@ -599,8 +641,8 @@ fn vep116_partial_overlap_deletion(
     };
 
     // VEP extracts the reference from the clamped transcript slice. Cache
-    // annotation already carries that sequence as the deletion allele, so
-    // retain only the genomic-overlap portion when its span is exact.
+    // annotation already carries that sequence as the REF allele, so retain
+    // only the genomic-overlap portion when its span is exact.
     let overlap_start = variant_start.max(tx.start);
     let overlap_end = variant_end.min(tx.end);
     let variant_span = variant_end.checked_sub(variant_start)?.checked_add(1)?;
@@ -1305,6 +1347,15 @@ fn reverse_complement(seq: &str) -> Option<String> {
 /// - Ensembl Variation `TranscriptVariationAllele::_clip_alleles()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2232>
 fn clip_alleles(notation: &mut HgvsNotation, strand: i8) {
+    clip_alleles_with_dup_retyping(notation, strand, true);
+}
+
+/// `_clip_alleles` re-types a clip to an empty REF as `dup` only when
+/// `$hgvs_notation->{'numbering'}` is already set and is not `p`
+/// (TranscriptVariationAllele.pm:2264-2272 @ 2fb834b). `hgvs_transcript`
+/// sets it only after the clip, so the transcript path passes `false` where
+/// it ports VEP literally (the release/116 partial-overlap clamp).
+fn clip_alleles_with_dup_retyping(notation: &mut HgvsNotation, strand: i8, retype_dup: bool) {
     let mut ref_allele = notation.ref_allele.clone();
     let mut alt_allele = notation.alt_allele.clone();
     let mut start = notation.start;
@@ -1349,7 +1400,7 @@ fn clip_alleles(notation: &mut HgvsNotation, strand: i8) {
     {
         notation.kind = ">".to_string();
     } else if notation.ref_allele.is_empty() && !notation.alt_allele.is_empty() {
-        if preseq.ends_with(&notation.alt_allele) {
+        if retype_dup && preseq.ends_with(&notation.alt_allele) {
             notation.kind = "dup".to_string();
             notation.start -= notation.alt_allele.len() as i64;
         } else {
@@ -1908,6 +1959,68 @@ fn split_hgvs_coord(value: &str) -> Option<(i64, Option<String>)> {
     Some((coord_part.parse::<i64>().ok()?, offset_part))
 }
 
+/// VEP's position sort in `hgvs_transcript`, literally:
+///
+/// ```perl
+/// # ensembl-variation 2fb834b TranscriptVariationAllele.pm:1525-1538
+/// my ($exon_start_coord, $intron_start_offset) = $hgvs_notation->{start} =~ m/(\-?[0-9]+)\+?(\-?[0-9]+)?/;
+/// my ($exon_end_coord,   $intron_end_offset)   = $same_pos ? (...) : $hgvs_notation->{end} =~ m/(\-?[0-9]+)\+?(\-?[0-9]+)?/;
+/// $intron_start_offset ||= 0;
+/// $intron_end_offset   ||= 0;
+/// ($hgvs_notation->{start},$hgvs_notation->{end}) = ($hgvs_notation->{end},$hgvs_notation->{start}) if (
+///   (($exon_start_coord  > $exon_end_coord) || ($exon_start_coord  == $exon_end_coord && $intron_start_offset > $intron_end_offset) ) &&
+///   $hgvs_notation->{end} !~/\*/
+/// );
+/// ```
+///
+/// The regex skips a leading `*`, so `*159` reads as 159, and an end carrying
+/// `*` is never swapped: a clipped `ins` in the 3' UTR prints `*159_*158`.
+fn vep_hgvs_positions_need_swap(start: &str, end: &str) -> bool {
+    if end.contains('*') {
+        return false;
+    }
+    match (vep_hgvs_position_parts(start), vep_hgvs_position_parts(end)) {
+        (Some((start_coord, start_offset)), Some((end_coord, end_offset))) => {
+            start_coord > end_coord || (start_coord == end_coord && start_offset > end_offset)
+        }
+        _ => false,
+    }
+}
+
+/// `m/(\-?[0-9]+)\+?(\-?[0-9]+)?/` on an HGVS position: the leftmost signed
+/// integer, then an optional `+` and an optional signed integer right after.
+fn vep_hgvs_position_parts(position: &str) -> Option<(i64, i64)> {
+    fn signed_int_at(bytes: &[u8], at: usize) -> Option<(i64, usize)> {
+        let digits_from = if bytes.get(at) == Some(&b'-') {
+            at + 1
+        } else {
+            at
+        };
+        let digits_to = digits_from
+            + bytes[digits_from.min(bytes.len())..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+        if digits_to == digits_from {
+            return None;
+        }
+        let value = std::str::from_utf8(&bytes[at..digits_to])
+            .ok()?
+            .parse()
+            .ok()?;
+        Some((value, digits_to))
+    }
+    let bytes = position.as_bytes();
+    let (coord, after) = (0..bytes.len()).find_map(|at| signed_int_at(bytes, at))?;
+    let offset_from = if bytes.get(after) == Some(&b'+') {
+        after + 1
+    } else {
+        after
+    };
+    let offset = signed_int_at(bytes, offset_from).map_or(0, |(value, _)| value);
+    Some((coord, offset))
+}
+
 fn compare_hgvs_positions(left: &str, right: &str) -> Option<Ordering> {
     let left_star = left.starts_with('*');
     let right_star = right.starts_with('*');
@@ -1981,24 +2094,12 @@ pub fn format_hgvsp(
     shift_hgvs: bool,
 ) -> Option<String> {
     let protein_id = versioned_id(translation.stable_id.as_deref()?, translation.version);
-    if protein.start_lost {
-        let start_ref = if protein.ref_peptide.is_empty() {
-            protein
-                .ref_translation
-                .chars()
-                .next()
-                .map(|aa| aa.to_string())?
-        } else {
-            protein.ref_peptide.clone()
-        };
-        return Some(format!(
-            "{protein_id}:p.{}{}?",
-            peptide_first_three(&start_ref)?,
-            protein.start
-        ));
-    }
 
     let mut notation = ProteinHgvsNotation::from_context(protein);
+    // VEP's `translation_end`. `_get_fs_peptides` moves `start` to the first
+    // differing residue but leaves `end` alone; `resolve_frameshift_hgvs`
+    // overwrites it, so the start_lost range below reads it from here.
+    let translation_end = notation.end;
     if protein.frameshift {
         resolve_frameshift_hgvs(&mut notation, protein)?;
     } else {
@@ -2048,6 +2149,36 @@ pub fn format_hgvsp(
     if !protein.frameshift {
         notation.ref_allele = notation.ref_allele.replace('*', "X");
         notation.alt_allele = notation.alt_allele.replace('*', "X");
+    }
+
+    // vepyr#221. VEP's start_lost override sits at the end of
+    // `_get_hgvs_peptides` (ensembl-variation 116
+    // `TranscriptVariationAllele.pm:2154-2159`), after the fs/ins/del
+    // peptide work above and after a `dup` has already returned (`:2125`):
+    //
+    //     if( start_lost($self) ){
+    //       $hgvs_notation->{alt}  = "?";
+    //       $hgvs_notation->{type} = "";
+    //     }
+    //
+    // `_get_hgvs_protein_format` has no start_lost arm. With type "" the
+    // first arm to match is `start ne end` (`:2024-2026`),
+    // `{ref}{start}_{alt}{end}`, else the default `{ref}{start}{alt}`.
+    // `ne` is a string test and nothing orders the pair, so a frameshift
+    // whose first differing residue lies past `translation_end` prints e.g.
+    // `p.His3_?2`. Deliberate replica: that is not valid HGVS.
+    if protein.start_lost && notation.kind != "dup" {
+        let end = if protein.frameshift {
+            translation_end
+        } else {
+            notation.end
+        };
+        let reference = peptide_to_three_letter(&notation.ref_allele.replace('*', "X"));
+        return Some(if notation.start != end {
+            format!("{protein_id}:p.{reference}{}_?{end}", notation.start)
+        } else {
+            format!("{protein_id}:p.{reference}{}?", notation.start)
+        });
     }
 
     format_hgvsp_notation(&protein_id, &notation, protein)
@@ -2153,6 +2284,14 @@ fn resolve_frameshift_hgvs(
 
     if start > alt_translation.len() {
         notation.kind = "del".to_string();
+        if protein.start_lost {
+            // Ensembl Variation 116 `_get_fs_peptides()` sets only
+            // `alt = "del"` and `type = "del"` in this branch, then returns.
+            // Preserve its original multi-residue `ref` and `end`; the later
+            // start_lost override changes alt/type but leaves ref/start/end.
+            notation.alt_allele = "del".to_string();
+            return Some(());
+        }
         notation.end = start;
         notation.ref_allele = peptide_char(&ref_translation, start)?.to_string();
         notation.alt_allele.clear();
@@ -2238,7 +2377,14 @@ fn shift_peptides_post_var(notation: &mut ProteinHgvsNotation, ref_translation: 
         return;
     }
 
-    for check_next_post in post_seq.chars() {
+    // VEP's loop is `for (my $n = 0; $n <= (length($post_seq) -
+    // $deleted_length); $n++)` (`_shift_3prime`, ensembl-variation 116
+    // `TranscriptVariationAllele.pm:2613`): it stops at most
+    // `len(post) - len(del) + 1` residues on, even inside a longer repeat.
+    // That under-shifts against the HGVS 3' rule; parity copies it
+    // (vepyr#233).
+    let max_shifts = post_seq.len() - deleted_len + 1;
+    for check_next_post in post_seq.chars().take(max_shifts) {
         let Some(check_next_del) = seq_to_check.chars().next() else {
             break;
         };
@@ -2315,20 +2461,38 @@ fn surrounding_peptides(
     original_ref: &str,
     length: Option<usize>,
 ) -> Option<String> {
-    let mut ref_trans = ref_translation.to_string();
+    // VEP reads `_peptide()`, the translation without its terminal stop
+    // (ensembl core `Transcript::translate` chops it). The production
+    // `ref_translation` already has none; the fallback translation and unit
+    // fixtures keep one, so drop a single trailing `*` to compare the same
+    // string.
+    let mut ref_trans = ref_translation
+        .strip_suffix('*')
+        .unwrap_or(ref_translation)
+        .to_string();
     if original_ref.starts_with('*') {
         ref_trans.push_str(original_ref);
     }
-    if ref_trans.len() < ref_pos {
+    // `return if length($ref_trans) <= $ref_pos;` -- no peptide after the
+    // last residue (vepyr#233).
+    if ref_trans.len() <= ref_pos {
         return None;
     }
-    let start = ref_pos.checked_sub(1)?;
-    match length {
-        Some(len) => ref_trans
-            .get(start..start.saturating_add(len))
-            .map(str::to_string),
-        None => ref_trans.get(start..).map(str::to_string),
-    }
+    // `substr($ref_trans, $ref_pos - 1, ...)`. At `ref_pos` 0 Perl's offset
+    // -1 starts at the LAST residue: a codon-1 insertion on a
+    // `cds_start_NF` fragment gets that residue as its 5' flank and VEP
+    // prints `p.Phe0_Phe1ins...` (vepyr#225). Deliberate replica: residue 0
+    // is not valid HGVS.
+    let start = match ref_pos {
+        0 => ref_trans.len() - 1,
+        pos => pos - 1,
+    };
+    // Perl's `substr` truncates a LENGTH that runs past the end.
+    let end = match length {
+        Some(len) => start.saturating_add(len).min(ref_trans.len()),
+        None => ref_trans.len(),
+    };
+    ref_trans.get(start..end).map(str::to_string)
 }
 
 /// Traceability:
@@ -2349,6 +2513,15 @@ fn stop_loss_extra_aa(
     ref_var_pos: usize,
     frameshift: bool,
 ) -> Option<usize> {
+    // Deliberate replica of a VEP bug (vepyr#224). `_stop_loss_extra_AA`
+    // opens with `return undef unless $ref_var_pos;`
+    // (ensembl-variation 116 `TranscriptVariationAllele.pm:2477`), and Perl's
+    // 0 is false, so a change at residue 1 (`ref_var_pos` = start - 1 = 0)
+    // never counts the distance to the new stop: every caller then prints
+    // `fsTer?` / `Ter?` or omits `extTer`, even when a stop exists.
+    if ref_var_pos == 0 {
+        return None;
+    }
     let alt_translation = protein
         .alt_translation_extension
         .as_deref()
@@ -2851,6 +3024,117 @@ mod tests {
         );
     }
 
+    fn start_lost_protein(
+        start: usize,
+        end: usize,
+        ref_peptide: &str,
+        alt_peptide: &str,
+        ref_translation: &str,
+        alt_translation: &str,
+        frameshift: bool,
+    ) -> ProteinHgvsData {
+        ProteinHgvsData {
+            start,
+            end,
+            ref_peptide: ref_peptide.to_string(),
+            alt_peptide: alt_peptide.to_string(),
+            ref_translation: ref_translation.to_string(),
+            alt_translation: alt_translation.to_string(),
+            alt_translation_extension: None,
+            frameshift,
+            start_lost: true,
+            stop_lost: false,
+            native_refseq: false,
+        }
+    }
+
+    /// vepyr#221: VEP's start_lost override (`_get_hgvs_peptides`,
+    /// `TranscriptVariationAllele.pm:2154-2159`) runs after clipping and the
+    /// 3' shift and only sets `alt = "?"`, `type = ""`. The first matching
+    /// format arm is `start ne end` (`:2024-2026`):
+    /// `{ref}{start}_{alt}{end}`, with the whole clipped reference peptide.
+    #[test]
+    fn test_format_hgvsp_start_lost_inframe_deletion_prints_range() {
+        let translation = make_translation();
+        let protein = start_lost_protein(1, 3, "MAG", "-", "MAGKLVWR", "KLVWR", false);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.MetAlaGly1_?3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_start_lost_mnv_prints_range() {
+        let translation = make_translation();
+        let protein = start_lost_protein(1, 2, "MP", "IS", "MPKLVWR", "ISKLVWR", false);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.MetPro1_?2".to_string())
+        );
+    }
+
+    /// vepyr#221: `_get_fs_peptides` (`:2336-2357`) moves `start` to the
+    /// first differing residue and sets `ref` to that one residue, but never
+    /// touches `end`, which stays `translation_end`.
+    #[test]
+    fn test_format_hgvsp_start_lost_frameshift_keeps_translation_end() {
+        let translation = make_translation();
+        let protein = start_lost_protein(1, 4, "MKLV", "IR", "MKLVWRP", "IRW*", true);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Met1_?4".to_string())
+        );
+    }
+
+    /// vepyr#221: when the shifted start is past the alternate translation,
+    /// VEP's `_get_fs_peptides` sets `alt = "del"` and returns without
+    /// replacing the original multi-residue reference peptide. The later
+    /// start_lost override then formats that full reference range.
+    #[test]
+    fn test_format_hgvsp_start_lost_terminal_frameshift_preserves_full_reference() {
+        let translation = make_translation();
+        let protein = start_lost_protein(1, 3, "MAG", "-", "MAGKLVWR", "", true);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.MetAlaGly1_?3".to_string())
+        );
+    }
+
+    /// vepyr#221: when the first differing residue lies past `end`, VEP's
+    /// `ne` string test still prints a range and nothing reorders it:
+    /// `p.His3_?2` (ENST00000399959). Deliberate replica: not valid HGVS.
+    #[test]
+    fn test_format_hgvsp_start_lost_frameshift_past_end_keeps_unordered_range() {
+        let translation = make_translation();
+        let protein = start_lost_protein(2, 2, "A", "A", "MAHKLVW", "MAQRS*", true);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.His3_?2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_start_lost_single_residue_prints_unknown() {
+        let translation = make_translation();
+        let protein = start_lost_protein(1, 1, "M", "T", "MKLV", "TKLV", false);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Met1?".to_string())
+        );
+    }
+
+    /// vepyr#221: a `dup` returns from `_get_hgvs_peptides` (`:2125`) before
+    /// the start_lost override, so it keeps its dup notation.
+    #[test]
+    fn test_format_hgvsp_start_lost_insertion_resolving_to_dup_stays_dup() {
+        let translation = make_translation();
+        let protein = start_lost_protein(2, 1, "-", "M", "MKLV", "MMKLV", false);
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Met1dup".to_string())
+        );
+    }
+
     #[test]
     fn test_format_hgvsp_frameshift_uses_first_changed_residue_and_stop_distance() {
         let translation = make_translation();
@@ -3031,8 +3315,8 @@ mod tests {
             end: 2,
             ref_peptide: "A".to_string(),
             alt_peptide: "-".to_string(),
-            ref_translation: "MAA*".to_string(),
-            alt_translation: "MA*".to_string(),
+            ref_translation: "MAAK*".to_string(),
+            alt_translation: "MAK*".to_string(),
             alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
@@ -3046,6 +3330,18 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ala3del".to_string())
+        );
+        // vepyr#233: on `MAA*` VEP's `_peptide()` is `MAA`, so `post_pos` 3
+        // is the last residue and `_get_surrounding_peptides` returns
+        // nothing (`length <= ref_pos`): no shift even with shift_hgvs on.
+        let protein = ProteinHgvsData {
+            ref_translation: "MAA*".to_string(),
+            alt_translation: "MA*".to_string(),
+            ..protein
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala2del".to_string())
         );
     }
 
@@ -3232,6 +3528,165 @@ mod tests {
             ),
             None
         );
+    }
+
+    // vepyr#216. Release/116 `_var2transcript_slice_coords` clamps every
+    // allele that overlaps part of the transcript, not only deletions
+    // (ensembl-variation 2fb834b TranscriptVariationAllele.pm:2719-2729).
+    // `hgvs_transcript` then cuts REF from the clamped slice, keeps ALT whole
+    // (:1474-1482) and clips the pair (:1492). The toy transcript spans
+    // 90-140 with one exon, so `n.1` is 90 on + and 140 on -.
+    fn partial_overlap_hgvsc(
+        tx: &TranscriptFeature,
+        ref_allele: &str,
+        alt_allele: &str,
+        start: i64,
+        end: i64,
+        semantics: VepSemantics,
+    ) -> Option<String> {
+        let exon = make_exon();
+        format_hgvsc_with_semantics(
+            tx,
+            &[&exon],
+            None,
+            None,
+            ref_allele,
+            alt_allele,
+            start,
+            end,
+            None,
+            semantics,
+        )
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_delins_minus_strand() {
+        // Five of six REF bases lie past the 3' end of a - strand transcript.
+        // The clamped REF is genomic 90 (C, feature G); ALT is kept whole and
+        // reverse-complemented (TACAGG -> CCTGTA).
+        let reverse = make_transcript("lncRNA", -1, None, None);
+        assert_eq!(
+            partial_overlap_hgvsc(&reverse, "ACGTAC", "TACAGG", 85, 90, VepSemantics::V116)
+                .as_deref(),
+            Some("ENSTHGVS000001.1:n.51delinsCCTGTA")
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_mnv_plus_strand() {
+        let forward = make_transcript("lncRNA", 1, None, None);
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "AC", "GT", 89, 90, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:n.1delinsGT")
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_clips_to_substitution() {
+        // Clamped REF AC (139-140) against ALT TC clips the shared C.
+        let forward = make_transcript("lncRNA", 1, None, None);
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "ACT", "TC", 139, 141, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:n.50A>T")
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_clips_to_deletion_and_insertion() {
+        let forward = make_transcript("lncRNA", 1, None, None);
+        // Clamped AC against C: the shared C is clipped, A is deleted.
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "ACT", "C", 139, 141, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:n.50del")
+        );
+        // Clamped ACG (90-92) against ATCG: A and CG are clipped, T inserted.
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "TACG", "ATCG", 89, 92, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:n.1_2insT")
+        );
+        // Clamped AAG against AAAG clips to an inserted A that repeats the
+        // clipped prefix. `hgvs_transcript` sets `numbering` only after the
+        // clip (TVA.pm:1548-1553), so `_clip_alleles`' dup re-typing (:2269)
+        // cannot fire there: VEP prints `ins`, never `dup`.
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "TAAG", "AAAG", 89, 92, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:n.2_3insA")
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_identical_clamped_pair_is_none() {
+        // `hgvs_variant_notation` returns undef when the REF cut from the
+        // slice equals ALT (Utils/Sequence.pm:526-531).
+        let forward = make_transcript("lncRNA", 1, None, None);
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "ACT", "AC", 139, 141, VepSemantics::V116),
+            None
+        );
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "GA", "A", 89, 90, VepSemantics::V116),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_v115_rejects_delins() {
+        // Release/115 returns undef for any partial overlap
+        // (origin/release/115 TranscriptVariationAllele.pm:2655-2661).
+        let forward = make_transcript("lncRNA", 1, None, None);
+        let reverse = make_transcript("lncRNA", -1, None, None);
+        assert_eq!(
+            partial_overlap_hgvsc(&reverse, "ACGTAC", "TACAGG", 85, 90, VepSemantics::V115),
+            None
+        );
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "AC", "GT", 89, 90, VepSemantics::V115),
+            None
+        );
+        assert_eq!(
+            partial_overlap_hgvsc(&forward, "TACG", "ATCG", 89, 92, VepSemantics::V115),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_partial_overlap_insertion_keeps_unswapped_star_end() {
+        // vepyr#244 sub-case, clamped path only. VEP sorts the clipped
+        // positions unless the end carries `*` (TVA.pm:1535-1538); a clipped
+        // `ins` has start = end + 1, so in the 3' UTR it prints `*32_*31`.
+        let coding = make_transcript("protein_coding", 1, Some(100), Some(108));
+        assert_eq!(
+            partial_overlap_hgvsc(&coding, "GCT", "GAC", 139, 141, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:c.*32_*31insA")
+        );
+        // The same clipped insertion inside the transcript numbering without
+        // `*` is sorted as usual (`n.1_2insT` above).
+
+        // - strand: the clamp is at genomic 90 (`*10`). Feature REF GC(T),
+        // ALT GAC clip to an A inserted between `*9` and `*10`, and VEP's
+        // slice order (start = end + 1) is kept: `*10_*9`.
+        let coding_reverse = make_transcript("protein_coding", -1, Some(100), Some(108));
+        assert_eq!(
+            partial_overlap_hgvsc(&coding_reverse, "AGC", "GTC", 89, 91, VepSemantics::V116)
+                .as_deref(),
+            Some("ENSTHGVS000001.1:c.*10_*9insA")
+        );
+    }
+
+    #[test]
+    fn test_vep_hgvs_position_parts_match_the_perl_regex() {
+        // m/(\-?[0-9]+)\+?(\-?[0-9]+)?/ (TranscriptVariationAllele.pm:1525-1526)
+        assert_eq!(vep_hgvs_position_parts("*159"), Some((159, 0)));
+        assert_eq!(vep_hgvs_position_parts("-42"), Some((-42, 0)));
+        assert_eq!(vep_hgvs_position_parts("-5+3"), Some((-5, 3)));
+        assert_eq!(vep_hgvs_position_parts("12-4"), Some((12, -4)));
+        assert_eq!(vep_hgvs_position_parts("253+5128"), Some((253, 5128)));
+        assert_eq!(vep_hgvs_position_parts("*31+5"), Some((31, 5)));
+        // VEP's `end !~ /\*/` guard: `1420_*251` is never swapped.
+        assert!(!vep_hgvs_positions_need_swap("1420", "*251"));
+        assert!(vep_hgvs_positions_need_swap("12", "11"));
+        assert!(vep_hgvs_positions_need_swap("12+5", "12+3"));
+        assert!(!vep_hgvs_positions_need_swap("-42", "253+5128"));
     }
 
     #[test]
@@ -6111,6 +6566,57 @@ mod tests {
         assert_eq!(stop_loss_extra_aa(&protein, 3, true), Some(2));
     }
 
+    /// vepyr#224: `_stop_loss_extra_AA` opens with
+    /// `return undef unless $ref_var_pos;` (`TranscriptVariationAllele.pm:2477`),
+    /// and Perl's 0 is false, so a change at residue 1 (`ref_var_pos` 0)
+    /// never counts the distance to the new stop, frameshift or not.
+    #[test]
+    fn test_stop_loss_extra_aa_returns_none_at_ref_var_pos_zero() {
+        for frameshift in [true, false] {
+            let protein = ProteinHgvsData {
+                start: 1,
+                end: 1,
+                ref_peptide: "K".into(),
+                alt_peptide: "Q".into(),
+                ref_translation: "MKKK*".into(),
+                alt_translation: "MKQW*".into(),
+                alt_translation_extension: None,
+                frameshift,
+                start_lost: false,
+                stop_lost: false,
+                native_refseq: false,
+            };
+            assert_eq!(stop_loss_extra_aa(&protein, 0, frameshift), None);
+        }
+    }
+
+    /// vepyr#224: a frameshift whose first changed residue is residue 1 (a
+    /// `cds_start_NF` fragment, so no Met and no start_lost) prints `fsTer?`
+    /// in VEP even though the alternate translation has a stop: the fs arm
+    /// passes `start - 1 = 0` to `_stop_loss_extra_AA` (`:2003-2008`).
+    #[test]
+    fn test_format_hgvsp_frameshift_at_residue_one_reports_unknown_stop() {
+        let translation = make_translation();
+        let alt_translation = format!("H{}*", "W".repeat(46));
+        let protein = ProteinHgvsData {
+            start: 1,
+            end: 1,
+            ref_peptide: "P".to_string(),
+            alt_peptide: "H".to_string(),
+            ref_translation: format!("P{}", "K".repeat(60)),
+            alt_translation,
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Pro1HisfsTer?".to_string())
+        );
+    }
+
     // ---------------------------------------------------------------
     // perform_shift_ensembl — hgvs_reverse flag combinations
     // ---------------------------------------------------------------
@@ -6416,6 +6922,141 @@ mod tests {
         assert_eq!(
             surrounding_peptides("MAK", 3, "*Q", Some(2)),
             Some("K*".into())
+        );
+    }
+
+    /// vepyr#225: VEP's `_get_surrounding_peptides` (`:2362-2384`) takes
+    /// `substr($ref_trans, $ref_pos - 1, ...)`, and at `ref_pos` 0 Perl's
+    /// negative offset starts at the protein's LAST residue, truncated at the
+    /// end of the string.
+    #[test]
+    fn test_surrounding_peptides_ref_pos_zero_returns_last_residue() {
+        assert_eq!(
+            surrounding_peptides("ATEPGF", 0, "", Some(2)),
+            Some("F".into())
+        );
+        assert_eq!(
+            surrounding_peptides("ATEPGF", 0, "", None),
+            Some("F".into())
+        );
+        assert_eq!(surrounding_peptides("", 0, "", Some(2)), None);
+    }
+
+    /// vepyr#233 (a): `return if length($ref_trans) <= $ref_pos;` over
+    /// `_peptide()`, which has no terminal `*`. A position equal to the
+    /// protein length (the last residue) has no peptide after it.
+    #[test]
+    fn test_surrounding_peptides_end_plus_one_at_last_residue_is_none() {
+        assert_eq!(surrounding_peptides("MKEEE", 5, "", None), None);
+        assert_eq!(surrounding_peptides("MKEEE*", 5, "", None), None);
+        assert_eq!(
+            surrounding_peptides("MKEEE*", 4, "", None),
+            Some("EE".into())
+        );
+    }
+
+    /// vepyr#225: an in-frame insertion in codon 1 of a
+    /// `cds_start_NF&cds_end_NF` fragment clips to `start = 1, end = 0`. VEP
+    /// takes the flank at `min(start, end) = 0`, which Perl's `substr` wraps
+    /// to the last residue (ENST00000637214, `p.Phe0_Phe1insAspThr`).
+    #[test]
+    fn test_format_hgvsp_insertion_before_residue_one_wraps_to_last_residue() {
+        let translation = make_translation();
+        let ref_translation = format!("A{}TEPGF", "K".repeat(40));
+        let alt_translation = format!("DT{ref_translation}");
+        let protein = ProteinHgvsData {
+            start: 1,
+            end: 1,
+            ref_peptide: "A".to_string(),
+            alt_peptide: "DTA".to_string(),
+            ref_translation,
+            alt_translation,
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Phe0_Phe1insAspThr".to_string())
+        );
+    }
+
+    /// vepyr#233 (b): `_shift_3prime` (`:2613`) runs at most
+    /// `length($post_seq) - $deleted_length + 1` times. Deleting `EE` at 2-3
+    /// of `MEEEEE` leaves post `EEE` (3), so two shifts, not three.
+    #[test]
+    fn test_format_hgvsp_deletion_shift_capped_by_post_length() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2,
+            end: 3,
+            ref_peptide: "EE".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: "MEEEEE".to_string(),
+            alt_translation: "MEEEE".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Glu4_Glu5del".to_string())
+        );
+    }
+
+    /// vepyr#233 (a), the 10:103089678 shape: a Glu run that ends the
+    /// protein. A deletion whose `end + 1` is the last residue gets no post
+    /// sequence and stays put (VEP `p.Glu568del` on a 569-residue protein).
+    #[test]
+    fn test_format_hgvsp_deletion_not_shifted_when_end_plus_one_is_last_residue() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 4,
+            end: 4,
+            ref_peptide: "E".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: "MKAEE".to_string(),
+            alt_translation: "MKAE".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Glu4del".to_string())
+        );
+    }
+
+    /// vepyr#233 (a), the 10:103089678 T>TTCC shape: an `E` inserted at the
+    /// end of a Glu run that ends the protein, as VEP's empty interval
+    /// `(start, end) = (5, 4)`. `post_pos` 5 is the last residue, so no
+    /// shift; the dup window then sits at residue 4 (VEP `p.Glu568dup` on
+    /// the 569-residue ENST00000874298, not 569).
+    #[test]
+    fn test_format_hgvsp_dup_not_shifted_when_end_plus_one_is_last_residue() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 5,
+            end: 4,
+            ref_peptide: "-".to_string(),
+            alt_peptide: "E".to_string(),
+            ref_translation: "MKAEE".to_string(),
+            alt_translation: "MKAEEE".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Glu4dup".to_string())
         );
     }
 
