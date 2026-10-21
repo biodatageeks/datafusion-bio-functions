@@ -1531,6 +1531,23 @@ impl TranscriptConsequenceEngine {
                                 );
                                 (None, None, None, None, protein_hgvs)
                             };
+                        // vepyr#222. VEP's HGVSp formatter calls `start_lost($self)`
+                        // on the same TVA that consequence calling already used,
+                        // and the predicate is memoised in `_predicate_cache`
+                        // (ensembl-variation 116 `VariationEffect.pm:851-858`).
+                        // The only invalidation (`TranscriptVariationAllele.pm:1469`)
+                        // needs `{shifted}`, which VEP sets only under
+                        // `--shift_3prime` (`-no_shift => !shift_3prime`,
+                        // ensembl-vep `AnnotationType/Transcript.pm:162`), and that
+                        // flag is outside the parity scope. So HGVSp's start_lost
+                        // is the consequence-level term, also for a payload rebuilt
+                        // on the HGVS-shifted allele. `terms` is still the pre-tier
+                        // set here, as VEP's predicate is.
+                        let consequence_start_lost = terms.contains(&SoTerm::StartLost);
+                        let protein_hgvs = protein_hgvs.map(|mut data| {
+                            data.start_lost = consequence_start_lost;
+                            data
+                        });
                         if let (Some(started), Some(profile)) =
                             (coding_started, profile.as_deref_mut())
                         {
@@ -4811,13 +4828,23 @@ fn build_protein_hgvs_data(
     let raw_end = class
         .protein_position_end
         .or(class.protein_position_start)?;
-    let (ref_peptide, alt_peptide) = match peptide_alleles {
-        Some(value) => match value.split_once('/') {
-            Some((left, right)) => (left.to_string(), right.to_string()),
-            None => (value.to_string(), value.to_string()),
-        },
-        None => (String::new(), String::new()),
+    let affected_start_lost_peptides = if class.start_lost && !frameshift {
+        class
+            .affected_ref_peptide
+            .as_deref()
+            .zip(class.affected_alt_peptide.as_deref())
+            .map(|(reference, alternate)| (reference.to_string(), alternate.to_string()))
+    } else {
+        None
     };
+    let (ref_peptide, alt_peptide) =
+        affected_start_lost_peptides.unwrap_or_else(|| match peptide_alleles {
+            Some(value) => match value.split_once('/') {
+                Some((left, right)) => (left.to_string(), right.to_string()),
+                None => (value.to_string(), value.to_string()),
+            },
+            None => (String::new(), String::new()),
+        });
     // Traceability:
     // - VEP's hgvs_protein() uses translation_start() which returns the
     //   FIRST coordinate from genomic2pep. For insertions, genomic2pep
@@ -18517,6 +18544,121 @@ mod tests {
                 terms
             );
         }
+    }
+
+    /// A start-lost deletion keeps the full reference peptide window. The
+    /// consequence Codons are `ATGGAG/-` (ME/-); using the narrower
+    /// classification amino-acid string `ME/E` would clip the shared Glu and
+    /// incorrectly produce `p.Met1?` instead of VEP's `p.MetGlu1_?2`.
+    #[test]
+    fn start_lost_hgvsp_uses_full_affected_peptide_window() {
+        let mut tr = translation(
+            "ENSTSTARTDEL",
+            Some(9),
+            Some(3),
+            Some("MEK"),
+            Some("ATGGAGAAA"),
+        );
+        tr.stable_id = Some("ENSPSTARTDEL".to_string());
+        tr.version = Some(1);
+        let class = CodingClassification {
+            protein_position_start: Some(1),
+            protein_position_end: Some(2),
+            amino_acids: Some("ME/E".to_string()),
+            start_lost: true,
+            affected_ref_peptide: Some("ME".to_string()),
+            affected_alt_peptide: Some("-".to_string()),
+            ..CodingClassification::default()
+        };
+        let data = build_protein_hgvs_data(
+            &class,
+            Some("ME/E"),
+            &['M', 'E', 'K'],
+            &['E', 'K'],
+            false,
+            Some(&tr),
+        )
+        .expect("start_lost HGVSp payload");
+
+        assert_eq!(data.ref_peptide, "ME");
+        assert_eq!(data.alt_peptide, "-");
+        assert_eq!(
+            crate::hgvs::format_hgvsp(&tr, &data, false).as_deref(),
+            Some("ENSPSTARTDEL.1:p.MetGlu1_?2")
+        );
+    }
+
+    /// vepyr#222: a deletion that starts in the 5'UTR and ends on the start
+    /// codon (`TA` across `...CCT|ATG...`) is HGVS-shifted wholly into the
+    /// CDS (`c.1_2del`). VEP's formatter reads the memoised consequence-time
+    /// `start_lost` (`VariationEffect.pm:851-858`; the cache is only cleared
+    /// under `--shift_3prime`, `TranscriptVariationAllele.pm:1469`), so the
+    /// shifted payload must print `p.Met1?`, not a frameshift.
+    #[test]
+    fn shifted_utr_start_codon_deletion_keeps_consequence_start_lost_hgvsp() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(5000, 5000, true);
+        let utr5 = "GGGAAACCCT";
+        let cds = "ATGCACCATGGCAAACCCGGGTTTAAATAG";
+        let utr3 = "GGGCCC".repeat(10);
+        let mut t = tx(
+            "ENSTSTART1",
+            "1",
+            1000,
+            1099,
+            1,
+            "protein_coding",
+            Some(1010),
+            Some(1039),
+        );
+        t.version = Some(1);
+        t.cdna_coding_start = Some(11);
+        t.cdna_coding_end = Some(40);
+        t.translation_stable_id = Some("ENSPSTART1".to_string());
+        t.spliced_seq = Some(format!("{utr5}{cds}{utr3}"));
+        t.five_prime_utr_seq = Some(utr5.to_string());
+        t.three_prime_utr_seq = Some(utr3.clone());
+        t.translateable_seq = Some(cds.to_string());
+        let exons = vec![exon("ENSTSTART1", 1, 1000, 1099)];
+        let mut tr = translation(
+            "ENSTSTART1",
+            Some(30),
+            Some(9),
+            Some("MHHGKPGFK"),
+            Some(cds),
+        );
+        tr.stable_id = Some("ENSPSTART1".to_string());
+        tr.version = Some(1);
+
+        let mut v = var("1", 1009, 1010, "TA", "-");
+        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 1,
+            start: 1010,
+            end: 1011,
+            shifted_allele_string: "AT".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "AT".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+
+        let assignments =
+            engine.evaluate_variant_with_context(&v, &[t], &exons, &[tr], &[], &[], &[], &[]);
+        let consequence = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENSTSTART1"))
+            .expect("expected transcript consequence");
+        assert!(
+            consequence.terms.contains(&SoTerm::StartLost),
+            "terms: {:?}",
+            consequence.terms
+        );
+        assert_eq!(consequence.hgvsc.as_deref(), Some("ENSTSTART1.1:c.1_2del"));
+        assert_eq!(consequence.hgvsp.as_deref(), Some("ENSPSTART1.1:p.Met1?"));
     }
 
     // ---- C2a: insertion at codon-1 boundary must NOT emit start_retained ----
