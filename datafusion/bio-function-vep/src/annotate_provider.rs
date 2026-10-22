@@ -7146,19 +7146,19 @@ impl AnnotateProvider {
                                 .unwrap_or(""),
                         );
                         let source_val = if include_source_field { source } else { "" };
-                        let refseq_offset_value = tx_opt
-                            .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
-                            .and_then(|tx| {
+                        let refseq_offset_value =
+                            tx_opt.filter(|_| hgvs_flags.hgvsc).and_then(|tx| {
                                 let variant = row_variant.as_ref()?;
                                 let tx_exons = ctx
                                     .exons_by_tx_genomic
                                     .get(tx.transcript_id.as_str())
                                     .or_else(|| ctx.exons_by_tx.get(tx.transcript_id.as_str()))?;
-                                refseq_misalignment_offset_for_variant(
+                                refseq_misalignment_offset_for_output(
                                     tx,
                                     tx_exons,
                                     variant.parser_start,
                                     variant.parser_end,
+                                    tc.cdna_position.as_deref(),
                                 )
                             });
                         let refseq_offset = OptDisplay(refseq_offset_value);
@@ -7613,19 +7613,19 @@ impl AnnotateProvider {
                             .and_then(|tx| tx.refseq_match.as_deref())
                             .unwrap_or("");
                         let source_val = tx_opt.and_then(|tx| tx.source.as_deref()).unwrap_or("");
-                        let refseq_offset_value = tx_opt
-                            .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
-                            .and_then(|tx| {
+                        let refseq_offset_value =
+                            tx_opt.filter(|_| hgvs_flags.hgvsc).and_then(|tx| {
                                 let variant = row_variant.as_ref()?;
                                 let tx_exons = ctx
                                     .exons_by_tx_genomic
                                     .get(tx.transcript_id.as_str())
                                     .or_else(|| ctx.exons_by_tx.get(tx.transcript_id.as_str()))?;
-                                refseq_misalignment_offset_for_variant(
+                                refseq_misalignment_offset_for_output(
                                     tx,
                                     tx_exons,
                                     variant.parser_start,
                                     variant.parser_end,
+                                    tc.cdna_position.as_deref(),
                                 )
                             });
                         let given_ref = tc.given_ref.as_deref().unwrap_or("");
@@ -8689,6 +8689,49 @@ fn refseq_misalignment_offset_for_variant(
         .and_then(|position| i64::try_from(position).ok())
         .unwrap_or(0);
     refseq_misalignment_offset(tx, cdna_start)
+}
+
+fn refseq_misalignment_offset_for_output(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variation_start: i64,
+    variation_end: i64,
+    displayed_cdna_position: Option<&str>,
+) -> Option<i64> {
+    refseq_misalignment_offset_for_variant(tx, tx_exons, variation_start, variation_end).or_else(
+        || {
+            displayed_cdna_position
+                .and_then(parse_cdna_position_start)
+                .and_then(|cdna_start| refseq_misalignment_offset(tx, cdna_start))
+        },
+    )
+}
+
+fn parse_cdna_position_start(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let mut sign = 1_i64;
+    let mut digit_start = 0;
+    if value.starts_with('-') {
+        sign = -1;
+        digit_start = 1;
+    }
+
+    let mut digit_end = digit_start;
+    for (idx, ch) in value[digit_start..].char_indices() {
+        if ch.is_ascii_digit() {
+            digit_end = digit_start + idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if digit_end == digit_start {
+        return None;
+    }
+
+    value[digit_start..digit_end]
+        .parse::<i64>()
+        .ok()
+        .map(|position| position * sign)
 }
 
 fn is_predicted_refseq_transcript(tx: &TranscriptFeature) -> bool {
@@ -21758,6 +21801,42 @@ mod tests {
         assert_eq!(
             refseq_misalignment_offset_for_variant(&tx, &[&exon], 150, 151),
             None
+        );
+    }
+
+    #[test]
+    fn test_refseq_offset_uses_displayed_cdna_position_for_intronic_variant() {
+        let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
+        tx.start = 100;
+        tx.end = 200;
+        tx.strand = 1;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 10,
+            end: 9,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        let exons = vec![
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 1,
+                start: 100,
+                end: 109,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 2,
+                start: 191,
+                end: 200,
+            },
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+
+        // The genomic mapper has no cDNA base for an intronic coordinate;
+        // VEP's output position still supplies the transcript start (35+2).
+        assert_eq!(
+            refseq_misalignment_offset_for_output(&tx, &exons_ref, 150, 150, Some("35+2"),),
+            Some(3)
         );
     }
 
