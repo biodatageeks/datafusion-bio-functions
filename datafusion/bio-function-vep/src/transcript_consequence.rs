@@ -1922,6 +1922,11 @@ impl TranscriptConsequenceEngine {
         out
     }
 
+    /// Collapse consequences with the legacy VEP 115 semantics.
+    ///
+    /// Call [`Self::collapse_variant_terms_with_semantics`] when the
+    /// assignments were produced by a VEP 116 engine so that predicate-based
+    /// `protein_altering_variant` handling is preserved.
     pub fn collapse_variant_terms(assignments: &[TranscriptConsequence]) -> Vec<SoTerm> {
         Self::collapse_variant_terms_with_semantics(
             assignments,
