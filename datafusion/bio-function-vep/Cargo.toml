@@ -37,14 +37,10 @@ noodles-csi = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3
 noodles-tabix = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-bgzf = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
-# The pinned datafusion-bio-formats rev is the formats#266 head. It carries v1.14.0
-# (the GT-first FORMAT fix, datafusion-bio-formats#254, and the native cache BAM
-# reference policy metadata, datafusion-bio-formats#259), formats master through
-# abac8df (codon_table from the variation feature cache, datafusion-bio-formats#262,
-# which the MT codon-table fix #274 needs), plus percent-encoding of reserved
-# characters in written INFO/FORMAT values (biodatageeks/vepyr#207, formats#264) and
-# Character INFO read materialization (datafusion-bio-formats#263, formats#266);
-# both are PR heads until released.
+# Pin the full formats master head. It includes formats#264/#266 (the vepyr#207
+# and formats#263 changes), formats master through abac8df (codon_table for the
+# MT codon-table fix #274), and formats#270's transcript gene bounds. The formats
+# release is postponed, so every formats crate uses this same full rev.
 # Every formats crate in this workspace, the pileup crate's included, has to name
 # the same tag or rev, or the lockfile resolves two copies of datafusion-bio-format-core.
 datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "6af1fa1480b2fc527e3b218585eae3a087f2aca9" }
