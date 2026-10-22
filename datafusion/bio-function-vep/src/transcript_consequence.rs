@@ -5251,6 +5251,21 @@ fn apply_vep116_primary_indel_predicates(
     }
 
     let frameshift = terms.contains(&SoTerm::FrameshiftVariant);
+    let mut resolved_class = class.clone();
+    if !frameshift && resolved_class.start_lost {
+        // Ensembl's start_lost and inframe_insertion predicates recurse. The
+        // start_lost predicate starts from false, asks inframe_insertion, and
+        // only emits start_lost when that child does not apply. Re-evaluate
+        // the insertion with that provisional flag cleared, then keep the
+        // original start_lost result if the insertion predicate still fails.
+        resolved_class.start_lost = false;
+        if vep116_inframe_insertion(&resolved_class) {
+            terms.remove(&SoTerm::StartLost);
+        } else {
+            resolved_class.start_lost = true;
+        }
+    }
+    let class = &resolved_class;
     let inframe_insertion = !frameshift && vep116_inframe_insertion(class);
     if inframe_insertion {
         terms.insert(SoTerm::InframeInsertion);
@@ -11847,25 +11862,48 @@ mod tests {
     }
 
     #[test]
-    fn vep116_inframe_insertion_respects_start_lost_guard() {
-        // VariationEffect::inframe_insertion returns false when start_lost
-        // is true, even if the insertion is in-frame and the peptide alleles
-        // would otherwise satisfy the insertion predicate.
+    fn vep116_inframe_insertion_respects_start_retained_guard_after_start_lost() {
+        // A preserved suffix with start_retained still vetoes the insertion,
+        // so the provisional start_lost flag must remain in this case.
         let class = CodingClassification {
             start_lost: true,
-            codons: Some("gct/GCTGCT".to_string()),
+            start_retained: true,
+            codons: Some("atg/GCTATG".to_string()),
             affected_ref_peptide: Some("M".to_string()),
-            affected_alt_peptide: Some("MA".to_string()),
+            affected_alt_peptide: Some("AM".to_string()),
             ..Default::default()
         };
-        let mut terms = BTreeSet::from([SoTerm::InframeInsertion]);
+        let mut terms = BTreeSet::from([SoTerm::StartLost, SoTerm::InframeInsertion]);
         apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
             false,
         );
+        assert!(terms.contains(&SoTerm::StartLost));
         assert!(!terms.contains(&SoTerm::InframeInsertion));
+    }
+
+    #[test]
+    fn vep116_start_lost_yields_to_valid_inframe_insertion() {
+        let class = CodingClassification {
+            start_lost: true,
+            codons: Some("atg/GCTATG".to_string()),
+            affected_ref_peptide: Some("M".to_string()),
+            affected_alt_peptide: Some("AM".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::StartLost, SoTerm::InframeInsertion]);
+
+        apply_vep116_primary_indel_predicates(
+            &mut terms,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+
+        assert!(!terms.contains(&SoTerm::StartLost));
+        assert!(terms.contains(&SoTerm::InframeInsertion));
     }
 
     #[test]
@@ -12017,6 +12055,22 @@ mod tests {
             true,
         );
         assert!(insertion_terms.contains(&SoTerm::InframeInsertion));
+    }
+
+    #[test]
+    fn vep116_partial_codon_pav_matches_empty_peptide_sentinel_rule() {
+        let class = CodingClassification {
+            affected_ref_peptide: Some("X".to_string()),
+            affected_alt_peptide: Some("-".to_string()),
+            ..Default::default()
+        };
+
+        // VariationEffect::_get_peptide_alleles normalizes `-` to an empty
+        // string before the PAV length and prefix/suffix checks.
+        assert!(vep116_partial_codon_protein_altering_variant(
+            &class,
+            &BTreeSet::new()
+        ));
     }
 
     #[test]
