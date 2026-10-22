@@ -25640,6 +25640,53 @@ mod tests {
     }
 
     #[test]
+    fn full_cds_refseq_without_cdna_bounds_keeps_genomic_positions_without_codons() {
+        let mut transcript = tx(
+            "NM_000001.1",
+            "22",
+            990,
+            1020,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        let exon_feature = exon("NM_000001.1", 1, 990, 1020);
+        let exons = [&exon_feature];
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let variant = var("22", 1000, 1000, "A", "G");
+
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
+
+        let classification = classification
+            .expect("legacy genomic CDS bounds retain mappable positions without cDNA bounds");
+        assert_eq!(classification.cds_position_start, Some(1));
+        assert_eq!(classification.cds_position_end, Some(1));
+        assert_eq!(classification.protein_position_start, Some(1));
+        assert_eq!(classification.protein_position_end, Some(1));
+        assert!(classification.codons.is_none());
+        assert!(classification.amino_acids.is_none());
+        assert!(classification.protein_hgvs.is_none());
+        assert!(
+            !terms.iter().any(|term| matches!(
+                term,
+                SoTerm::MissenseVariant
+                    | SoTerm::SynonymousVariant
+                    | SoTerm::StopGained
+                    | SoTerm::StopLost
+            )),
+            "genomic positions must not imply peptide-derived terms: {terms:?}"
+        );
+    }
+
+    #[test]
     fn insertion_at_cds_end_negative_strand() {
         // Negative strand: CDS boundary insertion.
         // On negative strand, cds_end (genomic) is the 5' CDS boundary.
