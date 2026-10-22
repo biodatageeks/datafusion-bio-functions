@@ -3121,6 +3121,8 @@ impl TranscriptConsequenceEngine {
         //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1041-L1042
         // - Ensembl Variation `stop_lost()` falls back to the indel predicate:
         //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1258-L1263
+        // This equal-length partial-boundary guard is V116-specific. V115
+        // keeps its historical classification path for compatibility.
         if self.semantics.vep116_stop_predicates() && has_partial_cds_endpoint && ref_len == alt_len
         {
             return partial_boundary_classification;
@@ -10973,12 +10975,11 @@ fn partial_coding_overlap_classification(
         return partial_coding_overlap_from_genomic_segments(tx, tx_exons, tx_translation, variant);
     }
 
-    let mapper = vep_coords::VepTxMapper::new(
-        tx,
-        tx_exons,
-        tx_translation,
-        vep_coords::CdnaBaseMap::Output,
-    );
+    let phase = reference_translateable_seq_for_vep(tx, tx_translation)
+        .map(|sequence| sequence.bytes().take_while(|&base| base == b'N').count())
+        .unwrap_or(0);
+    let mapper =
+        vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, phase);
     let span = vep_coords::VepSpan::from_variant(variant);
     // `cds_pieces` walks every genomic base in the allele span. Use the
     // transcript's exon/CDS intervals here so a large deletion costs O(exons),
@@ -25328,6 +25329,7 @@ mod tests {
     fn cds_boundary_delins_fixture(
         strand: i8,
         variant: VariantInput,
+        with_cdna_bounds: bool,
     ) -> (Vec<SoTerm>, Option<CodingClassification>) {
         let cds = "ATGGAATGA";
         let (tx_start, tx_end, cds_start, cds_end, cdna_coding_start, cdna_coding_end, cdna) =
@@ -25362,8 +25364,10 @@ mod tests {
             Some(cds_start),
             Some(cds_end),
         );
-        transcript.cdna_coding_start = Some(cdna_coding_start);
-        transcript.cdna_coding_end = Some(cdna_coding_end);
+        if with_cdna_bounds {
+            transcript.cdna_coding_start = Some(cdna_coding_start);
+            transcript.cdna_coding_end = Some(cdna_coding_end);
+        }
         transcript.spliced_seq = Some(cdna.clone());
         transcript.cdna_seq = Some(cdna);
         let exon_feature = exon("T_CDS_BOUNDARY", 1, tx_start, tx_end);
@@ -25410,8 +25414,6 @@ mod tests {
                     SoTerm::StartLost
                         | SoTerm::StartRetainedVariant
                         | SoTerm::StopGained
-                        | SoTerm::StopLost
-                        | SoTerm::StopRetainedVariant
                         | SoTerm::MissenseVariant
                         | SoTerm::SynonymousVariant
                         | SoTerm::ProteinAlteringVariant
@@ -25422,23 +25424,27 @@ mod tests {
     }
 
     #[test]
-    fn partial_cds_boundary_alt_longer_delins_plus_strand_keeps_only_partial_positions() {
+    fn partial_cds_boundary_alt_longer_delins_plus_strand_keeps_partial_positions() {
         let variant = var("22", 1007, 1010, "GACC", "GACCCC");
-        let (terms, classification) = cds_boundary_delins_fixture(1, variant);
+        let (terms, classification) = cds_boundary_delins_fixture(1, variant, true);
         assert_partial_cds_boundary_result(&terms, classification, 8);
+        assert_no_partial_boundary_codon_consequences(&terms);
+        assert!(terms.contains(&SoTerm::StopRetainedVariant), "{terms:?}");
     }
 
     #[test]
-    fn partial_cds_boundary_alt_longer_delins_minus_strand_keeps_only_partial_positions() {
+    fn partial_cds_boundary_alt_longer_delins_minus_strand_keeps_partial_positions() {
         let variant = var("22", 1004, 1010, "GGGGTCA", "GGGGTCACC");
-        let (terms, classification) = cds_boundary_delins_fixture(-1, variant);
+        let (terms, classification) = cds_boundary_delins_fixture(-1, variant, true);
         assert_partial_cds_boundary_result(&terms, classification, 7);
+        assert_no_partial_boundary_codon_consequences(&terms);
+        assert!(terms.contains(&SoTerm::StopLost), "{terms:?}");
     }
 
     #[test]
     fn partial_cds_boundary_equal_length_mnv_plus_strand_keeps_only_partial_positions() {
         let variant = var("22", 1007, 1010, "GACC", "TTTT");
-        let (terms, classification) = cds_boundary_delins_fixture(1, variant);
+        let (terms, classification) = cds_boundary_delins_fixture(1, variant, true);
         assert_partial_cds_boundary_result(&terms, classification, 8);
         assert_no_partial_boundary_codon_consequences(&terms);
     }
@@ -25446,7 +25452,7 @@ mod tests {
     #[test]
     fn partial_cds_boundary_equal_length_mnv_minus_strand_keeps_only_partial_positions() {
         let variant = var("22", 1004, 1010, "GGGGTCA", "TTTTTTT");
-        let (terms, classification) = cds_boundary_delins_fixture(-1, variant);
+        let (terms, classification) = cds_boundary_delins_fixture(-1, variant, true);
         assert_partial_cds_boundary_result(&terms, classification, 7);
         assert_no_partial_boundary_codon_consequences(&terms);
     }
@@ -25510,16 +25516,65 @@ mod tests {
             (1, var("22", 1007, 1010, "GACC", "-"), 8),
             (-1, var("22", 1004, 1010, "GGGGTCA", "-"), 7),
         ] {
-            let (terms, classification) = cds_boundary_delins_fixture(strand, variant);
+            let (terms, classification) = cds_boundary_delins_fixture(strand, variant, true);
             assert_partial_cds_boundary_result(&terms, classification, cds_start);
         }
 
         let fully_coding_delins = var("22", 1000, 1002, "ATG", "ATGGAA");
-        let (terms, classification) = cds_boundary_delins_fixture(1, fully_coding_delins);
+        let (terms, classification) = cds_boundary_delins_fixture(1, fully_coding_delins, true);
         assert!(terms.contains(&SoTerm::InframeInsertion), "{terms:?}");
         let classification = classification.expect("fully coding delins has a peptide window");
         assert!(classification.codons.is_some());
         assert!(classification.amino_acids.is_some());
+    }
+
+    #[test]
+    fn partial_cds_boundary_deletion_uses_genomic_bounds_without_cdna_bounds() {
+        let variant = var("22", 1007, 1010, "GACC", "-");
+        let (terms, classification) = cds_boundary_delins_fixture(1, variant, false);
+        assert_partial_cds_boundary_result(&terms, classification, 8);
+        assert_no_partial_boundary_codon_consequences(&terms);
+    }
+
+    #[test]
+    fn partial_boundary_positions_use_vep_phase_when_canonical_sequence_omits_it() {
+        let cds = "ATGGAATGA";
+        let mut transcript = tx(
+            "T_PHASE_BOUNDARY",
+            "22",
+            990,
+            1020,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.cdna_coding_start = Some(11);
+        transcript.cdna_coding_end = Some(19);
+        transcript.spliced_seq = Some(format!("{}{}{}", "A".repeat(10), cds, "C".repeat(12)));
+        let exon_feature = exon("T_PHASE_BOUNDARY", 1, 990, 1020);
+        let exons = [&exon_feature];
+        let mut translation = translation(
+            "T_PHASE_BOUNDARY",
+            Some(11),
+            Some(3),
+            None,
+            Some("NNATGGAATGA"),
+        );
+        translation.cds_sequence_canonical = Some(cds.to_string());
+        let variant = var("22", 1007, 1010, "GACC", "-");
+
+        let classification = partial_coding_overlap_classification(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+        )
+        .expect("the deletion overlaps the CDS and extends into UTR");
+        assert_eq!(classification.cds_position_start, Some(10));
+        assert_eq!(classification.cds_position_end, None);
+        assert_eq!(classification.protein_position_start, Some(4));
+        assert_eq!(classification.protein_position_end, None);
     }
 
     #[test]
