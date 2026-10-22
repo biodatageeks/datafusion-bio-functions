@@ -4463,7 +4463,8 @@ fn strip_coding_parent_terms(
         || terms.contains(&SoTerm::InframeInsertion)
         || terms.contains(&SoTerm::InframeDeletion)
         || terms.contains(&SoTerm::StopRetainedVariant)
-        || terms.contains(&SoTerm::StartRetainedVariant);
+        || terms.contains(&SoTerm::StartRetainedVariant)
+        || terms.contains(&SoTerm::IncompleteTerminalCodonVariant);
 
     if has_specific_coding && !semantics.vep116_stop_predicates() {
         terms.remove(&SoTerm::ProteinAlteringVariant);
@@ -19175,6 +19176,20 @@ mod tests {
     fn coding_unknown_keeps_csv_for_synonymous_term_when_peptide_is_missing() {
         let terms = BTreeSet::from([SoTerm::CodingSequenceVariant, SoTerm::SynonymousVariant]);
         assert!(vep116_coding_unknown(&terms, None, true, false));
+    }
+
+    #[test]
+    fn legacy_collapse_still_strips_pav_when_itc_is_present() {
+        let assignment = TranscriptConsequence {
+            terms: vec![
+                SoTerm::ProteinAlteringVariant,
+                SoTerm::IncompleteTerminalCodonVariant,
+            ],
+            ..Default::default()
+        };
+        let collapsed = TranscriptConsequenceEngine::collapse_variant_terms(&[assignment]);
+        assert!(collapsed.contains(&SoTerm::IncompleteTerminalCodonVariant));
+        assert!(!collapsed.contains(&SoTerm::ProteinAlteringVariant));
     }
 
     #[test]
