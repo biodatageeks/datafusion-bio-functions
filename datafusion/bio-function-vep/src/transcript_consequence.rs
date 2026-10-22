@@ -10545,8 +10545,17 @@ fn adjust_refseq_cds_output_position(
     let cdna_position = cdna_coding_start
         .checked_add(cdna_without_padding)?
         .checked_sub(1)?;
-    let adjusted = raw_cds_position as i64
-        + refseq_coding_cumulative_edit_offset_for_cdna(tx, cdna_position as i64).unwrap_or(0);
+    let offset = if bam_edit_succeeded(tx) && !use_cdna_mapper_for_general_coords(tx) {
+        // When the mapper is rejected, genomic coding coordinates omit edits
+        // that have no genomic bases, including edits before the CDS. VEP's
+        // successful BAM edit still carries those bases in its transcript
+        // coordinates, so reconstruct the full offset into that sequence.
+        refseq_cumulative_edit_offset_for_cdna(tx, cdna_position as i64)
+    } else {
+        refseq_coding_cumulative_edit_offset_for_cdna(tx, cdna_position as i64)
+    }
+    .unwrap_or(0);
+    let adjusted = raw_cds_position as i64 + offset;
     (adjusted > 0)
         .then(|| usize::try_from(adjusted).ok())
         .flatten()
@@ -17400,7 +17409,7 @@ mod tests {
     }
 
     #[test]
-    fn adjust_refseq_cds_output_position_ignores_five_prime_utr_edit() {
+    fn adjust_refseq_cds_output_position_applies_upstream_edit_after_mapper_fallback() {
         let mut t = tx(
             "NM_001405672.2",
             "1",
@@ -17413,6 +17422,23 @@ mod tests {
         );
         t.cdna_coding_start = Some(1934);
         t.cdna_coding_end = Some(6313);
+        t.bam_edit_status = Some("ok".to_string());
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 109,
+                cdna_start: 1,
+                cdna_end: 10,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 110,
+                genomic_end: 119,
+                cdna_start: 15,
+                cdna_end: 24,
+                ori: 1,
+            },
+        ];
         t.refseq_edits = vec![RefSeqEdit {
             start: 933,
             end: 932,
@@ -17420,9 +17446,39 @@ mod tests {
             skip_refseq_offset: false,
         }];
 
-        // This +4 edit is upstream of the CDS. CDS output positions are
-        // already in CDS coordinates and must not inherit a 5' UTR offset.
-        assert_eq!(adjust_refseq_cds_output_position(&t, 2671, 0), Some(2671));
+        // A cDNA-discontinuous mapper is rejected, so this coordinate starts
+        // in unedited exon geometry. The +4 5' UTR edit still shifts that
+        // geometry into the edited cDNA/CDS coordinates used by VEP.
+        assert!(!use_cdna_mapper_for_general_coords(&t));
+        assert_eq!(adjust_refseq_cds_output_position(&t, 2667, 0), Some(2671));
+    }
+
+    #[test]
+    fn adjust_refseq_cds_output_position_keeps_leading_bam_edit_in_cds_space() {
+        let mut t = tx(
+            "NM_012234.7",
+            "3",
+            72_374_597,
+            72_446_623,
+            -1,
+            "protein_coding",
+            Some(72_378_172),
+            Some(72_446_623),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(870);
+        t.bam_edit_status = Some("ok".to_string());
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 1,
+            end: 0,
+            replacement_len: Some(213),
+            skip_refseq_offset: false,
+        }];
+
+        // The leading insertion has no genomic mapper segment, but successful
+        // BAM editing includes it in the translated sequence and all later
+        // CDS coordinates.
+        assert_eq!(adjust_refseq_cds_output_position(&t, 405, 0), Some(618));
     }
 
     #[test]
