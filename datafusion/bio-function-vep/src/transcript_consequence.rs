@@ -3152,7 +3152,15 @@ impl TranscriptConsequenceEngine {
                 // classify_coding_change uses per-codon analysis for all
                 // indels, matching VEP's local-peptide approach.
                 apply_codon_classification(terms, &classification);
-                terms.insert(SoTerm::ProteinAlteringVariant);
+                if partial_terminal_codon_v116 {
+                    if vep116_partial_codon_protein_altering_variant(&classification, terms) {
+                        terms.insert(SoTerm::ProteinAlteringVariant);
+                    } else {
+                        terms.remove(&SoTerm::ProteinAlteringVariant);
+                    }
+                } else {
+                    terms.insert(SoTerm::ProteinAlteringVariant);
+                }
                 return Some(classification);
             } else {
                 let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
@@ -3163,7 +3171,12 @@ impl TranscriptConsequenceEngine {
                     tx_exons,
                     translateable_seq.as_deref(),
                 );
-                terms.insert(SoTerm::ProteinAlteringVariant);
+                if partial_terminal_codon_v116 {
+                    // VEP's PAV predicate requires defined peptide alleles.
+                    terms.remove(&SoTerm::ProteinAlteringVariant);
+                } else {
+                    terms.insert(SoTerm::ProteinAlteringVariant);
+                }
                 if extends_into_utr {
                     return partial_coding_overlap_classification(
                         tx,
@@ -3173,7 +3186,11 @@ impl TranscriptConsequenceEngine {
                     );
                 }
             }
-            terms.insert(SoTerm::ProteinAlteringVariant);
+            if partial_terminal_codon_v116 {
+                terms.remove(&SoTerm::ProteinAlteringVariant);
+            } else {
+                terms.insert(SoTerm::ProteinAlteringVariant);
+            }
             return None;
         }
 
@@ -5133,6 +5150,40 @@ fn apply_vep116_primary_indel_predicates(
         terms.remove(&SoTerm::FrameshiftVariant);
         terms.remove(&SoTerm::InframeDeletion);
     }
+}
+
+/// Re-evaluate VEP 116 PAV after the partial-codon guards remove primary indel terms.
+///
+/// The partial-codon `inframe_deletion()` predicate is false, but PAV still
+/// requires defined, unequal peptide alleles and must yield to its other child
+/// predicates ([`VariationEffect.pm:378-390`](https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L378-L390)).
+fn vep116_partial_codon_protein_altering_variant(
+    class: &CodingClassification,
+    terms: &BTreeSet<SoTerm>,
+) -> bool {
+    let (Some(ref_peptide), Some(alt_peptide)) = (
+        class.affected_ref_peptide.as_deref(),
+        class.affected_alt_peptide.as_deref(),
+    ) else {
+        return false;
+    };
+    if ref_peptide.is_empty() || alt_peptide.is_empty() {
+        return false;
+    }
+    let ref_peptide = if ref_peptide == "-" { "" } else { ref_peptide };
+    let alt_peptide = if alt_peptide == "-" { "" } else { alt_peptide };
+
+    if ref_peptide.len() == alt_peptide.len()
+        || ref_peptide.starts_with('*')
+        || alt_peptide.starts_with('*')
+        || alt_peptide.starts_with(ref_peptide)
+        || alt_peptide.ends_with(ref_peptide)
+    {
+        return false;
+    }
+    !class.start_lost
+        && !terms.contains(&SoTerm::StartLost)
+        && !terms.contains(&SoTerm::FrameshiftVariant)
 }
 
 /// VEP 116 `coding_unknown()`: peptide ambiguity can coexist with specific
@@ -26464,6 +26515,14 @@ mod tests {
         );
         assert!(positive.contains(&SoTerm::IncompleteTerminalCodonVariant));
         assert!(!positive.contains(&SoTerm::FrameshiftVariant));
+        assert!(
+            positive.contains(&SoTerm::CodingSequenceVariant),
+            "equal-length unknown partial peptides satisfy VEP 116 coding_unknown: {positive:?}"
+        );
+        assert!(
+            !positive.contains(&SoTerm::ProteinAlteringVariant),
+            "VEP 116 rejects PAV for equal-length peptides: {positive:?}"
+        );
 
         // Insertion at the negative-strand terminal codon has VEP's empty
         // mapper interval. ITC is allowed to co-emit; frameshift is vetoed.
