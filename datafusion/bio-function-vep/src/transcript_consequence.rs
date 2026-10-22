@@ -2263,6 +2263,9 @@ impl TranscriptConsequenceEngine {
         if self.semantics.vep116_stop_predicates() && terms.contains(&SoTerm::CodingSequenceVariant)
         {
             let complete_overlap = transcript_is_completely_covered_coding(variant, tx);
+            // `CodingSequenceVariant` is inserted only by `add_coding_terms`,
+            // after the variant has been shown to overlap the CDS. Therefore
+            // this VEP `coding_unknown()` call is always within the CDS.
             let coding_unknown =
                 vep116_coding_unknown(&terms, coding_class.as_ref(), true, complete_overlap);
             if !coding_unknown {
@@ -4549,6 +4552,7 @@ fn apply_tier_gate(terms: &mut Vec<SoTerm>) {
     terms.retain(|t| t.tier() <= assigned);
 }
 
+#[cfg(test)]
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     strip_parent_terms_with_semantics(terms, crate::vep_semantics::VepSemantics::V116);
 }
@@ -19163,6 +19167,12 @@ mod tests {
     }
 
     #[test]
+    fn coding_unknown_keeps_csv_for_synonymous_term_when_peptide_is_missing() {
+        let terms = BTreeSet::from([SoTerm::CodingSequenceVariant, SoTerm::SynonymousVariant]);
+        assert!(vep116_coding_unknown(&terms, None, true, false));
+    }
+
+    #[test]
     fn incomplete_terminal_codon_is_not_stripped_by_stop_gained() {
         // VEP's stop_gained predicate has no partial_codon guard. ITC can
         // co-emit with stop_gained, so term cleanup must not infer a veto.
@@ -27209,6 +27219,36 @@ mod tests {
         let (insertion_terms, _) =
             engine.evaluate_transcript_overlap(&insertion, &transcript, &exons, Some(&translation));
         assert!(insertion_terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
+    }
+
+    #[test]
+    fn partial_terminal_codon_fallback_uses_phase_for_legacy_minus_strand_cache() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let mut transcript = tx(
+            "NM_000001.1",
+            "22",
+            1000,
+            1007,
+            -1,
+            "protein_coding",
+            Some(1000),
+            Some(1007),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.spliced_seq = Some("ATGGCTGA".to_string());
+        let exon = exon("NM_000001.1", 1, 1000, 1007);
+        let exons = [&exon];
+        let translation = translation("NM_000001.1", Some(10), Some(3), None, Some("NNATGGCTGA"));
+        let variant = var("22", 1000, 1000, "T", "C");
+
+        let (terms, _) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, Some(&translation));
+        assert!(terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
     }
 
     #[test]
