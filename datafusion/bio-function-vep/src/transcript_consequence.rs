@@ -8360,7 +8360,11 @@ fn classify_insertion_with_semantics_and_gap(
     // exon-start boundary insertions where only the right genomic flank maps
     // into the CDS and the left side is recovered from the insertion-point
     // CDS coordinates.
-    let codon_at = ins_point / 3;
+    let codon_at = if replace_refseq_mapper_gap {
+        ins_point / 3
+    } else {
+        cds_idx / 3
+    };
     let display_cds_position_start = class.cds_position_start.unwrap_or(raw_cds_position_start);
     let display_cds_position_end = class.cds_position_end.unwrap_or(raw_cds_position_end);
     let pep_a = (display_cds_position_start + 2) / 3;
@@ -19364,6 +19368,19 @@ mod tests {
         let cds = "ATGGCTGAATGA";
         let c = classify_ins(cds, 1006, "TT").unwrap();
         assert_eq!(c.amino_acids.as_deref(), Some("-/X"));
+    }
+
+    #[test]
+    fn standard_boundary_insertion_keeps_stop_predicate_on_left_codon() {
+        // A one-base insertion after a complete codon must use the left
+        // affected codon for consequence predicates. This mirrors BRCA1
+        // NM_007294.4:c.3759dup, whose golden terms are frameshift_variant
+        // without stop_gained even though the shifted next codon is a stop.
+        let cds = "ATGAAATCTAAGGCTTGA";
+        let class = classify_ins(cds, 1009, "T").expect("boundary insertion");
+
+        assert!(!class.stop_gained);
+        assert_eq!(class.amino_acids.as_deref(), Some("-/X"));
     }
 
     #[test]
