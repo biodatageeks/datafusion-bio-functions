@@ -11569,6 +11569,22 @@ mod tests {
     }
 
     #[test]
+    fn vep116_partial_codon_pav_matches_empty_peptide_sentinel_rule() {
+        let class = CodingClassification {
+            affected_ref_peptide: Some("X".to_string()),
+            affected_alt_peptide: Some("-".to_string()),
+            ..Default::default()
+        };
+
+        // VariationEffect::_get_peptide_alleles normalizes `-` to an empty
+        // string before the PAV length and prefix/suffix checks.
+        assert!(vep116_partial_codon_protein_altering_variant(
+            &class,
+            &BTreeSet::new()
+        ));
+    }
+
+    #[test]
     fn vep116_hunk3_makes_stop_gained_and_stop_lost_mutually_exclusive() {
         let base = CodingClassification {
             stop_gained: true,
