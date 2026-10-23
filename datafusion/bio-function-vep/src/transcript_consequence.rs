@@ -5253,8 +5253,11 @@ fn vep116_incomplete_terminal_hgvsp_alleles(
     ) else {
         return None;
     };
-    // Keep VEP's partial-codon X on both HGVSp alleles. The formatter maps
-    // it to Ter for synonymous calls and clips the shared suffix for indels.
+    // `local_codon_truncated` comes from the CDS remainder (one or two bases),
+    // and the local peptide translator appends X for that incomplete codon.
+    // Thus this suffix X records VEP's partial-codon rule even if an earlier
+    // complete codon is ambiguous. The formatter maps it to Ter for
+    // synonymous calls and clips the shared suffix for indels.
     (reference.ends_with('X') && alternate.ends_with('X'))
         .then(|| format!("{reference}/{alternate}"))
 }
@@ -15739,10 +15742,7 @@ mod tests {
         let protein_hgvs_data = class.protein_hgvs.as_ref().expect("protein HGVS data");
         assert_eq!(protein_hgvs_data.ref_peptide, "AAX");
         assert_eq!(protein_hgvs_data.alt_peptide, "X");
-        let formatted = class
-            .protein_hgvs
-            .as_ref()
-            .and_then(|data| crate::hgvs::format_hgvsp(&translation, data, false));
+        let formatted = crate::hgvs::format_hgvsp(&translation, protein_hgvs_data, false);
         assert_eq!(
             formatted.as_deref(),
             Some("ENSPterminal.1:p.Ala143_Ala144del")
@@ -15757,6 +15757,40 @@ mod tests {
             .as_ref()
             .and_then(|data| crate::hgvs::format_hgvsp(&control_translation, data, false));
         assert_eq!(control_hgvsp.as_deref(), Some("ENSPterminal.1:p.Ala144del"));
+    }
+
+    #[test]
+    fn test_issue_247_insertion_keeps_partial_terminal_x_on_hgvsp_alleles() {
+        let cds = format!("{}AAGCT", "AAA".repeat(165));
+        let protein = "K".repeat(166);
+        let (class, translation) =
+            classify_incomplete_terminal_codon_variant(&cds, &protein, 1499, 1499, "-", "GG");
+
+        let protein_hgvs = class.protein_hgvs.as_ref().expect("protein HGVS data");
+        assert!(
+            protein_hgvs.ref_peptide.ends_with('X'),
+            "reference HGVSp peptide retains the partial-codon suffix"
+        );
+        assert!(
+            protein_hgvs.alt_peptide.ends_with('X'),
+            "inserted alternate HGVSp peptide retains the partial-codon suffix"
+        );
+        let formatted = class
+            .protein_hgvs
+            .as_ref()
+            .and_then(|data| crate::hgvs::format_hgvsp(&translation, data, false));
+        assert!(
+            formatted.is_some(),
+            "partial-codon insertion should format HGVSp"
+        );
+    }
+
+    #[test]
+    fn partial_codon_does_not_append_x_after_a_translated_stop() {
+        assert_eq!(
+            local_peptide_from_codon_window(CodonTable::Standard, b"TAACT").as_deref(),
+            Some("*")
+        );
     }
 
     // ---- classify_insertion: codons, amino acids, positions ----
