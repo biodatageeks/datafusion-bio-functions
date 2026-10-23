@@ -5576,18 +5576,22 @@ fn vep116_coding_unknown_with_table(
                     .as_deref()
                     .and_then(|alleles| alleles.split_once('/'))
             });
-        // A codon-boundary in-frame insertion reports `-/<inserted peptide>`
-        // in OutputFactory's peptide-allele string. The engine's local
-        // partial-codon window may include a leading X from CDS phase padding;
-        // VEP's coding_unknown predicate sees the insertion peptide pair,
-        // which is the same pair used for the Amino_acids field.
-        let insertion_output_peptides = terms.contains(&SoTerm::InframeInsertion)
-            && output_peptide_alleles.is_some_and(|(reference, _)| reference == "-");
         let predicate_peptides = classification
             .affected_ref_peptide
             .as_deref()
             .zip(classification.affected_alt_peptide.as_deref());
-        let peptide_alleles = if insertion_output_peptides {
+        // For partial-CDS boundary insertions, OutputFactory's known `-/<pep>`
+        // pair is the peptide VEP tests; the local window can include an X
+        // introduced by phase padding. Keep the local predicate for terminal
+        // partial codons, where VEP's peptide() itself reports X.
+        let known_partial_cds_insertion = terms.contains(&SoTerm::InframeInsertion)
+            && !terms.contains(&SoTerm::IncompleteTerminalCodonVariant)
+            && output_peptide_alleles
+                .is_some_and(|(reference, alternate)| reference == "-" && !alternate.contains('X'))
+            && predicate_peptides.is_some_and(|(reference, alternate)| {
+                reference.contains('X') || alternate.contains('X')
+            });
+        let peptide_alleles = if known_partial_cds_insertion {
             output_peptide_alleles
         } else {
             predicate_peptides.or(output_peptide_alleles)
@@ -20636,6 +20640,29 @@ mod tests {
                 "ClinVar {clinvar_id}: known partial-CDS peptide must not add coding_sequence_variant"
             );
         }
+    }
+
+    #[test]
+    fn coding_unknown_keeps_unknown_terminal_insertion_peptide() {
+        let terms = BTreeSet::from([
+            SoTerm::CodingSequenceVariant,
+            SoTerm::InframeInsertion,
+            SoTerm::IncompleteTerminalCodonVariant,
+        ]);
+        let classification = CodingClassification {
+            amino_acids: Some("-/A".to_string()),
+            codons: Some("-/T".to_string()),
+            affected_ref_peptide: Some("X".to_string()),
+            affected_alt_peptide: Some("X".to_string()),
+            ..Default::default()
+        };
+
+        assert!(vep116_coding_unknown(
+            &terms,
+            Some(&classification),
+            true,
+            false,
+        ));
     }
 
     #[test]
