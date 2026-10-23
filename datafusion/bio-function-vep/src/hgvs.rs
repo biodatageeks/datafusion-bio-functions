@@ -2343,10 +2343,16 @@ pub fn format_hgvsp(
     if protein.frameshift {
         resolve_frameshift_hgvs(&mut notation, protein)?;
     } else {
-        if notation.ref_allele != notation.alt_allele {
-            clip_protein_alleles(&mut notation);
-        } else {
-            notation.kind = "=".to_string();
+        // The non-frameshift case has no independent translated stop offset;
+        // preserve it only when both peptide windows retain the same stop.
+        let stop_retaining_delins = preserve_terminal_stop_retaining_delins(&mut notation, protein)
+            || preserve_stop_retaining_delins(&mut notation, protein, None);
+        if !stop_retaining_delins {
+            if notation.ref_allele != notation.alt_allele {
+                clip_protein_alleles(&mut notation);
+            } else {
+                notation.kind = "=".to_string();
+            }
         }
         if notation.kind.is_empty() {
             notation.kind = protein_event_type(&notation.ref_allele, &notation.alt_allele, false);
@@ -2518,6 +2524,95 @@ fn protein_event_type(ref_allele: &str, alt_allele: &str, frameshift: bool) -> S
     }
 }
 
+/// Preserve stop-retaining peptide windows at the terminal stop. The
+/// reference translation can omit its terminal Ter while the shifted local
+/// window contains `*` / `**`; Ensembl keeps this as a delins and truncates the
+/// alternate allele at its first Ter.
+fn preserve_terminal_stop_retaining_delins(
+    notation: &mut ProteinHgvsNotation,
+    protein: &ProteinHgvsData,
+) -> bool {
+    if protein.frameshift || protein.stop_lost {
+        return false;
+    }
+    let reference_translation = protein
+        .ref_translation
+        .strip_suffix('*')
+        .unwrap_or(&protein.ref_translation);
+    let ref_peptide = normalize_peptide_allele(&protein.ref_peptide);
+    let alt_peptide = normalize_peptide_allele(&protein.alt_peptide);
+    let terminal_stop_position = reference_translation.len().saturating_add(1);
+    if ref_peptide == "*"
+        && alt_peptide.starts_with("**")
+        && protein.start == terminal_stop_position
+        && protein.end == terminal_stop_position
+    {
+        notation.kind = "delins".to_string();
+        notation.start = terminal_stop_position;
+        notation.end = terminal_stop_position;
+        notation.ref_allele = "X".to_string();
+        notation.alt_allele = alt_peptide.replacen('*', "X", 1);
+        return true;
+    }
+
+    let Some(alt_tail) = alt_peptide.strip_prefix(&ref_peptide) else {
+        return false;
+    };
+    if ref_peptide.is_empty()
+        || protein.end != reference_translation.len()
+        || !reference_translation.ends_with(&ref_peptide)
+        || !alt_tail.starts_with('*')
+    {
+        return false;
+    }
+
+    notation.kind = "delins".to_string();
+    notation.start = terminal_stop_position;
+    notation.end = terminal_stop_position;
+    notation.ref_allele = "X".to_string();
+    notation.alt_allele = alt_tail.replacen('*', "X", 1);
+    if notation.alt_allele == notation.ref_allele {
+        // Keep the formatter on its delins arm when the only alternate
+        // residue is the retained Ter; it truncates this suffix at that Ter.
+        notation.alt_allele.push('*');
+    }
+    true
+}
+
+/// Preserve stop-retaining edits as delins so the HGVSp formatter can truncate
+/// the alternate peptide at the first Ter, matching Ensembl Variation 116.
+fn preserve_stop_retaining_delins(
+    notation: &mut ProteinHgvsNotation,
+    protein: &ProteinHgvsData,
+    expected_stop_offset: Option<usize>,
+) -> bool {
+    let Some((ref_stop, alt_stop)) = protein
+        .ref_peptide
+        .find('*')
+        .zip(protein.alt_peptide.find('*'))
+    else {
+        return false;
+    };
+    let has_added_peptide_after_stop = protein
+        .alt_peptide
+        .get(alt_stop + 1..)
+        .is_some_and(|tail| tail.chars().any(|aa| aa != '*'));
+    if ref_stop != alt_stop
+        || expected_stop_offset.is_some_and(|offset| ref_stop != offset)
+        || !has_added_peptide_after_stop
+        || protein.alt_peptide.len() <= protein.ref_peptide.len()
+    {
+        return false;
+    }
+
+    notation.kind = "delins".to_string();
+    notation.start = protein.start;
+    notation.end = protein.end;
+    notation.ref_allele = protein.ref_peptide.replacen('*', "X", 1);
+    notation.alt_allele = protein.alt_peptide.replacen('*', "X", 1);
+    true
+}
+
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_fs_peptides()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2249-L2295>
@@ -2558,6 +2653,13 @@ fn resolve_frameshift_hgvs(
         let ref_aa = peptide_char(&ref_translation, start)?;
         let alt_aa = peptide_char(alt_translation, start)?;
         if ref_aa == '*' && alt_aa == '*' {
+            if preserve_stop_retaining_delins(
+                notation,
+                protein,
+                Some(start.saturating_sub(protein.start)),
+            ) {
+                return Some(());
+            }
             notation.kind = "=".to_string();
             notation.start = start;
             notation.end = start;
@@ -3259,6 +3361,193 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ter262=".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_stop_retaining_insertion_formats_delins_ter() {
+        let translation = make_translation();
+        let reference = format!("{}*", "A".repeat(411));
+        let alternate = format!("{}*Q", "A".repeat(411));
+        let protein = ProteinHgvsData {
+            start: 412,
+            end: 412,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "*Q".to_string(),
+            ref_translation: reference,
+            alt_translation: alternate,
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter412delinsTer".to_string())
+        );
+
+        let reference = format!("{}H*", "A".repeat(355));
+        let alternate = format!("{}H*Q", "A".repeat(355));
+        let protein = ProteinHgvsData {
+            start: 356,
+            end: 357,
+            ref_peptide: "H*".to_string(),
+            alt_peptide: "H*Q".to_string(),
+            ref_translation: reference,
+            alt_translation: alternate,
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.His356_Ter357delinsHisTer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_nonframeshift_stop_retaining_insertion_formats_delins_ter() {
+        let translation = make_translation();
+        let reference = format!("{}*", "A".repeat(1321));
+        let protein = ProteinHgvsData {
+            start: 1322,
+            end: 1322,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "*SX".to_string(),
+            ref_translation: reference.clone(),
+            alt_translation: reference,
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter1322delinsTer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_terminal_stop_retaining_insertion_formats_delins_ter() {
+        let translation = make_translation();
+        let reference = format!("{}R", "A".repeat(69));
+        let protein = ProteinHgvsData {
+            start: 70,
+            end: 70,
+            ref_peptide: "R".to_string(),
+            alt_peptide: "R*".to_string(),
+            ref_translation: reference.clone(),
+            alt_translation: reference,
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter71delinsTer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_mid_protein_stop_retaining_insertion_keeps_variant_position() {
+        let translation = make_translation();
+        let reference = format!("{}R{}R", "A".repeat(39), "A".repeat(29));
+        let protein = ProteinHgvsData {
+            start: 40,
+            end: 40,
+            ref_peptide: "R".to_string(),
+            alt_peptide: "R*".to_string(),
+            ref_translation: reference.clone(),
+            alt_translation: reference,
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Arg40_Ala41insTer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_stop_retaining_delins_rejects_shifted_stop_offsets() {
+        let protein = ProteinHgvsData {
+            start: 40,
+            end: 44,
+            ref_peptide: "R*A".to_string(),
+            alt_peptide: "RTA*Q".to_string(),
+            ref_translation: "R*A".to_string(),
+            alt_translation: "RTA*Q".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        let mut notation = ProteinHgvsNotation::from_context(&protein);
+
+        assert!(!preserve_stop_retaining_delins(
+            &mut notation,
+            &protein,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_issue_228_shifted_terminal_stop_peptides_format_delins_ter() {
+        let translation = make_translation();
+        let reference = "A".repeat(70);
+        let protein = ProteinHgvsData {
+            start: 71,
+            end: 71,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "**".to_string(),
+            ref_translation: reference.clone(),
+            alt_translation: format!("{reference}**"),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter71delinsTer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_recreated_stop_without_added_peptide_stays_synonymous() {
+        let translation = make_translation();
+        let reference = format!("{}*", "A".repeat(411));
+        let protein = ProteinHgvsData {
+            start: 412,
+            end: 412,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "*".to_string(),
+            ref_translation: reference.clone(),
+            alt_translation: reference,
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter412=".to_string())
         );
     }
 

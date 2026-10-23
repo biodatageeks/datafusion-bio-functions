@@ -5709,6 +5709,29 @@ fn vep116_ambiguous_terminal_hgvsp_alleles(
     (reference.contains('*') && alternate.contains('X')).then(|| format!("{reference}/{alternate}"))
 }
 
+fn vep116_incomplete_terminal_hgvsp_alleles(
+    class: &CodingClassification,
+    semantics: crate::vep_semantics::VepSemantics,
+    local_codon_truncated: bool,
+) -> Option<String> {
+    if !semantics.vep116_stop_predicates() || !local_codon_truncated {
+        return None;
+    }
+    let (Some(reference), Some(alternate)) = (
+        class.affected_ref_peptide.as_deref(),
+        class.affected_alt_peptide.as_deref(),
+    ) else {
+        return None;
+    };
+    // `local_codon_truncated` comes from the CDS remainder (one or two bases),
+    // and the local peptide translator appends X for that incomplete codon.
+    // Thus this suffix X records VEP's partial-codon rule even if an earlier
+    // complete codon is ambiguous. The formatter maps it to Ter for
+    // synonymous calls and clips the shared suffix for indels.
+    (reference.ends_with('X') && alternate.ends_with('X'))
+        .then(|| format!("{reference}/{alternate}"))
+}
+
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::codon()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L888>
@@ -8561,6 +8584,9 @@ fn classify_coding_change_with_semantics(
         .map(|seq| seq.chars().collect::<Vec<_>>())
         .unwrap_or_else(|| new_aas.clone());
     let hgvs_amino_acids = vep116_ambiguous_terminal_hgvsp_alleles(&class, semantics)
+        .or_else(|| {
+            vep116_incomplete_terminal_hgvsp_alleles(&class, semantics, local_codon_truncated)
+        })
         .or_else(|| class.amino_acids.clone())
         .or_else(|| {
             class.codons.as_deref().and_then(|codons| {
@@ -9093,6 +9119,17 @@ fn classify_insertion_with_semantics_and_gap(
             // Frameshift insertion at codon boundary: VEP uses "-/X" because
             // no existing codon is disrupted — the insertion happens between codons.
             class.amino_acids = Some("-/X".to_string());
+        } else if let (Some(ref_peptide), Some(alt_peptide)) = (
+            class.affected_ref_peptide.as_deref(),
+            class.affected_alt_peptide.as_deref(),
+        ) && frameshift
+            && partial_terminal_codon
+            && alt_peptide.ends_with('X')
+        {
+            // Keep the full local peptide window when its last codon is
+            // incomplete. VEP exposes that final remainder as X in the
+            // Amino_acids field (the codon window is also retained above).
+            class.amino_acids = Some(format!("{ref_peptide}/{alt_peptide}"));
         } else if frameshift {
             // Frameshifts: VEP uses X for the altered downstream sequence.
             // If the first affected codon's amino acid is preserved, show it
@@ -16931,6 +16968,133 @@ mod tests {
                 .0
                 .as_deref(),
             Some("TQ/Y")
+        );
+    }
+
+    fn classify_incomplete_terminal_codon_variant(
+        cds: &str,
+        protein: &str,
+        start: i64,
+        end: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+    ) -> (CodingClassification, TranslationFeature) {
+        let cds_start = 1000;
+        let cds_end = cds_start + cds.len() as i64 - 1;
+        let mut transcript = tx(
+            "Tterminal",
+            "22",
+            cds_start,
+            cds_end,
+            1,
+            "protein_coding",
+            Some(cds_start),
+            Some(cds_end),
+        );
+        transcript.cds_end_nf = true;
+        transcript.translateable_seq = Some(cds.to_string());
+        let exon = exon("Tterminal", 1, cds_start, cds_end);
+        let exons = [&exon];
+        let mut translation = translation(
+            "Tterminal",
+            Some(cds.len()),
+            Some(protein.len()),
+            Some(protein),
+            Some(cds),
+        );
+        translation.stable_id = Some("ENSPterminal".to_string());
+        translation.version = Some(1);
+        let variant = var("22", start, end, ref_allele, alt_allele);
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("coding classification");
+        (class, translation)
+    }
+
+    #[test]
+    fn test_issue_245_hgvsp_synonymous_partial_terminal_codon_uses_local_peptide() {
+        let cds = format!("{}AAGCT", "AAA".repeat(165));
+        let protein = "K".repeat(166);
+        let (class, translation) =
+            classify_incomplete_terminal_codon_variant(&cds, &protein, 1497, 1498, "GC", "AT");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("KX"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("KX"));
+        let protein_hgvs_data = class.protein_hgvs.as_ref().expect("protein HGVS data");
+        assert_eq!(protein_hgvs_data.ref_peptide, "KX");
+        assert_eq!(protein_hgvs_data.alt_peptide, "KX");
+        let formatted = class
+            .protein_hgvs
+            .as_ref()
+            .and_then(|data| crate::hgvs::format_hgvsp(&translation, data, false));
+        assert_eq!(formatted.as_deref(), Some("ENSPterminal.1:p.LysTer166="));
+    }
+
+    #[test]
+    fn test_issue_247_inframe_deletion_clips_shared_partial_terminal_x() {
+        let cds = format!("{}GC", "GCT".repeat(144));
+        let protein = "A".repeat(144);
+        let (class, translation) =
+            classify_incomplete_terminal_codon_variant(&cds, &protein, 1428, 1433, "TGCTGC", "-");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("AAX"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("X"));
+        let protein_hgvs_data = class.protein_hgvs.as_ref().expect("protein HGVS data");
+        assert_eq!(protein_hgvs_data.ref_peptide, "AAX");
+        assert_eq!(protein_hgvs_data.alt_peptide, "X");
+        let formatted = crate::hgvs::format_hgvsp(&translation, protein_hgvs_data, false);
+        assert_eq!(
+            formatted.as_deref(),
+            Some("ENSPterminal.1:p.Ala143_Ala144del")
+        );
+
+        // A deletion ending immediately before the partial terminal codon
+        // does not carry X into the peptide alleles.
+        let (control, control_translation) =
+            classify_incomplete_terminal_codon_variant(&cds, &protein, 1429, 1431, "GCT", "-");
+        let control_hgvsp = control
+            .protein_hgvs
+            .as_ref()
+            .and_then(|data| crate::hgvs::format_hgvsp(&control_translation, data, false));
+        assert_eq!(control_hgvsp.as_deref(), Some("ENSPterminal.1:p.Ala144del"));
+    }
+
+    #[test]
+    fn test_issue_247_insertion_keeps_partial_terminal_x_on_hgvsp_alleles() {
+        let cds = format!("{}AAGCT", "AAA".repeat(165));
+        let protein = "K".repeat(166);
+        let (class, translation) =
+            classify_incomplete_terminal_codon_variant(&cds, &protein, 1499, 1499, "-", "GG");
+
+        let protein_hgvs = class.protein_hgvs.as_ref().expect("protein HGVS data");
+        assert!(
+            protein_hgvs.ref_peptide.ends_with('X'),
+            "reference HGVSp peptide retains the partial-codon suffix"
+        );
+        assert!(
+            protein_hgvs.alt_peptide.ends_with('X'),
+            "inserted alternate HGVSp peptide retains the partial-codon suffix"
+        );
+        let formatted = class
+            .protein_hgvs
+            .as_ref()
+            .and_then(|data| crate::hgvs::format_hgvsp(&translation, data, false));
+        assert!(
+            formatted.is_some(),
+            "partial-codon insertion should format HGVSp"
+        );
+    }
+
+    #[test]
+    fn partial_codon_does_not_append_x_after_a_translated_stop() {
+        assert_eq!(
+            local_peptide_from_codon_window(CodonTable::Standard, b"TAACT").as_deref(),
+            Some("*")
         );
     }
 
@@ -26276,6 +26440,37 @@ mod tests {
             c.codons.is_some(),
             "Codons should be computed for incomplete terminal codon insertion, got None"
         );
+    }
+
+    #[test]
+    fn test_issue_228_preserves_partial_terminal_codon_in_codons() {
+        // Insert eight bases after the two-base terminal CDS codon. VEP's
+        // local alternate window includes the padded third base and retains
+        // its final incomplete codon as X in Amino_acids.
+        let cds = "ATGGAACT";
+        let mut t = tx(
+            "T228",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1007),
+        );
+        t.cdna_coding_end = Some(cds.len());
+        t.translateable_seq = Some(cds.to_string());
+        t.spliced_seq = Some("ATGGAACTG".to_string());
+        t.three_prime_utr_seq = Some("G".to_string());
+        let e = exon("T228", 1, 1000, 1008);
+        let exons = [&e];
+        let tr = translation("T228", Some(cds.len()), Some(2), Some("ME"), Some(cds));
+        let variant = var("22", 1008, 1008, "-", "GACCCTGG");
+        let classification = classify_insertion(&t, &exons, Some(&tr), cds, &variant, "GACCCTGG")
+            .expect("terminal insertion should classify");
+
+        assert_eq!(classification.codons.as_deref(), Some("ctg/ctGACCCTGGg"));
+        assert_eq!(classification.amino_acids.as_deref(), Some("L/LTLX"));
     }
 
     #[test]
