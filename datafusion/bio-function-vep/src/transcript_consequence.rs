@@ -5567,28 +5567,31 @@ fn vep116_coding_unknown_with_table(
             .codons
             .as_deref()
             .and_then(|codons| pep_allele_string_from_codon_allele_string_in(codon_table, codons));
-        let peptide_alleles = classification
-            .affected_ref_peptide
+        let output_peptide_alleles = classification
+            .amino_acids
             .as_deref()
-            .zip(classification.affected_alt_peptide.as_deref())
+            .and_then(|alleles| alleles.split_once('/'))
             .or_else(|| {
-                // For partial-CDS insertions the mapper peptide window may
-                // be unavailable even though OutputFactory has the same
-                // known peptide pair in `Amino_acids`. VEP's peptide() and
-                // _get_peptide_alleles() use that pair for coding_unknown.
-                classification
-                    .amino_acids
-                    .as_deref()
-                    .and_then(|alleles| alleles.split_once('/'))
-            })
-            .or_else(|| {
-                // A boundary insertion's OutputFactory `Amino_acids` is
-                // derived from `Codons`; translate that same pair when the
-                // direct peptide window and amino-acid cache are unavailable.
                 codon_peptide_alleles
                     .as_deref()
                     .and_then(|alleles| alleles.split_once('/'))
             });
+        // A codon-boundary in-frame insertion reports `-/<inserted peptide>`
+        // in OutputFactory's peptide-allele string. The engine's local
+        // partial-codon window may include a leading X from CDS phase padding;
+        // VEP's coding_unknown predicate sees the insertion peptide pair,
+        // which is the same pair used for the Amino_acids field.
+        let insertion_output_peptides = terms.contains(&SoTerm::InframeInsertion)
+            && output_peptide_alleles.is_some_and(|(reference, _)| reference == "-");
+        let predicate_peptides = classification
+            .affected_ref_peptide
+            .as_deref()
+            .zip(classification.affected_alt_peptide.as_deref());
+        let peptide_alleles = if insertion_output_peptides {
+            output_peptide_alleles
+        } else {
+            predicate_peptides.or(output_peptide_alleles)
+        };
         let Some((ref_peptide, alt_peptide)) = peptide_alleles else {
             return true;
         };
@@ -20611,18 +20614,21 @@ mod tests {
 
     #[test]
     fn coding_unknown_uses_codon_alleles_when_partial_peptide_window_is_missing() {
-        // Boundary insertions can have OutputFactory Codons even when the
-        // local peptide window used by the general classifier is unavailable.
-        // The output amino-acid pair is translated from those codons, and VEP's
-        // peptide()/_get_peptide_alleles() still see a known insertion peptide.
+        // These three VEP 116 partial-CDS insertions expose the local boundary
+        // codon as X-prefixed predicate peptides, while OutputFactory's
+        // Amino_acids/Codons pair exposes the actual known insertion peptides.
+        // coding_unknown must use the latter pair, as VEP's peptide fields do.
         let terms = BTreeSet::from([SoTerm::CodingSequenceVariant, SoTerm::InframeInsertion]);
-        for (clinvar_id, codons) in [
-            (2180991, "-/AGCAGCGGCGGCGGC"),
-            (3910969, "-/GCGGCG"),
-            (3910970, "-/GCG"),
+        for (clinvar_id, amino_acids, codons, affected_alt) in [
+            (2180991, "-/SSGGG", "-/AGCAGCGGCGGCGGC", "XSSGGG"),
+            (3910969, "-/AA", "-/GCGGCG", "XAA"),
+            (3910970, "-/A", "-/GCG", "XA"),
         ] {
             let classification = CodingClassification {
+                amino_acids: Some(amino_acids.to_string()),
                 codons: Some(codons.to_string()),
+                affected_ref_peptide: Some("X".to_string()),
+                affected_alt_peptide: Some(affected_alt.to_string()),
                 ..Default::default()
             };
             assert!(
