@@ -2103,6 +2103,8 @@ pub fn format_hgvsp(
     if protein.frameshift {
         resolve_frameshift_hgvs(&mut notation, protein)?;
     } else {
+        // The non-frameshift case has no independent translated stop offset;
+        // preserve it only when both peptide windows retain the same stop.
         let stop_retaining_delins = preserve_terminal_stop_retaining_delins(&mut notation, protein)
             || preserve_stop_retaining_delins(&mut notation, protein, None);
         if !stop_retaining_delins {
@@ -2317,6 +2319,7 @@ fn preserve_terminal_stop_retaining_delins(
         return false;
     };
     if ref_peptide.is_empty()
+        || protein.end != reference_translation.len()
         || !reference_translation.ends_with(&ref_peptide)
         || !alt_tail.starts_with('*')
     {
@@ -3211,6 +3214,54 @@ mod tests {
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ter71delinsTer".to_string())
         );
+    }
+
+    #[test]
+    fn test_issue_228_mid_protein_stop_retaining_insertion_keeps_variant_position() {
+        let translation = make_translation();
+        let reference = format!("{}R{}R", "A".repeat(39), "A".repeat(29));
+        let protein = ProteinHgvsData {
+            start: 40,
+            end: 40,
+            ref_peptide: "R".to_string(),
+            alt_peptide: "R*".to_string(),
+            ref_translation: reference.clone(),
+            alt_translation: reference,
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Arg40_Ala41insTer".to_string())
+        );
+    }
+
+    #[test]
+    fn test_issue_228_stop_retaining_delins_rejects_shifted_stop_offsets() {
+        let protein = ProteinHgvsData {
+            start: 40,
+            end: 44,
+            ref_peptide: "R*A".to_string(),
+            alt_peptide: "RTA*Q".to_string(),
+            ref_translation: "R*A".to_string(),
+            alt_translation: "RTA*Q".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        let mut notation = ProteinHgvsNotation::from_context(&protein);
+
+        assert!(!preserve_stop_retaining_delins(
+            &mut notation,
+            &protein,
+            None
+        ));
     }
 
     #[test]

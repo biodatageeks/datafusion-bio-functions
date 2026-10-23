@@ -8424,23 +8424,17 @@ fn classify_insertion_with_semantics(
             // Frameshift insertion at codon boundary: VEP uses "-/X" because
             // no existing codon is disrupted — the insertion happens between codons.
             class.amino_acids = Some("-/X".to_string());
-        } else if frameshift
+        } else if let (Some(ref_peptide), Some(alt_peptide)) = (
+            class.affected_ref_peptide.as_deref(),
+            class.affected_alt_peptide.as_deref(),
+        ) && frameshift
             && partial_terminal_codon
-            && class
-                .affected_alt_peptide
-                .as_deref()
-                .is_some_and(|peptide| peptide.ends_with('X'))
-            && class.affected_ref_peptide.is_some()
+            && alt_peptide.ends_with('X')
         {
             // Keep the full local peptide window when its last codon is
             // incomplete. VEP exposes that final remainder as X in the
             // Amino_acids field (the codon window is also retained above).
-            if let (Some(ref_peptide), Some(alt_peptide)) = (
-                class.affected_ref_peptide.as_deref(),
-                class.affected_alt_peptide.as_deref(),
-            ) {
-                class.amino_acids = Some(format!("{ref_peptide}/{alt_peptide}"));
-            }
+            class.amino_acids = Some(format!("{ref_peptide}/{alt_peptide}"));
         } else if frameshift {
             // Frameshifts: VEP uses X for the altered downstream sequence.
             // If the first affected codon's amino acid is preserved, show it
