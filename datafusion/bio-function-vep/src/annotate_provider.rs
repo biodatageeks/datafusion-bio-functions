@@ -212,7 +212,8 @@ use crate::transcript_consequence::{
     RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind, SvFeatureKind,
     TranscriptCdnaMapperSegment, TranscriptConsequence, TranscriptConsequenceEngine,
     TranscriptEngineProfile, TranscriptFeature, TranslationFeature, VariantInput,
-    infer_refseq_deletion_edits_from_sequences, is_mitochondrial_contig, refseq_edit_offset_delta,
+    genomic_to_cdna_index_for_transcript, infer_refseq_deletion_edits_from_sequences,
+    is_mitochondrial_contig, mapper_cdna_start_for_insertion, refseq_edit_offset_delta,
 };
 
 #[cfg(feature = "parquet-cache")]
@@ -7148,15 +7149,20 @@ impl AnnotateProvider {
                                 .unwrap_or(""),
                         );
                         let source_val = if include_source_field { source } else { "" };
-                        let refseq_offset_value = tx_opt
-                            .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
-                            .and_then(|tx| {
-                                tc.cdna_position
-                                    .as_deref()
-                                    .and_then(parse_cdna_position_start)
-                                    .and_then(|cdna_start| {
-                                        refseq_misalignment_offset(tx, cdna_start)
-                                    })
+                        let refseq_offset_value =
+                            tx_opt.filter(|_| hgvs_flags.hgvsc).and_then(|tx| {
+                                let variant = row_variant.as_ref()?;
+                                let tx_exons = ctx
+                                    .exons_by_tx_genomic
+                                    .get(tx.transcript_id.as_str())
+                                    .or_else(|| ctx.exons_by_tx.get(tx.transcript_id.as_str()))?;
+                                refseq_misalignment_offset_for_output(
+                                    tx,
+                                    tx_exons,
+                                    variant.parser_start,
+                                    variant.parser_end,
+                                    tc.cdna_position.as_deref(),
+                                )
                             });
                         let refseq_offset = OptDisplay(refseq_offset_value);
                         let given_ref = tc.given_ref.as_deref().unwrap_or("");
@@ -7610,15 +7616,20 @@ impl AnnotateProvider {
                             .and_then(|tx| tx.refseq_match.as_deref())
                             .unwrap_or("");
                         let source_val = tx_opt.and_then(|tx| tx.source.as_deref()).unwrap_or("");
-                        let refseq_offset_value = tx_opt
-                            .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
-                            .and_then(|tx| {
-                                tc.cdna_position
-                                    .as_deref()
-                                    .and_then(parse_cdna_position_start)
-                                    .and_then(|cdna_start| {
-                                        refseq_misalignment_offset(tx, cdna_start)
-                                    })
+                        let refseq_offset_value =
+                            tx_opt.filter(|_| hgvs_flags.hgvsc).and_then(|tx| {
+                                let variant = row_variant.as_ref()?;
+                                let tx_exons = ctx
+                                    .exons_by_tx_genomic
+                                    .get(tx.transcript_id.as_str())
+                                    .or_else(|| ctx.exons_by_tx.get(tx.transcript_id.as_str()))?;
+                                refseq_misalignment_offset_for_output(
+                                    tx,
+                                    tx_exons,
+                                    variant.parser_start,
+                                    variant.parser_end,
+                                    tc.cdna_position.as_deref(),
+                                )
                             });
                         let given_ref = tc.given_ref.as_deref().unwrap_or("");
                         let used_ref = tc.used_ref.as_deref().unwrap_or("");
@@ -8633,16 +8644,79 @@ fn is_refseq_offset_transcript(tx: &TranscriptFeature) -> bool {
     tx.transcript_id.starts_with("NM_") || tx.transcript_id.starts_with("XM_")
 }
 
+fn refseq_misalignment_offset(tx: &TranscriptFeature, cdna_start: i64) -> Option<i64> {
+    if !is_refseq_offset_transcript(tx) || tx.refseq_edits.is_empty() {
+        return None;
+    }
+
+    let mut offset = 0_i64;
+    for edit in &tx.refseq_edits {
+        // VEP's `get_misalignment_offset` compares the variant start to the
+        // first coordinate in each `_rna_edit` attribute. A deletion affects
+        // its first base too, even though its end lies after that base.
+        if edit.start > cdna_start {
+            continue;
+        }
+        offset += refseq_edit_offset_delta(edit).unwrap_or(0);
+    }
+
+    (offset != 0).then_some(offset)
+}
+
+/// Match `BaseTranscriptVariation::cdna_start` for the parser-level feature
+/// coordinates used by VEP's RefSeq misalignment rule. For non-insertions,
+/// `genomic2cdna(start, end, strand)` uses `variation_start` on a plus-strand
+/// transcript and `variation_end` on a minus-strand transcript. Insertions
+/// use Mapper::map_insert's first mapped piece; displayed `cDNA_position` is
+/// not the threshold.
+fn refseq_misalignment_offset_for_variant(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variation_start: i64,
+    variation_end: i64,
+) -> Option<i64> {
+    if variation_end.checked_add(1) == Some(variation_start) {
+        let cdna_start =
+            mapper_cdna_start_for_insertion(tx, tx_exons, variation_start, variation_end)
+                .and_then(|position| i64::try_from(position).ok())
+                .unwrap_or(0);
+        return refseq_misalignment_offset(tx, cdna_start);
+    }
+
+    let first_genomic_coordinate = if tx.strand < 0 {
+        variation_end
+    } else {
+        variation_start
+    };
+    let cdna_start = genomic_to_cdna_index_for_transcript(tx, tx_exons, first_genomic_coordinate)
+        .and_then(|position| i64::try_from(position).ok())
+        .unwrap_or(0);
+    refseq_misalignment_offset(tx, cdna_start)
+}
+
+fn refseq_misalignment_offset_for_output(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variation_start: i64,
+    variation_end: i64,
+    displayed_cdna_position: Option<&str>,
+) -> Option<i64> {
+    refseq_misalignment_offset_for_variant(tx, tx_exons, variation_start, variation_end).or_else(
+        || {
+            displayed_cdna_position
+                .and_then(parse_cdna_position_start)
+                .and_then(|cdna_start| refseq_misalignment_offset(tx, cdna_start))
+        },
+    )
+}
+
 fn parse_cdna_position_start(value: &str) -> Option<i64> {
     let value = value.trim();
-    let mut chars = value.char_indices();
     let mut sign = 1_i64;
     let mut digit_start = 0;
-
-    if let Some((_, '-')) = chars.clone().next() {
+    if value.starts_with('-') {
         sign = -1;
         digit_start = 1;
-        chars.next();
     }
 
     let mut digit_end = digit_start;
@@ -8660,23 +8734,7 @@ fn parse_cdna_position_start(value: &str) -> Option<i64> {
     value[digit_start..digit_end]
         .parse::<i64>()
         .ok()
-        .map(|pos| pos * sign)
-}
-
-fn refseq_misalignment_offset(tx: &TranscriptFeature, cdna_start: i64) -> Option<i64> {
-    if !is_refseq_offset_transcript(tx) || tx.refseq_edits.is_empty() {
-        return None;
-    }
-
-    let mut offset = 0_i64;
-    for edit in &tx.refseq_edits {
-        if edit.end >= cdna_start {
-            continue;
-        }
-        offset += refseq_edit_offset_delta(edit).unwrap_or(0);
-    }
-
-    (offset != 0).then_some(offset)
+        .map(|position| position * sign)
 }
 
 fn is_predicted_refseq_transcript(tx: &TranscriptFeature) -> bool {
@@ -21579,8 +21637,6 @@ mod tests {
             },
         ];
 
-        assert_eq!(parse_cdna_position_start("35-36"), Some(35));
-        assert_eq!(parse_cdna_position_start("35+2"), Some(35));
         assert_eq!(refseq_misalignment_offset(&tx, 35), Some(1));
         assert_eq!(refseq_misalignment_offset(&tx, 5), None);
         assert_eq!(refseq_misalignment_offset(&tx, 10), Some(3));
@@ -21599,9 +21655,225 @@ mod tests {
             skip_refseq_offset: false,
         }];
 
-        assert_eq!(refseq_misalignment_offset(&tx, 1447), None);
+        assert_eq!(refseq_misalignment_offset(&tx, 1446), None);
+        assert_eq!(refseq_misalignment_offset(&tx, 1447), Some(2));
         assert_eq!(refseq_misalignment_offset(&tx, 1448), Some(2));
         assert_eq!(refseq_misalignment_offset(&tx, 2768), Some(2));
+    }
+
+    #[test]
+    fn test_refseq_offset_uses_mapper_start_for_vcf_insertion_boundary() {
+        let mut tx = make_selection_tx("NM_001193335.3", Some("RefSeq"));
+        tx.start = 92_474_624;
+        tx.end = 92_474_927;
+        tx.strand = -1;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 397,
+            end: 399,
+            replacement_len: None,
+            skip_refseq_offset: false,
+        }];
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 92_474_624,
+                genomic_end: 92_474_742,
+                cdna_start: 397,
+                cdna_end: 515,
+                ori: -1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 92_474_746,
+                genomic_end: 92_474_927,
+                cdna_start: 215,
+                cdna_end: 396,
+                ori: -1,
+            },
+        ];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        };
+        let exons = [&exon];
+
+        // VEP's VCF parser represents this insertion as start=pos+1, end=pos.
+        // Mapper::map_insert returns cDNA 397 from the mapped left flank even
+        // though the normalized displayed cDNA_position is 396-397.
+        assert_eq!(
+            refseq_misalignment_offset_for_variant(&tx, &exons, 92_474_743, 92_474_742),
+            Some(-3)
+        );
+    }
+
+    #[test]
+    fn test_refseq_offset_uses_start_flank_for_plus_strand_insertion() {
+        let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
+        tx.start = 100;
+        tx.end = 199;
+        tx.strand = 1;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 2,
+            end: 1,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 199,
+        };
+
+        assert_eq!(
+            refseq_misalignment_offset_for_variant(&tx, &[&exon], 101, 100),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_refseq_offset_uses_mapper_start_across_edit_gap_insertion() {
+        let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
+        tx.start = 100;
+        tx.end = 299;
+        tx.strand = 1;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 181,
+            end: 180,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 109,
+                cdna_start: 1,
+                cdna_end: 10,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 110,
+                genomic_end: 278,
+                cdna_start: 14,
+                cdna_end: 182,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 279,
+                genomic_end: 299,
+                cdna_start: 185,
+                cdna_end: 205,
+                ori: 1,
+            },
+        ];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        };
+
+        // The insertion lies between cDNA flanks 182 and 185. Mapper's first
+        // insertion piece starts at 183, after the later edit threshold at
+        // 181, so that edit contributes to REFSEQ_OFFSET.
+        assert_eq!(
+            refseq_misalignment_offset_for_variant(&tx, &[&exon], 279, 278),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_refseq_offset_uses_high_endpoint_for_minus_strand_span() {
+        let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
+        tx.start = 100;
+        tx.end = 199;
+        tx.strand = -1;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 50,
+            end: 50,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 199,
+        };
+
+        assert_eq!(
+            refseq_misalignment_offset_for_variant(&tx, &[&exon], 150, 151),
+            None
+        );
+    }
+
+    #[test]
+    fn test_refseq_offset_uses_displayed_cdna_position_for_intronic_variant() {
+        let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
+        tx.start = 100;
+        tx.end = 200;
+        tx.strand = 1;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 10,
+            end: 9,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        let exons = vec![
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 1,
+                start: 100,
+                end: 109,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 2,
+                start: 191,
+                end: 200,
+            },
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+
+        // The genomic mapper has no cDNA base for an intronic coordinate;
+        // VEP's output position still supplies the transcript start (35+2).
+        assert_eq!(
+            refseq_misalignment_offset_for_output(&tx, &exons_ref, 150, 150, Some("35+2"),),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn test_refseq_misalignment_offset_counts_cumulative_edits_from_edit_start() {
+        for (id, strand) in [("NM_000001.1", 1), ("XM_000001.1", -1)] {
+            let mut tx = make_selection_tx(id, Some("RefSeq"));
+            tx.strand = strand;
+            tx.refseq_edits = vec![
+                RefSeqEdit {
+                    start: 10,
+                    end: 9,
+                    replacement_len: Some(3),
+                    skip_refseq_offset: false,
+                },
+                RefSeqEdit {
+                    start: 30,
+                    end: 31,
+                    replacement_len: None,
+                    skip_refseq_offset: false,
+                },
+            ];
+
+            assert_eq!(refseq_misalignment_offset(&tx, 30), Some(1), "{id}");
+        }
+
+        let mut ensembl = make_selection_tx("ENST000001", Some("Ensembl"));
+        ensembl.refseq_edits = vec![RefSeqEdit {
+            start: 10,
+            end: 9,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        assert_eq!(refseq_misalignment_offset(&ensembl, 30), None);
     }
 
     #[test]

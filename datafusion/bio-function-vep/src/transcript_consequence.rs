@@ -5633,6 +5633,7 @@ fn vep116_ref_eq_alt_sequence_for_class(
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1680-L1682>
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499>
 fn build_protein_hgvs_data(
+    tx: &TranscriptFeature,
     class: &CodingClassification,
     peptide_alleles: Option<&str>,
     old_aas: &[char],
@@ -5678,7 +5679,11 @@ fn build_protein_hgvs_data(
         end,
         ref_peptide,
         alt_peptide,
-        ref_translation: canonical_ref_translation_for_hgvsp(translation, old_aas.iter().collect()),
+        ref_translation: canonical_ref_translation_for_hgvsp(
+            tx,
+            translation,
+            old_aas.iter().collect(),
+        ),
         alt_translation: new_aas.iter().collect(),
         alt_translation_extension: None,
         frameshift,
@@ -5818,19 +5823,27 @@ fn transcript_mrna_seq_for_vep(tx: &TranscriptFeature) -> Option<String> {
 
 /// Reference translation used for HGVSp formatting.
 ///
-/// Upstream caches carry canonical pre-BAM-edit RefSeq sequence in
-/// `translation_seq_canonical` / `cds_sequence_canonical`. VEP's HGVSp
-/// formatting uses that canonical NP sequence for peptide flanking,
-/// duplication checks, and final residue numbering, while Amino_acids /
-/// Codons still reflect the BAM-edited translation. Fall back to the caller's
-/// translated CDS when canonical sequence is unavailable (older caches).
+/// A successful VEP BAM edit clears the cached mapper and peptide and rebuilds
+/// them from the edited transcript. Use that edited translation for HGVSp as
+/// well. Failed or absent edits retain the canonical cached reference when it
+/// is available.
 fn canonical_ref_translation_for_hgvsp(
+    tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
     fallback: String,
 ) -> String {
+    if bam_edit_succeeded(tx) {
+        return edited_ref_translation_for_hgvsp(tx, translation, fallback);
+    }
     translation
         .and_then(|translation| translation.translation_seq_canonical.clone())
         .unwrap_or(fallback)
+}
+
+fn bam_edit_succeeded(tx: &TranscriptFeature) -> bool {
+    tx.bam_edit_status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
 }
 
 fn reference_aas_for_consequence(
@@ -5956,14 +5969,21 @@ fn reference_translateable_seq_for_hgvsp(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
 ) -> Option<String> {
+    if bam_edit_succeeded(tx) {
+        return reference_translateable_seq_for_vep(tx, translation);
+    }
     translation
         .and_then(|translation| translation.cds_sequence_canonical.as_deref())
         .map(|seq| seq.to_ascii_uppercase())
         .or_else(|| reference_translateable_seq_for_vep(tx, translation))
 }
 
-fn uses_canonical_reference_for_hgvsp(translation: Option<&TranslationFeature>) -> bool {
-    translation.is_some_and(|translation| translation.cds_sequence_canonical.is_some())
+fn uses_canonical_reference_for_hgvsp(
+    tx: &TranscriptFeature,
+    translation: Option<&TranslationFeature>,
+) -> bool {
+    !bam_edit_succeeded(tx)
+        && translation.is_some_and(|translation| translation.cds_sequence_canonical.is_some())
 }
 
 /// Traceability:
@@ -6031,21 +6051,24 @@ fn alternate_translation_for_vep_hgvs(
         } else {
             variant.start
         };
-        let raw_cds_idx = genomic_to_cds_index(tx, tx_exons, anchor_pos)
-            .or_else(|| {
-                let alt = if tx.strand >= 0 {
-                    variant.start
-                } else {
-                    variant.start.saturating_sub(1)
-                };
-                genomic_to_cds_index(tx, tx_exons, alt).and_then(|i| i.checked_sub(1))
-            })
-            .map(|i| i + leading_n_offset)?;
+        let (raw_cds_idx, mapper_used_for_index) =
+            genomic_to_cds_index_with_mapper_usage(tx, tx_exons, anchor_pos)
+                .or_else(|| {
+                    let alt = if tx.strand >= 0 {
+                        variant.start
+                    } else {
+                        variant.start.saturating_sub(1)
+                    };
+                    genomic_to_cds_index_with_mapper_usage(tx, tx_exons, alt)
+                        .and_then(|(i, mapper_used)| i.checked_sub(1).map(|i| (i, mapper_used)))
+                })
+                .map(|(i, mapper_used)| (i + leading_n_offset, mapper_used))?;
         let cds_idx = adjust_refseq_cds_sequence_index_for_hgvsp_reference(
             tx,
             Some(translation),
             raw_cds_idx,
             leading_n_offset,
+            mapper_used_for_index,
         )
         .unwrap_or(raw_cds_idx);
         // `_get_alternate_cds()` inserts after the mapped anchor base. For a
@@ -6059,14 +6082,16 @@ fn alternate_translation_for_vep_hgvs(
         }
         let mut cds_indices = Vec::with_capacity(genomic_positions.len());
         for pos in &genomic_positions {
-            let raw_idx =
-                genomic_to_cds_index(tx, tx_exons, *pos)?.saturating_add(leading_n_offset);
+            let (cds_idx, mapper_used_for_index) =
+                genomic_to_cds_index_with_mapper_usage(tx, tx_exons, *pos)?;
+            let raw_idx = cds_idx.saturating_add(leading_n_offset);
             cds_indices.push(
                 adjust_refseq_cds_sequence_index_for_hgvsp_reference(
                     tx,
                     Some(translation),
                     raw_idx,
                     leading_n_offset,
+                    mapper_used_for_index,
                 )
                 .unwrap_or(raw_idx),
             );
@@ -6133,7 +6158,7 @@ fn literal_indel_protein_hgvs_data(
     }
 
     let leading_n_offset = cds_seq.bytes().take_while(|&b| b == b'N').count();
-    let uses_canonical_ref = uses_canonical_reference_for_hgvsp(Some(translation));
+    let uses_canonical_ref = uses_canonical_reference_for_hgvsp(tx, Some(translation));
 
     let (raw_start_idx, raw_end_idx, start_idx, end_idx, alt_tx, cds_seq) = if ref_len == 0 {
         let anchor_pos = if tx.strand >= 0 {
@@ -6141,21 +6166,24 @@ fn literal_indel_protein_hgvs_data(
         } else {
             variant.start
         };
-        let raw_cds_idx = genomic_to_cds_index(tx, tx_exons, anchor_pos)
-            .or_else(|| {
-                let alt = if tx.strand >= 0 {
-                    variant.start
-                } else {
-                    variant.start.saturating_sub(1)
-                };
-                genomic_to_cds_index(tx, tx_exons, alt).and_then(|i| i.checked_sub(1))
-            })
-            .map(|i| i + leading_n_offset)?;
+        let (raw_cds_idx, mapper_used_for_index) =
+            genomic_to_cds_index_with_mapper_usage(tx, tx_exons, anchor_pos)
+                .or_else(|| {
+                    let alt = if tx.strand >= 0 {
+                        variant.start
+                    } else {
+                        variant.start.saturating_sub(1)
+                    };
+                    genomic_to_cds_index_with_mapper_usage(tx, tx_exons, alt)
+                        .and_then(|(i, mapper_used)| i.checked_sub(1).map(|i| (i, mapper_used)))
+                })
+                .map(|(i, mapper_used)| (i + leading_n_offset, mapper_used))?;
         let cds_idx = adjust_refseq_cds_sequence_index_for_hgvsp_reference(
             tx,
             Some(translation),
             raw_cds_idx,
             leading_n_offset,
+            mapper_used_for_index,
         )
         .unwrap_or(raw_cds_idx);
         let alt_tx = if tx.strand >= 0 {
@@ -6173,8 +6201,9 @@ fn literal_indel_protein_hgvs_data(
         let mut raw_cds_indices = Vec::with_capacity(genomic_positions.len());
         let mut cds_indices = Vec::with_capacity(genomic_positions.len());
         for pos in &genomic_positions {
-            let raw_idx =
-                genomic_to_cds_index(tx, tx_exons, *pos)?.saturating_add(leading_n_offset);
+            let (cds_idx, mapper_used_for_index) =
+                genomic_to_cds_index_with_mapper_usage(tx, tx_exons, *pos)?;
+            let raw_idx = cds_idx.saturating_add(leading_n_offset);
             raw_cds_indices.push(raw_idx);
             cds_indices.push(
                 adjust_refseq_cds_sequence_index_for_hgvsp_reference(
@@ -6182,6 +6211,7 @@ fn literal_indel_protein_hgvs_data(
                     Some(translation),
                     raw_idx,
                     leading_n_offset,
+                    mapper_used_for_index,
                 )
                 .unwrap_or(raw_idx),
             );
@@ -6309,6 +6339,7 @@ fn literal_indel_protein_hgvs_data(
         ref_peptide,
         alt_peptide,
         ref_translation: canonical_ref_translation_for_hgvsp(
+            tx,
             Some(translation),
             old_aas.iter().collect(),
         ),
@@ -6377,6 +6408,7 @@ fn literal_shifted_indel_protein_hgvs_data(
         //   and `_translateable_seq[cds_end..]`.
         //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1593-L1758>
         //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2323-L2352>
+        let mapper_used_for_index = exact_mapper_cdna_index_for_hgvsp(tx, shifted_start).is_some();
         let raw_idx = genomic_to_cds_index_for_hgvsp(tx, tx_exons, shifted_start)?
             .saturating_add(leading_n_offset);
         let cds_idx = adjust_refseq_cds_sequence_index_for_hgvsp_reference(
@@ -6384,6 +6416,7 @@ fn literal_shifted_indel_protein_hgvs_data(
             Some(translation),
             raw_idx,
             leading_n_offset,
+            mapper_used_for_index,
         )
         .unwrap_or(raw_idx);
         if cds_idx > reference_cds_seq.len() {
@@ -6399,6 +6432,7 @@ fn literal_shifted_indel_protein_hgvs_data(
         }
         let mut cds_indices = Vec::with_capacity(genomic_positions.len());
         for pos in &genomic_positions {
+            let mapper_used_for_index = exact_mapper_cdna_index_for_hgvsp(tx, *pos).is_some();
             let raw_idx = genomic_to_cds_index_for_hgvsp(tx, tx_exons, *pos)?
                 .saturating_add(leading_n_offset);
             cds_indices.push(
@@ -6407,6 +6441,7 @@ fn literal_shifted_indel_protein_hgvs_data(
                     Some(translation),
                     raw_idx,
                     leading_n_offset,
+                    mapper_used_for_index,
                 )
                 .unwrap_or(raw_idx),
             );
@@ -6488,6 +6523,7 @@ fn literal_shifted_indel_protein_hgvs_data(
         ref_peptide,
         alt_peptide,
         ref_translation: canonical_ref_translation_for_hgvsp(
+            tx,
             Some(translation),
             translate_protein_from_cds_in(tx.codon_table, reference_cds_seq.as_bytes())?
                 .iter()
@@ -6626,6 +6662,38 @@ fn shifted_insertion_cdna_flank(
     usize::try_from(raw_cdna.checked_add(offset)?).ok()
 }
 
+fn shifted_insertion_mapper_used_for_index(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    span: vep_coords::VepSpan,
+) -> bool {
+    let (five_prime_flank, three_prime_flank) = if tx.strand < 0 {
+        (span.start, span.end)
+    } else {
+        (span.end, span.start)
+    };
+
+    if !tx.cdna_mapper_segments.is_empty() {
+        // A cached mapper is authoritative only for flanks it actually maps;
+        // the missing flank can still be a Mapper::Gap.
+        return [five_prime_flank, three_prime_flank]
+            .into_iter()
+            .any(|pos| exact_mapper_cdna_index_for_hgvsp(tx, pos).is_some());
+    }
+
+    // With no cached mapper, shifted_insertion_cdna_flank reconstructs the
+    // cDNA edit offsets from RefSeq edit records. Treat the index as mapped
+    // only if that fallback actually changed a flank; BAM status by itself
+    // does not prove that the returned exon-geometry index is edit-aware.
+    [five_prime_flank, three_prime_flank]
+        .into_iter()
+        .any(|pos| {
+            let raw = genomic_to_cdna_index_for_transcript(tx, tx_exons, pos);
+            let shifted = shifted_insertion_cdna_flank(tx, tx_exons, pos);
+            matches!((raw, shifted), (Some(raw), Some(shifted)) if raw != shifted)
+        })
+}
+
 /// Replay Ensembl's shifted TVA mapper coordinates for `hgvs_protein()`.
 ///
 /// Traceability:
@@ -6664,7 +6732,8 @@ fn shifted_tva_coords_from_mapper(
         vep_coords::CdnaBaseMap::HgvspExact,
         leading_n_offset,
     );
-    let (cdna_start, cdna_end, raw_cds_start, raw_cds_end) = if is_insertion {
+    let (cdna_start, cdna_end, raw_cds_start, raw_cds_end, mapper_used_for_index) = if is_insertion
+    {
         // `Mapper::map_insert()` over the transcript-ordered flanks, keeping
         // the one that maps when the other is a `Gap`, and the edited-cDNA
         // gap between two mapped flanks; then the single-piece
@@ -6673,11 +6742,21 @@ fn shifted_tva_coords_from_mapper(
         let cdna = mapper.cdna(span);
         let (cdna_start, cdna_end) = cdna.both()?;
         let (raw_cds_start, raw_cds_end) = mapper.cds_of_cdna(cdna, true).both()?;
-        (cdna_start, cdna_end, raw_cds_start, raw_cds_end)
+        (
+            cdna_start,
+            cdna_end,
+            raw_cds_start,
+            raw_cds_end,
+            shifted_insertion_mapper_used_for_index(tx, tx_exons, span),
+        )
     } else {
         let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
         let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
+        let mut mapper_used_for_index = true;
         for pos in genomic_positions {
+            if exact_mapper_cdna_index_for_hgvsp(tx, pos).is_none() {
+                mapper_used_for_index = false;
+            }
             cdna_positions.push(genomic_to_cdna_index_for_hgvsp(tx, tx_exons, pos)?);
         }
         cdna_positions.sort_unstable();
@@ -6693,7 +6772,13 @@ fn shifted_tva_coords_from_mapper(
             .saturating_sub(coding_start)
             .saturating_add(1)
             .saturating_add(leading_n_offset);
-        (cdna_start, cdna_end, raw_cds_start, raw_cds_end)
+        (
+            cdna_start,
+            cdna_end,
+            raw_cds_start,
+            raw_cds_end,
+            mapper_used_for_index,
+        )
     };
     let edited_insertion_gap =
         is_insertion && cdna_start <= cdna_end && refseq_has_edited_sequence_state(tx);
@@ -6705,6 +6790,7 @@ fn shifted_tva_coords_from_mapper(
             Some(translation),
             raw_cds_start.checked_sub(1)?,
             leading_n_offset,
+            mapper_used_for_index,
         )
         .and_then(|idx| idx.checked_add(1))
         .unwrap_or(raw_cds_start)
@@ -6717,11 +6803,13 @@ fn shifted_tva_coords_from_mapper(
             Some(translation),
             raw_cds_end.checked_sub(1)?,
             leading_n_offset,
+            mapper_used_for_index,
         )
         .and_then(|idx| idx.checked_add(1))
         .unwrap_or(raw_cds_end)
     };
     let translateable_pos_1based = |genomic_pos: i64| -> Option<usize> {
+        let mapper_used_for_index = exact_mapper_cdna_index_for_hgvsp(tx, genomic_pos).is_some();
         let raw_idx = genomic_to_cds_index_for_hgvsp(tx, tx_exons, genomic_pos)?
             .checked_add(leading_n_offset)?;
         adjust_refseq_cds_sequence_index_for_hgvsp_reference(
@@ -6729,6 +6817,7 @@ fn shifted_tva_coords_from_mapper(
             Some(translation),
             raw_idx,
             leading_n_offset,
+            mapper_used_for_index,
         )
         .and_then(|idx| idx.checked_add(1))
     };
@@ -6839,7 +6928,8 @@ fn shifted_tva_peptide_window(
     //   spliced sequence) is not sufficient by itself.
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L826-L876>
     if is_reference
-        && (coords.edited_insertion_gap || !uses_canonical_reference_for_hgvsp(Some(translation)))
+        && (coords.edited_insertion_gap
+            || !uses_canonical_reference_for_hgvsp(tx, Some(translation)))
         && (!tx.refseq_edits.is_empty()
             || (coords.edited_insertion_gap && tx.has_non_polya_rna_edit))
         && vf_nt_len > 0
@@ -6953,6 +7043,7 @@ fn shifted_tva_protein_hgvs_data(
         true,
     )?;
     let canonical_ref_translation: String = canonical_ref_translation_for_hgvsp(
+        tx,
         Some(translation),
         translate_protein_from_cds_in(tx.codon_table, reference_cds_seq.as_bytes())?
             .iter()
@@ -7228,6 +7319,21 @@ fn protein_hgvs_for_output_with_semantics(
     let ref_norm = normalize_allele_seq(&variant.ref_allele);
     let alt_norm = normalize_allele_seq(&variant.alt_allele);
     let is_insertion = ref_norm.is_empty() && !alt_norm.is_empty();
+
+    // At a RefSeq insertion-edit gap, VEP's HGVS allele uses the edited
+    // transcript mapper interval and replaces that interval with the shifted
+    // allele in the edited CDS. Replay that narrow case directly; ordinary
+    // consequence classification keeps its genomic insertion behavior.
+    if is_insertion
+        && refseq_has_edited_sequence_state(tx)
+        && refseq_mapper_insertion_cds_gap(tx, tx_exons, tx_translation, variant).is_some()
+        && let Some(translation) = tx_translation
+        && let Some(protein) =
+            classify_refseq_gap_insertion_for_hgvsp(tx, tx_exons, translation, variant, semantics)
+                .and_then(|class| class.protein_hgvs)
+    {
+        return Some(protein);
+    }
 
     let existing_shift = variant.hgvs_shift_for_strand(tx.strand).cloned();
     let refseq_shift = if refseq_uses_transcript_shift_for_hgvsp(tx) {
@@ -7555,7 +7661,7 @@ fn protein_hgvs_shifted_variant_for_reference(
     shift: &crate::hgvs::HgvsGenomicShift,
 ) -> VariantInput {
     let mut shifted_variant = protein_hgvs_shifted_variant(variant, shift, tx.strand);
-    if !uses_canonical_reference_for_hgvsp(translation)
+    if !uses_canonical_reference_for_hgvsp(tx, translation)
         || !refseq_uses_transcript_shift_for_hgvsp(tx)
         || shift.ref_orig_allele_string.is_empty()
     {
@@ -8462,6 +8568,7 @@ fn classify_coding_change_with_semantics(
             })
         });
     class.protein_hgvs = build_protein_hgvs_data(
+        tx,
         &class,
         hgvs_amino_acids.as_deref(),
         &old_aas,
@@ -8485,6 +8592,7 @@ fn classify_coding_change_with_semantics(
             ref_peptide: "*".to_string(),
             alt_peptide: "*".to_string(),
             ref_translation: canonical_ref_translation_for_hgvsp(
+                tx,
                 Some(translation),
                 old_aas.iter().collect(),
             ),
@@ -8533,6 +8641,30 @@ fn classify_insertion(
     )
 }
 
+/// Return the edited RefSeq CDS interval between an insertion's mapped flanks.
+fn refseq_mapper_insertion_cds_gap(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+) -> Option<(usize, usize)> {
+    if !refseq_has_edited_sequence_state(tx) {
+        return None;
+    }
+    let span = vep_coords::VepSpan::from_variant(variant);
+    if !span.is_insertion() {
+        return None;
+    }
+    let mapper = vep_coords::VepTxMapper::new(
+        tx,
+        tx_exons,
+        tx_translation,
+        vep_coords::CdnaBaseMap::HgvspExact,
+    );
+    let (start, end) = mapper.cds(span).both()?;
+    (start <= end).then_some((start, end))
+}
+
 fn classify_insertion_with_semantics(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -8542,10 +8674,55 @@ fn classify_insertion_with_semantics(
     alt_genomic: &str,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<CodingClassification> {
+    classify_insertion_with_semantics_and_gap(
+        tx,
+        tx_exons,
+        tx_translation,
+        cds_seq,
+        variant,
+        alt_genomic,
+        semantics,
+        false,
+    )
+}
+
+fn classify_refseq_gap_insertion_for_hgvsp(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: &TranslationFeature,
+    variant: &VariantInput,
+    semantics: crate::vep_semantics::VepSemantics,
+) -> Option<CodingClassification> {
+    let cds_seq = reference_translateable_seq_for_vep(tx, Some(tx_translation))?;
+    let alt_genomic = normalize_allele_seq(&variant.alt_allele);
+    classify_insertion_with_semantics_and_gap(
+        tx,
+        tx_exons,
+        Some(tx_translation),
+        &cds_seq,
+        variant,
+        &alt_genomic,
+        semantics,
+        true,
+    )
+}
+
+fn classify_insertion_with_semantics_and_gap(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    cds_seq: &str,
+    variant: &VariantInput,
+    alt_genomic: &str,
+    semantics: crate::vep_semantics::VepSemantics,
+    replace_refseq_mapper_gap: bool,
+) -> Option<CodingClassification> {
     let alt_len = alt_genomic.len();
     if alt_len == 0 {
         return None;
     }
+    let mapper_gap_cds = refseq_mapper_insertion_cds_gap(tx, tx_exons, tx_translation, variant);
+    let mapper_gap_for_sequence = mapper_gap_cds.filter(|_| replace_refseq_mapper_gap);
 
     // VEP prepends N characters for non-zero phase.
     let leading_n_offset = cds_seq.bytes().take_while(|&b| b == b'N').count();
@@ -8594,8 +8771,16 @@ fn classify_insertion_with_semantics(
         reverse_complement(alt_genomic)?.to_ascii_uppercase()
     };
 
-    // Build mutated CDS: insert alt bases after cds_idx (i.e., at cds_idx+1).
-    let ins_point = cds_idx + 1;
+    // For HGVSp replay over an insertion edit gap, VEP replaces the mapped
+    // edited-CDS interval with the alternate allele. Ordinary consequence
+    // classification inserts after the genomic CDS anchor as usual.
+    let ins_point = mapper_gap_for_sequence
+        .map(|(start, _)| start.saturating_sub(1))
+        .unwrap_or_else(|| cds_idx + 1);
+    let mutation_end = mapper_gap_for_sequence
+        .map(|(_, end)| end)
+        .unwrap_or(ins_point);
+    let mutation_ref_len = mutation_end.saturating_sub(ins_point);
 
     // When the CDS has an incomplete terminal codon, VEP pads it with 3'UTR
     // bases to complete the reading frame before translating.  This lets VEP
@@ -8627,11 +8812,19 @@ fn classify_insertion_with_semantics(
     } else {
         cds_seq.as_bytes()
     };
+    if ins_point > mutation_end || mutation_end > effective_cds.len() {
+        return None;
+    }
 
-    let mut mutated = Vec::with_capacity(effective_cds.len() + alt_len);
+    let mut mutated = Vec::with_capacity(
+        effective_cds
+            .len()
+            .saturating_sub(mutation_ref_len)
+            .saturating_add(alt_len),
+    );
     mutated.extend_from_slice(&effective_cds[..ins_point]);
     mutated.extend_from_slice(alt_tx.as_bytes());
-    mutated.extend_from_slice(&effective_cds[ins_point..]);
+    mutated.extend_from_slice(&effective_cds[mutation_end..]);
 
     let old_aas = reference_aas_for_consequence(
         tx,
@@ -8645,19 +8838,28 @@ fn classify_insertion_with_semantics(
     // which is (cds_idx+1)-(cds_idx+2) in 1-based VEP convention.
     let raw_cds_position_start = raw_cds_idx + 1;
     let raw_cds_position_end = raw_cds_idx + 2;
-    class.cds_position_start =
-        adjust_refseq_cds_output_position(tx, raw_cds_position_start, leading_n_offset)
-            .or(Some(raw_cds_position_start));
-    class.cds_position_end =
-        adjust_refseq_cds_output_position(tx, raw_cds_position_end, leading_n_offset)
-            .or(Some(raw_cds_position_end));
+    if let Some((start, end)) = mapper_gap_cds {
+        class.cds_position_start = Some(start);
+        class.cds_position_end = Some(end);
+    } else {
+        class.cds_position_start =
+            adjust_refseq_cds_output_position(tx, raw_cds_position_start, leading_n_offset)
+                .or(Some(raw_cds_position_start));
+        class.cds_position_end =
+            adjust_refseq_cds_output_position(tx, raw_cds_position_end, leading_n_offset)
+                .or(Some(raw_cds_position_end));
+    }
 
     // Protein position follows the two displayed CDS flanks. This matches
     // VEP's genomic2pep() output for standard insertions and also for
     // exon-start boundary insertions where only the right genomic flank maps
     // into the CDS and the left side is recovered from the insertion-point
     // CDS coordinates.
-    let codon_at = cds_idx / 3;
+    let codon_at = if replace_refseq_mapper_gap {
+        ins_point / 3
+    } else {
+        cds_idx / 3
+    };
     let display_cds_position_start = class.cds_position_start.unwrap_or(raw_cds_position_start);
     let display_cds_position_end = class.cds_position_end.unwrap_or(raw_cds_position_end);
     let pep_a = (display_cds_position_start + 2) / 3;
@@ -8776,31 +8978,32 @@ fn classify_insertion_with_semantics(
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1320-L1355>
     // - codon() local window extraction (codon_len + allele_len - vf_nt_len):
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L877>
-    // Translate the LOCAL codon window from the mutated CDS, matching
-    // VEP's codon() extraction: codon_len (3) + alt_len bytes.
-    // For pure insertions ref is empty (vf_nt_len = 0), so
-    // window = codon_len + alt_len - 0 = 3 + alt_len.
-    //
-    // VEP uses this same local window for BOTH stop_retained and
-    // stop_gained predicates (both call _get_peptide_alleles).
-    // The final partial codon has no entry in the full-protein translation,
-    // so `codon_at == old_aas.len()` is still a real VEP peptide window. In
-    // particular, a one-base insertion can complete that window as a stop
-    // codon (X -> *) and VEP's stop_gained predicate has no partial_codon
+    // Translate VEP's local codon window from the mutated CDS. Its length is
+    // codon_len + alternate allele length - the replaced reference span;
+    // for a pure insertion that is 3 + alt_len. Use the effective CDS length
+    // rather than the complete-protein length so a terminal partial codon
+    // remains a real peptide window. In particular, an insertion can complete
+    // that window as a stop codon (X -> *), and stop_gained has no partial-codon
     // veto.
     let codon_start = codon_at.saturating_mul(3);
     let has_reference_codon_window = codon_start < effective_cds.len();
+    let codon_window_len = 3usize
+        .saturating_add(alt_len)
+        .saturating_sub(mutation_ref_len);
     let local_aas = if has_reference_codon_window {
-        let window_len = 3 + alt_len;
-        let window_end = (codon_start + window_len).min(mutated.len());
+        let window_end = codon_start
+            .saturating_add(codon_window_len)
+            .min(mutated.len());
         let local_window = &mutated[codon_start..window_end];
         translate_protein_from_cds_in(tx.codon_table, local_window).unwrap_or_default()
     } else {
         Vec::new()
     };
     if has_reference_codon_window {
-        let ref_end = (codon_start + 3).min(effective_cds.len());
-        let alt_end = (codon_start + 3 + alt_len).min(mutated.len());
+        let ref_end = codon_start.saturating_add(3).min(effective_cds.len());
+        let alt_end = codon_start
+            .saturating_add(codon_window_len)
+            .min(mutated.len());
         class.affected_ref_peptide =
             local_peptide_from_codon_window(tx.codon_table, &effective_cds[codon_start..ref_end]);
         class.affected_alt_peptide =
@@ -8877,7 +9080,7 @@ fn classify_insertion_with_semantics(
     let raw_frameshift = if class.stop_retained {
         false
     } else {
-        !alt_len.is_multiple_of(3)
+        !alt_len.abs_diff(mutation_ref_len).is_multiple_of(3)
     };
     let frameshift =
         frameshift_under_semantics(raw_frameshift, &class, semantics, partial_terminal_codon);
@@ -8986,14 +9189,22 @@ fn classify_insertion_with_semantics(
 
     // Extend with 3' UTR for HGVS stop-loss/frameshift extension distance.
     let preferred_hgvs_alt_translation = if class.stop_lost || frameshift {
-        preferred_alt_translation_extension_for_hgvsp(
-            tx,
-            frameshift,
-            tx_translation.and_then(|translation| {
-                alternate_translation_for_vep_hgvs(tx, tx_exons, translation, variant)
-            }),
-            translated_alt_protein_for_hgvs(tx, &mutated),
-        )
+        let direct_alt_translation = translated_alt_protein_for_hgvs(tx, &mutated);
+        if replace_refseq_mapper_gap {
+            // `_get_alternate_cds()` builds from the exact mapper CDS interval.
+            // The generic transcript replay only sees the genomic insertion
+            // anchor and would put this allele on the wrong side of the edit.
+            direct_alt_translation
+        } else {
+            preferred_alt_translation_extension_for_hgvsp(
+                tx,
+                frameshift,
+                tx_translation.and_then(|translation| {
+                    alternate_translation_for_vep_hgvs(tx, tx_exons, translation, variant)
+                }),
+                direct_alt_translation,
+            )
+        }
     } else {
         None
     };
@@ -9009,6 +9220,7 @@ fn classify_insertion_with_semantics(
             })
         });
     class.protein_hgvs = build_protein_hgvs_data(
+        tx,
         &class,
         hgvs_amino_acids.as_deref(),
         &old_aas,
@@ -9725,6 +9937,66 @@ pub(crate) fn genomic_to_cdna_index_for_transcript(
     }
 }
 
+/// Match the first coordinate piece returned by Ensembl Core's
+/// `Mapper::map_insert` for parser-level insertion coordinates
+/// (`variation_start == variation_end + 1`). If the transcript-5' flank is
+/// mapped, the insertion starts immediately after that flank; if only the
+/// transcript-3' flank is mapped, that flank's coordinate is the start.
+/// Unlike `cDNA_position`, this preserves the mapper's first piece when an
+/// RNA edit creates a cDNA gap between the flanks.
+pub(crate) fn mapper_cdna_start_for_insertion(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variation_start: i64,
+    variation_end: i64,
+) -> Option<usize> {
+    if variation_start != variation_end.checked_add(1)? {
+        return None;
+    }
+
+    let (five_prime_flank, three_prime_flank) = if tx.strand < 0 {
+        (variation_start, variation_end)
+    } else {
+        (variation_end, variation_start)
+    };
+    let map_flank = |position| {
+        if tx.cdna_mapper_segments.is_empty() {
+            genomic_to_cdna_index_for_transcript(tx, tx_exons, position)
+        } else {
+            tx.cdna_mapper_segments
+                .iter()
+                .find_map(|segment| mapper_segment_cdna_index(segment, position))
+        }
+    };
+
+    map_flank(five_prime_flank)
+        .and_then(|position| position.checked_add(1))
+        .or_else(|| map_flank(three_prime_flank))
+}
+
+/// The same first-piece rule over unedited exon geometry. RefSeq edit starts
+/// are stored in this original cDNA space, so HGVSc's offset-threshold
+/// comparison needs this coordinate alongside the edit-aware mapper start.
+pub(crate) fn raw_exon_cdna_start_for_insertion(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variation_start: i64,
+    variation_end: i64,
+) -> Option<usize> {
+    if variation_start != variation_end.checked_add(1)? {
+        return None;
+    }
+
+    let (five_prime_flank, three_prime_flank) = if tx.strand < 0 {
+        (variation_start, variation_end)
+    } else {
+        (variation_end, variation_start)
+    };
+    genomic_to_cdna_index(tx_exons, tx.strand, five_prime_flank)
+        .and_then(|position| position.checked_add(1))
+        .or_else(|| genomic_to_cdna_index(tx_exons, tx.strand, three_prime_flank))
+}
+
 /// Genomic→cDNA coordinate table for the transcript, memoized once on the
 /// transcript and reused across every overlapping variant/allele (redundancy C).
 /// The first caller pays the `to_vec()` + sort in [`transcript_cdna_coords_uncached`];
@@ -9906,7 +10178,7 @@ fn exons_sorted_by_genomic_start(tx_exons: &[&ExonFeature]) -> bool {
         .all(|pair| (pair[0].start, pair[0].end) <= (pair[1].start, pair[1].end))
 }
 
-fn raw_cdna_position_from_sorted_exons(
+pub(crate) fn raw_cdna_position_from_sorted_exons(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     genomic_pos: i64,
@@ -10650,6 +10922,27 @@ fn refseq_cumulative_edit_offset_for_cdna(tx: &TranscriptFeature, cdna_start: i6
     (offset != 0).then_some(offset)
 }
 
+fn refseq_coding_cumulative_edit_offset_for_cdna(
+    tx: &TranscriptFeature,
+    cdna_start: i64,
+) -> Option<i64> {
+    if !(tx.transcript_id.starts_with("NM_") || tx.transcript_id.starts_with("XM_")) {
+        return None;
+    }
+    if use_cdna_mapper_for_general_coords(tx) {
+        return None;
+    }
+
+    let mut offset = 0i64;
+    for edit in &tx.refseq_edits {
+        if edit.end >= cdna_start || !refseq_edit_overlaps_coding_sequence(tx, edit) {
+            continue;
+        }
+        offset += refseq_mapper_edit_offset_delta(edit).unwrap_or(0);
+    }
+    (offset != 0).then_some(offset)
+}
+
 pub(crate) fn refseq_sequence_offset_for_cdna(
     tx: &TranscriptFeature,
     cdna_start: i64,
@@ -10671,6 +10964,27 @@ pub(crate) fn refseq_sequence_offset_for_cdna(
         }
         offset += refseq_edit_offset_delta(edit).unwrap_or(0);
     }
+    (offset != 0).then_some(offset)
+}
+
+/// VEP's `get_misalignment_offset` rule for HGVS cDNA coordinates and
+/// REFSEQ_OFFSET: include each NM_/XM_ edit whose first coordinate is at or
+/// before the variant start, including a deletion when the variant starts
+/// inside its deleted range.
+pub(crate) fn refseq_hgvsc_misalignment_offset(
+    tx: &TranscriptFeature,
+    cdna_start: i64,
+) -> Option<i64> {
+    if !(tx.transcript_id.starts_with("NM_") || tx.transcript_id.starts_with("XM_")) {
+        return None;
+    }
+
+    let offset = tx
+        .refseq_edits
+        .iter()
+        .filter(|edit| edit.start <= cdna_start)
+        .filter_map(refseq_edit_offset_delta)
+        .sum::<i64>();
     (offset != 0).then_some(offset)
 }
 
@@ -10727,8 +11041,17 @@ fn adjust_refseq_cds_output_position(
     let cdna_position = cdna_coding_start
         .checked_add(cdna_without_padding)?
         .checked_sub(1)?;
-    let adjusted = raw_cds_position as i64
-        + refseq_misalignment_offset_for_cdna(tx, cdna_position as i64).unwrap_or(0);
+    let offset = if bam_edit_succeeded(tx) && !use_cdna_mapper_for_general_coords(tx) {
+        // When the mapper is rejected, genomic coding coordinates omit edits
+        // that have no genomic bases, including edits before the CDS. VEP's
+        // successful BAM edit still carries those bases in its transcript
+        // coordinates, so reconstruct the full offset into that sequence.
+        refseq_cumulative_edit_offset_for_cdna(tx, cdna_position as i64)
+    } else {
+        refseq_coding_cumulative_edit_offset_for_cdna(tx, cdna_position as i64)
+    }
+    .unwrap_or(0);
+    let adjusted = raw_cds_position as i64 + offset;
     (adjusted > 0)
         .then(|| usize::try_from(adjusted).ok())
         .flatten()
@@ -10779,15 +11102,41 @@ fn adjust_refseq_cds_sequence_index_for_hgvsp_reference(
     translation: Option<&TranslationFeature>,
     raw_cds_index: usize,
     leading_n_offset: usize,
+    mapper_used_for_index: bool,
 ) -> Option<usize> {
+    // Successful BAM edits rebuild VEP's mapper from the edited transcript.
+    // Callers that obtained this index from that mapper already have the
+    // cumulative edit offset. Exon-geometry fallbacks still need the offset,
+    // even when cached mapper segments exist but were not used for the index.
+    if bam_edit_succeeded(tx) && mapper_used_for_index {
+        return Some(raw_cds_index);
+    }
+
     let raw_cds_position = raw_cds_index.checked_add(1)?;
-    let adjusted = if uses_canonical_reference_for_hgvsp(translation) {
+    let adjusted = if uses_canonical_reference_for_hgvsp(tx, translation) {
         adjust_refseq_canonical_cds_output_position_for_hgvsp(
             tx,
             raw_cds_position,
             leading_n_offset,
         )
         .unwrap_or(raw_cds_position)
+    } else if bam_edit_succeeded(tx) {
+        // BAM-success indices from exon geometry are in the unedited cDNA
+        // space. Apply the pinned VEP cumulative edit offset directly; the
+        // general-coordinate helper suppresses it when mapper segments are
+        // accepted, but this caller did not use those segments.
+        let cdna_without_padding = match raw_cds_position.checked_sub(leading_n_offset) {
+            Some(0) | None => return Some(raw_cds_index),
+            Some(value) => value,
+        };
+        let Some(cdna_coding_start) = tx.cdna_coding_start else {
+            return Some(raw_cds_index);
+        };
+        let cdna_position = cdna_coding_start
+            .checked_add(cdna_without_padding)?
+            .checked_sub(1)?;
+        let offset = refseq_cumulative_edit_offset_for_cdna(tx, cdna_position as i64).unwrap_or(0);
+        usize::try_from(raw_cds_position as i64 + offset).ok()?
     } else {
         adjust_refseq_cds_output_position(tx, raw_cds_position, leading_n_offset)
             .unwrap_or(raw_cds_position)
@@ -11042,6 +11391,19 @@ pub(super) fn genomic_to_cds_index_from_segments(
         offset = offset.saturating_add(seg_len);
     }
     None
+}
+
+fn genomic_to_cds_index_with_mapper_usage(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    pos: i64,
+) -> Option<(usize, bool)> {
+    // Native RefSeq uses the cDNA mapper when it is accepted; a successful
+    // index from that path already includes BAM-edit offsets. Other paths use
+    // exon geometry/coding segments and still need the explicit offset helper.
+    let mapper_used_for_index =
+        prefers_exon_geometry_over_mapper(tx) && use_cdna_mapper_for_general_coords(tx);
+    genomic_to_cds_index(tx, tx_exons, pos).map(|index| (index, mapper_used_for_index))
 }
 
 /// Traceability:
@@ -13182,20 +13544,62 @@ mod tests {
         assert_eq!(
             shifted_tva_coords_from_mapper(&transcript, &exons_ref, &translation, &shifted_variant),
             Some(ShiftedTvaCoords {
-                // HGVSp now uses canonical RefSeq CDS coordinates when available,
-                // so the exact mapper gap is projected across the leading 6 bp
-                // transcript-start edit before peptide coordinates are derived.
-                cds_start: 123,
-                cds_end: 128,
-                protein_start: 41,
-                protein_end: 43,
+                // A successful BAM edit makes these coordinates edit-aware.
+                // HGVSp uses the edited CDS and does not project the gap back
+                // into canonical protein coordinates.
+                cds_start: 117,
+                cds_end: 122,
+                protein_start: 39,
+                protein_end: 41,
                 edited_insertion_gap: false,
             })
         );
     }
 
     #[test]
-    fn nm_015120_no_mapper_shifted_insertion_matches_vep_equal_window() {
+    fn insertion_mapper_provenance_requires_a_mapped_or_reconstructed_flank() {
+        let mut transcript = tx(
+            "NM_STATUS_ONLY.1",
+            "1",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_non_polya_rna_edit = true;
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(1001);
+        let exons = vec![exon(&transcript.transcript_id, 1, 1000, 2000)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let insertion = vep_coords::VepSpan::from_variant(&var("1", 1200, 1200, "-", "A"));
+
+        assert!(!shifted_insertion_mapper_used_for_index(
+            &transcript,
+            &exons_ref,
+            insertion,
+        ));
+
+        // Hydrated inferred edits have no cached mapper segments, but their
+        // reconstructed flank coordinates already include the edit offset.
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 100,
+            end: 99,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        assert!(shifted_insertion_mapper_used_for_index(
+            &transcript,
+            &exons_ref,
+            insertion,
+        ));
+    }
+
+    #[test]
+    fn nm_015120_mapper_gap_insertion_matches_vep_coordinates() {
         let five_prime_utr = "AGGCGGGCGGCACTGCGCCTAAGCTGGGCCACAACCGCCAGTCAGGGCTCTCCCCTTCCCCTCCCTCCCCCCCTCCTCCTCCTCCTCTGCCGCCCAGAGCGAGACACCAAC";
         let edited_cds = "ATGGAGCCCGAGGATCTGCCATGGCCGGGCGAGCTGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAAGAGGAGGAGGCTGCAGCGGCGGCGGCGGCGAACGTGGACGACGTAGTGGTCGTGGAGGAGGTGGAGGAAGAGGCGGGGCGGGAGTTGGACTCCGACTCTCACTACGGGCCCCAGCATCTGGAAAGTATAGACGACGAGGAGGACGAGGAGGCCAAGGCCTGG";
         let canonical_cds = "ATGGAGCCCGAGGATCTGCCATGGCCGGGCGAGCTGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAAGAGGAGGAGGCTGCAGCGGCGGCGGCGGCGAACGTGGACGACGTAGTGGTCGTGGAGGAGGTGGAGGAAGAGGCGGGGCGGGAGTTGGACTCCGACTCTCACTACGGGCCCCAGCATCTGGAAAGTATAGACGACGAGGAGGACGAGGAGGCCAAGGCCTGGCTG";
@@ -13306,6 +13710,97 @@ mod tests {
         );
 
         assert_eq!(formatted.as_deref(), Some("NP_055935.4:p.GluGlu25="));
+
+        // A genomic insertion immediately before the transcript's 3 bp RNA
+        // edit is mapped by VEP into the edited CDS after that mapper gap.
+        // Keep the exact edited mapper shape from the cached NM_015120.4 row
+        // so this probe guards the frameshift HGVSp at the same boundary.
+        // These bases and cached peptide are taken from the merged ALMS1
+        // translation row. Keeping the nucleotide and peptide references
+        // consistent makes the RNA-edit gap probe exercise the actual
+        // edited-CDS replay used by VEP.
+        let boundary_edited_cds = "ATGGAGCCCGAGGATCTGCCATGGCCGGGCGAGCTGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAAGAGGAGGAGGCTGCAGCGGCGGCGGCGGCGAACGTGGACGACGTAGTG";
+        let boundary_canonical_cds = "ATGGAGCCCGAGGATCTGCCATGGCCGGGCGAGCTGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAAGAGGAGGAGGCTGCAGCGGCGGCGGCGGCGAACGTGGACGACGTAGTGGTC";
+        let boundary_edited_translation = "MEPEDLPWPGELEEEEEEEEEEEEEEEEEAAAAAAANVDDVV";
+        let boundary_canonical_translation = "MEPEDLPWPGELEEEEEEEEEEEEEEEEAAAAAAANVDDVVV";
+        let mut boundary_transcript = transcript.clone();
+        boundary_transcript.translateable_seq = Some(boundary_edited_cds.to_string());
+        let mut boundary_translation = translation.clone();
+        boundary_translation.cds_len = Some(boundary_edited_cds.len());
+        boundary_translation.protein_len = Some(boundary_edited_translation.len());
+        boundary_translation.translation_seq = Some(boundary_edited_translation.to_string());
+        boundary_translation.cds_sequence = Some(boundary_edited_cds.to_string());
+        boundary_translation.stable_id = Some("NP_055935.4".to_string());
+        boundary_translation.translation_seq_canonical =
+            Some(boundary_canonical_translation.to_string());
+        boundary_translation.cds_sequence_canonical = Some(boundary_canonical_cds.to_string());
+        boundary_transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 73_385_758,
+                genomic_end: 73_385_942,
+                cdna_start: 1,
+                cdna_end: 185,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 73_385_943,
+                genomic_end: 73_386_108,
+                cdna_start: 189,
+                cdna_end: 354,
+                ori: 1,
+            },
+        ];
+        let boundary_variant =
+            VariantInput::from_vcf("2".into(), 73_385_942, 73_385_942, "A".into(), "AGG".into());
+        let boundary_mapper = crate::transcript_consequence::vep_coords::VepTxMapper::new(
+            &boundary_transcript,
+            &exons_ref,
+            Some(&boundary_translation),
+            crate::transcript_consequence::vep_coords::CdnaBaseMap::HgvspExact,
+        );
+        assert_eq!(
+            boundary_mapper
+                .cds(
+                    crate::transcript_consequence::vep_coords::VepSpan::from_variant(
+                        &boundary_variant,
+                    )
+                )
+                .both(),
+            Some((75, 77))
+        );
+        let boundary_class = classify_coding_change(
+            &boundary_transcript,
+            &exons_ref,
+            Some(&boundary_translation),
+            &boundary_variant,
+        )
+        .expect("boundary insertion classification");
+        assert_eq!(boundary_class.cds_position_start, Some(75));
+        assert_eq!(boundary_class.cds_position_end, Some(77));
+        let boundary_protein = protein_hgvs_for_output(
+            &boundary_transcript,
+            &exons_ref,
+            Some(&boundary_translation),
+            &boundary_variant,
+            true,
+            boundary_class.protein_position_start.zip(
+                boundary_class
+                    .protein_position_end
+                    .or(boundary_class.protein_position_start),
+            ),
+            boundary_class.protein_hgvs.as_ref(),
+            true,
+        )
+        .expect("boundary insertion protein HGVS");
+        assert_eq!(
+            crate::hgvs::format_hgvsp(
+                &translation_for_hgvsp(&boundary_transcript, &boundary_translation),
+                &boundary_protein,
+                true,
+            )
+            .as_deref(),
+            Some("NP_055935.4:p.Glu27ArgfsTer15")
+        );
 
         // Legacy caches can retain the actual mapper and RNA-edit flag while
         // omitting the optional parsed edit list. The gap still exists.
@@ -17065,7 +17560,8 @@ mod tests {
     }
 
     fn tx_mapper_absent_with_refseq_edit() -> TranscriptFeature {
-        // No mapper segments cached → exon geometry path, offset applied.
+        // No mapper segments cached; a leading 5' UTR edit must not shift CDS
+        // output coordinates even though the exon-geometry path is used.
         let mut t = tx(
             "NM_ABSENT.1",
             "1",
@@ -17078,6 +17574,7 @@ mod tests {
         );
         t.source = Some("RefSeq".to_string());
         t.cdna_coding_start = Some(112);
+        t.cdna_coding_end = Some(900);
         t.refseq_edits = vec![RefSeqEdit {
             start: 1,
             end: 0,
@@ -17196,10 +17693,21 @@ mod tests {
             adjust_refseq_cds_output_position(&rejected, 300, 0),
             Some(303)
         );
-        // (C) mapper absent → +7 offset applied
+        // (C) mapper absent, but the edit is in the 5' UTR → no CDS offset.
         assert_eq!(
             adjust_refseq_cds_output_position(&absent, 300, 0),
-            Some(307)
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn hgvsp_index_applies_offset_when_bam_edit_mapper_is_rejected() {
+        let mut rejected = tx_mapper_rejected_adjacent_cdna_gap();
+        rejected.bam_edit_status = Some("ok".to_string());
+
+        assert_eq!(
+            adjust_refseq_cds_sequence_index_for_hgvsp_reference(&rejected, None, 300, 0, false),
+            Some(303)
         );
     }
 
@@ -17783,6 +18291,79 @@ mod tests {
     }
 
     #[test]
+    fn adjust_refseq_cds_output_position_applies_upstream_edit_after_mapper_fallback() {
+        let mut t = tx(
+            "NM_001405672.2",
+            "1",
+            1,
+            10_000,
+            1,
+            "protein_coding",
+            Some(1),
+            Some(10_000),
+        );
+        t.cdna_coding_start = Some(1934);
+        t.cdna_coding_end = Some(6313);
+        t.bam_edit_status = Some("ok".to_string());
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 109,
+                cdna_start: 1,
+                cdna_end: 10,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 110,
+                genomic_end: 119,
+                cdna_start: 15,
+                cdna_end: 24,
+                ori: 1,
+            },
+        ];
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 933,
+            end: 932,
+            replacement_len: Some(4),
+            skip_refseq_offset: false,
+        }];
+
+        // A cDNA-discontinuous mapper is rejected, so this coordinate starts
+        // in unedited exon geometry. The +4 5' UTR edit still shifts that
+        // geometry into the edited cDNA/CDS coordinates used by VEP.
+        assert!(!use_cdna_mapper_for_general_coords(&t));
+        assert_eq!(adjust_refseq_cds_output_position(&t, 2667, 0), Some(2671));
+    }
+
+    #[test]
+    fn adjust_refseq_cds_output_position_keeps_leading_bam_edit_in_cds_space() {
+        let mut t = tx(
+            "NM_012234.7",
+            "3",
+            72_374_597,
+            72_446_623,
+            -1,
+            "protein_coding",
+            Some(72_378_172),
+            Some(72_446_623),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(870);
+        t.bam_edit_status = Some("ok".to_string());
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 1,
+            end: 0,
+            replacement_len: Some(213),
+            skip_refseq_offset: false,
+        }];
+
+        // The leading insertion has no genomic mapper segment, but successful
+        // BAM editing includes it in the translated sequence and all later
+        // CDS coordinates.
+        assert_eq!(adjust_refseq_cds_output_position(&t, 405, 0), Some(618));
+    }
+
+    #[test]
     fn transcript_consequence_uses_edited_refseq_reference_for_output_and_coding() {
         let mut t = tx(
             "NM_EDIT.1",
@@ -17880,6 +18461,157 @@ mod tests {
         assert_eq!(c.cds_position_end, Some(7));
         assert_eq!(c.protein_position_start, Some(3));
         assert_eq!(c.protein_position_end, Some(3));
+    }
+
+    #[test]
+    fn test_refseq_bam_edit_hgvsp_uses_edited_cds_when_ok() {
+        let mut t = tx(
+            "NM_EDIT_MAPPER.1",
+            "1",
+            100,
+            111,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(111),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(13);
+        t.bam_edit_status = Some("ok".to_string());
+        t.has_non_polya_rna_edit = true;
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 4,
+            end: 3,
+            replacement_len: Some(1),
+            skip_refseq_offset: false,
+        }];
+        t.spliced_seq = Some("ATGCAAACCCATA".to_string());
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 102,
+                cdna_start: 1,
+                cdna_end: 3,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 103,
+                genomic_end: 111,
+                cdna_start: 5,
+                cdna_end: 13,
+                ori: 1,
+            },
+        ];
+        let exons = [exon("NM_EDIT_MAPPER.1", 1, 100, 111)];
+        let exons_ref = [&exons[0]];
+        let tr = TranslationFeature {
+            transcript_id: "NM_EDIT_MAPPER.1".to_string(),
+            cds_len: Some(13),
+            protein_len: Some(4),
+            translation_seq: Some("MQTH".to_string()),
+            cds_sequence: Some("ATGCAAACCCATA".to_string()),
+            translation_seq_canonical: Some("MKPI".to_string()),
+            cds_sequence_canonical: Some("ATGAAACCCATA".to_string()),
+            stable_id: Some("NP_EDIT_MAPPER.1".to_string()),
+            version: None,
+            protein_features: Vec::new(),
+        };
+        let variant = var("1", 106, 106, "C", "A");
+
+        let class = classify_coding_change(&t, &exons_ref, Some(&tr), &variant)
+            .expect("edited RefSeq coding classification");
+        let protein = class.protein_hgvs.as_ref().expect("HGVSp payload");
+
+        assert_eq!(protein.ref_translation, "MQTH");
+        assert_eq!(protein.start, 3);
+        // This position comes from the edit-aware mapper. Do not subtract the
+        // canonical insertion offset a second time before peptide formatting.
+        assert_eq!(
+            adjust_refseq_cds_sequence_index_for_hgvsp_reference(&t, Some(&tr), 7, 0, true),
+            Some(7)
+        );
+
+        // An edit wholly in the UTR does not displace a CDS coordinate.
+        let mut utr_edit_tx = t.clone();
+        utr_edit_tx.refseq_edits = vec![RefSeqEdit {
+            start: 14,
+            end: 13,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        assert_eq!(
+            adjust_refseq_cds_sequence_index_for_hgvsp_reference(
+                &utr_edit_tx,
+                Some(&tr),
+                7,
+                0,
+                true
+            ),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn refseq_bam_edit_alternate_cds_does_not_double_apply_mapper_offset() {
+        let tx_id = "NM_EDIT_MAPPER_OFFSET.1";
+        let mut t = tx(
+            tx_id,
+            "1",
+            100,
+            111,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(111),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(11);
+        t.bam_edit_status = Some("ok".to_string());
+        t.has_non_polya_rna_edit = true;
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 4,
+            end: 4,
+            replacement_len: None,
+            skip_refseq_offset: false,
+        }];
+        t.spliced_seq = Some("ATGAACCTGGA".to_string());
+        t.three_prime_utr_seq = Some("GCT".to_string());
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 102,
+                cdna_start: 1,
+                cdna_end: 3,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 104,
+                genomic_end: 111,
+                cdna_start: 4,
+                cdna_end: 11,
+                ori: 1,
+            },
+        ];
+        let exons = [exon(tx_id, 1, 100, 111)];
+        let exons_ref = [&exons[0]];
+        let tr = TranslationFeature {
+            transcript_id: tx_id.to_string(),
+            cds_len: Some(11),
+            protein_len: Some(3),
+            translation_seq: Some("MNL".to_string()),
+            cds_sequence: Some("ATGAACCTGGA".to_string()),
+            translation_seq_canonical: Some("MKPG".to_string()),
+            cds_sequence_canonical: Some("ATGAAACCTGGA".to_string()),
+            stable_id: Some("NP_EDIT_MAPPER_OFFSET.1".to_string()),
+            version: None,
+            protein_features: Vec::new(),
+        };
+        let insertion = var("1", 106, 106, "C", "CA");
+
+        assert_eq!(
+            alternate_translation_for_vep_hgvs(&t, &exons_ref, &tr, &insertion).as_deref(),
+            Some("MNTGA")
+        );
     }
 
     #[test]
@@ -19663,6 +20395,19 @@ mod tests {
     }
 
     #[test]
+    fn standard_boundary_insertion_keeps_stop_predicate_on_left_codon() {
+        // A one-base insertion after a complete codon must use the left
+        // affected codon for consequence predicates. This mirrors BRCA1
+        // NM_007294.4:c.3759dup, whose golden terms are frameshift_variant
+        // without stop_gained even though the shifted next codon is a stop.
+        let cds = "ATGAAATCTAAGGCTTGA";
+        let class = classify_ins(cds, 1009, "T").expect("boundary insertion");
+
+        assert!(!class.stop_gained);
+        assert_eq!(class.amino_acids.as_deref(), Some("-/X"));
+    }
+
+    #[test]
     fn ppt_kept_intron_kept_with_splice_acceptor() {
         // PPT kept, intron_variant also kept when it was genuinely assigned.
         let mut terms = BTreeSet::new();
@@ -20143,7 +20888,18 @@ mod tests {
             affected_alt_peptide: Some("-".to_string()),
             ..CodingClassification::default()
         };
+        let transcript = tx(
+            "ENSTSTARTDEL",
+            "1",
+            1,
+            9,
+            1,
+            "protein_coding",
+            Some(1),
+            Some(9),
+        );
         let data = build_protein_hgvs_data(
+            &transcript,
             &class,
             Some("ME/E"),
             &['M', 'E', 'K'],
@@ -21296,6 +22052,34 @@ mod tests {
         assert_eq!(
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
             Some("ATGGAT")
+        );
+    }
+
+    #[test]
+    fn hgvsp_reference_sequence_uses_edited_cds_after_successful_bam_edit() {
+        let mut t = tx(
+            "NM_EDITED.1",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(112),
+        );
+        t.bam_edit_status = Some("ok".to_string());
+        let mut tr = translation(
+            "NM_EDITED.1",
+            Some(12),
+            Some(4),
+            Some("MQTH"),
+            Some("ATGCAAACCCATA"),
+        );
+        tr.cds_sequence_canonical = Some("ATGAAACCCATA".to_string());
+
+        assert_eq!(
+            reference_translateable_seq_for_hgvsp(&t, Some(&tr)).as_deref(),
+            Some("ATGCAAACCCATA")
         );
     }
 

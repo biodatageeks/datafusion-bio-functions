@@ -37,10 +37,10 @@ noodles-csi = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3
 noodles-tabix = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-bgzf = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
-# Pin the full formats master head. It includes formats#264/#266 (the vepyr#207
-# and formats#263 changes), formats master through abac8df (codon_table for the
-# MT codon-table fix #274), and formats#270's transcript gene bounds. The formats
-# release is postponed, so every formats crate uses this same full rev.
+# Pin all formats crates to the same full master rev. It includes the merged
+# RefSeq CDS-bound fix (#267), transcript SeqEdits column (#269), Character INFO
+# materialization (#266), percent-encoded VCF values (#264), MT codon_table
+# support (#262), and gene bounds (#270). The formats release is postponed.
 # Every formats crate in this workspace, the pileup crate's included, has to name
 # the same tag or rev, or the lockfile resolves two copies of datafusion-bio-format-core.
 datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "6af1fa1480b2fc527e3b218585eae3a087f2aca9" }

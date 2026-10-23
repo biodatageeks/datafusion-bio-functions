@@ -1007,6 +1007,7 @@ mod tests {
                 Some(translation),
                 raw_cds_start.checked_sub(1)?,
                 leading_n_offset,
+                false,
             )
             .and_then(|idx| idx.checked_add(1))
             .unwrap_or(raw_cds_start)
@@ -1019,6 +1020,7 @@ mod tests {
                 Some(translation),
                 raw_cds_end.checked_sub(1)?,
                 leading_n_offset,
+                false,
             )
             .and_then(|idx| idx.checked_add(1))
             .unwrap_or(raw_cds_end)
@@ -1031,6 +1033,7 @@ mod tests {
                 Some(translation),
                 raw_idx,
                 leading_n_offset,
+                false,
             )
             .and_then(|idx| idx.checked_add(1))
         };
