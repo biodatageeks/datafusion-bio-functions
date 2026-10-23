@@ -5187,7 +5187,7 @@ fn apply_vep116_primary_indel_predicates(
         resolved_class.start_lost = false;
         let inframe_child = vep116_inframe_insertion(&resolved_class)
             || vep116_inframe_deletion(&resolved_class, partial_terminal_codon);
-        if inframe_child && !vep116_start_lost_from_peptide_alleles(&resolved_class) {
+        if inframe_child && vep116_start_lost_from_peptide_alleles(&resolved_class) == Some(false) {
             terms.remove(&SoTerm::StartLost);
             resolved_start_lost = true;
         } else {
@@ -5346,19 +5346,23 @@ fn vep116_inframe_deletion(class: &CodingClassification, partial_codon: bool) ->
 }
 
 /// Ensembl Variation 116's final peptide check in `start_lost()`.
-fn vep116_start_lost_from_peptide_alleles(class: &CodingClassification) -> bool {
+///
+/// `None` means the peptide check cannot decide. Keep the provisional result
+/// in that case; the source predicate can return earlier through its
+/// nucleotide-level start-altered path, which the codon classifier preserves.
+fn vep116_start_lost_from_peptide_alleles(class: &CodingClassification) -> Option<bool> {
     let (Some(ref_peptide), Some(alt_peptide)) = (
         class.affected_ref_peptide.as_deref(),
         class.affected_alt_peptide.as_deref(),
     ) else {
-        return false;
+        return None;
     };
     let ref_peptide = if ref_peptide == "-" { "" } else { ref_peptide };
     let alt_peptide = if alt_peptide == "-" { "" } else { alt_peptide };
     if ref_peptide.is_empty() || alt_peptide.is_empty() || alt_peptide == "X" {
-        return false;
+        return None;
     }
-    !alt_peptide.starts_with(ref_peptide) && !alt_peptide.ends_with(ref_peptide)
+    Some(!alt_peptide.starts_with(ref_peptide) && !alt_peptide.ends_with(ref_peptide))
 }
 
 /// Ensembl Variation 116 `protein_altering_variant()` predicate.
@@ -11828,12 +11832,35 @@ mod tests {
     }
 
     #[test]
-    fn vep116_start_lost_yields_to_valid_inframe_deletion() {
+    fn vep116_start_lost_keeps_empty_peptide_inframe_deletion() {
         let mut class = CodingClassification {
             start_lost: true,
             codons: Some("ATG/-".to_string()),
             affected_ref_peptide: Some("M".to_string()),
             affected_alt_peptide: Some("-".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::StartLost, SoTerm::InframeDeletion]);
+
+        apply_vep116_primary_indel_predicates_to_class(
+            &mut terms,
+            &mut class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+
+        assert!(class.start_lost);
+        assert!(terms.contains(&SoTerm::StartLost));
+        assert!(terms.contains(&SoTerm::InframeDeletion));
+    }
+
+    #[test]
+    fn vep116_start_lost_yields_to_inframe_deletion_when_peptide_is_retained() {
+        let mut class = CodingClassification {
+            start_lost: true,
+            codons: Some("ATGATG/ATG".to_string()),
+            affected_ref_peptide: Some("M".to_string()),
+            affected_alt_peptide: Some("M".to_string()),
             ..Default::default()
         };
         let mut terms = BTreeSet::from([SoTerm::StartLost, SoTerm::InframeDeletion]);
