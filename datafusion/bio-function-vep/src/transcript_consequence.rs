@@ -4748,27 +4748,35 @@ fn vep_partial_terminal_codon(
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
 ) -> bool {
-    let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
-    let phase = translateable_seq
-        .as_deref()
-        .map(|sequence| sequence.bytes().take_while(|&base| base == b'N').count())
-        .unwrap_or(0);
-    let cds_len = translateable_seq
-        .as_ref()
-        .map(|sequence| sequence.len())
-        .or_else(|| tx_translation.and_then(|translation| translation.cds_len))
-        .or_else(|| {
-            coding_segments(tx, tx_exons).map(|segments| {
-                segments
-                    .iter()
-                    .map(|(start, end)| usize::try_from(end - start + 1).unwrap_or(0))
-                    .sum()
-            })
-        });
-    let Some(cds_len) = cds_len else {
+    let Some((phase, cds_len)) =
+        reference_translateable_cds_metrics_for_vep(tx, tx_exons, tx_translation)
+    else {
         return false;
     };
 
+    vep_partial_terminal_codon_with_metrics(tx, tx_exons, phase, cds_len, variant)
+}
+
+fn vep_partial_terminal_codon_for_cds(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    cds_seq: &str,
+    variant: &VariantInput,
+) -> bool {
+    let phase = cds_seq
+        .bytes()
+        .take_while(|&base| base == b'N' || base == b'n')
+        .count();
+    vep_partial_terminal_codon_with_metrics(tx, tx_exons, phase, cds_seq.len(), variant)
+}
+
+fn vep_partial_terminal_codon_with_metrics(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    phase: usize,
+    cds_len: usize,
+    variant: &VariantInput,
+) -> bool {
     let mapper =
         vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, phase);
     let Some(translation_start) = mapper
@@ -5534,14 +5542,20 @@ fn vep116_coding_unknown(
     }
 
     let peptide_unknown = classification.is_none_or(|classification| {
-        classification
-            .affected_alt_peptide
-            .as_deref()
-            .is_none_or(|peptide| peptide.is_empty() || peptide.contains('X'))
+        let Some(alt_peptide) = classification.affected_alt_peptide.as_deref() else {
+            return true;
+        };
+        // `_get_peptide_alleles()` first requires both peptide values, then
+        // normalizes the valid insertion reference `-` to `""`. VEP's
+        // `coding_unknown()` tests the alternate peptide for presence and X,
+        // and the reference peptide for X; the empty reference allele by
+        // itself is not missing peptide data.
+        alt_peptide.is_empty()
+            || alt_peptide.contains('X')
             || classification
                 .affected_ref_peptide
                 .as_deref()
-                .is_none_or(|peptide| peptide.is_empty() || peptide.contains('X'))
+                .is_none_or(|peptide| peptide.contains('X'))
     });
     if !peptide_unknown {
         return false;
@@ -5813,6 +5827,71 @@ fn cached_translateable_seq_for_vep(
         .as_deref()
         .or_else(|| translation.and_then(|t| t.cds_sequence.as_deref()))
         .map(|seq| seq.to_ascii_uppercase())
+}
+
+fn transcript_mrna_seq_for_vep_borrowed(tx: &TranscriptFeature) -> Option<&str> {
+    if let Some(seq) = tx.spliced_seq.as_deref() {
+        return Some(seq);
+    }
+    let seq = tx.cdna_seq.as_deref()?;
+    cdna_seq_has_full_transcript_context_for_vep(tx, seq).then_some(seq)
+}
+
+/// Return the phase and length of the same reference CDS selected by
+/// `reference_translateable_seq_for_vep`, without cloning or uppercasing the
+/// full sequence. `partial_codon()` only consumes these two scalar values.
+fn reference_translateable_cds_metrics_for_vep(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    translation: Option<&TranslationFeature>,
+) -> Option<(usize, usize)> {
+    let leading_n_count = |sequence: &str| {
+        sequence
+            .bytes()
+            .take_while(|&base| base == b'N' || base == b'n')
+            .count()
+    };
+
+    if let Some(sequence) = tx.translateable_seq.as_deref() {
+        return Some((leading_n_count(sequence), sequence.len()));
+    }
+
+    let cached_sequence = translation.and_then(|translation| translation.cds_sequence.as_deref());
+    let cached_phase = cached_sequence.map(leading_n_count).unwrap_or(0);
+    if let (Some(sequence), Some(start), Some(end)) = (
+        transcript_mrna_seq_for_vep_borrowed(tx),
+        tx.cdna_coding_start,
+        tx.cdna_coding_end,
+    ) {
+        if let Some(start_idx) = start.checked_sub(1) {
+            if start_idx < end && end <= sequence.len() {
+                let coding_slice = &sequence[start_idx..end];
+                let slice_phase = leading_n_count(coding_slice);
+                let prefix_n_count = cached_phase.saturating_sub(slice_phase);
+                return Some((
+                    prefix_n_count + slice_phase,
+                    prefix_n_count + coding_slice.len(),
+                ));
+            }
+        }
+    }
+
+    if let Some(sequence) = cached_sequence {
+        return Some((cached_phase, sequence.len()));
+    }
+
+    translation
+        .and_then(|translation| translation.cds_len)
+        .map(|cds_len| (0, cds_len))
+        .or_else(|| {
+            coding_segments(tx, tx_exons).map(|segments| {
+                let cds_len = segments
+                    .iter()
+                    .map(|(start, end)| usize::try_from(end - start + 1).unwrap_or(0))
+                    .sum();
+                (0, cds_len)
+            })
+        })
 }
 
 fn cdna_seq_has_full_transcript_context_for_vep(tx: &TranscriptFeature, seq: &str) -> bool {
@@ -8192,7 +8271,7 @@ fn classify_coding_change_with_semantics(
             .map(|peptide| peptide.iter().collect());
     }
     let partial_terminal_codon = semantics.vep116_stop_predicates()
-        && vep_partial_terminal_codon(tx, tx_exons, Some(translation), variant);
+        && vep_partial_terminal_codon_for_cds(tx, tx_exons, &cds_seq, variant);
 
     // Per-codon stop analysis.
     //
@@ -9043,7 +9122,7 @@ fn classify_insertion_with_semantics_and_gap(
     let last_codon_len = cds_seq.len().saturating_sub(partial_codon_start);
     let partial_terminal_codon = last_codon_len > 0 && last_codon_len < 3;
     let partial_terminal_codon_v116 = semantics.vep116_stop_predicates()
-        && vep_partial_terminal_codon(tx, tx_exons, tx_translation, variant);
+        && vep_partial_terminal_codon_for_cds(tx, tx_exons, cds_seq, variant);
 
     // stop_retained: VEP's ref_eq_alt_sequence (VariationEffect.pm L1320-1355)
     if !class.stop_retained && codon_at < old_aas.len() {
@@ -20467,6 +20546,28 @@ mod tests {
     }
 
     #[test]
+    fn coding_unknown_does_not_treat_empty_insertion_reference_as_missing_peptide() {
+        // VEP's _get_peptide_alleles() normalizes the valid insertion allele
+        // `-` to an empty peptide after confirming both peptide alleles exist.
+        // `coding_unknown()` then checks the alternate peptide and X content;
+        // an empty reference peptide alone is not an unknown peptide. These
+        // three partial-CDS ClinVar insertions all have this shape.
+        let terms = BTreeSet::from([SoTerm::CodingSequenceVariant, SoTerm::InframeInsertion]);
+        for (clinvar_id, alternate_peptide) in [(2180991, "SSGGG"), (3910969, "AA"), (3910970, "A")]
+        {
+            let classification = CodingClassification {
+                affected_ref_peptide: Some(String::new()),
+                affected_alt_peptide: Some(alternate_peptide.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                !vep116_coding_unknown(&terms, Some(&classification), true, false),
+                "ClinVar {clinvar_id}: a known insertion peptide must not add coding_sequence_variant"
+            );
+        }
+    }
+
+    #[test]
     fn coding_unknown_keeps_csv_for_synonymous_term_when_peptide_is_missing() {
         let terms = BTreeSet::from([SoTerm::CodingSequenceVariant, SoTerm::SynonymousVariant]);
         assert!(vep116_coding_unknown(&terms, None, true, false));
@@ -22152,6 +22253,19 @@ mod tests {
         assert_eq!(three_prime_utr_seq(&t), None);
     }
 
+    fn assert_translateable_cds_metrics_match_reference(
+        transcript: &TranscriptFeature,
+        translation: Option<&TranslationFeature>,
+    ) {
+        let sequence = reference_translateable_seq_for_vep(transcript, translation)
+            .expect("fixture provides a translateable sequence");
+        let expected_phase = sequence.bytes().take_while(|&base| base == b'N').count();
+        assert_eq!(
+            reference_translateable_cds_metrics_for_vep(transcript, &[], translation),
+            Some((expected_phase, sequence.len()))
+        );
+    }
+
     #[test]
     fn reference_translateable_seq_for_vep_prefers_transcript_coding_slice() {
         let mut t = tx(
@@ -22174,6 +22288,7 @@ mod tests {
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
             Some("NATGGCCCTT")
         );
+        assert_translateable_cds_metrics_match_reference(&t, Some(&tr));
     }
 
     #[test]
@@ -22198,6 +22313,7 @@ mod tests {
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
             Some("NATGGCCA")
         );
+        assert_translateable_cds_metrics_match_reference(&t, Some(&tr));
     }
 
     #[test]
@@ -22222,6 +22338,7 @@ mod tests {
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
             Some("NCCCCCCCCCC")
         );
+        assert_translateable_cds_metrics_match_reference(&t, Some(&tr));
     }
 
     #[test]
@@ -22246,6 +22363,7 @@ mod tests {
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
             Some("ATGTGA")
         );
+        assert_translateable_cds_metrics_match_reference(&t, Some(&tr));
     }
 
     #[test]
@@ -22271,6 +22389,7 @@ mod tests {
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
             Some("ATGGA")
         );
+        assert_translateable_cds_metrics_match_reference(&t, Some(&tr));
     }
 
     #[test]
@@ -22289,14 +22408,15 @@ mod tests {
         t.cdna_coding_end = Some(5);
         t.spliced_seq = Some("ATGGATTTTCCC".into());
         t.three_prime_utr_seq = Some("TTTCCC".into());
-        t.translateable_seq = Some("ATGGAT".into());
+        t.translateable_seq = Some("nATGgT".into());
 
         let tr = translation("ENST0001", Some(6), Some(2), None, Some("CCCCCC"));
 
         assert_eq!(
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
-            Some("ATGGAT")
+            Some("NATGGT")
         );
+        assert_translateable_cds_metrics_match_reference(&t, Some(&tr));
     }
 
     #[test]
