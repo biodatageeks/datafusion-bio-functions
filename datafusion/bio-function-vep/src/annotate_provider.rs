@@ -6964,7 +6964,10 @@ impl AnnotateProvider {
                 // annotate_vep API contract.
                 let collapse_pick_sort_started = engine_profile_enabled.then(Instant::now);
                 let mut all_terms =
-                    TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
+                    TranscriptConsequenceEngine::collapse_variant_terms_with_semantics(
+                        &assignments,
+                        engine.semantics(),
+                    );
                 if all_terms.is_empty() {
                     all_terms.push(SoTerm::SequenceVariant);
                 }
