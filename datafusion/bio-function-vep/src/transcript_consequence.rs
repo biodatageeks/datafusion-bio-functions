@@ -5723,6 +5723,21 @@ fn vep116_incomplete_terminal_hgvsp_alleles(
     ) else {
         return None;
     };
+    // This helper preserves the display X for partial terminal codons that
+    // still encode peptide. VEP 116 appends X only when its translated peptide
+    // is not exactly `*`, then its HGVSp formatter stops reporting alternate
+    // residues after Ter. Our local window can include residues past that
+    // stop, so do not feed its trailing X into HGVSp as an extra amino-acid
+    // change.
+    //
+    // Traceability:
+    // - Ensembl Variation 116 `TranscriptVariationAllele::peptide()`:
+    //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L774-L776
+    // - Ensembl Variation 116 `_get_hgvs_protein_format()`:
+    //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1958-L1962
+    if reference.contains('*') || alternate.contains('*') {
+        return None;
+    }
     // `local_codon_truncated` comes from the CDS remainder (one or two bases),
     // and the local peptide translator appends X for that incomplete codon.
     // Thus this suffix X records VEP's partial-codon rule even if an earlier
@@ -17101,6 +17116,29 @@ mod tests {
         assert!(
             formatted.is_none(),
             "VEP's non-frameshift insertion path needs a right peptide flank; this synthetic insertion is past the terminal partial codon"
+        );
+    }
+
+    #[test]
+    fn incomplete_terminal_hgvsp_does_not_extend_peptides_after_a_stop() {
+        // A partial terminal X can be useful in the local display window, but
+        // it must not turn a stop followed by that incomplete tail into a
+        // stop-retaining delins. VEP 116 only adds X to a peptide allele when
+        // its translated peptide is not the stop itself.
+        let class = CodingClassification {
+            affected_ref_peptide: Some("*X".to_string()),
+            affected_alt_peptide: Some("**X".to_string()),
+            ..CodingClassification::default()
+        };
+
+        assert_eq!(
+            vep116_incomplete_terminal_hgvsp_alleles(
+                &class,
+                crate::vep_semantics::VepSemantics::V116,
+                true,
+            ),
+            None,
+            "the partial-codon helper must not make an after-stop X look like an HGVSp change"
         );
     }
 
