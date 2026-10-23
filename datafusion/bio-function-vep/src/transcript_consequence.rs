@@ -3099,7 +3099,7 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::FrameshiftVariant);
             }
 
-            if let Some(classification) = classify_coding_change_with_semantics(
+            if let Some(mut classification) = classify_coding_change_with_semantics(
                 tx,
                 tx_exons,
                 tx_translation,
@@ -3116,9 +3116,9 @@ impl TranscriptConsequenceEngine {
                         terms.insert(SoTerm::InframeDeletion);
                     }
                 }
-                apply_vep116_primary_indel_predicates(
+                apply_vep116_primary_indel_predicates_to_class(
                     terms,
-                    &classification,
+                    &mut classification,
                     self.semantics,
                     partial_terminal_codon_v116,
                 );
@@ -5159,9 +5159,9 @@ fn apply_vep116_primary_indel_predicates(
     class: &CodingClassification,
     semantics: crate::vep_semantics::VepSemantics,
     partial_terminal_codon: bool,
-) {
+) -> bool {
     if !semantics.vep116_stop_predicates() {
-        return;
+        return false;
     }
     let ref_peptide = class.affected_ref_peptide.as_deref();
     let alt_peptide = class.affected_alt_peptide.as_deref();
@@ -5178,15 +5178,18 @@ fn apply_vep116_primary_indel_predicates(
 
     let frameshift = terms.contains(&SoTerm::FrameshiftVariant);
     let mut resolved_class = class.clone();
+    let mut resolved_start_lost = false;
     if !frameshift && resolved_class.start_lost {
-        // Ensembl's start_lost and inframe_insertion predicates recurse. The
-        // start_lost predicate starts from false, asks inframe_insertion, and
-        // only emits start_lost when that child does not apply. Re-evaluate
-        // the insertion with that provisional flag cleared, then keep the
-        // original start_lost result if the insertion predicate still fails.
+        // Ensembl's start_lost predicate asks both inframe predicates while
+        // its cached result is still false, then checks whether the reference
+        // peptide remains at either end of the alternate peptide. Mirror both
+        // steps before keeping the provisional start_lost result.
         resolved_class.start_lost = false;
-        if vep116_inframe_insertion(&resolved_class) {
+        let inframe_child = vep116_inframe_insertion(&resolved_class)
+            || vep116_inframe_deletion(&resolved_class, partial_terminal_codon);
+        if inframe_child && !vep116_start_lost_from_peptide_alleles(&resolved_class) {
             terms.remove(&SoTerm::StartLost);
+            resolved_start_lost = true;
         } else {
             resolved_class.start_lost = true;
         }
@@ -5213,6 +5216,21 @@ fn apply_vep116_primary_indel_predicates(
     }
     if ref_peptide == Some("*") {
         terms.remove(&SoTerm::InframeDeletion);
+    }
+    resolved_start_lost
+}
+
+fn apply_vep116_primary_indel_predicates_to_class(
+    terms: &mut BTreeSet<SoTerm>,
+    class: &mut CodingClassification,
+    semantics: crate::vep_semantics::VepSemantics,
+    partial_terminal_codon: bool,
+) {
+    if apply_vep116_primary_indel_predicates(terms, class, semantics, partial_terminal_codon) {
+        // Keep the classification that flows into PAV and HGVS in sync with
+        // the resolved consequence terms; otherwise later predicates can
+        // observe the provisional start_lost value.
+        class.start_lost = false;
     }
 }
 
@@ -5325,6 +5343,22 @@ fn vep116_inframe_deletion(class: &CodingClassification, partial_codon: bool) ->
     let ref_middle = &ref_codon[common_prefix..ref_middle_end];
     let alt_middle = &alt_codon[common_prefix..alt_middle_end];
     alt_middle.is_empty() && ref_middle.len().is_multiple_of(3)
+}
+
+/// Ensembl Variation 116's final peptide check in `start_lost()`.
+fn vep116_start_lost_from_peptide_alleles(class: &CodingClassification) -> bool {
+    let (Some(ref_peptide), Some(alt_peptide)) = (
+        class.affected_ref_peptide.as_deref(),
+        class.affected_alt_peptide.as_deref(),
+    ) else {
+        return false;
+    };
+    let ref_peptide = if ref_peptide == "-" { "" } else { ref_peptide };
+    let alt_peptide = if alt_peptide == "-" { "" } else { alt_peptide };
+    if ref_peptide.is_empty() || alt_peptide.is_empty() || alt_peptide == "X" {
+        return false;
+    }
+    !alt_peptide.starts_with(ref_peptide) && !alt_peptide.ends_with(ref_peptide)
 }
 
 /// Ensembl Variation 116 `protein_altering_variant()` predicate.
@@ -11750,7 +11784,7 @@ mod tests {
     fn vep116_inframe_insertion_respects_start_retained_guard_after_start_lost() {
         // A preserved suffix with start_retained still vetoes the insertion,
         // so the provisional start_lost flag must remain in this case.
-        let class = CodingClassification {
+        let mut class = CodingClassification {
             start_lost: true,
             start_retained: true,
             codons: Some("atg/GCTATG".to_string()),
@@ -11759,19 +11793,20 @@ mod tests {
             ..Default::default()
         };
         let mut terms = BTreeSet::from([SoTerm::StartLost, SoTerm::InframeInsertion]);
-        apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates_to_class(
             &mut terms,
-            &class,
+            &mut class,
             crate::vep_semantics::VepSemantics::V116,
             false,
         );
+        assert!(class.start_lost);
         assert!(terms.contains(&SoTerm::StartLost));
         assert!(!terms.contains(&SoTerm::InframeInsertion));
     }
 
     #[test]
     fn vep116_start_lost_yields_to_valid_inframe_insertion() {
-        let class = CodingClassification {
+        let mut class = CodingClassification {
             start_lost: true,
             codons: Some("atg/GCTATG".to_string()),
             affected_ref_peptide: Some("M".to_string()),
@@ -11780,15 +11815,62 @@ mod tests {
         };
         let mut terms = BTreeSet::from([SoTerm::StartLost, SoTerm::InframeInsertion]);
 
-        apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates_to_class(
             &mut terms,
-            &class,
+            &mut class,
             crate::vep_semantics::VepSemantics::V116,
             false,
         );
 
+        assert!(!class.start_lost);
         assert!(!terms.contains(&SoTerm::StartLost));
         assert!(terms.contains(&SoTerm::InframeInsertion));
+    }
+
+    #[test]
+    fn vep116_start_lost_yields_to_valid_inframe_deletion() {
+        let mut class = CodingClassification {
+            start_lost: true,
+            codons: Some("ATG/-".to_string()),
+            affected_ref_peptide: Some("M".to_string()),
+            affected_alt_peptide: Some("-".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::StartLost, SoTerm::InframeDeletion]);
+
+        apply_vep116_primary_indel_predicates_to_class(
+            &mut terms,
+            &mut class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+
+        assert!(!class.start_lost);
+        assert!(!terms.contains(&SoTerm::StartLost));
+        assert!(terms.contains(&SoTerm::InframeDeletion));
+    }
+
+    #[test]
+    fn vep116_inframe_deletion_keeps_start_lost_when_peptide_check_fires() {
+        let mut class = CodingClassification {
+            start_lost: true,
+            codons: Some("ATG/-".to_string()),
+            affected_ref_peptide: Some("M".to_string()),
+            affected_alt_peptide: Some("A".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::StartLost, SoTerm::InframeDeletion]);
+
+        apply_vep116_primary_indel_predicates_to_class(
+            &mut terms,
+            &mut class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+
+        assert!(class.start_lost);
+        assert!(terms.contains(&SoTerm::StartLost));
+        assert!(terms.contains(&SoTerm::InframeDeletion));
     }
 
     #[test]
