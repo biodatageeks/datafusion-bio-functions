@@ -2271,8 +2271,13 @@ impl TranscriptConsequenceEngine {
             // `CodingSequenceVariant` is inserted only by `add_coding_terms`,
             // after the variant has been shown to overlap the CDS. Therefore
             // this VEP `coding_unknown()` call is always within the CDS.
-            let coding_unknown =
-                vep116_coding_unknown(&terms, coding_class.as_ref(), true, complete_overlap);
+            let coding_unknown = vep116_coding_unknown_with_table(
+                &terms,
+                coding_class.as_ref(),
+                tx.codon_table,
+                true,
+                complete_overlap,
+            );
             if !coding_unknown {
                 terms.remove(&SoTerm::CodingSequenceVariant);
             }
@@ -5537,11 +5542,31 @@ fn vep116_coding_unknown(
     within_cds: bool,
     complete_overlap: bool,
 ) -> bool {
+    vep116_coding_unknown_with_table(
+        terms,
+        classification,
+        CodonTable::Standard,
+        within_cds,
+        complete_overlap,
+    )
+}
+
+fn vep116_coding_unknown_with_table(
+    terms: &BTreeSet<SoTerm>,
+    classification: Option<&CodingClassification>,
+    codon_table: CodonTable,
+    within_cds: bool,
+    complete_overlap: bool,
+) -> bool {
     if !within_cds || complete_overlap {
         return false;
     }
 
     let peptide_unknown = classification.is_none_or(|classification| {
+        let codon_peptide_alleles = classification
+            .codons
+            .as_deref()
+            .and_then(|codons| pep_allele_string_from_codon_allele_string_in(codon_table, codons));
         let peptide_alleles = classification
             .affected_ref_peptide
             .as_deref()
@@ -5553,6 +5578,14 @@ fn vep116_coding_unknown(
                 // _get_peptide_alleles() use that pair for coding_unknown.
                 classification
                     .amino_acids
+                    .as_deref()
+                    .and_then(|alleles| alleles.split_once('/'))
+            })
+            .or_else(|| {
+                // A boundary insertion's OutputFactory `Amino_acids` is
+                // derived from `Codons`; translate that same pair when the
+                // direct peptide window and amino-acid cache are unavailable.
+                codon_peptide_alleles
                     .as_deref()
                     .and_then(|alleles| alleles.split_once('/'))
             });
@@ -20577,17 +20610,19 @@ mod tests {
     }
 
     #[test]
-    fn coding_unknown_uses_available_partial_cds_amino_acids_when_predicate_peptides_are_missing() {
-        // Boundary insertions can have an OutputFactory Amino_acids value
-        // even when the local peptide window used by the general classifier
-        // is unavailable. VEP's `peptide()`/`_get_peptide_alleles()` still
-        // see the known insertion peptide in this case, so coding_unknown
-        // must not add coding_sequence_variant.
+    fn coding_unknown_uses_codon_alleles_when_partial_peptide_window_is_missing() {
+        // Boundary insertions can have OutputFactory Codons even when the
+        // local peptide window used by the general classifier is unavailable.
+        // The output amino-acid pair is translated from those codons, and VEP's
+        // peptide()/_get_peptide_alleles() still see a known insertion peptide.
         let terms = BTreeSet::from([SoTerm::CodingSequenceVariant, SoTerm::InframeInsertion]);
-        for (clinvar_id, amino_acids) in [(2180991, "-/SSGGG"), (3910969, "-/AA"), (3910970, "-/A")]
-        {
+        for (clinvar_id, codons) in [
+            (2180991, "-/AGCAGCGGCGGCGGC"),
+            (3910969, "-/GCGGCG"),
+            (3910970, "-/GCG"),
+        ] {
             let classification = CodingClassification {
-                amino_acids: Some(amino_acids.to_string()),
+                codons: Some(codons.to_string()),
                 ..Default::default()
             };
             assert!(
