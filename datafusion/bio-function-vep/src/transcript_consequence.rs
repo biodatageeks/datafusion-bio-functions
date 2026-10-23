@@ -9035,7 +9035,14 @@ fn classify_insertion_with_semantics_and_gap(
         class.affected_alt_peptide =
             local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
     }
-    let partial_terminal_codon = semantics.vep116_stop_predicates()
+    // Keep the local sequence remainder for display shaping. Predicate vetoes
+    // use VEP's mapper-derived partial_codon result below; these can differ at
+    // insertion boundaries where the mapped translation start includes UTR
+    // padding.
+    let partial_codon_start = codon_at.saturating_mul(3);
+    let last_codon_len = cds_seq.len().saturating_sub(partial_codon_start);
+    let partial_terminal_codon = last_codon_len > 0 && last_codon_len < 3;
+    let partial_terminal_codon_v116 = semantics.vep116_stop_predicates()
         && vep_partial_terminal_codon(tx, tx_exons, tx_translation, variant);
 
     // stop_retained: VEP's ref_eq_alt_sequence (VariationEffect.pm L1320-1355)
@@ -9089,13 +9096,13 @@ fn classify_insertion_with_semantics_and_gap(
     apply_vep116_stop_predicate_flags(
         &mut class,
         semantics,
-        partial_terminal_codon,
+        partial_terminal_codon_v116,
         vep116_ref_eq_alt_sequence,
     );
     apply_vep116_nucleotide_stop_fallbacks(
         &mut class,
         semantics,
-        partial_terminal_codon,
+        partial_terminal_codon_v116,
         tx,
         tx_exons,
         tx_translation,
@@ -9108,8 +9115,12 @@ fn classify_insertion_with_semantics_and_gap(
     } else {
         !alt_len.abs_diff(mutation_ref_len).is_multiple_of(3)
     };
-    let frameshift =
-        frameshift_under_semantics(raw_frameshift, &class, semantics, partial_terminal_codon);
+    let frameshift = frameshift_under_semantics(
+        raw_frameshift,
+        &class,
+        semantics,
+        partial_terminal_codon_v116,
+    );
 
     // Amino acids
     let first_codon = codon_at;
@@ -9250,6 +9261,9 @@ fn classify_insertion_with_semantics_and_gap(
         .map(|seq| seq.chars().collect::<Vec<_>>())
         .unwrap_or_else(|| new_aas.clone());
     let hgvs_amino_acids = vep116_ambiguous_terminal_hgvsp_alleles(&class, semantics)
+        .or_else(|| {
+            vep116_incomplete_terminal_hgvsp_alleles(&class, semantics, partial_terminal_codon)
+        })
         .or_else(|| class.amino_acids.clone())
         .or_else(|| {
             class.codons.as_deref().and_then(|codons| {
@@ -17085,8 +17099,74 @@ mod tests {
             .as_ref()
             .and_then(|data| crate::hgvs::format_hgvsp(&translation, data, false));
         assert!(
-            formatted.is_some(),
-            "partial-codon insertion should format HGVSp"
+            formatted.is_none(),
+            "VEP's non-frameshift insertion path needs a right peptide flank; this synthetic insertion is past the terminal partial codon"
+        );
+    }
+
+    #[test]
+    fn r3_integration_keeps_partial_terminal_hgvsp_payload_after_frame_veto() {
+        // R3-B's full local window remains available for the legacy display
+        // path, even when VEP's 116 predicate state does not classify this
+        // legacy API call as a frameshift.
+        let display_cds = "ATGGAACT";
+        let mut display_tx = tx(
+            "T228",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1007),
+        );
+        display_tx.cdna_coding_end = Some(display_cds.len());
+        display_tx.translateable_seq = Some(display_cds.to_string());
+        display_tx.spliced_seq = Some("ATGGAACTG".to_string());
+        display_tx.three_prime_utr_seq = Some("G".to_string());
+        let display_exon = exon("T228", 1, 1000, 1008);
+        let display_exons = [&display_exon];
+        let display_translation = translation(
+            "T228",
+            Some(display_cds.len()),
+            Some(2),
+            Some("ME"),
+            Some(display_cds),
+        );
+        let display_variant = var("22", 1008, 1008, "-", "GACCCTGG");
+        let display_class = classify_insertion(
+            &display_tx,
+            &display_exons,
+            Some(&display_translation),
+            display_cds,
+            &display_variant,
+            "GACCCTGG",
+        )
+        .expect("terminal insertion should classify");
+        assert_eq!(display_class.amino_acids.as_deref(), Some("L/LTLX"));
+
+        // On the VEP 116 path, frameshift is vetoed for the partial terminal
+        // codon, while the R3-B HGVSp peptide payload still carries X. VEP
+        // omits a formatted insertion here because no right peptide flank is
+        // available in this terminal synthetic context.
+        let cds = format!("{}AAGCT", "AAA".repeat(165));
+        let protein = "K".repeat(166);
+        let (class, translation) =
+            classify_incomplete_terminal_codon_variant(&cds, &protein, 1499, 1499, "-", "GG");
+
+        let protein_hgvs = class
+            .protein_hgvs
+            .as_ref()
+            .expect("R3-B partial-codon HGVSp survives the R3-A frameshift veto");
+        assert!(
+            !protein_hgvs.frameshift,
+            "R3-A suppresses frameshift_variant for this partial terminal codon"
+        );
+        assert!(protein_hgvs.ref_peptide.ends_with('X'));
+        assert!(protein_hgvs.alt_peptide.ends_with('X'));
+        assert!(
+            crate::hgvs::format_hgvsp(&translation, protein_hgvs, false).is_none(),
+            "VEP's non-frameshift insertion path must preserve its missing-flank behavior"
         );
     }
 
