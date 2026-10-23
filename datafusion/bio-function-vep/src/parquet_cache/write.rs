@@ -43,9 +43,17 @@ pub fn variation_writer_properties(schema: &SchemaRef) -> WriterProperties {
     point_lookup_writer_properties(schema, &["tier", "start"])
 }
 
+fn get_zstd_level() -> ZstdLevel {
+    let lvl = std::env::var("VEPYR_ZSTD_LEVEL")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(1);
+    ZstdLevel::try_new(lvl).unwrap_or_else(|_| ZstdLevel::try_new(1).unwrap())
+}
+
 /// Lookup-optimized `WriterProperties` shared by every point-lookup entity
 /// (variation, translation_sift): **no dictionary** (avoids the per-take
-/// dictionary load), zstd(3), small ~4 KiB / 512-row data pages, and page-level
+/// dictionary load), zstd(1), small ~4 KiB / 512-row data pages, and page-level
 /// statistics so the footer carries the `ColumnIndex`/`OffsetIndex` the read-side
 /// [`crate::parquet_cache::page_dir::PageDir`] resolves against. `sort_cols` is
 /// the declared sort order (leaf indices; the sort keys are top-level primitives
@@ -62,7 +70,7 @@ pub fn point_lookup_writer_properties(schema: &SchemaRef, sort_cols: &[&str]) ->
         .collect();
 
     WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+        .set_compression(Compression::ZSTD(get_zstd_level()))
         // Artifact #1: no dictionary → no per-take dictionary load. zstd recovers
         // the compression (the no-dict file is actually smaller).
         .set_dictionary_enabled(false)

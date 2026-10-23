@@ -1449,6 +1449,7 @@ dependencies = [
  "noodles-vcf 0.80.0",
  "parquet",
  "rapidhash",
+ "rayon",
  "serde",
  "serde_json",
  "smallvec",

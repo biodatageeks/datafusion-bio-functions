@@ -31,13 +31,21 @@ use parquet::file::properties::WriterProperties;
 /// during the write (the writer buffers a full row group before flushing).
 const CONTEXT_ROW_GROUP_ROWS: usize = 50_000;
 
-/// Dictionary-enabled `WriterProperties` for a context (scan) shard: zstd(3),
+fn get_zstd_level() -> ZstdLevel {
+    let lvl = std::env::var("VEPYR_ZSTD_LEVEL")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(1);
+    ZstdLevel::try_new(lvl).unwrap_or_else(|_| ZstdLevel::try_new(1).unwrap())
+}
+
+/// Dictionary-enabled `WriterProperties` for a context (scan) shard: zstd(1),
 /// dictionaries on (free for full scans; closes the `translation_core` gap vs
 /// Parquet), bounded row groups. No declared sort order — the read path is a full
 /// scan, and the physical order already follows the source query.
 pub fn context_writer_properties() -> WriterProperties {
     WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+        .set_compression(Compression::ZSTD(get_zstd_level()))
         .set_dictionary_enabled(true)
         .set_max_row_group_row_count(Some(CONTEXT_ROW_GROUP_ROWS))
         .build()
