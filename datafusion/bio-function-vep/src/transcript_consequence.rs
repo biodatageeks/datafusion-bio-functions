@@ -6197,6 +6197,38 @@ fn shifted_insertion_cdna_flank(
     usize::try_from(raw_cdna.checked_add(offset)?).ok()
 }
 
+fn shifted_insertion_mapper_used_for_index(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    span: vep_coords::VepSpan,
+) -> bool {
+    let (five_prime_flank, three_prime_flank) = if tx.strand < 0 {
+        (span.start, span.end)
+    } else {
+        (span.end, span.start)
+    };
+
+    if !tx.cdna_mapper_segments.is_empty() {
+        // A cached mapper is authoritative only for flanks it actually maps;
+        // the missing flank can still be a Mapper::Gap.
+        return [five_prime_flank, three_prime_flank]
+            .into_iter()
+            .any(|pos| exact_mapper_cdna_index_for_hgvsp(tx, pos).is_some());
+    }
+
+    // With no cached mapper, shifted_insertion_cdna_flank reconstructs the
+    // cDNA edit offsets from RefSeq edit records. Treat the index as mapped
+    // only if that fallback actually changed a flank; BAM status by itself
+    // does not prove that the returned exon-geometry index is edit-aware.
+    [five_prime_flank, three_prime_flank]
+        .into_iter()
+        .any(|pos| {
+            let raw = genomic_to_cdna_index_for_transcript(tx, tx_exons, pos);
+            let shifted = shifted_insertion_cdna_flank(tx, tx_exons, pos);
+            matches!((raw, shifted), (Some(raw), Some(shifted)) if raw != shifted)
+        })
+}
+
 /// Replay Ensembl's shifted TVA mapper coordinates for `hgvs_protein()`.
 ///
 /// Traceability:
@@ -6250,7 +6282,7 @@ fn shifted_tva_coords_from_mapper(
             cdna_end,
             raw_cds_start,
             raw_cds_end,
-            refseq_has_edited_sequence_state(tx),
+            shifted_insertion_mapper_used_for_index(tx, tx_exons, span),
         )
     } else {
         let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
@@ -12734,6 +12766,48 @@ mod tests {
                 edited_insertion_gap: false,
             })
         );
+    }
+
+    #[test]
+    fn insertion_mapper_provenance_requires_a_mapped_or_reconstructed_flank() {
+        let mut transcript = tx(
+            "NM_STATUS_ONLY.1",
+            "1",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_non_polya_rna_edit = true;
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(1001);
+        let exons = vec![exon(&transcript.transcript_id, 1, 1000, 2000)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let insertion = vep_coords::VepSpan::from_variant(&var("1", 1200, 1200, "-", "A"));
+
+        assert!(!shifted_insertion_mapper_used_for_index(
+            &transcript,
+            &exons_ref,
+            insertion,
+        ));
+
+        // Hydrated inferred edits have no cached mapper segments, but their
+        // reconstructed flank coordinates already include the edit offset.
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 100,
+            end: 99,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        assert!(shifted_insertion_mapper_used_for_index(
+            &transcript,
+            &exons_ref,
+            insertion,
+        ));
     }
 
     #[test]
