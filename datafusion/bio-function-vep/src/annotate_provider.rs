@@ -212,8 +212,9 @@ use crate::transcript_consequence::{
     RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind, SvFeatureKind,
     TranscriptCdnaMapperSegment, TranscriptConsequence, TranscriptConsequenceEngine,
     TranscriptEngineProfile, TranscriptFeature, TranslationFeature, VariantInput,
-    genomic_to_cdna_index_for_transcript, infer_refseq_deletion_edits_from_sequences,
-    is_mitochondrial_contig, mapper_cdna_start_for_insertion, refseq_edit_offset_delta,
+    exact_mapper_cdna_index_for_transcript, genomic_to_cdna_index_for_transcript,
+    infer_refseq_deletion_edits_from_sequences, is_mitochondrial_contig,
+    mapper_cdna_start_for_insertion, refseq_edit_offset_delta,
 };
 
 #[cfg(feature = "parquet-cache")]
@@ -8688,7 +8689,8 @@ fn refseq_misalignment_offset_for_variant(
     } else {
         variation_start
     };
-    let cdna_start = genomic_to_cdna_index_for_transcript(tx, tx_exons, first_genomic_coordinate)
+    let cdna_start = exact_mapper_cdna_index_for_transcript(tx, first_genomic_coordinate)
+        .or_else(|| genomic_to_cdna_index_for_transcript(tx, tx_exons, first_genomic_coordinate))
         .and_then(|position| i64::try_from(position).ok())
         .unwrap_or(0);
     refseq_misalignment_offset(tx, cdna_start)
@@ -21779,6 +21781,63 @@ mod tests {
         assert_eq!(
             refseq_misalignment_offset_for_variant(&tx, &[&exon], 279, 278),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn test_refseq_offset_uses_edit_adjusted_mapper_after_cdnainsertions() {
+        let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
+        tx.start = 100;
+        tx.end = 199;
+        tx.strand = 1;
+        tx.bam_edit_status = Some("ok".to_string());
+        tx.refseq_edits = vec![
+            RefSeqEdit {
+                start: 11,
+                end: 10,
+                replacement_len: Some(3),
+                skip_refseq_offset: false,
+            },
+            RefSeqEdit {
+                start: 22,
+                end: 21,
+                replacement_len: Some(2),
+                skip_refseq_offset: false,
+            },
+        ];
+        // The mapper's edit-aware cDNA starts are discontinuous across the
+        // unmapped inserted bases. General consequence mapping deliberately
+        // falls back to exon geometry here, but VEP's TVA cdna_start still
+        // comes from TranscriptMapper and therefore includes the first edit.
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 109,
+                cdna_start: 1,
+                cdna_end: 10,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 110,
+                genomic_end: 199,
+                cdna_start: 14,
+                cdna_end: 103,
+                ori: 1,
+            },
+        ];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        };
+
+        // The raw exon index is 20; the edit-aware mapper index is 23. VEP's
+        // get_misalignment_offset compares the latter to edit.start, so both
+        // edit deltas contribute at this boundary.
+        assert_eq!(
+            refseq_misalignment_offset_for_variant(&tx, &[&exon], 119, 119),
+            Some(5)
         );
     }
 

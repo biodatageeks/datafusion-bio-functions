@@ -7443,14 +7443,14 @@ fn protein_hgvs_for_output_with_semantics(
     let shifted =
         shifted_tva_protein_hgvs_data(tx, tx_exons, tx_translation, variant, shift, fallback);
 
-    // The direct shifted TVA replay already has the mapper's notation
-    // window. When its two peptides agree, retain equality on that window;
-    // reclassifying against a canonical CDS can move it across an RNA edit.
+    // The direct shifted TVA replay already has VEP's mapper-derived notation
+    // window. At an edited insertion gap, keep that result even when the
+    // peptides differ: classifying the same shifted allele against the
+    // consequence CDS can move it across the RNA edit and manufacture an
+    // equality on a different peptide window.
     if is_insertion
         && refseq_uses_transcript_shift_for_hgvsp(tx)
-        && shifted.as_ref().is_some_and(|protein| {
-            !protein.frameshift && protein.ref_peptide == protein.alt_peptide
-        })
+        && shifted.is_some()
         && tx_translation.is_some_and(|translation| {
             let shifted_variant =
                 protein_hgvs_shifted_variant_for_reference(tx, Some(translation), variant, shift);
@@ -9784,13 +9784,24 @@ fn mapper_segment_cdna_index(segment: &TranscriptCdnaMapperSegment, pos: i64) ->
     Some(segment.cdna_start.saturating_add(local))
 }
 
+/// Map a genomic base through an exact cached TranscriptMapper segment even
+/// when adjacent segments encode a cDNA insertion gap. General consequence
+/// mapping may reject that shape and fall back to exon geometry, but VEP's
+/// `BaseTranscriptVariation::cdna_start()` still observes the mapper piece.
+pub(crate) fn exact_mapper_cdna_index_for_transcript(
+    tx: &TranscriptFeature,
+    pos: i64,
+) -> Option<usize> {
+    tx.cdna_mapper_segments
+        .iter()
+        .find_map(|segment| mapper_segment_cdna_index(segment, pos))
+}
+
 fn exact_mapper_cdna_index_for_hgvsp(tx: &TranscriptFeature, pos: i64) -> Option<usize> {
     if !refseq_has_edited_sequence_state(tx) || tx.cdna_mapper_segments.is_empty() {
         return None;
     }
-    tx.cdna_mapper_segments
-        .iter()
-        .find_map(|segment| mapper_segment_cdna_index(segment, pos))
+    exact_mapper_cdna_index_for_transcript(tx, pos)
 }
 
 fn genomic_to_cdna_index_for_hgvsp(
@@ -10342,9 +10353,12 @@ pub(crate) fn unshifted_cdna_bounds_for_hgvs_shift(
     let coords = transcript_cdna_coords(tx, tx_exons)?;
 
     if ref_allele == "-" && alt_allele != "-" {
-        let left =
-            genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_start.saturating_sub(1));
-        let right = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_start);
+        let map_position = |pos| {
+            exact_mapper_cdna_index_for_transcript(tx, pos)
+                .or_else(|| genomic_to_cdna_index_for_transcript(tx, tx_exons, pos))
+        };
+        let left = map_position(variant_start.saturating_sub(1));
+        let right = map_position(variant_start);
         return match (left, right) {
             (Some(left), Some(right)) => Some((left.min(right), left.max(right))),
             (None, Some(right)) => {
@@ -10381,8 +10395,12 @@ pub(crate) fn unshifted_cdna_bounds_for_hgvs_shift(
     }
 
     if ref_allele != "-" && alt_allele == "-" {
-        let start = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_start)?;
-        let end = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_end)?;
+        let map_position = |pos| {
+            exact_mapper_cdna_index_for_transcript(tx, pos)
+                .or_else(|| genomic_to_cdna_index_for_transcript(tx, tx_exons, pos))
+        };
+        let start = map_position(variant_start)?;
+        let end = map_position(variant_end)?;
         return Some((start.min(end), start.max(end)));
     }
 
@@ -23383,6 +23401,65 @@ mod tests {
             formatted.as_deref(),
             Some("NP_002102.4:p.Pro39delinsGlnGlnGlnGln"),
             "The minimized insertion must replace the edited mapper gap."
+        );
+
+        // ClinVar 3910356 is the same locus with one CAG inserted. Its VEP 116
+        // shifted TVA window yields p.Pro39Gln; the larger insertion above is
+        // a positive control for mapper-gap replacement.
+        let mut short_variant =
+            VariantInput::from_vcf("4".into(), 3074876, 3074876, "C".into(), "CCAGCAG".into());
+        // The production HGVS prelude shifts the six-base insertion by 59 nt
+        // into the RefSeq mapper gap. Keep that shift hash in the fixture so
+        // the transcript helper takes VEP's existing-shift reuse path.
+        short_variant.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 59,
+            start: 3074936,
+            end: 3074935,
+            shifted_allele_string: "GCAGCA".to_string(),
+            shifted_compare_allele: "GCAGCA".to_string(),
+            shifted_output_allele: "GCAGCA".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "CAGCAG".to_string(),
+            five_prime_flanking_seq: "GAGACCGCCATGGCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTTC"
+                .to_string(),
+            three_prime_flanking_seq:
+                "CAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAGCAA".to_string(),
+            five_prime_context: "GCAGCA".to_string(),
+            three_prime_context: "ACAGCC".to_string(),
+        });
+        let selected_short_shift =
+            refseq_transcript_shift_for_hgvs_protein(&t, &exons_ref, &short_variant)
+                .expect("reuse the genomic shift after matching edited transcript flanks");
+        assert_eq!(selected_short_shift.shift_length, 59);
+        assert_eq!(
+            (selected_short_shift.start, selected_short_shift.end),
+            (3074936, 3074935)
+        );
+        let short_class = classify_coding_change(&t, &exons_ref, Some(&tr), &short_variant)
+            .expect("single-CAG insertion classification");
+        let short_protein = protein_hgvs_for_output_with_semantics(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            &short_variant,
+            true,
+            short_class.protein_position_start.zip(
+                short_class
+                    .protein_position_end
+                    .or(short_class.protein_position_start),
+            ),
+            short_class.protein_hgvs.as_ref(),
+            crate::vep_semantics::VepSemantics::V116,
+            true,
+        )
+        .expect("single-CAG insertion protein HGVS");
+        let short_formatted =
+            crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), &short_protein, true);
+        assert_eq!(
+            short_formatted.as_deref(),
+            Some("NP_002102.4:p.Pro39Gln"),
+            "ClinVar 3910356 must retain VEP's single-CAG HGVS output."
         );
     }
 
