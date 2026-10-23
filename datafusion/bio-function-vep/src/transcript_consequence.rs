@@ -5228,6 +5228,7 @@ fn frameshift_under_semantics(
                     .is_some_and(|peptide| peptide.starts_with('*'))))
 }
 
+#[must_use = "use the class wrapper to keep classification.start_lost in sync"]
 fn apply_vep116_primary_indel_predicates(
     terms: &mut BTreeSet<SoTerm>,
     class: &CodingClassification,
@@ -11883,13 +11884,13 @@ mod tests {
         };
         let mut v115 = BTreeSet::from([SoTerm::InframeInsertion]);
         let mut v116 = v115.clone();
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut v115,
             &class,
             crate::vep_semantics::VepSemantics::V115,
             false,
         );
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut v116,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -12023,7 +12024,7 @@ mod tests {
             ..Default::default()
         };
         let mut terms = BTreeSet::from([SoTerm::InframeInsertion]);
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -12038,7 +12039,7 @@ mod tests {
             ..Default::default()
         };
         let mut valid_terms = BTreeSet::from([SoTerm::InframeInsertion]);
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut valid_terms,
             &valid,
             crate::vep_semantics::VepSemantics::V116,
@@ -12060,7 +12061,7 @@ mod tests {
         // VEP's partial_codon predicate vetoes frameshift_variant but does not
         // veto inframe_insertion. The codon and peptide predicate must still
         // add the insertion term after clearing the raw length-based term.
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -12081,7 +12082,7 @@ mod tests {
         };
         let mut terms = BTreeSet::from([SoTerm::FrameshiftVariant]);
 
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -12102,7 +12103,7 @@ mod tests {
             ..Default::default()
         };
         let mut terms = BTreeSet::from([SoTerm::InframeInsertion]);
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -12120,13 +12121,13 @@ mod tests {
         };
         let mut v115 = BTreeSet::from([SoTerm::InframeDeletion]);
         let mut v116 = v115.clone();
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut v115,
             &class,
             crate::vep_semantics::VepSemantics::V115,
             false,
         );
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut v116,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -12140,7 +12141,7 @@ mod tests {
     fn vep116_partial_codon_vetoes_only_its_guarded_indel_predicates() {
         let class = CodingClassification::default();
         let mut terms = BTreeSet::from([SoTerm::FrameshiftVariant, SoTerm::InframeDeletion]);
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -12157,7 +12158,7 @@ mod tests {
             ..Default::default()
         };
         let mut insertion_terms = BTreeSet::from([SoTerm::InframeInsertion]);
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut insertion_terms,
             &insertion,
             crate::vep_semantics::VepSemantics::V116,
@@ -27192,7 +27193,7 @@ mod tests {
             ..Default::default()
         };
         let mut terms = BTreeSet::from([SoTerm::InframeDeletion]);
-        apply_vep116_primary_indel_predicates(
+        let _ = apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
