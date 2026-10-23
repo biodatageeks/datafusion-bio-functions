@@ -5723,6 +5723,38 @@ fn vep116_incomplete_terminal_hgvsp_alleles(
     ) else {
         return None;
     };
+    // This helper preserves the display X for partial terminal codons that
+    // still encode peptide. VEP 116 appends X only when its translated peptide
+    // is not exactly `*`, then `_get_fs_peptides()` treats a shared translated
+    // stop as synonymous. The local display window can retain a partial X
+    // after that stop; strip it from HGVSp only when the shared stop is aligned
+    // and the post-stop payload contains no residue other than stop/X.
+    //
+    // Traceability:
+    // - Ensembl Variation 116 `TranscriptVariationAllele::peptide()`:
+    //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L774-L776
+    // - Ensembl Variation 116 `_get_fs_peptides()`:
+    //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2342-L2355
+    // - Ensembl Variation 116 `_get_hgvs_protein_format()`:
+    //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1911-L1913
+    if let (Some(reference_stop), Some(alternate_stop)) = (reference.find('*'), alternate.find('*'))
+    {
+        let reference_tail = &reference[reference_stop + 1..];
+        let alternate_tail = &alternate[alternate_stop + 1..];
+        let stop_only_payload = |tail: &str| tail.chars().all(|aa| matches!(aa, '*' | 'X'));
+        let reference_through_stop = &reference[..=reference_stop];
+        let alternate_through_stop = &alternate[..=alternate_stop];
+        let has_partial_x = reference_tail.contains('X') || alternate_tail.contains('X');
+        if reference_stop == alternate_stop
+            && reference_through_stop == alternate_through_stop
+            && has_partial_x
+            && stop_only_payload(reference_tail)
+            && stop_only_payload(alternate_tail)
+        {
+            return Some(format!("{reference_through_stop}/{alternate_through_stop}"));
+        }
+        return None;
+    }
     // `local_codon_truncated` comes from the CDS remainder (one or two bases),
     // and the local peptide translator appends X for that incomplete codon.
     // Thus this suffix X records VEP's partial-codon rule even if an earlier
@@ -17119,6 +17151,29 @@ mod tests {
         assert!(
             formatted.is_none(),
             "VEP's non-frameshift insertion path needs a right peptide flank; this synthetic insertion is past the terminal partial codon"
+        );
+    }
+
+    #[test]
+    fn incomplete_terminal_hgvsp_discards_partial_payload_after_a_shared_stop() {
+        // A partial terminal X can be useful in the local display window, but
+        // it must not turn a stop followed by that incomplete tail into a
+        // stop-retaining delins. VEP 116 only adds X to a peptide allele when
+        // its translated peptide is not the stop itself.
+        let class = CodingClassification {
+            affected_ref_peptide: Some("*X".to_string()),
+            affected_alt_peptide: Some("**X".to_string()),
+            ..CodingClassification::default()
+        };
+
+        assert_eq!(
+            vep116_incomplete_terminal_hgvsp_alleles(
+                &class,
+                crate::vep_semantics::VepSemantics::V116,
+                true,
+            ),
+            Some("*/*".to_string()),
+            "a shared stop makes the local partial-codon tail irrelevant to HGVSp"
         );
     }
 
