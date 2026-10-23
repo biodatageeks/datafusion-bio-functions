@@ -5542,20 +5542,29 @@ fn vep116_coding_unknown(
     }
 
     let peptide_unknown = classification.is_none_or(|classification| {
-        let Some(alt_peptide) = classification.affected_alt_peptide.as_deref() else {
+        let peptide_alleles = classification
+            .affected_ref_peptide
+            .as_deref()
+            .zip(classification.affected_alt_peptide.as_deref())
+            .or_else(|| {
+                // For partial-CDS insertions the mapper peptide window may
+                // be unavailable even though OutputFactory has the same
+                // known peptide pair in `Amino_acids`. VEP's peptide() and
+                // _get_peptide_alleles() use that pair for coding_unknown.
+                classification
+                    .amino_acids
+                    .as_deref()
+                    .and_then(|alleles| alleles.split_once('/'))
+            });
+        let Some((ref_peptide, alt_peptide)) = peptide_alleles else {
             return true;
         };
-        // `_get_peptide_alleles()` first requires both peptide values, then
-        // normalizes the valid insertion reference `-` to `""`. VEP's
-        // `coding_unknown()` tests the alternate peptide for presence and X,
-        // and the reference peptide for X; the empty reference allele by
-        // itself is not missing peptide data.
-        alt_peptide.is_empty()
-            || alt_peptide.contains('X')
-            || classification
-                .affected_ref_peptide
-                .as_deref()
-                .is_none_or(|peptide| peptide.contains('X'))
+        // `_get_peptide_alleles()` normalizes `-` to an empty allele only
+        // after confirming both peptide values exist. Empty strings are
+        // therefore valid known insertion alleles, not missing data.
+        let ref_peptide = if ref_peptide == "-" { "" } else { ref_peptide };
+        let alt_peptide = if alt_peptide == "-" { "" } else { alt_peptide };
+        alt_peptide.contains('X') || ref_peptide.contains('X')
     });
     if !peptide_unknown {
         return false;
@@ -20563,6 +20572,27 @@ mod tests {
             assert!(
                 !vep116_coding_unknown(&terms, Some(&classification), true, false),
                 "ClinVar {clinvar_id}: a known insertion peptide must not add coding_sequence_variant"
+            );
+        }
+    }
+
+    #[test]
+    fn coding_unknown_uses_available_partial_cds_amino_acids_when_predicate_peptides_are_missing() {
+        // Boundary insertions can have an OutputFactory Amino_acids value
+        // even when the local peptide window used by the general classifier
+        // is unavailable. VEP's `peptide()`/`_get_peptide_alleles()` still
+        // see the known insertion peptide in this case, so coding_unknown
+        // must not add coding_sequence_variant.
+        let terms = BTreeSet::from([SoTerm::CodingSequenceVariant, SoTerm::InframeInsertion]);
+        for (clinvar_id, amino_acids) in [(2180991, "-/SSGGG"), (3910969, "-/AA"), (3910970, "-/A")]
+        {
+            let classification = CodingClassification {
+                amino_acids: Some(amino_acids.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                !vep116_coding_unknown(&terms, Some(&classification), true, false),
+                "ClinVar {clinvar_id}: known partial-CDS peptide must not add coding_sequence_variant"
             );
         }
     }
