@@ -2653,11 +2653,22 @@ fn resolve_frameshift_hgvs(
         let ref_aa = peptide_char(&ref_translation, start)?;
         let alt_aa = peptide_char(alt_translation, start)?;
         if ref_aa == '*' && alt_aa == '*' {
-            if preserve_stop_retaining_delins(
-                notation,
-                protein,
-                Some(start.saturating_sub(protein.start)),
-            ) {
+            // VEP 116 `_get_fs_peptides()` compares the translated alternate
+            // CDS and returns synonymous immediately when both translations
+            // retain the stop. Do not let the local peptide window's payload
+            // after that stop turn the result into a delins. Keep the
+            // stop-retaining fallback for callers that have no translated
+            // alternate-CDS extension; this is the path covered by #228.
+            // Traceability:
+            // - Ensembl Variation 116 `_get_fs_peptides()`:
+            //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2342-L2355
+            if protein.alt_translation_extension.is_none()
+                && preserve_stop_retaining_delins(
+                    notation,
+                    protein,
+                    Some(start.saturating_sub(protein.start)),
+                )
+            {
                 return Some(());
             }
             notation.kind = "=".to_string();
@@ -3548,6 +3559,29 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ter412=".to_string())
+        );
+    }
+
+    #[test]
+    fn frameshift_shared_translated_stop_ignores_local_peptide_after_stop() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 3,
+            end: 3,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "*LX".to_string(),
+            ref_translation: "MA".to_string(),
+            alt_translation: "MA*".to_string(),
+            alt_translation_extension: Some("MA*Q".to_string()),
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter3=".to_string())
         );
     }
 
