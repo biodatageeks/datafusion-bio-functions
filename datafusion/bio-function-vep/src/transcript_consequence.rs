@@ -5280,7 +5280,7 @@ fn apply_vep116_nucleotide_stop_fallbacks(
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
 ) {
-    if !semantics.vep116_stop_predicates() || partial_terminal_codon {
+    if !semantics.vep116_stop_predicates() {
         return;
     }
 
@@ -5289,7 +5289,8 @@ fn apply_vep116_nucleotide_stop_fallbacks(
             .affected_alt_peptide
             .as_deref()
             .is_some_and(|peptide| !peptide.contains('X'));
-    if !stop_lost_uses_peptides
+    if !partial_terminal_codon
+        && !stop_lost_uses_peptides
         && vep116_stop_lost_without_unambiguous_alt_peptide(tx, tx_exons, tx_translation, variant)
     {
         class.stop_gained = false;
@@ -21513,6 +21514,21 @@ mod tests {
             Some(&translation),
             &stop_runoff,
         ));
+
+        // VEP's no-peptide stop_retained expression has no partial-codon
+        // guard. The outer CIL overlap remains true when an endpoint is a
+        // mapper Gap, because the nested nucleotide helper returns false.
+        let mut stop_retained = CodingClassification::default();
+        apply_vep116_nucleotide_stop_fallbacks(
+            &mut stop_retained,
+            crate::vep_semantics::VepSemantics::V116,
+            true,
+            &transcript,
+            &exons,
+            Some(&translation),
+            &stop_runoff,
+        );
+        assert!(stop_retained.stop_retained, "{stop_retained:?}");
 
         // The two partial-CDS attributes independently veto their codon
         // overlap predicates.
