@@ -599,12 +599,6 @@ fn format_hgvsc_fallback(
         if vep_hgvs_positions_need_swap(&start, &end) {
             std::mem::swap(&mut start, &mut end);
         }
-        if let Some((negative_star, coding_position)) =
-            order_star_negative_hgvsc_positions(&start, &end)
-        {
-            start = negative_star;
-            end = coding_position;
-        }
     } else {
         (start, end) = order_hgvsc_positions(&start, &end);
     }
@@ -2289,12 +2283,11 @@ fn vep_hgvs_position_parts(position: &str) -> Option<(i64, i64)> {
 }
 
 fn order_hgvsc_positions(start: &str, end: &str) -> (String, String) {
-    // In the general fallback, the mapper can hand us either endpoint first.
-    // The #244 `*-N` coordinate is numerically before a positive coding
-    // coordinate, so keep it first in either input order. Other ranges retain
-    // the established star-last comparator; applying VEP's slice sort to all
-    // mapper outputs changes many unrelated `*N` ranges.
-    if let Some(ordered) = order_star_negative_hgvsc_positions(start, end) {
+    // VEP's `hgvs_transcript` sort keeps both endpoints in their incoming
+    // order for this shape: `*-N` sorts numerically before coding positions,
+    // while a `*` in the end suppresses a swap. Do not normalize the pair
+    // symmetrically; the mapper's transcript-slice order is significant.
+    if let Some(ordered) = preserve_star_negative_hgvsc_order(start, end) {
         return ordered;
     }
 
@@ -2305,7 +2298,7 @@ fn order_hgvsc_positions(start: &str, end: &str) -> (String, String) {
     }
 }
 
-fn order_star_negative_hgvsc_positions(start: &str, end: &str) -> Option<(String, String)> {
+fn preserve_star_negative_hgvsc_order(start: &str, end: &str) -> Option<(String, String)> {
     let start_is_star_negative = start
         .strip_prefix("*-")
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
@@ -2317,10 +2310,10 @@ fn order_star_negative_hgvsc_positions(start: &str, end: &str) -> Option<(String
     let end_is_positive_coding =
         !end.contains('*') && vep_hgvs_position_parts(end).is_some_and(|(coord, _)| coord > 0);
 
-    if start_is_star_negative && end_is_positive_coding {
+    if (start_is_star_negative && end_is_positive_coding)
+        || (end_is_star_negative && start_is_positive_coding)
+    {
         Some((start.to_string(), end.to_string()))
-    } else if end_is_star_negative && start_is_positive_coding {
-        Some((end.to_string(), start.to_string()))
     } else {
         None
     }
@@ -7757,19 +7750,28 @@ mod tests {
     }
 
     #[test]
-    fn test_hgvsc_format_order_keeps_star_intronic_start_before_coding_end() {
-        // The #244 shape is ordered with the negative starred coordinate first.
+    fn test_hgvsc_format_order_preserves_star_negative_mapper_order() {
+        // VEP keeps the mapper's transcript-slice order when one endpoint is
+        // `*-N` and the other is a positive coding coordinate.
         assert_eq!(
             order_hgvsc_positions("*-1", "2016"),
             ("*-1".to_string(), "2016".to_string())
         );
         assert_eq!(
-            order_star_negative_hgvsc_positions("2016", "*-1"),
-            Some(("*-1".to_string(), "2016".to_string()))
+            preserve_star_negative_hgvsc_order("2016", "*-1"),
+            Some(("2016".to_string(), "*-1".to_string()))
         );
         assert_eq!(
             order_hgvsc_positions("2016", "*-1"),
-            ("*-1".to_string(), "2016".to_string())
+            ("2016".to_string(), "*-1".to_string())
+        );
+        assert_eq!(
+            order_hgvsc_positions("962+66", "*-51"),
+            ("962+66".to_string(), "*-51".to_string())
+        );
+        assert_eq!(
+            order_hgvsc_positions("*-51", "962+66"),
+            ("*-51".to_string(), "962+66".to_string())
         );
         assert_eq!(
             order_hgvsc_positions("2016", "2015"),
