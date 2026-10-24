@@ -453,15 +453,15 @@ fn format_hgvsc_fallback(
     let clamped = partial_clamp.is_some();
     let (ref_allele, alt_allele, variant_start, variant_end, feature_start, feature_end) =
         if let Some(clamp) = partial_clamp.as_ref() {
-            // Preserve the existing genomic-coordinate fallback for clamped
-            // reference-span alleles. If clipping re-types one as an
-            // insertion below, convert just that insertion's mapped flanks
-            // back to VEP's transcript-slice order before the single sort.
+            // VEP constructs notation from the transcript-slice coordinates
+            // returned by `_var2transcript_slice_coords` and clamps there
+            // (TranscriptVariationAllele.pm:2697-2729 @ 2fb834b). Keep the
+            // genomic span separately for transcript-reference recovery.
             (
                 clamp.ref_allele.as_str(),
                 alt_allele,
-                clamp.genomic_start,
-                clamp.genomic_end,
+                clamp.slice_start,
+                clamp.slice_end,
                 clamp.genomic_start,
                 clamp.genomic_end,
             )
@@ -549,19 +549,10 @@ fn format_hgvsc_fallback(
     }
     let identical_substitution = notation.kind == ">" && notation.ref_allele == notation.alt_allele;
     if clamped {
-        // VEP maps and clamps every partially overlapping allele in
-        // transcript-slice coordinates before formatting its notation
-        // (TranscriptVariationAllele.pm:2697-2729 @ 2fb834b). It clips the
-        // REF/ALT pair in that same slice order (:1474-1493, 2211-2278).
-        // Preserve those endpoints for every clamped type so the one cDNA
-        // sort receives VEP's real pre-sort order.
-        let clamp = partial_clamp.as_ref()?;
-        notation = hgvs_variant_notation(
-            &feature_ref,
-            &feature_alt,
-            clamp.slice_start,
-            clamp.slice_end,
-        )?;
+        // `notation` already uses the transcript-slice endpoints above. VEP
+        // clips the REF/ALT pair in that same order before mapping endpoints
+        // to cDNA (TranscriptVariationAllele.pm:1474-1493, 2211-2278 @
+        // 2fb834b), so keep this pair for the one shared VEP sort.
         if notation.kind != "dup" && !identical_substitution {
             clip_alleles_with_dup_retyping(&mut notation, 1, false);
         }
