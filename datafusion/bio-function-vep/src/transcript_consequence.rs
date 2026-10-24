@@ -6059,7 +6059,7 @@ fn local_peptide_from_codon_window(table: CodonTable, codon: &[u8]) -> Option<St
             .into_iter()
             .collect()
     };
-    if !partial.is_empty() && peptide != "*" {
+    if !partial.is_empty() && !peptide.contains('*') {
         peptide.push('X');
     }
     if peptide.is_empty() {
@@ -17668,6 +17668,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn partial_codon_after_terminal_stop_does_not_append_x() {
+        assert_eq!(
+            local_peptide_from_codon_window(CodonTable::Standard, b"GCTTAAC").as_deref(),
+            Some("A*")
+        );
+    }
+
     // ---- classify_insertion: codons, amino acids, positions ----
 
     /// Helper for insertion classification in a single-exon transcript.
@@ -28966,6 +28974,54 @@ mod tests {
 
         assert!(class.stop_retained, "{class:?}");
         assert!(!class.stop_gained, "{class:?}");
+    }
+
+    #[test]
+    fn issue_202_v116_frameshift_insertion_before_terminal_stop_ignores_partial_tail() {
+        let cds = "ATGGCTGAATGA";
+        let transcript = tx(
+            "T_V116_TERMINAL_FRAMESHIFT_INSERTION",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        let exon = exon("T_V116_TERMINAL_FRAMESHIFT_INSERTION", 1, 1000, 1011);
+        let exons = [&exon];
+        let translation = translation(
+            "T_V116_TERMINAL_FRAMESHIFT_INSERTION",
+            Some(cds.len()),
+            Some(4),
+            Some("MAE*"),
+            Some(cds),
+        );
+        let insertion = var("22", 1009, 1009, "-", "TAAA");
+
+        let class = classify_insertion_with_semantics_and_gap(
+            &transcript,
+            &exons,
+            Some(&translation),
+            cds,
+            &insertion,
+            "TAAA",
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        )
+        .expect("terminal insertion should be classified");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("E"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("E*"));
+        assert!(class.stop_retained, "{class:?}");
+        assert!(!class.stop_gained, "{class:?}");
+        assert!(!frameshift_under_semantics(
+            true,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        ));
     }
 
     #[test]
