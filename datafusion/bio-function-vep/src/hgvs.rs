@@ -473,7 +473,9 @@ fn format_hgvsc_fallback(
         } else {
             (ref_allele, alt_allele, variant_start, variant_end)
         };
-    let (mut feature_ref, feature_alt) = hgvs_feature_strand_alleles(tx, ref_allele, alt_allele)?;
+    let (genomic_feature_ref, feature_alt) =
+        hgvs_feature_strand_alleles(tx, ref_allele, alt_allele)?;
+    let mut feature_ref = genomic_feature_ref.clone();
     let refseq_edit_started = profile.is_some().then(Instant::now);
     // The engine may already have selected the submitted reference TVA allele
     // because native use_feature_ref is disabled. A legacy sequence fallback
@@ -492,17 +494,18 @@ fn format_hgvsc_fallback(
     if let (Some(started), Some(profile)) = (refseq_edit_started, profile.as_deref_mut()) {
         profile.refseq_edit += started.elapsed();
     }
-    if let Some(transcript_ref) = transcript_ref {
-        feature_ref = transcript_ref;
-    }
     // `hgvs_variant_notation` returns undef when the REF cut from the clamped
     // slice equals ALT (Utils/Sequence.pm:526-531 @ 2fb834b). The engine's
     // own helper keeps a 1-base identical pair as `>` for the unclamped path.
-    if clamped && feature_ref.eq_ignore_ascii_case(&feature_alt) {
+    if clamped && genomic_feature_ref.eq_ignore_ascii_case(&feature_alt) {
         return None;
     }
-    let mut notation =
-        hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
+    let mut notation = hgvs_variant_notation(
+        &genomic_feature_ref,
+        &feature_alt,
+        variant_start,
+        variant_end,
+    )?;
     if let Some(shift) = dup_context {
         // VEP determines transcript-level insertion duplication from the shifted
         // HGVS allele first, then later overrides the displayed inserted bases
@@ -525,8 +528,12 @@ fn format_hgvsc_fallback(
             let span_start = tx_exons.iter().map(|e| e.start).min().unwrap_or(0);
             let span_end = tx_exons.iter().map(|e| e.end).max().unwrap_or(0);
             if notation.start < span_start || notation.end > span_end {
-                notation =
-                    hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
+                notation = hgvs_variant_notation(
+                    &genomic_feature_ref,
+                    &feature_alt,
+                    variant_start,
+                    variant_end,
+                )?;
             }
         }
     }
@@ -541,6 +548,9 @@ fn format_hgvsc_fallback(
         } else {
             clip_alleles(&mut notation, tx.strand);
         }
+    }
+    if let Some(transcript_ref) = transcript_ref {
+        feature_ref = transcript_ref;
     }
     // Traceability:
     // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
@@ -6998,6 +7008,49 @@ mod tests {
         );
 
         assert_eq!(hgvsc.as_deref(), Some("NM_001143773.1:c.*572dup"));
+    }
+
+    #[test]
+    fn rna_edit_mnv_classifies_genomic_alleles_before_transcript_replacement() {
+        let mut tx = make_transcript("protein_coding", 1, Some(100), Some(110));
+        tx.transcript_id = "NM_001293306.2".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 100;
+        tx.end = 110;
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(11);
+        tx.bam_edit_status = Some("ok".to_string());
+        tx.has_non_polya_rna_edit = true;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 3,
+            end: 3,
+            replacement_len: Some(1),
+            skip_refseq_offset: false,
+        }];
+        tx.spliced_seq = Some("CCAAGGTTCCA".to_string());
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 110,
+        };
+
+        let hgvsc = format_hgvsc(&tx, &[&exon], Some("3-4"), None, "TG", "CA", 102, 103, None);
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001293306.2:c.3_4inv"));
+    }
+
+    #[test]
+    fn nm_147183_intronic_mnv_control_is_not_retyped_as_an_inversion() {
+        // This non-trigger ClinVar control is reported by VEP as
+        // NM_147183.3:c.225+12857AAT>AAA. Only reverse-complementary genomic
+        // alleles use the inversion class in the RNA-edit path.
+        let mut notation = hgvs_variant_notation("AAT", "AAA", 1, 3).expect("notation");
+        clip_alleles(&mut notation, 1);
+
+        assert_eq!(notation.kind, ">");
+        assert_eq!(notation.ref_allele, "T");
+        assert_eq!(notation.alt_allele, "A");
     }
 
     #[test]
