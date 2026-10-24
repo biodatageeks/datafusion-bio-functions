@@ -14768,6 +14768,25 @@ mod tests {
             "ClinVar 1167157 reference codons come from the canonical cached CDS."
         );
 
+        // The RNA edit changes the full cached CDS length. VEP still slices
+        // this reference codon window from its canonical translateable CDS;
+        // total sequence-length equality is not a prerequisite for the slice.
+        let mut unequal_length_translation = boundary_translation.clone();
+        unequal_length_translation.cds_sequence_canonical =
+            Some(format!("{boundary_canonical_cds}GTC"));
+        let unequal_length_class = classify_coding_change(
+            &boundary_transcript,
+            &exons_ref,
+            Some(&unequal_length_translation),
+            &boundary_variant,
+        )
+        .expect("boundary insertion with unequal canonical CDS length");
+        assert_eq!(
+            unequal_length_class.codons.as_deref(),
+            Some("gaagag/gaGGa"),
+            "the reference codon window is valid although the whole CDS lengths differ"
+        );
+
         let boundary_three_base_variant = VariantInput::from_vcf(
             "2".into(),
             73_385_942,
@@ -14786,6 +14805,18 @@ mod tests {
             boundary_three_base_class.codons.as_deref(),
             Some("gaagag/gaGGCa"),
             "ClinVar 551063 reference codons come from the canonical cached CDS."
+        );
+        let unequal_length_three_base_class = classify_coding_change(
+            &boundary_transcript,
+            &exons_ref,
+            Some(&unequal_length_translation),
+            &boundary_three_base_variant,
+        )
+        .expect("three-base boundary insertion with unequal canonical CDS length");
+        assert_eq!(
+            unequal_length_three_base_class.codons.as_deref(),
+            Some("gaagag/gaGGCa"),
+            "the inframe reference codon window is valid although whole CDS lengths differ"
         );
         let boundary_protein = protein_hgvs_for_output(
             &boundary_transcript,
