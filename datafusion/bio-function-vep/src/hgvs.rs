@@ -2635,20 +2635,14 @@ fn resolve_frameshift_hgvs(
 
     if start > alt_translation.len() {
         notation.kind = "del".to_string();
-        if protein.start_lost {
-            // Ensembl Variation 116 `_get_fs_peptides()` sets only
-            // `alt = "del"` and `type = "del"` in this branch, then returns.
-            // Preserve its original multi-residue `ref` and `end`; the later
-            // start_lost override changes alt/type but leaves ref/start/end.
-            notation.alt_allele = "del".to_string();
-            return Some(());
-        }
-        notation.end = start;
-        notation.ref_allele = peptide_char(&ref_translation, start)?.to_string();
-        notation.alt_allele.clear();
+        // Ensembl Variation 116 `_get_fs_peptides()` sets only `alt = "del"`
+        // and `type = "del"` in this branch, then returns. Preserve the
+        // clipped reference range and coordinates initialized from context.
+        notation.alt_allele = "del".to_string();
         return Some(());
     }
 
+    let mut last_equal = None;
     while start <= alt_translation.len() {
         let ref_aa = peptide_char(&ref_translation, start)?;
         let alt_aa = peptide_char(alt_translation, start)?;
@@ -2685,14 +2679,17 @@ fn resolve_frameshift_hgvs(
             notation.alt_allele = alt_aa.to_string();
             return Some(());
         }
+        last_equal = Some((ref_aa, alt_aa));
         start = start.saturating_add(1);
     }
 
-    notation.kind = "del".to_string();
+    // VEP returns the last equal residue with the original `fs` kind after
+    // exhausting the comparison loop. `start` has advanced to len(alt) + 1.
+    let (ref_aa, alt_aa) = last_equal?;
+    notation.kind = "fs".to_string();
     notation.start = start;
-    notation.end = start;
-    notation.ref_allele = peptide_char(&ref_translation, start)?.to_string();
-    notation.alt_allele.clear();
+    notation.ref_allele = ref_aa.to_string();
+    notation.alt_allele = alt_aa.to_string();
     Some(())
 }
 
@@ -2964,7 +2961,11 @@ fn format_hgvsp_notation(
         let extra = stop_loss_extra_aa(protein, notation.start.saturating_sub(1), false)
             .map(|v| v.to_string())
             .unwrap_or_else(|| "?".to_string());
-        let alt_head = peptide_first_three(&notation.alt_allele).unwrap_or("?");
+        let alt_head = if notation.kind == "del" {
+            "del"
+        } else {
+            peptide_first_three(&notation.alt_allele).unwrap_or("?")
+        };
         if notation.ref_allele.len() > 1 && notation.kind == "del" {
             out.push_str(&format!(
                 "{}{}_{}{}{}extTer{}",
@@ -3762,6 +3763,36 @@ mod tests {
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ter3GlnextTer2".to_string())
         );
+    }
+
+    #[test]
+    fn test_format_hgvsp_stop_lost_deletion_uses_del_head() {
+        let translation = make_translation();
+        for (alt_translation, expected) in [
+            (
+                format!("MA{}*", "Q".repeat(19)),
+                "ENSPHGVS000001.1:p.Ter3delextTer19",
+            ),
+            ("MAQ".to_string(), "ENSPHGVS000001.1:p.Ter3delextTer?"),
+        ] {
+            let protein = ProteinHgvsData {
+                start: 3,
+                end: 3,
+                ref_peptide: "*".to_string(),
+                alt_peptide: "-".to_string(),
+                ref_translation: "MA*".to_string(),
+                alt_translation,
+                alt_translation_extension: None,
+                frameshift: false,
+                start_lost: false,
+                stop_lost: true,
+                native_refseq: false,
+            };
+            assert_eq!(
+                format_hgvsp(&translation, &protein, true).as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
@@ -8069,6 +8100,52 @@ mod tests {
         assert_eq!(notation.start, 2); // first differing AA
         assert_eq!(notation.ref_allele, "A");
         assert_eq!(notation.alt_allele, "Q");
+    }
+
+    #[test]
+    fn test_format_hgvsp_frameshift_that_runs_out_keeps_last_equal_residue() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 3,
+            end: 3,
+            ref_peptide: "P".into(),
+            alt_peptide: "P".into(),
+            ref_translation: "MAP".into(),
+            alt_translation: "MAP".into(),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Pro4ProfsTer?".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_frameshift_past_alt_translation_keeps_clipped_range() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2,
+            end: 3,
+            ref_peptide: "SQ".into(),
+            alt_peptide: "-".into(),
+            ref_translation: "MSQ".into(),
+            alt_translation: "M".into(),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ser2_Gln3del".to_string())
+        );
     }
 
     #[test]
