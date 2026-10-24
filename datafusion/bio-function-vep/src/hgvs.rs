@@ -2676,21 +2676,43 @@ fn resolve_frameshift_hgvs(
         notation.kind = "del".to_string();
         // Ensembl Variation 116 `_get_fs_peptides()` sets only `alt = "del"`
         // and `type = "del"` in this branch, then returns. Preserve the
-        // clipped reference range and coordinates initialized from context,
-        // except for the terminal stop that Ensembl Core removes from peptide
-        // translations. In this path the local peptide window can encode that
-        // stop as BioPerl's `X`, or omit it from the allele while retaining its
-        // coordinate in `end`.
+        // clipped reference range and coordinates initialized from context.
         notation.alt_allele = "del".to_string();
+        // A VEP translation window of `-/X` at the first position after an
+        // incomplete CDS is synonymous in the ClinVar #223 targets. The
+        // generic past-end branch would otherwise emit `p.Ndel`.
+        if protein.ref_peptide == "-"
+            && protein.alt_peptide == "X"
+            && notation.start == alt_translation.len().saturating_add(1)
+            && notation.end.saturating_add(1) == notation.start
+        {
+            notation.kind = "=".to_string();
+            notation.end = start;
+            notation.ref_allele.clear();
+            notation.alt_allele.clear();
+            return Some(());
+        }
+
+        // Core removes a literal terminal `*` from peptide translations. For
+        // an incomplete CDS, VEP also excludes the terminal `X` from a
+        // deletion when both local peptide windows contain it (#220); other
+        // clipped `X`/Ter ranges stay intact for `_get_fs_peptides()`'s early
+        // return.
         let terminal_stop = if protein.ref_translation.ends_with('*') {
             protein.ref_translation.len()
         } else {
             protein.ref_translation.len().saturating_add(1)
         };
-        if notation.end == terminal_stop {
-            if matches!(notation.ref_allele.chars().last(), Some('*' | 'X')) {
-                notation.ref_allele.pop();
-            }
+        let has_literal_terminal_stop =
+            protein.ref_translation.ends_with('*') && notation.ref_allele.ends_with('*');
+        let has_shared_incomplete_terminal_x = !protein.ref_translation.ends_with('*')
+            && protein.alt_peptide == "X"
+            && protein.ref_peptide.ends_with('X');
+        if notation.end == terminal_stop
+            && !protein.stop_lost
+            && (has_literal_terminal_stop || has_shared_incomplete_terminal_x)
+        {
+            notation.ref_allele.pop();
             notation.end = notation.end.saturating_sub(1);
         }
         return Some(());
@@ -3847,6 +3869,29 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn test_format_hgvsp_stop_lost_clipped_frameshift_keeps_terminal_stop_range() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 285,
+            end: 287,
+            ref_peptide: "LQ*".into(),
+            alt_peptide: "X".into(),
+            ref_translation: "M".repeat(286),
+            alt_translation: "M".repeat(284),
+            alt_translation_extension: Some("M".repeat(284)),
+            frameshift: true,
+            start_lost: false,
+            stop_lost: true,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Leu285_Ter287delextTer?".to_string())
+        );
     }
 
     #[test]
@@ -8239,7 +8284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_hgvsp_frameshift_past_alt_translation_drops_unrepresented_terminal_stop() {
+    fn test_format_hgvsp_frameshift_past_alt_translation_preserves_incomplete_ter_range() {
         let translation = make_translation();
         let protein = ProteinHgvsData {
             start: 132,
@@ -8257,7 +8302,76 @@ mod tests {
 
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
-            Some("ENSPHGVS000001.1:p.Glu132del".to_string())
+            Some("ENSPHGVS000001.1:p.Glu132_Ter133del".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_frameshift_past_alt_translation_preserves_terminal_ter_range() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 164,
+            end: 165,
+            ref_peptide: "KX".into(),
+            alt_peptide: "-".into(),
+            ref_translation: "M".repeat(164),
+            alt_translation: "M".repeat(163),
+            alt_translation_extension: Some("M".repeat(163)),
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Lys164_Ter165del".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_frameshift_past_alt_translation_terminal_x_is_synonymous() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 142,
+            end: 141,
+            ref_peptide: "-".into(),
+            alt_peptide: "X".into(),
+            ref_translation: "M".repeat(141),
+            alt_translation: "M".repeat(141),
+            alt_translation_extension: Some("M".repeat(141)),
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.142=".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_frameshift_incomplete_terminal_codon_drops_terminal_x() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 82,
+            end: 83,
+            ref_peptide: "MX".into(),
+            alt_peptide: "X".into(),
+            ref_translation: "M".repeat(82),
+            alt_translation: "M".repeat(81),
+            alt_translation_extension: Some("M".repeat(81)),
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Met82del".to_string())
         );
     }
 
