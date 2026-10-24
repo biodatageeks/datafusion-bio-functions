@@ -4933,12 +4933,12 @@ fn mutated_cds_stop_preserved(
     // lost. Keep the existing flank-based insertion handling, where the
     // source has a TODO for insertion-specific span semantics.
     let (cds_idx, ref_len) = if variant.start > variant.end {
-        let anchor = if tx.strand >= 0 {
-            variant.end
-        } else {
+        let var_start_genomic = if tx.strand >= 0 {
             variant.start
+        } else {
+            variant.end
         };
-        let Some(raw_cds_idx) = genomic_to_cds_index(tx, tx_exons, anchor) else {
+        let Some(raw_cds_idx) = genomic_to_cds_index(tx, tx_exons, var_start_genomic) else {
             return false;
         };
         let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
@@ -4954,9 +4954,26 @@ fn mutated_cds_stop_preserved(
         );
         let span = vep_coords::VepSpan::from_variant(variant);
         let mapped_cdna = mapper.cdna(span);
-        let (Some(cdna_start), Some(cdna_end), Some(cds_start)) =
-            (mapped_cdna.start, mapped_cdna.end, mapper.cds(span).start)
-        else {
+        let (Some(cdna_start), Some(cdna_end)) = (mapped_cdna.start, mapped_cdna.end) else {
+            return false;
+        };
+        let cds_start = mapper.cds(span).start.or_else(|| {
+            // Legacy cache rows can carry genomic CDS bounds without cDNA
+            // coding bounds. VEP still maps `cds_start` for these transcripts.
+            let var_start_genomic = if tx.strand >= 0 {
+                variant.start
+            } else {
+                variant.end
+            };
+            let raw_cds_idx = genomic_to_cds_index(tx, tx_exons, var_start_genomic)?;
+            let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
+            Some(
+                adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset)
+                    .unwrap_or(raw_cds_idx)
+                    .saturating_add(1),
+            )
+        });
+        let Some(cds_start) = cds_start else {
             return false;
         };
         let Some(ref_len) = cdna_end
