@@ -2678,10 +2678,19 @@ fn resolve_frameshift_hgvs(
         // and `type = "del"` in this branch, then returns. Preserve the
         // clipped reference range and coordinates initialized from context,
         // except for the terminal stop that Ensembl Core removes from peptide
-        // translations.
+        // translations. In this path the local peptide window can encode that
+        // stop as BioPerl's `X`, or omit it from the allele while retaining its
+        // coordinate in `end`.
         notation.alt_allele = "del".to_string();
-        if notation.ref_allele.ends_with('*') {
-            notation.ref_allele.pop();
+        let terminal_stop = if protein.ref_translation.ends_with('*') {
+            protein.ref_translation.len()
+        } else {
+            protein.ref_translation.len().saturating_add(1)
+        };
+        if notation.end == terminal_stop {
+            if matches!(notation.ref_allele.chars().last(), Some('*' | 'X')) {
+                notation.ref_allele.pop();
+            }
             notation.end = notation.end.saturating_sub(1);
         }
         return Some(());
@@ -8226,6 +8235,29 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ala2del".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_frameshift_past_alt_translation_drops_unrepresented_terminal_stop() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 132,
+            end: 133,
+            ref_peptide: "EX".into(),
+            alt_peptide: "-".into(),
+            ref_translation: "M".repeat(132),
+            alt_translation: "M".repeat(131),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Glu132del".to_string())
         );
     }
 
