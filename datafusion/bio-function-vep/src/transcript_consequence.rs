@@ -2010,7 +2010,12 @@ impl TranscriptConsequenceEngine {
         let mut terms = BTreeSet::new();
         let is_ins = variant.ref_allele == "-";
         let mut coding_class = None;
-        if refseq_mapped_cdna_endpoints_outside_unedited_length(tx, tx_exons, variant) {
+        if refseq_mapped_cdna_endpoints_outside_unedited_length(
+            tx,
+            tx_exons,
+            variant,
+            tx_translation,
+        ) {
             // VEP's cache dumper removes `edits_enabled` from the serialized
             // Transcript. Cache loading restores that object directly, and
             // Core's getter returns the missing field as false, so
@@ -10274,6 +10279,7 @@ fn refseq_mapped_cdna_endpoints_outside_unedited_length(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     variant: &VariantInput,
+    tx_translation: Option<&TranslationFeature>,
 ) -> bool {
     if !prefers_exon_geometry_over_mapper(tx) || tx.refseq_edits.is_empty() {
         return false;
@@ -10291,9 +10297,33 @@ fn refseq_mapped_cdna_endpoints_outside_unedited_length(
         // their own transcript-variation predicates and default handling.
         return false;
     };
-    ![start, end]
+    let outside_transcript = ![start, end]
         .into_iter()
-        .any(|position| position > 0 && position <= transcript_length)
+        .any(|position| position > 0 && position <= transcript_length);
+    if !outside_transcript {
+        return false;
+    }
+
+    // VEP tests `within_cds` independently of `within_cdna`. A mapper
+    // coordinate beyond Transcript::length can still be a coding coordinate
+    // when a RefSeq edit extends the mapper after the unedited exon sum.
+    // Preserve that transcript consequence if any CDS mapper piece overlaps
+    // the translateable sequence.
+    let Some(translateable_length) =
+        cached_translateable_seq_for_vep(tx, tx_translation).map(|sequence| sequence.len())
+    else {
+        return true;
+    };
+    let mapper = vep_coords::VepTxMapper::new(tx, tx_exons, None, vep_coords::CdnaBaseMap::Output);
+    !mapper
+        .cds_pieces(vep_coords::VepSpan::from_variant(variant))
+        .iter()
+        .any(|piece| match piece {
+            vep_coords::MapperPiece::Coord { start, end } => {
+                *end > 0 && *start <= translateable_length
+            }
+            vep_coords::MapperPiece::Gap => false,
+        })
 }
 
 /// Return `tx.cdna_mapper_segments` in genomic-sorted order, borrowing the
@@ -13993,6 +14023,59 @@ mod tests {
 
         assert_eq!(terms, vec![SoTerm::IntergenicVariant]);
         assert!(classification.is_none());
+    }
+
+    #[test]
+    fn refseq_cdna_endpoint_outside_transcript_length_remains_coding_within_cds() {
+        let mut transcript = tx(
+            "NM_OUTSIDE_CDNA_CDS.1",
+            "1",
+            100,
+            109,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(109),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_rna_edit = true;
+        transcript.cdna_coding_start = Some(11);
+        transcript.cdna_coding_end = Some(20);
+        transcript.translateable_seq = Some("A".repeat(10));
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 1,
+            end: 0,
+            replacement_len: Some(10),
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 100,
+            genomic_end: 109,
+            cdna_start: 11,
+            cdna_end: 20,
+            ori: 1,
+        }];
+        let exons_owned = [exon("NM_OUTSIDE_CDNA_CDS.1", 1, 100, 109)];
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = var("1", 104, 104, "A", "C");
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        assert!(!refseq_mapped_cdna_endpoints_outside_unedited_length(
+            &transcript,
+            &exons,
+            &variant,
+            None,
+        ));
+        let (terms, _) = engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
+
+        assert!(terms.contains(&SoTerm::CodingSequenceVariant), "{terms:?}");
+        assert!(!terms.contains(&SoTerm::IntergenicVariant), "{terms:?}");
     }
 
     #[test]
