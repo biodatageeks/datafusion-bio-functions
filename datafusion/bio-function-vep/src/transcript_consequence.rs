@@ -5366,21 +5366,22 @@ fn apply_vep116_stop_predicate_flags(
     // VEP's ref_eq_alt_sequence has a terminal insertion fast path: when the
     // insertion maps past the translated reference and the alternate peptide
     // starts with '*', it retains the terminal stop. The local window can
-    // carry a trailing partial-codon X even though this fast path is about the
-    // leading stop; accept that stop-only partial tail here.
+    // be empty (`*`) or carry only a trailing partial-codon X even though this
+    // fast path is about the leading stop. Preserve that shortcut even when
+    // the local coding window ends in a partial codon.
     let terminal_stop_after_translation = ref_peptide == Some("-")
         && alt_peptide.is_some_and(|alternate| {
             alternate
                 .strip_prefix('*')
-                .is_some_and(|tail| !tail.is_empty() && tail.chars().all(|aa| aa == 'X'))
+                .is_some_and(|tail| tail.chars().all(|aa| aa == 'X'))
         })
         && ref_eq_alt_sequence;
-    let stop_retained = !partial_terminal_codon
-        && !stop_lost
+    let stop_retained = !stop_lost
         && (terminal_stop_after_translation
-            || alt_peptide.is_some_and(|alternate| {
-                !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
-            }));
+            || (!partial_terminal_codon
+                && alt_peptide.is_some_and(|alternate| {
+                    !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
+                })));
     let stop_gained = !stop_retained
         && !stop_lost
         && ref_peptide.is_some_and(|reference| !reference.contains('*'))
@@ -13366,6 +13367,29 @@ mod tests {
             &mut insertion,
             crate::vep_semantics::VepSemantics::V116,
             false,
+            ref_eq_alt,
+        );
+        assert!(insertion.stop_retained, "{insertion:?}");
+        assert!(!insertion.stop_gained, "{insertion:?}");
+    }
+
+    #[test]
+    fn vep116_terminal_insertion_retains_stop_with_empty_tail_and_partial_terminal_codon() {
+        let mut insertion = CodingClassification {
+            protein_position_start: Some(756),
+            protein_position_end: Some(757),
+            affected_ref_peptide: Some("-".to_string()),
+            affected_alt_peptide: Some("*".to_string()),
+            ..Default::default()
+        };
+        let reference = vec!['A'; 756];
+        let ref_eq_alt = vep116_ref_eq_alt_sequence_for_class(&insertion, &reference, 755, true);
+        assert!(ref_eq_alt);
+
+        apply_vep116_stop_predicate_flags(
+            &mut insertion,
+            crate::vep_semantics::VepSemantics::V116,
+            true,
             ref_eq_alt,
         );
         assert!(insertion.stop_retained, "{insertion:?}");
