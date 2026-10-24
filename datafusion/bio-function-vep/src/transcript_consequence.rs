@@ -2010,6 +2010,27 @@ impl TranscriptConsequenceEngine {
         let mut terms = BTreeSet::new();
         let is_ins = variant.ref_allele == "-";
         let mut coding_class = None;
+        // VEP evaluates splice and intron predicates on each differing region
+        // even when the edited cDNA endpoints fall outside Transcript::length.
+        // Compute these effects before that early fallback so it uses the same
+        // per-region path as the ordinary overlap branch.
+        // Trimming never lengthens an allele, so the raw lengths cheaply skip
+        // single-base alleles and indels that cannot have multiple regions.
+        let multi_region_effects =
+            (tx_exons.len() >= 2 && variant.ref_allele.len() > 1 && variant.alt_allele.len() > 1)
+                .then(|| {
+                    vep_multi_region_intron_effects(
+                        &VariantInput::from_vcf(
+                            variant.chrom.clone(),
+                            variant.start,
+                            variant.end,
+                            variant.ref_allele.clone(),
+                            variant.alt_allele.clone(),
+                        ),
+                        tx_exons,
+                    )
+                })
+                .flatten();
         if refseq_mapped_cdna_endpoints_outside_unedited_length(
             tx,
             tx_exons,
@@ -2023,7 +2044,14 @@ impl TranscriptConsequenceEngine {
             // VEP's `_intron_overlap` checks splice-region exonic margins
             // independently of `within_cdna`, so retain those terms before
             // falling back when the edited mapper endpoint exceeds this sum.
-            self.add_intron_splice_terms(&mut terms, variant, tx, tx_exons, None);
+            self.add_intron_splice_terms(
+                &mut terms,
+                variant,
+                tx,
+                tx_exons,
+                multi_region_effects.as_ref(),
+            );
+            strip_parent_terms_with_semantics(&mut terms, self.semantics);
             if terms.is_empty() {
                 terms.insert(SoTerm::IntergenicVariant);
             }
@@ -2115,23 +2143,6 @@ impl TranscriptConsequenceEngine {
         // span gets every intron and splice flag from VEP's per-region
         // `_intron_effects`, `intron_variant` included (`within_intron` reads
         // its `intronic` flag, VariationEffect.pm:629-634 @ 2fb834b).
-        // Trimming never lengthens an allele, so the raw lengths are a cheap
-        // necessary test that keeps SNVs and indels off the allocation.
-        let multi_region_effects =
-            (tx_exons.len() >= 2 && variant.ref_allele.len() > 1 && variant.alt_allele.len() > 1)
-                .then(|| {
-                    vep_multi_region_intron_effects(
-                        &VariantInput::from_vcf(
-                            variant.chrom.clone(),
-                            variant.start,
-                            variant.end,
-                            variant.ref_allele.clone(),
-                            variant.alt_allele.clone(),
-                        ),
-                        tx_exons,
-                    )
-                })
-                .flatten();
         let overlaps_intron = match multi_region_effects.as_ref() {
             Some(effects) => effects.intronic,
             None => self.variant_overlaps_intron(variant, tx_exons),
@@ -24969,6 +24980,97 @@ mod tests {
 
         assert!(terms.contains(&SoTerm::SpliceRegionVariant));
         assert!(!terms.contains(&SoTerm::IntergenicVariant));
+        assert!(coding_class.is_none());
+    }
+
+    #[test]
+    fn refseq_mapped_endpoint_outside_length_uses_differing_regions_for_splice_terms() {
+        let engine = TranscriptConsequenceEngine::default();
+        let mut transcript = tx(
+            "NM_OUTSIDE_MULTI_REGION.1",
+            "1",
+            100,
+            209,
+            1,
+            "lncRNA",
+            None,
+            None,
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 5,
+            end: 4,
+            replacement_len: Some(15),
+            skip_refseq_offset: false,
+        }];
+        let exons_owned = [
+            exon("NM_OUTSIDE_MULTI_REGION.1", 1, 100, 109),
+            exon("NM_OUTSIDE_MULTI_REGION.1", 2, 200, 209),
+        ];
+        let exons: Vec<&ExonFeature> = exons_owned.iter().collect();
+        let variants = [
+            // VEP's differing positions are 202 and 204. The latter clears
+            // the splice-region flag set by the first region.
+            var("1", 202, 203, "CT", "TTA"),
+            // Only position 204 differs, outside the exonic splice margin.
+            var("1", 200, 204, "AAAAA", "AAAAT"),
+        ];
+
+        for variant in variants {
+            assert!(refseq_mapped_cdna_endpoints_outside_unedited_length(
+                &transcript,
+                &exons,
+                &variant,
+                None,
+            ));
+            let (terms, coding_class) =
+                engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
+
+            assert_eq!(terms, vec![SoTerm::IntergenicVariant], "{variant:?}");
+            assert!(coding_class.is_none());
+        }
+    }
+
+    #[test]
+    fn refseq_mapped_endpoint_outside_length_strips_parent_splice_region_term() {
+        let engine = TranscriptConsequenceEngine::default();
+        let mut transcript = tx(
+            "NM_OUTSIDE_SPLICE_PARENT.1",
+            "1",
+            1000,
+            1300,
+            1,
+            "lncRNA",
+            None,
+            None,
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 5,
+            end: 4,
+            replacement_len: Some(500),
+            skip_refseq_offset: false,
+        }];
+        let exons_owned = [
+            exon("NM_OUTSIDE_SPLICE_PARENT.1", 1, 1000, 1099),
+            exon("NM_OUTSIDE_SPLICE_PARENT.1", 2, 1200, 1300),
+        ];
+        let exons: Vec<&ExonFeature> = exons_owned.iter().collect();
+        let ref_allele = "A".repeat(105);
+        let variant = var("1", 1098, 1202, &ref_allele, "A");
+
+        assert!(refseq_mapped_cdna_endpoints_outside_unedited_length(
+            &transcript,
+            &exons,
+            &variant,
+            None,
+        ));
+        let (terms, coding_class) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
+
+        assert!(terms.contains(&SoTerm::SpliceDonorVariant), "{terms:?}");
+        assert!(terms.contains(&SoTerm::SpliceAcceptorVariant), "{terms:?}");
+        assert!(!terms.contains(&SoTerm::SpliceRegionVariant), "{terms:?}");
         assert!(coding_class.is_none());
     }
 
