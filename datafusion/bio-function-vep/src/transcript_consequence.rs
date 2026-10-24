@@ -5398,7 +5398,8 @@ fn apply_vep116_nucleotide_stop_fallbacks(
         .affected_alt_peptide
         .as_deref()
         .is_some_and(|peptide| !peptide.is_empty() && !peptide.contains('X'));
-    if !stop_retained_uses_peptides
+    if !partial_terminal_codon
+        && !stop_retained_uses_peptides
         && vep116_stop_retained_without_alt_peptide(tx, tx_exons, tx_translation, variant)
     {
         class.stop_gained = false;
@@ -5843,6 +5844,7 @@ fn vep116_ref_eq_alt_sequence_for_class(
     class: &CodingClassification,
     ref_translation: &[char],
     translation_start: usize,
+    insertion: bool,
 ) -> bool {
     // VEP passes `$bvfo->_peptide` here. Ensembl's transcript translation
     // excludes the terminal stop, while our CDS translation retains it.
@@ -5850,6 +5852,14 @@ fn vep116_ref_eq_alt_sequence_for_class(
     let ref_translation = ref_translation
         .strip_suffix(&['*'])
         .unwrap_or(ref_translation);
+    let translation_start = if insertion {
+        class
+            .protein_position_end
+            .and_then(|position| position.checked_sub(1))
+            .unwrap_or(translation_start)
+    } else {
+        translation_start
+    };
     match (
         class.affected_ref_peptide.as_deref(),
         class.affected_alt_peptide.as_deref(),
@@ -8608,7 +8618,7 @@ fn classify_coding_change_with_semantics(
     }
 
     let vep116_ref_eq_alt_sequence =
-        vep116_ref_eq_alt_sequence_for_class(&class, &old_aas, local_first_codon);
+        vep116_ref_eq_alt_sequence_for_class(&class, &old_aas, local_first_codon, ref_len == 0);
     apply_vep116_stop_predicate_flags(
         &mut class,
         semantics,
@@ -9433,7 +9443,7 @@ fn classify_insertion_with_semantics_and_gap(
         }
     }
     let vep116_ref_eq_alt_sequence =
-        vep116_ref_eq_alt_sequence_for_class(&class, &old_aas, codon_at);
+        vep116_ref_eq_alt_sequence_for_class(&class, &old_aas, codon_at, true);
     apply_vep116_stop_predicate_flags(
         &mut class,
         semantics,
@@ -13245,6 +13255,22 @@ mod tests {
             &terminal_insertion,
             &['A', 'T', 'L', '*'],
             1,
+            false,
+        ));
+    }
+
+    #[test]
+    fn vep116_insertion_ref_eq_alt_uses_post_insertion_protein_flank() {
+        let insertion = CodingClassification {
+            protein_position_start: Some(756),
+            protein_position_end: Some(757),
+            affected_ref_peptide: Some("-".to_string()),
+            affected_alt_peptide: Some("*".to_string()),
+            ..Default::default()
+        };
+        let reference = vec!['A'; 756];
+        assert!(vep116_ref_eq_alt_sequence_for_class(
+            &insertion, &reference, 755, true,
         ));
     }
 
@@ -21630,9 +21656,8 @@ mod tests {
             &stop_runoff,
         ));
 
-        // VEP's no-peptide stop_retained expression has no partial-codon
-        // guard. The outer CIL overlap remains true when an endpoint is a
-        // mapper Gap, because the nested nucleotide helper returns false.
+        // VEP's stop_retained predicate rejects partial terminal codons
+        // before evaluating its no-peptide CIL fallback.
         let mut stop_retained = CodingClassification::default();
         apply_vep116_nucleotide_stop_fallbacks(
             &mut stop_retained,
@@ -21643,7 +21668,7 @@ mod tests {
             Some(&translation),
             &stop_runoff,
         );
-        assert!(stop_retained.stop_retained, "{stop_retained:?}");
+        assert!(!stop_retained.stop_retained, "{stop_retained:?}");
 
         // The two partial-CDS attributes independently veto their codon
         // overlap predicates.
