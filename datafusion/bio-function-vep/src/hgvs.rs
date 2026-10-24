@@ -1728,6 +1728,8 @@ fn refseq_hgvsc_position_before_first_genomic_exon(
     };
     let upstream_distance = genomic_pos.abs_diff(last.end);
     let downstream_distance = first.start.abs_diff(genomic_pos);
+    // Ensembl `_get_cDNA_position` chooses the upstream exon when distances
+    // tie on the positive strand, and the downstream exon on the negative.
     if upstream_distance < downstream_distance
         || (upstream_distance == downstream_distance && tx.strand >= 0)
     {
@@ -5222,6 +5224,68 @@ mod tests {
         assert_eq!(
             refseq_hgvsc_position_from_genomic(&tx, &[&exon1, &exon2], 100, 10),
             Some("200+10".to_string())
+        );
+    }
+
+    #[test]
+    fn test_refseq_hgvsc_maps_offset_past_positive_strand_terminal_exon() {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "NM_TERMINAL_OFFSET_PLUS.1".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 100;
+        tx.end = 999;
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 199,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 900,
+            end: 999,
+        };
+
+        assert_eq!(
+            refseq_hgvsc_position_from_genomic(&tx, &[&exon1, &exon2], 100, -10),
+            Some("1-10".to_string())
+        );
+    }
+
+    #[test]
+    fn test_edited_refseq_zero_offset_matches_previous_coordinate_path() {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "NM_ZERO_OFFSET.1".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 90;
+        tx.end = 140;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 40,
+            end: 39,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 90,
+            end: 140,
+        };
+        let notation = HgvsNotation {
+            start: 95,
+            end: 95,
+            ref_allele: "A".to_string(),
+            alt_allele: "G".to_string(),
+            kind: "snp".to_string(),
+        };
+        let previous_path = hgvs_cdna_position_from_genomic(&tx, &[&exon], 95);
+
+        assert_eq!(
+            notation_to_hgvsc_coords(&tx, &[&exon], &notation, None),
+            previous_path
+                .clone()
+                .map(|position| (position.clone(), position))
         );
     }
 
