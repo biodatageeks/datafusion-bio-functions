@@ -3009,6 +3009,7 @@ impl TranscriptConsequenceEngine {
         sorted_exons: &[&ExonFeature],
         exon: &ExonFeature,
     ) -> bool {
+        let mut overlaps_intron = false;
         for pair in sorted_exons.windows(2) {
             let intron_start = pair[0].end + 1;
             let intron_end = pair[1].start - 1;
@@ -3022,12 +3023,13 @@ impl TranscriptConsequenceEngine {
                 continue;
             }
             if overlaps(variant.start, variant.end, intron_start, intron_end) {
+                overlaps_intron = true;
                 if (intron_end - intron_start).abs() > 12 {
                     return false; // Non-frameshift intron
                 }
             }
         }
-        true
+        overlaps_intron
     }
 
     fn add_coding_terms(
@@ -21592,6 +21594,84 @@ mod tests {
             &negative_variant,
         ));
         assert_eq!(split_exons_ref.len(), 2);
+    }
+
+    #[test]
+    fn issue_202_terminal_exon_runoff_keeps_vep_cil_stop_retained() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let mut transcript = tx(
+            "ENST00000374152",
+            "1",
+            26728912,
+            26780756,
+            1,
+            "protein_coding",
+            Some(26729663),
+            Some(26780756),
+        );
+        transcript.cdna_coding_start = Some(752);
+        transcript.cdna_coding_end = Some(6460);
+        transcript.translateable_seq = Some("ATG".repeat(1903));
+        let exon_rows = [
+            (26728912, 26729863),
+            (26731152, 26731604),
+            (26732676, 26732792),
+            (26760856, 26761096),
+            (26761384, 26761473),
+            (26762152, 26762319),
+            (26762973, 26763285),
+            (26766221, 26766366),
+            (26766457, 26766566),
+            (26767790, 26767999),
+            (26771119, 26771326),
+            (26772500, 26772632),
+            (26772812, 26772987),
+            (26773346, 26773496),
+            (26773580, 26773717),
+            (26773802, 26773898),
+            (26774329, 26775220),
+            (26775577, 26775707),
+            (26779023, 26780756),
+        ];
+        let exon_rows = exon_rows
+            .iter()
+            .enumerate()
+            .map(|(index, (start, end))| {
+                exon(&transcript.transcript_id, index as i32 + 1, *start, *end)
+            })
+            .collect::<Vec<_>>();
+        let exon_refs = exon_rows.iter().collect::<Vec<_>>();
+        let deletion = VariantInput::from_vcf(
+            "1".into(),
+            26780754,
+            26780765,
+            "TGACAGCCGTGG".into(),
+            "T".into(),
+        );
+
+        assert_eq!((deletion.start, deletion.end), (26780755, 26780765));
+        assert!(!vep_partial_terminal_codon(
+            &transcript,
+            &exon_refs,
+            None,
+            &deletion,
+        ));
+        assert!(vep116_overlaps_stop_codon_cil(&transcript, &deletion, 0));
+        assert!(vep116_stop_retained_without_alt_peptide(
+            &transcript,
+            &exon_refs,
+            None,
+            &deletion,
+        ));
+        assert!(engine.is_complex_indel(&deletion, &exon_refs));
+        let mut terms = BTreeSet::new();
+        engine.add_coding_terms(&mut terms, &deletion, &transcript, &exon_refs, None);
+        assert!(terms.contains(&SoTerm::StopRetainedVariant), "{terms:?}");
     }
 
     /// A start-lost deletion keeps the full reference peptide window. The
