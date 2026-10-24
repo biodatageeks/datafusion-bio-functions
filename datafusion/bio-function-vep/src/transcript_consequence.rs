@@ -8075,6 +8075,22 @@ fn classify_coding_change_with_semantics(
         return None;
     }
 
+    // A partial mapper Gap is an undefined CDS endpoint in VEP's coding
+    // classifier. Keep the transcript-level consequence and partial `?`
+    // coordinates, but do not infer a complete peptide change from only the
+    // mapped side of an allele whose endpoint lies in a deleted RefSeq edit.
+    // Internal deleted-edit gaps remain eligible: when both allele endpoints
+    // map, the mapped CDS span still defines the coding change.
+    if [genomic_positions[0], *genomic_positions.last()?]
+        .into_iter()
+        .any(|pos| {
+            mapper_deleted_gap_cdna_index(tx, tx_exons, pos).is_some()
+                || refseq_deleted_edit_cdna_index(tx, tx_exons, pos).is_some()
+        })
+    {
+        return None;
+    }
+
     // VEP prepends N characters to the CDS sequence when the first coding
     // exon starts mid-codon (non-zero phase).  These Ns align the reading
     // frame to codon boundaries but are not part of the genomic sequence.
@@ -8151,7 +8167,20 @@ fn classify_coding_change_with_semantics(
     let edited_ref_tx = edited_transcript_reference_allele(variant, tx, tx_exons)
         .filter(|seq| seq.len() == input_ref_len);
     let effective_ref_tx = if spans_refseq_edit_gap {
-        ref_seq_slice.clone()
+        if ref_len < input_ref_len {
+            // VEP's `TranscriptVariationAllele::codon()` patches the reference
+            // translateable sequence at the mapped CDS start for `_rna_edit`
+            // transcripts, using the feature REF over the mapped CDS width.
+            // A deleted genomic mapper gap therefore shortens the feature REF
+            // to the first `ref_len` transcript-oriented input bases; the
+            // unmapped genomic bases do not occupy CDS sequence positions.
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L874
+            ref_tx.get(..ref_len)?.to_string()
+        } else {
+            // A transcript-only insertion expands the mapped CDS width. Its
+            // edited spliced sequence supplies those inserted reference bases.
+            ref_seq_slice.clone()
+        }
     } else {
         edited_ref_tx.unwrap_or(ref_tx)
     };
@@ -13696,6 +13725,18 @@ mod tests {
         let (transcript, exons_owned) = make_refseq_coding_deleted_edit_gap();
         let exons = exons_owned.iter().collect::<Vec<_>>();
         let variant = var("1", 103, 104, "AA", "-");
+        let translation = translation("NM_GAP_TEST.1", Some(8), Some(2), None, Some("ATGCCGTA"));
+
+        assert!(
+            classify_coding_change_with_semantics(
+                &transcript,
+                &exons,
+                Some(&translation),
+                &variant,
+                crate::vep_semantics::VepSemantics::V116,
+            )
+            .is_none()
+        );
 
         let (terms, classification) =
             engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
@@ -13705,6 +13746,20 @@ mod tests {
         let classification = classification.expect("mapped endpoint should retain CDS coordinates");
         assert_eq!(classification.cds_position_start, Some(4));
         assert_eq!(classification.cds_position_end, None);
+        assert!(classification.codons.is_none());
+        assert!(classification.amino_acids.is_none());
+        assert!(classification.protein_hgvs.is_none());
+        assert!(!terms.iter().any(|term| {
+            matches!(
+                term,
+                SoTerm::FrameshiftVariant
+                    | SoTerm::InframeInsertion
+                    | SoTerm::InframeDeletion
+                    | SoTerm::MissenseVariant
+                    | SoTerm::SynonymousVariant
+                    | SoTerm::ProteinAlteringVariant
+            )
+        }));
     }
 
     #[test]
@@ -13863,6 +13918,13 @@ mod tests {
 
         assert_eq!(classification.cds_position_start, Some(3));
         assert_eq!(classification.cds_position_end, Some(6));
+        assert!(
+            classification
+                .codons
+                .as_deref()
+                .is_some_and(|codons| codons.contains("AAAA")),
+            "the `_rna_edit` reference codons use the mapped-width feature REF: {classification:?}"
+        );
     }
 
     fn synthetic_qk_dup_cds(
