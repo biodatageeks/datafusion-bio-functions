@@ -5365,16 +5365,11 @@ fn apply_vep116_stop_predicate_flags(
         );
     // VEP's ref_eq_alt_sequence has a terminal insertion fast path: when the
     // insertion maps past the translated reference and the alternate peptide
-    // starts with '*', it retains the terminal stop. The local window can
-    // be empty (`*`) or carry only a trailing partial-codon X even though this
-    // fast path is about the leading stop. Preserve that shortcut even when
-    // the local coding window ends in a partial codon.
+    // starts with '*', it retains the terminal stop. The local window may
+    // carry translated sequence after that stop, but VEP's shortcut only
+    // checks the leading amino acid.
     let terminal_stop_after_translation = ref_peptide == Some("-")
-        && alt_peptide.is_some_and(|alternate| {
-            alternate
-                .strip_prefix('*')
-                .is_some_and(|tail| tail.chars().all(|aa| aa == 'X'))
-        })
+        && alt_peptide.is_some_and(|alternate| alternate.starts_with('*'))
         && ref_eq_alt_sequence;
     let stop_retained = !stop_lost
         && (terminal_stop_after_translation
@@ -9268,16 +9263,21 @@ fn classify_insertion_with_semantics_and_gap(
     // exon-start boundary insertions where only the right genomic flank maps
     // into the CDS and the left side is recovered from the insertion-point
     // CDS coordinates.
-    // A normal insertion anchored on the final coding base has its local
-    // peptide window at the following codon. When that anchor is the exact
-    // end of a complete translated sequence, this is an empty reference
-    // window, not the preceding amino acid. VEP 116's ref_eq_alt_sequence
-    // terminal shortcut depends on that distinction (`tl_start > length(ref)`
-    // and the alternate peptide beginning with `*`).
+    // An insertion immediately after the final translated residue has an
+    // empty reference peptide, even when the CDS still contains its terminal
+    // stop codon. This covers both the CDS end and the boundary before that
+    // stop. VEP 116's ref_eq_alt_sequence shortcut uses this empty peptide
+    // with a translation start beyond the reference and an alternate peptide
+    // beginning with `*`.
     // <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1326-L1345>
+    let terminal_stop_start = old_aas
+        .last()
+        .filter(|&&amino_acid| amino_acid == '*')
+        .and_then(|_| old_aas.len().checked_sub(1))
+        .and_then(|index| index.checked_mul(3));
     let insertion_after_translated_reference = !replace_refseq_mapper_gap
-        && ins_point == effective_cds.len()
-        && ins_point.is_multiple_of(3);
+        && ins_point.is_multiple_of(3)
+        && (ins_point == effective_cds.len() || terminal_stop_start == Some(ins_point));
     let codon_at = if replace_refseq_mapper_gap || insertion_after_translated_reference {
         ins_point / 3
     } else {
@@ -9422,20 +9422,20 @@ fn classify_insertion_with_semantics_and_gap(
     } else {
         Vec::new()
     };
-    if has_reference_codon_window {
+    if insertion_after_translated_reference {
+        let alt_end = codon_start
+            .saturating_add(codon_window_len)
+            .min(mutated.len());
+        class.affected_ref_peptide = Some("-".to_string());
+        class.affected_alt_peptide =
+            local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
+    } else if has_reference_codon_window {
         let ref_end = codon_start.saturating_add(3).min(effective_cds.len());
         let alt_end = codon_start
             .saturating_add(codon_window_len)
             .min(mutated.len());
         class.affected_ref_peptide =
             local_peptide_from_codon_window(tx.codon_table, &effective_cds[codon_start..ref_end]);
-        class.affected_alt_peptide =
-            local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
-    } else if insertion_after_translated_reference {
-        let alt_end = codon_start
-            .saturating_add(codon_window_len)
-            .min(mutated.len());
-        class.affected_ref_peptide = Some("-".to_string());
         class.affected_alt_peptide =
             local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
     }
@@ -29054,7 +29054,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_202_v116_frameshift_insertion_before_terminal_stop_keeps_partial_tail() {
+    fn issue_202_v116_insertion_before_terminal_stop_uses_empty_reference_peptide() {
         let cds = "ATGGCTGAATGA";
         let transcript = tx(
             "T_V116_TERMINAL_FRAMESHIFT_INSERTION",
@@ -29089,11 +29089,16 @@ mod tests {
         )
         .expect("terminal insertion should be classified");
 
-        assert_eq!(class.affected_ref_peptide.as_deref(), Some("E"));
-        assert_eq!(class.affected_alt_peptide.as_deref(), Some("E*X"));
-        assert!(!class.stop_retained, "{class:?}");
-        assert!(class.stop_gained, "{class:?}");
-        assert!(frameshift_under_semantics(
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("-"));
+        assert!(
+            class
+                .affected_alt_peptide
+                .as_deref()
+                .is_some_and(|peptide| peptide.starts_with('*'))
+        );
+        assert!(class.stop_retained, "{class:?}");
+        assert!(!class.stop_gained, "{class:?}");
+        assert!(!frameshift_under_semantics(
             true,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -29142,6 +29147,59 @@ mod tests {
 
         assert_eq!(class.affected_ref_peptide.as_deref(), Some("-"));
         assert_eq!(class.affected_alt_peptide.as_deref(), Some("*"));
+        assert!(class.stop_retained, "{class:?}");
+        assert!(!class.stop_gained, "{class:?}");
+        assert!(!frameshift_under_semantics(
+            true,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        ));
+    }
+
+    #[test]
+    fn issue_202_v116_insertion_before_terminal_stop_is_after_translation() {
+        let cds = "ATGGCTTAA";
+        let transcript = tx(
+            "T_V116_BEFORE_TERMINAL_STOP_INSERTION",
+            "22",
+            1000,
+            1010,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        let exon = exon("T_V116_BEFORE_TERMINAL_STOP_INSERTION", 1, 1000, 1010);
+        let exons = [&exon];
+        let translation = translation(
+            "T_V116_BEFORE_TERMINAL_STOP_INSERTION",
+            Some(cds.len()),
+            Some(3),
+            Some("MA"),
+            Some(cds),
+        );
+        let insertion = var("22", 1006, 1006, "-", "TAAA");
+
+        let class = classify_insertion_with_semantics_and_gap(
+            &transcript,
+            &exons,
+            Some(&translation),
+            cds,
+            &insertion,
+            "TAAA",
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        )
+        .expect("insertion before the terminal stop should be classified");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("-"));
+        assert!(
+            class
+                .affected_alt_peptide
+                .as_deref()
+                .is_some_and(|peptide| peptide.starts_with('*'))
+        );
         assert!(class.stop_retained, "{class:?}");
         assert!(!class.stop_gained, "{class:?}");
         assert!(!frameshift_under_semantics(
