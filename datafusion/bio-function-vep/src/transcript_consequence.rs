@@ -5363,11 +5363,24 @@ fn apply_vep116_stop_predicate_flags(
                     && reference.contains('*')
                     && !alternate.contains('*')
         );
+    // VEP's ref_eq_alt_sequence has a terminal insertion fast path: when the
+    // insertion maps past the translated reference and the alternate peptide
+    // starts with '*', it retains the terminal stop. The local window can
+    // carry a trailing partial-codon X even though this fast path is about the
+    // leading stop; accept that stop-only partial tail here.
+    let terminal_stop_after_translation = ref_peptide == Some("-")
+        && alt_peptide.is_some_and(|alternate| {
+            alternate
+                .strip_prefix('*')
+                .is_some_and(|tail| !tail.is_empty() && tail.chars().all(|aa| aa == 'X'))
+        })
+        && ref_eq_alt_sequence;
     let stop_retained = !partial_terminal_codon
         && !stop_lost
-        && alt_peptide.is_some_and(|alternate| {
-            !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
-        });
+        && (terminal_stop_after_translation
+            || alt_peptide.is_some_and(|alternate| {
+                !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
+            }));
     let stop_gained = !stop_retained
         && !stop_lost
         && ref_peptide.is_some_and(|reference| !reference.contains('*'))
@@ -6059,7 +6072,7 @@ fn local_peptide_from_codon_window(table: CodonTable, codon: &[u8]) -> Option<St
             .into_iter()
             .collect()
     };
-    if !partial.is_empty() && !peptide.contains('*') {
+    if !partial.is_empty() && peptide != "*" {
         peptide.push('X');
     }
     if peptide.is_empty() {
@@ -13337,6 +13350,29 @@ mod tests {
     }
 
     #[test]
+    fn vep116_terminal_insertion_uses_post_translation_stop_with_partial_tail() {
+        let mut insertion = CodingClassification {
+            protein_position_start: Some(756),
+            protein_position_end: Some(757),
+            affected_ref_peptide: Some("-".to_string()),
+            affected_alt_peptide: Some("*X".to_string()),
+            ..Default::default()
+        };
+        let reference = vec!['A'; 756];
+        let ref_eq_alt = vep116_ref_eq_alt_sequence_for_class(&insertion, &reference, 755, true);
+        assert!(ref_eq_alt);
+
+        apply_vep116_stop_predicate_flags(
+            &mut insertion,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+            ref_eq_alt,
+        );
+        assert!(insertion.stop_retained, "{insertion:?}");
+        assert!(!insertion.stop_gained, "{insertion:?}");
+    }
+
+    #[test]
     fn vep116_hunk9_rejects_frameshift_when_reference_peptide_starts_stop() {
         let class = CodingClassification {
             affected_ref_peptide: Some("*Q".to_string()),
@@ -17669,10 +17705,10 @@ mod tests {
     }
 
     #[test]
-    fn partial_codon_after_terminal_stop_does_not_append_x() {
+    fn partial_codon_after_preceding_residue_and_stop_appends_x() {
         assert_eq!(
             local_peptide_from_codon_window(CodonTable::Standard, b"GCTTAAC").as_deref(),
-            Some("A*")
+            Some("A*X")
         );
     }
 
@@ -28977,7 +29013,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_202_v116_frameshift_insertion_before_terminal_stop_ignores_partial_tail() {
+    fn issue_202_v116_frameshift_insertion_before_terminal_stop_keeps_partial_tail() {
         let cds = "ATGGCTGAATGA";
         let transcript = tx(
             "T_V116_TERMINAL_FRAMESHIFT_INSERTION",
@@ -29013,10 +29049,10 @@ mod tests {
         .expect("terminal insertion should be classified");
 
         assert_eq!(class.affected_ref_peptide.as_deref(), Some("E"));
-        assert_eq!(class.affected_alt_peptide.as_deref(), Some("E*"));
-        assert!(class.stop_retained, "{class:?}");
-        assert!(!class.stop_gained, "{class:?}");
-        assert!(!frameshift_under_semantics(
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("E*X"));
+        assert!(!class.stop_retained, "{class:?}");
+        assert!(class.stop_gained, "{class:?}");
+        assert!(frameshift_under_semantics(
             true,
             &class,
             crate::vep_semantics::VepSemantics::V116,
