@@ -1506,7 +1506,13 @@ impl TranscriptConsequenceEngine {
                                     )
                                 };
                                 let codons = cc.codons.clone();
-                                let amino_acids = amino_acids_for_output(tx, tx_translation, cc);
+                                let amino_acids = amino_acids_for_output(
+                                    tx,
+                                    tx_translation,
+                                    cc,
+                                    variant,
+                                    self.semantics,
+                                );
                                 let protein_hgvs = protein_hgvs_for_output_with_semantics(
                                     tx,
                                     tx_exons,
@@ -6428,7 +6434,15 @@ fn amino_acids_for_output(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
     class: &CodingClassification,
+    variant: &VariantInput,
+    semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<String> {
+    if semantics.vep116_stop_predicates()
+        && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
+    {
+        return None;
+    }
+
     let codon_amino_acids = class
         .codons
         .as_deref()
@@ -19842,7 +19856,14 @@ mod tests {
         };
 
         assert_eq!(
-            amino_acids_for_output(&t, Some(&tr), &class).as_deref(),
+            amino_acids_for_output(
+                &t,
+                Some(&tr),
+                &class,
+                &var("12", 102, 102, "G", "A"),
+                crate::vep_semantics::VepSemantics::V115,
+            )
+            .as_deref(),
             Some("R")
         );
     }
@@ -30247,6 +30268,59 @@ mod tests {
             |class| class.amino_acids.is_some() && class.affected_alt_peptide.is_some()
         ));
         assert!(acgt_terms.contains(&SoTerm::MissenseVariant));
+    }
+
+    #[test]
+    fn issue_208_ambiguous_alt_suppresses_codon_derived_amino_acids() {
+        let transcript = tx(
+            "T_ISSUE_208_OUTPUT",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        let translation = translation(
+            "T_ISSUE_208_OUTPUT",
+            Some(12),
+            Some(4),
+            None,
+            Some("ATGGCTGAATAA"),
+        );
+        let class = CodingClassification {
+            codons: Some("gct/gNt".to_string()),
+            ..CodingClassification::default()
+        };
+        let ambiguous_alt = var("22", 1003, 1003, "G", "N");
+        assert!(
+            amino_acids_for_output(
+                &transcript,
+                Some(&translation),
+                &class,
+                &ambiguous_alt,
+                crate::vep_semantics::VepSemantics::V116,
+            )
+            .is_none(),
+            "Codons remain available, but VEP exposes no ALT peptide for N"
+        );
+
+        let acgt_alt = var("22", 1003, 1003, "G", "T");
+        let acgt_class = CodingClassification {
+            codons: Some("gct/gtt".to_string()),
+            ..CodingClassification::default()
+        };
+        assert!(
+            amino_acids_for_output(
+                &transcript,
+                Some(&translation),
+                &acgt_class,
+                &acgt_alt,
+                crate::vep_semantics::VepSemantics::V116,
+            )
+            .is_some()
+        );
     }
 
     #[test]
