@@ -2010,11 +2010,11 @@ impl TranscriptConsequenceEngine {
         let mut terms = BTreeSet::new();
         let is_ins = variant.ref_allele == "-";
         let mut coding_class = None;
-        if refseq_mapped_cdna_endpoints_outside_transcript_length(tx, tx_exons, variant) {
-            // Ensembl Core's Transcript constructor enables sequence edits by
-            // default, and Transcript::length adds every SeqEdit::length_diff.
-            // The cache dumper removes the serialized flag, but that does not
-            // disable the edits on the reconstructed Transcript.
+        if refseq_mapped_cdna_endpoints_outside_unedited_length(tx, tx_exons, variant) {
+            // VEP's cache dumper removes `edits_enabled` from the serialized
+            // Transcript. Cache loading restores that object directly, and
+            // Core's getter returns the missing field as false, so
+            // Transcript::length is the unedited exon sum here.
             return (vec![SoTerm::IntergenicVariant], None);
         }
         let deleted_gap_started = profiling.then(Instant::now);
@@ -10270,7 +10270,7 @@ fn prefers_exon_geometry_over_mapper(tx: &TranscriptFeature) -> bool {
         )
 }
 
-fn refseq_mapped_cdna_endpoints_outside_transcript_length(
+fn refseq_mapped_cdna_endpoints_outside_unedited_length(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     variant: &VariantInput,
@@ -10278,21 +10278,10 @@ fn refseq_mapped_cdna_endpoints_outside_transcript_length(
     if !prefers_exon_geometry_over_mapper(tx) || tx.refseq_edits.is_empty() {
         return false;
     }
-    let Some(exon_length) = tx_exons.iter().try_fold(0usize, |length, exon| {
+    let Some(transcript_length) = tx_exons.iter().try_fold(0usize, |length, exon| {
         let exon_len = usize::try_from(exon.end.checked_sub(exon.start)?.checked_add(1)?).ok()?;
         length.checked_add(exon_len)
     }) else {
-        return false;
-    };
-    let Some(transcript_length) = i64::try_from(exon_length)
-        .ok()
-        .and_then(|length| {
-            tx.refseq_edits.iter().try_fold(length, |length, edit| {
-                length.checked_add(refseq_edit_length_delta(edit)?)
-            })
-        })
-        .and_then(|length| usize::try_from(length).ok())
-    else {
         return false;
     };
     let coords = vep_coords::VepTxMapper::new(tx, tx_exons, None, vep_coords::CdnaBaseMap::Output)
@@ -13960,7 +13949,7 @@ mod tests {
     }
 
     #[test]
-    fn refseq_cdna_endpoint_within_edit_adjusted_transcript_length_is_annotated() {
+    fn refseq_cdna_endpoint_past_unedited_transcript_length_is_intergenic() {
         let mut transcript = tx(
             "NM_OUTSIDE_CDNA.1",
             "1",
@@ -13999,13 +13988,11 @@ mod tests {
             crate::vep_semantics::VepSemantics::V116,
         );
 
-        let (terms, _) = engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
 
-        assert!(
-            terms.contains(&SoTerm::CodingSequenceVariant),
-            "a cDNA endpoint within Transcript::length, including SeqEdit length changes, must remain annotated: {terms:?}"
-        );
-        assert!(!terms.contains(&SoTerm::IntergenicVariant), "{terms:?}");
+        assert_eq!(terms, vec![SoTerm::IntergenicVariant]);
+        assert!(classification.is_none());
     }
 
     #[test]
