@@ -8084,8 +8084,23 @@ fn classify_coding_change_with_semantics(
 
     let mut raw_cds_indices = Vec::with_capacity(genomic_positions.len());
     let mut cds_indices = Vec::with_capacity(genomic_positions.len());
+    let mut spans_refseq_edit_gap = false;
     for pos in &genomic_positions {
-        let raw_idx = genomic_to_cds_index(tx, tx_exons, *pos)?.saturating_add(leading_n_offset);
+        let Some(raw_cds_index) = genomic_to_cds_index(tx, tx_exons, *pos) else {
+            // A genomic allele may span bases removed from the RefSeq
+            // transcript by a successful BAM edit. Those bases have no CDS
+            // coordinate; the surrounding mapped bases still define the
+            // affected transcript sequence. Require the mapper's in-exon gap
+            // proof so a true intron or arbitrary unmapped base stays unmapped.
+            if mapper_deleted_gap_cdna_index(tx, tx_exons, *pos).is_some()
+                || refseq_deleted_edit_cdna_index(tx, tx_exons, *pos).is_some()
+            {
+                spans_refseq_edit_gap = true;
+                continue;
+            }
+            return None;
+        };
+        let raw_idx = raw_cds_index.saturating_add(leading_n_offset);
         raw_cds_indices.push(raw_idx);
         cds_indices.push(
             adjust_refseq_cds_sequence_index(tx, raw_idx, leading_n_offset).unwrap_or(raw_idx),
@@ -8093,14 +8108,13 @@ fn classify_coding_change_with_semantics(
     }
     raw_cds_indices.sort_unstable();
     cds_indices.sort_unstable();
-    let mut spans_inserted_edit_gap = false;
     for window in cds_indices.windows(2) {
         if window[1] <= window[0] {
             return None;
         }
         if window[1] != window[0].saturating_add(1) {
             if refseq_inserted_cds_gap_between(tx, window[0], window[1], leading_n_offset) {
-                spans_inserted_edit_gap = true;
+                spans_refseq_edit_gap = true;
             } else {
                 return None;
             }
@@ -8113,10 +8127,10 @@ fn classify_coding_change_with_semantics(
     if end_idx >= cds_seq.len() {
         return None;
     }
-    // A successful BAM edit can insert transcript-only bases between two
-    // genomic positions. The coding allele then spans those cDNA bases even
-    // though the VCF REF does not contain them.
-    let ref_len = if spans_inserted_edit_gap {
+    // A successful BAM edit can add transcript-only bases between mapped
+    // genomic positions, or remove genomic bases between adjacent cDNA bases.
+    // In either case the transcript reference allele is the mapped CDS span.
+    let ref_len = if spans_refseq_edit_gap {
         end_idx.checked_sub(start_idx)?.checked_add(1)?
     } else {
         input_ref_len
@@ -8136,7 +8150,7 @@ fn classify_coding_change_with_semantics(
     let ref_seq_slice = cds_seq[start_idx..=end_idx].to_string();
     let edited_ref_tx = edited_transcript_reference_allele(variant, tx, tx_exons)
         .filter(|seq| seq.len() == input_ref_len);
-    let effective_ref_tx = if spans_inserted_edit_gap {
+    let effective_ref_tx = if spans_refseq_edit_gap {
         ref_seq_slice.clone()
     } else {
         edited_ref_tx.unwrap_or(ref_tx)
@@ -13831,6 +13845,26 @@ mod tests {
         assert!(classification.is_some(), "edited CDS span must classify");
     }
 
+    #[test]
+    fn coding_deletion_crossing_deleted_edit_gap_uses_mapped_cds_span() {
+        let (transcript, exons_owned) = make_refseq_coding_deleted_edit_gap();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let translation = translation("NM_GAP_TEST.1", Some(8), Some(2), None, Some("ATGCCGTA"));
+        let variant = var("1", 102, 107, "AAAAAA", "-");
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("the mapped CDS bases on both sides of the deleted edit gap classify");
+
+        assert_eq!(classification.cds_position_start, Some(3));
+        assert_eq!(classification.cds_position_end, Some(6));
+    }
+
     fn synthetic_qk_dup_cds(
         total_codons: usize,
         exon_start_codon_index: usize,
@@ -19011,6 +19045,18 @@ mod tests {
         assert_eq!(
             compute_cdna_position(&v, &t, &refs),
             Some("353".to_string())
+        );
+    }
+
+    #[test]
+    fn compute_cdna_position_insertion_across_refseq_edit_uses_mapper_flanks() {
+        let (transcript, exons_owned) = make_refseq_coding_insertion_edit_gap();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = var("1", 220, 219, "-", "AAA");
+
+        assert_eq!(
+            compute_cdna_position(&variant, &transcript, &exons),
+            Some("21-26".into())
         );
     }
 
