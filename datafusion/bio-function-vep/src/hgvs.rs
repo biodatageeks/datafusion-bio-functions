@@ -1841,23 +1841,19 @@ fn uses_output_cdna_position_for_hgvsc_coords(
                         .any(|exon| notation.start >= exon.start && notation.end <= exon.end)
             }
             "ins" => genomic_shift.is_some_and(|shift| {
-                shift.shift_length > 0
-                    && shifted_notation_within_transcript_span(tx_exons, notation)
+                shift.shift_length > 0 && shifted_notation_within_one_exon(tx_exons, notation)
             }),
             _ => false,
         }
 }
 
-fn shifted_notation_within_transcript_span(
-    tx_exons: &[&ExonFeature],
-    notation: &HgvsNotation,
-) -> bool {
-    let span_start = tx_exons.iter().map(|e| e.start).min().unwrap_or(0);
-    let span_end = tx_exons.iter().map(|e| e.end).max().unwrap_or(0);
-    notation.start >= span_start
-        && notation.start <= span_end
-        && notation.end >= span_start
-        && notation.end <= span_end
+fn shifted_notation_within_one_exon(tx_exons: &[&ExonFeature], notation: &HgvsNotation) -> bool {
+    tx_exons.iter().any(|exon| {
+        notation.start >= exon.start
+            && notation.start <= exon.end
+            && notation.end >= exon.start
+            && notation.end <= exon.end
+    })
 }
 
 fn apply_shifted_insertion_duplication(
@@ -7076,6 +7072,63 @@ mod tests {
             unedited_control.as_deref(),
             Some("NM_001318792.1:n.11+1dup")
         );
+    }
+
+    #[test]
+    fn hgvsc_refseq_insertion_shifted_into_intron_uses_intronic_coordinates() {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "NM_001318792.1".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 100;
+        tx.end = 210;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 15,
+            end: 14,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 110,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 200,
+            end: 210,
+        };
+        let exons = [&exon1, &exon2];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 38,
+            start: 148,
+            end: 147,
+            shifted_compare_allele: "T".to_string(),
+            shifted_allele_string: "ACG".to_string(),
+            shifted_output_allele: "ACG".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "ACG".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: "G".to_string(),
+            three_prime_context: "T".to_string(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            Some("10-11"),
+            None,
+            "-",
+            "ACG",
+            110,
+            109,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001318792.1:n.11+37_11+38insACG"));
     }
 
     #[test]
