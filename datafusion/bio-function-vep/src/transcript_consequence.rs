@@ -3056,12 +3056,51 @@ impl TranscriptConsequenceEngine {
         if self.is_complex_indel(variant, tx_exons) {
             let mut classification =
                 partial_coding_overlap_classification(tx, tx_exons, tx_translation, variant);
-            if self.semantics.vep116_stop_predicates()
-                && vep116_stop_retained_without_alt_peptide(tx, tx_exons, tx_translation, variant)
-            {
-                terms.insert(SoTerm::StopRetainedVariant);
-                if let Some(classification) = classification.as_mut() {
-                    classification.stop_retained = true;
+            if self.semantics.vep116_stop_predicates() {
+                let partial_terminal_codon =
+                    vep_partial_terminal_codon(tx, tx_exons, tx_translation, variant);
+                if partial_terminal_codon {
+                    terms.insert(SoTerm::IncompleteTerminalCodonVariant);
+                }
+                let stop_lost_uses_peptides = classification.as_ref().is_some_and(|class| {
+                    class.affected_ref_peptide.is_some()
+                        && class
+                            .affected_alt_peptide
+                            .as_deref()
+                            .is_some_and(|peptide| !peptide.contains('X'))
+                });
+                let stop_lost = !partial_terminal_codon
+                    && !stop_lost_uses_peptides
+                    && vep116_stop_lost_without_unambiguous_alt_peptide(
+                        tx,
+                        tx_exons,
+                        tx_translation,
+                        variant,
+                    );
+                let stop_retained_uses_peptides = classification.as_ref().is_some_and(|class| {
+                    class
+                        .affected_alt_peptide
+                        .as_deref()
+                        .is_some_and(|peptide| !peptide.is_empty() && !peptide.contains('X'))
+                });
+                if stop_lost {
+                    terms.insert(SoTerm::StopLost);
+                    if let Some(classification) = classification.as_mut() {
+                        classification.stop_lost = true;
+                    }
+                } else if !partial_terminal_codon
+                    && !stop_retained_uses_peptides
+                    && vep116_stop_retained_without_alt_peptide(
+                        tx,
+                        tx_exons,
+                        tx_translation,
+                        variant,
+                    )
+                {
+                    terms.insert(SoTerm::StopRetainedVariant);
+                    if let Some(classification) = classification.as_mut() {
+                        classification.stop_retained = true;
+                    }
                 }
             }
             return classification;
@@ -21672,6 +21711,88 @@ mod tests {
         let mut terms = BTreeSet::new();
         engine.add_coding_terms(&mut terms, &deletion, &transcript, &exon_refs, None);
         assert!(terms.contains(&SoTerm::StopRetainedVariant), "{terms:?}");
+    }
+
+    #[test]
+    fn issue_202_complex_splice_stop_lost_uses_nucleotide_fallback() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let mut transcript = tx(
+            "T_ISSUE_202_SPLIT_DELETE",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(12);
+        transcript.translateable_seq = Some("ATGAAACCTTAA".to_string());
+        let exons = [
+            exon(&transcript.transcript_id, 1, 100, 110),
+            exon(&transcript.transcript_id, 2, 200, 200),
+        ];
+        let exon_refs = exons.iter().collect::<Vec<_>>();
+        let deletion = var("22", 110, 200, "TA", "-");
+
+        assert!(engine.is_complex_indel(&deletion, &exon_refs));
+        assert!(vep116_stop_lost_without_unambiguous_alt_peptide(
+            &transcript,
+            &exon_refs,
+            None,
+            &deletion,
+        ));
+        let mut terms = BTreeSet::new();
+        engine.add_coding_terms(&mut terms, &deletion, &transcript, &exon_refs, None);
+        assert!(terms.contains(&SoTerm::StopLost), "{terms:?}");
+    }
+
+    #[test]
+    fn issue_202_complex_runoff_reports_incomplete_terminal_codon() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let mut transcript = tx(
+            "T_ISSUE_202_PARTIAL_END",
+            "22",
+            100,
+            108,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(107),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(8);
+        transcript.translateable_seq = Some("ATGAAATA".to_string());
+        let exon = exon(&transcript.transcript_id, 1, 100, 108);
+        let exons = [&exon];
+        let deletion = var("22", 106, 110, "TA", "-");
+
+        assert!(engine.is_complex_indel(&deletion, &exons));
+        assert!(vep_partial_terminal_codon(
+            &transcript,
+            &exons,
+            None,
+            &deletion,
+        ));
+        let mut terms = BTreeSet::new();
+        engine.add_coding_terms(&mut terms, &deletion, &transcript, &exons, None);
+        assert!(
+            terms.contains(&SoTerm::IncompleteTerminalCodonVariant),
+            "{terms:?}"
+        );
+        assert!(!terms.contains(&SoTerm::StopLost), "{terms:?}");
+        assert!(!terms.contains(&SoTerm::StopRetainedVariant), "{terms:?}");
     }
 
     /// A start-lost deletion keeps the full reference peptide window. The
