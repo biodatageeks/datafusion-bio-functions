@@ -1884,9 +1884,15 @@ fn uses_output_cdna_position_for_hgvsc_coords(
         && match notation.kind.as_str() {
             "dup" => {
                 notation.alt_allele.len() == 1
-                    && tx_exons
-                        .iter()
-                        .any(|exon| notation.start >= exon.start && notation.end <= exon.end)
+                    && tx_exons.iter().any(|exon| {
+                        let start_within_exon =
+                            notation.start >= exon.start && notation.start <= exon.end;
+                        let end_within_exon =
+                            notation.end >= exon.start && notation.end <= exon.end;
+                        let dup_at_first_base = notation.start == exon.start
+                            && exon.start.checked_sub(1) == Some(notation.end);
+                        start_within_exon && (end_within_exon || dup_at_first_base)
+                    })
             }
             "ins" => genomic_shift.is_some_and(|shift| {
                 shift.shift_length > 0 && shifted_notation_within_one_exon(tx_exons, notation)
@@ -7184,8 +7190,8 @@ mod tests {
         tx.start = 100;
         tx.end = 210;
         tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
-            start: 15,
-            end: 14,
+            start: 3,
+            end: 2,
             replacement_len: Some(2),
             skip_refseq_offset: false,
         }];
@@ -7221,7 +7227,7 @@ mod tests {
         let hgvsc = format_hgvsc(
             &tx,
             &exons,
-            Some("10-11"),
+            Some("12-13"),
             None,
             "-",
             "A",
@@ -7230,7 +7236,7 @@ mod tests {
             Some(&shift),
         );
 
-        assert_eq!(hgvsc.as_deref(), Some("NM_001318792.1:n.11+1dup"));
+        assert_eq!(hgvsc.as_deref(), Some("NM_001318792.1:n.11+3dup"));
 
         tx.refseq_edits.clear();
         let unedited_control = format_hgvsc(
@@ -7248,6 +7254,77 @@ mod tests {
             unedited_control.as_deref(),
             Some("NM_001318792.1:n.11+1dup")
         );
+    }
+
+    #[test]
+    fn output_cdna_dup_coordinates_are_used_only_within_one_exon() {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "NM_001318792.1".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 100;
+        tx.end = 210;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 3,
+            end: 2,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 110,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 200,
+            end: 210,
+        };
+        let exons = [&exon1, &exon2];
+        let shifted_past_exon = HgvsNotation {
+            start: 111,
+            end: 110,
+            ref_allele: "A".to_string(),
+            alt_allele: "A".to_string(),
+            kind: "dup".to_string(),
+        };
+        let dup_at_exon_end = HgvsNotation {
+            start: 110,
+            end: 109,
+            ref_allele: "A".to_string(),
+            alt_allele: "A".to_string(),
+            kind: "dup".to_string(),
+        };
+        let dup_at_exon_start = HgvsNotation {
+            start: 100,
+            end: 99,
+            ref_allele: "A".to_string(),
+            alt_allele: "A".to_string(),
+            kind: "dup".to_string(),
+        };
+
+        assert!(!uses_output_cdna_position_for_hgvsc_coords(
+            &tx,
+            &exons,
+            &shifted_past_exon,
+            Some("12-13"),
+            None,
+        ));
+        assert!(uses_output_cdna_position_for_hgvsc_coords(
+            &tx,
+            &exons,
+            &dup_at_exon_end,
+            Some("12-13"),
+            None,
+        ));
+        assert!(uses_output_cdna_position_for_hgvsc_coords(
+            &tx,
+            &exons,
+            &dup_at_exon_start,
+            Some("1-2"),
+            None,
+        ));
     }
 
     #[test]
@@ -7315,8 +7392,8 @@ mod tests {
         tx.start = 100;
         tx.end = 310;
         tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
-            start: 28,
-            end: 27,
+            start: 3,
+            end: 2,
             replacement_len: Some(2),
             skip_refseq_offset: false,
         }];
@@ -7358,7 +7435,7 @@ mod tests {
         let hgvsc = format_hgvsc(
             &tx,
             &exons,
-            Some("22-23"),
+            Some("24-25"),
             None,
             "-",
             "T",
@@ -7367,7 +7444,23 @@ mod tests {
             Some(&shift),
         );
 
-        assert_eq!(hgvsc.as_deref(), Some("NM_001318792.1:n.22+1dup"));
+        assert_eq!(hgvsc.as_deref(), Some("NM_001318792.1:n.22+3dup"));
+        tx.refseq_edits.clear();
+        let unedited_control = format_hgvsc(
+            &tx,
+            &exons,
+            Some("22-23"),
+            None,
+            "-",
+            "T",
+            201,
+            200,
+            Some(&shift),
+        );
+        assert_eq!(
+            unedited_control.as_deref(),
+            Some("NM_001318792.1:n.22+1dup")
+        );
     }
 
     #[test]
