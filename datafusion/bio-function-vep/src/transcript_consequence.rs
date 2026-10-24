@@ -1988,13 +1988,38 @@ impl TranscriptConsequenceEngine {
         let mut terms = BTreeSet::new();
         let is_ins = variant.ref_allele == "-";
         let mut coding_class = None;
+        if refseq_mapped_cdna_endpoints_outside_unedited_length(tx, tx_exons, variant) {
+            // The VEP cache dumper disables transcript edits. `Transcript::length`
+            // therefore remains the exon sum, even when the live mapper carries
+            // edited cDNA coordinates beyond that endpoint.
+            return (vec![SoTerm::IntergenicVariant], None);
+        }
         let deleted_gap_started = profiling.then(Instant::now);
-        let deleted_refseq_gap = !is_ins
-            && prefers_exon_geometry_over_mapper(tx)
-            && (variant.start..=variant.end).any(|pos| {
-                mapper_deleted_gap_cdna_index(tx, tx_exons, pos).is_some()
-                    || refseq_deleted_edit_cdna_index(tx, tx_exons, pos).is_some()
-            });
+        let deleted_refseq_gap_candidate = prefers_exon_geometry_over_mapper(tx)
+            && if is_ins {
+                [variant.start.saturating_sub(1), variant.start]
+                    .into_iter()
+                    .all(|pos| {
+                        mapper_deleted_gap_cdna_index(tx, tx_exons, pos).is_some()
+                            || refseq_deleted_edit_cdna_index(tx, tx_exons, pos).is_some()
+                    })
+            } else {
+                (variant.start..=variant.end).any(|pos| {
+                    mapper_deleted_gap_cdna_index(tx, tx_exons, pos).is_some()
+                        || refseq_deleted_edit_cdna_index(tx, tx_exons, pos).is_some()
+                })
+            };
+        // VEP falls through to the default overlap consequence only when the
+        // mapper returns no Coordinate for the whole variant. A deleted-edit
+        // gap can be only one piece of an otherwise mapped allele, and both
+        // insertion flanks must be tested because map_insert maps them
+        // independently. This path is only entered for spans touching an
+        // edited gap, so the piece walk stays off the ordinary overlap path.
+        let deleted_refseq_gap = deleted_refseq_gap_candidate
+            && !vep_coords::VepTxMapper::new(tx, tx_exons, None, vep_coords::CdnaBaseMap::Output)
+                .cdna_pieces(vep_coords::VepSpan::from_variant(variant))
+                .iter()
+                .any(|piece| matches!(piece, vep_coords::MapperPiece::Coord { .. }));
         let deleted_refseq_gap_noncoding_exon =
             deleted_refseq_gap && is_non_coding_biotype(&tx.biotype);
         if let (Some(started), Some(profile)) = (deleted_gap_started, profile.as_deref_mut()) {
@@ -8029,11 +8054,11 @@ fn classify_coding_change_with_semantics(
     let cds_seq = reference_translateable_seq_for_vep(tx, Some(translation))?;
     let ref_genomic = normalize_allele_seq(&variant.ref_allele);
     let alt_genomic = normalize_allele_seq(&variant.alt_allele);
-    let ref_len = ref_genomic.len();
+    let input_ref_len = ref_genomic.len();
     let alt_len = alt_genomic.len();
 
     // Handle pure insertions (ref = "-") separately.
-    if ref_len == 0 {
+    if input_ref_len == 0 {
         return classify_insertion_with_semantics(
             tx,
             tx_exons,
@@ -8046,7 +8071,7 @@ fn classify_coding_change_with_semantics(
     }
 
     let genomic_positions = genomic_range(variant.start, variant.end)?;
-    if genomic_positions.len() != ref_len {
+    if genomic_positions.len() != input_ref_len {
         return None;
     }
 
@@ -8068,11 +8093,18 @@ fn classify_coding_change_with_semantics(
     }
     raw_cds_indices.sort_unstable();
     cds_indices.sort_unstable();
-    if cds_indices
-        .windows(2)
-        .any(|w| w[1] != w[0].saturating_add(1))
-    {
-        return None;
+    let mut spans_inserted_edit_gap = false;
+    for window in cds_indices.windows(2) {
+        if window[1] <= window[0] {
+            return None;
+        }
+        if window[1] != window[0].saturating_add(1) {
+            if refseq_inserted_cds_gap_between(tx, window[0], window[1], leading_n_offset) {
+                spans_inserted_edit_gap = true;
+            } else {
+                return None;
+            }
+        }
     }
     let raw_start_idx = *raw_cds_indices.first()?;
     let raw_end_idx = *raw_cds_indices.last()?;
@@ -8081,6 +8113,14 @@ fn classify_coding_change_with_semantics(
     if end_idx >= cds_seq.len() {
         return None;
     }
+    // A successful BAM edit can insert transcript-only bases between two
+    // genomic positions. The coding allele then spans those cDNA bases even
+    // though the VCF REF does not contain them.
+    let ref_len = if spans_inserted_edit_gap {
+        end_idx.checked_sub(start_idx)?.checked_add(1)?
+    } else {
+        input_ref_len
+    };
 
     let ref_tx = if tx.strand >= 0 {
         ref_genomic
@@ -8093,10 +8133,14 @@ fn classify_coding_change_with_semantics(
         reverse_complement(&alt_genomic)?.to_ascii_uppercase()
     };
 
+    let ref_seq_slice = cds_seq[start_idx..=end_idx].to_string();
     let edited_ref_tx = edited_transcript_reference_allele(variant, tx, tx_exons)
-        .filter(|seq| seq.len() == ref_len);
-    let effective_ref_tx = edited_ref_tx.as_deref().unwrap_or(ref_tx.as_str());
-    let ref_seq_slice = &cds_seq[start_idx..=end_idx];
+        .filter(|seq| seq.len() == input_ref_len);
+    let effective_ref_tx = if spans_inserted_edit_gap {
+        ref_seq_slice.clone()
+    } else {
+        edited_ref_tx.unwrap_or(ref_tx)
+    };
     // VEP's reference codon comes from _translateable_seq(), even when the
     // supplied REF disagrees with it. Only actual _rna_edit attributes replace
     // that span with reference feature_seq; BAM/mapper state alone does not.
@@ -9997,6 +10041,32 @@ fn prefers_exon_geometry_over_mapper(tx: &TranscriptFeature) -> bool {
         )
 }
 
+fn refseq_mapped_cdna_endpoints_outside_unedited_length(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+) -> bool {
+    if !prefers_exon_geometry_over_mapper(tx) || tx.refseq_edits.is_empty() {
+        return false;
+    }
+    let Some(transcript_length) = tx_exons.iter().try_fold(0usize, |length, exon| {
+        let exon_len = usize::try_from(exon.end.checked_sub(exon.start)?.checked_add(1)?).ok()?;
+        length.checked_add(exon_len)
+    }) else {
+        return false;
+    };
+    let coords = vep_coords::VepTxMapper::new(tx, tx_exons, None, vep_coords::CdnaBaseMap::Output)
+        .cdna(vep_coords::VepSpan::from_variant(variant));
+    let (Some(start), Some(end)) = (coords.start, coords.end) else {
+        // An unmapped endpoint can be an intron or edit gap; those retain
+        // their own transcript-variation predicates and default handling.
+        return false;
+    };
+    ![start, end]
+        .into_iter()
+        .any(|position| position > 0 && position <= transcript_length)
+}
+
 /// Return `tx.cdna_mapper_segments` in genomic-sorted order, borrowing the
 /// original slice when it is already sorted (the common case after build) and
 /// only cloning + sorting when it isn't. Centralizes the sort key shared by
@@ -10741,7 +10811,7 @@ fn used_ref_with_cache_policy(
         || tx.bam_edit_status.is_some()
     {
         let Some(reference) = mapped_transcript_reference_allele(variant, tx, tx_exons, true)
-            .filter(|reference| reference.len() == given.len())
+            .filter(|reference| reference.len() >= given.len())
         else {
             return Some(given);
         };
@@ -10989,6 +11059,7 @@ fn mapped_transcript_reference_allele(
         return None;
     }
     let mut cdna_positions: Vec<usize> = Vec::with_capacity(genomic_positions.len());
+    let mut spans_inserted_edit_gap = false;
     for pos in genomic_positions {
         let cdna = edited_transcript_sequence_cdna_index(
             tx,
@@ -11004,10 +11075,21 @@ fn mapped_transcript_reference_allele(
                 previous.checked_sub(1)
             };
             if next != Some(cdna) {
-                return None;
+                if refseq_inserted_cdna_gap_between(tx, previous, cdna) {
+                    spans_inserted_edit_gap = true;
+                } else {
+                    return None;
+                }
             }
         }
         cdna_positions.push(cdna);
+    }
+    if spans_inserted_edit_gap {
+        let first = *cdna_positions.iter().min()?;
+        let last = *cdna_positions.iter().max()?;
+        return transcript_seq
+            .get(first.checked_sub(1)?..last)
+            .map(str::to_ascii_uppercase);
     }
     cdna_positions.sort_unstable();
     let seq = transcript_seq.as_bytes();
@@ -11016,6 +11098,74 @@ fn mapped_transcript_reference_allele(
         transcript_ref.push((seq[cdna - 1] as char).to_ascii_uppercase());
     }
     Some(transcript_ref)
+}
+
+/// True when the missing cDNA interval between two mapped genomic bases is
+/// supplied by a transcript-only RefSeq insertion. Coordinates on either
+/// strand are accepted; the underlying RefSeq edit coordinates are in the
+/// original transcript space, so earlier edits are included in the start.
+fn refseq_inserted_cdna_gap_between(
+    tx: &TranscriptFeature,
+    first_cdna: usize,
+    second_cdna: usize,
+) -> bool {
+    let (low, high) = (first_cdna.min(second_cdna), first_cdna.max(second_cdna));
+    let Some(gap_start) = low.checked_add(1) else {
+        return false;
+    };
+    let gap_end = high.saturating_sub(1);
+    if gap_start > gap_end {
+        return false;
+    }
+
+    tx.refseq_edits.iter().any(|edit| {
+        if edit.skip_refseq_offset || edit.end.checked_add(1) != Some(edit.start) {
+            return false;
+        }
+        let Some(inserted_len) = edit.replacement_len else {
+            return false;
+        };
+        if inserted_len == 0 {
+            return false;
+        }
+        let prior_offset = tx
+            .refseq_edits
+            .iter()
+            .filter(|prior| prior.start < edit.start)
+            .filter_map(refseq_edit_offset_delta)
+            .sum::<i64>();
+        let Ok(start) = usize::try_from(edit.start.saturating_add(prior_offset)) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(inserted_len.saturating_sub(1)) else {
+            return false;
+        };
+        start == gap_start && end == gap_end
+    })
+}
+
+fn refseq_inserted_cds_gap_between(
+    tx: &TranscriptFeature,
+    first_cds_index: usize,
+    second_cds_index: usize,
+    leading_n_offset: usize,
+) -> bool {
+    let Some(coding_start) = tx.cdna_coding_start else {
+        return false;
+    };
+    let (Some(first_without_phase), Some(second_without_phase)) = (
+        first_cds_index.checked_sub(leading_n_offset),
+        second_cds_index.checked_sub(leading_n_offset),
+    ) else {
+        return false;
+    };
+    let (Some(first_cdna), Some(second_cdna)) = (
+        coding_start.checked_add(first_without_phase),
+        coding_start.checked_add(second_without_phase),
+    ) else {
+        return false;
+    };
+    refseq_inserted_cdna_gap_between(tx, first_cdna, second_cdna)
 }
 
 fn edited_transcript_cdna_index(tx: &TranscriptFeature, cdna: usize) -> Option<usize> {
@@ -13426,6 +13576,259 @@ mod tests {
         ];
         let exons = [exon("NR_144422.2", 1, 46_672_255, 46_674_518)];
         (transcript, exons)
+    }
+
+    fn make_refseq_coding_deleted_edit_gap() -> (TranscriptFeature, [ExonFeature; 1]) {
+        let mut transcript = tx(
+            "NM_GAP_TEST.1",
+            "1",
+            100,
+            109,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(109),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_rna_edit = true;
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(8);
+        transcript.translateable_seq = Some("ATGCCGTA".to_string());
+        transcript.spliced_seq = Some("ATGCCGTA".to_string());
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 5,
+            end: 6,
+            replacement_len: None,
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 103,
+                cdna_start: 1,
+                cdna_end: 4,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 106,
+                genomic_end: 109,
+                cdna_start: 5,
+                cdna_end: 8,
+                ori: 1,
+            },
+        ];
+        let exons = [exon("NM_GAP_TEST.1", 1, 100, 109)];
+        (transcript, exons)
+    }
+
+    fn make_refseq_coding_insertion_edit_gap() -> (TranscriptFeature, [ExonFeature; 1]) {
+        let mut transcript = tx(
+            "NM_INSERT_TEST.1",
+            "1",
+            200,
+            239,
+            1,
+            "protein_coding",
+            Some(200),
+            Some(239),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_rna_edit = true;
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(45);
+        transcript.translateable_seq = Some("ATG".repeat(15));
+        transcript.spliced_seq = transcript.translateable_seq.clone();
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 21,
+            end: 20,
+            replacement_len: Some(6),
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 200,
+                genomic_end: 219,
+                cdna_start: 1,
+                cdna_end: 20,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 220,
+                genomic_end: 239,
+                cdna_start: 27,
+                cdna_end: 46,
+                ori: 1,
+            },
+        ];
+        // The mapper spans 46 cDNA bases (20 + 6 edit bases + 20); the
+        // synthetic transcript uses 46 bases so both endpoints are valid.
+        transcript.cdna_coding_end = Some(46);
+        transcript.translateable_seq = Some("ATG".repeat(15) + "A");
+        transcript.spliced_seq = transcript.translateable_seq.clone();
+        let exons = [exon("NM_INSERT_TEST.1", 1, 200, 239)];
+        (transcript, exons)
+    }
+
+    #[test]
+    fn partial_deleted_edit_gap_keeps_mapped_coding_endpoint() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let (transcript, exons_owned) = make_refseq_coding_deleted_edit_gap();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = var("1", 103, 104, "AA", "-");
+
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
+
+        assert!(terms.contains(&SoTerm::CodingSequenceVariant), "{terms:?}");
+        assert!(!terms.contains(&SoTerm::IntergenicVariant), "{terms:?}");
+        let classification = classification.expect("mapped endpoint should retain CDS coordinates");
+        assert_eq!(classification.cds_position_start, Some(4));
+        assert_eq!(classification.cds_position_end, None);
+    }
+
+    #[test]
+    fn refseq_cdna_endpoint_past_unedited_transcript_length_is_intergenic() {
+        let mut transcript = tx(
+            "NM_OUTSIDE_CDNA.1",
+            "1",
+            100,
+            109,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(109),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_rna_edit = true;
+        transcript.cdna_coding_start = Some(11);
+        transcript.cdna_coding_end = Some(20);
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 1,
+            end: 0,
+            replacement_len: Some(10),
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 100,
+            genomic_end: 109,
+            cdna_start: 11,
+            cdna_end: 20,
+            ori: 1,
+        }];
+        let exons_owned = [exon("NM_OUTSIDE_CDNA.1", 1, 100, 109)];
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = var("1", 104, 104, "A", "C");
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
+
+        assert_eq!(terms, vec![SoTerm::IntergenicVariant]);
+        assert!(classification.is_none());
+    }
+
+    #[test]
+    fn partial_cds_after_deleted_edit_uses_mapped_cds_position() {
+        let (transcript, exons_owned) = make_refseq_coding_deleted_edit_gap();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = var("1", 107, 110, "AAAA", "A");
+
+        let classification =
+            partial_coding_overlap_classification(&transcript, &exons, None, &variant)
+                .expect("partial overlap keeps the mapped coding end");
+
+        assert_eq!(classification.cds_position_start, Some(6));
+        assert_eq!(classification.cds_position_end, None);
+    }
+
+    #[test]
+    fn variant_fully_inside_deleted_edit_gap_is_intergenic() {
+        let engine = TranscriptConsequenceEngine::default();
+        let (transcript, exons_owned) = make_refseq_coding_deleted_edit_gap();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = var("1", 104, 105, "AA", "-");
+
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
+
+        assert_eq!(terms, vec![SoTerm::IntergenicVariant]);
+        assert!(classification.is_none());
+    }
+
+    #[test]
+    fn insertion_fully_inside_deleted_edit_gap_is_intergenic() {
+        let engine = TranscriptConsequenceEngine::default();
+        let (transcript, exons_owned) = make_refseq_coding_deleted_edit_gap();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = var("1", 105, 104, "-", "A");
+
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
+
+        assert_eq!(terms, vec![SoTerm::IntergenicVariant]);
+        assert!(classification.is_none());
+    }
+
+    #[test]
+    fn coding_deletion_crossing_inserted_edit_bases_uses_full_transcript_reference() {
+        let (transcript, exons_owned) = make_refseq_coding_insertion_edit_gap();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = var("1", 215, 224, "AAAAAAAAAA", "-");
+
+        let used_ref = used_ref_with_cache_policy(
+            &variant,
+            &transcript,
+            &exons,
+            None,
+            false,
+            Some(true),
+            None,
+        );
+        assert_eq!(
+            used_ref.as_deref(),
+            Some(&transcript.spliced_seq.as_deref().unwrap()[15..31])
+        );
+
+        let translation = translation("NM_INSERT_TEST.1", Some(46), Some(15), None, None);
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        assert!(classification.is_some(), "edited CDS span must classify");
+    }
+
+    #[test]
+    fn coding_deletion_crossing_inserted_edit_bases_classifies_from_edited_cds() {
+        let (transcript, exons_owned) = make_refseq_coding_insertion_edit_gap();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = var("1", 215, 224, "AAAAAAAAAA", "-");
+        let translation = translation("NM_INSERT_TEST.1", Some(46), Some(15), None, None);
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        assert!(classification.is_some(), "edited CDS span must classify");
     }
 
     fn synthetic_qk_dup_cds(
