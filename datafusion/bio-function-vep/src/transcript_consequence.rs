@@ -1628,6 +1628,8 @@ impl TranscriptConsequenceEngine {
                         let crosses_transcript_end =
                             variant.start < tx.start || variant.end > tx.end;
                         let hgvs_minimised = if tx.refseq_edits.is_empty()
+                            && (!self.semantics.vep116_stop_predicates()
+                                || crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele))
                             && !(self.semantics.partial_overlap_hgvs() && crosses_transcript_end)
                         {
                             minimised_substitution(variant, hgvsc_ref_allele)
@@ -3409,6 +3411,26 @@ impl TranscriptConsequenceEngine {
         tx_exons: &[&ExonFeature],
         cds_seq: Option<&str>,
     ) {
+        if self.semantics.vep116_stop_predicates()
+            && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
+        {
+            // VEP's start-alteration predicates return false for an
+            // ambiguous sequence, making start_retained the negated
+            // predicate while start_lost remains unavailable without an
+            // alternate peptide. The no-peptide stop-retained path keeps
+            // its separate CIL overlap behavior.
+            if self.overlaps_start_codon(variant, tx, tx_exons) {
+                terms.insert(SoTerm::StartRetainedVariant);
+            }
+            if !cds_seq
+                .is_some_and(|cds| vep_partial_terminal_codon_for_cds(tx, tx_exons, cds, variant))
+                && vep116_stop_retained_without_alt_peptide(tx, tx_exons, None, variant)
+            {
+                terms.insert(SoTerm::StopRetainedVariant);
+            }
+            return;
+        }
+
         if self.overlaps_start_codon(variant, tx, tx_exons) {
             if is_start_codon(&variant.ref_allele) && is_start_codon(&variant.alt_allele) {
                 terms.insert(SoTerm::StartRetainedVariant);
@@ -5186,6 +5208,28 @@ fn vep116_codon_overlap(
     mapped_variant.overlap(codon_start, codon_end)
 }
 
+fn vep116_ambiguous_alt_overlaps_start_codon(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+) -> bool {
+    if tx.cds_start_nf {
+        return false;
+    }
+    if !tx_exons.is_empty() {
+        return vep116_codon_overlap(tx, tx_exons, variant, true);
+    }
+    let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
+        return false;
+    };
+    let (start, end) = if tx.strand >= 0 {
+        (cds_start, cds_start.saturating_add(2))
+    } else {
+        (cds_end.saturating_sub(2), cds_end)
+    };
+    overlaps(variant.start, variant.end, start, end)
+}
+
 /// VEP's `_ins_del_stop_altered()` returns false unless the variant has two
 /// truthy cDNA endpoints and a mapped CDS start. `stop_lost()` must preserve
 /// that gate even when genomic overlap finds the terminal codon.
@@ -5219,6 +5263,8 @@ fn vep116_has_defined_stop_edit_coordinates(
 /// edit in spliced cDNA/CDS coordinates (so introns do not inflate its length),
 /// splice it into translateable-sequence + 3' UTR, and test the original
 /// terminal-codon slot.
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1311-L1319>
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1492-L1503>
 fn vep116_stop_retained_without_alt_peptide(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -5227,14 +5273,17 @@ fn vep116_stop_retained_without_alt_peptide(
 ) -> bool {
     let ref_seq = normalize_allele_seq(&variant.ref_allele);
     let alt_seq = normalize_allele_seq(&variant.alt_allele);
-    if ref_seq.len() == alt_seq.len()
-        || !ref_seq
-            .bytes()
-            .chain(alt_seq.bytes())
-            .all(|base| matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'N'))
-        || !vep116_overlaps_stop_codon_cil(tx, variant, alt_seq.len())
+    if ref_seq.len() == alt_seq.len() || !vep116_overlaps_stop_codon_cil(tx, variant, alt_seq.len())
     {
         return false;
+    }
+
+    // VEP's `_ins_del_stop_altered_cil()` returns false before inspecting the
+    // sequence when `seq_is_unambiguous_dna()` is false. `stop_retained()`
+    // negates that result after its length and CIL-overlap guards, so an
+    // ambiguous ALT preserves this source-level outer-expression quirk.
+    if !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele) {
+        return true;
     }
 
     let Some(cds_seq) = reference_translateable_seq_for_vep(tx, tx_translation) else {
@@ -5330,6 +5379,8 @@ fn vep116_stop_retained_without_alt_peptide(
 /// alternate peptide is missing or contains `X`. Unlike the
 /// stop-retained fallback, this path uses the ordinary (unextended) stop-codon
 /// overlap interval.
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1258-L1264>
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1437-L1454>
 fn vep116_stop_lost_without_unambiguous_alt_peptide(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -5340,10 +5391,7 @@ fn vep116_stop_lost_without_unambiguous_alt_peptide(
     let alt_seq = normalize_allele_seq(&variant.alt_allele);
     if tx.cds_end_nf
         || ref_seq.len() == alt_seq.len()
-        || !ref_seq
-            .bytes()
-            .chain(alt_seq.bytes())
-            .all(|base| matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'N'))
+        || !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
     {
         return false;
     }
@@ -7787,6 +7835,14 @@ fn protein_hgvs_for_output_with_semantics(
     semantics: crate::vep_semantics::VepSemantics,
     shift_hgvs: bool,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
+    // Ensembl Variation 116's hgvs_protein() returns undef for an ALT outside
+    // /^[ACGT-]+$/i, before either the unshifted or shifted formatting path.
+    if semantics.vep116_stop_predicates()
+        && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
+    {
+        return None;
+    }
+
     // Ensembl only emits HGVSp when the original transcript variation is
     // coding (`$pre->{coding}`), even if HGVS 3' shifting later moves an
     // intronic indel into CDS coordinates for HGVSc.
@@ -8423,7 +8479,8 @@ fn classify_coding_change_with_semantics(
     mutated.extend_from_slice(&cds_seq.as_bytes()[end_idx + 1..]);
 
     let old_aas = reference_aas_for_consequence(tx, tx_translation, cds_seq.as_str())?;
-    let new_aas = translate_protein_from_cds_in(tx.codon_table, &mutated)?;
+    let new_aas =
+        translate_protein_for_coding_classification(tx.codon_table, &mutated, variant, semantics)?;
     let mut class = CodingClassification::default();
 
     // Start codon logic: gate on cds_start_nf flag. VEP's
@@ -8649,6 +8706,16 @@ fn classify_coding_change_with_semantics(
         class.affected_alt_peptide = new_aas
             .get(local_first_codon..peptide_end)
             .map(|peptide| peptide.iter().collect());
+    }
+    let ambiguous_alt_peptide = semantics.vep116_stop_predicates()
+        && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele);
+    if ambiguous_alt_peptide {
+        // VariationFeatureOverlapAllele::peptide() returns before translating
+        // an ALT outside /^[ACGT-]+$/i:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L697-L703
+        // Keep codon alleles for Codons and nucleotide predicates, but do not
+        // expose/use an ALT peptide for consequence or HGVS decisions.
+        class.affected_alt_peptide = None;
     }
     let partial_terminal_codon = semantics.vep116_stop_predicates()
         && vep_partial_terminal_codon_for_cds(tx, tx_exons, &cds_seq, variant);
@@ -9100,6 +9167,16 @@ fn classify_coding_change_with_semantics(
             native_refseq: refseq_has_edited_sequence_state(tx),
         });
     }
+    if ambiguous_alt_peptide {
+        class.synonymous = false;
+        class.missense = false;
+        class.stop_gained = false;
+        class.stop_lost = false;
+        class.start_lost = false;
+        class.start_retained = vep116_ambiguous_alt_overlaps_start_codon(tx, tx_exons, variant);
+        class.amino_acids = None;
+        class.protein_hgvs = None;
+    }
     Some(class)
 }
 
@@ -9321,7 +9398,8 @@ fn classify_insertion_with_semantics_and_gap(
         tx_translation,
         std::str::from_utf8(effective_cds).ok()?,
     )?;
-    let new_aas = translate_protein_from_cds_in(tx.codon_table, &mutated)?;
+    let new_aas =
+        translate_protein_for_coding_classification(tx.codon_table, &mutated, variant, semantics)?;
     let mut class = CodingClassification::default();
 
     // CDS position: insertion between cds_idx and cds_idx+1 in 0-based,
@@ -9523,6 +9601,11 @@ fn classify_insertion_with_semantics_and_gap(
             local_peptide_from_codon_window(tx.codon_table, &effective_cds[codon_start..ref_end]);
         class.affected_alt_peptide =
             local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
+    }
+    let ambiguous_alt_peptide = semantics.vep116_stop_predicates()
+        && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele);
+    if ambiguous_alt_peptide {
+        class.affected_alt_peptide = None;
     }
     // Keep the local sequence remainder for display shaping. Predicate vetoes
     // use VEP's mapper-derived partial_codon result below; these can differ at
@@ -9770,6 +9853,16 @@ fn classify_insertion_with_semantics_and_gap(
     );
     if let Some(protein_hgvs) = class.protein_hgvs.as_mut() {
         protein_hgvs.alt_translation_extension = preferred_hgvs_alt_translation;
+    }
+    if ambiguous_alt_peptide {
+        class.synonymous = false;
+        class.missense = false;
+        class.stop_gained = false;
+        class.stop_lost = false;
+        class.start_lost = false;
+        class.start_retained = vep116_ambiguous_alt_overlaps_start_codon(tx, tx_exons, variant);
+        class.amino_acids = None;
+        class.protein_hgvs = None;
     }
     Some(class)
 }
@@ -12222,7 +12315,18 @@ fn reverse_complement(seq: &str) -> Option<String> {
             b'C' => 'G',
             b'G' => 'C',
             b'T' => 'A',
+            b'R' => 'Y',
+            b'Y' => 'R',
+            b'M' => 'K',
+            b'K' => 'M',
+            b'S' => 'S',
+            b'W' => 'W',
+            b'B' => 'V',
+            b'V' => 'B',
+            b'D' => 'H',
+            b'H' => 'D',
             b'N' => 'N',
+            b'-' => '-',
             _ => return None,
         };
         out.push(c);
@@ -12289,6 +12393,36 @@ fn translate_protein_from_cds_in(table: CodonTable, cds: &[u8]) -> Option<Vec<ch
         out.push(translate_codon_in(table, codon)?);
     }
     Some(out)
+}
+
+fn translate_protein_for_coding_classification(
+    table: CodonTable,
+    cds: &[u8],
+    variant: &VariantInput,
+    semantics: crate::vep_semantics::VepSemantics,
+) -> Option<Vec<char>> {
+    if !semantics.vep116_stop_predicates()
+        || crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
+    {
+        return translate_protein_from_cds_in(table, cds);
+    }
+
+    // VEP keeps Codons for ambiguous ALT alleles but leaves their peptide
+    // undefined. Translate non-ACGT bases as N only for internal coordinate
+    // and coding-class construction; the caller clears every peptide-derived
+    // output and predicate before returning the classification.
+    let unknown_as_n: Vec<u8> = cds
+        .iter()
+        .map(|base| {
+            let base = base.to_ascii_uppercase();
+            if matches!(base, b'A' | b'C' | b'G' | b'T' | b'N') {
+                base
+            } else {
+                b'N'
+            }
+        })
+        .collect();
+    translate_protein_from_cds_in(table, &unknown_as_n)
 }
 
 /// Genetic code a transcript is translated with, as VEP's
@@ -30072,6 +30206,128 @@ mod tests {
             Some(&translation),
         );
         (terms, classification)
+    }
+
+    #[test]
+    fn issue_208_ambiguous_alt_has_no_alternate_peptide() {
+        let (terms, classification) =
+            r3a_v116_raw_coding_terms("ATGGCTGAATAA", 1003, 1003, "G", "N");
+        let class = classification.as_ref().expect("coding classification");
+        assert!(
+            class.amino_acids.is_none() && class.affected_alt_peptide.is_none(),
+            "ambiguous ALT must not expose an alternate peptide: {classification:?}"
+        );
+        assert!(
+            class.codons.is_some(),
+            "Codons remains available: {class:?}"
+        );
+        assert!(class.protein_hgvs.is_none());
+        assert!(terms.contains(&SoTerm::CodingSequenceVariant));
+        assert!(
+            !terms.contains(&SoTerm::MissenseVariant)
+                && !terms.contains(&SoTerm::SynonymousVariant)
+                && !terms.contains(&SoTerm::StopGained)
+                && !terms.contains(&SoTerm::StopLost),
+            "ambiguous ALT must not emit peptide-derived missense: {terms:?}"
+        );
+
+        let (iupac_terms, iupac_class) =
+            r3a_v116_raw_coding_terms("ATGGCTGAATAA", 1003, 1003, "G", "R");
+        assert!(
+            iupac_class.as_ref().is_some_and(
+                |class| class.amino_acids.is_none() && class.affected_alt_peptide.is_none()
+            ),
+            "{iupac_class:?} {iupac_terms:?}"
+        );
+        assert!(!iupac_terms.contains(&SoTerm::MissenseVariant));
+
+        let (acgt_terms, acgt_class) =
+            r3a_v116_raw_coding_terms("ATGGCTGAATAA", 1003, 1003, "G", "A");
+        assert!(acgt_class.as_ref().is_some_and(
+            |class| class.amino_acids.is_some() && class.affected_alt_peptide.is_some()
+        ));
+        assert!(acgt_terms.contains(&SoTerm::MissenseVariant));
+    }
+
+    #[test]
+    fn issue_208_ambiguous_indels_keep_only_vep_length_and_outer_stop_terms() {
+        let (frameshift_terms, frameshift_class) =
+            r3a_v116_raw_coding_terms("ATGGCTGAATAA", 1005, 1005, "-", "N");
+        assert!(frameshift_terms.contains(&SoTerm::FrameshiftVariant));
+        assert!(!frameshift_terms.contains(&SoTerm::InframeInsertion));
+        assert!(frameshift_class.as_ref().is_some_and(
+            |class| class.amino_acids.is_none() && class.affected_alt_peptide.is_none()
+        ));
+
+        let (inframe_terms, _) = r3a_v116_raw_coding_terms("ATGGCTGAATAA", 1005, 1005, "-", "NNN");
+        assert!(!inframe_terms.contains(&SoTerm::InframeInsertion));
+
+        let (start_terms, start_class) =
+            r3a_v116_raw_coding_terms("ATGGCTGAATAA", 1000, 1000, "A", "N");
+        assert!(start_terms.contains(&SoTerm::StartRetainedVariant));
+        assert!(!start_terms.contains(&SoTerm::StartLost));
+        assert!(
+            start_class
+                .as_ref()
+                .is_some_and(|class| class.start_retained && !class.start_lost)
+        );
+
+        // VEP 116's outer stop_retained expression negates the false
+        // ambiguous-ALT nucleotide helper after length and CIL-overlap tests.
+        let (stop_terms, stop_class) =
+            r3a_v116_raw_coding_terms("ATGGCTGAATAA", 1009, 1009, "T", "NN");
+        assert!(stop_terms.contains(&SoTerm::StopRetainedVariant));
+        assert!(!stop_terms.contains(&SoTerm::StopLost));
+        assert!(
+            stop_class
+                .as_ref()
+                .is_some_and(|class| class.stop_retained && !class.stop_lost)
+        );
+    }
+
+    #[test]
+    fn issue_208_ambiguous_alt_suppresses_hgvsp_before_fallback() {
+        let transcript = tx(
+            "T_ISSUE_208_HGVS",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        let exon = exon("T_ISSUE_208_HGVS", 1, 1000, 1011);
+        let fallback = crate::hgvs::ProteinHgvsData {
+            start: 1,
+            end: 1,
+            ref_peptide: "A".to_string(),
+            alt_peptide: "T".to_string(),
+            ref_translation: "A".to_string(),
+            alt_translation: "T".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        let render = |alt: &str| {
+            protein_hgvs_for_output_with_semantics(
+                &transcript,
+                &[&exon],
+                None,
+                &var("22", 1003, 1003, "G", alt),
+                true,
+                None,
+                Some(&fallback),
+                crate::vep_semantics::VepSemantics::V116,
+                false,
+            )
+        };
+
+        assert!(render("N").is_none());
+        assert!(render("R").is_none());
+        assert!(render("A").is_some());
     }
 
     #[test]
