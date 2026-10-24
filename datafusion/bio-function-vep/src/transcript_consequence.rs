@@ -3062,13 +3062,9 @@ impl TranscriptConsequenceEngine {
                 if partial_terminal_codon {
                     terms.insert(SoTerm::IncompleteTerminalCodonVariant);
                 }
-                let stop_lost_uses_peptides = classification.as_ref().is_some_and(|class| {
-                    class.affected_ref_peptide.is_some()
-                        && class
-                            .affected_alt_peptide
-                            .as_deref()
-                            .is_some_and(|peptide| !peptide.contains('X'))
-                });
+                let stop_lost_uses_peptides = classification
+                    .as_ref()
+                    .is_some_and(vep116_stop_lost_uses_peptides);
                 let stop_lost = !partial_terminal_codon
                     && !stop_lost_uses_peptides
                     && vep116_stop_lost_without_unambiguous_alt_peptide(
@@ -3077,12 +3073,9 @@ impl TranscriptConsequenceEngine {
                         tx_translation,
                         variant,
                     );
-                let stop_retained_uses_peptides = classification.as_ref().is_some_and(|class| {
-                    class
-                        .affected_alt_peptide
-                        .as_deref()
-                        .is_some_and(|peptide| !peptide.is_empty() && !peptide.contains('X'))
-                });
+                let stop_retained_uses_peptides = classification
+                    .as_ref()
+                    .is_some_and(vep116_stop_retained_uses_peptides);
                 if stop_lost {
                     terms.insert(SoTerm::StopLost);
                     if let Some(classification) = classification.as_mut() {
@@ -5234,8 +5227,9 @@ fn vep116_stop_retained_without_alt_peptide(
         .is_some_and(|codon| is_stop_codon_in(tx.codon_table, codon))
 }
 
-/// VEP 116 `stop_lost()` falls back to `_ins_del_stop_altered()` when the
-/// local alternate peptide is missing or contains `X`. Unlike the
+/// VEP 116 `stop_lost()` falls back to `_ins_del_stop_altered()` only when a
+/// peptide allele is undefined. A defined partial-codon peptide ending in
+/// `X` still takes the peptide predicate branch. Unlike the
 /// stop-retained fallback, this path uses the ordinary (unextended) stop-codon
 /// overlap interval.
 fn vep116_stop_lost_without_unambiguous_alt_peptide(
@@ -5319,6 +5313,21 @@ impl CodingClassification {
     }
 }
 
+/// VEP's stop-lost peptide branch runs whenever both peptide alleles exist,
+/// including partial-codon peptides that contain `X`.
+fn vep116_stop_lost_uses_peptides(class: &CodingClassification) -> bool {
+    class.affected_ref_peptide.is_some() && class.affected_alt_peptide.is_some()
+}
+
+/// VEP's stop-retained peptide branch runs for any defined, nonempty alternate
+/// peptide, including partial-codon peptides that contain `X`.
+fn vep116_stop_retained_uses_peptides(class: &CodingClassification) -> bool {
+    class
+        .affected_alt_peptide
+        .as_deref()
+        .is_some_and(|peptide| !peptide.is_empty())
+}
+
 fn apply_vep116_stop_predicate_flags(
     class: &mut CodingClassification,
     semantics: crate::vep_semantics::VepSemantics,
@@ -5338,15 +5347,11 @@ fn apply_vep116_stop_predicate_flags(
         && matches!(
             (ref_peptide, alt_peptide),
             (Some(reference), Some(alternate))
-                if !alternate.contains('X')
-                    && reference.contains('*')
-                    && !alternate.contains('*')
+                if reference.contains('*') && !alternate.contains('*')
         );
     let stop_retained = !partial_terminal_codon
         && !stop_lost
-        && alt_peptide.is_some_and(|alternate| {
-            !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
-        });
+        && alt_peptide.is_some_and(|alternate| !alternate.is_empty() && ref_eq_alt_sequence);
     let stop_gained = !stop_retained
         && !stop_lost
         && ref_peptide.is_some_and(|reference| !reference.contains('*'))
@@ -5370,11 +5375,7 @@ fn apply_vep116_nucleotide_stop_fallbacks(
         return;
     }
 
-    let stop_lost_uses_peptides = class.affected_ref_peptide.is_some()
-        && class
-            .affected_alt_peptide
-            .as_deref()
-            .is_some_and(|peptide| !peptide.contains('X'));
+    let stop_lost_uses_peptides = vep116_stop_lost_uses_peptides(class);
     if !partial_terminal_codon
         && !stop_lost_uses_peptides
         && vep116_stop_lost_without_unambiguous_alt_peptide(tx, tx_exons, tx_translation, variant)
@@ -5385,10 +5386,7 @@ fn apply_vep116_nucleotide_stop_fallbacks(
         return;
     }
 
-    let stop_retained_uses_peptides = class
-        .affected_alt_peptide
-        .as_deref()
-        .is_some_and(|peptide| !peptide.is_empty() && !peptide.contains('X'));
+    let stop_retained_uses_peptides = vep116_stop_retained_uses_peptides(class);
     if !stop_retained_uses_peptides
         && vep116_stop_retained_without_alt_peptide(tx, tx_exons, tx_translation, variant)
     {
@@ -13020,7 +13018,7 @@ mod tests {
     }
 
     #[test]
-    fn vep116_hunks5_and6_route_x_peptides_to_nucleotide_stop_fallbacks() {
+    fn vep116_hunks5_and6_use_defined_x_peptides_before_fallbacks() {
         let base = CodingClassification {
             stop_lost: true,
             stop_retained: true,
@@ -13043,7 +13041,8 @@ mod tests {
             false,
         );
         assert!(v115.stop_lost && v115.stop_retained);
-        assert!(!v116.stop_lost && !v116.stop_retained);
+        assert!(v116.stop_lost);
+        assert!(!v116.stop_retained);
 
         let mut plus = tx(
             "T1",
@@ -13063,6 +13062,7 @@ mod tests {
         let translation = translation("T1", Some(9), Some(3), None, Some("ATGAAATAA"));
         let insertion = var("22", 1007, 1007, "-", "T");
         let mut fallback = CodingClassification {
+            stop_lost: true,
             affected_ref_peptide: Some("*".to_string()),
             affected_alt_peptide: Some("LX".to_string()),
             ..Default::default()
@@ -26204,6 +26204,51 @@ mod tests {
             None,
             &deletion,
         ));
+    }
+
+    #[test]
+    fn issue_202_defined_partial_peptides_prevent_nucleotide_stop_override() {
+        let mut transcript = tx(
+            "T_PARTIAL_PEPTIDE",
+            "22",
+            100,
+            108,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
+        transcript.translateable_seq = Some("ATGGCTTAA".to_string());
+        let exon = exon("T_PARTIAL_PEPTIDE", 1, 100, 108);
+        let exons = [&exon];
+        let deletion = var("22", 106, 108, "TAA", "-");
+        assert!(vep116_stop_lost_without_unambiguous_alt_peptide(
+            &transcript,
+            &exons,
+            None,
+            &deletion,
+        ));
+
+        let mut classification = CodingClassification {
+            affected_ref_peptide: Some("A".to_string()),
+            affected_alt_peptide: Some("*X".to_string()),
+            ..Default::default()
+        };
+        apply_vep116_nucleotide_stop_fallbacks(
+            &mut classification,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+            &transcript,
+            &exons,
+            None,
+            &deletion,
+        );
+        assert!(
+            !classification.stop_lost,
+            "defined peptide alleles must use VEP's peptide predicate even when the alternate ends in X: {classification:?}"
+        );
     }
 
     #[test]
