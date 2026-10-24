@@ -604,6 +604,12 @@ fn format_hgvsc_fallback(
         if vep_hgvs_positions_need_swap(&start, &end) {
             std::mem::swap(&mut start, &mut end);
         }
+    } else if notation.kind == "ins" {
+        // Insertion flanks are not ordered like the mapper's deletion
+        // endpoints at the coding / `*-N` boundary. VEP's insertion formatter
+        // puts the star-negative flank first (vepyr#244); preserve mapper
+        // order for other notation kinds.
+        (start, end) = order_hgvsc_insertion_positions(&start, &end);
     } else {
         (start, end) = order_hgvsc_positions(&start, &end);
     }
@@ -2340,6 +2346,18 @@ fn preserve_star_negative_hgvsc_order(start: &str, end: &str) -> Option<(String,
         Some((start.to_string(), end.to_string()))
     } else {
         None
+    }
+}
+
+fn order_hgvsc_insertion_positions(start: &str, end: &str) -> (String, String) {
+    if let Some((first, second)) = preserve_star_negative_hgvsc_order(start, end) {
+        if first.starts_with("*-") {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    } else {
+        order_hgvsc_positions(start, end)
     }
 }
 
@@ -7825,6 +7843,21 @@ mod tests {
         assert_eq!(
             order_hgvsc_positions("*184", "*159"),
             ("*159".to_string(), "*184".to_string())
+        );
+    }
+
+    #[test]
+    fn test_hgvsc_insertion_orders_star_negative_before_coding_flank() {
+        // The non-clamped 3' insertion at the c.1239 / *-1 boundary is
+        // emitted by VEP as `*-1_1239ins`, even though the coordinate mapper
+        // returns the coding flank first for this insertion path.
+        assert_eq!(
+            order_hgvsc_insertion_positions("1239", "*-1"),
+            ("*-1".to_string(), "1239".to_string())
+        );
+        assert_eq!(
+            order_hgvsc_insertion_positions("*-1", "1239"),
+            ("*-1".to_string(), "1239".to_string())
         );
     }
 
