@@ -1724,7 +1724,11 @@ impl TranscriptConsequenceEngine {
                             hgvsc_detail_profile.as_mut(),
                             self.semantics,
                             self.bam_edited != Some(false),
-                            tx.has_rna_edit.then_some(genomic_reference).flatten(),
+                            rna_edit_classification_reference(
+                                tx.has_rna_edit,
+                                variant,
+                                genomic_reference,
+                            ),
                         );
                         if let (Some(started), Some(profile)) =
                             (hgvsc_started, profile.as_deref_mut())
@@ -10962,6 +10966,25 @@ fn minimised_substitution(
     minimised.start = variant.start + prefix as i64;
     minimised.end = variant.end - suffix as i64;
     Some((minimised, prefix, suffix))
+}
+
+fn rna_edit_classification_reference<'a>(
+    has_rna_edit: bool,
+    variant: &VariantInput,
+    genomic_reference: Option<&'a str>,
+) -> Option<&'a str> {
+    // The #155 trigger is a two-base MNV. Keep the genomic-first VEP
+    // classification scoped to that shape so unrelated RNA-edited indels and
+    // long substitutions retain their established HGVSc notation.
+    let is_two_base_mnv = variant.ref_allele.len() == 2
+        && variant.alt_allele.len() == 2
+        && variant.ref_allele != variant.alt_allele
+        && variant.ref_allele != "-"
+        && variant.alt_allele != "-";
+    (has_rna_edit && is_two_base_mnv)
+        .then_some(genomic_reference)
+        .flatten()
+        .filter(|reference| reference.len() == 2)
 }
 
 fn compute_cdna_position(
@@ -20572,6 +20595,42 @@ mod tests {
 
         // Nothing shared between the HGVS reference and the alt: no reduction.
         assert!(minimised_substitution(&v, "TCC").is_none());
+    }
+
+    #[test]
+    fn rna_edit_genomic_classification_reference_is_limited_to_two_base_mnvs() {
+        let mnv = var("22", 100, 101, "TG", "CA");
+        assert_eq!(
+            rna_edit_classification_reference(true, &mnv, Some("TG")),
+            Some("TG")
+        );
+        assert_eq!(
+            rna_edit_classification_reference(false, &mnv, Some("TG")),
+            None
+        );
+
+        let indel = var("22", 100, 100, "A", "AT");
+        assert_eq!(
+            rna_edit_classification_reference(true, &indel, Some("A")),
+            None,
+            "RNA-edited indels must keep their previous transcript-reference classification"
+        );
+
+        let long_inversion = var("22", 100, 6_514, &"A".repeat(6_415), &"T".repeat(6_415));
+        assert_eq!(
+            rna_edit_classification_reference(
+                true,
+                &long_inversion,
+                Some(&long_inversion.ref_allele)
+            ),
+            None,
+            "the two-base ClinVar MNV rule must not affect long equal-length inversions"
+        );
+        assert_eq!(
+            rna_edit_classification_reference(true, &mnv, Some("T")),
+            None,
+            "the classification reference must cover the full two-base variant"
+        );
     }
 
     /// vepyr#216. VEP never minimises a same-length pair (ensembl-vep
