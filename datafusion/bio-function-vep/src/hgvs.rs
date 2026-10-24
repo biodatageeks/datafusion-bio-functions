@@ -221,6 +221,7 @@ pub fn format_hgvsc_with_semantics(
         None,
         semantics,
         true,
+        None,
     )
 }
 
@@ -279,6 +280,7 @@ pub fn format_hgvsc_profiled_with_semantics(
         Some(profile),
         semantics,
         true,
+        None,
     )
 }
 
@@ -296,6 +298,7 @@ pub(crate) fn format_hgvsc_with_reference_policy(
     mut profile: Option<&mut HgvscProfile>,
     semantics: VepSemantics,
     use_transcript_ref: bool,
+    classification_ref_allele: Option<&str>,
 ) -> Option<String> {
     // Traceability:
     // - Release/115 `_var2transcript_slice_coords` returns undef for any
@@ -308,21 +311,29 @@ pub(crate) fn format_hgvsc_with_reference_policy(
     {
         return None;
     }
-    if let Some(profile) = profile.as_deref_mut() {
-        profile.simple_fast_calls += 1;
+    if classification_ref_allele.is_none() {
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.simple_fast_calls += 1;
+        }
     }
-    let simple_fast_started = profile.is_some().then(Instant::now);
-    let simple_hgvsc = format_hgvsc_simple_substitution_fast_inner(
-        tx,
-        tx_exons,
-        cdna_position,
-        cds_position,
-        ref_allele,
-        alt_allele,
-        variant_start,
-        variant_end,
-        profile.as_deref_mut(),
-    );
+    let simple_fast_started =
+        (profile.is_some() && classification_ref_allele.is_none()).then(Instant::now);
+    let simple_hgvsc = classification_ref_allele
+        .is_none()
+        .then(|| {
+            format_hgvsc_simple_substitution_fast_inner(
+                tx,
+                tx_exons,
+                cdna_position,
+                cds_position,
+                ref_allele,
+                alt_allele,
+                variant_start,
+                variant_end,
+                profile.as_deref_mut(),
+            )
+        })
+        .flatten();
     if let (Some(started), Some(profile)) = (simple_fast_started, profile.as_deref_mut()) {
         profile.simple_fast += started.elapsed();
         if simple_hgvsc.is_some() {
@@ -349,6 +360,7 @@ pub(crate) fn format_hgvsc_with_reference_policy(
         profile.as_deref_mut(),
         semantics,
         use_transcript_ref,
+        classification_ref_allele,
     );
     if let (Some(started), Some(profile)) = (fallback_started, profile.as_deref_mut()) {
         profile.fallback += started.elapsed();
@@ -370,6 +382,7 @@ fn format_hgvsc_fallback(
     mut profile: Option<&mut HgvscProfile>,
     semantics: VepSemantics,
     use_transcript_ref: bool,
+    classification_ref_allele: Option<&str>,
 ) -> Option<String> {
     let tx_id = versioned_id(&tx.transcript_id, tx.version);
     // VEP's HGVS misalignment offset is selected from TranscriptVariation's
@@ -473,9 +486,15 @@ fn format_hgvsc_fallback(
         } else {
             (ref_allele, alt_allele, variant_start, variant_end)
         };
-    let (genomic_feature_ref, feature_alt) =
+    let (display_feature_ref, feature_alt) =
         hgvs_feature_strand_alleles(tx, ref_allele, alt_allele)?;
-    let mut feature_ref = genomic_feature_ref.clone();
+    let mut feature_ref = display_feature_ref.clone();
+    let (genomic_feature_ref, classification_alt) = match classification_ref_allele {
+        Some(classification_ref) => {
+            hgvs_feature_strand_alleles(tx, classification_ref, alt_allele)?
+        }
+        None => (display_feature_ref.clone(), feature_alt.clone()),
+    };
     let refseq_edit_started = profile.is_some().then(Instant::now);
     // The engine may already have selected the submitted reference TVA allele
     // because native use_feature_ref is disabled. A legacy sequence fallback
@@ -497,12 +516,12 @@ fn format_hgvsc_fallback(
     // `hgvs_variant_notation` returns undef when the REF cut from the clamped
     // slice equals ALT (Utils/Sequence.pm:526-531 @ 2fb834b). The engine's
     // own helper keeps a 1-base identical pair as `>` for the unclamped path.
-    if clamped && genomic_feature_ref.eq_ignore_ascii_case(&feature_alt) {
+    if clamped && genomic_feature_ref.eq_ignore_ascii_case(&classification_alt) {
         return None;
     }
     let mut notation = hgvs_variant_notation(
         &genomic_feature_ref,
-        &feature_alt,
+        &classification_alt,
         variant_start,
         variant_end,
     )?;
@@ -530,7 +549,7 @@ fn format_hgvsc_fallback(
             if notation.start < span_start || notation.end > span_end {
                 notation = hgvs_variant_notation(
                     &genomic_feature_ref,
-                    &feature_alt,
+                    &classification_alt,
                     variant_start,
                     variant_end,
                 )?;
@@ -556,8 +575,8 @@ fn format_hgvsc_fallback(
     // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
     //   replaces clipped alleles with feature_seq when `_rna_edit` attributes
     //   are present on the transcript
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1443-L1449>
-    if !tx.refseq_edits.is_empty() {
+    //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1507-L1514>
+    if tx.has_rna_edit || !tx.refseq_edits.is_empty() {
         notation.ref_allele = feature_ref.clone();
         notation.alt_allele = feature_alt.clone();
     }

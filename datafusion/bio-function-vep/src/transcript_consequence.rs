@@ -1589,10 +1589,14 @@ impl TranscriptConsequenceEngine {
                         }
                         // VEP classifies and clips HGVS from the genomic feature
                         // slice, independently of USED_REF's transcript mapping.
-                        // The HGVS formatter restores the RNA-edited transcript
-                        // reference for display only, after genomic classification.
+                        // Keep USED_REF as the display allele and pass the genomic
+                        // reference separately for RNA-edit classification.
                         let feature_reference = used_ref.as_deref().unwrap_or(&variant.ref_allele);
-                        let hgvsc_ref_allele = genomic_reference.unwrap_or(feature_reference);
+                        let hgvsc_ref_allele = if tx.has_rna_edit {
+                            feature_reference
+                        } else {
+                            genomic_reference.unwrap_or(feature_reference)
+                        };
                         // Compute HGVSc notation.
                         let hgvsc_started = profiling.then(Instant::now);
                         if let Some(profile) = profile.as_deref_mut() {
@@ -1720,6 +1724,7 @@ impl TranscriptConsequenceEngine {
                             hgvsc_detail_profile.as_mut(),
                             self.semantics,
                             self.bam_edited != Some(false),
+                            tx.has_rna_edit.then_some(genomic_reference).flatten(),
                         );
                         if let (Some(started), Some(profile)) =
                             (hgvsc_started, profile.as_deref_mut())
