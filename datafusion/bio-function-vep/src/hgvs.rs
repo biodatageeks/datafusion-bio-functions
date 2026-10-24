@@ -7959,24 +7959,39 @@ mod tests {
         // removes the matching leading base and advances start in slice order
         // (TranscriptVariationAllele.pm:2211-2215), leaving this clamped
         // insertion's two flanks in VEP's pre-sort order.
-        let tx = make_transcript("lncRNA", 1, None, None);
         let exon = make_exon();
         let exons = [&exon];
-        let clamp = vep116_partial_overlap_clamp(&tx, "AA", 89, 90, None).unwrap();
-        assert_eq!((clamp.slice_start, clamp.slice_end), (1, 1));
-        assert_eq!(clamp.ref_allele, "A");
-        let mut clamped_insertion =
-            hgvs_variant_notation(&clamp.ref_allele, "AT", clamp.slice_start, clamp.slice_end)
-                .unwrap();
-        clip_alleles_with_dup_retyping(&mut clamped_insertion, 1, false);
-        assert_eq!(clamped_insertion.kind, "ins");
-        let pre_sort =
-            notation_to_hgvsc_coords(&tx, &exons, &clamped_insertion, None, true).unwrap();
-        assert_eq!(pre_sort, ("2".to_string(), "1".to_string()));
-        assert_eq!(
-            order_mapped_hgvsc_positions(&pre_sort.0, &pre_sort.1),
-            ("1".to_string(), "2".to_string())
-        );
+
+        for (strand, variant_start, variant_end, alt_allele) in
+            [(1, 89, 90, "AT"), (-1, 140, 141, "TA")]
+        {
+            let tx = make_transcript("lncRNA", strand, None, None);
+            let clamp =
+                vep116_partial_overlap_clamp(&tx, "AA", variant_start, variant_end, None).unwrap();
+            assert_eq!((clamp.slice_start, clamp.slice_end), (1, 1));
+            assert_eq!(clamp.ref_allele, "A");
+            let (feature_ref, feature_alt) =
+                hgvs_feature_strand_alleles(&tx, &clamp.ref_allele, alt_allele).unwrap();
+            let mut clamped_insertion = hgvs_variant_notation(
+                &feature_ref,
+                &feature_alt,
+                clamp.slice_start,
+                clamp.slice_end,
+            )
+            .unwrap();
+            // Clipping is in the already transcript-oriented slice, so the
+            // shared leading base advances the slice start on either strand
+            // (TranscriptVariationAllele.pm:2211-2215).
+            clip_alleles_with_dup_retyping(&mut clamped_insertion, 1, false);
+            assert_eq!(clamped_insertion.kind, "ins");
+            let pre_sort =
+                notation_to_hgvsc_coords(&tx, &exons, &clamped_insertion, None, true).unwrap();
+            assert_eq!(pre_sort, ("2".to_string(), "1".to_string()));
+            assert_eq!(
+                order_mapped_hgvsc_positions(&pre_sort.0, &pre_sort.1),
+                ("1".to_string(), "2".to_string())
+            );
+        }
     }
 
     // ---------------------------------------------------------------
