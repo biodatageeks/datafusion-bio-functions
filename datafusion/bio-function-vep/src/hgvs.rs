@@ -1678,9 +1678,71 @@ fn refseq_hgvsc_position_from_genomic(
     let shifted_genomic_pos = genomic_pos.checked_add(offset_in_transcript_orientation)?;
     let mut sorted_exons = tx_exons.to_vec();
     sorted_exons.sort_by_key(|exon| (exon.start, exon.end));
-    let raw_cdna_position =
-        raw_cdna_position_from_sorted_exons(tx, &sorted_exons, shifted_genomic_pos)?;
+    let raw_cdna_position = raw_cdna_position_from_sorted_exons(
+        tx,
+        &sorted_exons,
+        shifted_genomic_pos,
+    )
+    .or_else(|| {
+        refseq_hgvsc_position_before_first_genomic_exon(tx, &sorted_exons, shifted_genomic_pos)
+    })?;
     shift_to_hgvs_coding_coordinates(tx, tx_exons, &raw_cdna_position)
+}
+
+/// VEP's `_get_cDNA_position` treats the exon before the first genomic exon as
+/// the last exon in its sorted list. When a RefSeq misalignment offset moves a
+/// coordinate just outside the transcript's genomic start, it selects the
+/// nearest terminal exon and retains its intronic offset.
+fn refseq_hgvsc_position_before_first_genomic_exon(
+    tx: &TranscriptFeature,
+    sorted_exons: &[&ExonFeature],
+    genomic_pos: i64,
+) -> Option<String> {
+    let first = *sorted_exons.first()?;
+    let last = *sorted_exons.last()?;
+    if genomic_pos >= first.start {
+        return None;
+    }
+    let exon_len = |exon: &ExonFeature| {
+        usize::try_from(exon.end.checked_sub(exon.start)?.checked_add(1)?).ok()
+    };
+    let total_len = sorted_exons
+        .iter()
+        .try_fold(0usize, |total, exon| total.checked_add(exon_len(exon)?))?;
+    let first_len = exon_len(first)?;
+    let last_len = exon_len(last)?;
+    let (first_cdna_start, first_cdna_end, last_cdna_start, last_cdna_end) = if tx.strand >= 0 {
+        (
+            1usize,
+            first_len,
+            total_len.saturating_sub(last_len).saturating_add(1),
+            total_len,
+        )
+    } else {
+        (
+            total_len.saturating_sub(first_len).saturating_add(1),
+            total_len,
+            1usize,
+            last_len,
+        )
+    };
+    let upstream_distance = genomic_pos.abs_diff(last.end);
+    let downstream_distance = first.start.abs_diff(genomic_pos);
+    if upstream_distance < downstream_distance
+        || (upstream_distance == downstream_distance && tx.strand >= 0)
+    {
+        Some(if tx.strand >= 0 {
+            format!("{last_cdna_end}+{upstream_distance}")
+        } else {
+            format!("{last_cdna_start}-{upstream_distance}")
+        })
+    } else {
+        Some(if tx.strand >= 0 {
+            format!("{first_cdna_start}-{downstream_distance}")
+        } else {
+            format!("{first_cdna_end}+{downstream_distance}")
+        })
+    }
 }
 
 fn hgvsc_coords_from_output_cdna_position(
@@ -5132,6 +5194,34 @@ mod tests {
         assert_eq!(
             refseq_hgvsc_position_from_genomic(&tx, &exons, 2740, 201),
             Some("2842".to_string())
+        );
+    }
+
+    #[test]
+    fn test_refseq_hgvsc_maps_offset_past_negative_strand_terminal_exon() {
+        let mut tx = make_transcript("protein_coding", -1, Some(100), Some(999));
+        tx.transcript_id = "NM_TERMINAL_OFFSET.1".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 100;
+        tx.end = 999;
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(300);
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 900,
+            end: 999,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 100,
+            end: 199,
+        };
+
+        assert_eq!(
+            refseq_hgvsc_position_from_genomic(&tx, &[&exon1, &exon2], 100, 10),
+            Some("200+10".to_string())
         );
     }
 
