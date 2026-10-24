@@ -7305,7 +7305,10 @@ impl AnnotateProvider {
                                         lookup_domains(
                                             tc.transcript_id.as_deref(),
                                             tc.protein_position.as_deref(),
-                                            tc.amino_acids.as_deref(),
+                                            row_variant.as_ref().is_some_and(|variant| {
+                                                variant.ref_allele == "-"
+                                                    && variant.alt_allele != "-"
+                                            }),
                                             ctx,
                                         )
                                     }
@@ -7952,7 +7955,9 @@ impl AnnotateProvider {
                                 let domains_str = lookup_domains(
                                     tc.transcript_id.as_deref(),
                                     tc.protein_position.as_deref(),
-                                    tc.amino_acids.as_deref(),
+                                    row_variant.as_ref().is_some_and(|variant| {
+                                        variant.ref_allele == "-" && variant.alt_allele != "-"
+                                    }),
                                     ctx,
                                 );
                                 if !domains_str.is_empty() {
@@ -9004,7 +9009,7 @@ fn read_protein_features(col: &dyn Array, row: usize) -> Vec<ProteinDomainFeatur
 fn lookup_domains(
     transcript_id: Option<&str>,
     protein_position: Option<&str>,
-    amino_acids: Option<&str>,
+    is_insertion: bool,
     ctx: &PreparedContext<'_>,
 ) -> String {
     let Some(tx_id) = transcript_id else {
@@ -9025,12 +9030,11 @@ fn lookup_domains(
         let Ok(e) = b.parse::<i64>() else {
             return String::new();
         };
-        // For insertions (amino_acids = "-/X"), VEP's Mapper.map_insert swaps
+        // For insertions, VEP's Mapper.map_insert swaps
         // translation_start and translation_end so that start > end. This makes
         // the overlap check exclude features that touch only at the exact
         // insertion boundary. E.g., insertion at protein 408-409 becomes
         // tl_start=409, tl_end=408: overlap with [389-408] is 409<=408 → false.
-        let is_insertion = amino_acids.is_some_and(|aa| aa.starts_with("-/"));
         if is_insertion {
             (e, s) // swap: start=409, end=408
         } else {
@@ -19832,7 +19836,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("42"), None, &ctx),
+            lookup_domains(Some("ENST00000001"), Some("42"), false, &ctx),
             "Pfam:PF00069"
         );
     }
@@ -19858,7 +19862,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("42"), None, &ctx),
+            lookup_domains(Some("ENST00000001"), Some("42"), false, &ctx),
             "Pfam:PF00069&PROSITE_profiles:PS50011"
         );
     }
@@ -19875,7 +19879,26 @@ mod tests {
             }],
         )];
         let ctx = minimal_ctx(&translations);
-        assert!(lookup_domains(Some("ENST00000001"), Some("42"), None, &ctx).is_empty());
+        assert!(lookup_domains(Some("ENST00000001"), Some("42"), false, &ctx).is_empty());
+    }
+
+    #[test]
+    fn lookup_domains_keeps_ambiguous_insertion_boundary_geometry() {
+        let translations = vec![make_translation(
+            "ENST00000001",
+            vec![ProteinDomainFeature {
+                analysis: Some("Pfam".to_string()),
+                hseqname: Some("PF_BOUNDARY".to_string()),
+                start: 10,
+                end: 42,
+            }],
+        )];
+        let ctx = minimal_ctx(&translations);
+
+        // The alternate peptide is intentionally absent for an ambiguous
+        // insertion. VEP still carries inverted insertion coordinates, which
+        // excludes a domain ending at the insertion boundary.
+        assert!(lookup_domains(Some("ENST00000001"), Some("42-43"), true, &ctx).is_empty());
     }
 
     #[test]
@@ -19891,7 +19914,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("10"), None, &ctx),
+            lookup_domains(Some("ENST00000001"), Some("10"), false, &ctx),
             "Gene3D_db:1.10.510.10"
         );
     }
@@ -19912,7 +19935,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("10"), None, &ctx),
+            lookup_domains(Some("ENST00000001"), Some("10"), false, &ctx),
             "a__b:x"
         );
     }
@@ -19932,7 +19955,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("10"), None, &ctx),
+            lookup_domains(Some("ENST00000001"), Some("10"), false, &ctx),
             "a_b:c_d_e"
         );
     }
