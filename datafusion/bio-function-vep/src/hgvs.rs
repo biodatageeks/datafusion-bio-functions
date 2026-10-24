@@ -626,7 +626,17 @@ fn format_hgvsc_fallback(
             cdna_position?,
             use_genomic_shift,
         )?
+    } else if notation.kind == "ins" {
+        // VEP converts the insertion VF span `(P, P-1)` into transcript-slice
+        // coordinates before `hgvs_variant_notation` reverses display start
+        // and end for an insertion. Rebuild that exact pre-sort pair here;
+        // the engine represents the same gap as the point `P`.
+        let slice_notation = hgvsc_insertion_pre_sort_slice_notation(tx, &notation)?;
+        notation_to_hgvsc_coords(tx, tx_exons, &slice_notation, hgvsc_edit_offset, true)?
     } else {
+        // `_var2transcript_slice_coords` also supplies transcript-oriented
+        // endpoints for ranges. Unlike a plain insertion, Sequence.pm leaves
+        // these endpoints in that order.
         let mut slice_notation = notation.clone();
         (slice_notation.start, slice_notation.end) =
             genomic_range_to_transcript_slice(tx, notation.start, notation.end)?;
@@ -1580,6 +1590,44 @@ fn genomic_range_to_transcript_slice(
             tx.end.checked_sub(genomic_start)?.checked_add(1)?,
         ))
     }
+}
+
+/// Build VEP's plain-insertion coordinates in transcript-slice pre-sort order.
+///
+/// ```perl
+/// # ensembl-variation 2fb834b TranscriptVariationAllele.pm:2697-2707
+/// ($vf_start, $vf_end) = map {($tr_end - $_) + 1} ($vf->end, $vf->start);
+/// ($vf_start, $vf_end) = map {($_ - $tr_start) + 1} ($vf->start, $vf->end);
+/// # Utils/Sequence.pm:591-594
+/// $notation{'start'} = $display_end;
+/// $notation{'end'} = $display_start;
+/// ```
+///
+/// vepyr stores an insertion as a point `P`; Ensembl Variation's VF span is
+/// `(P, P-1)`. Map that span first, then apply the pinned formatter's one
+/// start/end reversal. This produces the transcript-upstream flank first on
+/// either strand, before `order_mapped_hgvsc_positions` applies VEP's sort.
+fn hgvsc_insertion_pre_sort_slice_notation(
+    tx: &TranscriptFeature,
+    notation: &HgvsNotation,
+) -> Option<HgvsNotation> {
+    if notation.kind != "ins" {
+        return None;
+    }
+    let (vf_start, vf_end) = if notation.start == notation.end {
+        (notation.start, notation.start.checked_sub(1)?)
+    } else {
+        // Before clipping, Sequence.pm has already assigned (display_end,
+        // display_start) to (start, end); reverse it back to the VF span.
+        (notation.end, notation.start)
+    };
+    let (slice_start, slice_end) = genomic_range_to_transcript_slice(tx, vf_start, vf_end)?;
+    let mut slice_notation = notation.clone();
+    // Utils/Sequence.pm:591-594 sets insertion start = display_end and
+    // end = display_start after the VF span has been mapped.
+    slice_notation.start = slice_end;
+    slice_notation.end = slice_start;
+    Some(slice_notation)
 }
 
 fn refseq_hgvsc_variant_cdna_start(
@@ -7937,6 +7985,32 @@ mod tests {
             notation_to_hgvsc_coords(&reverse, &exons, &reverse_range, None, true),
             Some(("5".to_string(), "6".to_string()))
         );
+    }
+
+    #[test]
+    fn test_hgvsc_plain_insertion_uses_vep_slice_pre_sort_order_on_both_strands() {
+        // VEP maps the VF insertion gap `(P, P-1)` to transcript-slice
+        // coordinates (`TranscriptVariationAllele.pm:2697-2707`) and then
+        // sets start=display_end/end=display_start for a plain insertion
+        // (`Utils/Sequence.pm:591-594`), before the one sort at
+        // `TranscriptVariationAllele.pm:1523-1538` (@ 2fb834b).
+        let exon = make_exon();
+        let exons = [&exon];
+        for (strand, expected_slice, expected_hgvsc) in
+            [(1, (14, 15), ("14", "15")), (-1, (37, 38), ("37", "38"))]
+        {
+            let tx = make_transcript("protein_coding", strand, None, None);
+            let notation = hgvs_variant_notation("-", "AT", 104, 104).unwrap();
+            assert_eq!(notation.kind, "ins");
+            let pre_sort_slice = hgvsc_insertion_pre_sort_slice_notation(&tx, &notation).unwrap();
+            assert_eq!((pre_sort_slice.start, pre_sort_slice.end), expected_slice);
+            let pre_sort_hgvsc =
+                notation_to_hgvsc_coords(&tx, &exons, &pre_sort_slice, None, true).unwrap();
+            assert_eq!(
+                pre_sort_hgvsc,
+                (expected_hgvsc.0.to_string(), expected_hgvsc.1.to_string())
+            );
+        }
     }
 
     #[test]
