@@ -6975,6 +6975,28 @@ fn shifted_tva_coords_from_mapper(
         vep_coords::CdnaBaseMap::HgvspExact,
         leading_n_offset,
     );
+    let is_deleted_refseq_gap = |pos| {
+        if !refseq_has_edited_sequence_state(tx) {
+            return false;
+        }
+        if refseq_deleted_edit_cdna_index(tx, tx_exons, pos).is_some() {
+            return true;
+        }
+        if mapper_deleted_gap_cdna_index(tx, tx_exons, pos).is_none() {
+            return false;
+        }
+        let Some(raw_cdna) = genomic_to_cdna_index(tx_exons, tx.strand, pos)
+            .and_then(|position| i64::try_from(position).ok())
+        else {
+            return false;
+        };
+        tx.refseq_edits.iter().any(|edit| {
+            !edit.skip_refseq_offset
+                && refseq_edit_offset_delta(edit).is_some_and(|delta| delta < 0)
+                && raw_cdna >= edit.start
+                && raw_cdna <= edit.end
+        })
+    };
     let (cdna_start, cdna_end, raw_cds_start, raw_cds_end, mapper_used_for_index) = if is_insertion
     {
         // `Mapper::map_insert()` over the transcript-ordered flanks, keeping
@@ -6997,10 +7019,30 @@ fn shifted_tva_coords_from_mapper(
         let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
         let mut mapper_used_for_index = true;
         for pos in genomic_positions {
+            // `TranscriptMapper` returns a `Gap` for genomic bases deleted
+            // from an edited RefSeq transcript. `translation_start/end()` use
+            // the first and last mapper pieces, so an internal Gap does not
+            // erase valid coordinates on both allele endpoints.
+            // Ensembl Core `Mapper::map_coordinates()` retains those pieces
+            // around gaps (c0cf13d):
+            // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L267-L270
+            // Ensembl Variation `BaseTranscriptVariation::translation_coords()`
+            // takes the first/last pieces (2fb834b):
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L540-L560
+            if is_deleted_refseq_gap(pos)
+                && pos != shifted_variant.start
+                && pos != shifted_variant.end
+            {
+                mapper_used_for_index = false;
+                continue;
+            }
             if exact_mapper_cdna_index_for_hgvsp(tx, pos).is_none() {
                 mapper_used_for_index = false;
             }
             cdna_positions.push(genomic_to_cdna_index_for_hgvsp(tx, tx_exons, pos)?);
+        }
+        if cdna_positions.is_empty() {
+            return None;
         }
         cdna_positions.sort_unstable();
         let (cdna_start, cdna_end) = (*cdna_positions.first()?, *cdna_positions.last()?);
@@ -7080,8 +7122,17 @@ fn shifted_tva_coords_from_mapper(
         let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
         let mut peptide_positions = Vec::with_capacity(genomic_positions.len());
         for pos in genomic_positions {
+            if is_deleted_refseq_gap(pos)
+                && pos != shifted_variant.start
+                && pos != shifted_variant.end
+            {
+                continue;
+            }
             let tr_pos = translateable_pos_1based(pos)?;
             peptide_positions.push(tr_pos.saturating_add(2) / 3);
+        }
+        if peptide_positions.is_empty() {
+            return None;
         }
         peptide_positions.sort_unstable();
         (*peptide_positions.first()?, *peptide_positions.last()?)
@@ -9501,7 +9552,25 @@ fn classify_insertion_with_semantics_and_gap(
         }
         .min(effective_cds.len());
         if codon_end <= effective_cds.len() {
-            let ref_codon: String = effective_cds[codon_start..codon_end]
+            // Insertion alleles at an RNA-edit mapper gap use the canonical
+            // cached CDS for VEP's reference `codon()` window. The consequence
+            // classifier above still uses the edited CDS; only the displayed
+            // reference codon is replayed from the cached reference sequence.
+            // Variation's codon implementation selects `_translateable_seq`
+            // for the reference TVA and widens only the alternate window
+            // (`2fb834b`):
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L888
+            let canonical_reference_cds = replace_refseq_mapper_gap
+                .then(|| {
+                    tx_translation
+                        .and_then(|translation| translation.cds_sequence_canonical.as_deref())
+                })
+                .flatten()
+                .filter(|sequence| sequence.len() == effective_cds.len());
+            let reference_codon = canonical_reference_cds
+                .and_then(|sequence| sequence.as_bytes().get(codon_start..codon_end))
+                .unwrap_or(&effective_cds[codon_start..codon_end]);
+            let ref_codon: String = reference_codon
                 .iter()
                 .map(|&b| (b as char).to_ascii_lowercase())
                 .collect();
@@ -9545,7 +9614,17 @@ fn classify_insertion_with_semantics_and_gap(
         }
         .min(effective_cds.len());
         if codon_end <= effective_cds.len() {
-            let ref_codon: String = effective_cds[codon_start..codon_end]
+            let canonical_reference_cds = replace_refseq_mapper_gap
+                .then(|| {
+                    tx_translation
+                        .and_then(|translation| translation.cds_sequence_canonical.as_deref())
+                })
+                .flatten()
+                .filter(|sequence| sequence.len() == effective_cds.len());
+            let reference_codon = canonical_reference_cds
+                .and_then(|sequence| sequence.as_bytes().get(codon_start..codon_end))
+                .unwrap_or(&effective_cds[codon_start..codon_end]);
+            let ref_codon: String = reference_codon
                 .iter()
                 .map(|&b| (b as char).to_ascii_lowercase())
                 .collect();
@@ -14081,6 +14160,28 @@ mod tests {
                 .is_some_and(|codons| codons.contains("AAAA")),
             "the `_rna_edit` reference codons use the mapped-width feature REF: {classification:?}"
         );
+        assert_eq!(
+            shifted_tva_coords_from_mapper(&transcript, &exons, &translation, &variant),
+            Some(ShiftedTvaCoords {
+                cds_start: 3,
+                cds_end: 6,
+                protein_start: 1,
+                protein_end: 2,
+                edited_insertion_gap: false,
+            }),
+            "a deleted-edit gap inside the allele must not erase mapped endpoint coordinates"
+        );
+        let gap_endpoint_variant = var("1", 104, 107, "AAAA", "-");
+        assert_eq!(
+            shifted_tva_coords_from_mapper(
+                &transcript,
+                &exons,
+                &translation,
+                &gap_endpoint_variant
+            ),
+            None,
+            "a deleted-edit Gap at an allele endpoint still suppresses HGVSp"
+        );
     }
 
     fn synthetic_qk_dup_cds(
@@ -14661,6 +14762,31 @@ mod tests {
         .expect("boundary insertion classification");
         assert_eq!(boundary_class.cds_position_start, Some(75));
         assert_eq!(boundary_class.cds_position_end, Some(77));
+        assert_eq!(
+            boundary_class.codons.as_deref(),
+            Some("gaagag/gaGGa"),
+            "ClinVar 1167157 reference codons come from the canonical cached CDS."
+        );
+
+        let boundary_three_base_variant = VariantInput::from_vcf(
+            "2".into(),
+            73_385_942,
+            73_385_942,
+            "A".into(),
+            "AGGC".into(),
+        );
+        let boundary_three_base_class = classify_coding_change(
+            &boundary_transcript,
+            &exons_ref,
+            Some(&boundary_translation),
+            &boundary_three_base_variant,
+        )
+        .expect("three-base boundary insertion classification");
+        assert_eq!(
+            boundary_three_base_class.codons.as_deref(),
+            Some("gaagag/gaGGCa"),
+            "ClinVar 551063 reference codons come from the canonical cached CDS."
+        );
         let boundary_protein = protein_hgvs_for_output(
             &boundary_transcript,
             &exons_ref,
