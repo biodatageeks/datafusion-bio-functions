@@ -1,6 +1,5 @@
 //! HGVS notation formatting for VEP CSQ fields (HGVSc and HGVSp).
 
-use std::cmp::Ordering;
 use std::fmt::Write;
 use std::io::{BufRead, Seek};
 use std::time::{Duration, Instant};
@@ -587,32 +586,7 @@ fn format_hgvsc_fallback(
     if let (Some(started), Some(profile)) = (coord_map_started, profile.as_deref_mut()) {
         profile.coord_map += started.elapsed();
     }
-    if clamped {
-        // vepyr#244 sub-case, ported on the clamped path only (vepyr#216).
-        // `notation_to_hgvsc_coords` returns the genomic order; VEP keeps the
-        // transcript-slice order (an `ins` clipped from a clamp has start =
-        // end + 1) and sorts it with a guard against an end carrying `*`.
-        // Restore VEP's slice order before applying its coordinate sort. For
-        // a `*-N`/coding pair, the endpoint order is already the transcript
-        // slice order; reversing it here would defeat that star-coordinate
-        // ordering.
-        (start, end) = restore_clamped_hgvsc_insertion_slice_order(
-            &start,
-            &end,
-            (tx.strand >= 0) == (notation.kind == "ins"),
-        );
-        if vep_hgvs_positions_need_swap(&start, &end) {
-            std::mem::swap(&mut start, &mut end);
-        }
-    } else if notation.kind == "ins" {
-        // Insertion flanks are not ordered like the mapper's deletion
-        // endpoints at the coding / `*-N` boundary. VEP's insertion formatter
-        // puts the star-negative flank first (vepyr#244); preserve mapper
-        // order for other notation kinds.
-        (start, end) = order_hgvsc_insertion_positions(&start, &end);
-    } else {
-        (start, end) = order_hgvsc_positions(&start, &end);
-    }
+    (start, end) = order_mapped_hgvsc_positions(&start, &end, tx.strand, &notation.kind, clamped);
     let format_started = profile.is_some().then(Instant::now);
     let hgvsc = format_hgvs_string(&tx_id, numbering, &start, &end, &notation);
     if let (Some(started), Some(profile)) = (format_started, profile.as_deref_mut()) {
@@ -2205,32 +2179,6 @@ fn split_hgvs_coord(value: &str) -> Option<(i64, Option<String>)> {
     Some((coord_part.parse::<i64>().ok()?, offset_part))
 }
 
-fn compare_hgvs_positions(left: &str, right: &str) -> Option<Ordering> {
-    let left_star = left.starts_with('*');
-    let right_star = right.starts_with('*');
-    match (left_star, right_star) {
-        (false, true) => return Some(Ordering::Less),
-        (true, false) => return Some(Ordering::Greater),
-        _ => {}
-    }
-
-    let (left_coord, left_offset) = split_hgvs_coord(left)?;
-    let (right_coord, right_offset) = split_hgvs_coord(right)?;
-    let left_offset = left_offset
-        .as_deref()
-        .unwrap_or("0")
-        .parse::<i64>()
-        .ok()
-        .unwrap_or(0);
-    let right_offset = right_offset
-        .as_deref()
-        .unwrap_or("0")
-        .parse::<i64>()
-        .ok()
-        .unwrap_or(0);
-    Some((left_coord, left_offset).cmp(&(right_coord, right_offset)))
-}
-
 /// VEP's position sort in `hgvs_transcript`, literally:
 ///
 /// ```perl
@@ -2312,16 +2260,50 @@ fn restore_clamped_hgvsc_insertion_slice_order(
     (start, end)
 }
 
-fn order_hgvsc_positions(start: &str, end: &str) -> (String, String) {
-    // VEP's `hgvs_transcript` sort keeps both endpoints in their incoming
-    // order for this shape: `*-N` sorts numerically before coding positions,
-    // while a `*` in the end suppresses a swap. Do not normalize the pair
-    // symmetrically; the mapper's transcript-slice order is significant.
-    if let Some(ordered) = preserve_star_negative_hgvsc_order(start, end) {
-        return ordered;
+fn order_mapped_hgvsc_positions(
+    start: &str,
+    end: &str,
+    transcript_strand: i8,
+    kind: &str,
+    clamped: bool,
+) -> (String, String) {
+    let mut start = start.to_string();
+    let mut end = end.to_string();
+
+    if clamped && kind == "ins" {
+        // Clamped insertions use adjacent transcript-slice flanks. Preserve
+        // their VEP slice orientation before applying the star-end guard.
+        (start, end) = restore_clamped_hgvsc_insertion_slice_order(
+            &start,
+            &end,
+            (transcript_strand >= 0) == (kind == "ins"),
+        );
+    } else if transcript_strand < 0 {
+        // `_var2transcript_slice_coords` reverses genomic start/end for a
+        // reverse-strand transcript before `_get_cDNA_position` maps them.
+        std::mem::swap(&mut start, &mut end);
     }
 
-    if matches!(compare_hgvs_positions(start, end), Some(Ordering::Greater)) {
+    if clamped {
+        if vep_hgvs_positions_need_swap(&start, &end) {
+            std::mem::swap(&mut start, &mut end);
+        }
+        return (start, end);
+    }
+
+    if kind == "ins" {
+        // VEP's insertion formatter places the star-negative flank first at
+        // the coding / `*-N` boundary (vepyr#244).
+        order_hgvsc_insertion_positions(&start, &end)
+    } else {
+        order_hgvsc_positions(&start, &end)
+    }
+}
+
+fn order_hgvsc_positions(start: &str, end: &str) -> (String, String) {
+    // Match the pinned VEP sort: it uses the parsed numeric/offset values and
+    // suppresses a swap only when the end position contains `*`.
+    if vep_hgvs_positions_need_swap(start, end) {
         (end.to_string(), start.to_string())
     } else {
         (start.to_string(), end.to_string())
@@ -7847,9 +7829,11 @@ mod tests {
             order_hgvsc_positions("2016", "2015"),
             ("2015".to_string(), "2016".to_string())
         );
+        // VEP's end-star guard suppresses the swap even when the numeric
+        // positions are descending.
         assert_eq!(
             order_hgvsc_positions("*184", "*159"),
-            ("*159".to_string(), "*184".to_string())
+            ("*184".to_string(), "*159".to_string())
         );
     }
 
@@ -7864,6 +7848,26 @@ mod tests {
         );
         assert_eq!(
             order_hgvsc_insertion_positions("*-1", "1239"),
+            ("*-1".to_string(), "1239".to_string())
+        );
+    }
+
+    #[test]
+    fn test_hgvsc_transcript_slice_order_matches_vep_for_star_negative_ranges() {
+        assert_eq!(
+            order_mapped_hgvsc_positions("*-51", "962+66", -1, "dup", false),
+            ("962+66".to_string(), "*-51".to_string())
+        );
+        assert_eq!(
+            order_mapped_hgvsc_positions("6", "*-530", 1, "del", true),
+            ("6".to_string(), "*-530".to_string())
+        );
+        assert_eq!(
+            order_mapped_hgvsc_positions("*-1", "2016", 1, "del", false),
+            ("*-1".to_string(), "2016".to_string())
+        );
+        assert_eq!(
+            order_mapped_hgvsc_positions("*-1", "1239", 1, "ins", true),
             ("*-1".to_string(), "1239".to_string())
         );
     }
