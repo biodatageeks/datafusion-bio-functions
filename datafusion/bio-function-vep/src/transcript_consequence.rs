@@ -9565,8 +9565,7 @@ fn classify_insertion_with_semantics_and_gap(
                     tx_translation
                         .and_then(|translation| translation.cds_sequence_canonical.as_deref())
                 })
-                .flatten()
-                .filter(|sequence| sequence.len() == effective_cds.len());
+                .flatten();
             let reference_codon = canonical_reference_cds
                 .and_then(|sequence| sequence.as_bytes().get(codon_start..codon_end))
                 .unwrap_or(&effective_cds[codon_start..codon_end]);
@@ -9619,8 +9618,7 @@ fn classify_insertion_with_semantics_and_gap(
                     tx_translation
                         .and_then(|translation| translation.cds_sequence_canonical.as_deref())
                 })
-                .flatten()
-                .filter(|sequence| sequence.len() == effective_cds.len());
+                .flatten();
             let reference_codon = canonical_reference_cds
                 .and_then(|sequence| sequence.as_bytes().get(codon_start..codon_end))
                 .unwrap_or(&effective_cds[codon_start..codon_end]);
