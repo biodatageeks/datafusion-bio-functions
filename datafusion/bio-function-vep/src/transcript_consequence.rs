@@ -3062,9 +3062,13 @@ impl TranscriptConsequenceEngine {
                 if partial_terminal_codon {
                     terms.insert(SoTerm::IncompleteTerminalCodonVariant);
                 }
-                let stop_lost_uses_peptides = classification
-                    .as_ref()
-                    .is_some_and(vep116_stop_lost_uses_peptides);
+                let stop_lost_uses_peptides = classification.as_ref().is_some_and(|class| {
+                    class.affected_ref_peptide.is_some()
+                        && class
+                            .affected_alt_peptide
+                            .as_deref()
+                            .is_some_and(|peptide| !peptide.contains('X'))
+                });
                 let stop_lost = !partial_terminal_codon
                     && !stop_lost_uses_peptides
                     && vep116_stop_lost_without_unambiguous_alt_peptide(
@@ -3073,9 +3077,12 @@ impl TranscriptConsequenceEngine {
                         tx_translation,
                         variant,
                     );
-                let stop_retained_uses_peptides = classification
-                    .as_ref()
-                    .is_some_and(vep116_stop_retained_uses_peptides);
+                let stop_retained_uses_peptides = classification.as_ref().is_some_and(|class| {
+                    class
+                        .affected_alt_peptide
+                        .as_deref()
+                        .is_some_and(|peptide| !peptide.is_empty() && !peptide.contains('X'))
+                });
                 if stop_lost {
                     terms.insert(SoTerm::StopLost);
                     if let Some(classification) = classification.as_mut() {
@@ -4907,9 +4914,9 @@ fn is_stop_codon(allele: &str) -> bool {
 ///
 /// Traceability:
 /// - `_ins_del_stop_altered`:
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1382-L1433>
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
 /// - `stop_retained_variant = !_ins_del_stop_altered`:
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1354-L1370>
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
 fn mutated_cds_stop_preserved(
     cds_seq: &str,
     variant: &VariantInput,
@@ -4920,12 +4927,13 @@ fn mutated_cds_stop_preserved(
     let alt_allele = normalize_allele_seq(&variant.alt_allele);
 
     let leading_n_offset = cds_seq.bytes().take_while(|&b| b == b'N').count();
-    // VEP `_ins_del_stop_altered()` edits by BTV's mapped CDS start and the
-    // mapped cDNA span. A genomic REF length incorrectly counts introns in
-    // exon-spanning deletions and can make a preserved terminal stop appear
-    // lost. Keep the existing flank-based insertion handling, where the
-    // source has a TODO for insertion-specific span semantics.
-    let (cds_idx, ref_len) = if variant.start > variant.end {
+    // A genomic REF length includes introns for exon-spanning deletions. Use
+    // the mapped cDNA span for net deletions, while insertions retain their
+    // allele-length edit span (the cDNA interval can include the inserted
+    // flank and over-delete the transcript sequence).
+    let use_cdna_deletion_span =
+        ref_allele.len() > alt_allele.len() && variant.start <= variant.end;
+    let (cds_idx, ref_len) = if !use_cdna_deletion_span {
         let var_start_genomic = if tx.strand >= 0 {
             variant.start
         } else {
@@ -5227,9 +5235,8 @@ fn vep116_stop_retained_without_alt_peptide(
         .is_some_and(|codon| is_stop_codon_in(tx.codon_table, codon))
 }
 
-/// VEP 116 `stop_lost()` falls back to `_ins_del_stop_altered()` only when a
-/// peptide allele is undefined. A defined partial-codon peptide ending in
-/// `X` still takes the peptide predicate branch. Unlike the
+/// VEP 116 `stop_lost()` falls back to `_ins_del_stop_altered()` when the
+/// alternate peptide is missing or contains `X`. Unlike the
 /// stop-retained fallback, this path uses the ordinary (unextended) stop-codon
 /// overlap interval.
 fn vep116_stop_lost_without_unambiguous_alt_peptide(
@@ -5253,15 +5260,7 @@ fn vep116_stop_lost_without_unambiguous_alt_peptide(
         return false;
     }
 
-    let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
-        return false;
-    };
-    let (stop_start, stop_end) = if tx.strand >= 0 {
-        (cds_end.saturating_sub(2), cds_end)
-    } else {
-        (cds_start, cds_start.saturating_add(2))
-    };
-    if !overlaps(variant.start, variant.end, stop_start, stop_end) {
+    if !vep116_codon_overlap(tx, tx_exons, variant, false) {
         return false;
     }
 
@@ -5313,21 +5312,6 @@ impl CodingClassification {
     }
 }
 
-/// VEP's stop-lost peptide branch runs whenever both peptide alleles exist,
-/// including partial-codon peptides that contain `X`.
-fn vep116_stop_lost_uses_peptides(class: &CodingClassification) -> bool {
-    class.affected_ref_peptide.is_some() && class.affected_alt_peptide.is_some()
-}
-
-/// VEP's stop-retained peptide branch runs for any defined, nonempty alternate
-/// peptide, including partial-codon peptides that contain `X`.
-fn vep116_stop_retained_uses_peptides(class: &CodingClassification) -> bool {
-    class
-        .affected_alt_peptide
-        .as_deref()
-        .is_some_and(|peptide| !peptide.is_empty())
-}
-
 fn apply_vep116_stop_predicate_flags(
     class: &mut CodingClassification,
     semantics: crate::vep_semantics::VepSemantics,
@@ -5347,11 +5331,15 @@ fn apply_vep116_stop_predicate_flags(
         && matches!(
             (ref_peptide, alt_peptide),
             (Some(reference), Some(alternate))
-                if reference.contains('*') && !alternate.contains('*')
+                if !alternate.contains('X')
+                    && reference.contains('*')
+                    && !alternate.contains('*')
         );
     let stop_retained = !partial_terminal_codon
         && !stop_lost
-        && alt_peptide.is_some_and(|alternate| !alternate.is_empty() && ref_eq_alt_sequence);
+        && alt_peptide.is_some_and(|alternate| {
+            !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
+        });
     let stop_gained = !stop_retained
         && !stop_lost
         && ref_peptide.is_some_and(|reference| !reference.contains('*'))
@@ -5375,7 +5363,11 @@ fn apply_vep116_nucleotide_stop_fallbacks(
         return;
     }
 
-    let stop_lost_uses_peptides = vep116_stop_lost_uses_peptides(class);
+    let stop_lost_uses_peptides = class.affected_ref_peptide.is_some()
+        && class
+            .affected_alt_peptide
+            .as_deref()
+            .is_some_and(|peptide| !peptide.contains('X'));
     if !partial_terminal_codon
         && !stop_lost_uses_peptides
         && vep116_stop_lost_without_unambiguous_alt_peptide(tx, tx_exons, tx_translation, variant)
@@ -5386,7 +5378,10 @@ fn apply_vep116_nucleotide_stop_fallbacks(
         return;
     }
 
-    let stop_retained_uses_peptides = vep116_stop_retained_uses_peptides(class);
+    let stop_retained_uses_peptides = class
+        .affected_alt_peptide
+        .as_deref()
+        .is_some_and(|peptide| !peptide.is_empty() && !peptide.contains('X'));
     if !stop_retained_uses_peptides
         && vep116_stop_retained_without_alt_peptide(tx, tx_exons, tx_translation, variant)
     {
@@ -13018,7 +13013,7 @@ mod tests {
     }
 
     #[test]
-    fn vep116_hunks5_and6_use_defined_x_peptides_before_fallbacks() {
+    fn vep116_hunks5_and6_route_x_peptides_to_nucleotide_stop_fallbacks() {
         let base = CodingClassification {
             stop_lost: true,
             stop_retained: true,
@@ -13041,8 +13036,7 @@ mod tests {
             false,
         );
         assert!(v115.stop_lost && v115.stop_retained);
-        assert!(v116.stop_lost);
-        assert!(!v116.stop_retained);
+        assert!(!v116.stop_lost && !v116.stop_retained);
 
         let mut plus = tx(
             "T1",
@@ -13062,7 +13056,6 @@ mod tests {
         let translation = translation("T1", Some(9), Some(3), None, Some("ATGAAATAA"));
         let insertion = var("22", 1007, 1007, "-", "T");
         let mut fallback = CodingClassification {
-            stop_lost: true,
             affected_ref_peptide: Some("*".to_string()),
             affected_alt_peptide: Some("LX".to_string()),
             ..Default::default()
@@ -26207,48 +26200,67 @@ mod tests {
     }
 
     #[test]
-    fn issue_202_defined_partial_peptides_prevent_nucleotide_stop_override() {
+    fn stop_lost_fallback_uses_cdna_overlap_for_split_terminal_stop() {
         let mut transcript = tx(
-            "T_PARTIAL_PEPTIDE",
+            "T_SPLIT_STOP_OVERLAP",
             "22",
             100,
-            108,
+            200,
             1,
             "protein_coding",
             Some(100),
-            Some(108),
+            Some(200),
         );
         transcript.cdna_coding_start = Some(1);
-        transcript.cdna_coding_end = Some(9);
-        transcript.translateable_seq = Some("ATGGCTTAA".to_string());
-        let exon = exon("T_PARTIAL_PEPTIDE", 1, 100, 108);
-        let exons = [&exon];
-        let deletion = var("22", 106, 108, "TAA", "-");
+        transcript.cdna_coding_end = Some(12);
+        transcript.translateable_seq = Some("ATGAAACCTTAA".to_string());
+        let exons = [
+            exon("T_SPLIT_STOP_OVERLAP", 1, 100, 110),
+            exon("T_SPLIT_STOP_OVERLAP", 2, 200, 200),
+        ];
+        let exon_refs = exons.iter().collect::<Vec<_>>();
+        let deletion = var("22", 109, 109, "T", "-");
+
+        assert!(vep116_codon_overlap(
+            &transcript,
+            &exon_refs,
+            &deletion,
+            false,
+        ));
         assert!(vep116_stop_lost_without_unambiguous_alt_peptide(
             &transcript,
-            &exons,
+            &exon_refs,
             None,
             &deletion,
         ));
+    }
 
-        let mut classification = CodingClassification {
-            affected_ref_peptide: Some("A".to_string()),
-            affected_alt_peptide: Some("*X".to_string()),
-            ..Default::default()
-        };
-        apply_vep116_nucleotide_stop_fallbacks(
-            &mut classification,
-            crate::vep_semantics::VepSemantics::V116,
-            false,
+    #[test]
+    fn mutated_cds_stop_preserved_keeps_insertion_span_from_alleles() {
+        let cds = "ATGGCTTGA";
+        let mut transcript = tx(
+            "T_VCF_INSERTION",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
+        transcript.translateable_seq = Some(cds.to_string());
+        let exon = exon("T_VCF_INSERTION", 1, 1000, 1008);
+        let exons = [&exon];
+        let insertion = var("22", 1006, 1007, "T", "TG");
+
+        assert!(!mutated_cds_stop_preserved(
+            cds,
+            &insertion,
             &transcript,
             &exons,
-            None,
-            &deletion,
-        );
-        assert!(
-            !classification.stop_lost,
-            "defined peptide alleles must use VEP's peptide predicate even when the alternate ends in X: {classification:?}"
-        );
+        ));
     }
 
     #[test]
