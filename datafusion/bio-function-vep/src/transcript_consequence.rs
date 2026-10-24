@@ -5193,19 +5193,31 @@ fn vep116_stop_retained_without_alt_peptide(
         reverse.to_ascii_uppercase()
     };
 
-    let (edit_start, edit_len) = if variant.start > variant.end {
-        let anchor = if tx.strand >= 0 {
-            variant.end
-        } else {
-            variant.start
+    let span = vep_coords::VepSpan::from_variant(variant);
+    let (edit_start, edit_len) = if span.is_insertion() {
+        // `VariantInput` stores a normalized insertion at n+1 as the point
+        // (n+1,n+1); VEP's mapper sees the empty span (n+1,n). Use the
+        // mapper's transcript-order cDNA/CDS coordinates so the edit is
+        // inserted before the 3' flank and replaces zero reference bases.
+        // `_ins_del_stop_altered_cil()` returns 0 when any required mapped
+        // coordinate is missing, which makes `stop_retained()` treat the
+        // stop as preserved.
+        let mapper = vep_coords::VepTxMapper::with_phase(
+            tx,
+            tx_exons,
+            vep_coords::CdnaBaseMap::Output,
+            leading_n_offset,
+        );
+        if mapper.cdna(span).both_truthy().is_none() {
+            return true;
+        }
+        let Some(cds_start) = mapper.cds(span).start else {
+            return true;
         };
-        let Some(cds_idx) = genomic_to_cds_index(tx, tx_exons, anchor) else {
-            return false;
+        let Some(edit_start) = cds_start.checked_sub(1) else {
+            return true;
         };
-        (
-            cds_idx.saturating_add(leading_n_offset).saturating_add(1),
-            0,
-        )
+        (edit_start, 0)
     } else {
         // VEP reads `$bvfo->cdna_start`, `$bvfo->cdna_end`, and
         // `$bvfo->cds_start` directly. When either genomic endpoint cannot be
@@ -13215,6 +13227,46 @@ mod tests {
         // a point. VEP's mapper represents the same event as (n+1, n), then
         // extends its start by the inserted length before genomic overlap.
         assert!(!vep116_overlaps_stop_codon_cil(&transcript, &insertion, 3,));
+    }
+
+    #[test]
+    fn vep116_stop_retained_fallback_maps_point_insertion_as_empty_span() {
+        // VEP maps this insertion to (cdna_start, cdna_end)=(8,7), so the
+        // CIL edit replaces zero bases before the second base of the terminal
+        // TGA. Inserting G makes the original stop slot TGG; treating the
+        // equal genomic endpoints as a one-base replacement incorrectly
+        // leaves TGA intact and emits stop_retained_variant.
+        let mut transcript = tx(
+            "T_POINT_CIL_STOP_EDIT",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
+        transcript.three_prime_utr_seq = Some("CCC".to_string());
+        let exon = exon("T_POINT_CIL_STOP_EDIT", 1, 1000, 1008);
+        let exons = [&exon];
+        let translation = translation(
+            "T_POINT_CIL_STOP_EDIT",
+            Some(9),
+            Some(3),
+            None,
+            Some("ATGAAATGA"),
+        );
+        let insertion = var("22", 1007, 1007, "-", "G");
+
+        assert!(vep116_overlaps_stop_codon_cil(&transcript, &insertion, 1));
+        assert!(!vep116_stop_retained_without_alt_peptide(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &insertion,
+        ));
     }
 
     #[test]
