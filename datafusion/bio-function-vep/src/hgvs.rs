@@ -1468,9 +1468,25 @@ fn notation_to_hgvsc_coords(
     notation: &HgvsNotation,
     refseq_hgvsc_offset: Option<i64>,
 ) -> Option<(String, String)> {
-    let map_position = |genomic_pos| match refseq_hgvsc_offset {
-        Some(offset) => refseq_hgvsc_position_from_genomic(tx, tx_exons, genomic_pos, offset),
-        None => hgvs_cdna_position_from_genomic(tx, tx_exons, genomic_pos),
+    let map_position = |genomic_pos| {
+        if !tx.refseq_edits.is_empty() {
+            // Ensembl Variation 2fb834b maps the HGVS transcript-slice
+            // coordinate through unedited exon geometry after applying the
+            // single misalignment offset selected from the original TVA start
+            // (TranscriptVariationAllele.pm:1519-1525, 2758-2765). Per-endpoint
+            // edited mapper offsets would incorrectly shift a shifted end that
+            // crossed an RNA edit after the original variant start.
+            return refseq_hgvsc_position_from_genomic(
+                tx,
+                tx_exons,
+                genomic_pos,
+                refseq_hgvsc_offset.unwrap_or(0),
+            );
+        }
+        match refseq_hgvsc_offset {
+            Some(offset) => refseq_hgvsc_position_from_genomic(tx, tx_exons, genomic_pos, offset),
+            None => hgvs_cdna_position_from_genomic(tx, tx_exons, genomic_pos),
+        }
     };
     if notation.kind == "ins" {
         let start = map_position(notation.start - 1)?;
@@ -7314,6 +7330,106 @@ mod tests {
         );
 
         assert_eq!(hgvsc.as_deref(), Some("NM_001142673.3:c.*432_*433del"));
+    }
+
+    #[test]
+    fn native_refseq_hgvsc_maps_shifted_endpoints_through_unedited_exons() {
+        let exon = ExonFeature {
+            transcript_id: "NM_EDIT_COORDS.1".to_string(),
+            exon_number: 1,
+            start: 100,
+            end: 199,
+        };
+        let exons = [&exon];
+        let mut inserted_edit = make_transcript("lncRNA", 1, None, None);
+        inserted_edit.transcript_id = "NM_EDIT_COORDS.1".to_string();
+        inserted_edit.source = Some("RefSeq".to_string());
+        inserted_edit.start = 100;
+        inserted_edit.end = 199;
+        inserted_edit.bam_edit_status = Some("ok".to_string());
+        inserted_edit.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 50,
+            end: 49,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        inserted_edit.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 148,
+                cdna_start: 1,
+                cdna_end: 49,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 149,
+                genomic_end: 199,
+                cdna_start: 53,
+                cdna_end: 103,
+                ori: 1,
+            },
+        ];
+
+        let inserted_hgvsc = format_hgvsc(
+            &inserted_edit,
+            &exons,
+            None,
+            None,
+            &"A".repeat(21),
+            "-",
+            140,
+            160,
+            None,
+        );
+        assert_eq!(
+            inserted_hgvsc.as_deref(),
+            Some("NM_EDIT_COORDS.1:n.41_61del")
+        );
+
+        let mut deleted_edit = make_transcript("lncRNA", 1, None, None);
+        deleted_edit.transcript_id = "NM_EDIT_COORDS.1".to_string();
+        deleted_edit.source = Some("RefSeq".to_string());
+        deleted_edit.start = 100;
+        deleted_edit.end = 199;
+        deleted_edit.bam_edit_status = Some("ok".to_string());
+        deleted_edit.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 50,
+            end: 52,
+            replacement_len: None,
+            skip_refseq_offset: false,
+        }];
+        deleted_edit.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 148,
+                cdna_start: 1,
+                cdna_end: 49,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 152,
+                genomic_end: 199,
+                cdna_start: 50,
+                cdna_end: 97,
+                ori: 1,
+            },
+        ];
+
+        let deleted_hgvsc = format_hgvsc(
+            &deleted_edit,
+            &exons,
+            None,
+            None,
+            &"A".repeat(21),
+            "-",
+            140,
+            160,
+            None,
+        );
+        assert_eq!(
+            deleted_hgvsc.as_deref(),
+            Some("NM_EDIT_COORDS.1:n.41_61del")
+        );
     }
 
     #[test]
