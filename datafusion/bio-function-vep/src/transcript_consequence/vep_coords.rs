@@ -39,7 +39,7 @@
 use super::{
     ExonFeature, TranscriptFeature, VariantInput, edited_transcript_cdna_index,
     edited_transcript_sequence_cdna_index, genomic_to_cdna_index_for_hgvsp,
-    genomic_to_cdna_index_for_transcript, mapper_insertion_gap_cdna_position,
+    genomic_to_cdna_index_for_transcript, genomic_to_cds_index, mapper_insertion_gap_cdna_position,
     reference_translateable_seq_for_hgvsp, shifted_insertion_cdna_flank,
     uses_refseq_transcript_reference,
 };
@@ -355,6 +355,48 @@ impl<'a> VepTxMapper<'a> {
     /// `genomic2pep` + BTV `translation_start` / `translation_end`.
     pub fn translation(&self, span: VepSpan) -> TvRange {
         self.cds(span).map(peptide_of_cds)
+    }
+
+    /// The translation start used by partial-codon predicates, with a fallback
+    /// for older caches that lack cDNA CDS bounds. Such caches still carry
+    /// genomic CDS coordinates, so ordinary mapped bases can use the existing
+    /// genomic-to-CDS mapper and the same peptide-coordinate conversion.
+    pub fn translation_with_genomic_cds_fallback(&self, span: VepSpan) -> TvRange {
+        let mapped = self.translation(span);
+        if mapped.start.is_some()
+            || (self.tx.cdna_coding_start.is_some() && self.tx.cdna_coding_end.is_some())
+        {
+            return mapped;
+        }
+
+        let (five_prime, three_prime) = self.transcript_ends(span);
+        let cds_index_for_fallback = |position| {
+            if super::prefers_exon_geometry_over_mapper(self.tx) {
+                super::genomic_to_cds_index_from_segments(self.tx, self.exons, position)
+            } else {
+                genomic_to_cds_index(self.tx, self.exons, position)
+            }
+        };
+        let Some(cds_index) = cds_index_for_fallback(five_prime) else {
+            return mapped;
+        };
+        // VEP's insertion mapper can produce a CDS coordinate only when both
+        // insertion flanks map. In particular, an insertion at a CDS edge
+        // must stay undefined rather than borrowing its single coding flank.
+        if span.is_insertion() && cds_index_for_fallback(three_prime).is_none() {
+            return mapped;
+        }
+
+        // For insertions `translation_start` is the coordinate immediately
+        // after the transcript-5' flank; ordinary variants start at the flank.
+        let after_five_prime_flank = usize::from(span.is_insertion()) + 1;
+        let cds_with_phase = cds_index
+            .saturating_add(self.phase)
+            .saturating_add(after_five_prime_flank);
+        TvRange {
+            start: Some(peptide_of_cds(cds_with_phase)),
+            end: mapped.end,
+        }
     }
 
     /// All three pairs, mapping the span once.
@@ -965,6 +1007,7 @@ mod tests {
                 Some(translation),
                 raw_cds_start.checked_sub(1)?,
                 leading_n_offset,
+                false,
             )
             .and_then(|idx| idx.checked_add(1))
             .unwrap_or(raw_cds_start)
@@ -977,6 +1020,7 @@ mod tests {
                 Some(translation),
                 raw_cds_end.checked_sub(1)?,
                 leading_n_offset,
+                false,
             )
             .and_then(|idx| idx.checked_add(1))
             .unwrap_or(raw_cds_end)
@@ -989,6 +1033,7 @@ mod tests {
                 Some(translation),
                 raw_idx,
                 leading_n_offset,
+                false,
             )
             .and_then(|idx| idx.checked_add(1))
         };
