@@ -5865,8 +5865,18 @@ fn vep116_ref_eq_alt_sequence_for_class(
         .strip_suffix(&['*'])
         .unwrap_or(ref_translation);
     let translation_start = if insertion {
-        class
-            .protein_position_end
+        // The mapper's displayed protein span can bracket an insertion
+        // between residues. When VEP's local reference peptide contains the
+        // left flank, splice that window at protein_position_start; when it is
+        // empty (`-`), the insertion is after the translated protein and the
+        // post-insertion end position is the correct terminal-stop boundary.
+        let mapped_position = class
+            .affected_ref_peptide
+            .as_deref()
+            .filter(|peptide| !peptide.is_empty() && *peptide != "-")
+            .and(class.protein_position_start)
+            .or(class.protein_position_end);
+        mapped_position
             .and_then(|position| position.checked_sub(1))
             .unwrap_or(translation_start)
     } else {
@@ -28916,6 +28926,46 @@ mod tests {
             "3bp in-frame insertion at stop codon should detect stop_retained. Got: {:?}",
             c
         );
+    }
+
+    #[test]
+    fn issue_202_v116_insertion_before_terminal_stop_is_stop_retained() {
+        let cds = "ATGGCTGAATGA";
+        let transcript = tx(
+            "T_V116_TERMINAL_INSERTION",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        let exon = exon("T_V116_TERMINAL_INSERTION", 1, 1000, 1011);
+        let exons = [&exon];
+        let translation = translation(
+            "T_V116_TERMINAL_INSERTION",
+            Some(cds.len()),
+            Some(4),
+            Some("MAE*"),
+            Some(cds),
+        );
+        let insertion = var("22", 1009, 1009, "-", "TGA");
+
+        let class = classify_insertion_with_semantics_and_gap(
+            &transcript,
+            &exons,
+            Some(&translation),
+            cds,
+            &insertion,
+            "TGA",
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        )
+        .expect("terminal insertion should be classified");
+
+        assert!(class.stop_retained, "{class:?}");
+        assert!(!class.stop_gained, "{class:?}");
     }
 
     #[test]
