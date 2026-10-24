@@ -1442,7 +1442,16 @@ impl TranscriptConsequenceEngine {
                             None
                         };
                         let original_allows_protein_hgvs =
-                            original_terms_allow_protein_hgvs(&terms);
+                            original_terms_allow_protein_hgvs(&terms)
+                                || (variant.ref_allele == "-"
+                                    && coding_class.is_some()
+                                    && refseq_mapper_insertion_cds_gap(
+                                        tx,
+                                        tx_exons,
+                                        tx_translation,
+                                        variant,
+                                    )
+                                    .is_some());
                         let shifted_deletion_uses_protein_hgvs_reference =
                             shifted_deletion_uses_protein_hgvs_reference(
                                 tx,
@@ -3064,6 +3073,32 @@ impl TranscriptConsequenceEngine {
         tx_translation: Option<&TranslationFeature>,
     ) -> Option<CodingClassification> {
         let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
+
+        // At a transcript-only RefSeq insertion, an allele that replaces the
+        // complete inserted CDS interval can still carry mapper-derived HGVS
+        // fields, while VEP's consequence predicates see no length-changing
+        // coding allele and the transcript overlap falls back to its default
+        // term. Preserve that release-116 split for the ClinVar insertion-site
+        // records (NM_015120.4), rather than reporting an in-frame insertion.
+        // VEP's coding and protein HGVS paths intentionally use separate
+        // mapper checks here:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L642-L668
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1626-L1749
+        if ref_len == 0
+            && let Some((start, end)) =
+                refseq_mapper_insertion_cds_gap(tx, tx_exons, tx_translation, variant)
+            && end.checked_sub(start).and_then(|span| span.checked_add(1)) == Some(alt_len)
+        {
+            terms.insert(SoTerm::IntergenicVariant);
+            return classify_coding_change_with_semantics(
+                tx,
+                tx_exons,
+                tx_translation,
+                variant,
+                self.semantics,
+            );
+        }
+
         terms.insert(SoTerm::CodingSequenceVariant);
 
         // Traceability:
@@ -8947,6 +8982,8 @@ fn classify_insertion_with_semantics(
     alt_genomic: &str,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<CodingClassification> {
+    let replace_refseq_mapper_gap =
+        refseq_mapper_insertion_cds_gap(tx, tx_exons, tx_translation, variant).is_some();
     classify_insertion_with_semantics_and_gap(
         tx,
         tx_exons,
@@ -8955,7 +8992,7 @@ fn classify_insertion_with_semantics(
         variant,
         alt_genomic,
         semantics,
-        false,
+        replace_refseq_mapper_gap,
     )
 }
 
@@ -9044,9 +9081,9 @@ fn classify_insertion_with_semantics_and_gap(
         reverse_complement(alt_genomic)?.to_ascii_uppercase()
     };
 
-    // For HGVSp replay over an insertion edit gap, VEP replaces the mapped
-    // edited-CDS interval with the alternate allele. Ordinary consequence
-    // classification inserts after the genomic CDS anchor as usual.
+    // For an insertion at a RefSeq mapper edit gap, VEP replays the allele
+    // over the mapped edited-CDS interval rather than inserting after the
+    // genomic CDS anchor.
     let ins_point = mapper_gap_for_sequence
         .map(|(start, _)| start.saturating_sub(1))
         .unwrap_or_else(|| cds_idx + 1);
@@ -9258,9 +9295,23 @@ fn classify_insertion_with_semantics_and_gap(
     // remains a real peptide window. In particular, an insertion can complete
     // that window as a stop codon (X -> *), and stop_gained has no partial-codon
     // veto.
-    let codon_start = codon_at.saturating_mul(3);
-    let has_reference_codon_window = codon_start < effective_cds.len();
-    let codon_window_len = 3usize
+    let (codon_start, reference_codon_end) = if replace_refseq_mapper_gap {
+        let start = class
+            .protein_position_start
+            .unwrap_or(codon_at.saturating_add(1));
+        let end = class.protein_position_end.unwrap_or(start);
+        (
+            start.saturating_sub(1).saturating_mul(3),
+            end.saturating_mul(3),
+        )
+    } else {
+        let start = codon_at.saturating_mul(3);
+        (start, start.saturating_add(3))
+    };
+    let has_reference_codon_window = codon_start < effective_cds.len()
+        && (!replace_refseq_mapper_gap || reference_codon_end <= effective_cds.len());
+    let codon_window_len = reference_codon_end
+        .saturating_sub(codon_start)
         .saturating_add(alt_len)
         .saturating_sub(mutation_ref_len);
     let local_aas = if has_reference_codon_window {
@@ -9273,7 +9324,7 @@ fn classify_insertion_with_semantics_and_gap(
         Vec::new()
     };
     if has_reference_codon_window {
-        let ref_end = codon_start.saturating_add(3).min(effective_cds.len());
+        let ref_end = reference_codon_end.min(effective_cds.len());
         let alt_end = codon_start
             .saturating_add(codon_window_len)
             .min(mutated.len());
@@ -9431,14 +9482,32 @@ fn classify_insertion_with_semantics_and_gap(
         class.codons = Some(format!("-/{alt_codon}"));
     } else if frameshift {
         // Frameshift insertion within codon: ref codon all lowercase, alt codon with inserted bases uppercase
-        let codon_start = first_codon * 3;
-        let codon_end = ((first_codon + 1) * 3).min(effective_cds.len());
+        let codon_start = if replace_refseq_mapper_gap {
+            class
+                .protein_position_start
+                .unwrap_or(first_codon.saturating_add(1))
+                .saturating_sub(1)
+                .saturating_mul(3)
+        } else {
+            first_codon * 3
+        };
+        let codon_end = if replace_refseq_mapper_gap {
+            class
+                .protein_position_end
+                .unwrap_or(first_codon.saturating_add(1))
+                .saturating_mul(3)
+        } else {
+            ((first_codon + 1) * 3).min(effective_cds.len())
+        }
+        .min(effective_cds.len());
         if codon_end <= effective_cds.len() {
             let ref_codon: String = effective_cds[codon_start..codon_end]
                 .iter()
                 .map(|&b| (b as char).to_ascii_lowercase())
                 .collect();
-            let alt_codon_len = (codon_end - codon_start) + alt_len;
+            let alt_codon_len = (codon_end - codon_start)
+                .saturating_add(alt_len)
+                .saturating_sub(mutation_ref_len);
             let alt_end = (codon_start + alt_codon_len).min(mutated.len());
             // Mark inserted bases uppercase: they start at ins_point in mutated
             let alt_codon: String = mutated[codon_start..alt_end]
@@ -9457,14 +9526,32 @@ fn classify_insertion_with_semantics_and_gap(
         }
     } else {
         // Inframe insertion within codon: ref=lowercase, alt=codon+inserted(uppercase)
-        let codon_start = first_codon * 3;
-        let codon_end = ((first_codon + 1) * 3).min(effective_cds.len());
+        let codon_start = if replace_refseq_mapper_gap {
+            class
+                .protein_position_start
+                .unwrap_or(first_codon.saturating_add(1))
+                .saturating_sub(1)
+                .saturating_mul(3)
+        } else {
+            first_codon * 3
+        };
+        let codon_end = if replace_refseq_mapper_gap {
+            class
+                .protein_position_end
+                .unwrap_or(first_codon.saturating_add(1))
+                .saturating_mul(3)
+        } else {
+            ((first_codon + 1) * 3).min(effective_cds.len())
+        }
+        .min(effective_cds.len());
         if codon_end <= effective_cds.len() {
             let ref_codon: String = effective_cds[codon_start..codon_end]
                 .iter()
                 .map(|&b| (b as char).to_ascii_lowercase())
                 .collect();
-            let alt_codon_len = (codon_end - codon_start) + alt_len;
+            let alt_codon_len = (codon_end - codon_start)
+                .saturating_add(alt_len)
+                .saturating_sub(mutation_ref_len);
             let alt_end = (codon_start + alt_codon_len).min(mutated.len());
             let alt_codon: String = mutated[codon_start..alt_end]
                 .iter()
@@ -9480,6 +9567,14 @@ fn classify_insertion_with_semantics_and_gap(
                 .collect();
             class.codons = Some(format!("{ref_codon}/{alt_codon}"));
         }
+    }
+    if replace_refseq_mapper_gap
+        && let (Some(ref_peptide), Some(alt_peptide)) = (
+            class.affected_ref_peptide.as_deref(),
+            class.affected_alt_peptide.as_deref(),
+        )
+    {
+        class.amino_acids = Some(format!("{ref_peptide}/{alt_peptide}"));
     }
 
     // Extend with 3' UTR for HGVS stop-loss/frameshift extension distance.
@@ -13898,6 +13993,67 @@ mod tests {
         );
 
         assert!(classification.is_some(), "edited CDS span must classify");
+    }
+
+    #[test]
+    fn refseq_insertion_edit_uses_mapper_replacement_codon_window() {
+        let (transcript, exons_owned) = make_refseq_coding_insertion_edit_gap();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let translation = translation("NM_INSERT_TEST.1", Some(46), Some(15), None, None);
+        let variant = var("1", 220, 219, "-", "GGC");
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("the mapped insertion edit interval is coding");
+
+        assert_eq!(classification.cds_position_start, Some(21));
+        assert_eq!(classification.cds_position_end, Some(26));
+        assert_eq!(
+            classification
+                .codons
+                .as_deref()
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap()
+                .len(),
+            9
+        );
+    }
+
+    #[test]
+    fn equal_length_refseq_insertion_edit_keeps_vep_intergenic_consequence() {
+        let engine = TranscriptConsequenceEngine::default();
+        let (mut transcript, exons_owned) = make_refseq_coding_insertion_edit_gap();
+        transcript.refseq_edits[0].replacement_len = Some(3);
+        transcript.cdna_mapper_segments[1].cdna_start = 24;
+        transcript.cdna_mapper_segments[1].cdna_end = 43;
+        transcript.cdna_coding_end = Some(43);
+        transcript.translateable_seq = Some("ATG".repeat(14) + "A");
+        transcript.spliced_seq = transcript.translateable_seq.clone();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let translation = translation("NM_INSERT_TEST.1", Some(43), Some(15), None, None);
+        let variant = var("1", 220, 219, "-", "GGC");
+
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, Some(&translation));
+
+        assert_eq!(terms, vec![SoTerm::IntergenicVariant]);
+        let classification = classification.expect("HGVS fields remain mapper-derived");
+        assert_eq!(classification.cds_position_start, Some(21));
+        assert_eq!(classification.cds_position_end, Some(23));
+        assert_eq!(classification.amino_acids.as_deref(), Some("MM/MA"));
+        assert!(
+            classification
+                .codons
+                .as_deref()
+                .is_some_and(|codons| codons.starts_with("atgatg/atGGC"))
+        );
     }
 
     #[test]
