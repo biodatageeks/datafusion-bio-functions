@@ -627,7 +627,10 @@ fn format_hgvsc_fallback(
             use_genomic_shift,
         )?
     } else {
-        notation_to_hgvsc_coords(tx, tx_exons, &notation, hgvsc_edit_offset, false)?
+        let mut slice_notation = notation.clone();
+        (slice_notation.start, slice_notation.end) =
+            genomic_range_to_transcript_slice(tx, notation.start, notation.end)?;
+        notation_to_hgvsc_coords(tx, tx_exons, &slice_notation, hgvsc_edit_offset, true)?
     };
     if let (Some(started), Some(profile)) = (coord_map_started, profile.as_deref_mut()) {
         profile.coord_map += started.elapsed();
@@ -1551,6 +1554,32 @@ fn notation_to_hgvsc_coords(
         return Some((start, end));
     }
     Some((map_position(notation.start)?, map_position(notation.end)?))
+}
+
+/// Convert a genomic coordinate pair into the transcript-slice order used by
+/// Ensembl Variation before `_get_cDNA_position` maps either endpoint.
+///
+/// ```perl
+/// # ensembl-variation 2fb834b TranscriptVariationAllele.pm:2697-2707
+/// ($vf_start, $vf_end) = map {($tr_end - $_) + 1} ($vf->end, $vf->start);
+/// ($vf_start, $vf_end) = map {($_ - $tr_start) + 1} ($vf->start, $vf->end);
+/// ```
+fn genomic_range_to_transcript_slice(
+    tx: &TranscriptFeature,
+    genomic_start: i64,
+    genomic_end: i64,
+) -> Option<(i64, i64)> {
+    if tx.strand >= 0 {
+        Some((
+            genomic_start.checked_sub(tx.start)?.checked_add(1)?,
+            genomic_end.checked_sub(tx.start)?.checked_add(1)?,
+        ))
+    } else {
+        Some((
+            tx.end.checked_sub(genomic_end)?.checked_add(1)?,
+            tx.end.checked_sub(genomic_start)?.checked_add(1)?,
+        ))
+    }
 }
 
 fn refseq_hgvsc_variant_cdna_start(
@@ -7867,6 +7896,59 @@ mod tests {
         assert_eq!(
             notation_to_hgvsc_coords(&reverse, &exons, &reverse_insertion, None, true),
             Some(("5".to_string(), "6".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_hgvsc_range_enters_mapping_in_vep_slice_order_on_both_strands() {
+        // `_var2transcript_slice_coords` keeps the genomic pair on `+` and
+        // maps (VF end, VF start) on `-` before `_get_cDNA_position`
+        // (TranscriptVariationAllele.pm:2697-2707, 1523-1525 @ 2fb834b).
+        let exon = make_exon();
+        let exons = [&exon];
+        let forward = make_transcript("protein_coding", 1, Some(100), Some(108));
+        let (forward_start, forward_end) =
+            genomic_range_to_transcript_slice(&forward, 103, 104).unwrap();
+        assert_eq!((forward_start, forward_end), (14, 15));
+        let forward_range = HgvsNotation {
+            start: forward_start,
+            end: forward_end,
+            ref_allele: "AC".to_string(),
+            alt_allele: String::new(),
+            kind: "del".to_string(),
+        };
+        assert_eq!(
+            notation_to_hgvsc_coords(&forward, &exons, &forward_range, None, true),
+            Some(("4".to_string(), "5".to_string()))
+        );
+
+        let reverse = make_transcript("protein_coding", -1, Some(100), Some(108));
+        let (reverse_start, reverse_end) =
+            genomic_range_to_transcript_slice(&reverse, 103, 104).unwrap();
+        assert_eq!((reverse_start, reverse_end), (37, 38));
+        let reverse_range = HgvsNotation {
+            start: reverse_start,
+            end: reverse_end,
+            ref_allele: "AC".to_string(),
+            alt_allele: String::new(),
+            kind: "del".to_string(),
+        };
+        assert_eq!(
+            notation_to_hgvsc_coords(&reverse, &exons, &reverse_range, None, true),
+            Some(("5".to_string(), "6".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_hgvsc_minus_strand_range_maps_vep_pre_sort_order() {
+        // `_var2transcript_slice_coords` maps (vf.end, vf.start) on the minus
+        // strand before `_get_cDNA_position`; the single sort then keeps a
+        // mapped end containing `*` (TranscriptVariationAllele.pm:2697-2707,
+        // 1523-1538 @ 2fb834b).
+        let reverse = make_transcript("protein_coding", -1, Some(100), Some(130));
+        assert_eq!(
+            partial_overlap_hgvsc(&reverse, "AAA", "-", 99, 101, VepSemantics::V116).as_deref(),
+            Some("ENSTHGVS000001.1:c.30_*1del")
         );
     }
 
