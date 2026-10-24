@@ -9571,7 +9571,12 @@ fn classify_insertion_with_semantics_and_gap(
 
     // Codons — inserted bases start at ins_point in the mutated CDS.
     let at_codon_boundary = ins_point.is_multiple_of(3);
-    if at_codon_boundary {
+    // A RefSeq mapper-gap replacement can use VCF's `ref="-"` while replacing
+    // transcript CDS bases. Preserve the mapped reference codon window for
+    // that case; VEP's `codon()` patches the reference CDS for RNA edits and
+    // widens the alternate window by the allele/reference length delta
+    // (Variation 2fb834b, TranscriptVariationAllele.pm:865-877).
+    if at_codon_boundary && mutation_ref_len == 0 {
         // Insertion at codon boundary (both frameshift and inframe): ref="-", alt=UPPERCASE
         let alt_codon: String = alt_tx.chars().map(|c| c.to_ascii_uppercase()).collect();
         class.codons = Some(format!("-/{alt_codon}"));
@@ -14311,6 +14316,41 @@ mod tests {
                 .len(),
             9
         );
+    }
+
+    #[test]
+    fn refseq_insertion_edit_replacement_at_codon_boundary_keeps_reference_codons() {
+        let (mut transcript, mut exons_owned) = make_refseq_coding_insertion_edit_gap();
+        transcript.end = 240;
+        transcript.refseq_edits[0].start = 22;
+        transcript.refseq_edits[0].end = 21;
+        transcript.cdna_mapper_segments[0].genomic_end = 220;
+        transcript.cdna_mapper_segments[1].genomic_start = 221;
+        transcript.cdna_mapper_segments[1].cdna_start = 28;
+        transcript.cdna_mapper_segments[1].cdna_end = 47;
+        transcript.cdna_coding_end = Some(47);
+        exons_owned[0].end = 240;
+
+        let cds = "ATG".repeat(15) + "AT";
+        transcript.translateable_seq = Some(cds.clone());
+        transcript.spliced_seq = Some(cds.clone());
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let translation = translation("NM_INSERT_TEST.1", Some(47), Some(15), None, Some(&cds));
+        let variant = var("1", 221, 220, "-", "ATG");
+
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, Some(&translation));
+
+        let classification = classification.expect("the mapper replacement interval is coding");
+        assert_eq!(classification.amino_acids.as_deref(), Some("MM/M"));
+        assert_eq!(classification.codons.as_deref(), Some("atgatg/ATG"));
+        assert!(terms.contains(&SoTerm::InframeDeletion), "{terms:?}");
     }
 
     #[test]
