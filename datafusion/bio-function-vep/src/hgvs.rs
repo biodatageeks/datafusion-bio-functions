@@ -2654,24 +2654,16 @@ fn resolve_frameshift_hgvs(
             return Some(());
         }
 
-        // Core removes a literal terminal `*` from peptide translations. For
-        // an incomplete CDS, VEP also excludes the terminal `X` from a
-        // deletion when both local peptide windows contain it (#220); other
-        // clipped `X`/Ter ranges stay intact for `_get_fs_peptides()`'s early
-        // return.
-        let terminal_stop = if protein.ref_translation.ends_with('*') {
-            protein.ref_translation.len()
-        } else {
-            protein.ref_translation.len().saturating_add(1)
-        };
-        let has_literal_terminal_stop =
-            protein.ref_translation.ends_with('*') && notation.ref_allele.ends_with('*');
-        let has_shared_incomplete_terminal_x = !protein.ref_translation.ends_with('*')
-            && protein.alt_peptide == "X"
-            && protein.ref_peptide.ends_with('X');
-        if notation.end == terminal_stop
+        // For #220's incomplete CDS, VEP excludes the terminal `X` from a
+        // deletion when both local peptide windows contain it. Keep literal
+        // `Ter` residues in the clipped range: `_get_fs_peptides()` returns
+        // early with that reference range intact.
+        let incomplete_cds_terminal = protein.ref_translation.len().saturating_add(1);
+        let has_shared_incomplete_terminal_x =
+            protein.alt_peptide == "X" && protein.ref_peptide.ends_with('X');
+        if notation.end == incomplete_cds_terminal
             && !protein.stop_lost
-            && (has_literal_terminal_stop || has_shared_incomplete_terminal_x)
+            && has_shared_incomplete_terminal_x
         {
             notation.ref_allele.pop();
             notation.end = notation.end.saturating_sub(1);
@@ -8209,7 +8201,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_hgvsp_frameshift_past_alt_translation_drops_terminal_stop() {
+    fn test_format_hgvsp_frameshift_past_alt_translation_preserves_terminal_stop_range() {
         let translation = make_translation();
         let protein = ProteinHgvsData {
             start: 2,
@@ -8227,7 +8219,7 @@ mod tests {
 
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
-            Some("ENSPHGVS000001.1:p.Ala2del".to_string())
+            Some("ENSPHGVS000001.1:p.Ala2_Ter3del".to_string())
         );
     }
 
