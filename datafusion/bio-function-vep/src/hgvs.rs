@@ -1834,7 +1834,12 @@ fn uses_output_cdna_position_for_hgvsc_coords(
         && !tx.refseq_edits.is_empty()
         && cdna_position.is_some_and(|value| !value.is_empty() && !value.contains('?'))
         && match notation.kind.as_str() {
-            "dup" => notation.alt_allele.len() == 1,
+            "dup" => {
+                notation.alt_allele.len() == 1
+                    && tx_exons
+                        .iter()
+                        .any(|exon| notation.start >= exon.start && notation.end <= exon.end)
+            }
             "ins" => genomic_shift.is_some_and(|shift| {
                 shift.shift_length > 0
                     && shifted_notation_within_transcript_span(tx_exons, notation)
@@ -6997,6 +7002,143 @@ mod tests {
         );
 
         assert_eq!(hgvsc.as_deref(), Some("NM_001143773.1:c.*572dup"));
+    }
+
+    #[test]
+    fn hgvsc_refseq_dup_shifted_past_plus_strand_exon_end_uses_intronic_offset() {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "NM_001318792.1".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 100;
+        tx.end = 210;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 15,
+            end: 14,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 110,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 200,
+            end: 210,
+        };
+        let exons = [&exon1, &exon2];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 1,
+            start: 111,
+            end: 110,
+            shifted_compare_allele: "A".to_string(),
+            shifted_allele_string: "A".to_string(),
+            shifted_output_allele: "A".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "A".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: "A".to_string(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            Some("10-11"),
+            None,
+            "-",
+            "A",
+            110,
+            109,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001318792.1:n.11+1dup"));
+
+        tx.refseq_edits.clear();
+        let unedited_control = format_hgvsc(
+            &tx,
+            &exons,
+            Some("10-11"),
+            None,
+            "-",
+            "A",
+            110,
+            109,
+            Some(&shift),
+        );
+        assert_eq!(
+            unedited_control.as_deref(),
+            Some("NM_001318792.1:n.11+1dup")
+        );
+    }
+
+    #[test]
+    fn hgvsc_refseq_dup_shifted_past_minus_strand_exon_end_uses_intronic_offset() {
+        let mut tx = make_transcript("lncRNA", -1, None, None);
+        tx.transcript_id = "NM_001318792.1".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 100;
+        tx.end = 310;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 28,
+            end: 27,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 300,
+            end: 310,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 200,
+            end: 210,
+        };
+        let exon3 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 3,
+            start: 100,
+            end: 110,
+        };
+        let exons = [&exon1, &exon2, &exon3];
+        let shift = HgvsGenomicShift {
+            strand: -1,
+            shift_length: 1,
+            start: 201,
+            end: 200,
+            shifted_compare_allele: "T".to_string(),
+            shifted_allele_string: "T".to_string(),
+            shifted_output_allele: "T".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "T".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: "T".to_string(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            Some("22-23"),
+            None,
+            "-",
+            "T",
+            201,
+            200,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001318792.1:n.22+1dup"));
     }
 
     #[test]
