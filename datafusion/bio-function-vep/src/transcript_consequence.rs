@@ -10309,8 +10309,11 @@ fn refseq_mapped_cdna_endpoints_outside_unedited_length(
     // when a RefSeq edit extends the mapper after the unedited exon sum.
     // Preserve that transcript consequence if any CDS mapper piece overlaps
     // the translateable sequence.
-    let Some(translateable_length) =
-        cached_translateable_seq_for_vep(tx, tx_translation).map(|sequence| sequence.len())
+    let Some(translateable_length) = tx
+        .translateable_seq
+        .as_deref()
+        .or_else(|| tx_translation.and_then(|translation| translation.cds_sequence.as_deref()))
+        .map(str::len)
     else {
         return true;
     };
