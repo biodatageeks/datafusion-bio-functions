@@ -5052,16 +5052,32 @@ fn vep116_overlaps_stop_codon_cil(
     let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
         return false;
     };
+    let alt_seq = normalize_allele_seq(&variant.alt_allele);
+    let ref_seq = normalize_allele_seq(&variant.ref_allele);
+    let is_point_insertion =
+        ref_seq.is_empty() && !alt_seq.is_empty() && variant.start == variant.end;
     let mut variant_start = variant.start;
-    let variant_end = variant.end;
+    // VariantInput stores a normalized pure insertion at n+1 as the point
+    // [n+1,n+1]. VEP's mapper keeps the empty interval (n+1,n), which matters
+    // when the subsequent CIL extension moves the insertion past a stop.
+    let variant_end = if is_point_insertion {
+        variant.end.saturating_sub(1)
+    } else {
+        variant.end
+    };
     if variant_end < variant_start && feature_seq_len > 0 {
-        let Ok(feature_seq_len) = i64::try_from(feature_seq_len) else {
-            return false;
-        };
-        if tx.strand >= 0 {
-            variant_start = variant_start.saturating_add(feature_seq_len);
-        } else {
-            variant_start = variant_start.saturating_sub(feature_seq_len);
+        let vep_feature_seq = alt_seq
+            .bytes()
+            .all(|base| matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'N'));
+        if vep_feature_seq {
+            let Ok(feature_seq_len) = i64::try_from(feature_seq_len) else {
+                return false;
+            };
+            if tx.strand >= 0 {
+                variant_start = variant_start.saturating_add(feature_seq_len);
+            } else {
+                variant_start = variant_start.saturating_sub(feature_seq_len);
+            }
         }
     }
     let (stop_start, stop_end) = if tx.strand >= 0 {
@@ -13169,6 +13185,26 @@ mod tests {
             Some(&partial_translation),
             &intron_to_stop_deletion,
         ));
+    }
+
+    #[test]
+    fn vep116_cil_overlap_normalizes_point_insertions_to_empty_intervals() {
+        let transcript = tx(
+            "T_POINT_INSERTION_CIL",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        let insertion = var("22", 1006, 1006, "-", "AAA");
+
+        // VariantInput represents a pure insertion at the first stop base as
+        // a point. VEP's mapper represents the same event as (n+1, n), then
+        // extends its start by the inserted length before genomic overlap.
+        assert!(!vep116_overlaps_stop_codon_cil(&transcript, &insertion, 3,));
     }
 
     #[test]
