@@ -2297,6 +2297,12 @@ fn restore_clamped_hgvsc_insertion_slice_order(
     if reverse_slice_order && preserve_star_negative_hgvsc_order(&start, &end).is_none() {
         std::mem::swap(&mut start, &mut end);
     }
+    if let Some((star_negative, coding_position)) =
+        order_clamped_star_negative_hgvsc_positions(&start, &end)
+    {
+        start = star_negative;
+        end = coding_position;
+    }
     (start, end)
 }
 
@@ -2334,6 +2340,15 @@ fn preserve_star_negative_hgvsc_order(start: &str, end: &str) -> Option<(String,
         Some((start.to_string(), end.to_string()))
     } else {
         None
+    }
+}
+
+fn order_clamped_star_negative_hgvsc_positions(start: &str, end: &str) -> Option<(String, String)> {
+    let (start, end) = preserve_star_negative_hgvsc_order(start, end)?;
+    if start.starts_with("*-") {
+        Some((start, end))
+    } else {
+        Some((end, start))
     }
 }
 
@@ -7797,7 +7812,7 @@ mod tests {
         );
         assert_eq!(
             restore_clamped_hgvsc_insertion_slice_order("1239", "*-1", true),
-            ("1239".to_string(), "*-1".to_string())
+            ("*-1".to_string(), "1239".to_string())
         );
         assert_eq!(
             restore_clamped_hgvsc_insertion_slice_order("*32", "*31", true),
