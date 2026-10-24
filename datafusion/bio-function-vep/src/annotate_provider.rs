@@ -7150,8 +7150,10 @@ impl AnnotateProvider {
                                 .unwrap_or(""),
                         );
                         let source_val = if include_source_field { source } else { "" };
-                        // VEP OutputFactory emits REFSEQ_OFFSET independently
-                        // of whether HGVSc formatted for this transcript allele.
+                        // OutputFactory emits the property independently, but
+                        // VEP 116 populates it from `hgvs_transcript()` after
+                        // that method's ambiguous-allele early return. Do not
+                        // infer an offset for an ALT whose HGVS path never ran.
                         let refseq_offset_value =
                             tx_opt.filter(|_| hgvs_flags.hgvsc).and_then(|tx| {
                                 let variant = row_variant.as_ref()?;
@@ -7159,12 +7161,13 @@ impl AnnotateProvider {
                                     .exons_by_tx_genomic
                                     .get(tx.transcript_id.as_str())
                                     .or_else(|| ctx.exons_by_tx.get(tx.transcript_id.as_str()))?;
-                                refseq_misalignment_offset_for_output(
+                                refseq_misalignment_offset_for_output_for_allele(
                                     tx,
                                     tx_exons,
                                     variant.parser_start,
                                     variant.parser_end,
                                     tc.cdna_position.as_deref(),
+                                    &variant.alt_allele,
                                 )
                             });
                         let refseq_offset = OptDisplay(refseq_offset_value);
@@ -7629,12 +7632,13 @@ impl AnnotateProvider {
                                     .exons_by_tx_genomic
                                     .get(tx.transcript_id.as_str())
                                     .or_else(|| ctx.exons_by_tx.get(tx.transcript_id.as_str()))?;
-                                refseq_misalignment_offset_for_output(
+                                refseq_misalignment_offset_for_output_for_allele(
                                     tx,
                                     tx_exons,
                                     variant.parser_start,
                                     variant.parser_end,
                                     tc.cdna_position.as_deref(),
+                                    &variant.alt_allele,
                                 )
                             });
                         let given_ref = tc.given_ref.as_deref().unwrap_or("");
@@ -8716,6 +8720,26 @@ fn refseq_misalignment_offset_for_output(
                 .and_then(parse_cdna_position_start)
                 .and_then(|cdna_start| refseq_misalignment_offset(tx, cdna_start))
         },
+    )
+}
+
+fn refseq_misalignment_offset_for_output_for_allele(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variation_start: i64,
+    variation_end: i64,
+    displayed_cdna_position: Option<&str>,
+    variation_feature_seq: &str,
+) -> Option<i64> {
+    if !crate::hgvs::vep116_seq_is_unambiguous_dna(variation_feature_seq) {
+        return None;
+    }
+    refseq_misalignment_offset_for_output(
+        tx,
+        tx_exons,
+        variation_start,
+        variation_end,
+        displayed_cdna_position,
     )
 }
 
@@ -21924,6 +21948,60 @@ mod tests {
         assert_eq!(
             refseq_misalignment_offset_for_output(&tx, &exons_ref, 150, 150, Some("35+2"),),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn refseq_offset_is_not_inferred_when_vep_hgvs_rejects_ambiguous_alt() {
+        let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
+        tx.start = 100;
+        tx.end = 199;
+        tx.strand = 1;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 2,
+            end: 1,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        };
+
+        assert_eq!(
+            refseq_misalignment_offset_for_output_for_allele(
+                &tx,
+                &[&exon],
+                150,
+                150,
+                Some("51"),
+                "N",
+            ),
+            None
+        );
+        assert_eq!(
+            refseq_misalignment_offset_for_output_for_allele(
+                &tx,
+                &[&exon],
+                150,
+                150,
+                Some("51"),
+                "R",
+            ),
+            None
+        );
+        assert_eq!(
+            refseq_misalignment_offset_for_output_for_allele(
+                &tx,
+                &[&exon],
+                150,
+                150,
+                Some("51"),
+                "A",
+            ),
+            Some(2)
         );
     }
 
