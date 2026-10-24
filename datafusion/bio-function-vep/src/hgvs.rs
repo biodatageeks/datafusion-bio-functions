@@ -2637,8 +2637,14 @@ fn resolve_frameshift_hgvs(
         notation.kind = "del".to_string();
         // Ensembl Variation 116 `_get_fs_peptides()` sets only `alt = "del"`
         // and `type = "del"` in this branch, then returns. Preserve the
-        // clipped reference range and coordinates initialized from context.
+        // clipped reference range and coordinates initialized from context,
+        // except for the terminal stop that Ensembl Core removes from peptide
+        // translations.
         notation.alt_allele = "del".to_string();
+        if notation.ref_allele.ends_with('*') {
+            notation.ref_allele.pop();
+            notation.end = notation.end.saturating_sub(1);
+        }
         return Some(());
     }
 
@@ -8145,6 +8151,29 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ser2_Gln3del".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_frameshift_past_alt_translation_drops_terminal_stop() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2,
+            end: 3,
+            ref_peptide: "A*".into(),
+            alt_peptide: "-".into(),
+            ref_translation: "MA*".into(),
+            alt_translation: "M".into(),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala2del".to_string())
         );
     }
 
