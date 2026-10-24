@@ -4927,13 +4927,46 @@ fn mutated_cds_stop_preserved(
     let alt_allele = normalize_allele_seq(&variant.alt_allele);
 
     let leading_n_offset = cds_seq.bytes().take_while(|&b| b == b'N').count();
+    let is_pure_insertion = ref_allele.is_empty() && !alt_allele.is_empty();
     // A genomic REF length includes introns for exon-spanning deletions. Use
     // the mapped cDNA span for net deletions, while insertions retain their
     // allele-length edit span (the cDNA interval can include the inserted
     // flank and over-delete the transcript sequence).
     let use_cdna_deletion_span =
         ref_allele.len() > alt_allele.len() && variant.start <= variant.end;
-    let (cds_idx, ref_len) = if !use_cdna_deletion_span {
+    let (cds_idx, ref_len) = if is_pure_insertion {
+        // An insertion is a CDS gap, not a genomic anchor base. At exon
+        // boundaries one genomic flank can be unmapped while VEP's map_insert
+        // still maps the other flank and assigns the insertion to the CDS.
+        let mapper = vep_coords::VepTxMapper::with_phase(
+            tx,
+            tx_exons,
+            vep_coords::CdnaBaseMap::Output,
+            leading_n_offset,
+        );
+        let span = vep_coords::VepSpan::from_variant(variant);
+        let cds_idx = if let Some(cds_start) = mapper.cds(span).start {
+            let Some(cds_idx) = cds_start.checked_sub(1) else {
+                return false;
+            };
+            cds_idx
+        } else {
+            // Older cache rows may not provide cDNA coding bounds, and the
+            // existing genomic fallback still covers fully mapped insertions.
+            let var_start_genomic = if tx.strand >= 0 {
+                variant.start
+            } else {
+                variant.end
+            };
+            let Some(raw_cds_idx) = genomic_to_cds_index(tx, tx_exons, var_start_genomic) else {
+                return false;
+            };
+            let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
+            adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset)
+                .unwrap_or(raw_cds_idx)
+        };
+        (cds_idx, 0)
+    } else if !use_cdna_deletion_span {
         let var_start_genomic = if tx.strand >= 0 {
             variant.start
         } else {
@@ -26468,6 +26501,55 @@ mod tests {
             &insertion,
             &transcript,
             &exons,
+        ));
+    }
+
+    #[test]
+    fn stop_lost_fallback_maps_negative_strand_exon_boundary_insertion() {
+        let cds = "TGA";
+        let mut transcript = tx(
+            "T_NEGATIVE_EXON_BOUNDARY_STOP",
+            "22",
+            1,
+            21,
+            -1,
+            "protein_coding",
+            Some(1),
+            Some(21),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        transcript.translateable_seq = Some(cds.to_string());
+        let exons = [
+            exon("T_NEGATIVE_EXON_BOUNDARY_STOP", 1, 20, 21),
+            exon("T_NEGATIVE_EXON_BOUNDARY_STOP", 2, 1, 1),
+        ];
+        let exon_refs = exons.iter().collect::<Vec<_>>();
+        // At the exon junction, the minus-strand 5' flank is unmapped but
+        // the 3' flank maps to the final cDNA base. VEP still assigns the
+        // insertion to the terminal stop codon via the mapped CDS gap.
+        let insertion = var("22", 2, 2, "-", "TT");
+        let mapper = vep_coords::VepTxMapper::with_phase(
+            &transcript,
+            &exon_refs,
+            vep_coords::CdnaBaseMap::Output,
+            0,
+        );
+        let span = vep_coords::VepSpan::from_variant(&insertion);
+
+        assert_eq!(mapper.cdna(span).both_truthy(), Some((3, 2)));
+        assert_eq!(mapper.cds(span).start, Some(3));
+        assert!(mutated_cds_stop_preserved(
+            cds,
+            &insertion,
+            &transcript,
+            &exon_refs,
+        ));
+        assert!(!vep116_stop_lost_without_unambiguous_alt_peptide(
+            &transcript,
+            &exon_refs,
+            None,
+            &insertion,
         ));
     }
 
