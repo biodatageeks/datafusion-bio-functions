@@ -7150,8 +7150,9 @@ impl AnnotateProvider {
                                 .unwrap_or(""),
                         );
                         let source_val = if include_source_field { source } else { "" };
-                        let refseq_offset_value =
-                            tx_opt.filter(|_| hgvs_flags.hgvsc).and_then(|tx| {
+                        let refseq_offset_value = tx_opt
+                            .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
+                            .and_then(|tx| {
                                 let variant = row_variant.as_ref()?;
                                 let tx_exons = ctx
                                     .exons_by_tx_genomic
@@ -7617,8 +7618,9 @@ impl AnnotateProvider {
                             .and_then(|tx| tx.refseq_match.as_deref())
                             .unwrap_or("");
                         let source_val = tx_opt.and_then(|tx| tx.source.as_deref()).unwrap_or("");
-                        let refseq_offset_value =
-                            tx_opt.filter(|_| hgvs_flags.hgvsc).and_then(|tx| {
+                        let refseq_offset_value = tx_opt
+                            .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
+                            .and_then(|tx| {
                                 let variant = row_variant.as_ref()?;
                                 let tx_exons = ctx
                                     .exons_by_tx_genomic
