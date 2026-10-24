@@ -3366,7 +3366,7 @@ impl TranscriptConsequenceEngine {
         tx_exons: &[&ExonFeature],
         cds_seq: Option<&str>,
     ) {
-        if self.overlaps_start_codon(variant, tx) {
+        if self.overlaps_start_codon(variant, tx, tx_exons) {
             if is_start_codon(&variant.ref_allele) && is_start_codon(&variant.alt_allele) {
                 terms.insert(SoTerm::StartRetainedVariant);
             } else {
@@ -3436,7 +3436,7 @@ impl TranscriptConsequenceEngine {
                 }
             }
         }
-        if self.overlaps_stop_codon(variant, tx) {
+        if self.overlaps_stop_codon(variant, tx, tx_exons) {
             if is_stop_codon_in(tx.codon_table, &variant.ref_allele)
                 && is_stop_codon_in(tx.codon_table, &variant.alt_allele)
             {
@@ -3523,9 +3523,17 @@ impl TranscriptConsequenceEngine {
     ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L965-L985>
     /// - cds_start_NF gate at line 975:
     ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L975>
-    fn overlaps_start_codon(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
+    fn overlaps_start_codon(
+        &self,
+        variant: &VariantInput,
+        tx: &TranscriptFeature,
+        tx_exons: &[&ExonFeature],
+    ) -> bool {
         if tx.cds_start_nf {
             return false;
+        }
+        if self.semantics.vep116_stop_predicates() && !tx_exons.is_empty() {
+            return vep116_codon_overlap(tx, tx_exons, variant, true);
         }
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return false;
@@ -3543,7 +3551,18 @@ impl TranscriptConsequenceEngine {
     ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L124-L158>
     /// - Ensembl Variation `TranscriptVariationAllele::stop_gained()`
     ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L161-L194>
-    fn overlaps_stop_codon(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
+    fn overlaps_stop_codon(
+        &self,
+        variant: &VariantInput,
+        tx: &TranscriptFeature,
+        tx_exons: &[&ExonFeature],
+    ) -> bool {
+        if tx.cds_end_nf {
+            return false;
+        }
+        if self.semantics.vep116_stop_predicates() && !tx_exons.is_empty() {
+            return vep116_codon_overlap(tx, tx_exons, variant, false);
+        }
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return false;
         };
@@ -4966,6 +4985,69 @@ fn vep116_overlaps_stop_codon_cil(
     variant_end >= stop_start && variant_start <= stop_end
 }
 
+/// VEP's `_overlaps_start_codon()` / `_overlaps_stop_codon()` use the mapped
+/// cDNA endpoints, and return false when either is a mapper Gap. The codon
+/// anchors are also cDNA coordinates: genomic overlap is wrong for codons
+/// split across exon junctions.
+fn vep116_codon_overlap(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+    start_codon: bool,
+) -> bool {
+    if (start_codon && tx.cds_start_nf) || (!start_codon && tx.cds_end_nf) {
+        return false;
+    }
+    let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
+        return false;
+    };
+    let mapper =
+        vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, 0);
+    let mapped_variant = mapper.cdna(vep_coords::VepSpan::from_variant(variant));
+    if mapped_variant.both_truthy().is_none() {
+        return false;
+    }
+
+    let (cdna_anchor, genomic_anchor) = if start_codon {
+        (
+            tx.cdna_coding_start,
+            if tx.strand >= 0 { cds_start } else { cds_end },
+        )
+    } else {
+        (
+            tx.cdna_coding_end,
+            if tx.strand >= 0 { cds_end } else { cds_start },
+        )
+    };
+    let Some(anchor) = cdna_anchor.or_else(|| {
+        mapper
+            .cdna(vep_coords::VepSpan::new(genomic_anchor, genomic_anchor))
+            .start
+    }) else {
+        return false;
+    };
+    let (codon_start, codon_end) = if start_codon {
+        (anchor, anchor.saturating_add(2))
+    } else {
+        (anchor.saturating_sub(2), anchor)
+    };
+    mapped_variant.overlap(codon_start, codon_end)
+}
+
+/// VEP's `_ins_del_stop_altered()` returns false unless the variant has two
+/// truthy cDNA endpoints and a mapped CDS start. `stop_lost()` must preserve
+/// that gate even when genomic overlap finds the terminal codon.
+fn vep116_has_defined_stop_edit_coordinates(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+) -> bool {
+    let mapper =
+        vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, 0);
+    let span = vep_coords::VepSpan::from_variant(variant);
+    mapper.cdna(span).both_truthy().is_some() && mapper.cds(span).start.is_some()
+}
+
 /// VEP 116's no-alt-peptide `stop_retained` branch. This is the source-level
 /// `_overlaps_stop_codon_cil && !_ins_del_stop_altered_cil` path: locate the
 /// edit in spliced cDNA/CDS coordinates (so introns do not inflate its length),
@@ -5085,6 +5167,9 @@ fn vep116_stop_lost_without_unambiguous_alt_peptide(
             .chain(alt_seq.bytes())
             .all(|base| matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'N'))
     {
+        return false;
+    }
+    if !vep116_has_defined_stop_edit_coordinates(tx, tx_exons, variant) {
         return false;
     }
 
@@ -20816,7 +20901,7 @@ mod tests {
         let engine = TranscriptConsequenceEngine::default();
         // Transcript: 100..200, CDS: 100..200, positive strand.
         // Start codon at positions 100-102.
-        let t = tx(
+        let mut t = tx(
             "tx1",
             "22",
             100,
@@ -20826,7 +20911,10 @@ mod tests {
             Some(100),
             Some(200),
         );
-        let _e = exon("tx1", 1, 100, 200);
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(101);
+        let e = exon("tx1", 1, 100, 200);
+        let exons = [&e];
         // Deletion at pos 103 — overlaps_start_codon is true (overlaps
         // region 100-102 via generic overlap because the function checks
         // if the variant range overlaps 100..102). Actually overlaps() checks
@@ -20836,8 +20924,7 @@ mod tests {
         let mut terms = BTreeSet::new();
         // Simulate: variant overlaps start codon (102 overlaps 100-102) but
         // starts at the last base → ATG is not fully disrupted.
-        let exons_ref: Vec<&ExonFeature> = vec![];
-        engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons_ref, None);
+        engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons, None);
         // The allele is not "ATG" so old heuristic would emit start_lost.
         // But the variant starts at pos 102 (== start_codon_end), not after.
         // So this should emit start_lost (codon IS touched).
@@ -20852,7 +20939,7 @@ mod tests {
         // Deletion entirely past the start codon should emit start_retained
         // when overlaps_start_codon returns true (due to proximity).
         let engine = TranscriptConsequenceEngine::default();
-        let t = tx(
+        let mut t = tx(
             "tx1",
             "22",
             100,
@@ -20862,14 +20949,16 @@ mod tests {
             Some(100),
             Some(200),
         );
-        let _e = exon("tx1", 1, 100, 200);
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(101);
+        let e = exon("tx1", 1, 100, 200);
+        let exons = [&e];
         // Deletion at pos 103 — strictly after start codon end (102).
         let v = var("22", 103, 103, "T", "-");
         let mut terms = BTreeSet::new();
         // Check if overlaps_start_codon is true for this case.
-        if engine.overlaps_start_codon(&v, &t) {
-            let exons_ref: Vec<&ExonFeature> = vec![];
-            engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons_ref, None);
+        if engine.overlaps_start_codon(&v, &t, &exons) {
+            engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons, None);
             assert!(
                 terms.contains(&SoTerm::StartRetainedVariant),
                 "Deletion after start codon should emit start_retained, got: {:?}",
@@ -21358,12 +21447,15 @@ mod tests {
             Some(200),
             Some(220),
         );
-        let _e = exon("tx1", 1, 100, 300);
+        let e = exon("tx1", 1, 100, 300);
+        let exons = [&e];
+        let mut t = t;
+        t.cdna_coding_start = Some(81);
+        t.cdna_coding_end = Some(101);
         let v = var("22", 218, 228, "TTTTTTTTTTT", "-");
         let mut terms = BTreeSet::new();
-        if engine.overlaps_start_codon(&v, &t) {
-            let exons_ref: Vec<&ExonFeature> = vec![];
-            engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons_ref, None);
+        if engine.overlaps_start_codon(&v, &t, &exons) {
+            engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons, None);
             // Boundary deletion touching start codon should emit start_lost
             // only — VEP does not co-emit start_retained for boundary
             // deletions (verified against GIAB HG002 benchmark).
@@ -21378,6 +21470,112 @@ mod tests {
                 terms
             );
         }
+    }
+
+    #[test]
+    fn issue_202_undefined_mapper_endpoints_gate_start_stop() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let mut transcript = tx(
+            "T_ISSUE_202",
+            "22",
+            100,
+            108,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
+        transcript.translateable_seq = Some("ATGGAATAA".to_string());
+        transcript.spliced_seq = Some("ATGGAATAA".to_string());
+        let run_off_exon = exon("T_ISSUE_202", 1, 100, 108);
+        let exons = [&run_off_exon];
+
+        // VEP requires both cDNA endpoints for `_overlaps_start_codon`; a
+        // deletion beginning before the transcript has an unmapped 5' end.
+        let start_runoff = var("22", 98, 101, "NNNN", "-");
+        assert!(!engine.overlaps_start_codon(&start_runoff, &transcript, &exons));
+
+        // `_overlaps_stop_codon` has the same endpoint rule, and
+        // `_ins_del_stop_altered` also requires a mapped CDS start.
+        let stop_runoff = var("22", 106, 110, "TAAAA", "-");
+        assert!(!engine.overlaps_stop_codon(&stop_runoff, &transcript, &exons));
+        let translation = translation("T_ISSUE_202", Some(9), Some(3), None, Some("ATGGAATAA"));
+        assert!(!vep116_stop_lost_without_unambiguous_alt_peptide(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &stop_runoff,
+        ));
+
+        // The two partial-CDS attributes independently veto their codon
+        // overlap predicates.
+        transcript.cds_start_nf = true;
+        assert!(!engine.overlaps_start_codon(&start_runoff, &transcript, &exons));
+        transcript.cds_start_nf = false;
+        transcript.cds_end_nf = true;
+        assert!(!engine.overlaps_stop_codon(&stop_runoff, &transcript, &exons));
+
+        // cDNA coordinates retain stop-codon overlap across an exon junction;
+        // the genomic CDS-end heuristic cannot see the split codon.
+        let mut split_stop = tx(
+            "T_ISSUE_202_SPLIT",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
+        split_stop.cdna_coding_start = Some(1);
+        split_stop.cdna_coding_end = Some(12);
+        let split_exons = [
+            exon("T_ISSUE_202_SPLIT", 1, 100, 110),
+            exon("T_ISSUE_202_SPLIT", 2, 200, 200),
+        ];
+        let split_exons_ref = split_exons.iter().collect::<Vec<_>>();
+        let split_stop_snv = var("22", 110, 110, "A", "C");
+        assert!(engine.overlaps_stop_codon(&split_stop_snv, &split_stop, &split_exons_ref));
+        let mut split_terms = BTreeSet::new();
+        engine.add_start_stop_heuristic_terms(
+            &mut split_terms,
+            &split_stop_snv,
+            &split_stop,
+            &split_exons_ref,
+            Some("ATGAAAGGGTAA"),
+        );
+        assert!(split_terms.contains(&SoTerm::StopLost), "{split_terms:?}");
+
+        // The negative-strand partial terminal codon is measured from the
+        // transcript-oriented translation start supplied by the R3 mapper.
+        let mut negative = tx(
+            "T_ISSUE_202_MINUS",
+            "22",
+            100,
+            109,
+            -1,
+            "protein_coding",
+            Some(100),
+            Some(109),
+        );
+        negative.cdna_coding_start = Some(1);
+        negative.cdna_coding_end = Some(10);
+        let negative_exon = exon("T_ISSUE_202_MINUS", 1, 100, 109);
+        let negative_variant = var("22", 100, 100, "T", "C");
+        assert!(vep_partial_terminal_codon_for_cds(
+            &negative,
+            &[&negative_exon],
+            "ATGAAAGGGT",
+            &negative_variant,
+        ));
+        assert_eq!(split_exons_ref.len(), 2);
     }
 
     /// A start-lost deletion keeps the full reference peptide window. The
