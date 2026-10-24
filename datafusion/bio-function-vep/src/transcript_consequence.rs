@@ -2020,7 +2020,14 @@ impl TranscriptConsequenceEngine {
             // Transcript. Cache loading restores that object directly, and
             // Core's getter returns the missing field as false, so
             // Transcript::length is the unedited exon sum here.
-            return (vec![SoTerm::IntergenicVariant], None);
+            // VEP's `_intron_overlap` checks splice-region exonic margins
+            // independently of `within_cdna`, so retain those terms before
+            // falling back when the edited mapper endpoint exceeds this sum.
+            self.add_intron_splice_terms(&mut terms, variant, tx, tx_exons, None);
+            if terms.is_empty() {
+                terms.insert(SoTerm::IntergenicVariant);
+            }
+            return (terms.into_iter().collect(), None);
         }
         let deleted_gap_started = profiling.then(Instant::now);
         let deleted_refseq_gap_candidate = prefers_exon_geometry_over_mapper(tx)
@@ -14282,6 +14289,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn negative_strand_coding_deletion_crossing_deleted_edit_gap_uses_mapped_cds_span() {
+        let (mut transcript, exons_owned) = make_refseq_coding_deleted_edit_gap();
+        transcript.strand = -1;
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 103,
+                cdna_start: 5,
+                cdna_end: 8,
+                ori: -1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 106,
+                genomic_end: 109,
+                cdna_start: 1,
+                cdna_end: 4,
+                ori: -1,
+            },
+        ];
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let translation = translation("NM_GAP_TEST.1", Some(8), Some(2), None, Some("ATGCCGTA"));
+        let variant = var("1", 102, 107, "AAAAAA", "-");
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("mapped transcript-oriented bases on both sides of the deleted gap classify");
+
+        assert_eq!(classification.cds_position_start, Some(3));
+        assert_eq!(classification.cds_position_end, Some(6));
+        assert!(classification.codons.is_some());
+    }
+
+    #[test]
+    fn intronic_coordinate_distance_ties_follow_vep_strand_rule() {
+        for (strand, expected) in [(1, "9+46"), (-1, "10+46")] {
+            let transcript = tx("NM_TIE.1", "1", 100, 209, strand, "lncRNA", None, None);
+            let exons_owned = [exon("NM_TIE.1", 1, 100, 108), exon("NM_TIE.1", 2, 200, 209)];
+            let exons = exons_owned.iter().collect::<Vec<_>>();
+
+            assert_eq!(
+                raw_cdna_position_from_sorted_exons(&transcript, &exons, 154),
+                Some(expected.to_string()),
+                "strand={strand}"
+            );
+        }
+    }
+
     fn synthetic_qk_dup_cds(
         total_codons: usize,
         exon_start_codon_index: usize,
@@ -24876,6 +24936,39 @@ mod tests {
             engine.evaluate_transcript_overlap(&variant, &transcript, &exons_ref, None);
 
         assert_eq!(terms, vec![SoTerm::IntergenicVariant]);
+        assert!(coding_class.is_none());
+    }
+
+    #[test]
+    fn refseq_mapped_endpoint_outside_length_keeps_independent_splice_region_term() {
+        let engine = TranscriptConsequenceEngine::default();
+        let mut transcript = tx(
+            "NM_TEST.1",
+            "1",
+            100,
+            209,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(109),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 5,
+            end: 4,
+            replacement_len: Some(15),
+            skip_refseq_offset: false,
+        }];
+        let exon1 = exon("NM_TEST.1", 1, 100, 109);
+        let exon2 = exon("NM_TEST.1", 2, 200, 209);
+        let exons = [&exon1, &exon2];
+        let variant = var("1", 200, 200, "G", "A");
+
+        let (terms, coding_class) =
+            engine.evaluate_transcript_overlap(&variant, &transcript, &exons, None);
+
+        assert!(terms.contains(&SoTerm::SpliceRegionVariant));
+        assert!(!terms.contains(&SoTerm::IntergenicVariant));
         assert!(coding_class.is_none());
     }
 
