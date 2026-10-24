@@ -1726,7 +1726,8 @@ impl TranscriptConsequenceEngine {
                             self.bam_edited != Some(false),
                             rna_edit_classification_reference(
                                 tx.has_rna_edit,
-                                variant,
+                                hgvsc_ref_allele,
+                                hgvsc_alt_allele,
                                 genomic_reference,
                             ),
                         );
@@ -10970,17 +10971,18 @@ fn minimised_substitution(
 
 fn rna_edit_classification_reference<'a>(
     has_rna_edit: bool,
-    variant: &VariantInput,
+    hgvsc_ref_allele: &str,
+    hgvsc_alt_allele: &str,
     genomic_reference: Option<&'a str>,
 ) -> Option<&'a str> {
     // The #155 trigger is a two-base MNV. Keep the genomic-first VEP
     // classification scoped to that shape so unrelated RNA-edited indels and
     // long substitutions retain their established HGVSc notation.
-    let is_two_base_mnv = variant.ref_allele.len() == 2
-        && variant.alt_allele.len() == 2
-        && variant.ref_allele != variant.alt_allele
-        && variant.ref_allele != "-"
-        && variant.alt_allele != "-";
+    let is_two_base_mnv = hgvsc_ref_allele.len() == 2
+        && hgvsc_alt_allele.len() == 2
+        && hgvsc_ref_allele != hgvsc_alt_allele
+        && hgvsc_ref_allele != "-"
+        && hgvsc_alt_allele != "-";
     (has_rna_edit && is_two_base_mnv)
         .then_some(genomic_reference)
         .flatten()
@@ -12713,6 +12715,42 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].used_ref.as_deref(), Some("CG"));
         assert_eq!(result[0].hgvsc.as_deref(), Some("NR_RNA_MNV.1:n.94_95inv"));
+    }
+
+    #[test]
+    fn rna_edit_mnv_that_minimises_to_snv_uses_minimised_hgvsc_reference() {
+        let mut transcript = tx(
+            "NR_RNA_MINIMISED.1",
+            "21",
+            100,
+            199,
+            1,
+            "lncRNA",
+            None,
+            None,
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.has_rna_edit = true;
+        transcript.has_non_polya_rna_edit = true;
+        transcript.spliced_seq = Some({
+            let mut sequence = vec![b'A'; 100];
+            sequence[5] = b'T';
+            sequence[6] = b'G';
+            String::from_utf8(sequence).expect("ASCII transcript sequence")
+        });
+        let exons = [exon("NR_RNA_MINIMISED.1", 1, 100, 199)];
+        let transcripts = [transcript];
+        let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+        let variant = var("21", 105, 106, "TG", "TA");
+
+        let result = TranscriptConsequenceEngine::default()
+            .evaluate_variant_prepared_with_reference(&variant, &context, Some("TG"), None);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].hgvsc.as_deref(),
+            Some("NR_RNA_MINIMISED.1:n.7G>A")
+        );
     }
 
     #[test]
@@ -20599,37 +20637,37 @@ mod tests {
 
     #[test]
     fn rna_edit_genomic_classification_reference_is_limited_to_two_base_mnvs() {
-        let mnv = var("22", 100, 101, "TG", "CA");
         assert_eq!(
-            rna_edit_classification_reference(true, &mnv, Some("TG")),
+            rna_edit_classification_reference(true, "TG", "CA", Some("TG")),
             Some("TG")
         );
         assert_eq!(
-            rna_edit_classification_reference(false, &mnv, Some("TG")),
+            rna_edit_classification_reference(false, "TG", "CA", Some("TG")),
             None
         );
 
-        let indel = var("22", 100, 100, "A", "AT");
         assert_eq!(
-            rna_edit_classification_reference(true, &indel, Some("A")),
+            rna_edit_classification_reference(true, "A", "AT", Some("A")),
             None,
             "RNA-edited indels must keep their previous transcript-reference classification"
         );
 
-        let long_inversion = var("22", 100, 6_514, &"A".repeat(6_415), &"T".repeat(6_415));
+        let long_ref = "A".repeat(6_415);
+        let long_alt = "T".repeat(6_415);
         assert_eq!(
-            rna_edit_classification_reference(
-                true,
-                &long_inversion,
-                Some(&long_inversion.ref_allele)
-            ),
+            rna_edit_classification_reference(true, &long_ref, &long_alt, Some(&long_ref)),
             None,
             "the two-base ClinVar MNV rule must not affect long equal-length inversions"
         );
         assert_eq!(
-            rna_edit_classification_reference(true, &mnv, Some("T")),
+            rna_edit_classification_reference(true, "TG", "CA", Some("T")),
             None,
             "the classification reference must cover the full two-base variant"
+        );
+        assert_eq!(
+            rna_edit_classification_reference(true, "G", "A", Some("TG")),
+            None,
+            "an MNV minimised to an SNV must use its current HGVSc reference"
         );
     }
 

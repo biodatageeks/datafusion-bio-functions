@@ -461,6 +461,18 @@ fn format_hgvsc_fallback(
             )
         })
         .flatten();
+    let classification_partial_ref = classification_ref_allele
+        .filter(|_| partial_overlap)
+        .and_then(|classification_ref| {
+            vep116_partial_overlap_clamp(
+                tx,
+                classification_ref,
+                variant_start,
+                variant_end,
+                use_genomic_shift,
+            )
+            .map(|(clamped_ref, _, _)| clamped_ref)
+        });
     if partial_overlap && partial_clamp.is_none() {
         return None;
     }
@@ -491,6 +503,11 @@ fn format_hgvsc_fallback(
     let mut feature_ref = display_feature_ref.clone();
     let (genomic_feature_ref, classification_alt) = match classification_ref_allele {
         Some(classification_ref) => {
+            let classification_ref = if clamped {
+                classification_partial_ref.as_deref().unwrap_or(ref_allele)
+            } else {
+                classification_ref
+            };
             hgvs_feature_strand_alleles(tx, classification_ref, alt_allele)?
         }
         None => (display_feature_ref.clone(), feature_alt.clone()),
@@ -4327,6 +4344,29 @@ mod tests {
             partial_overlap_hgvsc(&forward, "AC", "GT", 89, 90, VepSemantics::V116).as_deref(),
             Some("ENSTHGVS000001.1:n.1delinsGT")
         );
+    }
+
+    #[test]
+    fn test_partial_overlap_rna_edit_classification_uses_clamped_reference() {
+        let tx = make_transcript("lncRNA", 1, None, None);
+        let exon = make_exon();
+        let hgvsc = format_hgvsc_with_reference_policy(
+            &tx,
+            &[&exon],
+            None,
+            None,
+            "AC",
+            "GT",
+            89,
+            90,
+            None,
+            None,
+            VepSemantics::V116,
+            true,
+            Some("AC"),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("ENSTHGVS000001.1:n.1delinsGT"));
     }
 
     #[test]
