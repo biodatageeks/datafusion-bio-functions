@@ -592,10 +592,15 @@ fn format_hgvsc_fallback(
         // `notation_to_hgvsc_coords` returns the genomic order; VEP keeps the
         // transcript-slice order (an `ins` clipped from a clamp has start =
         // end + 1) and sorts it with a guard against an end carrying `*`.
-        // Restore VEP's slice order before applying its coordinate sort.
-        if (tx.strand >= 0) == (notation.kind == "ins") {
-            std::mem::swap(&mut start, &mut end);
-        }
+        // Restore VEP's slice order before applying its coordinate sort. For
+        // a `*-N`/coding pair, the endpoint order is already the transcript
+        // slice order; reversing it here would defeat that star-coordinate
+        // ordering.
+        (start, end) = restore_clamped_hgvsc_insertion_slice_order(
+            &start,
+            &end,
+            (tx.strand >= 0) == (notation.kind == "ins"),
+        );
         if vep_hgvs_positions_need_swap(&start, &end) {
             std::mem::swap(&mut start, &mut end);
         }
@@ -2280,6 +2285,19 @@ fn vep_hgvs_position_parts(position: &str) -> Option<(i64, i64)> {
     };
     let offset = signed_int_at(bytes, offset_from).map_or(0, |(value, _)| value);
     Some((coord, offset))
+}
+
+fn restore_clamped_hgvsc_insertion_slice_order(
+    start: &str,
+    end: &str,
+    reverse_slice_order: bool,
+) -> (String, String) {
+    let mut start = start.to_string();
+    let mut end = end.to_string();
+    if reverse_slice_order && preserve_star_negative_hgvsc_order(&start, &end).is_none() {
+        std::mem::swap(&mut start, &mut end);
+    }
+    (start, end)
 }
 
 fn order_hgvsc_positions(start: &str, end: &str) -> (String, String) {
@@ -7772,6 +7790,18 @@ mod tests {
         assert_eq!(
             order_hgvsc_positions("*-51", "962+66"),
             ("*-51".to_string(), "962+66".to_string())
+        );
+        assert_eq!(
+            restore_clamped_hgvsc_insertion_slice_order("*-1", "1239", true),
+            ("*-1".to_string(), "1239".to_string())
+        );
+        assert_eq!(
+            restore_clamped_hgvsc_insertion_slice_order("1239", "*-1", true),
+            ("1239".to_string(), "*-1".to_string())
+        );
+        assert_eq!(
+            restore_clamped_hgvsc_insertion_slice_order("*32", "*31", true),
+            ("*31".to_string(), "*32".to_string())
         );
         assert_eq!(
             order_hgvsc_positions("2016", "2015"),
