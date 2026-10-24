@@ -1587,15 +1587,12 @@ impl TranscriptConsequenceEngine {
                         {
                             profile.transcript_flags += started.elapsed();
                         }
-                        // VEP builds ordinary HGVSc from the genomic feature
+                        // VEP classifies and clips HGVS from the genomic feature
                         // slice, independently of USED_REF's transcript mapping.
-                        // Actual native RNA edits restore the feature reference.
+                        // The HGVS formatter restores the RNA-edited transcript
+                        // reference for display only, after genomic classification.
                         let feature_reference = used_ref.as_deref().unwrap_or(&variant.ref_allele);
-                        let hgvsc_ref_allele = if tx.has_rna_edit {
-                            feature_reference
-                        } else {
-                            genomic_reference.unwrap_or(feature_reference)
-                        };
+                        let hgvsc_ref_allele = genomic_reference.unwrap_or(feature_reference);
                         // Compute HGVSc notation.
                         let hgvsc_started = profiling.then(Instant::now);
                         if let Some(profile) = profile.as_deref_mut() {
@@ -12659,6 +12656,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rna_edit_mnv_hgvsc_classifies_from_genomic_reference() {
+        let mut transcript = tx("NR_RNA_MNV.1", "21", 100, 199, -1, "lncRNA", None, None);
+        transcript.source = Some("RefSeq".to_string());
+        transcript.has_rna_edit = true;
+        transcript.spliced_seq = Some({
+            let mut sequence = vec![b'G'; 100];
+            sequence[93] = b'C';
+            String::from_utf8(sequence).expect("ASCII transcript sequence")
+        });
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 50,
+            end: 50,
+            replacement_len: Some(1),
+            skip_refseq_offset: false,
+        }];
+        let exons = [exon("NR_RNA_MNV.1", 1, 100, 199)];
+        let transcripts = [transcript];
+        let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+        let variant = var("21", 105, 106, "TG", "CA");
+
+        let result = TranscriptConsequenceEngine::default()
+            .evaluate_variant_prepared_with_reference(&variant, &context, Some("TG"), None);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].used_ref.as_deref(), Some("CG"));
+        assert_eq!(result[0].hgvsc.as_deref(), Some("NR_RNA_MNV.1:n.94_95inv"));
     }
 
     #[test]
