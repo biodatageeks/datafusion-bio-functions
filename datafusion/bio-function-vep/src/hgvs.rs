@@ -1,5 +1,6 @@
 //! HGVS notation formatting for VEP CSQ fields (HGVSc and HGVSp).
 
+use std::cmp::Ordering;
 use std::fmt::Write;
 use std::io::{BufRead, Seek};
 use std::time::{Duration, Instant};
@@ -591,12 +592,16 @@ fn format_hgvsc_fallback(
         // `notation_to_hgvsc_coords` returns the genomic order; VEP keeps the
         // transcript-slice order (an `ins` clipped from a clamp has start =
         // end + 1) and sorts it with a guard against an end carrying `*`.
-        // Restore VEP's slice order before applying its shared coordinate sort.
+        // Restore VEP's slice order before applying its coordinate sort.
         if (tx.strand >= 0) == (notation.kind == "ins") {
             std::mem::swap(&mut start, &mut end);
         }
+        if vep_hgvs_positions_need_swap(&start, &end) {
+            std::mem::swap(&mut start, &mut end);
+        }
+    } else {
+        (start, end) = order_hgvsc_positions(&start, &end);
     }
-    (start, end) = order_hgvsc_positions(&start, &end);
     let format_started = profile.is_some().then(Instant::now);
     let hgvsc = format_hgvs_string(&tx_id, numbering, &start, &end, &notation);
     if let (Some(started), Some(profile)) = (format_started, profile.as_deref_mut()) {
@@ -2189,6 +2194,32 @@ fn split_hgvs_coord(value: &str) -> Option<(i64, Option<String>)> {
     Some((coord_part.parse::<i64>().ok()?, offset_part))
 }
 
+fn compare_hgvs_positions(left: &str, right: &str) -> Option<Ordering> {
+    let left_star = left.starts_with('*');
+    let right_star = right.starts_with('*');
+    match (left_star, right_star) {
+        (false, true) => return Some(Ordering::Less),
+        (true, false) => return Some(Ordering::Greater),
+        _ => {}
+    }
+
+    let (left_coord, left_offset) = split_hgvs_coord(left)?;
+    let (right_coord, right_offset) = split_hgvs_coord(right)?;
+    let left_offset = left_offset
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<i64>()
+        .ok()
+        .unwrap_or(0);
+    let right_offset = right_offset
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<i64>()
+        .ok()
+        .unwrap_or(0);
+    Some((left_coord, left_offset).cmp(&(right_coord, right_offset)))
+}
+
 /// VEP's position sort in `hgvs_transcript`, literally:
 ///
 /// ```perl
@@ -2252,7 +2283,29 @@ fn vep_hgvs_position_parts(position: &str) -> Option<(i64, i64)> {
 }
 
 fn order_hgvsc_positions(start: &str, end: &str) -> (String, String) {
-    if vep_hgvs_positions_need_swap(start, end) {
+    // In the general fallback, the mapper can hand us either endpoint first.
+    // The #244 `*-N` coordinate is numerically before a positive coding
+    // coordinate, so keep it first in either input order. Other ranges retain
+    // the established star-last comparator; applying VEP's slice sort to all
+    // mapper outputs changes many unrelated `*N` ranges.
+    let start_is_star_negative = start
+        .strip_prefix("*-")
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+    let end_is_star_negative = end
+        .strip_prefix("*-")
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+    let start_is_positive_coding =
+        !start.contains('*') && vep_hgvs_position_parts(start).is_some_and(|(coord, _)| coord > 0);
+    let end_is_positive_coding =
+        !end.contains('*') && vep_hgvs_position_parts(end).is_some_and(|(coord, _)| coord > 0);
+
+    if start_is_star_negative && end_is_positive_coding {
+        return (start.to_string(), end.to_string());
+    }
+
+    let should_swap = (end_is_star_negative && start_is_positive_coding)
+        || matches!(compare_hgvs_positions(start, end), Some(Ordering::Greater));
+    if should_swap {
         (end.to_string(), start.to_string())
     } else {
         (start.to_string(), end.to_string())
@@ -7699,15 +7752,22 @@ mod tests {
 
     #[test]
     fn test_hgvsc_format_order_keeps_star_intronic_start_before_coding_end() {
-        // The HGVSc output is `c.*-1_2016del`: VEP's regex parses `*-1` as
-        // -1, so this pair is already ordered and must not be swapped.
+        // The #244 shape is ordered with the negative starred coordinate first.
         assert_eq!(
             order_hgvsc_positions("*-1", "2016"),
             ("*-1".to_string(), "2016".to_string())
         );
         assert_eq!(
+            order_hgvsc_positions("2016", "*-1"),
+            ("*-1".to_string(), "2016".to_string())
+        );
+        assert_eq!(
             order_hgvsc_positions("2016", "2015"),
             ("2015".to_string(), "2016".to_string())
+        );
+        assert_eq!(
+            order_hgvsc_positions("*184", "*159"),
+            ("*159".to_string(), "*184".to_string())
         );
     }
 
