@@ -599,6 +599,12 @@ fn format_hgvsc_fallback(
         if vep_hgvs_positions_need_swap(&start, &end) {
             std::mem::swap(&mut start, &mut end);
         }
+        if let Some((negative_star, coding_position)) =
+            order_star_negative_hgvsc_positions(&start, &end)
+        {
+            start = negative_star;
+            end = coding_position;
+        }
     } else {
         (start, end) = order_hgvsc_positions(&start, &end);
     }
@@ -2288,6 +2294,18 @@ fn order_hgvsc_positions(start: &str, end: &str) -> (String, String) {
     // coordinate, so keep it first in either input order. Other ranges retain
     // the established star-last comparator; applying VEP's slice sort to all
     // mapper outputs changes many unrelated `*N` ranges.
+    if let Some(ordered) = order_star_negative_hgvsc_positions(start, end) {
+        return ordered;
+    }
+
+    if matches!(compare_hgvs_positions(start, end), Some(Ordering::Greater)) {
+        (end.to_string(), start.to_string())
+    } else {
+        (start.to_string(), end.to_string())
+    }
+}
+
+fn order_star_negative_hgvsc_positions(start: &str, end: &str) -> Option<(String, String)> {
     let start_is_star_negative = start
         .strip_prefix("*-")
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
@@ -2300,15 +2318,11 @@ fn order_hgvsc_positions(start: &str, end: &str) -> (String, String) {
         !end.contains('*') && vep_hgvs_position_parts(end).is_some_and(|(coord, _)| coord > 0);
 
     if start_is_star_negative && end_is_positive_coding {
-        return (start.to_string(), end.to_string());
-    }
-
-    let should_swap = (end_is_star_negative && start_is_positive_coding)
-        || matches!(compare_hgvs_positions(start, end), Some(Ordering::Greater));
-    if should_swap {
-        (end.to_string(), start.to_string())
+        Some((start.to_string(), end.to_string()))
+    } else if end_is_star_negative && start_is_positive_coding {
+        Some((end.to_string(), start.to_string()))
     } else {
-        (start.to_string(), end.to_string())
+        None
     }
 }
 
@@ -7756,6 +7770,10 @@ mod tests {
         assert_eq!(
             order_hgvsc_positions("*-1", "2016"),
             ("*-1".to_string(), "2016".to_string())
+        );
+        assert_eq!(
+            order_star_negative_hgvsc_positions("2016", "*-1"),
+            Some(("*-1".to_string(), "2016".to_string()))
         );
         assert_eq!(
             order_hgvsc_positions("2016", "*-1"),
