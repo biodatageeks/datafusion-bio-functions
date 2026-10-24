@@ -2639,13 +2639,6 @@ fn resolve_frameshift_hgvs(
         // and `type = "del"` in this branch, then returns. Preserve the
         // clipped reference range and coordinates initialized from context.
         notation.alt_allele = "del".to_string();
-        // The engine's clipped window can be empty exactly at the reference
-        // terminal stop. VEP's transcript-slice peptide still supplies that
-        // Ter residue; retain the clipped range when present, and recover the
-        // translated residue only for this empty-reference case.
-        if notation.ref_allele.is_empty() {
-            notation.ref_allele = peptide_char(&ref_translation, start)?.to_string();
-        }
         // A VEP translation window of `-/X` at the first position after an
         // incomplete CDS is synonymous in the ClinVar #223 targets. The
         // generic past-end branch would otherwise emit `p.Ndel`.
@@ -2674,6 +2667,12 @@ fn resolve_frameshift_hgvs(
         {
             notation.ref_allele.pop();
             notation.end = notation.end.saturating_sub(1);
+        }
+        // The clipped window can be empty at the reference terminal stop, or
+        // the incomplete-terminal-X rule above can trim its only residue.
+        // VEP's translated reference still supplies the Ter in either case.
+        if notation.ref_allele.is_empty() {
+            notation.ref_allele = peptide_char(&ref_translation, start)?.to_string();
         }
         return Some(());
     }
@@ -8239,6 +8238,29 @@ mod tests {
             ref_peptide: "-".into(),
             alt_peptide: "-".into(),
             ref_translation: format!("{}*", "M".repeat(143)),
+            alt_translation: "M".repeat(143),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter144del".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_frameshift_past_alt_translation_recovers_trimmed_terminal_x() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 144,
+            end: 144,
+            ref_peptide: "X".into(),
+            alt_peptide: "X".into(),
+            ref_translation: "M".repeat(143),
             alt_translation: "M".repeat(143),
             alt_translation_extension: None,
             frameshift: true,
