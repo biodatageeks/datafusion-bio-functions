@@ -4926,21 +4926,50 @@ fn mutated_cds_stop_preserved(
     let ref_allele = normalize_allele_seq(&variant.ref_allele);
     let alt_allele = normalize_allele_seq(&variant.alt_allele);
 
-    // Map variant genomic position to 0-based CDS index using proper
-    // exon-aware coordinate mapping (handles multi-exon transcripts).
-    let var_start_genomic = if tx.strand >= 0 {
-        variant.start
-    } else {
-        variant.end
-    };
-
     let leading_n_offset = cds_seq.bytes().take_while(|&b| b == b'N').count();
-    let Some(raw_cds_idx) = genomic_to_cds_index(tx, tx_exons, var_start_genomic) else {
-        return false;
+    // VEP `_ins_del_stop_altered()` edits by BTV's mapped CDS start and the
+    // mapped cDNA span. A genomic REF length incorrectly counts introns in
+    // exon-spanning deletions and can make a preserved terminal stop appear
+    // lost. Keep the existing flank-based insertion handling, where the
+    // source has a TODO for insertion-specific span semantics.
+    let (cds_idx, ref_len) = if variant.start > variant.end {
+        let anchor = if tx.strand >= 0 {
+            variant.end
+        } else {
+            variant.start
+        };
+        let Some(raw_cds_idx) = genomic_to_cds_index(tx, tx_exons, anchor) else {
+            return false;
+        };
+        let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
+        let cds_idx = adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset)
+            .unwrap_or(raw_cds_idx);
+        (cds_idx, ref_allele.len())
+    } else {
+        let mapper = vep_coords::VepTxMapper::with_phase(
+            tx,
+            tx_exons,
+            vep_coords::CdnaBaseMap::Output,
+            leading_n_offset,
+        );
+        let span = vep_coords::VepSpan::from_variant(variant);
+        let mapped_cdna = mapper.cdna(span);
+        let (Some(cdna_start), Some(cdna_end), Some(cds_start)) =
+            (mapped_cdna.start, mapped_cdna.end, mapper.cds(span).start)
+        else {
+            return false;
+        };
+        let Some(ref_len) = cdna_end
+            .checked_sub(cdna_start)
+            .and_then(|length| length.checked_add(1))
+        else {
+            return false;
+        };
+        let Some(cds_idx) = cds_start.checked_sub(1) else {
+            return false;
+        };
+        (cds_idx, ref_len)
     };
-    let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
-    let cds_idx =
-        adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset).unwrap_or(raw_cds_idx);
 
     if cds_idx > cds_seq.len() {
         return false;
@@ -4954,7 +4983,6 @@ fn mutated_cds_stop_preserved(
     combined.extend_from_slice(utr_seq.as_bytes());
 
     // VEP step 2: apply mutation — substr($combined, $cds_idx, $ref_len) = $alt
-    let ref_len = ref_allele.len();
     let end_idx = cds_idx.saturating_add(ref_len).min(combined.len());
 
     let alt_bytes = if alt_allele.is_empty() {
@@ -26119,6 +26147,46 @@ mod tests {
             !result,
             "Without UTR, deletion making mutated shorter than CDS should return false (stop altered)"
         );
+    }
+
+    #[test]
+    fn stop_lost_fallback_uses_spliced_length_for_intronic_deletion() {
+        let cds = "ATGAAACCCTAA";
+        let mut transcript = tx(
+            "T_INTRON_STOP",
+            "22",
+            100,
+            609,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(501),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(12);
+        transcript.translateable_seq = Some(cds.to_string());
+        transcript.three_prime_utr_seq = Some("AAAAAAATAA".to_string());
+        let exons = [
+            exon("T_INTRON_STOP", 1, 100, 105),
+            exon("T_INTRON_STOP", 2, 200, 203),
+            exon("T_INTRON_STOP", 3, 500, 501),
+            exon("T_INTRON_STOP", 4, 600, 609),
+        ];
+        let exon_refs = exons.iter().collect::<Vec<_>>();
+        let deletion = var("22", 201, 605, &"C".repeat(405), "A");
+
+        assert!(mutated_cds_stop_preserved(
+            cds,
+            &deletion,
+            &transcript,
+            &exon_refs,
+        ));
+        assert!(!vep116_stop_lost_without_unambiguous_alt_peptide(
+            &transcript,
+            &exon_refs,
+            None,
+            &deletion,
+        ));
     }
 
     #[test]
