@@ -20070,6 +20070,14 @@ mod tests {
                 .as_deref(),
             Some("Y")
         );
+        assert_eq!(
+            reverse_complement_for_semantics(
+                "ACGTRYMKSWBDHVN-",
+                crate::vep_semantics::VepSemantics::V116,
+            )
+            .as_deref(),
+            Some("-NBDHVWSMKRYACGT")
+        );
     }
 
     #[test]
