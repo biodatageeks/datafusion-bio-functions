@@ -5450,6 +5450,18 @@ struct CodingClassification {
     affected_alt_peptide: Option<String>,
 }
 
+fn clear_ambiguous_alt_peptide_outputs(class: &mut CodingClassification, start_retained: bool) {
+    class.affected_alt_peptide = None;
+    class.synonymous = false;
+    class.missense = false;
+    class.stop_gained = false;
+    class.stop_lost = false;
+    class.start_lost = false;
+    class.start_retained = start_retained;
+    class.amino_acids = None;
+    class.protein_hgvs = None;
+}
+
 impl CodingClassification {
     fn has_any(&self) -> bool {
         self.synonymous
@@ -8459,12 +8471,12 @@ fn classify_coding_change_with_semantics(
     let ref_tx = if tx.strand >= 0 {
         ref_genomic
     } else {
-        reverse_complement(&ref_genomic)?.to_ascii_uppercase()
+        reverse_complement_for_semantics(&ref_genomic, semantics)?.to_ascii_uppercase()
     };
     let alt_tx = if tx.strand >= 0 {
         alt_genomic
     } else {
-        reverse_complement(&alt_genomic)?.to_ascii_uppercase()
+        reverse_complement_for_semantics(&alt_genomic, semantics)?.to_ascii_uppercase()
     };
 
     let edited_ref_tx = edited_transcript_reference_allele(variant, tx, tx_exons)
@@ -8728,14 +8740,6 @@ fn classify_coding_change_with_semantics(
     }
     let ambiguous_alt_peptide = semantics.vep116_stop_predicates()
         && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele);
-    if ambiguous_alt_peptide {
-        // VariationFeatureOverlapAllele::peptide() returns before translating
-        // an ALT outside /^[ACGT-]+$/i:
-        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L697-L703
-        // Keep codon alleles for Codons and nucleotide predicates, but do not
-        // expose/use an ALT peptide for consequence or HGVS decisions.
-        class.affected_alt_peptide = None;
-    }
     let partial_terminal_codon = semantics.vep116_stop_predicates()
         && vep_partial_terminal_codon_for_cds(tx, tx_exons, &cds_seq, variant);
 
@@ -9187,14 +9191,10 @@ fn classify_coding_change_with_semantics(
         });
     }
     if ambiguous_alt_peptide {
-        class.synonymous = false;
-        class.missense = false;
-        class.stop_gained = false;
-        class.stop_lost = false;
-        class.start_lost = false;
-        class.start_retained = vep116_ambiguous_alt_overlaps_start_codon(tx, tx_exons, variant);
-        class.amino_acids = None;
-        class.protein_hgvs = None;
+        clear_ambiguous_alt_peptide_outputs(
+            &mut class,
+            vep116_ambiguous_alt_overlaps_start_codon(tx, tx_exons, variant),
+        );
     }
     Some(class)
 }
@@ -9354,7 +9354,7 @@ fn classify_insertion_with_semantics_and_gap(
     let alt_tx = if tx.strand >= 0 {
         alt_genomic.to_ascii_uppercase()
     } else {
-        reverse_complement(alt_genomic)?.to_ascii_uppercase()
+        reverse_complement_for_semantics(alt_genomic, semantics)?.to_ascii_uppercase()
     };
 
     // For HGVSp replay over an insertion edit gap, VEP replaces the mapped
@@ -9623,9 +9623,6 @@ fn classify_insertion_with_semantics_and_gap(
     }
     let ambiguous_alt_peptide = semantics.vep116_stop_predicates()
         && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele);
-    if ambiguous_alt_peptide {
-        class.affected_alt_peptide = None;
-    }
     // Keep the local sequence remainder for display shaping. Predicate vetoes
     // use VEP's mapper-derived partial_codon result below; these can differ at
     // insertion boundaries where the mapped translation start includes UTR
@@ -9874,14 +9871,10 @@ fn classify_insertion_with_semantics_and_gap(
         protein_hgvs.alt_translation_extension = preferred_hgvs_alt_translation;
     }
     if ambiguous_alt_peptide {
-        class.synonymous = false;
-        class.missense = false;
-        class.stop_gained = false;
-        class.stop_lost = false;
-        class.start_lost = false;
-        class.start_retained = vep116_ambiguous_alt_overlaps_start_codon(tx, tx_exons, variant);
-        class.amino_acids = None;
-        class.protein_hgvs = None;
+        clear_ambiguous_alt_peptide_outputs(
+            &mut class,
+            vep116_ambiguous_alt_overlaps_start_codon(tx, tx_exons, variant),
+        );
     }
     Some(class)
 }
@@ -12327,6 +12320,32 @@ fn coding_segments(tx: &TranscriptFeature, tx_exons: &[&ExonFeature]) -> Option<
 }
 
 fn reverse_complement(seq: &str) -> Option<String> {
+    let mut out = String::with_capacity(seq.len());
+    for b in seq.as_bytes().iter().rev() {
+        let c = match b.to_ascii_uppercase() {
+            b'A' => 'T',
+            b'C' => 'G',
+            b'G' => 'C',
+            b'T' => 'A',
+            b'N' => 'N',
+            _ => return None,
+        };
+        out.push(c);
+    }
+    Some(out)
+}
+
+fn reverse_complement_for_semantics(
+    seq: &str,
+    semantics: crate::vep_semantics::VepSemantics,
+) -> Option<String> {
+    if !semantics.vep116_stop_predicates() {
+        return reverse_complement(seq);
+    }
+    reverse_complement_iupac(seq)
+}
+
+fn reverse_complement_iupac(seq: &str) -> Option<String> {
     let mut out = String::with_capacity(seq.len());
     for b in seq.as_bytes().iter().rev() {
         let c = match b.to_ascii_uppercase() {
@@ -19972,6 +19991,20 @@ mod tests {
         assert_eq!(
             used_ref_for_transcript_variant(&v, &t, &refs, None, false).as_deref(),
             Some("A")
+        );
+    }
+
+    #[test]
+    fn reverse_complement_keeps_iupac_expansion_v116_only() {
+        assert_eq!(reverse_complement("R"), None);
+        assert_eq!(
+            reverse_complement_for_semantics("R", crate::vep_semantics::VepSemantics::V115),
+            None
+        );
+        assert_eq!(
+            reverse_complement_for_semantics("R", crate::vep_semantics::VepSemantics::V116)
+                .as_deref(),
+            Some("Y")
         );
     }
 
@@ -30383,6 +30416,78 @@ mod tests {
             stop_class
                 .as_ref()
                 .is_some_and(|class| class.stop_retained && !class.stop_lost)
+        );
+    }
+
+    #[test]
+    fn issue_208_ambiguous_outer_stop_retained_quirk_is_v116_only() {
+        let cds = "ATGGCTGAATAA";
+        let full_cdna = format!("{cds}CCC");
+        let mut transcript = tx(
+            "T_ISSUE_208_V115_CONTROL",
+            "22",
+            1000,
+            1014,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        transcript.spliced_seq = Some(full_cdna);
+        let exon = exon("T_ISSUE_208_V115_CONTROL", 1, 1000, 1014);
+        let translation = translation(
+            "T_ISSUE_208_V115_CONTROL",
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            None,
+            Some(cds),
+        );
+        let variant = var("22", 1009, 1009, "T", "NN");
+        let v115 = TranscriptConsequenceEngine::new(5000, 5000);
+        let (v115_terms, _) =
+            v115.evaluate_transcript_overlap(&variant, &transcript, &[&exon], Some(&translation));
+        let (v116_terms, _) = r3a_v116_raw_coding_terms(cds, 1009, 1009, "T", "NN");
+
+        assert!(
+            !v115_terms.contains(&SoTerm::StopRetainedVariant),
+            "{v115_terms:?}"
+        );
+        assert!(
+            v116_terms.contains(&SoTerm::StopRetainedVariant),
+            "{v116_terms:?}"
+        );
+    }
+
+    #[test]
+    fn vep116_ambiguous_start_codon_fallback_matches_minus_strand_bounds() {
+        let transcript = tx(
+            "T_MINUS_START_FALLBACK",
+            "22",
+            100,
+            200,
+            -1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
+        let variant = var("22", 199, 199, "A", "N");
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        assert!(vep116_ambiguous_alt_overlaps_start_codon(
+            &transcript,
+            &[],
+            &variant,
+        ));
+        assert_eq!(
+            vep116_ambiguous_alt_overlaps_start_codon(&transcript, &[], &variant),
+            engine.overlaps_start_codon(&variant, &transcript, &[]),
         );
     }
 

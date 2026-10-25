@@ -7168,6 +7168,7 @@ impl AnnotateProvider {
                                     variant.parser_end,
                                     tc.cdna_position.as_deref(),
                                     &variant.alt_allele,
+                                    engine.semantics(),
                                 )
                             });
                         let refseq_offset = OptDisplay(refseq_offset_value);
@@ -7639,6 +7640,7 @@ impl AnnotateProvider {
                                     variant.parser_end,
                                     tc.cdna_position.as_deref(),
                                     &variant.alt_allele,
+                                    engine.semantics(),
                                 )
                             });
                         let given_ref = tc.given_ref.as_deref().unwrap_or("");
@@ -8730,8 +8732,11 @@ fn refseq_misalignment_offset_for_output_for_allele(
     variation_end: i64,
     displayed_cdna_position: Option<&str>,
     variation_feature_seq: &str,
+    semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<i64> {
-    if !crate::hgvs::vep116_seq_is_unambiguous_dna(variation_feature_seq) {
+    if semantics.vep116_stop_predicates()
+        && !crate::hgvs::vep116_seq_is_unambiguous_dna(variation_feature_seq)
+    {
         return None;
     }
     refseq_misalignment_offset_for_output(
@@ -19907,7 +19912,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_domains_keeps_ambiguous_insertion_boundary_geometry() {
+    fn lookup_domains_keeps_insertion_boundary_geometry_without_amino_acids() {
         let translations = vec![make_translation(
             "ENST00000001",
             vec![ProteinDomainFeature {
@@ -19919,10 +19924,17 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
 
-        // The alternate peptide is intentionally absent for an ambiguous
-        // insertion. VEP still carries inverted insertion coordinates, which
-        // excludes a domain ending at the insertion boundary.
-        assert!(lookup_domains(Some("ENST00000001"), Some("42-43"), true, &ctx).is_empty());
+        // An unambiguous anchored VCF insertion is normalized to VEP's `-`
+        // allele even if this consequence has no Amino_acids value. Domain
+        // geometry comes from the insertion itself, not the peptide string.
+        let insertion =
+            VariantInput::from_vcf("22".to_string(), 42, 42, "A".to_string(), "AT".to_string());
+        assert_eq!(insertion.ref_allele, "-");
+        assert_eq!(insertion.alt_allele, "T");
+        let is_insertion = insertion.ref_allele == "-" && insertion.alt_allele != "-";
+        assert!(
+            lookup_domains(Some("ENST00000001"), Some("42-43"), is_insertion, &ctx,).is_empty()
+        );
     }
 
     #[test]
@@ -21952,6 +21964,51 @@ mod tests {
     }
 
     #[test]
+    fn refseq_offset_suppression_for_ambiguous_alt_is_v116_only() {
+        let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
+        tx.start = 100;
+        tx.end = 199;
+        tx.strand = 1;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 2,
+            end: 1,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        };
+
+        assert_eq!(
+            refseq_misalignment_offset_for_output_for_allele(
+                &tx,
+                &[&exon],
+                150,
+                150,
+                Some("51"),
+                "N",
+                crate::vep_semantics::VepSemantics::V115,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            refseq_misalignment_offset_for_output_for_allele(
+                &tx,
+                &[&exon],
+                150,
+                150,
+                Some("51"),
+                "N",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn refseq_offset_is_not_inferred_when_vep_hgvs_rejects_ambiguous_alt() {
         let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
         tx.start = 100;
@@ -21978,6 +22035,7 @@ mod tests {
                 150,
                 Some("51"),
                 "N",
+                crate::vep_semantics::VepSemantics::V116,
             ),
             None
         );
@@ -21989,6 +22047,7 @@ mod tests {
                 150,
                 Some("51"),
                 "R",
+                crate::vep_semantics::VepSemantics::V116,
             ),
             None
         );
@@ -22000,6 +22059,7 @@ mod tests {
                 150,
                 Some("51"),
                 "A",
+                crate::vep_semantics::VepSemantics::V116,
             ),
             Some(2)
         );
