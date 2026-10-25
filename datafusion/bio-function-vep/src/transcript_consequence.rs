@@ -3493,9 +3493,7 @@ impl TranscriptConsequenceEngine {
                     let partial_terminal_codon =
                         vep_partial_terminal_codon(tx, tx_exons, None, variant);
                     if !partial_terminal_codon
-                        && vep116_stop_lost_without_unambiguous_alt_peptide(
-                            tx, tx_exons, None, variant,
-                        )
+                        && vep116_stop_lost_with_reference_sequence(tx, tx_exons, cds_seq, variant)
                     {
                         terms.insert(SoTerm::StopLost);
                     } else if !partial_terminal_codon
@@ -4969,33 +4967,20 @@ fn mutated_cds_stop_preserved(
         } else {
             // Older cache rows may not provide cDNA coding bounds, and the
             // existing genomic fallback still covers fully mapped insertions.
-            let var_start_genomic = if tx.strand >= 0 {
-                variant.start
-            } else {
-                variant.end
-            };
-            let Some(raw_cds_idx) =
-                genomic_to_cds_index_with_legacy_bounds_fallback(tx, tx_exons, var_start_genomic)
+            let Some(cds_idx) =
+                genomic_cds_sequence_index_for_variant(tx, tx_exons, variant, leading_n_offset)
             else {
                 return false;
             };
-            let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
-            adjust_refseq_cds_index_or_raw(tx, raw_cds_idx, leading_n_offset)
+            cds_idx
         };
         (cds_idx, 0)
     } else if !use_cdna_deletion_span {
-        let var_start_genomic = if tx.strand >= 0 {
-            variant.start
-        } else {
-            variant.end
-        };
-        let Some(raw_cds_idx) =
-            genomic_to_cds_index_with_legacy_bounds_fallback(tx, tx_exons, var_start_genomic)
+        let Some(cds_idx) =
+            genomic_cds_sequence_index_for_variant(tx, tx_exons, variant, leading_n_offset)
         else {
             return false;
         };
-        let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
-        let cds_idx = adjust_refseq_cds_index_or_raw(tx, raw_cds_idx, leading_n_offset);
         (cds_idx, ref_allele.len())
     } else {
         let mapper = vep_coords::VepTxMapper::with_phase(
@@ -5012,17 +4997,8 @@ fn mutated_cds_stop_preserved(
         let cds_start = mapper.cds(span).start.or_else(|| {
             // Legacy cache rows can carry genomic CDS bounds without cDNA
             // coding bounds. VEP still maps `cds_start` for these transcripts.
-            let var_start_genomic = if tx.strand >= 0 {
-                variant.start
-            } else {
-                variant.end
-            };
-            let raw_cds_idx =
-                genomic_to_cds_index_with_legacy_bounds_fallback(tx, tx_exons, var_start_genomic)?;
-            let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
-            Some(
-                adjust_refseq_cds_index_or_raw(tx, raw_cds_idx, leading_n_offset).saturating_add(1),
-            )
+            genomic_cds_sequence_index_for_variant(tx, tx_exons, variant, leading_n_offset)
+                .map(|index| index.saturating_add(1))
         });
         let Some(cds_start) = cds_start else {
             return false;
@@ -5086,6 +5062,26 @@ fn mutated_cds_stop_preserved(
         .unwrap_or("")
         .to_ascii_uppercase();
     is_stop_codon_in(tx.codon_table, &codon_at_stop)
+}
+
+fn genomic_cds_sequence_index_for_variant(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+    leading_n_offset: usize,
+) -> Option<usize> {
+    let genomic_anchor = if tx.strand >= 0 {
+        variant.start
+    } else {
+        variant.end
+    };
+    let raw_index = genomic_to_cds_index_with_legacy_bounds_fallback(tx, tx_exons, genomic_anchor)?;
+    let raw_index = raw_index.saturating_add(leading_n_offset);
+    Some(adjust_refseq_cds_index_or_raw(
+        tx,
+        raw_index,
+        leading_n_offset,
+    ))
 }
 
 /// VEP 116 `_overlaps_stop_codon_cil()` uses genomic coordinates and, for an
@@ -5336,6 +5332,16 @@ fn vep116_stop_lost_without_unambiguous_alt_peptide(
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
 ) -> bool {
+    let cds_seq = reference_translateable_seq_for_vep(tx, tx_translation);
+    vep116_stop_lost_with_reference_sequence(tx, tx_exons, cds_seq.as_deref(), variant)
+}
+
+fn vep116_stop_lost_with_reference_sequence(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    cds_seq: Option<&str>,
+    variant: &VariantInput,
+) -> bool {
     let ref_seq = normalize_allele_seq(&variant.ref_allele);
     let alt_seq = normalize_allele_seq(&variant.alt_allele);
     if tx.cds_end_nf
@@ -5355,8 +5361,7 @@ fn vep116_stop_lost_without_unambiguous_alt_peptide(
         return false;
     }
 
-    reference_translateable_seq_for_vep(tx, tx_translation)
-        .is_some_and(|cds_seq| !mutated_cds_stop_preserved(&cds_seq, variant, tx, tx_exons))
+    cds_seq.is_some_and(|cds_seq| !mutated_cds_stop_preserved(cds_seq, variant, tx, tx_exons))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -26855,6 +26860,8 @@ mod tests {
             Some(1008),
         );
         transcript.source = Some("RefSeq".to_string());
+        assert!(transcript.cdna_coding_start.is_none());
+        assert!(transcript.cdna_coding_end.is_none());
         let exon = exon("NM_000001.1", 1, 1000, 1008);
         let exons = [&exon];
         let translation = translation(
@@ -26872,6 +26879,26 @@ mod tests {
             Some(&translation),
             &deletion,
         ));
+
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        assert!(engine.overlaps_stop_codon(&deletion, &transcript, &exons));
+        let (terms, class) =
+            engine.evaluate_transcript_overlap(&deletion, &transcript, &exons, Some(&translation));
+        assert!(
+            terms.contains(&SoTerm::StopLost),
+            "terms={terms:?}, class={class:?}"
+        );
+        assert!(
+            class
+                .as_ref()
+                .and_then(|class| class.affected_alt_peptide.as_deref())
+                .is_none_or(|peptide| peptide.contains('X'))
+        );
     }
 
     #[test]
