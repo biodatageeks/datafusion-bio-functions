@@ -547,6 +547,7 @@ fn format_hgvsc_fallback(
             }
         }
     }
+    let was_insertion_before_clip = notation.kind == "ins";
     let identical_substitution = notation.kind == ">" && notation.ref_allele == notation.alt_allele;
     if clamped {
         // `notation` already uses the transcript-slice endpoints above. VEP
@@ -561,6 +562,7 @@ fn format_hgvsc_fallback(
     } else if notation.kind != "dup" && !identical_substitution {
         clip_alleles(&mut notation, tx.strand);
     }
+    let clipped_to_insertion = !was_insertion_before_clip && notation.kind == "ins";
     // Traceability:
     // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
     //   replaces clipped alleles with feature_seq when `_rna_edit` attributes
@@ -602,13 +604,23 @@ fn format_hgvsc_fallback(
             use_genomic_shift,
         )?
     } else if notation.kind == "ins" {
-        // VEP converts the insertion VF span `(P, P-1)` into transcript-slice
-        // coordinates before `hgvs_variant_notation` reverses display start
-        // and end for an insertion. An unshifted engine insertion is a point
-        // `(P, P)`, while a shifted insertion already carries the VF gap
-        // `(P, P-1)` in `feature_start/feature_end`; preserve that distinction.
-        let slice_notation =
-            hgvsc_insertion_pre_sort_slice_notation(tx, &notation, feature_start, feature_end)?;
+        let slice_notation = if clipped_to_insertion {
+            // This began as a reference-span delins, so VEP's plain-insertion
+            // `display_end/display_start` branch never ran. `_clip_alleles`
+            // adjusted the slice endpoints and retyped the empty REF to `ins`;
+            // `hgvs_transcript` maps those endpoints as-is, then applies its
+            // one shared sort (TranscriptVariationAllele.pm:1491-1493,
+            // 1523-1538, 2211-2243, 2264-2278 @ 2fb834b; Sequence.pm:533-538,
+            // 598-616). Preserve the clipped pair without the plain-insertion
+            // reversal in `hgvsc_insertion_pre_sort_slice_notation`.
+            hgvsc_clipped_insertion_pre_sort_slice_notation(tx, &notation)?
+        } else {
+            // Plain insertions use the VF gap `(P, P-1)` in transcript-slice
+            // coordinates, then Sequence.pm sets start=display_end and
+            // end=display_start (591-594 @ 2fb834b). Preserve that order for
+            // unshifted points and shifted VF gaps.
+            hgvsc_insertion_pre_sort_slice_notation(tx, &notation, feature_start, feature_end)?
+        };
         notation_to_hgvsc_coords(tx, tx_exons, &slice_notation, hgvsc_edit_offset, true)?
     } else {
         // `_var2transcript_slice_coords` also supplies transcript-oriented
@@ -1567,6 +1579,33 @@ fn genomic_range_to_transcript_slice(
             tx.end.checked_sub(genomic_start)?.checked_add(1)?,
         ))
     }
+}
+
+/// Convert the already-clipped endpoints of a reference-span allele that VEP
+/// retyped to an insertion. This is not Sequence.pm's plain-insertion path:
+/// VEP clips the reference-span notation first, maps its adjusted endpoints,
+/// then applies the shared HGVSc sort.
+///
+/// ```perl
+/// # ensembl-variation 2fb834b TranscriptVariationAllele.pm:1491-1493
+/// $hgvs_notation = _clip_alleles($hgvs_notation) unless $hgvs_notation->{'type'} eq 'dup';
+/// # TranscriptVariationAllele.pm:1523-1538 maps both endpoints, then sorts once.
+/// # TranscriptVariationAllele.pm:2211-2243 adjusts start/end while clipping;
+/// # :2264-2278 re-types an empty REF with non-empty ALT to `ins`.
+/// ```
+fn hgvsc_clipped_insertion_pre_sort_slice_notation(
+    tx: &TranscriptFeature,
+    notation: &HgvsNotation,
+) -> Option<HgvsNotation> {
+    if notation.kind != "ins" {
+        return None;
+    }
+    let (slice_start, slice_end) =
+        genomic_range_to_transcript_slice(tx, notation.start, notation.end)?;
+    let mut slice_notation = notation.clone();
+    slice_notation.start = slice_start;
+    slice_notation.end = slice_end;
+    Some(slice_notation)
 }
 
 /// Build VEP's plain-insertion coordinates in transcript-slice pre-sort order.
@@ -8029,6 +8068,89 @@ mod tests {
             assert_eq!(
                 pre_sort_hgvsc,
                 (expected_hgvsc.0.to_string(), expected_hgvsc.1.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_hgvsc_ref_span_clipped_to_insertion_keeps_vep_slice_pair_on_both_strands() {
+        // These begin as ref-span delins, so Sequence.pm's plain-insertion
+        // start=display_end/end=display_start branch does not run. VEP first
+        // clips the ref span, adjusts start/end, retypes empty REF as `ins`,
+        // then maps those endpoints and runs the shared sort
+        // (TranscriptVariationAllele.pm:1491-1493, 1523-1538, 2211-2243,
+        // 2264-2278; Utils/Sequence.pm:533-538, 598-616 @ 2fb834b).
+        let exon = make_exon();
+        let exons = [&exon];
+        let cases = [
+            (1, "A", "AT", 103, 103, (15, 14), ("15", "14"), ("14", "15")),
+            (
+                -1,
+                "A",
+                "AT",
+                103,
+                103,
+                (38, 37),
+                ("38", "37"),
+                ("37", "38"),
+            ),
+            (
+                1,
+                "AC",
+                "ATC",
+                103,
+                104,
+                (15, 14),
+                ("15", "14"),
+                ("14", "15"),
+            ),
+            (
+                -1,
+                "AC",
+                "ATC",
+                103,
+                104,
+                (38, 37),
+                ("38", "37"),
+                ("37", "38"),
+            ),
+        ];
+
+        for (
+            strand,
+            ref_allele,
+            alt_allele,
+            start,
+            end,
+            expected_slice,
+            expected_pre_sort,
+            expected_sorted,
+        ) in cases
+        {
+            let tx = make_transcript("protein_coding", strand, None, None);
+            let (feature_ref, feature_alt) =
+                hgvs_feature_strand_alleles(&tx, ref_allele, alt_allele).unwrap();
+            let mut notation =
+                hgvs_variant_notation(&feature_ref, &feature_alt, start, end).unwrap();
+            assert_ne!(notation.kind, "ins");
+            clip_alleles(&mut notation, strand);
+            assert_eq!(notation.kind, "ins");
+
+            let slice_notation =
+                hgvsc_clipped_insertion_pre_sort_slice_notation(&tx, &notation).unwrap();
+            assert_eq!((slice_notation.start, slice_notation.end), expected_slice);
+            let pre_sort =
+                notation_to_hgvsc_coords(&tx, &exons, &slice_notation, None, true).unwrap();
+            assert_eq!(
+                pre_sort,
+                (
+                    expected_pre_sort.0.to_string(),
+                    expected_pre_sort.1.to_string()
+                )
+            );
+            assert_eq!(
+                order_mapped_hgvsc_positions(&pre_sort.0, &pre_sort.1),
+                (expected_sorted.0.to_string(), expected_sorted.1.to_string())
             );
         }
     }
