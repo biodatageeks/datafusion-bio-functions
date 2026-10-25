@@ -5434,7 +5434,10 @@ fn apply_vep116_stop_predicate_flags(
     // VEP's stop_retained predicate returns early when partial_codon is true,
     // before reaching the ref_eq_alt_sequence terminal-insertion case. Keep
     // that gate on the shortcut as well: otherwise a stop in the inserted
-    // peptide is mislabeled stop_retained instead of stop_gained.
+    // peptide is mislabeled stop_retained instead of stop_gained. This shortcut
+    // also intentionally precedes the generic peptide-X check: VEP applies its
+    // terminal ref_eq_alt_sequence rule when ALT starts with `*`, even if a
+    // later peptide residue is `X`.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1319
     let terminal_stop_after_translation = !partial_terminal_codon
         && ref_peptide == Some("-")
