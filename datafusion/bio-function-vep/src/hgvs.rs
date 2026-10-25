@@ -8184,6 +8184,64 @@ mod tests {
                 Some(expected_hgvsc)
             );
         }
+
+        // VEP maps both clipped endpoints before its single sort
+        // (TranscriptVariationAllele.pm:1523-1538 @ 2fb834b). Make the
+        // output-cDNA shortcut predicate true too, so this fallback test
+        // proves clipped `ins` keeps the mapped flank pair ahead of it.
+        let mut refseq = make_transcript("lncRNA", 1, None, None);
+        refseq.transcript_id = "NR_HGVSC_CLIPPED_INS.1".to_string();
+        refseq.source = Some("RefSeq".to_string());
+        refseq.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 500,
+            end: 499,
+            replacement_len: Some(1),
+            skip_refseq_offset: false,
+        }];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 1,
+            start: 103,
+            end: 103,
+            shifted_compare_allele: "T".to_string(),
+            shifted_allele_string: "T".to_string(),
+            shifted_output_allele: "T".to_string(),
+            ref_orig_allele_string: "A".to_string(),
+            alt_orig_allele_string: "AT".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+        let (feature_ref, feature_alt) = hgvs_feature_strand_alleles(&refseq, "A", "AT").unwrap();
+        let mut notation = hgvs_variant_notation(&feature_ref, &feature_alt, 103, 103).unwrap();
+        clip_alleles(&mut notation, refseq.strand);
+        assert_eq!(notation.kind, "ins");
+        assert!(uses_output_cdna_position_for_hgvsc_coords(
+            &refseq,
+            &exons,
+            &notation,
+            Some("14"),
+            Some(&shift)
+        ));
+        assert_eq!(
+            format_hgvsc_fallback(
+                &refseq,
+                &exons,
+                Some("14"),
+                None,
+                "A",
+                "AT",
+                103,
+                103,
+                Some(&shift),
+                None,
+                VepSemantics::V116,
+                false,
+            )
+            .as_deref(),
+            Some("NR_HGVSC_CLIPPED_INS.1:n.14_15insAT")
+        );
     }
 
     #[test]
