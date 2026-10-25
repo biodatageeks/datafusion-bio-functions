@@ -3395,10 +3395,12 @@ impl TranscriptConsequenceEngine {
     /// Traceability:
     /// - Ensembl Variation `TranscriptVariationAllele::start_lost()`
     ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L83-L120>
-    /// - Ensembl Variation `TranscriptVariationAllele::stop_lost()`
-    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L124-L158>
-    /// - Ensembl Variation `TranscriptVariationAllele::stop_gained()`
-    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L161-L194>
+    /// - Ensembl Variation `_overlaps_stop_codon()` rejects `cds_end_NF` and
+    ///   requires defined cDNA endpoints:
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1363-L1385>
+    /// - VEP 116 `stop_gained()` requires a reference peptide before testing the
+    ///   alternate stop:
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1211-L1231>
     fn add_start_stop_heuristic_terms(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -3612,7 +3614,7 @@ impl TranscriptConsequenceEngine {
         tx: &TranscriptFeature,
         tx_exons: &[&ExonFeature],
     ) -> bool {
-        if tx.cds_end_nf {
+        if self.semantics.vep116_stop_predicates() && tx.cds_end_nf {
             return false;
         }
         if self.semantics.vep116_stop_predicates() && !tx_exons.is_empty() {
@@ -4927,10 +4929,10 @@ fn is_stop_codon(allele: &str) -> bool {
 /// stop position and may form a new stop codon (stop_retained).
 ///
 /// Traceability:
-/// - `_ins_del_stop_altered`:
-///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
-/// - `stop_retained_variant = !_ins_del_stop_altered`:
-///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
+/// - `_ins_del_stop_altered()` coordinate gate and stop-slot check:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1433-L1486>
+/// - `stop_retained()` negates the CIL predicate when its peptide is absent:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1319>
 fn mutated_cds_stop_preserved(
     cds_seq: &str,
     variant: &VariantInput,
@@ -4972,12 +4974,13 @@ fn mutated_cds_stop_preserved(
             } else {
                 variant.end
             };
-            let Some(raw_cds_idx) = genomic_to_cds_index(tx, tx_exons, var_start_genomic) else {
+            let Some(raw_cds_idx) =
+                genomic_to_cds_index_with_legacy_bounds_fallback(tx, tx_exons, var_start_genomic)
+            else {
                 return false;
             };
             let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
-            adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset)
-                .unwrap_or(raw_cds_idx)
+            adjust_refseq_cds_index_or_raw(tx, raw_cds_idx, leading_n_offset)
         };
         (cds_idx, 0)
     } else if !use_cdna_deletion_span {
@@ -4986,12 +4989,13 @@ fn mutated_cds_stop_preserved(
         } else {
             variant.end
         };
-        let Some(raw_cds_idx) = genomic_to_cds_index(tx, tx_exons, var_start_genomic) else {
+        let Some(raw_cds_idx) =
+            genomic_to_cds_index_with_legacy_bounds_fallback(tx, tx_exons, var_start_genomic)
+        else {
             return false;
         };
         let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
-        let cds_idx = adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset)
-            .unwrap_or(raw_cds_idx);
+        let cds_idx = adjust_refseq_cds_index_or_raw(tx, raw_cds_idx, leading_n_offset);
         (cds_idx, ref_allele.len())
     } else {
         let mapper = vep_coords::VepTxMapper::with_phase(
@@ -5013,12 +5017,11 @@ fn mutated_cds_stop_preserved(
             } else {
                 variant.end
             };
-            let raw_cds_idx = genomic_to_cds_index(tx, tx_exons, var_start_genomic)?;
+            let raw_cds_idx =
+                genomic_to_cds_index_with_legacy_bounds_fallback(tx, tx_exons, var_start_genomic)?;
             let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
             Some(
-                adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset)
-                    .unwrap_or(raw_cds_idx)
-                    .saturating_add(1),
+                adjust_refseq_cds_index_or_raw(tx, raw_cds_idx, leading_n_offset).saturating_add(1),
             )
         });
         let Some(cds_start) = cds_start else {
@@ -5100,9 +5103,8 @@ fn vep116_overlaps_stop_codon_cil(
         return false;
     };
     let alt_seq = normalize_allele_seq(&variant.alt_allele);
-    let ref_seq = normalize_allele_seq(&variant.ref_allele);
     let is_point_insertion =
-        ref_seq.is_empty() && !alt_seq.is_empty() && variant.start == variant.end;
+        vep_coords::VepSpan::from_variant(variant).is_insertion() && variant.start == variant.end;
     let mut variant_start = variant.start;
     // VariantInput stores a normalized pure insertion at n+1 as the point
     // [n+1,n+1]. VEP's mapper keeps the empty interval (n+1,n), which matters
@@ -5195,7 +5197,21 @@ fn vep116_has_defined_stop_edit_coordinates(
     let mapper =
         vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, 0);
     let span = vep_coords::VepSpan::from_variant(variant);
-    mapper.cdna(span).both_truthy().is_some() && mapper.cds(span).start.is_some()
+    if mapper.cdna(span).both_truthy().is_none() {
+        return false;
+    }
+    mapper.cds(span).start.is_some()
+        || ((tx.cdna_coding_start.is_none() || tx.cdna_coding_end.is_none())
+            && genomic_to_cds_index_with_legacy_bounds_fallback(
+                tx,
+                tx_exons,
+                if tx.strand >= 0 {
+                    variant.start
+                } else {
+                    variant.end
+                },
+            )
+            .is_some())
 }
 
 /// VEP 116's no-alt-peptide `stop_retained` branch. This is the source-level
@@ -11620,6 +11636,16 @@ fn adjust_refseq_cds_sequence_index(
     adjusted.checked_sub(1)
 }
 
+/// Keep the genomic CDS index when a legacy RefSeq cache row cannot resolve a
+/// sequence-projection offset. Callers can still use the genomic coding bound.
+fn adjust_refseq_cds_index_or_raw(
+    tx: &TranscriptFeature,
+    raw_cds_index: usize,
+    leading_n_offset: usize,
+) -> usize {
+    adjust_refseq_cds_sequence_index(tx, raw_cds_index, leading_n_offset).unwrap_or(raw_cds_index)
+}
+
 fn adjust_refseq_cds_sequence_index_for_hgvsp_reference(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
@@ -11889,6 +11915,22 @@ fn genomic_to_cds_index(
     }
 
     genomic_to_cds_index_from_segments(tx, tx_exons, pos)
+}
+
+/// Map a genomic base to CDS coordinates, preserving the segment-based path
+/// for legacy RefSeq caches that omit one or both cDNA CDS bounds. When those
+/// bounds exist, a mapper gap remains undefined instead of falling through to
+/// genomic geometry.
+fn genomic_to_cds_index_with_legacy_bounds_fallback(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    pos: i64,
+) -> Option<usize> {
+    genomic_to_cds_index(tx, tx_exons, pos).or_else(|| {
+        (tx.cdna_coding_start.is_none() || tx.cdna_coding_end.is_none())
+            .then(|| genomic_to_cds_index_from_segments(tx, tx_exons, pos))
+            .flatten()
+    })
 }
 
 /// Map a genomic base through the transcript's genomic CDS segments, in
@@ -13093,6 +13135,29 @@ mod tests {
         );
         assert!(v115.stop_gained && v115.stop_lost);
         assert!(!v116.stop_gained && v116.stop_lost);
+    }
+
+    #[test]
+    fn vep116_terminal_stop_shortcut_can_coexist_with_incomplete_terminal_codon() {
+        let mut class = CodingClassification {
+            affected_ref_peptide: Some("-".to_string()),
+            affected_alt_peptide: Some("*A".to_string()),
+            ..Default::default()
+        };
+        let mut terms = BTreeSet::from([SoTerm::IncompleteTerminalCodonVariant]);
+
+        apply_vep116_stop_predicate_flags(
+            &mut class,
+            crate::vep_semantics::VepSemantics::V116,
+            true,
+            true,
+        );
+        if class.stop_retained {
+            terms.insert(SoTerm::StopRetainedVariant);
+        }
+
+        assert!(terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
+        assert!(terms.contains(&SoTerm::StopRetainedVariant));
     }
 
     #[test]
@@ -20614,6 +20679,24 @@ mod tests {
         assert!(!variant_hits_intron_body(&v, 10_015_674, 10_015_675));
     }
 
+    #[test]
+    fn short_intron_extension_requires_actual_intron_body_overlap() {
+        let engine = TranscriptConsequenceEngine::default();
+        let exons = [
+            exon("T_SHORT_INTRON", 1, 100, 109),
+            exon("T_SHORT_INTRON", 2, 122, 131),
+        ];
+        let exon_refs = [&exons[0], &exons[1]];
+        let upstream_extension = var("22", 95, 105, "AAAAAAAAAAA", "-");
+
+        assert!(!engine.extends_into_frameshift_intron_only(
+            &upstream_extension,
+            &exon_refs,
+            &exons[0],
+        ));
+        assert!(engine.is_complex_indel(&upstream_extension, &exon_refs));
+    }
+
     /// A substitution overlapping a short intron still takes the
     /// frameshift-intron skip.
     #[test]
@@ -22277,6 +22360,52 @@ mod tests {
         assert!(!terms.contains(&SoTerm::StopGained), "{terms:?}");
         assert_eq!(class.affected_ref_peptide.as_deref(), Some("-"));
         assert_eq!(class.affected_alt_peptide.as_deref(), Some("TS"));
+    }
+
+    #[test]
+    fn terminal_insertion_after_translated_reference_uses_leading_n_phase() {
+        let transcript_id = "T_PHASE_TERMINAL_INSERT";
+        let mut transcript = tx(
+            transcript_id,
+            "22",
+            1000,
+            1006,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1006),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(7);
+        transcript.translateable_seq = Some("NNAGCTTAA".to_string());
+        let exon = exon(transcript_id, 1, 1000, 1006);
+        let exons = [&exon];
+        let translation = translation(
+            transcript_id,
+            Some(9),
+            Some(3),
+            Some("XA*"),
+            Some("NNAGCTTAA"),
+        );
+        let insertion = var("22", 1004, 1004, "-", "GCT");
+
+        let class = classify_insertion_with_semantics_and_gap(
+            &transcript,
+            &exons,
+            Some(&translation),
+            "NNAGCTTAA",
+            &insertion,
+            "GCT",
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        )
+        .expect("phase-padded insertion should classify");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("-"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("A"));
+        let protein_hgvs = class.protein_hgvs.expect("phase-padded HGVSp data");
+        assert_eq!(protein_hgvs.ref_translation, "XA*");
+        assert_eq!(protein_hgvs.alt_translation, "XAA*");
     }
 
     /// A start-lost deletion keeps the full reference peptide window. The
@@ -26643,6 +26772,67 @@ mod tests {
             None,
             &deletion,
         ));
+    }
+
+    #[test]
+    fn stop_lost_fallback_uses_genomic_cds_bounds_for_legacy_refseq() {
+        let cds = "ATGAAATAA";
+        let mut transcript = tx(
+            "NM_000001.1",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        let exon = exon("NM_000001.1", 1, 1000, 1008);
+        let exons = [&exon];
+        let translation = translation(
+            "NM_000001.1",
+            Some(cds.len()),
+            Some(3),
+            Some("MK*"),
+            Some(cds),
+        );
+        let deletion = var("22", 1006, 1006, "T", "-");
+
+        assert!(vep116_stop_lost_without_unambiguous_alt_peptide(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &deletion,
+        ));
+    }
+
+    #[test]
+    fn stop_overlap_cds_end_nf_guard_is_v116_only() {
+        let mut transcript = tx(
+            "T_CDS_END_NF",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.cds_end_nf = true;
+        let exon = exon("T_CDS_END_NF", 1, 1000, 1008);
+        let exons = [&exon];
+        let variant = var("22", 1006, 1006, "T", "C");
+        let v115 = TranscriptConsequenceEngine::new(5000, 5000);
+        let v116 = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        assert!(v115.overlaps_stop_codon(&variant, &transcript, &exons));
+        assert!(!v116.overlaps_stop_codon(&variant, &transcript, &exons));
     }
 
     #[test]
