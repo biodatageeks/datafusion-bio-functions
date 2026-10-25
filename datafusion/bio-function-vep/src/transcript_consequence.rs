@@ -12455,7 +12455,8 @@ fn translate_protein_for_coding_classification(
     // VEP keeps Codons for ambiguous ALT alleles but leaves their peptide
     // undefined. Translate non-ACGT bases as N only for internal coordinate
     // and coding-class construction; the caller clears every peptide-derived
-    // output and predicate before returning the classification.
+    // output and predicate before returning the classification. The temporary
+    // translated CDS is an internal aid and is intentionally discarded.
     let unknown_as_n: Vec<u8> = cds
         .iter()
         .map(|base| {
@@ -30549,6 +30550,34 @@ mod tests {
             vep116_ambiguous_alt_overlaps_start_codon(&transcript, &[], &variant),
             engine.overlaps_start_codon(&variant, &transcript, &[]),
         );
+
+        let mut cds_start_nf = transcript.clone();
+        cds_start_nf.cds_start_nf = true;
+        assert!(!vep116_ambiguous_alt_overlaps_start_codon(
+            &cds_start_nf,
+            &[],
+            &variant,
+        ));
+        assert_eq!(
+            vep116_ambiguous_alt_overlaps_start_codon(&cds_start_nf, &[], &variant),
+            engine.overlaps_start_codon(&variant, &cds_start_nf, &[]),
+        );
+    }
+
+    #[test]
+    fn issue_208_vcf_deletion_uses_unambiguous_empty_allele_sentinel() {
+        let deletion = VariantInput::from_vcf(
+            "22".to_string(),
+            100,
+            101,
+            "AT".to_string(),
+            "A".to_string(),
+        );
+        assert_eq!(deletion.alt_allele, "-");
+        assert!(crate::hgvs::vep116_seq_is_unambiguous_dna(
+            &deletion.alt_allele
+        ));
+        assert!(!crate::hgvs::vep116_seq_is_unambiguous_dna(""));
     }
 
     #[test]

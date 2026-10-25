@@ -7309,10 +7309,11 @@ impl AnnotateProvider {
                                         lookup_domains(
                                             tc.transcript_id.as_deref(),
                                             tc.protein_position.as_deref(),
-                                            row_variant.as_ref().is_some_and(|variant| {
-                                                variant.ref_allele == "-"
-                                                    && variant.alt_allele != "-"
-                                            }),
+                                            variant_is_insertion_for_domains(
+                                                row_variant.as_ref(),
+                                                tc.amino_acids.as_deref(),
+                                                engine.semantics(),
+                                            ),
                                             ctx,
                                         )
                                     }
@@ -7961,9 +7962,11 @@ impl AnnotateProvider {
                                 let domains_str = lookup_domains(
                                     tc.transcript_id.as_deref(),
                                     tc.protein_position.as_deref(),
-                                    row_variant.as_ref().is_some_and(|variant| {
-                                        variant.ref_allele == "-" && variant.alt_allele != "-"
-                                    }),
+                                    variant_is_insertion_for_domains(
+                                        row_variant.as_ref(),
+                                        tc.amino_acids.as_deref(),
+                                        engine.semantics(),
+                                    ),
                                     ctx,
                                 );
                                 if !domains_str.is_empty() {
@@ -9035,6 +9038,21 @@ fn read_protein_features(col: &dyn Array, row: usize) -> Vec<ProteinDomainFeatur
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm>
 /// - VEP Mapper.pm map_insert: for insertions, translation_start > translation_end
 ///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm>
+fn variant_is_insertion_for_domains(
+    variant: Option<&VariantInput>,
+    amino_acids: Option<&str>,
+    semantics: crate::vep_semantics::VepSemantics,
+) -> bool {
+    if semantics.vep116_stop_predicates() {
+        // V116's insertion geometry is defined by the normalized allele, even
+        // when an ambiguous ALT has no peptide/Amino_acids value.
+        variant.is_some_and(|variant| variant.ref_allele == "-" && variant.alt_allele != "-")
+    } else {
+        // Preserve the V115 peptide-derived insertion test.
+        amino_acids.is_some_and(|value| value.starts_with("-/"))
+    }
+}
+
 fn lookup_domains(
     transcript_id: Option<&str>,
     protein_position: Option<&str>,
@@ -19931,10 +19949,33 @@ mod tests {
             VariantInput::from_vcf("22".to_string(), 42, 42, "A".to_string(), "AT".to_string());
         assert_eq!(insertion.ref_allele, "-");
         assert_eq!(insertion.alt_allele, "T");
-        let is_insertion = insertion.ref_allele == "-" && insertion.alt_allele != "-";
+        let is_insertion = variant_is_insertion_for_domains(
+            Some(&insertion),
+            None,
+            crate::vep_semantics::VepSemantics::V116,
+        );
         assert!(
             lookup_domains(Some("ENST00000001"), Some("42-43"), is_insertion, &ctx,).is_empty()
         );
+        assert!(!variant_is_insertion_for_domains(
+            Some(&insertion),
+            None,
+            crate::vep_semantics::VepSemantics::V115,
+        ));
+        assert!(variant_is_insertion_for_domains(
+            Some(&insertion),
+            Some("-/T"),
+            crate::vep_semantics::VepSemantics::V115,
+        ));
+
+        let deletion =
+            VariantInput::from_vcf("22".to_string(), 42, 43, "AT".to_string(), "A".to_string());
+        assert_eq!(deletion.alt_allele, "-");
+        assert!(!variant_is_insertion_for_domains(
+            Some(&deletion),
+            None,
+            crate::vep_semantics::VepSemantics::V116,
+        ));
     }
 
     #[test]
