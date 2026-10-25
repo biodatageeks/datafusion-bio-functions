@@ -5892,31 +5892,41 @@ fn vep116_coding_unknown_with_table(
 fn vep116_ref_eq_alt_sequence_final_stop(
     ref_translation: &[char],
     translation_start: usize,
+    translation_end: usize,
     ref_peptide: &str,
     alt_peptide: &str,
 ) -> bool {
     if ref_peptide == "X" && alt_peptide == "X" {
         return false;
     }
-    // VEP's early TranscriptVariationAllele clause: an insertion mapped
-    // beyond the cached reference translation retains the terminal stop when
-    // the alternate local peptide begins with one. The Rust index is 0-based,
-    // so `>= len` corresponds to Perl's 1-based `tl_start > length(ref_seq)`.
-    if translation_start >= ref_translation.len() {
-        return alt_peptide.starts_with('*');
+    // VEP's conditional TranscriptVariationAllele clause returns early only
+    // when the alternate local peptide begins with `*`; otherwise it continues
+    // to splice with the mapper's translation_start/end and evaluate both
+    // sequence clauses. Rust indices are 0-based, so `>= len` corresponds to
+    // Perl's 1-based `tl_start > length(ref_seq)`.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1343-L1359
+    if translation_start >= ref_translation.len() && alt_peptide.starts_with('*') {
+        return true;
     }
     let same_stop_index = ref_peptide
         .find('*')
         .is_some_and(|stop_index| alt_peptide.find('*') == Some(stop_index));
     let mut mutated = ref_translation.to_vec();
-    let ref_len = ref_peptide.chars().count();
-    let replace_end = translation_start.saturating_add(ref_len).min(mutated.len());
+    let splice_start = translation_start.min(mutated.len());
+    let splice_len = translation_end
+        .checked_sub(translation_start)
+        .and_then(|span| span.checked_add(1))
+        .unwrap_or(0);
+    let splice_end = translation_start
+        .saturating_add(splice_len)
+        .min(mutated.len())
+        .max(splice_start);
     let replacement = if alt_peptide == "-" {
         Vec::new()
     } else {
         alt_peptide.chars().collect()
     };
-    mutated.splice(translation_start..replace_end, replacement);
+    mutated.splice(splice_start..splice_end, replacement);
     same_stop_index
         || (mutated.starts_with(ref_translation)
             && mutated
@@ -5928,6 +5938,7 @@ fn vep116_ref_eq_alt_sequence_for_class(
     class: &CodingClassification,
     ref_translation: &[char],
     translation_start: usize,
+    translation_end: usize,
     insertion: bool,
 ) -> bool {
     // VEP passes `$bvfo->_peptide` here. Ensembl's transcript translation
@@ -5936,23 +5947,25 @@ fn vep116_ref_eq_alt_sequence_for_class(
     let ref_translation = ref_translation
         .strip_suffix(&['*'])
         .unwrap_or(ref_translation);
-    let translation_start = if insertion {
+    let (translation_start, translation_end) = if insertion {
         // The mapper's displayed protein span can bracket an insertion
-        // between residues. When VEP's local reference peptide contains the
-        // left flank, splice that window at protein_position_start; when it is
-        // empty (`-`), the insertion is after the translated protein and the
-        // post-insertion end position is the correct terminal-stop boundary.
+        // between residues. VEP maps POS+1 first, so the raw translation span
+        // is the reverse of the displayed min/max flank. Preserve both
+        // endpoints to retain empty (start > end) insertion spans independently
+        // of the local peptide allele, which can be `-`.
         let mapped_position = class
-            .affected_ref_peptide
-            .as_deref()
-            .filter(|peptide| !peptide.is_empty() && *peptide != "-")
-            .and(class.protein_position_start)
-            .or(class.protein_position_end);
-        mapped_position
+            .protein_position_end
+            .or(class.protein_position_start)
             .and_then(|position| position.checked_sub(1))
-            .unwrap_or(translation_start)
+            .unwrap_or(translation_start);
+        let mapped_end = class
+            .protein_position_start
+            .or(class.protein_position_end)
+            .and_then(|position| position.checked_sub(1))
+            .unwrap_or(mapped_position);
+        (mapped_position, mapped_end)
     } else {
-        translation_start
+        (translation_start, translation_end)
     };
     match (
         class.affected_ref_peptide.as_deref(),
@@ -5961,6 +5974,7 @@ fn vep116_ref_eq_alt_sequence_for_class(
         (Some(ref_peptide), Some(alt_peptide)) => vep116_ref_eq_alt_sequence_final_stop(
             ref_translation,
             translation_start,
+            translation_end,
             ref_peptide,
             alt_peptide,
         ),
@@ -8711,8 +8725,13 @@ fn classify_coding_change_with_semantics(
         }
     }
 
-    let vep116_ref_eq_alt_sequence =
-        vep116_ref_eq_alt_sequence_for_class(&class, &old_aas, local_first_codon, ref_len == 0);
+    let vep116_ref_eq_alt_sequence = vep116_ref_eq_alt_sequence_for_class(
+        &class,
+        &old_aas,
+        local_first_codon,
+        local_last_codon,
+        ref_len == 0,
+    );
     apply_vep116_stop_predicate_flags(
         &mut class,
         semantics,
@@ -9562,7 +9581,7 @@ fn classify_insertion_with_semantics_and_gap(
         }
     }
     let vep116_ref_eq_alt_sequence =
-        vep116_ref_eq_alt_sequence_for_class(&class, &old_aas, codon_at, true);
+        vep116_ref_eq_alt_sequence_for_class(&class, &old_aas, codon_at, codon_at, true);
     apply_vep116_stop_predicate_flags(
         &mut class,
         semantics,
@@ -13432,11 +13451,13 @@ mod tests {
         assert!(!vep116_ref_eq_alt_sequence_final_stop(
             &['A', 'B', 'C', '*'],
             0,
+            0,
             "A",
             "A*",
         ));
         assert!(vep116_ref_eq_alt_sequence_final_stop(
             &['A', 'B'],
+            3,
             3,
             "",
             "*",
@@ -13444,11 +13465,13 @@ mod tests {
         assert!(!vep116_ref_eq_alt_sequence_final_stop(
             &['A', 'B'],
             3,
+            3,
             "",
             "Q",
         ));
         assert!(vep116_ref_eq_alt_sequence_final_stop(
             &['A', 'Q', '*'],
+            1,
             1,
             "Q*",
             "R*",
@@ -13463,7 +13486,49 @@ mod tests {
             &terminal_insertion,
             &['A', 'T', 'L', '*'],
             1,
+            1,
             false,
+        ));
+    }
+
+    #[test]
+    fn vep116_ref_eq_alt_falls_through_after_missed_terminal_shortcut() {
+        // VariationEffect.pm:1344 returns early only when the appended local
+        // peptide starts with '*'; lines 1346-1359 still run otherwise. At
+        // tl_start == length(ref_seq) + 1, the shared-stop-index clause can
+        // therefore still make the predicate true.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1343-L1359
+        assert!(vep116_ref_eq_alt_sequence_final_stop(
+            &['A', 'B'],
+            2,
+            1,
+            "Q*",
+            "R*",
+        ));
+    }
+
+    #[test]
+    fn vep116_insertion_ref_eq_alt_uses_empty_mapped_translation_span() {
+        // VEP splices using translation_start/end, not local ref_peptide
+        // length. For an insertion between residues, the mapper's inverted
+        // span has length zero even though the displayed reference peptide is
+        // '-'. See VariationEffect.pm:1346-1349 and _get_peptide_alleles at
+        // VariationEffect.pm:772-794.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1346-L1349
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L772-L794
+        let insertion = CodingClassification {
+            protein_position_start: Some(1),
+            protein_position_end: Some(2),
+            affected_ref_peptide: Some("-".to_string()),
+            affected_alt_peptide: Some("*A".to_string()),
+            ..Default::default()
+        };
+        assert!(vep116_ref_eq_alt_sequence_for_class(
+            &insertion,
+            &['A', '*', 'A'],
+            0,
+            0,
+            true,
         ));
     }
 
@@ -13478,7 +13543,7 @@ mod tests {
         };
         let reference = vec!['A'; 756];
         assert!(vep116_ref_eq_alt_sequence_for_class(
-            &insertion, &reference, 755, true,
+            &insertion, &reference, 755, 755, true,
         ));
     }
 
@@ -13492,7 +13557,8 @@ mod tests {
             ..Default::default()
         };
         let reference = vec!['A'; 756];
-        let ref_eq_alt = vep116_ref_eq_alt_sequence_for_class(&insertion, &reference, 755, true);
+        let ref_eq_alt =
+            vep116_ref_eq_alt_sequence_for_class(&insertion, &reference, 755, 755, true);
         assert!(ref_eq_alt);
 
         apply_vep116_stop_predicate_flags(
@@ -13515,7 +13581,8 @@ mod tests {
             ..Default::default()
         };
         let reference = vec!['A'; 756];
-        let ref_eq_alt = vep116_ref_eq_alt_sequence_for_class(&insertion, &reference, 755, true);
+        let ref_eq_alt =
+            vep116_ref_eq_alt_sequence_for_class(&insertion, &reference, 755, 755, true);
         assert!(ref_eq_alt);
 
         apply_vep116_stop_predicate_flags(
