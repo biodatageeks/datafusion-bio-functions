@@ -3253,6 +3253,7 @@ mod tests {
         assert!(vep116_seq_is_unambiguous_dna("acgt-"));
         assert!(!vep116_seq_is_unambiguous_dna("N"));
         assert!(!vep116_seq_is_unambiguous_dna("R"));
+        assert!(!vep116_seq_is_unambiguous_dna(""));
     }
 
     #[test]
