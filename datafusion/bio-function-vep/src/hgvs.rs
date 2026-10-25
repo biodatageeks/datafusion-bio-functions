@@ -578,6 +578,12 @@ fn format_hgvsc_fallback(
         // each with `_get_cDNA_position` (TranscriptVariationAllele.pm:
         // 1519-1526 @ 2fb834b) before the single coordinate sort.
         notation_to_hgvsc_coords(tx, tx_exons, &notation, hgvsc_edit_offset, true)?
+    } else if notation.kind == "ins" && clipped_to_insertion {
+        // A ref-span allele retyped by `_clip_alleles` must keep VEP's
+        // clipped endpoint path even when the transcript also has an output
+        // cDNA coordinate; VEP maps the clipped notation before its one sort.
+        let slice_notation = hgvsc_clipped_insertion_pre_sort_slice_notation(tx, &notation)?;
+        notation_to_hgvsc_coords(tx, tx_exons, &slice_notation, hgvsc_edit_offset, true)?
     } else if notation.kind == ">"
         && numbering == 'c'
         && cds_position.is_some_and(|value| !value.is_empty() && !value.contains('_'))
@@ -604,23 +610,12 @@ fn format_hgvsc_fallback(
             use_genomic_shift,
         )?
     } else if notation.kind == "ins" {
-        let slice_notation = if clipped_to_insertion {
-            // This began as a reference-span delins, so VEP's plain-insertion
-            // `display_end/display_start` branch never ran. `_clip_alleles`
-            // adjusted the slice endpoints and retyped the empty REF to `ins`;
-            // `hgvs_transcript` maps those endpoints as-is, then applies its
-            // one shared sort (TranscriptVariationAllele.pm:1491-1493,
-            // 1523-1538, 2211-2243, 2264-2278 @ 2fb834b; Sequence.pm:533-538,
-            // 598-616). Preserve the clipped pair without the plain-insertion
-            // reversal in `hgvsc_insertion_pre_sort_slice_notation`.
-            hgvsc_clipped_insertion_pre_sort_slice_notation(tx, &notation)?
-        } else {
-            // Plain insertions use the VF gap `(P, P-1)` in transcript-slice
-            // coordinates, then Sequence.pm sets start=display_end and
-            // end=display_start (591-594 @ 2fb834b). Preserve that order for
-            // unshifted points and shifted VF gaps.
-            hgvsc_insertion_pre_sort_slice_notation(tx, &notation, feature_start, feature_end)?
-        };
+        // Plain insertions use the VF gap `(P, P-1)` in transcript-slice
+        // coordinates, then Sequence.pm sets start=display_end and
+        // end=display_start (591-594 @ 2fb834b). Preserve that order for
+        // unshifted points and shifted VF gaps.
+        let slice_notation =
+            hgvsc_insertion_pre_sort_slice_notation(tx, &notation, feature_start, feature_end)?;
         notation_to_hgvsc_coords(tx, tx_exons, &slice_notation, hgvsc_edit_offset, true)?
     } else {
         // `_var2transcript_slice_coords` also supplies transcript-oriented
@@ -1643,6 +1638,10 @@ fn hgvsc_insertion_pre_sort_slice_notation(
     // Every insertion reaching this path must retain VEP's one-base VF gap
     // `(P, P-1)` from `_var2transcript_slice_coords` before display reversal.
     let expected_vf_start = vf_end.checked_add(1)?;
+    debug_assert_eq!(
+        vf_start, expected_vf_start,
+        "plain VEP insertion coordinates must be a one-base VF gap"
+    );
     if vf_start != expected_vf_start {
         return None;
     }
@@ -8083,7 +8082,17 @@ mod tests {
         let exon = make_exon();
         let exons = [&exon];
         let cases = [
-            (1, "A", "AT", 103, 103, (15, 14), ("15", "14"), ("14", "15")),
+            (
+                1,
+                "A",
+                "AT",
+                103,
+                103,
+                (15, 14),
+                ("15", "14"),
+                ("14", "15"),
+                "ENSTHGVS000001.1:n.14_15insT",
+            ),
             (
                 -1,
                 "A",
@@ -8093,6 +8102,7 @@ mod tests {
                 (38, 37),
                 ("38", "37"),
                 ("37", "38"),
+                "ENSTHGVS000001.1:n.37_38insA",
             ),
             (
                 1,
@@ -8103,6 +8113,7 @@ mod tests {
                 (15, 14),
                 ("15", "14"),
                 ("14", "15"),
+                "ENSTHGVS000001.1:n.14_15insT",
             ),
             (
                 -1,
@@ -8113,6 +8124,7 @@ mod tests {
                 (38, 37),
                 ("38", "37"),
                 ("37", "38"),
+                "ENSTHGVS000001.1:n.37_38insA",
             ),
         ];
 
@@ -8125,6 +8137,7 @@ mod tests {
             expected_slice,
             expected_pre_sort,
             expected_sorted,
+            expected_hgvsc,
         ) in cases
         {
             let tx = make_transcript("protein_coding", strand, None, None);
@@ -8151,6 +8164,24 @@ mod tests {
             assert_eq!(
                 order_mapped_hgvsc_positions(&pre_sort.0, &pre_sort.1),
                 (expected_sorted.0.to_string(), expected_sorted.1.to_string())
+            );
+            assert_eq!(
+                format_hgvsc_fallback(
+                    &tx,
+                    &exons,
+                    None,
+                    None,
+                    ref_allele,
+                    alt_allele,
+                    start,
+                    end,
+                    None,
+                    None,
+                    VepSemantics::V116,
+                    false,
+                )
+                .as_deref(),
+                Some(expected_hgvsc)
             );
         }
     }
