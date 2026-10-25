@@ -9601,16 +9601,22 @@ fn classify_insertion_with_semantics_and_gap(
     } else {
         Vec::new()
     };
-    if insertion_after_translated_reference {
-        // VEP's peptide allele at the boundary after its translated reference
-        // contains the inserted allele only. The local codon window used by
-        // stop-retained checks may extend through the downstream terminal
-        // stop, but that reference stop is not part of the alternate peptide
-        // allele and must not create a stop_gained consequence.
+    if insertion_after_translated_reference || ins_point.is_multiple_of(3) {
+        // VEP's `codon()` uses translation_start/end to select the reference
+        // codon window. At an insertion boundary that mapped window is empty,
+        // so `_get_peptide_alleles()` sees `-` and the inserted allele alone;
+        // the adjacent reference codon is not part of the stop predicate's
+        // peptide. This matters for duplications that reproduce the reference
+        // tail and its stop in the full-sequence splice check.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L841-L877
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L772-L795
         let alt_end = codon_start.saturating_add(alt_len).min(mutated.len());
         class.affected_ref_peptide = Some("-".to_string());
-        class.affected_alt_peptide =
-            local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
+        class.affected_alt_peptide = if insertion_after_translated_reference {
+            local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end])
+        } else {
+            local_peptide_from_codon_window(tx.codon_table, alt_tx.as_bytes())
+        };
     } else if has_reference_codon_window {
         let ref_end = codon_start.saturating_add(3).min(effective_cds.len());
         let alt_end = codon_start
@@ -13702,6 +13708,55 @@ mod tests {
             0,
             true,
         ));
+    }
+
+    #[test]
+    fn vep116_terminal_duplicating_insertion_preserves_the_reference_stop() {
+        // VariationEffect.pm ref_eq_alt_sequence splices the local peptide
+        // into the complete VEP reference peptide using translation_start/end.
+        // This insertion duplicates the final ten reference residues and
+        // carries the terminal stop immediately after that duplicate, so the
+        // reference prefix and final stop are unchanged.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1326-L1359
+        let id = "ENST00000509513";
+        let mut transcript = tx(
+            id,
+            "10",
+            1_000,
+            2_703,
+            1,
+            "protein_coding",
+            Some(1_000),
+            Some(2_703),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(1_704);
+        let mut cds = "GCT".repeat(557);
+        cds.push_str("AAGAAGCAGTGGGTAAATACCAGTCTTTTTTAG");
+        assert_eq!(cds.len(), 1_704);
+        transcript.translateable_seq = Some(cds.clone());
+        let exons = [exon(id, 1, 1_000, 2_703)];
+        let exon_refs = [&exons[0]];
+        let tx_translation = translation(id, Some(1_704), Some(567), None, Some(&cds));
+        let variant = VariantInput::from_vcf(
+            "10".to_string(),
+            2_670,
+            2_670,
+            "T".to_string(),
+            "TAAGAAGCAGTGGGTAAATACCAGTCTTTTTTAGACCCTTATTTCTGAA".to_string(),
+        );
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exon_refs,
+            Some(&tx_translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("coding insertion should be classified");
+
+        assert!(class.stop_retained, "{class:?}");
+        assert!(!class.stop_gained, "{class:?}");
     }
 
     #[test]
