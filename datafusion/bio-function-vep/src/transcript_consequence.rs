@@ -5497,12 +5497,13 @@ fn apply_vep116_stop_predicate_flags(
                     && reference.contains('*')
                     && !alternate.contains('*')
         );
-    // VEP's ref_eq_alt_sequence has a terminal insertion fast path: when the
-    // insertion maps past the translated reference and the alternate peptide
-    // starts with '*', it retains the terminal stop. The local window may
-    // carry translated sequence after that stop, but VEP's shortcut only
-    // checks the leading amino acid.
-    let terminal_stop_after_translation = ref_peptide == Some("-")
+    // VEP's stop_retained predicate returns early when partial_codon is true,
+    // before reaching the ref_eq_alt_sequence terminal-insertion case. Keep
+    // that gate on the shortcut as well: otherwise a stop in the inserted
+    // peptide is mislabeled stop_retained instead of stop_gained.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1319
+    let terminal_stop_after_translation = !partial_terminal_codon
+        && ref_peptide == Some("-")
         && alt_peptide.is_some_and(|alternate| alternate.starts_with('*'))
         && ref_eq_alt_sequence;
     let stop_retained = !stop_lost
@@ -13335,7 +13336,7 @@ mod tests {
     }
 
     #[test]
-    fn vep116_terminal_stop_shortcut_can_coexist_with_incomplete_terminal_codon() {
+    fn vep116_partial_terminal_codon_gates_terminal_stop_retained_shortcut() {
         let mut class = CodingClassification {
             affected_ref_peptide: Some("-".to_string()),
             affected_alt_peptide: Some("*A".to_string()),
@@ -13352,9 +13353,13 @@ mod tests {
         if class.stop_retained {
             terms.insert(SoTerm::StopRetainedVariant);
         }
+        if class.stop_gained {
+            terms.insert(SoTerm::StopGained);
+        }
 
         assert!(terms.contains(&SoTerm::IncompleteTerminalCodonVariant));
-        assert!(terms.contains(&SoTerm::StopRetainedVariant));
+        assert!(!terms.contains(&SoTerm::StopRetainedVariant), "{terms:?}");
+        assert!(terms.contains(&SoTerm::StopGained), "{terms:?}");
     }
 
     #[test]
@@ -13799,7 +13804,7 @@ mod tests {
     }
 
     #[test]
-    fn vep116_terminal_insertion_retains_stop_with_empty_tail_and_partial_terminal_codon() {
+    fn vep116_terminal_insertion_gains_stop_with_partial_terminal_codon() {
         let mut insertion = CodingClassification {
             protein_position_start: Some(756),
             protein_position_end: Some(757),
@@ -13818,8 +13823,8 @@ mod tests {
             true,
             ref_eq_alt,
         );
-        assert!(insertion.stop_retained, "{insertion:?}");
-        assert!(!insertion.stop_gained, "{insertion:?}");
+        assert!(!insertion.stop_retained, "{insertion:?}");
+        assert!(insertion.stop_gained, "{insertion:?}");
     }
 
     #[test]
