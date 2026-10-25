@@ -8184,7 +8184,10 @@ mod tests {
                 Some(expected_hgvsc)
             );
         }
+    }
 
+    #[test]
+    fn test_hgvsc_refseq_clipped_insertion_precedes_output_cdna_shortcut() {
         // VEP maps both clipped endpoints before its single sort
         // (TranscriptVariationAllele.pm:1523-1538 @ 2fb834b). Make the
         // output-cDNA shortcut predicate true too, so this fallback test
@@ -8198,6 +8201,8 @@ mod tests {
             replacement_len: Some(1),
             skip_refseq_offset: false,
         }];
+        let exon = make_exon();
+        let exons = [&exon];
         let shift = HgvsGenomicShift {
             strand: 1,
             shift_length: 1,
