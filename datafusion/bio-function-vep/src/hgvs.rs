@@ -554,6 +554,8 @@ fn format_hgvsc_fallback(
         // to cDNA (TranscriptVariationAllele.pm:1474-1493, 2211-2278 @
         // 2fb834b), so keep this pair for the one shared VEP sort.
         if notation.kind != "dup" && !identical_substitution {
+            // `strand = 1` means forward within this already transcript-oriented
+            // slice, on both genomic transcript strands.
             clip_alleles_with_dup_retyping(&mut notation, 1, false);
         }
     } else if notation.kind != "dup" && !identical_substitution {
@@ -629,6 +631,15 @@ fn format_hgvsc_fallback(
     hgvsc
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Vep116ClampedAllele {
+    ref_allele: String,
+    slice_start: i64,
+    slice_end: i64,
+    genomic_start: i64,
+    genomic_end: i64,
+}
+
 /// Reproduce the release/116 `_var2transcript_slice_coords` behavior for an
 /// allele with a reference span (deletion, delins or MNV) that overlaps only
 /// part of a transcript.
@@ -647,15 +658,6 @@ fn format_hgvsc_fallback(
 /// `genomic_shift` is `None` for a delins or MNV here and the offset is 0.
 /// `hgvs_transcript` then cuts REF from the clamped slice and keeps ALT whole
 /// (:1474-1482), which the caller does with the returned REF.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Vep116ClampedAllele {
-    ref_allele: String,
-    slice_start: i64,
-    slice_end: i64,
-    genomic_start: i64,
-    genomic_end: i64,
-}
-
 fn vep116_partial_overlap_clamp(
     tx: &TranscriptFeature,
     ref_allele: &str,
@@ -1599,7 +1601,10 @@ fn hgvsc_insertion_pre_sort_slice_notation(
         // Sequence.pm endpoint reversal, so do not infer the span from it.
         (feature_start, feature_end)
     };
-    if vf_start != vf_end.checked_add(1)? {
+    // Every insertion reaching this path must retain VEP's one-base VF gap
+    // `(P, P-1)` from `_var2transcript_slice_coords` before display reversal.
+    let expected_vf_start = vf_end.checked_add(1)?;
+    if vf_start != expected_vf_start {
         return None;
     }
     let (slice_start, slice_end) = genomic_range_to_transcript_slice(tx, vf_start, vf_end)?;
@@ -7886,6 +7891,10 @@ mod tests {
             order_mapped_hgvsc_positions("*184", "*159"),
             ("*184".to_string(), "*159".to_string())
         );
+        assert_eq!(
+            order_mapped_hgvsc_positions("*203-3410", "*203-3415"),
+            ("*203-3410".to_string(), "*203-3415".to_string())
+        );
     }
 
     #[test]
@@ -8005,7 +8014,7 @@ mod tests {
         let exon = make_exon();
         let exons = [&exon];
 
-        for strand in [1, -1] {
+        for (strand, expected_hgvsc) in [(1, ("14", "15")), (-1, ("37", "38"))] {
             let tx = make_transcript("protein_coding", strand, None, None);
             let notation = hgvs_variant_notation("-", "AT", 104, 103).unwrap();
             assert_eq!(notation.kind, "ins");
@@ -8015,8 +8024,12 @@ mod tests {
             let pre_sort_slice =
                 hgvsc_insertion_pre_sort_slice_notation(&tx, &notation, 104, 103).unwrap();
             assert_eq!((pre_sort_slice.start, pre_sort_slice.end), expected);
-            let _pre_sort_hgvsc =
+            let pre_sort_hgvsc =
                 notation_to_hgvsc_coords(&tx, &exons, &pre_sort_slice, None, true).unwrap();
+            assert_eq!(
+                pre_sort_hgvsc,
+                (expected_hgvsc.0.to_string(), expected_hgvsc.1.to_string())
+            );
         }
     }
 
