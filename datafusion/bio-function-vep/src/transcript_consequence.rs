@@ -9470,9 +9470,12 @@ fn classify_insertion_with_semantics_and_gap(
         Vec::new()
     };
     if insertion_after_translated_reference {
-        let alt_end = codon_start
-            .saturating_add(codon_window_len)
-            .min(mutated.len());
+        // VEP's peptide allele at the boundary after its translated reference
+        // contains the inserted allele only. The local codon window used by
+        // stop-retained checks may extend through the downstream terminal
+        // stop, but that reference stop is not part of the alternate peptide
+        // allele and must not create a stop_gained consequence.
+        let alt_end = codon_start.saturating_add(alt_len).min(mutated.len());
         class.affected_ref_peptide = Some("-".to_string());
         class.affected_alt_peptide =
             local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
@@ -22222,6 +22225,58 @@ mod tests {
             "{terms:?}"
         );
         assert!(!terms.contains(&SoTerm::StopLost), "{terms:?}");
+    }
+
+    #[test]
+    fn issue_202_terminal_stop_after_inframe_duplication_is_not_stop_gained() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let transcript_id = "T_ISSUE_202_TERMINAL_DUPLICATION";
+        let cds = "ATGACTTCTTAA";
+        let mut transcript = tx(
+            transcript_id,
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        transcript.spliced_seq = Some(format!("{cds}CCCGGG"));
+        let exon = exon(transcript_id, 1, 1000, 1011);
+        let exons = [&exon];
+        let translation = translation(
+            transcript_id,
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            Some("MTS*"),
+            Some(cds),
+        );
+        // Duplicate the last translated residues immediately before the
+        // transcript-terminal stop, as in the eight full-contig regressions.
+        let insertion = var("22", 1009, 1009, "-", "ACTTCT");
+
+        let mut terms = BTreeSet::new();
+        let class = engine
+            .add_coding_terms(
+                &mut terms,
+                &insertion,
+                &transcript,
+                &exons,
+                Some(&translation),
+            )
+            .expect("terminal duplication should be classified");
+        assert!(terms.contains(&SoTerm::InframeInsertion), "{terms:?}");
+        assert!(!terms.contains(&SoTerm::StopGained), "{terms:?}");
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("-"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("TS"));
     }
 
     /// A start-lost deletion keeps the full reference peptide window. The
