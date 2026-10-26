@@ -9838,9 +9838,12 @@ fn classify_insertion_with_semantics_and_gap(
     } else {
         Vec::new()
     };
-    if insertion_after_translated_reference || ins_point.is_multiple_of(3) {
+    if insertion_after_translated_reference
+        || (ins_point.is_multiple_of(3) && mutation_ref_len == 0)
+    {
         // VEP's `codon()` uses translation_start/end to select the reference
-        // codon window. At an insertion boundary that mapped window is empty,
+        // codon window. At an insertion boundary with no mapped REF span, that
+        // mapped window is empty,
         // so `_get_peptide_alleles()` sees `-` and the inserted allele alone;
         // the adjacent reference codon is not part of the stop predicate's
         // peptide. This matters for duplications that reproduce the reference
@@ -9848,7 +9851,9 @@ fn classify_insertion_with_semantics_and_gap(
         // A genomic insertion is the empty mapper interval (n+1,n) (Core
         // c0cf13d, Mapper.pm:267-270), and Variation's `codon()` returns '-'
         // for an empty mapped window while extending only the alternate window
-        // by allele length (2fb834b, TranscriptVariationAllele.pm:841-880).
+        // by `allele_len - vf_nt_len` (2fb834b, TranscriptVariationAllele.pm:
+        // 841-880). A RefSeq edit-gap replacement has a nonzero mapped `vf_nt_len`
+        // and keeps its R4C reference codon span.
         // `_get_peptide_alleles()` then treats '-' as an empty peptide
         // (VariationEffect.pm:772-797).
         let alt_end = codon_start.saturating_add(alt_len).min(mutated.len());
