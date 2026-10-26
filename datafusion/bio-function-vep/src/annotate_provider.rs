@@ -9026,18 +9026,6 @@ fn read_protein_features(col: &dyn Array, row: usize) -> Vec<ProteinDomainFeatur
     out
 }
 
-/// Look up overlapping protein domains for a given transcript and protein position.
-///
-/// Formats matching domains as `analysis:hseqname` joined with `&`, with
-/// spaces, semicolons, and equals signs replaced by underscores (matching VEP).
-///
-/// Traceability:
-/// - VEP OutputFactory.pm DOMAINS output
-///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466>
-/// - VEP BaseTranscriptVariation.pm get_overlapping_ProteinFeatures
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm>
-/// - VEP Mapper.pm map_insert: for insertions, translation_start > translation_end
-///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm>
 fn variant_is_insertion_for_domains(
     variant: Option<&VariantInput>,
     amino_acids: Option<&str>,
@@ -9053,6 +9041,18 @@ fn variant_is_insertion_for_domains(
     }
 }
 
+/// Look up overlapping protein domains for a given transcript and protein position.
+///
+/// Formats matching domains as `analysis:hseqname` joined with `&`, with
+/// spaces, semicolons, and equals signs replaced by underscores (matching VEP).
+///
+/// Traceability:
+/// - VEP OutputFactory.pm DOMAINS output
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466>
+/// - VEP BaseTranscriptVariation.pm get_overlapping_ProteinFeatures
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm>
+/// - VEP Mapper.pm map_insert: for insertions, translation_start > translation_end
+///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm>
 fn lookup_domains(
     transcript_id: Option<&str>,
     protein_position: Option<&str>,
