@@ -3127,6 +3127,23 @@ impl TranscriptConsequenceEngine {
         tx_translation: Option<&TranslationFeature>,
     ) -> Option<CodingClassification> {
         let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
+        let refseq_mapper_insertion_gap = (ref_len == 0)
+            .then(|| refseq_mapper_insertion_cds_gap(tx, tx_exons, tx_translation, variant))
+            .flatten();
+        // VEP's frameshift predicate compares alternate allele length with
+        // the mapped CDS span, which can be nonempty for a genomic insertion
+        // replacing a RefSeq mapper gap. Keep the genomic insertion shape for
+        // control flow, but seed consequence length terms from that mapped
+        // reference span.
+        //
+        // Traceability: Ensembl Variation `frameshift()` computes
+        // `cds_end - cds_start + 1` and compares it with `seq_length`:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1551-L1565
+        // `TranscriptVariationAllele::codon()` derives the same mapped width:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L850-L852
+        let consequence_ref_len = refseq_mapper_insertion_gap
+            .and_then(|(start, end)| end.checked_sub(start)?.checked_add(1))
+            .unwrap_or(ref_len);
 
         // At a transcript-only RefSeq insertion, an allele that replaces the
         // complete inserted CDS interval can still carry mapper-derived HGVS
@@ -3139,8 +3156,7 @@ impl TranscriptConsequenceEngine {
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L642-L668
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1626-L1749
         if ref_len == 0
-            && let Some((start, end)) =
-                refseq_mapper_insertion_cds_gap(tx, tx_exons, tx_translation, variant)
+            && let Some((start, end)) = refseq_mapper_insertion_gap
             && end.checked_sub(start).and_then(|span| span.checked_add(1)) == Some(alt_len)
         {
             terms.insert(SoTerm::IntergenicVariant);
@@ -3299,14 +3315,14 @@ impl TranscriptConsequenceEngine {
                 false
             };
 
-            let diff = ref_len.abs_diff(alt_len);
+            let diff = consequence_ref_len.abs_diff(alt_len);
             let suppress_length_terms = extends_into_utr || has_partial_cds_endpoint;
             if suppress_length_terms {
                 // A deletion/delins spans CDS + UTR (or has another mapped
                 // endpoint Gap). VEP's defined-CDS/codon guards suppress the
                 // length-based consequences for either allele-length delta.
             } else if diff % 3 == 0 {
-                if alt_len > ref_len {
+                if alt_len > consequence_ref_len {
                     terms.insert(SoTerm::InframeInsertion);
                 } else if !partial_terminal_codon_v116 {
                     terms.insert(SoTerm::InframeDeletion);
@@ -3326,7 +3342,7 @@ impl TranscriptConsequenceEngine {
                 // is true. Override frameshift → inframe_insertion.
                 if classification.stop_retained && terms.contains(&SoTerm::FrameshiftVariant) {
                     terms.remove(&SoTerm::FrameshiftVariant);
-                    if alt_len > ref_len {
+                    if alt_len > consequence_ref_len {
                         terms.insert(SoTerm::InframeInsertion);
                     } else {
                         terms.insert(SoTerm::InframeDeletion);
@@ -15982,6 +15998,83 @@ mod tests {
             )
             .as_deref(),
             Some("NP_055935.4:p.GluGlu25=")
+        );
+    }
+
+    #[test]
+    fn refseq_insertion_replacement_uses_mapped_cds_length_for_frameshift() {
+        let edited_cds = format!("{}A", "ATG".repeat(118));
+        let mut transcript = tx(
+            "NM_MAPPED_GAP.1",
+            "2",
+            1000,
+            1350,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1350),
+        );
+        transcript.source = Some("BestRefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_non_polya_rna_edit = true;
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 186,
+            end: 185,
+            replacement_len: Some(4),
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1000,
+                genomic_end: 1184,
+                cdna_start: 1,
+                cdna_end: 185,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1185,
+                genomic_end: 1350,
+                cdna_start: 190,
+                cdna_end: 355,
+                ori: 1,
+            },
+        ];
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(355);
+        transcript.translateable_seq = Some(edited_cds.clone());
+        let exons = [exon(&transcript.transcript_id, 1, 1000, 1350)];
+        let exon_refs = exons.iter().collect::<Vec<_>>();
+        let translation_seq = "M".repeat(118);
+        let translation = translation(
+            &transcript.transcript_id,
+            Some(edited_cds.len()),
+            Some(118),
+            Some(&translation_seq),
+            Some(&edited_cds),
+        );
+        let variant = VariantInput::from_vcf("2".into(), 1184, 1184, "A".into(), "AA".into());
+        assert_eq!(
+            refseq_mapper_insertion_cds_gap(&transcript, &exon_refs, Some(&translation), &variant,),
+            Some((186, 189))
+        );
+
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let mut terms = BTreeSet::new();
+        engine.add_coding_terms(
+            &mut terms,
+            &variant,
+            &transcript,
+            &exon_refs,
+            Some(&translation),
+        );
+        assert!(
+            !terms.contains(&SoTerm::FrameshiftVariant),
+            "the ALT replaces a four-base mapped CDS span with one base: {terms:?}"
         );
     }
 
