@@ -7150,6 +7150,10 @@ impl AnnotateProvider {
                                 .unwrap_or(""),
                         );
                         let source_val = if include_source_field { source } else { "" };
+                        // OutputFactory emits the property independently, but
+                        // VEP 116 populates it from `hgvs_transcript()` after
+                        // that method's ambiguous-allele early return. Do not
+                        // infer an offset for an ALT whose HGVS path never ran.
                         let refseq_offset_value =
                             tx_opt.filter(|_| hgvs_flags.hgvsc).and_then(|tx| {
                                 let variant = row_variant.as_ref()?;
@@ -7157,12 +7161,14 @@ impl AnnotateProvider {
                                     .exons_by_tx_genomic
                                     .get(tx.transcript_id.as_str())
                                     .or_else(|| ctx.exons_by_tx.get(tx.transcript_id.as_str()))?;
-                                refseq_misalignment_offset_for_output(
+                                refseq_misalignment_offset_for_output_for_allele(
                                     tx,
                                     tx_exons,
                                     variant.parser_start,
                                     variant.parser_end,
                                     tc.cdna_position.as_deref(),
+                                    &variant.alt_allele,
+                                    engine.semantics(),
                                 )
                             });
                         let refseq_offset = OptDisplay(refseq_offset_value);
@@ -7303,7 +7309,11 @@ impl AnnotateProvider {
                                         lookup_domains(
                                             tc.transcript_id.as_deref(),
                                             tc.protein_position.as_deref(),
-                                            tc.amino_acids.as_deref(),
+                                            variant_is_insertion_for_domains(
+                                                row_variant.as_ref(),
+                                                tc.amino_acids.as_deref(),
+                                                engine.semantics(),
+                                            ),
                                             ctx,
                                         )
                                     }
@@ -7624,12 +7634,14 @@ impl AnnotateProvider {
                                     .exons_by_tx_genomic
                                     .get(tx.transcript_id.as_str())
                                     .or_else(|| ctx.exons_by_tx.get(tx.transcript_id.as_str()))?;
-                                refseq_misalignment_offset_for_output(
+                                refseq_misalignment_offset_for_output_for_allele(
                                     tx,
                                     tx_exons,
                                     variant.parser_start,
                                     variant.parser_end,
                                     tc.cdna_position.as_deref(),
+                                    &variant.alt_allele,
+                                    engine.semantics(),
                                 )
                             });
                         let given_ref = tc.given_ref.as_deref().unwrap_or("");
@@ -7950,7 +7962,11 @@ impl AnnotateProvider {
                                 let domains_str = lookup_domains(
                                     tc.transcript_id.as_deref(),
                                     tc.protein_position.as_deref(),
-                                    tc.amino_acids.as_deref(),
+                                    variant_is_insertion_for_domains(
+                                        row_variant.as_ref(),
+                                        tc.amino_acids.as_deref(),
+                                        engine.semantics(),
+                                    ),
                                     ctx,
                                 );
                                 if !domains_str.is_empty() {
@@ -8712,6 +8728,29 @@ fn refseq_misalignment_offset_for_output(
     )
 }
 
+fn refseq_misalignment_offset_for_output_for_allele(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variation_start: i64,
+    variation_end: i64,
+    displayed_cdna_position: Option<&str>,
+    variation_feature_seq: &str,
+    semantics: crate::vep_semantics::VepSemantics,
+) -> Option<i64> {
+    if semantics.vep116_stop_predicates()
+        && !crate::hgvs::vep116_seq_is_unambiguous_dna(variation_feature_seq)
+    {
+        return None;
+    }
+    refseq_misalignment_offset_for_output(
+        tx,
+        tx_exons,
+        variation_start,
+        variation_end,
+        displayed_cdna_position,
+    )
+}
+
 fn parse_cdna_position_start(value: &str) -> Option<i64> {
     let value = value.trim();
     let mut sign = 1_i64;
@@ -8999,10 +9038,25 @@ fn read_protein_features(col: &dyn Array, row: usize) -> Vec<ProteinDomainFeatur
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm>
 /// - VEP Mapper.pm map_insert: for insertions, translation_start > translation_end
 ///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm>
+fn variant_is_insertion_for_domains(
+    variant: Option<&VariantInput>,
+    amino_acids: Option<&str>,
+    semantics: crate::vep_semantics::VepSemantics,
+) -> bool {
+    if semantics.vep116_stop_predicates() {
+        // V116's insertion geometry is defined by the normalized allele, even
+        // when an ambiguous ALT has no peptide/Amino_acids value.
+        variant.is_some_and(|variant| variant.ref_allele == "-" && variant.alt_allele != "-")
+    } else {
+        // Preserve the V115 peptide-derived insertion test.
+        amino_acids.is_some_and(|value| value.starts_with("-/"))
+    }
+}
+
 fn lookup_domains(
     transcript_id: Option<&str>,
     protein_position: Option<&str>,
-    amino_acids: Option<&str>,
+    is_insertion: bool,
     ctx: &PreparedContext<'_>,
 ) -> String {
     let Some(tx_id) = transcript_id else {
@@ -9023,12 +9077,11 @@ fn lookup_domains(
         let Ok(e) = b.parse::<i64>() else {
             return String::new();
         };
-        // For insertions (amino_acids = "-/X"), VEP's Mapper.map_insert swaps
+        // For insertions, VEP's Mapper.map_insert swaps
         // translation_start and translation_end so that start > end. This makes
         // the overlap check exclude features that touch only at the exact
         // insertion boundary. E.g., insertion at protein 408-409 becomes
         // tl_start=409, tl_end=408: overlap with [389-408] is 409<=408 → false.
-        let is_insertion = amino_acids.is_some_and(|aa| aa.starts_with("-/"));
         if is_insertion {
             (e, s) // swap: start=409, end=408
         } else {
@@ -19830,7 +19883,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("42"), None, &ctx),
+            lookup_domains(Some("ENST00000001"), Some("42"), false, &ctx),
             "Pfam:PF00069"
         );
     }
@@ -19856,7 +19909,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("42"), None, &ctx),
+            lookup_domains(Some("ENST00000001"), Some("42"), false, &ctx),
             "Pfam:PF00069&PROSITE_profiles:PS50011"
         );
     }
@@ -19873,7 +19926,56 @@ mod tests {
             }],
         )];
         let ctx = minimal_ctx(&translations);
-        assert!(lookup_domains(Some("ENST00000001"), Some("42"), None, &ctx).is_empty());
+        assert!(lookup_domains(Some("ENST00000001"), Some("42"), false, &ctx).is_empty());
+    }
+
+    #[test]
+    fn lookup_domains_keeps_insertion_boundary_geometry_without_amino_acids() {
+        let translations = vec![make_translation(
+            "ENST00000001",
+            vec![ProteinDomainFeature {
+                analysis: Some("Pfam".to_string()),
+                hseqname: Some("PF_BOUNDARY".to_string()),
+                start: 10,
+                end: 42,
+            }],
+        )];
+        let ctx = minimal_ctx(&translations);
+
+        // An unambiguous anchored VCF insertion is normalized to VEP's `-`
+        // allele even if this consequence has no Amino_acids value. Domain
+        // geometry comes from the insertion itself, not the peptide string.
+        let insertion =
+            VariantInput::from_vcf("22".to_string(), 42, 42, "A".to_string(), "AT".to_string());
+        assert_eq!(insertion.ref_allele, "-");
+        assert_eq!(insertion.alt_allele, "T");
+        let is_insertion = variant_is_insertion_for_domains(
+            Some(&insertion),
+            None,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        assert!(
+            lookup_domains(Some("ENST00000001"), Some("42-43"), is_insertion, &ctx,).is_empty()
+        );
+        assert!(!variant_is_insertion_for_domains(
+            Some(&insertion),
+            None,
+            crate::vep_semantics::VepSemantics::V115,
+        ));
+        assert!(variant_is_insertion_for_domains(
+            Some(&insertion),
+            Some("-/T"),
+            crate::vep_semantics::VepSemantics::V115,
+        ));
+
+        let deletion =
+            VariantInput::from_vcf("22".to_string(), 42, 43, "AT".to_string(), "A".to_string());
+        assert_eq!(deletion.alt_allele, "-");
+        assert!(!variant_is_insertion_for_domains(
+            Some(&deletion),
+            None,
+            crate::vep_semantics::VepSemantics::V116,
+        ));
     }
 
     #[test]
@@ -19889,7 +19991,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("10"), None, &ctx),
+            lookup_domains(Some("ENST00000001"), Some("10"), false, &ctx),
             "Gene3D_db:1.10.510.10"
         );
     }
@@ -19910,7 +20012,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("10"), None, &ctx),
+            lookup_domains(Some("ENST00000001"), Some("10"), false, &ctx),
             "a__b:x"
         );
     }
@@ -19930,7 +20032,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("10"), None, &ctx),
+            lookup_domains(Some("ENST00000001"), Some("10"), false, &ctx),
             "a_b:c_d_e"
         );
     }
@@ -21899,6 +22001,108 @@ mod tests {
         assert_eq!(
             refseq_misalignment_offset_for_output(&tx, &exons_ref, 150, 150, Some("35+2"),),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn refseq_offset_suppression_for_ambiguous_alt_is_v116_only() {
+        let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
+        tx.start = 100;
+        tx.end = 199;
+        tx.strand = 1;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 2,
+            end: 1,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        };
+
+        assert_eq!(
+            refseq_misalignment_offset_for_output_for_allele(
+                &tx,
+                &[&exon],
+                150,
+                150,
+                Some("51"),
+                "N",
+                crate::vep_semantics::VepSemantics::V115,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            refseq_misalignment_offset_for_output_for_allele(
+                &tx,
+                &[&exon],
+                150,
+                150,
+                Some("51"),
+                "N",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn refseq_offset_is_not_inferred_when_vep_hgvs_rejects_ambiguous_alt() {
+        let mut tx = make_selection_tx("NM_000001.1", Some("RefSeq"));
+        tx.start = 100;
+        tx.end = 199;
+        tx.strand = 1;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 2,
+            end: 1,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        };
+
+        assert_eq!(
+            refseq_misalignment_offset_for_output_for_allele(
+                &tx,
+                &[&exon],
+                150,
+                150,
+                Some("51"),
+                "N",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            None
+        );
+        assert_eq!(
+            refseq_misalignment_offset_for_output_for_allele(
+                &tx,
+                &[&exon],
+                150,
+                150,
+                Some("51"),
+                "R",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            None
+        );
+        assert_eq!(
+            refseq_misalignment_offset_for_output_for_allele(
+                &tx,
+                &[&exon],
+                150,
+                150,
+                Some("51"),
+                "A",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            Some(2)
         );
     }
 

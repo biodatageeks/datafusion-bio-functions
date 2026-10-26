@@ -299,6 +299,9 @@ pub(crate) fn format_hgvsc_with_reference_policy(
     use_transcript_ref: bool,
     classification_ref_allele: Option<&str>,
 ) -> Option<String> {
+    if semantics.vep116_stop_predicates() && !vep116_seq_is_unambiguous_dna(alt_allele) {
+        return None;
+    }
     // Traceability:
     // - Release/115 `_var2transcript_slice_coords` returns undef for any
     //   allele with an end outside the transcript, whatever its type
@@ -365,6 +368,16 @@ pub(crate) fn format_hgvsc_with_reference_policy(
         profile.fallback += started.elapsed();
     }
     fallback_hgvsc
+}
+
+/// Ensembl Variation 116's `seq_is_unambiguous_dna()` accepts only A/C/G/T
+/// and the deletion marker, case-insensitively.
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeatureOverlapAllele.pm#L74-L75>
+pub(crate) fn vep116_seq_is_unambiguous_dna(sequence: &str) -> bool {
+    !sequence.is_empty()
+        && sequence
+            .bytes()
+            .all(|base| matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'-'))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3541,6 +3554,36 @@ mod tests {
         assert_eq!(aa_one_to_three('R'), "Arg");
         assert_eq!(aa_one_to_three('*'), "Ter");
         assert_eq!(aa_one_to_three('X'), "Xaa");
+    }
+
+    #[test]
+    fn vep116_hgvsc_rejects_every_non_acgt_alt() {
+        let mut transcript = make_transcript("protein_coding", 1, Some(100), Some(140));
+        transcript.cdna_coding_start = Some(11);
+        transcript.cdna_coding_end = Some(51);
+        let exon = make_exon();
+        let format = |alt: &str| {
+            format_hgvsc_with_semantics(
+                &transcript,
+                &[&exon],
+                Some("11"),
+                Some("1"),
+                "G",
+                alt,
+                100,
+                100,
+                None,
+                VepSemantics::V116,
+            )
+        };
+
+        assert!(format("N").is_none());
+        assert!(format("R").is_none());
+        assert!(format("A").is_some());
+        assert!(vep116_seq_is_unambiguous_dna("acgt-"));
+        assert!(!vep116_seq_is_unambiguous_dna("N"));
+        assert!(!vep116_seq_is_unambiguous_dna("R"));
+        assert!(!vep116_seq_is_unambiguous_dna(""));
     }
 
     #[test]
