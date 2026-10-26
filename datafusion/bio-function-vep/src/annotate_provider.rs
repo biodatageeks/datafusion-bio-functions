@@ -7306,12 +7306,19 @@ impl AnnotateProvider {
                                     engine_profile,
                                     domains,
                                     {
+                                        let has_nonempty_mapped_translation_span =
+                                            refseq_insertion_has_nonempty_translation_span(
+                                                row_variant.as_ref(),
+                                                tx_opt,
+                                                ctx,
+                                            );
                                         lookup_domains(
                                             tc.transcript_id.as_deref(),
                                             tc.protein_position.as_deref(),
                                             variant_is_insertion_for_domains(
                                                 row_variant.as_ref(),
                                                 tc.amino_acids.as_deref(),
+                                                has_nonempty_mapped_translation_span,
                                                 engine.semantics(),
                                             ),
                                             ctx,
@@ -7959,12 +7966,19 @@ impl AnnotateProvider {
                             let is_coding =
                                 tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
                             if is_coding {
+                                let has_nonempty_mapped_translation_span =
+                                    refseq_insertion_has_nonempty_translation_span(
+                                        row_variant.as_ref(),
+                                        tx_opt,
+                                        ctx,
+                                    );
                                 let domains_str = lookup_domains(
                                     tc.transcript_id.as_deref(),
                                     tc.protein_position.as_deref(),
                                     variant_is_insertion_for_domains(
                                         row_variant.as_ref(),
                                         tc.amino_acids.as_deref(),
+                                        has_nonempty_mapped_translation_span,
                                         engine.semantics(),
                                     ),
                                     ctx,
@@ -9029,16 +9043,61 @@ fn read_protein_features(col: &dyn Array, row: usize) -> Vec<ProteinDomainFeatur
 fn variant_is_insertion_for_domains(
     variant: Option<&VariantInput>,
     amino_acids: Option<&str>,
+    has_nonempty_mapped_translation_span: bool,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> bool {
     if semantics.vep116_stop_predicates() {
         // V116's insertion geometry is defined by the normalized allele, even
-        // when an ambiguous ALT has no peptide/Amino_acids value.
+        // when an ambiguous ALT has no peptide/Amino_acids value. RefSeq gaps
+        // can map an insertion to a nonempty translation interval, which stays
+        // forward-ordered for protein-feature overlap.
         variant.is_some_and(|variant| variant.ref_allele == "-" && variant.alt_allele != "-")
+            && !has_nonempty_mapped_translation_span
     } else {
         // Preserve the V115 peptide-derived insertion test.
         amino_acids.is_some_and(|value| value.starts_with("-/"))
     }
+}
+
+fn refseq_insertion_has_nonempty_translation_span(
+    variant: Option<&VariantInput>,
+    tx: Option<&&TranscriptFeature>,
+    ctx: &PreparedContext<'_>,
+) -> bool {
+    let Some(variant) = variant.filter(|v| v.ref_allele == "-" && v.alt_allele != "-") else {
+        return false;
+    };
+    let Some(tx) = tx.copied() else {
+        return false;
+    };
+    let transcript_id = tx.transcript_id.as_str();
+    let Some(exons) = ctx
+        .exons_by_tx_genomic
+        .get(transcript_id)
+        .or_else(|| ctx.exons_by_tx.get(transcript_id))
+    else {
+        return false;
+    };
+    let translation = ctx.translation_by_tx.get(transcript_id).copied();
+
+    // VEP derives protein endpoints from mapped translation coordinates and
+    // overlaps protein features with that interval as-is (Variation at
+    // 2fb834b987ede3824e200197a838ce11e91aeb4b, BaseTranscriptVariation.pm
+    // :365-376 and :618-641). Core at c0cf13daa961d80584bad797b2eb0ff3a7500ef3
+    // routes zero-width coordinates through map_insert and swaps their
+    // endpoints (Mapper.pm:267-270,485-505). OutputFactory at release/116.0
+    // emits Protein_position from those translation endpoints (line 1734) and
+    // uses the overlap result for DOMAINS (lines 1493-1510). RefSeq insertions
+    // spanning a mapped CDS gap therefore keep forward translation geometry.
+    // Pinned sources:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L365-L376
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L618-L641
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L267-L270
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L485-L505
+    // https://github.com/Ensembl/ensembl-vep/blob/release/116.0/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1493-L1510
+    // https://github.com/Ensembl/ensembl-vep/blob/release/116.0/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1734-L1735
+    crate::transcript_consequence::refseq_mapper_insertion_cds_gap(tx, exons, translation, variant)
+        .is_some()
 }
 
 /// Look up overlapping protein domains for a given transcript and protein position.
@@ -9049,10 +9108,14 @@ fn variant_is_insertion_for_domains(
 /// Traceability:
 /// - VEP OutputFactory.pm DOMAINS output
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466>
-/// - VEP BaseTranscriptVariation.pm get_overlapping_ProteinFeatures
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm>
-/// - VEP Mapper.pm map_insert: for insertions, translation_start > translation_end
-///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm>
+/// - VEP BaseTranscriptVariation.pm derives translation endpoints from mapped
+///   coordinates and overlaps features with those endpoints in order
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L365-L376>
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L618-L641>
+/// - Core Mapper.pm handles the zero-width insertion coordinate through
+///   map_insert's coordinate swap
+///   <https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L267-L270>
+///   <https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L485-L505>
 fn lookup_domains(
     transcript_id: Option<&str>,
     protein_position: Option<&str>,
@@ -19952,6 +20015,7 @@ mod tests {
         let is_insertion = variant_is_insertion_for_domains(
             Some(&insertion),
             None,
+            false,
             crate::vep_semantics::VepSemantics::V116,
         );
         assert!(
@@ -19960,11 +20024,13 @@ mod tests {
         assert!(!variant_is_insertion_for_domains(
             Some(&insertion),
             None,
+            false,
             crate::vep_semantics::VepSemantics::V115,
         ));
         assert!(variant_is_insertion_for_domains(
             Some(&insertion),
             Some("-/T"),
+            false,
             crate::vep_semantics::VepSemantics::V115,
         ));
 
@@ -19974,8 +20040,108 @@ mod tests {
         assert!(!variant_is_insertion_for_domains(
             Some(&deletion),
             None,
+            false,
             crate::vep_semantics::VepSemantics::V116,
         ));
+    }
+
+    #[test]
+    fn lookup_domains_keeps_forward_geometry_for_refseq_mapper_gap() {
+        let domains = vec![
+            ProteinDomainFeature {
+                analysis: Some("Pfam".to_string()),
+                hseqname: Some("PF_ENDS_AT_25".to_string()),
+                start: 25,
+                end: 25,
+            },
+            ProteinDomainFeature {
+                analysis: Some("Pfam".to_string()),
+                hseqname: Some("PF_STARTS_AT_26".to_string()),
+                start: 26,
+                end: 26,
+            },
+        ];
+        let mut tx = make_tx("NM_MAPPED_GAP.1", None, None, None, None);
+        tx.chrom = "2".to_string();
+        tx.start = 1000;
+        tx.end = 1350;
+        tx.strand = 1;
+        tx.biotype = "protein_coding".to_string();
+        tx.cds_start = Some(1000);
+        tx.cds_end = Some(1350);
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1000,
+                genomic_end: 1073,
+                cdna_start: 1,
+                cdna_end: 74,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1074,
+                genomic_end: 1350,
+                cdna_start: 78,
+                cdna_end: 354,
+                ori: 1,
+            },
+        ];
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(354);
+        tx.translateable_seq = Some("ATG".repeat(118));
+        tx.source = Some("BestRefSeq".to_string());
+        tx.bam_edit_status = Some("ok".to_string());
+        tx.has_non_polya_rna_edit = true;
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 75,
+            end: 74,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        let exons = [ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 1000,
+            end: 1350,
+        }];
+        let translations = [make_translation(
+            &tx.transcript_id,
+            vec![domains[0].clone(), domains[1].clone()],
+        )];
+        let transcripts = [tx];
+        let ctx = PreparedContext::new(&transcripts, &exons, &translations, &[], &[], &[], &[]);
+        let insertion = VariantInput::from_vcf(
+            "2".to_string(),
+            1073,
+            1073,
+            "A".to_string(),
+            "AT".to_string(),
+        );
+        let tx_ref = ctx.transcripts[0];
+        let tx_opt = Some(&tx_ref);
+        assert_eq!(
+            crate::transcript_consequence::refseq_mapper_insertion_cds_gap(
+                tx_ref,
+                ctx.exons_by_tx_genomic.get("NM_MAPPED_GAP.1").unwrap(),
+                ctx.translation_by_tx.get("NM_MAPPED_GAP.1").copied(),
+                &insertion,
+            ),
+            Some((75, 77))
+        );
+
+        // VEP maps CDS 75-77 to protein 25-26, so this remains forward-ordered.
+        let has_nonempty_mapped_translation_span =
+            refseq_insertion_has_nonempty_translation_span(Some(&insertion), tx_opt, &ctx);
+        assert!(has_nonempty_mapped_translation_span);
+        let is_insertion = variant_is_insertion_for_domains(
+            Some(&insertion),
+            None,
+            has_nonempty_mapped_translation_span,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        assert!(!is_insertion);
+        let domains = lookup_domains(Some("NM_MAPPED_GAP.1"), Some("25-26"), is_insertion, &ctx);
+        assert!(domains.contains("PF_ENDS_AT_25"), "{domains}");
+        assert!(domains.contains("PF_STARTS_AT_26"), "{domains}");
     }
 
     #[test]

@@ -9465,7 +9465,7 @@ fn classify_insertion(
 }
 
 /// Return the edited RefSeq CDS interval between an insertion's mapped flanks.
-fn refseq_mapper_insertion_cds_gap(
+pub(crate) fn refseq_mapper_insertion_cds_gap(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     tx_translation: Option<&TranslationFeature>,
@@ -16075,6 +16075,19 @@ mod tests {
         assert!(
             !terms.contains(&SoTerm::FrameshiftVariant),
             "the ALT replaces a four-base mapped CDS span with one base: {terms:?}"
+        );
+        // The source's frameshift predicate uses mapped CDS width
+        // (VariationEffect.pm:1551-1564), but inframe_deletion additionally
+        // requires defined codons and a qualifying codon/peptide deletion
+        // (VariationEffect.pm:1161-1185). This mapped-gap fixture therefore
+        // falls through to the protein-altering catch-all
+        // (VariationEffect.pm:375-392), rather than an inframe-deletion term.
+        // Pinned source: https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L375-L392
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1161-L1185
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1551-L1564
+        assert!(
+            terms.contains(&SoTerm::ProteinAlteringVariant),
+            "the non-frameshift RefSeq gap replacement remains protein-altering: {terms:?}"
         );
     }
 
