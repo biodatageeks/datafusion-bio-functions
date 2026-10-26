@@ -271,13 +271,24 @@ impl<'a> VepTxMapper<'a> {
             return TvRange::new(cdna, cdna);
         }
         match self.insertion_flanks(span) {
-            // ENGINE != VEP (Output flavour, to be removed by #242): when the
-            // flanks straddle a >= 2-base insertion-edit cDNA gap VEP gives
-            // `(a+1, b-1)`; cDNA_position has always printed `a-b`. The two
-            // agree whenever `b == a+1`, i.e. outside such a gap.
-            (Some(five), Some(three)) if self.base == CdnaBaseMap::Output => {
+            // If output-space adjustment collapses the two genomic flanks to
+            // one cDNA position (a deleted RefSeq edit), keep the established
+            // `a-a` display rather than expanding it around the edit.
+            (Some(five), Some(three)) if self.base == CdnaBaseMap::Output && five == three => {
                 TvRange::new(three, five)
             }
+            // Without transcript-mapper segments, RefSeq output-space offsets
+            // can collapse a deleted edit between the genomic flanks to the
+            // same cDNA base. Preserve that legacy `a-a` display; core's
+            // map_insert adjustment applies to mapper-produced coordinates.
+            (Some(five), Some(three))
+                if self.base == CdnaBaseMap::Output && self.tx.cdna_mapper_segments.is_empty() =>
+            {
+                TvRange::new(three, five)
+            }
+            // `map_insert` increments the transcript-5' flank's start and
+            // decrements the transcript-3' flank's end. For an edit-inserted
+            // cDNA gap, this keeps only the intervening mapped coordinates.
             (Some(five), Some(three)) => {
                 TvRange::new(five.saturating_add(1), three.saturating_sub(1))
             }
@@ -903,9 +914,26 @@ mod tests {
             for v in variants_for(&tx) {
                 let legacy = legacy_compute_cdna_position(&v, &tx, &refs);
                 let new = super::super::compute_cdna_position(&v, &tx, &refs);
+                let expected = if new != legacy
+                    && v.ref_allele == "-"
+                    && !tx.cdna_mapper_segments.is_empty()
+                {
+                    let mapper = VepTxMapper::new(&tx, &refs, None, CdnaBaseMap::Output);
+                    let (five, three) = mapper.insertion_flanks(VepSpan::from_variant(&v));
+                    match (five, three) {
+                        (Some(five), Some(three))
+                            if super::super::refseq_inserted_cdna_gap_between(&tx, five, three) =>
+                        {
+                            TvRange::new(five.saturating_add(1), three.saturating_sub(1)).format()
+                        }
+                        _ => legacy.clone(),
+                    }
+                } else {
+                    legacy.clone()
+                };
                 assert_eq!(
                     new,
-                    legacy,
+                    expected,
                     "cDNA_position differs: tx={} strand={} segments={:?} edits={:?} variant={}-{} {}>{}",
                     tx.transcript_id,
                     tx.strand,
