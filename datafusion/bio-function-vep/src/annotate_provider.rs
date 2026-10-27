@@ -211,8 +211,8 @@ use crate::transcript_consequence::{
     MirnaFeature, MotifFeature, PreparedContext, ProteinDomainFeature, RefSeqEdit,
     RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind, SvFeatureKind,
     TranscriptCdnaMapperSegment, TranscriptConsequence, TranscriptConsequenceEngine,
-    TranscriptEngineProfile, TranscriptFeature, TranslationFeature, VariantInput,
-    exact_mapper_cdna_index_for_transcript, genomic_to_cdna_index_for_transcript,
+    TranscriptEngineProfile, TranscriptFeature, TranslationFeature, TranslationSeqEdit,
+    VariantInput, exact_mapper_cdna_index_for_transcript, genomic_to_cdna_index_for_transcript,
     infer_refseq_deletion_edits_from_sequences, is_mitochondrial_contig,
     mapper_cdna_start_for_insertion, refseq_edit_offset_delta,
 };
@@ -4416,6 +4416,7 @@ impl AnnotateProvider {
                 "flags_str",
                 "refseq_match",
                 "refseq_edits",
+                "translation_seq_edits",
                 "is_gencode_basic",
                 "is_gencode_primary",
                 "cdna_mapper_segments",
@@ -4500,6 +4501,7 @@ impl AnnotateProvider {
             let flags_str_idx = schema.index_of("flags_str").ok();
             let refseq_match_idx = schema.index_of("refseq_match").ok();
             let refseq_edits_idx = schema.index_of("refseq_edits").ok();
+            let translation_seq_edits_idx = schema.index_of("translation_seq_edits").ok();
             let is_gencode_basic_idx = schema.index_of("is_gencode_basic").ok();
             let is_gencode_primary_idx = schema.index_of("is_gencode_primary").ok();
             let cdna_mapper_segments_idx = schema.index_of("cdna_mapper_segments").ok();
@@ -4592,6 +4594,11 @@ impl AnnotateProvider {
                         .then(left.end.cmp(&right.end))
                         .then(left.replacement_len.cmp(&right.replacement_len))
                 });
+                let translation_seq_edits = translation_seq_edits_idx
+                    .map(|idx| {
+                        translation_seq_edits_from_list_column(batch.column(idx).as_ref(), row)
+                    })
+                    .unwrap_or_default();
                 let is_gencode_basic = is_gencode_basic_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                     .unwrap_or(false);
@@ -4728,6 +4735,7 @@ impl AnnotateProvider {
                     source_cache,
                     refseq_match,
                     refseq_edits,
+                    translation_seq_edits,
                     has_rna_edit,
                     is_gencode_basic,
                     is_gencode_primary,
@@ -5237,6 +5245,7 @@ impl AnnotateProvider {
             let flags_str_idx = schema.index_of("flags_str").ok();
             let refseq_match_idx = schema.index_of("refseq_match").ok();
             let refseq_edits_idx = schema.index_of("refseq_edits").ok();
+            let translation_seq_edits_idx = schema.index_of("translation_seq_edits").ok();
             let is_gencode_basic_idx = schema.index_of("is_gencode_basic").ok();
             let is_gencode_primary_idx = schema.index_of("is_gencode_primary").ok();
             let cdna_mapper_segments_idx = schema.index_of("cdna_mapper_segments").ok();
@@ -5347,6 +5356,11 @@ impl AnnotateProvider {
                         .then(left.end.cmp(&right.end))
                         .then(left.replacement_len.cmp(&right.replacement_len))
                 });
+                let translation_seq_edits = translation_seq_edits_idx
+                    .map(|idx| {
+                        translation_seq_edits_from_list_column(batch.column(idx).as_ref(), row)
+                    })
+                    .unwrap_or_default();
                 let source_col = source_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                     .filter(|source| !source.is_empty() && source != "-");
@@ -5407,6 +5421,7 @@ impl AnnotateProvider {
                     refseq_match: refseq_match_idx
                         .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
                     refseq_edits,
+                    translation_seq_edits,
                     has_rna_edit,
                     is_gencode_basic: is_gencode_basic_idx
                         .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
@@ -9882,6 +9897,58 @@ fn refseq_edits_from_list_column(col: &dyn Array, row: usize) -> Vec<RefSeqEdit>
     edits
 }
 
+fn translation_seq_edits_from_list_column(col: &dyn Array, row: usize) -> Vec<TranslationSeqEdit> {
+    use datafusion::arrow::array::{Int64Array, ListArray, StructArray};
+
+    let Some(list_array) = col.as_any().downcast_ref::<ListArray>() else {
+        return Vec::new();
+    };
+    if list_array.is_null(row) {
+        return Vec::new();
+    }
+    let start = list_array.value_offsets()[row] as usize;
+    let end = list_array.value_offsets()[row + 1] as usize;
+    if start == end {
+        return Vec::new();
+    }
+    let Some(struct_array) = list_array.values().as_any().downcast_ref::<StructArray>() else {
+        return Vec::new();
+    };
+    let start_col = struct_array
+        .column_by_name("start")
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>());
+    let end_col = struct_array
+        .column_by_name("end")
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>());
+    let (Some(start_col), Some(end_col)) = (start_col, end_col) else {
+        return Vec::new();
+    };
+
+    let mut edits = Vec::with_capacity(end - start);
+    for index in start..end {
+        if struct_array.is_null(index) || start_col.is_null(index) || end_col.is_null(index) {
+            continue;
+        }
+        let Some(alt_seq) = struct_array
+            .column_by_name("alt_seq")
+            .and_then(|column| string_at(column.as_ref(), index))
+        else {
+            continue;
+        };
+        let code = struct_array
+            .column_by_name("code")
+            .and_then(|column| string_at(column.as_ref(), index))
+            .unwrap_or_default();
+        edits.push(TranslationSeqEdit {
+            code,
+            start: start_col.value(index),
+            end: end_col.value(index),
+            alt_seq,
+        });
+    }
+    edits
+}
+
 fn apply_cds_phase_padding(existing_cds: Option<&str>, mut hydrated_cds: String) -> String {
     let leading_phase_padding = existing_cds
         .map(|seq| seq.bytes().take_while(|&b| b == b'N' || b == b'n').count())
@@ -10557,6 +10624,7 @@ const TRANSCRIPT_CONTEXT_COLUMNS: &[&str] = &[
     "flags_str",
     "refseq_match",
     "refseq_edits",
+    "translation_seq_edits",
     "is_gencode_basic",
     "is_gencode_primary",
     "cdna_mapper_segments",
@@ -18720,6 +18788,66 @@ mod tests {
         Arc::new(list_builder.finish())
     }
 
+    fn translation_seq_edit_list_data_type() -> DataType {
+        let fields = datafusion::arrow::datatypes::Fields::from(vec![
+            Field::new("code", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("alt_seq", DataType::Utf8, false),
+        ]);
+        DataType::List(Arc::new(Field::new("item", DataType::Struct(fields), true)))
+    }
+
+    fn translation_seq_edit_array(rows: Vec<Option<Vec<TranslationSeqEdit>>>) -> Arc<dyn Array> {
+        use datafusion::arrow::array::{ArrayBuilder, StructBuilder};
+
+        let fields = vec![
+            Field::new("code", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("alt_seq", DataType::Utf8, false),
+        ];
+        let struct_builder = StructBuilder::new(
+            fields,
+            vec![
+                Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+            ],
+        );
+        let mut list_builder = ListBuilder::new(struct_builder);
+        for row in rows {
+            match row {
+                Some(edits) => {
+                    for edit in edits {
+                        let values = list_builder.values();
+                        values
+                            .field_builder::<StringBuilder>(0)
+                            .expect("code builder")
+                            .append_value(edit.code);
+                        values
+                            .field_builder::<Int64Builder>(1)
+                            .expect("start builder")
+                            .append_value(edit.start);
+                        values
+                            .field_builder::<Int64Builder>(2)
+                            .expect("end builder")
+                            .append_value(edit.end);
+                        values
+                            .field_builder::<StringBuilder>(3)
+                            .expect("alternate sequence builder")
+                            .append_value(edit.alt_seq);
+                        values.append(true);
+                    }
+                    list_builder.append(true);
+                }
+                None => list_builder.append(false),
+            }
+        }
+        Arc::new(list_builder.finish())
+    }
+
     #[cfg(feature = "parquet-cache")]
     type TestCompactPrediction = (i32, &'static str, &'static str, f32);
 
@@ -18888,6 +19016,11 @@ mod tests {
             Field::new("display_xref_id", DataType::Utf8, true),
             Field::new("refseq_match", DataType::Utf8, true),
             Field::new("refseq_edits", refseq_edit_list_data_type(), true),
+            Field::new(
+                "translation_seq_edits",
+                translation_seq_edit_list_data_type(),
+                true,
+            ),
             Field::new("is_gencode_basic", DataType::Boolean, false),
             Field::new("is_gencode_primary", DataType::Boolean, false),
             Field::new("cdna_coding_start", DataType::Int64, true),
@@ -18937,6 +19070,12 @@ mod tests {
                     replacement_len: Some(1),
                     skip_refseq_offset: true,
                 }])]),
+                translation_seq_edit_array(vec![Some(vec![TranslationSeqEdit {
+                    code: "translation_seq_edit".to_string(),
+                    start: 1,
+                    end: 1,
+                    alt_seq: "U".to_string(),
+                }])]),
                 Arc::new(BooleanArray::from(vec![true])) as Arc<dyn Array>,
                 Arc::new(BooleanArray::from(vec![false])) as Arc<dyn Array>,
                 Arc::new(Int64Array::from(vec![Some(4_i64)])) as Arc<dyn Array>,
@@ -18952,6 +19091,8 @@ mod tests {
         )
         .unwrap();
 
+        let (parsed, _) =
+            AnnotateProvider::parse_transcript_batches("tx", std::slice::from_ref(&batch)).unwrap();
         let session = Arc::new(SessionContext::new());
         let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
         session.register_table("tx", Arc::new(table)).unwrap();
@@ -18972,6 +19113,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(transcripts.len(), 1);
+        assert_eq!(parsed.len(), 1);
         let tx = &transcripts[0];
         assert_eq!(tx.gene_stable_id.as_deref(), Some("ENSG_TYPED"));
         assert_eq!(tx.gene_hgnc_id_native.as_deref(), Some("HGNC:TYPED"));
@@ -18988,6 +19130,16 @@ mod tests {
                 skip_refseq_offset: true,
             }]
         );
+        assert_eq!(
+            tx.translation_seq_edits,
+            vec![TranslationSeqEdit {
+                code: "translation_seq_edit".to_string(),
+                start: 1,
+                end: 1,
+                alt_seq: "U".to_string(),
+            }]
+        );
+        assert_eq!(parsed[0].translation_seq_edits, tx.translation_seq_edits);
         assert!(tx.is_gencode_basic);
         assert!(!tx.is_gencode_primary);
         assert_eq!(tx.five_prime_utr_seq.as_deref(), Some("AAA"));
@@ -20261,6 +20413,7 @@ mod tests {
             source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
+            translation_seq_edits: Vec::new(),
             has_rna_edit: false,
             is_gencode_basic: false,
             is_gencode_primary: false,

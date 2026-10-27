@@ -3493,6 +3493,7 @@ mod tests {
             source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
+            translation_seq_edits: Vec::new(),
             has_rna_edit: false,
             is_gencode_basic: false,
             is_gencode_primary: false,

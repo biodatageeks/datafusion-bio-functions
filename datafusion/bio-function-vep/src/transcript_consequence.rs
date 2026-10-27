@@ -188,6 +188,66 @@ pub struct RefSeqEdit {
     pub skip_refseq_offset: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationSeqEdit {
+    pub code: String,
+    pub start: i64,
+    pub end: i64,
+    pub alt_seq: String,
+}
+
+fn overlay_reference_peptide_seq_edits(
+    peptide: &str,
+    translation_start: usize,
+    translation_end: usize,
+    edits: &[TranslationSeqEdit],
+) -> Option<String> {
+    if translation_start == 0 || translation_end == 0 {
+        return None;
+    }
+    let (translation_start, translation_end) = if translation_start <= translation_end {
+        (translation_start, translation_end)
+    } else {
+        (translation_end, translation_start)
+    };
+    let mut peptide = peptide.chars().collect::<Vec<_>>();
+
+    // Ensembl Variation iterates overlapping SeqEdits in cache order, then
+    // replaces only reference-peptide positions in the variation's translated
+    // span. Keep the input order because overlapping edits are order-sensitive.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
+    for edit in edits {
+        let Ok(edit_start) = usize::try_from(edit.start) else {
+            continue;
+        };
+        let Ok(edit_end) = usize::try_from(edit.end) else {
+            continue;
+        };
+        let overlap_start = translation_start.max(edit_start);
+        let overlap_end = translation_end.min(edit_end);
+        if overlap_start > overlap_end {
+            continue;
+        }
+        let alt_seq = edit.alt_seq.chars().collect::<Vec<_>>();
+        for translation_position in overlap_start..=overlap_end {
+            let edit_offset = translation_position - edit_start;
+            if edit_offset >= alt_seq.len() {
+                // The source returns undef when an edit shortens the protein
+                // before a mapped variation position.
+                return None;
+            }
+            let peptide_offset = translation_position - translation_start;
+            if peptide_offset < peptide.len() {
+                peptide[peptide_offset] = alt_seq[edit_offset];
+            } else if peptide_offset == peptide.len() {
+                peptide.push(alt_seq[edit_offset]);
+            }
+        }
+    }
+
+    Some(peptide.into_iter().collect())
+}
+
 pub(crate) fn refseq_edit_offset_delta(edit: &RefSeqEdit) -> Option<i64> {
     if edit.skip_refseq_offset {
         return None;
@@ -296,6 +356,8 @@ pub struct TranscriptFeature {
     pub refseq_match: Option<String>,
     /// Parsed `_rna_edit*` transcript attributes used for VEP `REFSEQ_OFFSET`.
     pub refseq_edits: Vec<RefSeqEdit>,
+    /// Translation-coordinate SeqEdits applied to reference peptides by VEP.
+    pub translation_seq_edits: Vec<TranslationSeqEdit>,
     /// RNA-edit attribute evidence at cache load, including poly-A edits.
     /// Unlike `refseq_edits`, this is not changed by inferred alignment edits.
     pub has_rna_edit: bool,
@@ -8990,6 +9052,14 @@ fn classify_coding_change_with_semantics(
             .get(local_first_codon..peptide_end)
             .map(|peptide| peptide.iter().collect());
     }
+    if let Some(reference_peptide) = class.affected_ref_peptide.as_deref() {
+        class.affected_ref_peptide = overlay_reference_peptide_seq_edits(
+            reference_peptide,
+            local_first_codon.saturating_add(1),
+            local_last_codon.saturating_add(1),
+            &tx.translation_seq_edits,
+        );
+    }
     let ambiguous_alt_peptide = semantics.vep116_stop_predicates()
         && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele);
     let partial_terminal_codon = semantics.vep116_stop_predicates()
@@ -9966,6 +10036,18 @@ fn classify_insertion_with_semantics_and_gap(
             local_peptide_from_codon_window(tx.codon_table, &effective_cds[codon_start..ref_end]);
         class.affected_alt_peptide =
             local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
+    }
+    if let Some(reference_peptide) = class.affected_ref_peptide.as_deref() {
+        let translation_start = class
+            .protein_position_start
+            .unwrap_or_else(|| codon_at.saturating_add(1));
+        let translation_end = class.protein_position_end.unwrap_or(translation_start);
+        class.affected_ref_peptide = overlay_reference_peptide_seq_edits(
+            reference_peptide,
+            translation_start,
+            translation_end,
+            &tx.translation_seq_edits,
+        );
     }
     let ambiguous_alt_peptide = semantics.vep116_stop_predicates()
         && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele);
@@ -13349,6 +13431,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reference_peptide_overlays_only_seqedit_positions_in_the_variant_span() {
+        let edits = [
+            TranslationSeqEdit {
+                code: "translation_seq_edit".to_string(),
+                start: 10,
+                end: 10,
+                alt_seq: "U".to_string(),
+            },
+            TranslationSeqEdit {
+                code: "outside_span".to_string(),
+                start: 12,
+                end: 12,
+                alt_seq: "Y".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            overlay_reference_peptide_seq_edits("MA", 10, 11, &edits).as_deref(),
+            Some("UA")
+        );
+    }
+
+    #[test]
+    fn reference_peptide_is_undefined_when_seqedit_shortens_past_variant_position() {
+        let edits = [TranslationSeqEdit {
+            code: "shortened_translation".to_string(),
+            start: 10,
+            end: 11,
+            alt_seq: "U".to_string(),
+        }];
+
+        assert_eq!(
+            overlay_reference_peptide_seq_edits("MA", 10, 11, &edits),
+            None
+        );
+    }
+
+    #[test]
     fn cache_reference_policy_selects_complete_noncoding_reference_on_both_strands() {
         for strand in [1, -1] {
             let transcript = tx(
@@ -13659,6 +13779,7 @@ mod tests {
             source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
+            translation_seq_edits: Vec::new(),
             has_rna_edit: false,
             is_gencode_basic: false,
             is_gencode_primary: false,
@@ -19042,6 +19163,84 @@ mod tests {
         assert_eq!(c.protein_position_end, Some(2));
         assert_eq!(c.cds_position_start, Some(5));
         assert_eq!(c.cds_position_end, Some(5));
+    }
+
+    #[test]
+    fn coding_reference_peptide_uses_translation_seqedit_overlay() {
+        let mut transcript = tx(
+            "T_SEQEDIT",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.translation_seq_edits = vec![TranslationSeqEdit {
+            code: "translation_seq_edit".to_string(),
+            start: 2,
+            end: 2,
+            alt_seq: "U".to_string(),
+        }];
+        let transcript_exon = exon("T_SEQEDIT", 1, 1000, 1008);
+        let exons = [&transcript_exon];
+        let cached_translation =
+            translation("T_SEQEDIT", Some(9), Some(3), None, Some("ATGGCTTAA"));
+        let variant = var("22", 1004, 1004, "C", "T");
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("coding variant should classify");
+
+        assert_eq!(classification.affected_ref_peptide.as_deref(), Some("U"));
+        assert_eq!(classification.affected_alt_peptide.as_deref(), Some("V"));
+    }
+
+    #[test]
+    fn insertion_reference_peptide_uses_translation_seqedit_overlay() {
+        let mut transcript = tx(
+            "T_SEQEDIT_INSERTION",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.translation_seq_edits = vec![TranslationSeqEdit {
+            code: "translation_seq_edit".to_string(),
+            start: 2,
+            end: 2,
+            alt_seq: "U".to_string(),
+        }];
+        let transcript_exon = exon("T_SEQEDIT_INSERTION", 1, 1000, 1008);
+        let exons = [&transcript_exon];
+        let cached_translation = translation(
+            "T_SEQEDIT_INSERTION",
+            Some(9),
+            Some(3),
+            None,
+            Some("ATGGCTTAA"),
+        );
+        let variant = var("22", 1004, 1004, "-", "TT");
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("coding insertion should classify");
+
+        assert_eq!(classification.affected_ref_peptide.as_deref(), Some("U"));
     }
 
     #[test]
