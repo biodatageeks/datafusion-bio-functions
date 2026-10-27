@@ -1115,11 +1115,13 @@ mod tests {
     }
 
     /// Commit 2 of F0: the insertion branch of `shifted_tva_coords_from_mapper`
-    /// goes through `VepTxMapper` (HgvspExact). Every shifted insertion span
-    /// `(P, P-1)` and every deletion of length 1..=6 over the matrix, with a
-    /// leading-N phase of 0, 1 and 2, must give the same coordinates.
+    /// goes through `VepTxMapper` (HgvspExact). Shifted insertions and
+    /// deletions without internal mapper Gaps retain the legacy coordinates.
+    /// When a deletion crosses an internal Gap, VEP's first/last mapper-piece
+    /// rule keeps it defined even though the old per-base implementation did
+    /// not; the accessor supplies the source-derived positive control.
     #[test]
-    fn f0_shifted_insertion_matches_legacy() {
+    fn f0_shifted_coords_match_legacy_except_source_endpoint_gaps() {
         let mut compared = 0usize;
         let mut defined = 0usize;
         for (tx, exons) in matrix() {
@@ -1138,21 +1140,39 @@ mod tests {
                     for v in spans {
                         let legacy = legacy_shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
                         let new = shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
-                        assert_eq!(
-                            new,
-                            legacy,
-                            "shifted coords differ: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{}",
-                            tx.transcript_id,
-                            tx.strand,
-                            tx.cdna_coding_start,
-                            tx.cdna_coding_end,
-                            tx.cdna_mapper_segments,
-                            tx.refseq_edits,
-                            v.start,
-                            v.end,
-                            v.ref_allele,
-                            v.alt_allele
-                        );
+                        let source_has_endpoints = !VepSpan::from_variant(&v).is_insertion()
+                            && VepTxMapper::new(&tx, &refs, Some(&tl), CdnaBaseMap::HgvspExact)
+                                .translation(VepSpan::from_variant(&v))
+                                .both()
+                                .is_some();
+                        if legacy.is_none() && source_has_endpoints {
+                            assert!(
+                                new.is_some(),
+                                "VEP endpoint mapper is defined but shifted coords were not: tx={} strand={} variant={}-{} {}>{}",
+                                tx.transcript_id,
+                                tx.strand,
+                                v.start,
+                                v.end,
+                                v.ref_allele,
+                                v.alt_allele
+                            );
+                        } else {
+                            assert_eq!(
+                                new,
+                                legacy,
+                                "shifted coords differ: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{}",
+                                tx.transcript_id,
+                                tx.strand,
+                                tx.cdna_coding_start,
+                                tx.cdna_coding_end,
+                                tx.cdna_mapper_segments,
+                                tx.refseq_edits,
+                                v.start,
+                                v.end,
+                                v.ref_allele,
+                                v.alt_allele
+                            );
+                        }
                         compared += 1;
                         defined += usize::from(legacy.is_some());
                     }
