@@ -8152,6 +8152,24 @@ fn protein_hgvs_for_output(
     )
 }
 
+fn hgvsp_translation_bounds_are_truthy(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+) -> bool {
+    let mapper = vep_coords::VepTxMapper::new(
+        tx,
+        tx_exons,
+        tx_translation,
+        vep_coords::CdnaBaseMap::HgvspExact,
+    );
+    mapper
+        .translation_with_genomic_cds_fallback(vep_coords::VepSpan::from_variant(variant))
+        .both_truthy()
+        .is_some()
+}
+
 fn protein_hgvs_for_output_with_semantics(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -8179,12 +8197,44 @@ fn protein_hgvs_for_output_with_semantics(
     }
 
     if !shift_hgvs {
+        if !hgvsp_translation_bounds_are_truthy(tx, tx_exons, tx_translation, variant) {
+            return None;
+        }
         return fallback.cloned();
     }
 
     let ref_norm = normalize_allele_seq(&variant.ref_allele);
     let alt_norm = normalize_allele_seq(&variant.alt_allele);
     let is_insertion = ref_norm.is_empty() && !alt_norm.is_empty();
+
+    let existing_shift = variant.hgvs_shift_for_strand(tx.strand).cloned();
+    let refseq_shift = if refseq_uses_transcript_shift_for_hgvsp(tx) {
+        refseq_transcript_shift_for_hgvs_protein(tx, tx_exons, variant)
+    } else {
+        None
+    };
+    let shift = if is_insertion {
+        refseq_shift.clone().or(existing_shift.clone())
+    } else {
+        existing_shift.clone().or(refseq_shift.clone())
+    };
+
+    // Ensembl Variation 116 checks the original coding predicate and both
+    // shifted translation endpoints before every HGVSp path, including the
+    // zero-shift fallback. `translation_start/end` use the first/last mapper
+    // pieces, so an endpoint Gap suppresses HGVSp while an internal Gap is
+    // tolerated. The offset is `strand * shift_length`.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1711-L1738
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L365-L405
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L540-L548
+    let shifted_variant = shift
+        .as_ref()
+        .filter(|shift| shift.shift_length != 0)
+        .map(|shift| protein_hgvs_shifted_variant(variant, shift, tx.strand))
+        .unwrap_or_else(|| variant.clone());
+    if !hgvsp_translation_bounds_are_truthy(tx, tx_exons, tx_translation, &shifted_variant) {
+        return None;
+    }
 
     // At a RefSeq insertion-edit gap, VEP's HGVS allele uses the edited
     // transcript mapper interval and replaces that interval with the shifted
@@ -8201,17 +8251,6 @@ fn protein_hgvs_for_output_with_semantics(
         return Some(protein);
     }
 
-    let existing_shift = variant.hgvs_shift_for_strand(tx.strand).cloned();
-    let refseq_shift = if refseq_uses_transcript_shift_for_hgvsp(tx) {
-        refseq_transcript_shift_for_hgvs_protein(tx, tx_exons, variant)
-    } else {
-        None
-    };
-    let shift = if is_insertion {
-        refseq_shift.clone().or(existing_shift.clone())
-    } else {
-        existing_shift.clone().or(refseq_shift.clone())
-    };
     let Some(shift) = shift.as_ref() else {
         return fallback.cloned();
     };
@@ -8235,29 +8274,6 @@ fn protein_hgvs_for_output_with_semantics(
     // `_boundary_shift` fallback needs `$vf->{shifted_flag}`, which neither
     // ensembl-vep 116.0 nor ensembl-variation 116 sets.
     //
-    // For insertions the guard is checked here, on VEP's empty interval
-    // `(start, start - 1)` shifted by `strand * shift_length`, through the
-    // shared VEP mapper port. A mapper that cannot place either flank, or
-    // a transcript without cDNA coding bounds, is not a decision: the
-    // engine falls through to its existing paths rather than drop HGVSp.
-    if is_insertion
-        && let Some(translation) = tx_translation
-        && tx.cdna_coding_start.is_some()
-        && tx.cdna_coding_end.is_some()
-    {
-        let shifted_variant = protein_hgvs_shifted_variant(variant, shift, tx.strand);
-        let span = vep_coords::VepSpan::new(shifted_variant.start, shifted_variant.end);
-        let mapper = vep_coords::VepTxMapper::new(
-            tx,
-            tx_exons,
-            Some(translation),
-            vep_coords::CdnaBaseMap::HgvspExact,
-        );
-        if mapper.cdna(span).both().is_some() && mapper.translation(span).both_truthy().is_none() {
-            return None;
-        }
-    }
-
     if shift.shift_length == 0 {
         // Traceability:
         // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
@@ -26293,6 +26309,61 @@ mod tests {
         assert_eq!(star_insertion_hgvsp(&v), None);
     }
 
+    /// Even with no genomic HGVS shift, VEP runs the original mapper guard:
+    /// `$pre->{coding}` plus truthy `translation_start/end`. A deletion that
+    /// crosses the terminal CDS boundary has a coding Coordinate plus a UTR
+    /// Gap, but no last peptide coordinate, so its fallback protein is
+    /// suppressed.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1711-L1738>
+    /// - `BaseTranscriptVariation::translation_start/end()` selects first/last
+    ///   mapper pieces and leaves a Gap undefined
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L365-L405>
+    #[test]
+    fn protein_hgvs_without_shift_still_requires_truthy_translation_bounds_for_partial_coding_deletion()
+     {
+        let (t, exons, tr) = star_insertion_fixture();
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        // Prefix minimization leaves the deletion 179..180: the last coding
+        // base followed by the first 3' UTR base.
+        let v = VariantInput::from_vcf("1".into(), 178, 180, "AAA".into(), "A".into());
+
+        assert!(v.hgvs_shift_for_strand(t.strand).is_none());
+        assert!(
+            original_variation_maps_to_cds(&t, &exons_ref, &v),
+            "the coding Coordinate plus UTR Gap makes the original mapper predicate partial-coding"
+        );
+        let mapper = vep_coords::VepTxMapper::new(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            vep_coords::CdnaBaseMap::HgvspExact,
+        );
+        assert_eq!(
+            mapper
+                .translation(vep_coords::VepSpan::from_variant(&v))
+                .both_truthy(),
+            None,
+            "the last translation mapper piece is a UTR Gap"
+        );
+        assert_eq!(
+            protein_hgvs_for_output(
+                &t,
+                &exons_ref,
+                Some(&tr),
+                &v,
+                true,
+                Some((20, 20)),
+                Some(&star_star_fallback()),
+                true,
+            ),
+            None,
+            "VEP suppresses HGVSp when either translation endpoint is undefined"
+        );
+    }
+
     #[test]
     fn chr20_37179387_frameshift_hgvsp_prefers_vep_alternate_cds_stop_distance() {
         let transcript = tx(
@@ -32296,7 +32367,7 @@ mod tests {
 
     #[test]
     fn issue_208_ambiguous_alt_suppresses_hgvsp_before_fallback() {
-        let transcript = tx(
+        let mut transcript = tx(
             "T_ISSUE_208_HGVS",
             "22",
             1000,
@@ -32306,7 +32377,16 @@ mod tests {
             Some(1000),
             Some(1011),
         );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(12);
         let exon = exon("T_ISSUE_208_HGVS", 1, 1000, 1011);
+        let translation = translation(
+            &transcript.transcript_id,
+            Some(12),
+            Some(4),
+            Some("MK*"),
+            Some("ATGAAA"),
+        );
         let fallback = crate::hgvs::ProteinHgvsData {
             start: 1,
             end: 1,
@@ -32324,7 +32404,7 @@ mod tests {
             protein_hgvs_for_output_with_semantics(
                 &transcript,
                 &[&exon],
-                None,
+                Some(&translation),
                 &var("22", 1003, 1003, "G", alt),
                 true,
                 None,
