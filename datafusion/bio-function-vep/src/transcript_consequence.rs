@@ -3296,6 +3296,30 @@ impl TranscriptConsequenceEngine {
             if self.semantics.vep116_stop_predicates() {
                 let partial_terminal_codon =
                     vep_partial_terminal_codon(tx, tx_exons, tx_translation, variant);
+                // This early return preserves partial CDS fields for indels
+                // that cross exon/intron boundaries. VEP's start_lost
+                // predicate still runs on TranscriptVariation objects here:
+                // it gates on mapped cDNA endpoints and evaluates
+                // _ins_del_start_altered before the peptide clause.
+                // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+                // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1028-L1074
+                let predicate_class = classification.clone().unwrap_or_default();
+                let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
+                if vep116_start_lost_from_predicates(
+                    &predicate_class,
+                    tx,
+                    tx_exons,
+                    variant,
+                    translateable_seq.as_deref(),
+                    partial_terminal_codon,
+                ) {
+                    terms.insert(SoTerm::StartLost);
+                    if let Some(classification) = classification.as_mut() {
+                        classification.start_lost = true;
+                        classification.missense = false;
+                    }
+                }
+
                 if partial_terminal_codon {
                     terms.insert(SoTerm::IncompleteTerminalCodonVariant);
                 }
@@ -25670,6 +25694,57 @@ mod tests {
             terms.contains(&SoTerm::StartLost),
             "the length-changing start-codon deletion must follow VEP's first start_lost predicate"
         );
+    }
+
+    #[test]
+    fn complex_multiexon_deletion_keeps_start_lost_predicate() {
+        let mut transcript = tx(
+            "ENST00000873970",
+            "1",
+            45_329_163,
+            45_335_911,
+            -1,
+            "protein_coding",
+            Some(45_329_306),
+            Some(45_334_505),
+        );
+        transcript.cdna_coding_start = Some(413);
+        transcript.cdna_coding_end = Some(1_981);
+        transcript.five_prime_utr_seq = Some("C".repeat(412));
+        transcript.translateable_seq = Some(format!("ATG{}", "C".repeat(1_566)));
+        transcript.cdna_seq = transcript.translateable_seq.clone();
+        let exons = [
+            exon("ENST00000873970", 1, 45_335_506, 45_335_911),
+            exon("ENST00000873970", 2, 45_334_391, 45_334_511),
+            exon("ENST00000873970", 3, 45_333_413, 45_333_564),
+            exon("ENST00000873970", 4, 45_333_285, 45_333_324),
+            exon("ENST00000873970", 5, 45_333_097, 45_333_170),
+            exon("ENST00000873970", 6, 45_332_918, 45_332_959),
+            exon("ENST00000873970", 7, 45_332_763, 45_332_834),
+            exon("ENST00000873970", 8, 45_332_574, 45_332_687),
+            exon("ENST00000873970", 9, 45_332_391, 45_332_488),
+            exon("ENST00000873970", 10, 45_332_166, 45_332_310),
+            exon("ENST00000873970", 11, 45_332_023, 45_332_086),
+            exon("ENST00000873970", 12, 45_331_661, 45_331_849),
+            exon("ENST00000873970", 13, 45_331_420, 45_331_556),
+            exon("ENST00000873970", 14, 45_331_182, 45_331_334),
+            exon("ENST00000873970", 15, 45_330_516, 45_330_557),
+            exon("ENST00000873970", 16, 45_329_163, 45_329_437),
+        ];
+        let exon_refs: Vec<&ExonFeature> = exons.iter().collect();
+        let reference = format!("A{}", "C".repeat(3_232));
+        let deletion = var("1", 45_332_596, 45_335_828, &reference, "A");
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5_000,
+            5_000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let mut terms = BTreeSet::new();
+
+        engine.add_coding_terms(&mut terms, &deletion, &transcript, &exon_refs, None);
+
+        assert!(terms.contains(&SoTerm::StartLost), "terms={terms:?}");
     }
 
     #[test]
