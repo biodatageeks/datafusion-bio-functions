@@ -1114,10 +1114,10 @@ mod tests {
         }
     }
 
-    /// Commit 2 of F0: the insertion branch of `shifted_tva_coords_from_mapper`
-    /// goes through `VepTxMapper` (HgvspExact). Every shifted insertion span
-    /// `(P, P-1)` and every deletion of length 1..=6 over the matrix, with a
-    /// leading-N phase of 0, 1 and 2, must give the same coordinates.
+    /// The mapper-coordinate path agrees with the legacy path across ordinary
+    /// shifted spans. A deletion with mapped endpoints and an internal intron
+    /// is the intentional exception: VEP keeps its first and last mapped
+    /// pieces, whereas the legacy per-base path rejects the unmapped gap.
     #[test]
     fn f0_shifted_insertion_matches_legacy() {
         let mut compared = 0usize;
@@ -1138,21 +1138,41 @@ mod tests {
                     for v in spans {
                         let legacy = legacy_shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
                         let new = shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
-                        assert_eq!(
-                            new,
-                            legacy,
-                            "shifted coords differ: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{}",
-                            tx.transcript_id,
-                            tx.strand,
-                            tx.cdna_coding_start,
-                            tx.cdna_coding_end,
-                            tx.cdna_mapper_segments,
-                            tx.refseq_edits,
-                            v.start,
-                            v.end,
-                            v.ref_allele,
-                            v.alt_allele
-                        );
+                        if new != legacy {
+                            let span = VepSpan::from_variant(&v);
+                            let mapper =
+                                VepTxMapper::new(&tx, &refs, Some(&tl), CdnaBaseMap::HgvspExact);
+                            let cdna = mapper.cdna(span);
+                            let cds = mapper.cds_of_cdna(cdna, false).both();
+                            let crosses_mapper_gap = !span.is_insertion()
+                                && mapper
+                                    .cdna_pieces(span)
+                                    .iter()
+                                    .any(|piece| matches!(piece, MapperPiece::Gap));
+                            assert!(
+                                legacy.is_none() && crosses_mapper_gap && cdna.both().is_some(),
+                                "unexpected shifted-coordinate divergence: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{} pieces={:?} legacy={legacy:?} new={new:?}",
+                                tx.transcript_id,
+                                tx.strand,
+                                tx.cdna_coding_start,
+                                tx.cdna_coding_end,
+                                tx.cdna_mapper_segments,
+                                tx.refseq_edits,
+                                v.start,
+                                v.end,
+                                v.ref_allele,
+                                v.alt_allele,
+                                mapper.cdna_pieces(span)
+                            );
+                            let mapped = new.expect("the mapped endpoints define a CDS interval");
+                            if tx.refseq_edits.is_empty()
+                                && let Some(cds) = cds
+                            {
+                                assert_eq!((mapped.cds_start, mapped.cds_end), cds);
+                            }
+                            assert_eq!(mapped.protein_start, peptide_of_cds(mapped.cds_start));
+                            assert_eq!(mapped.protein_end, peptide_of_cds(mapped.cds_end));
+                        }
                         compared += 1;
                         defined += usize::from(legacy.is_some());
                     }

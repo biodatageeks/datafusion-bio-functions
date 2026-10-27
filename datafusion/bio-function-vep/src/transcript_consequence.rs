@@ -7423,8 +7423,6 @@ fn shifted_tva_coords_from_mapper(
         .bytes()
         .take_while(|&b| b == b'N' || b == b'n')
         .count();
-    let coding_start = tx.cdna_coding_start?;
-    let coding_end = tx.cdna_coding_end?;
 
     let span = vep_coords::VepSpan::new(shifted_variant.start, shifted_variant.end);
     let is_insertion = span.is_insertion();
@@ -7456,8 +7454,14 @@ fn shifted_tva_coords_from_mapper(
                 && raw_cdna <= edit.end
         })
     };
-    let (cdna_start, cdna_end, raw_cds_start, raw_cds_end, mapper_used_for_index) = if is_insertion
-    {
+    let (
+        cdna_start,
+        cdna_end,
+        raw_cds_start,
+        raw_cds_end,
+        mapper_used_for_index,
+        has_internal_mapper_gap,
+    ) = if is_insertion {
         // `Mapper::map_insert()` over the transcript-ordered flanks, keeping
         // the one that maps when the other is a `Gap`, and the edited-cDNA
         // gap between two mapped flanks; then the single-piece
@@ -7472,56 +7476,68 @@ fn shifted_tva_coords_from_mapper(
             raw_cds_start,
             raw_cds_end,
             shifted_insertion_mapper_used_for_index(tx, tx_exons, span),
+            false,
         )
     } else {
-        let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
-        let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
-        let mut mapper_used_for_index = true;
-        for pos in genomic_positions {
-            // `TranscriptMapper` returns a `Gap` for genomic bases deleted
-            // from an edited RefSeq transcript. `translation_start/end()` use
-            // the first and last mapper pieces, so an internal Gap does not
-            // erase valid coordinates on both allele endpoints.
-            // Ensembl Core `Mapper::map_coordinates()` retains those pieces
-            // around gaps (c0cf13d):
-            // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L267-L270
-            // Ensembl Variation `BaseTranscriptVariation::translation_coords()`
-            // takes the first/last pieces (2fb834b):
-            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L540-L560
-            if is_deleted_refseq_gap(pos)
-                && pos != shifted_variant.start
-                && pos != shifted_variant.end
-            {
-                mapper_used_for_index = false;
-                continue;
+        // VEP maps the whole variation span through `genomic2pep()` and then
+        // takes the first and last mapper pieces for translation_start/end.
+        // A Gap at either endpoint makes that bound undefined; internal
+        // intronic Gaps do not erase mapped coding endpoints. Keep this as an
+        // endpoint lookup instead of rejecting the span when an intronic base
+        // has no cDNA coordinate.
+        //
+        // Traceability at the pinned sources:
+        // - Ensembl Variation `BaseTranscriptVariation::translation_coords()`
+        //   maps the complete span, while `translation_start/end()` select its
+        //   first and last pieces and only reject a Gap at that endpoint:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L365-L381>
+        //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L540-L560>
+        // - Ensembl core `genomic2pep()` maps CDS pieces to peptide coordinates:
+        //   <https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L504-L535>
+        let cdna = mapper.cdna(span);
+        let (cdna_start, cdna_end) = cdna.both()?;
+        let genomic_positions = genomic_range(span.start, span.end)?;
+        let has_internal_mapper_gap = genomic_positions
+            .iter()
+            .skip(1)
+            .take(genomic_positions.len().saturating_sub(2))
+            .any(|&pos| {
+                is_deleted_refseq_gap(pos)
+                    || genomic_to_cdna_index_for_hgvsp(tx, tx_exons, pos).is_none()
+            });
+        let (raw_cds_start, raw_cds_end) = if has_internal_mapper_gap {
+            mapper.cds_of_cdna(cdna, false).both()?
+        } else {
+            // Keep the existing clipped conversion for a continuous mapper
+            // piece. In particular, a span that reaches the CDS edge can
+            // start in a mapped UTR coordinate and still have a CDS bound.
+            let coding_start = tx.cdna_coding_start?;
+            let coding_end = tx.cdna_coding_end?;
+            if cdna_end < coding_start || cdna_start > coding_end {
+                return None;
             }
-            if exact_mapper_cdna_index_for_hgvsp(tx, pos).is_none() {
-                mapper_used_for_index = false;
-            }
-            cdna_positions.push(genomic_to_cdna_index_for_hgvsp(tx, tx_exons, pos)?);
-        }
-        if cdna_positions.is_empty() {
-            return None;
-        }
-        cdna_positions.sort_unstable();
-        let (cdna_start, cdna_end) = (*cdna_positions.first()?, *cdna_positions.last()?);
-        if cdna_end < coding_start || cdna_start > coding_end {
-            return None;
-        }
-        let raw_cds_start = cdna_start
-            .saturating_sub(coding_start)
-            .saturating_add(1)
-            .saturating_add(leading_n_offset);
-        let raw_cds_end = cdna_end
-            .saturating_sub(coding_start)
-            .saturating_add(1)
-            .saturating_add(leading_n_offset);
+            (
+                cdna_start
+                    .saturating_sub(coding_start)
+                    .saturating_add(1)
+                    .saturating_add(leading_n_offset),
+                cdna_end
+                    .saturating_sub(coding_start)
+                    .saturating_add(1)
+                    .saturating_add(leading_n_offset),
+            )
+        };
+        let mapper_used_for_index = genomic_positions
+            .into_iter()
+            .all(|pos| exact_mapper_cdna_index_for_hgvsp(tx, pos).is_some())
+            && !has_internal_mapper_gap;
         (
             cdna_start,
             cdna_end,
             raw_cds_start,
             raw_cds_end,
             mapper_used_for_index,
+            has_internal_mapper_gap,
         )
     };
     let edited_insertion_gap =
@@ -7578,23 +7594,28 @@ fn shifted_tva_coords_from_mapper(
             vep_coords::peptide_of_cds(cds_end),
         )
     } else {
-        let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
-        let mut peptide_positions = Vec::with_capacity(genomic_positions.len());
-        for pos in genomic_positions {
-            if is_deleted_refseq_gap(pos)
-                && pos != shifted_variant.start
-                && pos != shifted_variant.end
-            {
-                continue;
+        if has_internal_mapper_gap {
+            // `translation_start/end()` use the same first/last mapper pieces
+            // as `cdna_start/end`. Convert those mapped CDS bounds directly
+            // to peptide coordinates so internal unmapped intron or deleted-
+            // RefSeq bases do not suppress valid bounds.
+            (
+                vep_coords::peptide_of_cds(cds_start),
+                vep_coords::peptide_of_cds(cds_end),
+            )
+        } else {
+            // In a continuous mapper piece, keep the per-base RefSeq edit
+            // adjustment used by the existing path. It is equivalent for
+            // ordinary exonic spans and preserves transcript edit offsets.
+            let genomic_positions = genomic_range(span.start, span.end)?;
+            let mut peptide_positions = Vec::with_capacity(genomic_positions.len());
+            for pos in genomic_positions {
+                let tr_pos = translateable_pos_1based(pos)?;
+                peptide_positions.push(tr_pos.saturating_add(2) / 3);
             }
-            let tr_pos = translateable_pos_1based(pos)?;
-            peptide_positions.push(tr_pos.saturating_add(2) / 3);
+            peptide_positions.sort_unstable();
+            (*peptide_positions.first()?, *peptide_positions.last()?)
         }
-        if peptide_positions.is_empty() {
-            return None;
-        }
-        peptide_positions.sort_unstable();
-        (*peptide_positions.first()?, *peptide_positions.last()?)
     };
 
     Some(ShiftedTvaCoords {
@@ -18257,9 +18278,22 @@ mod tests {
         let mut tr = translation("T215", Some(24), Some(7), Some("MKPEEPG"), Some(cds));
         tr.stable_id = Some("ENSP215".to_string());
         tr.version = Some(1);
+        let exon_refs = exon_features.iter().collect::<Vec<_>>();
         // The deleted genomic REF includes an 88-bp intron, but its two CDS
         // endpoints delimit twelve spliced coding bases (CDS 7-18).
         let deletion = var("22", 106, 205, &"N".repeat(100), "-");
+        let shifted_coords =
+            shifted_tva_coords_from_mapper(&transcript, &exon_refs, &tr, &deletion)
+                .expect("mapped endpoints on both sides of the intron define HGVSp bounds");
+        assert_eq!(
+            (
+                shifted_coords.cds_start,
+                shifted_coords.cds_end,
+                shifted_coords.protein_start,
+                shifted_coords.protein_end,
+            ),
+            (7, 18, 3, 6)
+        );
         let result = engine.evaluate_variant_with_context(
             &deletion,
             &[transcript.clone()],
@@ -18319,7 +18353,6 @@ mod tests {
         // VEP drops protein HGVS when 3' shifting moves either protein
         // coordinate outside the translation, even though the unshifted
         // spliced deletion has complete coding endpoints.
-        let exon_refs = exon_features.iter().collect::<Vec<_>>();
         let mut shifted_deletion = deletion.clone();
         shifted_deletion.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
             strand: 1,
