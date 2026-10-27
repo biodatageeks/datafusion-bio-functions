@@ -19283,6 +19283,61 @@ mod tests {
     }
 
     #[test]
+    fn mt_nd2_initiator_seqedit_makes_att_reference_peptide_methionine() {
+        // The refreshed MT transcript cache carries this amino_acid_sub edit.
+        // VEP overlays it on the reference peptide, then uses that peptide for
+        // both `Amino_acids` and its ordered start_lost predicate.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+        let mut transcript = tx(
+            "ENST00000361453",
+            "MT",
+            4470,
+            4475,
+            1,
+            "protein_coding",
+            Some(4470),
+            Some(4475),
+        );
+        transcript.codon_table = CodonTable::VertebrateMitochondrial;
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(6);
+        transcript.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 4470,
+            genomic_end: 4475,
+            cdna_start: 1,
+            cdna_end: 6,
+            ori: 1,
+        }];
+        transcript.translation_seq_edits = vec![TranslationSeqEdit {
+            code: "amino_acid_sub".to_string(),
+            start: 1,
+            end: 1,
+            alt_seq: "M".to_string(),
+        }];
+        let transcript_exon = exon("ENST00000361453", 1, 4470, 4475);
+        let exons = [&transcript_exon];
+        let cached_translation =
+            translation("ENST00000361453", Some(6), Some(2), None, Some("ATTAAT"));
+        let variant = var("MT", 4472, 4472, "T", "C");
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("ND2 initiator variant should classify");
+
+        assert_eq!(classification.affected_ref_peptide.as_deref(), Some("M"));
+        assert_eq!(classification.affected_alt_peptide.as_deref(), Some("I"));
+        assert_eq!(classification.amino_acids.as_deref(), Some("M/I"));
+        assert!(classification.start_lost);
+        assert!(!classification.synonymous);
+    }
+
+    #[test]
     fn selenocysteine_seqedit_drives_stop_terms_and_amino_acids_from_peptides() {
         // VEP's reference `peptide()` overlays SeqEdits before OutputFactory
         // asks `pep_allele_string` for Amino_acids. The alternate peptide is
