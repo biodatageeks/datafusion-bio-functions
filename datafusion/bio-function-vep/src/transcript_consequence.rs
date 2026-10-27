@@ -3447,9 +3447,11 @@ impl TranscriptConsequenceEngine {
                     // deletion has two mapped CDS endpoints but its local
                     // peptide classification is unavailable.
                     // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1723-L1738
-                    spliced_cds_span.and_then(|_| {
+                    if spliced_cds_span.is_some() {
                         partial_coding_overlap_classification(tx, tx_exons, tx_translation, variant)
-                    })
+                    } else {
+                        None
+                    }
                 });
                 if self.semantics.vep116_stop_predicates() {
                     if vep116_protein_altering_variant(
@@ -18508,6 +18510,38 @@ mod tests {
         .expect("mapped spliced coding deletion is classifiable");
 
         assert_eq!(mapped, (12, 23));
+        // HGVSp projects these mapper endpoints through the canonical CDS
+        // reference. Each endpoint must take the same RefSeq adjustment as
+        // its ordinary per-base path before the internal Gap is collapsed.
+        let shifted = shifted_tva_coords_from_mapper(&transcript, &exon_refs, &tr, &deletion)
+            .expect("mapped endpoints remain available with an upstream RefSeq edit");
+        let left_endpoint = shifted_tva_coords_from_mapper(
+            &transcript,
+            &exon_refs,
+            &tr,
+            &var("22", 106, 106, "N", "A"),
+        )
+        .expect("the left endpoint has a per-base HGVSp coordinate");
+        let right_endpoint = shifted_tva_coords_from_mapper(
+            &transcript,
+            &exon_refs,
+            &tr,
+            &var("22", 205, 205, "N", "A"),
+        )
+        .expect("the right endpoint has a per-base HGVSp coordinate");
+        assert_eq!(
+            (
+                shifted.cds_start,
+                shifted.cds_end,
+                shifted.protein_start,
+                shifted.protein_end,
+            ),
+            (2, 13, 1, 5)
+        );
+        assert_eq!(shifted.cds_start, left_endpoint.cds_start);
+        assert_eq!(shifted.cds_end, right_endpoint.cds_end);
+        assert_eq!(shifted.protein_start, left_endpoint.protein_start);
+        assert_eq!(shifted.protein_end, right_endpoint.protein_end);
         assert_eq!(
             (
                 classification.cds_position_start,
