@@ -25555,6 +25555,46 @@ mod tests {
     }
 
     #[test]
+    fn literal_indel_hgvsp_does_not_restore_an_empty_v116_cds_from_utr() {
+        let mut transcript = tx(
+            "ENSTLITERALUTR",
+            "1",
+            1000,
+            1002,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1002),
+        );
+        transcript.translateable_seq = Some("ATG".to_string());
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(3);
+        transcript.three_prime_utr_seq = Some("ATG".to_string());
+        let exons = vec![exon("ENSTLITERALUTR", 1, 1000, 1002)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let translation = translation("ENSTLITERALUTR", Some(3), Some(1), Some("M"), Some("ATG"));
+        let variant = var("1", 1000, 1002, "ATG", "-");
+        let class = CodingClassification {
+            protein_position_start: Some(1),
+            protein_position_end: Some(1),
+            ..Default::default()
+        };
+
+        let protein = literal_indel_protein_hgvs_data(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("literal deletion HGVS payload");
+
+        assert_eq!(protein.alt_translation, "");
+        assert_eq!(protein.alt_translation_extension, None);
+    }
+
+    #[test]
     fn issue149_missing_mapper_reconstructs_insertions_and_deletion_gaps() {
         // TranscriptMapper::_load_mapper applies these original-cDNA edits
         // in transcript order on either genomic strand. The deleted bases
