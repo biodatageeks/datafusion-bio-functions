@@ -271,6 +271,17 @@ fn translation_seq_edits_overlap(
     })
 }
 
+fn translation_seqedit_range_for_variant(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+) -> Option<(usize, usize)> {
+    vep_coords::VepTxMapper::new(tx, tx_exons, translation, vep_coords::CdnaBaseMap::Output)
+        .translation(vep_coords::VepSpan::from_variant(variant))
+        .both_truthy()
+}
+
 pub(crate) fn refseq_edit_offset_delta(edit: &RefSeqEdit) -> Option<i64> {
     if edit.skip_refseq_offset {
         return None;
@@ -1618,6 +1629,7 @@ impl TranscriptConsequenceEngine {
                                 let codons = cc.codons.clone();
                                 let amino_acids = amino_acids_for_output(
                                     tx,
+                                    tx_exons,
                                     tx_translation,
                                     cc,
                                     variant,
@@ -6715,6 +6727,7 @@ fn failed_refseq_uses_cached_translation_for_consequence(
 
 fn amino_acids_for_output(
     tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
     translation: Option<&TranslationFeature>,
     class: &CodingClassification,
     variant: &VariantInput,
@@ -6735,8 +6748,19 @@ fn amino_acids_for_output(
         .is_some_and(|cds_seq| {
             failed_refseq_uses_cached_translation_for_consequence(tx, translation, cds_seq)
         });
+    let translation_seqedit_overlap =
+        translation_seqedit_range_for_variant(tx, tx_exons, translation, variant).is_some_and(
+            |(start, end)| translation_seq_edits_overlap(start, end, &tx.translation_seq_edits),
+        );
 
-    if prefer_classified_amino_acids {
+    // VEP 116 writes `Amino_acids` from the peptide allele string, so a
+    // reference peptide containing a mapped SeqEdit takes precedence over
+    // codon translation (which can still spell a selenocysteine as `*`).
+    // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1723-L1727
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
+    if translation_seqedit_overlap {
+        class.amino_acids.clone()
+    } else if prefer_classified_amino_acids {
         class.amino_acids.clone().or(codon_amino_acids)
     } else {
         codon_amino_acids.or_else(|| class.amino_acids.clone())
@@ -8996,11 +9020,16 @@ fn classify_coding_change_with_semantics(
 
     let old_stop = old_aas.iter().position(|aa| *aa == '*');
     let new_stop = new_aas.iter().position(|aa| *aa == '*');
-    let translation_seqedit_overlap = translation_seq_edits_overlap(
-        start_idx / 3 + 1,
-        end_idx / 3 + 1,
-        &tx.translation_seq_edits,
-    );
+    // VEP's reference `peptide()` overlays SeqEdits over the mapped
+    // translation_start/end range, whose first/last coordinates come from the
+    // mapper rather than the local codon window.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L365-L379
+    let translation_seqedit_range =
+        translation_seqedit_range_for_variant(tx, tx_exons, tx_translation, variant);
+    let translation_seqedit_overlap = translation_seqedit_range.is_some_and(|(start, end)| {
+        translation_seq_edits_overlap(start, end, &tx.translation_seq_edits)
+    });
     let skip_global_stop_compare = translation_seqedit_overlap
         || (ref_len == alt_len
             && failed_refseq_uses_cached_translation_for_consequence(
@@ -9147,11 +9176,14 @@ fn classify_coding_change_with_semantics(
             .get(local_first_codon..peptide_end)
             .map(|peptide| peptide.iter().collect());
     }
-    if let Some(reference_peptide) = class.affected_ref_peptide.as_deref() {
+    if let (Some(reference_peptide), Some((translation_start, translation_end))) = (
+        class.affected_ref_peptide.as_deref(),
+        translation_seqedit_range.filter(|_| translation_seqedit_overlap),
+    ) {
         class.affected_ref_peptide = overlay_reference_peptide_seq_edits(
             reference_peptide,
-            local_first_codon.saturating_add(1),
-            local_last_codon.saturating_add(1),
+            translation_start,
+            translation_end,
             &tx.translation_seq_edits,
         );
     }
@@ -19467,6 +19499,8 @@ mod tests {
             end: 2,
             alt_seq: "U".to_string(),
         }];
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
         let transcript_exon = exon("T_SEQEDIT", 1, 1000, 1008);
         let exons = [&transcript_exon];
         let cached_translation =
@@ -19564,6 +19598,8 @@ mod tests {
             end: 2,
             alt_seq: "U".to_string(),
         }];
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(12);
         let transcript_exon = exon("T_SEC_SEQEDIT", 1, 1000, 1011);
         let exons = [&transcript_exon];
         let cached_translation = translation(
@@ -19587,6 +19623,18 @@ mod tests {
         assert_eq!(classification.affected_ref_peptide.as_deref(), Some("U"));
         assert_eq!(classification.affected_alt_peptide.as_deref(), Some("S"));
         assert_eq!(classification.amino_acids.as_deref(), Some("U/S"));
+        assert_eq!(
+            amino_acids_for_output(
+                &transcript,
+                &exons,
+                Some(&cached_translation),
+                &classification,
+                &variant,
+                crate::vep_semantics::VepSemantics::V116,
+            )
+            .as_deref(),
+            Some("U/S")
+        );
         assert!(!classification.stop_lost);
         assert!(classification.missense);
     }
@@ -19609,6 +19657,8 @@ mod tests {
             end: 2,
             alt_seq: "X".to_string(),
         }];
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(12);
         let transcript_exon = exon("T_STOP_READTHROUGH", 1, 1000, 1011);
         let exons = [&transcript_exon];
         let cached_translation = translation(
@@ -19654,6 +19704,8 @@ mod tests {
             end: 2,
             alt_seq: "U".to_string(),
         }];
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
         let transcript_exon = exon("T_SEQEDIT_INSERTION", 1, 1000, 1008);
         let exons = [&transcript_exon];
         let cached_translation = translation(
@@ -22078,6 +22130,8 @@ mod tests {
         t.cdna_coding_start = Some(1);
         t.cdna_coding_end = Some(9);
         t.bam_edit_status = Some("FAILED".to_string());
+        let e = exon("NM_173600.2", 1, 100, 108);
+        let exons_ref = [&e];
 
         let mut tr = translation(
             "NM_173600.2",
@@ -22097,6 +22151,7 @@ mod tests {
         assert_eq!(
             amino_acids_for_output(
                 &t,
+                &exons_ref,
                 Some(&tr),
                 &class,
                 &var("12", 102, 102, "G", "A"),
@@ -33047,6 +33102,7 @@ mod tests {
         assert!(
             amino_acids_for_output(
                 &transcript,
+                &[],
                 Some(&translation),
                 &class,
                 &ambiguous_alt,
@@ -33064,6 +33120,7 @@ mod tests {
         assert!(
             amino_acids_for_output(
                 &transcript,
+                &[],
                 Some(&translation),
                 &acgt_class,
                 &acgt_alt,
