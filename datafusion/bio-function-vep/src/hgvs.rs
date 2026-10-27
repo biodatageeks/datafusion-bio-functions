@@ -2742,11 +2742,13 @@ pub fn format_hgvsp(
         } else {
             notation.end
         };
-        // Only the past-alternate-translation early return (`alt=del`) needs
-        // the initiator anchor: it retains the original reference window,
-        // which can start downstream even though start loss overlaps residue
-        // 1. Keep a resolved nonterminal frameshift start, and fall back to
-        // that window if the full translation has no initiator residue.
+        // The `_get_fs_peptides` early return sets `alt=del` when its resolved
+        // start is past the alternate translation. The local affected peptide
+        // window may start downstream even though start loss overlaps residue
+        // 1, so use the initiator anchor for that exact path whether the mapper
+        // window already starts at 1 or was clipped downstream. Keep a resolved
+        // nonterminal frameshift start, and fall back to that window if the full
+        // translation has no initiator residue.
         //
         // Traceability:
         // - Ensembl Variation `VariationEffect::start_lost()` requires the
@@ -2755,13 +2757,23 @@ pub fn format_hgvsp(
         // - `TranscriptVariationAllele::_get_hgvs_peptides()` overrides only
         //   ALT and type for start loss:
         //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2154-L2158>
+        // - `_get_fs_peptides()` takes the `alt=del` early return precisely
+        //   when start is beyond the alternate translation:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2334-L2339>
+        let alt_translation = protein
+            .alt_translation_extension
+            .as_deref()
+            .unwrap_or(&protein.alt_translation);
         let past_alt_translation_deletion = protein.frameshift
             && notation.kind == "del"
             && notation.alt_allele == "del"
-            && translation_end > notation.start
-            && notation.start > 1;
-        let initiator_reference = past_alt_translation_deletion
-            .then(|| peptide_char(&protein.ref_translation, 1))
+            && notation.start > alt_translation.len();
+        let initiator = peptide_char(&protein.ref_translation, 1);
+        let needs_initiator_anchor = past_alt_translation_deletion
+            && (notation.start != 1
+                || initiator.is_some_and(|aa| !notation.ref_allele.starts_with(aa)));
+        let initiator_reference = needs_initiator_anchor
+            .then_some(initiator)
             .flatten()
             .map(|initiator| peptide_to_three_letter(&initiator.to_string()));
         let (start, reference) = match initiator_reference {

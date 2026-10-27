@@ -8178,18 +8178,19 @@ fn protein_hgvs_for_output_with_semantics(
         return fallback.map(|protein| {
             let mut protein = protein.clone();
             // Ensembl initializes HGVS protein start/end from the mapper
-            // before resolving peptide alleles. A deletion's empty ALT
-            // peptide (`-`) does not replace those coordinates; only an
-            // insertion's empty REF peptide keeps its clipped window.
-            // Ensembl Variation 116, TranscriptVariationAllele.pm:1765-1766:
+            // before clipping peptides. With ALT `-`, `_clip_alleles()` has
+            // no common peptide prefix or suffix to remove, so deletions
+            // retain those bounds;
+            // insertions with REF `-` keep their clipped window. VEP 116:
+            // TranscriptVariationAllele.pm:1765-1766, 1802-1805, 2182-2243
             // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1765-L1766
+            // VEP 115 initializes the same mapper bounds at :1701-1702:
+            // https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1701-L1702
             if protein.ref_peptide != "-" {
                 if let Some((start, end)) = original_protein_bounds {
                     protein.start = start;
                     protein.end = end;
                 }
-            } else if let Some((start, end)) = original_protein_bounds {
-                let _ = (start, end); // traceability: insertion's clipped window is distinct
             }
             protein
         });
@@ -25954,7 +25955,7 @@ mod tests {
         let fallback = crate::hgvs::ProteinHgvsData {
             start: 2,
             end: 39,
-            ref_peptide: "MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN*".to_string(),
+            ref_peptide: "S".to_string(),
             alt_peptide: "-".to_string(),
             ref_translation: "MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN*".to_string(),
             alt_translation: String::new(),
@@ -25978,6 +25979,96 @@ mod tests {
         )
         .expect("VEP retains HGVSp for the coding start-lost deletion");
         assert_eq!((got.start, got.end), (1, 39));
+        assert_eq!(
+            crate::hgvs::format_hgvsp(&translation, &got, true).as_deref(),
+            Some("ENSP00000392649.1:p.Met1_?39")
+        );
+
+        let got_v115 = protein_hgvs_for_output_with_semantics(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            true,
+            Some((1, 39)),
+            Some(&fallback),
+            crate::vep_semantics::VepSemantics::V115,
+            true,
+        )
+        .expect("VEP 115 also retains HGVSp for the coding start-lost deletion");
+        assert_eq!((got_v115.start, got_v115.end), (1, 39));
+        assert_eq!(
+            crate::hgvs::format_hgvsp(&translation, &got_v115, true).as_deref(),
+            Some("ENSP00000392649.1:p.Met1_?39")
+        );
+    }
+
+    #[test]
+    fn unshifted_non_start_lost_deletion_uses_mapper_window_in_v115_and_v116() {
+        // A regular peptide deletion also keeps the mapper-derived HGVS
+        // window. This is the shared V115/V116 default before `_clip_alleles`;
+        // the start-lost ClinVar case is not a special coordinate heuristic.
+        let transcript = tx(
+            "T_UNSHIFTED_DELETION",
+            "1",
+            100,
+            110,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(110),
+        );
+        let translation = translation("T_UNSHIFTED_DELETION", Some(11), Some(3), Some("MK*"), None);
+        let exons: Vec<ExonFeature> = Vec::new();
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let mut variant = VariantInput::from_vcf("1".into(), 101, 102, "AT".into(), "A".into());
+        variant.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 0,
+            start: 101,
+            end: 102,
+            shifted_allele_string: "-".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "AT".to_string(),
+            alt_orig_allele_string: "A".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+        let fallback = crate::hgvs::ProteinHgvsData {
+            start: 2,
+            end: 2,
+            ref_peptide: "K".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: "MK*".to_string(),
+            alt_translation: "M*".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        for semantics in [
+            crate::vep_semantics::VepSemantics::V115,
+            crate::vep_semantics::VepSemantics::V116,
+        ] {
+            let got = protein_hgvs_for_output_with_semantics(
+                &transcript,
+                &exons_ref,
+                Some(&translation),
+                &variant,
+                true,
+                Some((1, 2)),
+                Some(&fallback),
+                semantics,
+                true,
+            )
+            .expect("unshifted deletion retains HGVSp");
+            assert_eq!((got.start, got.end), (1, 2), "VEP {}", semantics.as_str());
+        }
     }
 
     #[test]
