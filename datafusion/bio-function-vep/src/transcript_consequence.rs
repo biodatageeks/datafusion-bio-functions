@@ -7273,21 +7273,59 @@ fn shifted_output_allele_for_transcript(strand: i8, shifted_output_allele: &str)
     }
 }
 
-/// VEP's cached `pre->{coding}` predicate comes from `cds_coords`: it is true
-/// when any mapper result is a Coordinate, including a partial Coordinate/Gap
-/// result at a splice boundary. It is independent of the reported SO terms.
+/// VEP's cached `pre->{coding}` predicate comes from `cds_coords`: a Coordinate
+/// result or a non-empty partial Coordinate/Gap mapping counts as coding,
+/// independently of the reported SO terms. When cDNA coding bounds are absent,
+/// Core maps the request to a Gap and Variation's genomic CDS/exon overlap path
+/// treats an exon-overlapping span within the genomic CDS range as partial.
 /// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L519-L556
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L505-L526
+/// https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L410-L430
 fn original_variation_maps_to_cds(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     variant: &VariantInput,
 ) -> bool {
-    let Some((coding_start, coding_end)) = tx.cdna_coding_start.zip(tx.cdna_coding_end) else {
-        return false;
-    };
     let mapper =
         vep_coords::VepTxMapper::new(tx, tx_exons, None, vep_coords::CdnaBaseMap::HgvspExact);
     let span = vep_coords::VepSpan::from_variant(variant);
+
+    let Some((coding_start, coding_end)) = tx.cdna_coding_start.zip(tx.cdna_coding_end) else {
+        let Some((genomic_start, genomic_end)) = tx.cds_start.zip(tx.cds_end) else {
+            return false;
+        };
+        let (genomic_cds_start, genomic_cds_end) = (
+            genomic_start.min(genomic_end),
+            genomic_start.max(genomic_end),
+        );
+        let Some(coords) = tx
+            .cdna_coords_cache
+            .0
+            .get_or_init(|| transcript_cdna_coords_uncached(tx, tx_exons))
+            .as_deref()
+        else {
+            return false;
+        };
+
+        // This is the source's legacy partial-mapping case: `genomic2cds`
+        // returns one Gap when `cdna_coding_start` is absent, while
+        // `_bvfo_preds` marks an exon-overlapping span within the genomic CDS
+        // bounds as coding. Intersect mapper intervals rather than expanding
+        // the genomic span base by base.
+        if span.is_insertion() {
+            return [span.start, span.end].into_iter().any(|flank| {
+                (genomic_cds_start..=genomic_cds_end).contains(&flank)
+                    && coords
+                        .iter()
+                        .any(|segment| (segment.start..=segment.end).contains(&flank))
+            });
+        }
+        return coords.iter().any(|segment| {
+            span.start.max(segment.start).max(genomic_cds_start)
+                <= span.end.min(segment.end).min(genomic_cds_end)
+        });
+    };
+
     if span.is_insertion() {
         // `cds_coords()` maps insertion flanks as a constant-size operation.
         return mapper
@@ -33271,10 +33309,11 @@ mod tests {
     }
 
     #[test]
-    fn original_coding_predicate_rejects_missing_cdna_coding_bounds() {
+    fn original_coding_predicate_preserves_missing_cdna_bounds_partial_mapping() {
         // Pinned Ensembl core `TranscriptMapper::genomic2cds` returns a Gap
-        // for the full span when `cdna_coding_start` is undefined; Variation
-        // sets `pre->{coding}` only when `cds_coords` contains a Coordinate.
+        // for the full span when `cdna_coding_start` is undefined. Variation
+        // treats a non-empty Gap/Coordinate mapper result as partial coding
+        // when the variant overlaps an exon and the genomic CDS range.
         // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L410-L430
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L519-L556
         let tx = tx(
@@ -33287,14 +33326,23 @@ mod tests {
             Some(100),
             Some(109),
         );
-        let exons = [exon("ENSTCDSBOUNDSMISSING0001", 1, 100, 109)];
+        let exons = [
+            exon("ENSTCDSBOUNDSMISSING0001", 1, 100, 109),
+            exon("ENSTCDSBOUNDSMISSING0001", 2, 130, 139),
+        ];
         let exons_ref = exons.iter().collect::<Vec<_>>();
         let coding_substitution = var("1", 105, 105, "A", "C");
+        let intronic_substitution = var("1", 120, 120, "A", "C");
 
-        assert!(!original_variation_maps_to_cds(
+        assert!(original_variation_maps_to_cds(
             &tx,
             &exons_ref,
             &coding_substitution
+        ));
+        assert!(!original_variation_maps_to_cds(
+            &tx,
+            &exons_ref,
+            &intronic_substitution
         ));
     }
 
