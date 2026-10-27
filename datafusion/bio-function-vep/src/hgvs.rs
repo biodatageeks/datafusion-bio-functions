@@ -2742,11 +2742,34 @@ pub fn format_hgvsp(
         } else {
             notation.end
         };
-        let reference = peptide_to_three_letter(&notation.ref_allele.replace('*', "X"));
-        return Some(if notation.start != end {
-            format!("{protein_id}:p.{reference}{}_?{end}", notation.start)
+        // `start_lost()` is tied to an overlap with the initiator codon. When
+        // a frameshift's resolved peptide starts downstream but its retained
+        // window still reaches the translation end, format the initiator
+        // reference residue from the full reference translation. VEP's
+        // start-lost override changes only ALT to `?` and clears the type, so
+        // the reference start/window remains anchored at residue 1.
+        //
+        // Traceability:
+        // - Ensembl Variation `VariationEffect::start_lost()` requires the
+        //   start-codon overlap and sets peptide start-lost at translation 1:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L851-L883>
+        // - `TranscriptVariationAllele::_get_hgvs_peptides()` overrides only
+        //   ALT and type for start loss:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2154-L2158>
+        let (start, reference) =
+            if protein.frameshift && translation_end > notation.start && notation.start > 1 {
+                let initiator = peptide_char(&protein.ref_translation, 1)?;
+                (1, peptide_to_three_letter(&initiator.to_string()))
+            } else {
+                (
+                    notation.start,
+                    peptide_to_three_letter(&notation.ref_allele.replace('*', "X")),
+                )
+            };
+        return Some(if start != end {
+            format!("{protein_id}:p.{reference}{start}_?{end}")
         } else {
-            format!("{protein_id}:p.{reference}{}?", notation.start)
+            format!("{protein_id}:p.{reference}{start}?")
         });
     }
 
@@ -2946,6 +2969,26 @@ fn resolve_frameshift_hgvs(
         // and `type = "del"` in this branch, then returns. Preserve the
         // clipped reference range and coordinates initialized from context.
         notation.alt_allele = "del".to_string();
+        // `_get_fs_peptides()` appends the reference stop before this early
+        // return. If the affected deletion range reaches that appended stop
+        // but the local peptide window omitted it, retain the terminal `*`
+        // sentinel so HGVS formats `Ter` at the range end.
+        //
+        // Traceability:
+        // - Ensembl Variation 116 `_get_fs_peptides()` appends `*` to the
+        //   reference translation, then returns `alt=del` when `start` is
+        //   past the alternate translation:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2314-L2339>
+        let affected_range_len = notation
+            .end
+            .saturating_sub(notation.start)
+            .saturating_add(1);
+        if notation.end == ref_translation.len()
+            && notation.ref_allele.len() < affected_range_len
+            && peptide_char(&ref_translation, notation.end) == Some('*')
+        {
+            notation.ref_allele.push('*');
+        }
         // A VEP translation window of `-/X` at the first position after an
         // incomplete CDS is synonymous in the ClinVar #223 targets. The
         // generic past-end branch would otherwise emit `p.Ndel`.
@@ -4039,6 +4082,32 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Met1_?4".to_string())
+        );
+    }
+
+    #[test]
+    fn issue_221_golden_start_lost_frameshift_keeps_initiator_peptide_window() {
+        // Golden ClinVar 4533193, 3:36993547: VEP retains the Met1 window
+        // and formats the unknown alternate through translation end 39.
+        let mut translation = make_translation();
+        translation.stable_id = Some("ENSP00000392649".to_string());
+        let reference = "MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN*";
+        let protein = ProteinHgvsData {
+            start: 2,
+            end: 39,
+            ref_peptide: "S".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: reference.to_string(),
+            alt_translation: String::new(),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: true,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true).as_deref(),
+            Some("ENSP00000392649.1:p.Met1_?39")
         );
     }
 
@@ -9627,6 +9696,50 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Lys164_Ter165del".to_string())
+        );
+    }
+
+    #[test]
+    fn issue_220_golden_terminal_frameshift_deletions_retain_ter_sentinel() {
+        // Golden ClinVar 638055: ENSP00000492822.1:p.Leu421_Ter423del.
+        let mut translation = make_translation();
+        translation.stable_id = Some("ENSP00000492822".to_string());
+        let protein = ProteinHgvsData {
+            start: 421,
+            end: 423,
+            ref_peptide: "LQ".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: format!("{}LQ", "M".repeat(420)),
+            alt_translation: "M".repeat(420),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true).as_deref(),
+            Some("ENSP00000492822.1:p.Leu421_Ter423del")
+        );
+
+        // Golden ClinVar 633614: ENSP00000402456.1:p.Lys1023_Ter1024del.
+        translation.stable_id = Some("ENSP00000402456".to_string());
+        let protein = ProteinHgvsData {
+            start: 1023,
+            end: 1024,
+            ref_peptide: "K".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: format!("{}K", "M".repeat(1022)),
+            alt_translation: "M".repeat(1022),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true).as_deref(),
+            Some("ENSP00000402456.1:p.Lys1023_Ter1024del")
         );
     }
 

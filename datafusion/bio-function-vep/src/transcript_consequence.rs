@@ -5645,6 +5645,37 @@ fn apply_vep116_stop_predicate_flags(
     class.stop_gained = stop_gained;
 }
 
+/// Ensembl Variation 116 `missense_variant()` compares the affected peptide
+/// alleles directly. Unlike `synonymous_variant()`, it has no X-peptide veto;
+/// only the explicit `partial_codon()` predicate suppresses missense.
+///
+/// Traceability:
+/// - Ensembl Variation `VariationEffect::missense_variant()` at the pinned
+///   commit checks start/stop/partial-codon/stop-retained, then requires
+///   unequal peptide strings of equal length:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1085-L1098>
+fn vep_missense_variant(
+    ref_peptide: Option<&str>,
+    alt_peptide: Option<&str>,
+    start_lost: bool,
+    stop_lost: bool,
+    stop_gained: bool,
+    partial_codon: bool,
+    stop_retained: bool,
+) -> bool {
+    let (Some(ref_peptide), Some(alt_peptide)) = (ref_peptide, alt_peptide) else {
+        return false;
+    };
+
+    !start_lost
+        && !stop_lost
+        && !stop_gained
+        && !partial_codon
+        && !stop_retained
+        && ref_peptide != alt_peptide
+        && ref_peptide.len() == alt_peptide.len()
+}
+
 fn apply_vep116_nucleotide_stop_fallbacks(
     class: &mut CodingClassification,
     semantics: crate::vep_semantics::VepSemantics,
@@ -8977,8 +9008,8 @@ fn classify_coding_change_with_semantics(
     }
     let ambiguous_alt_peptide = semantics.vep116_stop_predicates()
         && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele);
-    let partial_terminal_codon = semantics.vep116_stop_predicates()
-        && vep_partial_terminal_codon_for_cds(tx, tx_exons, &cds_seq, variant);
+    let partial_codon = vep_partial_terminal_codon_for_cds(tx, tx_exons, &cds_seq, variant);
+    let partial_terminal_codon = semantics.vep116_stop_predicates() && partial_codon;
 
     // Per-codon stop analysis.
     //
@@ -9109,16 +9140,29 @@ fn classify_coding_change_with_semantics(
                 || ci >= old_aas.len()
                 || ci >= new_aas.len()
         });
-        // VEP's missense_variant also has `return 0 if partial_codon(@_)`
-        // (VariationEffect.pm L1093). Suppress missense when the affected
-        // codon is in the incomplete terminal region.
-        if aa_changed
-            && !class.stop_gained
-            && !class.stop_lost
-            && !class.start_lost
-            && !class.stop_retained
-            && !has_x
-        {
+        // VEP 116 missense uses the local peptide pair and does not reject X;
+        // partial_codon is its explicit incomplete-terminal guard. Preserve
+        // the established VEP 115 predicate until its own source rule is
+        // reconciled.
+        let missense = if semantics.vep116_stop_predicates() {
+            vep_missense_variant(
+                class.affected_ref_peptide.as_deref(),
+                class.affected_alt_peptide.as_deref(),
+                class.start_lost,
+                class.stop_lost,
+                class.stop_gained,
+                partial_terminal_codon,
+                class.stop_retained,
+            )
+        } else {
+            aa_changed
+                && !class.stop_gained
+                && !class.stop_lost
+                && !class.start_lost
+                && !class.stop_retained
+                && !has_x
+        };
+        if missense {
             class.missense = true;
         } else if !aa_changed && !class.stop_retained && !class.start_retained && !has_x {
             class.synonymous = true;
@@ -9235,7 +9279,7 @@ fn classify_coding_change_with_semantics(
             );
             let alt_codon =
                 format_codon_display(&local_alt_codon, start_idx, end_idx, codon_nt_start);
-            class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+            class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
         }
     } else {
         // Indels: different formatting for frameshift vs inframe
@@ -9262,14 +9306,14 @@ fn classify_coding_change_with_semantics(
                         start_idx + alt_len - 1,
                         codon_nt_start,
                     );
-                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                    class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
                 } else {
                     // Frameshift deletion: all alt bases lowercase
                     let alt_codon: String = local_alt_codon
                         .iter()
                         .map(|&b| (b as char).to_ascii_lowercase())
                         .collect();
-                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                    class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
                 }
             } else if alt_len < ref_len {
                 // Inframe deletion: ref codon with deleted bases uppercase, context lowercase.
@@ -9294,11 +9338,7 @@ fn classify_coding_change_with_semantics(
                         .map(|&b| (b as char).to_ascii_lowercase())
                         .collect()
                 };
-                if alt_codon.is_empty() {
-                    class.codons = Some(format!("{ref_codon}/-"));
-                } else {
-                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
-                }
+                class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
             } else {
                 // Inframe insertion (ref_len < alt_len, handled in classify_insertion)
                 // This branch shouldn't be reached for pure insertions (ref="-"),
@@ -9318,7 +9358,7 @@ fn classify_coding_change_with_semantics(
                     start_idx + alt_len - 1,
                     codon_nt_start,
                 );
-                class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
             }
         }
     }
@@ -10104,7 +10144,7 @@ fn classify_insertion_with_semantics_and_gap(
                     }
                 })
                 .collect();
-            class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+            class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
         }
     } else {
         // Inframe insertion within codon: ref=lowercase, alt=codon+inserted(uppercase)
@@ -10156,7 +10196,7 @@ fn classify_insertion_with_semantics_and_gap(
                     }
                 })
                 .collect();
-            class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+            class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
         }
     }
     if replace_refseq_mapper_gap
@@ -10552,6 +10592,21 @@ fn format_codon_display(
             }
         })
         .collect()
+}
+
+/// Join VEP display codons, representing an empty alternate codon with `-`.
+///
+/// Traceability:
+/// - Ensembl Variation 116 `codon_allele_string()` joins reference/alternate
+///   codons with `/`; `codon()` stores `-` for an empty codon:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L642-L651>
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L876-L881>
+fn vep_codon_allele_string(ref_codon: &str, alt_codon: &str) -> String {
+    if alt_codon.is_empty() {
+        format!("{ref_codon}/-")
+    } else {
+        format!("{ref_codon}/{alt_codon}")
+    }
 }
 
 /// Determine which exon (if any) the variant overlaps.
@@ -32698,6 +32753,200 @@ mod tests {
         let classification = classification.expect("coding insertion should be classified");
         assert_eq!(classification.affected_ref_peptide.as_deref(), Some("X"));
         assert_eq!(classification.affected_alt_peptide.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn issue_220_golden_x_peptides_keep_missense_for_16_2047742() {
+        // Golden ClinVar 1776749, ENST00000561841: VEP reports XP/XS and
+        // missense_variant&coding_sequence_variant&NMD_transcript_variant.
+        let id = "ENST00000561841";
+        let pos = 2_047_742;
+        let mut transcript = tx(
+            id,
+            "16",
+            pos - 2,
+            pos + 3,
+            1,
+            "protein_coding",
+            Some(pos),
+            Some(pos + 3),
+        );
+        transcript.translateable_seq = Some("NNGCCC".to_string());
+        let exon = exon(id, 1, pos - 2, pos + 3);
+        let exons = [&exon];
+        let translation = translation(id, Some(6), Some(2), Some("XP"), Some("NNGCCC"));
+        let variant = var("16", pos, pos + 1, "GC", "AT");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("golden record is coding");
+
+        assert_eq!(
+            class.affected_ref_peptide.as_deref(),
+            Some("XP"),
+            "{class:#?}"
+        );
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("XS"));
+        assert!(
+            class.missense,
+            "VEP 116 allows X-containing unequal peptides: {class:?}"
+        );
+
+        let v115 = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V115,
+        )
+        .expect("golden record is coding");
+        assert!(
+            !v115.missense,
+            "VEP 115 behavior remains unchanged for the X-containing peptide: {v115:?}"
+        );
+    }
+
+    #[test]
+    fn issue_220_golden_x_peptides_keep_missense_for_17_75629084() {
+        // Golden ClinVar 2633463, ENST00000581825: XLLAS/XPEAE is an
+        // unequal equal-length peptide change and VEP reports missense.
+        let id = "ENST00000581825";
+        let pos = 75_629_084;
+        let ref_allele = "GATGCCAGCAGA";
+        let alt_allele = "TCTGCCTCTGGG";
+        let ref_cds = "NNTCTGCTGGCATCA";
+        let mut transcript = tx(
+            id,
+            "17",
+            pos,
+            pos + ref_allele.len() as i64 - 1,
+            -1,
+            "protein_coding",
+            Some(pos),
+            Some(pos + ref_allele.len() as i64 - 1),
+        );
+        transcript.translateable_seq = Some(ref_cds.to_string());
+        let exon = exon(id, 1, pos, pos + ref_allele.len() as i64 - 1);
+        let exons = [&exon];
+        let translation = translation(id, Some(15), Some(5), Some("XLLAS"), Some(ref_cds));
+        let variant = var(
+            "17",
+            pos,
+            pos + ref_allele.len() as i64 - 1,
+            ref_allele,
+            alt_allele,
+        );
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("golden record is coding");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("XLLAS"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("XPEAE"));
+        assert!(
+            class.missense,
+            "VEP 116 allows X-containing unequal peptides: {class:?}"
+        );
+    }
+
+    #[test]
+    fn issue_220_golden_x_peptides_keep_missense_for_2_232334660() {
+        // Golden ClinVar 854843, ENST00000418143: XV/XL is missense.
+        let id = "ENST00000418143";
+        let pos = 232_334_660;
+        let cds = "NNGGtg";
+        let mut transcript = tx(
+            id,
+            "2",
+            pos - 2,
+            pos + 1,
+            1,
+            "protein_coding",
+            Some(pos),
+            Some(pos + 1),
+        );
+        transcript.translateable_seq = Some(cds.to_string());
+        let exon = exon(id, 1, pos - 2, pos + 1);
+        let exons = [&exon];
+        let translation = translation(id, Some(6), Some(2), Some("XV"), Some(cds));
+        let variant = var("2", pos, pos + 1, "GG", "CT");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("golden record is coding");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("XV"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("XL"));
+        assert!(
+            class.missense,
+            "VEP 116 allows X-containing unequal peptides: {class:?}"
+        );
+    }
+
+    #[test]
+    fn issue_220_golden_x_peptides_keep_missense_for_5_35860925() {
+        // Golden ClinVar 640639, ENST00000515665: QX/HX remains missense;
+        // this X comes from the partial local peptide window, not partial_codon.
+        let id = "ENST00000515665";
+        let pos = 35_860_925;
+        let cds_prefix = "ATG".repeat(51);
+        let cds = format!("{cds_prefix}CAGC");
+        let transcript_start = pos - 155;
+        let mut transcript = tx(
+            id,
+            "5",
+            transcript_start,
+            pos + 1,
+            1,
+            "protein_coding",
+            Some(transcript_start),
+            Some(pos + 1),
+        );
+        transcript.translateable_seq = Some(cds.clone());
+        let exon = exon(id, 1, transcript_start, pos + 1);
+        let exons = [&exon];
+        let protein = format!("{}Q", "M".repeat(51));
+        let translation = translation(id, Some(cds.len()), Some(52), Some(&protein), Some(&cds));
+        let variant = var("5", pos, pos + 1, "GC", "TT");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("golden record is coding");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("QX"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("HX"));
+        assert!(
+            class.missense,
+            "VEP 116 allows X-containing unequal peptides: {class:?}"
+        );
+    }
+
+    #[test]
+    fn issue_220_golden_terminal_deletions_render_empty_alt_codons_as_dash() {
+        // Golden ClinVar 638055 (11:31789935) and 633614 (20:59877463).
+        for (reference, expected) in [("TTACAGT", "TTACAGT/-"), ("AAAAA", "AAAAA/-")] {
+            assert_eq!(vep_codon_allele_string(reference, ""), expected);
+        }
     }
 
     #[test]
