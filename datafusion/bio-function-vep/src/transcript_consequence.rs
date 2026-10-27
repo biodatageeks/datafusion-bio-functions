@@ -7286,8 +7286,6 @@ fn original_variation_maps_to_cds(
     tx_exons: &[&ExonFeature],
     variant: &VariantInput,
 ) -> bool {
-    let mapper =
-        vep_coords::VepTxMapper::new(tx, tx_exons, None, vep_coords::CdnaBaseMap::HgvspExact);
     let span = vep_coords::VepSpan::from_variant(variant);
 
     let Some((coding_start, coding_end)) = tx.cdna_coding_start.zip(tx.cdna_coding_end) else {
@@ -7326,6 +7324,8 @@ fn original_variation_maps_to_cds(
         });
     };
 
+    let mapper =
+        vep_coords::VepTxMapper::new(tx, tx_exons, None, vep_coords::CdnaBaseMap::HgvspExact);
     if span.is_insertion() {
         // `cds_coords()` maps insertion flanks as a constant-size operation.
         return mapper
@@ -33320,11 +33320,11 @@ mod tests {
             "ENSTCDSBOUNDSMISSING0001",
             "1",
             100,
-            109,
+            139,
             1,
             "protein_coding",
             Some(100),
-            Some(109),
+            Some(139),
         );
         let exons = [
             exon("ENSTCDSBOUNDSMISSING0001", 1, 100, 109),
@@ -33344,6 +33344,47 @@ mod tests {
             &exons_ref,
             &intronic_substitution
         ));
+    }
+
+    #[test]
+    fn missing_cdna_bounds_insertion_matches_mapper_at_exon_boundary() {
+        // VEP maps insertion flanks through TranscriptMapper and retains a
+        // mapped coordinate at a one-sided exon boundary; the legacy genomic
+        // CDS/exon fallback must agree when cDNA coding bounds are absent.
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L430-L475
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L519-L556
+        let mut with_cdna_bounds = tx(
+            "ENSTCDSINSERTBOUNDARY0001",
+            "1",
+            100,
+            139,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(139),
+        );
+        with_cdna_bounds.cdna_coding_start = Some(1);
+        with_cdna_bounds.cdna_coding_end = Some(20);
+        let mut legacy_without_cdna_bounds = with_cdna_bounds.clone();
+        legacy_without_cdna_bounds.cdna_coding_start = None;
+        legacy_without_cdna_bounds.cdna_coding_end = None;
+
+        let exons = vec![
+            exon("ENSTCDSINSERTBOUNDARY0001", 1, 100, 109),
+            exon("ENSTCDSINSERTBOUNDARY0001", 2, 130, 139),
+        ];
+        let exons_ref = exons.iter().collect::<Vec<_>>();
+        let exon_boundary_insertion = var("1", 110, 109, "-", "A");
+
+        let source_bounds_result =
+            original_variation_maps_to_cds(&with_cdna_bounds, &exons_ref, &exon_boundary_insertion);
+        let legacy_result = original_variation_maps_to_cds(
+            &legacy_without_cdna_bounds,
+            &exons_ref,
+            &exon_boundary_insertion,
+        );
+        assert!(source_bounds_result);
+        assert_eq!(legacy_result, source_bounds_result);
     }
 
     #[test]
