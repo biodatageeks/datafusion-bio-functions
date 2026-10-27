@@ -18586,82 +18586,121 @@ mod tests {
 
     #[test]
     fn issue_215_spliced_hgvsp_keeps_endpoint_mapper_provenance() {
-        let cds = "ATG".repeat(8);
-        let mut transcript = tx(
-            "NM_215_MAPPED_TEST.1",
-            "22",
-            100,
-            211,
-            1,
-            "protein_coding",
-            Some(100),
-            Some(211),
-        );
-        transcript.source = Some("RefSeq".to_string());
-        transcript.bam_edit_status = Some("ok".to_string());
-        transcript.cdna_coding_start = Some(6);
-        transcript.cdna_coding_end = Some(29);
-        transcript.translateable_seq = Some(cds.clone());
-        // This upstream insertion is already present in the cached mapper
-        // coordinates for both coding endpoints.
-        transcript.refseq_edits = vec![RefSeqEdit {
-            start: 2,
-            end: 1,
-            replacement_len: Some(5),
-            skip_refseq_offset: false,
-        }];
-        transcript.cdna_mapper_segments = vec![
-            TranscriptCdnaMapperSegment {
-                genomic_start: 100,
-                genomic_end: 111,
-                cdna_start: 6,
-                cdna_end: 17,
-                ori: 1,
-            },
-            TranscriptCdnaMapperSegment {
-                genomic_start: 200,
-                genomic_end: 211,
-                cdna_start: 18,
-                cdna_end: 29,
-                ori: 1,
-            },
-        ];
-        let exons = [
-            exon("NM_215_MAPPED_TEST.1", 1, 100, 111),
-            exon("NM_215_MAPPED_TEST.1", 2, 200, 211),
-        ];
-        let exon_refs = exons.iter().collect::<Vec<_>>();
-        let tr = translation(
-            "NM_215_MAPPED_TEST.1",
-            Some(24),
-            Some(8),
-            Some(&"M".repeat(8)),
-            Some(&cds),
-        );
-        let deletion = var("22", 106, 205, &"N".repeat(100), "-");
+        for strand in [1, -1] {
+            let cds = "ATG".repeat(8);
+            let mut transcript = tx(
+                "NM_215_MAPPED_TEST.1",
+                "22",
+                100,
+                211,
+                strand,
+                "protein_coding",
+                Some(100),
+                Some(211),
+            );
+            transcript.source = Some("RefSeq".to_string());
+            transcript.bam_edit_status = Some("ok".to_string());
+            transcript.cdna_coding_start = Some(6);
+            transcript.cdna_coding_end = Some(29);
+            transcript.translateable_seq = Some(cds.clone());
+            // This upstream insertion is already present in the cached mapper
+            // coordinates for both coding endpoints.
+            transcript.refseq_edits = vec![RefSeqEdit {
+                start: 2,
+                end: 1,
+                replacement_len: Some(5),
+                skip_refseq_offset: false,
+            }];
+            let (segments, exons, start_endpoint_pos, end_endpoint_pos) = if strand > 0 {
+                (
+                    vec![
+                        TranscriptCdnaMapperSegment {
+                            genomic_start: 100,
+                            genomic_end: 111,
+                            cdna_start: 6,
+                            cdna_end: 17,
+                            ori: strand,
+                        },
+                        TranscriptCdnaMapperSegment {
+                            genomic_start: 200,
+                            genomic_end: 211,
+                            cdna_start: 18,
+                            cdna_end: 29,
+                            ori: strand,
+                        },
+                    ],
+                    [
+                        exon("NM_215_MAPPED_TEST.1", 1, 100, 111),
+                        exon("NM_215_MAPPED_TEST.1", 2, 200, 211),
+                    ],
+                    106,
+                    205,
+                )
+            } else {
+                (
+                    vec![
+                        TranscriptCdnaMapperSegment {
+                            genomic_start: 200,
+                            genomic_end: 211,
+                            cdna_start: 6,
+                            cdna_end: 17,
+                            ori: strand,
+                        },
+                        TranscriptCdnaMapperSegment {
+                            genomic_start: 100,
+                            genomic_end: 111,
+                            cdna_start: 18,
+                            cdna_end: 29,
+                            ori: strand,
+                        },
+                    ],
+                    [
+                        exon("NM_215_MAPPED_TEST.1", 1, 200, 211),
+                        exon("NM_215_MAPPED_TEST.1", 2, 100, 111),
+                    ],
+                    205,
+                    106,
+                )
+            };
+            transcript.cdna_mapper_segments = segments;
+            let exon_refs = exons.iter().collect::<Vec<_>>();
+            let tr = translation(
+                "NM_215_MAPPED_TEST.1",
+                Some(24),
+                Some(8),
+                Some(&"M".repeat(8)),
+                Some(&cds),
+            );
+            let deletion = var("22", 106, 205, &"N".repeat(100), "-");
 
-        let shifted = shifted_tva_coords_from_mapper(&transcript, &exon_refs, &tr, &deletion)
-            .expect("mapped spliced endpoints remain available for HGVSp");
-        let left_endpoint = shifted_tva_coords_from_mapper(
-            &transcript,
-            &exon_refs,
-            &tr,
-            &var("22", 106, 106, "N", "A"),
-        )
-        .expect("left endpoint has exact mapper provenance");
-        let right_endpoint = shifted_tva_coords_from_mapper(
-            &transcript,
-            &exon_refs,
-            &tr,
-            &var("22", 205, 205, "N", "A"),
-        )
-        .expect("right endpoint has exact mapper provenance");
+            let shifted = shifted_tva_coords_from_mapper(&transcript, &exon_refs, &tr, &deletion)
+                .expect("mapped spliced endpoints remain available for HGVSp");
+            let start_endpoint = shifted_tva_coords_from_mapper(
+                &transcript,
+                &exon_refs,
+                &tr,
+                &var("22", start_endpoint_pos, start_endpoint_pos, "N", "A"),
+            )
+            .expect("transcript-order start endpoint has exact mapper provenance");
+            let end_endpoint = shifted_tva_coords_from_mapper(
+                &transcript,
+                &exon_refs,
+                &tr,
+                &var("22", end_endpoint_pos, end_endpoint_pos, "N", "A"),
+            )
+            .expect("transcript-order end endpoint has exact mapper provenance");
 
-        assert_eq!(
-            (shifted.cds_start, shifted.cds_end),
-            (left_endpoint.cds_start, right_endpoint.cds_end)
-        );
-        assert_eq!((shifted.cds_start, shifted.cds_end), (7, 18));
+            assert_eq!(
+                (shifted.cds_start, shifted.cds_end),
+                (start_endpoint.cds_start, end_endpoint.cds_end),
+                "strand {strand}"
+            );
+            assert_eq!(
+                (shifted.cds_start, shifted.cds_end),
+                (7, 18),
+                "strand {strand}"
+            );
+        }
     }
 
     #[test]
