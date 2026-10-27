@@ -7925,19 +7925,19 @@ fn shifted_hgvsp_frameshift_for_output(
     ref_peptide: &str,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> bool {
+    // VEP 116's `stop_retained()` returns before the length test and forces a
+    // non-frameshift result. Pass the original consequence's cached result
+    // through: shifting the TVA can change the classification even though
+    // OutputFactory keeps the consequence made before HGVSp formatting.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1324
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
     // The consequence classifier already evaluated VEP's complete frameshift
     // predicate on this transcript/variant. The shifted HGVSp peptide window
     // can begin at the stop codon even when that source classification is a
     // frameshift; reducing it to the first residue loses the CDS-boundary,
     // partial-codon, stop-retained, and allele-length checks in VariationEffect.
     // Only use the local stop rule when no consequence classification exists.
-    // `stop_retained()` also returns before the length test and forces a
-    // non-frameshift result. Pass the original consequence's cached result
-    // through: shifting the TVA can change the classification even though
-    // OutputFactory keeps the consequence made before HGVSp formatting.
-    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1324
-    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
-    let raw_frameshift = if source_stop_retained {
+    let raw_frameshift = if semantics.vep116_stop_predicates() && source_stop_retained {
         false
     } else if let Some(protein) = fallback {
         protein.frameshift
@@ -33702,6 +33702,65 @@ mod tests {
                 crate::vep_semantics::VepSemantics::V116,
             ),
             "VEP stop_retained suppresses frameshift even when the mapped CDS delta is non-triplet"
+        );
+    }
+
+    #[test]
+    fn v116_source_stop_retained_overrides_fallback_but_v115_does_not() {
+        let mut source_classification = star_star_fallback();
+        source_classification.frameshift = true;
+
+        assert!(!shifted_hgvsp_frameshift_for_output(
+            Some(&source_classification),
+            true,
+            1,
+            206,
+            0,
+            "I",
+            crate::vep_semantics::VepSemantics::V116,
+        ));
+        assert!(shifted_hgvsp_frameshift_for_output(
+            Some(&source_classification),
+            true,
+            1,
+            206,
+            0,
+            "I",
+            crate::vep_semantics::VepSemantics::V115,
+        ));
+    }
+
+    #[test]
+    fn shifted_hgvsp_output_formats_source_stop_retained_through_the_real_path() {
+        let (transcript, exons, translation) = star_insertion_fixture();
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let variant = star_insertion_variant(177, "T", "TA", 1, "A");
+        let mut source_classification = star_star_fallback();
+        source_classification.frameshift = true;
+
+        let protein = protein_hgvs_for_output_with_semantics(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            true,
+            Some((20, 20)),
+            Some(&source_classification),
+            true,
+            crate::vep_semantics::VepSemantics::V116,
+            true,
+        )
+        .expect("shifted stop-retained HGVSp");
+
+        assert!(!protein.frameshift);
+        assert_eq!(
+            crate::hgvs::format_hgvsp(
+                &translation_for_hgvsp(&transcript, &translation),
+                &protein,
+                true
+            )
+            .as_deref(),
+            Some("ENSPSTARINS0001.1:p.Ter20=")
         );
     }
 
