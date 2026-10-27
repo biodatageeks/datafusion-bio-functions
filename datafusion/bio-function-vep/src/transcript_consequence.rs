@@ -3567,33 +3567,44 @@ impl TranscriptConsequenceEngine {
         }
 
         if self.overlaps_start_codon(variant, tx, tx_exons) {
-            if is_start_codon(&variant.ref_allele) && is_start_codon(&variant.alt_allele) {
+            if self.semantics.vep116_stop_predicates() {
+                let ref_len = normalize_allele_seq(&variant.ref_allele).len();
+                let alt_len = normalize_allele_seq(&variant.alt_allele).len();
+                let unambiguous = crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele);
+                let altered_by_indel = ref_len != alt_len
+                    && unambiguous
+                    && ins_del_start_altered(tx, tx_exons, variant, cds_seq).unwrap_or(false);
+                let start_retained = if ref_len == 1 && alt_len == 1 {
+                    cds_seq
+                        .and_then(|cds| mutated_cds_first3(cds, variant, tx, tx.cds_start?))
+                        .is_some_and(|codon| codon.eq_ignore_ascii_case("ATG"))
+                } else {
+                    !altered_by_indel
+                };
+                if start_retained {
+                    terms.insert(SoTerm::StartRetainedVariant);
+                }
+                // This path has no CodingClassification, so it cannot evaluate
+                // VEP's inframe children or final peptide guard. Do not replace
+                // those source predicates with a length-delta guess; the
+                // independent `_inv_start_altered()` clause remains decidable.
+                // VariationEffect.pm:870-882, 906-945.
+                if vep116_inv_start_altered(tx, tx_exons, variant, cds_seq) {
+                    terms.insert(SoTerm::StartLost);
+                }
+            } else if is_start_codon(&variant.ref_allele) && is_start_codon(&variant.alt_allele) {
                 terms.insert(SoTerm::StartRetainedVariant);
             } else {
                 let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
                 let is_indel = ref_len != alt_len;
 
-                // VEP's _ins_del_start_altered works in cDNA space (5'UTR +
-                // CDS combined) to check if ATG is preserved at the original
-                // CDS-start position. start_retained = !altered.
-                // start_lost can CO-OCCUR with start_retained for frameshifts:
-                // VEP's peptide-level check fires start_lost when the full
-                // affected peptide range differs from the reference.
-                //
-                // Traceability:
-                // - _ins_del_start_altered:
-                //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L990-L1022>
-                // - start_retained_variant = !_ins_del_start_altered:
-                //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L947-L962>
-                // - start_lost peptide check:
-                //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L872-L882>
+                // V115 compatibility path. The V116 implementation above
+                // follows VariationEffect.pm:870-962 at the pinned source.
                 if is_indel {
                     let is_frameshift = !ref_len.abs_diff(alt_len).is_multiple_of(3);
                     match ins_del_start_altered(tx, tx_exons, variant, cds_seq) {
                         Some(false) => {
-                            // ATG preserved at CDS-start → start_retained
                             terms.insert(SoTerm::StartRetainedVariant);
-                            // Frameshift: VEP peptide check co-fires start_lost
                             if is_frameshift {
                                 terms.insert(SoTerm::StartLost);
                             }
@@ -3602,7 +3613,6 @@ impl TranscriptConsequenceEngine {
                             terms.insert(SoTerm::StartLost);
                         }
                         None => {
-                            // No cDNA data — fall back to mutated_cds_first3
                             if cds_seq.is_some_and(|s| s.len() >= 3) {
                                 let cds = cds_seq.unwrap();
                                 let cds_start = tx.cds_start.unwrap_or(0);
@@ -3617,7 +3627,6 @@ impl TranscriptConsequenceEngine {
                                     terms.insert(SoTerm::StartLost);
                                 }
                             } else {
-                                // No CDS sequence: position-based fallback.
                                 let start_codon_end = if tx.strand >= 0 {
                                     tx.cds_start.unwrap_or(0) + 2
                                 } else {
@@ -5736,15 +5745,14 @@ fn frameshift_under_semantics(
                     .is_some_and(|peptide| peptide.starts_with('*'))))
 }
 
-#[must_use = "use the class wrapper to keep classification.start_lost in sync"]
 fn apply_vep116_primary_indel_predicates(
     terms: &mut BTreeSet<SoTerm>,
     class: &CodingClassification,
     semantics: crate::vep_semantics::VepSemantics,
     partial_terminal_codon: bool,
-) -> bool {
+) {
     if !semantics.vep116_stop_predicates() {
-        return false;
+        return;
     }
     let ref_peptide = class.affected_ref_peptide.as_deref();
     let alt_peptide = class.affected_alt_peptide.as_deref();
@@ -5760,24 +5768,10 @@ fn apply_vep116_primary_indel_predicates(
     }
 
     let frameshift = terms.contains(&SoTerm::FrameshiftVariant);
-    let mut resolved_class = class.clone();
-    let mut resolved_start_lost = false;
-    if !frameshift && resolved_class.start_lost {
-        // Ensembl's start_lost predicate asks both inframe predicates while
-        // its cached result is still false, then checks whether the reference
-        // peptide remains at either end of the alternate peptide. Mirror both
-        // steps before keeping the provisional start_lost result.
-        resolved_class.start_lost = false;
-        let inframe_child = vep116_inframe_insertion(&resolved_class)
-            || vep116_inframe_deletion(&resolved_class, partial_terminal_codon);
-        if inframe_child && vep116_start_lost_from_peptide_alleles(&resolved_class) == Some(false) {
-            terms.remove(&SoTerm::StartLost);
-            resolved_start_lost = true;
-        } else {
-            resolved_class.start_lost = true;
-        }
-    }
-    let class = &resolved_class;
+    // start_lost has already followed VEP's ordered nucleotide, inversion,
+    // and peptide predicates in the coding classifier. Child inframe terms
+    // must therefore observe the final cached result, as VariationEffect.pm
+    // does after start_lost() returns.
     let inframe_insertion = !frameshift && vep116_inframe_insertion(class);
     if inframe_insertion {
         terms.insert(SoTerm::InframeInsertion);
@@ -5800,7 +5794,6 @@ fn apply_vep116_primary_indel_predicates(
     if ref_peptide == Some("*") {
         terms.remove(&SoTerm::InframeDeletion);
     }
-    resolved_start_lost
 }
 
 fn apply_vep116_primary_indel_predicates_to_class(
@@ -5809,12 +5802,7 @@ fn apply_vep116_primary_indel_predicates_to_class(
     semantics: crate::vep_semantics::VepSemantics,
     partial_terminal_codon: bool,
 ) {
-    if apply_vep116_primary_indel_predicates(terms, class, semantics, partial_terminal_codon) {
-        // Keep the classification that flows into PAV and HGVS in sync with
-        // the resolved consequence terms; otherwise later predicates can
-        // observe the provisional start_lost value.
-        class.start_lost = false;
-    }
+    apply_vep116_primary_indel_predicates(terms, class, semantics, partial_terminal_codon);
 }
 
 /// Ensembl Variation 116 `inframe_insertion()` predicate.
@@ -5940,6 +5928,9 @@ fn vep116_start_lost_from_peptide_alleles(class: &CodingClassification) -> Optio
     ) else {
         return None;
     };
+    // VariationEffect::_get_peptide_alleles() converts "-" to an empty string
+    // before start_lost() applies its Perl truthiness guards.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L772-L791
     let ref_peptide = if ref_peptide == "-" { "" } else { ref_peptide };
     let alt_peptide = if alt_peptide == "-" { "" } else { alt_peptide };
     if ref_peptide.is_empty() || alt_peptide.is_empty() || alt_peptide == "X" {
@@ -8785,30 +8776,20 @@ fn classify_coding_change_with_semantics(
         translate_protein_for_coding_classification(tx.codon_table, &mutated, variant, semantics)?;
     let mut class = CodingClassification::default();
 
-    // Start codon logic: gate on cds_start_nf flag. VEP's
-    // _overlaps_start_codon returns 0 for cds_start_NF transcripts,
-    // blocking both start_lost and start_retained_variant.
-    //
-    // start_lost and start_retained CAN co-fire for the same allele:
-    // - start_retained = !_snp_start_altered(): checks if mutated codon
-    //   is ATG (nucleotide-level). Fires when new AA is Met.
-    // - start_lost: peptide-level check at translation_start==1. Fires
-    //   when AA at position 1 changed (even if new codon is ATG).
-    // Example: V→M at non-standard start codon (GTG→ATG) fires both.
-    //
-    // Traceability:
-    // - _overlaps_start_codon cds_start_NF gate:
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L975>
-    // - start_lost peptide check:
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L872-L882>
-    // - _snp_start_altered (checks mutated codon == "ATG"):
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L992-L1026>
-    // - start_retained_variant = !_snp_start_altered for SNPs:
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L958>
-    // start_idx < 3: variant touches at least one of CDS positions 0, 1, 2
-    // (the start codon). Unlike the insertion path (cds_idx < 2), SNVs and
-    // deletions at position 2 DO overlap the start codon.
-    if start_idx < 3 && !tx.cds_start_nf {
+    // VEP 116's ordered start_lost predicate is applied after local codons and
+    // peptides are populated; the nucleotide start-retained result is set
+    // before the child in-frame predicates are evaluated.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L962
+    if semantics.vep116_stop_predicates() && vep116_codon_overlap(tx, tx_exons, variant, true) {
+        class.start_retained = vep116_start_retained_variant(
+            tx,
+            tx_exons,
+            variant,
+            &mutated,
+            leading_n_offset,
+            Some(cds_seq.as_str()),
+        );
+    } else if !semantics.vep116_stop_predicates() && start_idx < 3 && !tx.cds_start_nf {
         // 1. Codon level (works for SNVs and as fallback for indels). VEP
         //    compares the mutated codon with the literal "ATG", so under
         //    table 2 an ATA start (also Met) is not start_retained.
@@ -9357,6 +9338,20 @@ fn classify_coding_change_with_semantics(
         }
     }
 
+    if semantics.vep116_stop_predicates() {
+        class.start_lost = vep116_start_lost_from_predicates(
+            &class,
+            tx,
+            tx_exons,
+            variant,
+            Some(cds_seq.as_str()),
+            partial_terminal_codon,
+        );
+        if class.start_lost {
+            class.missense = false;
+        }
+    }
+
     if !class.stop_lost && frameshift && alt_len < ref_len {
         if class
             .codons
@@ -9782,40 +9777,52 @@ fn classify_insertion_with_semantics_and_gap(
         false
     };
     if overlaps_start && !tx.cds_start_nf {
-        // 1. Codon level: the literal "ATG", as in the SNV path.
-        if mutated_cds_starts_with_atg(&mutated) {
-            class.start_retained = true;
-        }
-        if old_aas.first() != new_aas.first() {
-            class.start_lost = true;
-        }
-        // 2. Nucleotide level: VEP's _ins_del_start_altered in cDNA space
-        match ins_del_start_altered(tx, tx_exons, variant, Some(cds_seq)) {
-            Some(false) => {
+        if semantics.vep116_stop_predicates() {
+            class.start_retained = vep116_start_retained_variant(
+                tx,
+                tx_exons,
+                variant,
+                &mutated,
+                leading_n_offset,
+                Some(cds_seq),
+            );
+        } else {
+            // 1. Codon level: the literal "ATG", as in the SNV path.
+            if mutated_cds_starts_with_atg(&mutated) {
                 class.start_retained = true;
-                if !alt_len.is_multiple_of(3) {
-                    class.start_lost = true;
-                }
             }
-            Some(true) => {
-                if !alt_len.is_multiple_of(3) {
-                    class.start_lost = true;
-                }
+            if old_aas.first() != new_aas.first() {
+                class.start_lost = true;
             }
-            None => {
-                // No cDNA data — check the mutated CDS vector directly.
-                //
-                // Traceability:
-                // - VEP _ins_del_start_altered:
-                //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1005-L1010>
-                // - VEP start_retained_variant = !_ins_del_start_altered:
-                //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L957-L962>
-                if mutated.len() >= leading_n_offset + 3
-                    && mutated[leading_n_offset..leading_n_offset + 3].eq_ignore_ascii_case(b"ATG")
-                {
+            // 2. Nucleotide level: VEP's _ins_del_start_altered in cDNA space
+            match ins_del_start_altered(tx, tx_exons, variant, Some(cds_seq)) {
+                Some(false) => {
                     class.start_retained = true;
                     if !alt_len.is_multiple_of(3) {
                         class.start_lost = true;
+                    }
+                }
+                Some(true) => {
+                    if !alt_len.is_multiple_of(3) {
+                        class.start_lost = true;
+                    }
+                }
+                None => {
+                    // No cDNA data — check the mutated CDS vector directly.
+                    //
+                    // Traceability:
+                    // - VEP _ins_del_start_altered:
+                    //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1005-L1010>
+                    // - VEP start_retained_variant = !_ins_del_start_altered:
+                    //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L957-L962>
+                    if mutated.len() >= leading_n_offset + 3
+                        && mutated[leading_n_offset..leading_n_offset + 3]
+                            .eq_ignore_ascii_case(b"ATG")
+                    {
+                        class.start_retained = true;
+                        if !alt_len.is_multiple_of(3) {
+                            class.start_lost = true;
+                        }
                     }
                 }
             }
@@ -10228,6 +10235,17 @@ fn classify_insertion_with_semantics_and_gap(
             class.codons = Some(format!("{ref_codon}/{alt_codon}"));
         }
     }
+    if semantics.vep116_stop_predicates() {
+        class.start_lost = vep116_start_lost_from_predicates(
+            &class,
+            tx,
+            tx_exons,
+            variant,
+            Some(cds_seq),
+            partial_terminal_codon_v116,
+        );
+    }
+
     if replace_refseq_mapper_gap
         && let (Some(ref_peptide), Some(alt_peptide)) = (
             class.affected_ref_peptide.as_deref(),
@@ -10340,9 +10358,8 @@ fn start_codon_context<'a>(
 /// sequence, CDS-only `cdna_seq`, no cdna_coding_start, or variant can't be
 /// mapped to cDNA coordinates).
 ///
-/// Traceability:
-/// - VEP `_ins_del_start_altered`:
-///   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
+/// Ensembl Variation 2fb834b, VariationEffect.pm:1028-1075:
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1028-L1075
 fn ins_del_start_altered(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -10370,21 +10387,18 @@ fn ins_del_start_altered(
     // is therefore `cdna_start - 1`, exactly as VariationEffect.pm:1028-1058
     // splices at `$cdna_start - 1` with a zero-length REF span.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1028-L1058
+    let mapper =
+        vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, 0);
+    let (cdna_start, cdna_end) = mapper
+        .cdna(vep_coords::VepSpan::from_variant(variant))
+        .both_truthy()?;
     let (cdna_min, cdna_max) = if is_ins {
-        let mapper =
-            vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, 0);
-        let span = vep_coords::VepSpan::from_variant(variant);
-        let (cdna_start, _cdna_end) = mapper.cdna(span).both_truthy()?;
         let insertion_index = cdna_start.checked_sub(1)?;
         (insertion_index, insertion_index)
     } else {
-        // genomic_to_cdna_index_for_transcript returns 1-based indices;
-        // convert to 0-based for byte-level string operations.
-        let cdna_start =
-            genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start)?.checked_sub(1)?;
-        let cdna_end =
-            genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.end)?.checked_sub(1)?;
-        (cdna_start.min(cdna_end), cdna_start.max(cdna_end))
+        // VEP's mapped non-insertion endpoints are transcript-ordered and
+        // one-based. Use `end` as the exclusive Rust splice boundary.
+        (cdna_start.checked_sub(1)?, cdna_end)
     };
 
     // Build alt allele in transcript orientation.
@@ -10415,7 +10429,7 @@ fn ins_del_start_altered(
         }
         mutated.extend_from_slice(&seq_bytes[..cdna_min]);
         mutated.extend_from_slice(&alt_bytes);
-        let after = (cdna_max + 1).min(seq_bytes.len());
+        let after = cdna_max.min(seq_bytes.len());
         mutated.extend_from_slice(&seq_bytes[after..]);
     }
 
@@ -10440,6 +10454,191 @@ fn ins_del_start_altered(
 
     let translated_suffix = &mutated[mutated.len() - translateable.len()..];
     Some(!translated_suffix.eq_ignore_ascii_case(translateable.as_bytes()))
+}
+
+/// VEP 116 `_inv_start_altered()` replays a sequence allele in mapped cDNA
+/// space and tests the triplet at the original CDS start. This is independent
+/// of the length-changing `_ins_del_start_altered()` clause.
+///
+/// Ensembl Variation 2fb834b, VariationEffect.pm:906-945:
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+fn vep116_inv_start_altered(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+    translateable_seq: Option<&str>,
+) -> bool {
+    if !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
+        || !vep116_codon_overlap(tx, tx_exons, variant, true)
+    {
+        return false;
+    }
+
+    let Some((Some(utr), translateable)) = start_codon_context(tx, translateable_seq) else {
+        return false;
+    };
+    let mapper =
+        vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, 0);
+    let Some((cdna_start, cdna_end)) = mapper
+        .cdna(vep_coords::VepSpan::from_variant(variant))
+        .both_truthy()
+    else {
+        return false;
+    };
+    // `_inv_start_altered()` applies the shift hash's cDNA offset after
+    // retrieving the unshifted mapper endpoints (VariationEffect.pm:928-930).
+    let shifting_offset = variant
+        .hgvs_shift_for_strand(tx.strand)
+        .and_then(|shift| i64::try_from(shift.shift_length).ok())
+        .unwrap_or(0);
+    let Some(cdna_start) = i64::try_from(cdna_start)
+        .ok()
+        .and_then(|start| start.checked_add(shifting_offset))
+        .and_then(|start| usize::try_from(start).ok())
+    else {
+        return false;
+    };
+    let Some(cdna_end) = i64::try_from(cdna_end)
+        .ok()
+        .and_then(|end| end.checked_add(shifting_offset))
+        .and_then(|end| usize::try_from(end).ok())
+    else {
+        return false;
+    };
+    let utr_and_translateable_len = utr.len().saturating_add(translateable.len());
+    if cdna_end > utr_and_translateable_len {
+        return false;
+    }
+
+    let start = cdna_start.saturating_sub(1);
+    let replaced_len = if cdna_end >= cdna_start {
+        cdna_end - cdna_start + 1
+    } else {
+        0
+    };
+    let Some(end) = start.checked_add(replaced_len) else {
+        return false;
+    };
+    if end > utr_and_translateable_len {
+        return false;
+    }
+
+    let alt = normalize_allele_seq(&variant.alt_allele);
+    let alt = if tx.strand >= 0 {
+        alt.to_ascii_uppercase()
+    } else {
+        let Some(alt) = reverse_complement(&alt) else {
+            return false;
+        };
+        alt.to_ascii_uppercase()
+    };
+    let mut mutated = Vec::with_capacity(utr_and_translateable_len - replaced_len + alt.len());
+    mutated.extend_from_slice(utr.as_bytes());
+    mutated.extend_from_slice(translateable.as_bytes());
+    mutated.splice(start..end, alt.bytes());
+
+    let atg_start = utr.len();
+    mutated
+        .get(atg_start..atg_start.saturating_add(3))
+        .is_none_or(|codon| codon != b"ATG")
+}
+
+/// Compute the VEP 116 start_lost result after its local peptide/codon inputs
+/// are available. VEP tries the length-changing nucleotide predicate first,
+/// then `_inv_start_altered()`, then the guarded peptide clause.
+///
+/// Ensembl Variation 2fb834b, VariationEffect.pm:870-882:
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+fn vep116_start_lost_from_predicates(
+    class: &CodingClassification,
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+    translateable_seq: Option<&str>,
+    partial_terminal_codon: bool,
+) -> bool {
+    if !vep116_codon_overlap(tx, tx_exons, variant, true) {
+        return false;
+    }
+
+    let ref_len = normalize_allele_seq(&variant.ref_allele).len();
+    let alt_len = normalize_allele_seq(&variant.alt_allele).len();
+    let unambiguous = crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele);
+    let altered_by_indel = ref_len != alt_len
+        && unambiguous
+        && ins_del_start_altered(tx, tx_exons, variant, translateable_seq).unwrap_or(false);
+
+    // start_lost() enters inframe_insertion/deletion while its cache still
+    // contains the default false value. Those child predicates therefore see
+    // this clean copy, before the result below is cached on the class.
+    let mut start_lost_cache_view = class.clone();
+    start_lost_cache_view.start_lost = false;
+    let frameshift = frameshift_under_semantics(
+        !ref_len.abs_diff(alt_len).is_multiple_of(3),
+        class,
+        crate::vep_semantics::VepSemantics::V116,
+        partial_terminal_codon,
+    );
+    let inframe = !frameshift
+        && (vep116_inframe_insertion(&start_lost_cache_view)
+            || vep116_inframe_deletion(&start_lost_cache_view, partial_terminal_codon));
+
+    if altered_by_indel && !inframe {
+        return true;
+    }
+    if unambiguous && vep116_inv_start_altered(tx, tx_exons, variant, translateable_seq) {
+        return true;
+    }
+
+    let phase = translateable_seq
+        .map(|seq| {
+            seq.bytes()
+                .take_while(|&base| base == b'N' || base == b'n')
+                .count()
+        })
+        .unwrap_or(0);
+    let mapper =
+        vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, phase);
+    mapper
+        .translation(vep_coords::VepSpan::from_variant(variant))
+        .start
+        == Some(1)
+        && vep116_start_lost_from_peptide_alleles(class) == Some(true)
+}
+
+/// VEP 116 `start_retained_variant()` uses `_snp_start_altered()` for an SNP,
+/// and otherwise negates `_ins_del_start_altered()`. Missing mapped endpoints
+/// leave that latter predicate false.
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L947-L962
+fn vep116_start_retained_variant(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+    mutated_cds: &[u8],
+    leading_n_offset: usize,
+    translateable_seq: Option<&str>,
+) -> bool {
+    if !vep116_codon_overlap(tx, tx_exons, variant, true) {
+        return false;
+    }
+    let ref_len = normalize_allele_seq(&variant.ref_allele).len();
+    let alt_len = normalize_allele_seq(&variant.alt_allele).len();
+    if ref_len == 1 && alt_len == 1 {
+        // `_snp_start_altered()` returns false for ambiguous alleles, so its
+        // negated start_retained_variant predicate is true.
+        if !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele) {
+            return true;
+        }
+        return mutated_cds
+            .get(leading_n_offset..leading_n_offset.saturating_add(3))
+            .is_some_and(|codon| codon.eq_ignore_ascii_case(b"ATG"));
+    }
+    let altered = ref_len != alt_len
+        && crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
+        && translateable_seq.is_some_and(|seq| {
+            ins_del_start_altered(tx, tx_exons, variant, Some(seq)).unwrap_or(false)
+        });
+    !altered
 }
 
 /// Build the first 3 bases of the mutated CDS for an indel near the start
@@ -13641,13 +13840,13 @@ mod tests {
         };
         let mut v115 = BTreeSet::from([SoTerm::InframeInsertion]);
         let mut v116 = v115.clone();
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut v115,
             &class,
             crate::vep_semantics::VepSemantics::V115,
             false,
         );
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut v116,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -13682,15 +13881,14 @@ mod tests {
     }
 
     #[test]
-    fn vep116_start_lost_yields_to_valid_inframe_insertion() {
+    fn vep116_inframe_insertion_uses_cached_start_lost_result() {
         let mut class = CodingClassification {
-            start_lost: true,
             codons: Some("atg/GCTATG".to_string()),
             affected_ref_peptide: Some("M".to_string()),
             affected_alt_peptide: Some("AM".to_string()),
             ..Default::default()
         };
-        let mut terms = BTreeSet::from([SoTerm::StartLost, SoTerm::InframeInsertion]);
+        let mut terms = BTreeSet::from([SoTerm::InframeInsertion]);
 
         apply_vep116_primary_indel_predicates_to_class(
             &mut terms,
@@ -13699,8 +13897,6 @@ mod tests {
             false,
         );
 
-        assert!(!class.start_lost);
-        assert!(!terms.contains(&SoTerm::StartLost));
         assert!(terms.contains(&SoTerm::InframeInsertion));
     }
 
@@ -13728,15 +13924,14 @@ mod tests {
     }
 
     #[test]
-    fn vep116_start_lost_yields_to_inframe_deletion_when_peptide_is_retained() {
+    fn vep116_inframe_deletion_uses_peptide_retention_after_start_predicates() {
         let mut class = CodingClassification {
-            start_lost: true,
             codons: Some("ATGATG/ATG".to_string()),
             affected_ref_peptide: Some("M".to_string()),
             affected_alt_peptide: Some("M".to_string()),
             ..Default::default()
         };
-        let mut terms = BTreeSet::from([SoTerm::StartLost, SoTerm::InframeDeletion]);
+        let mut terms = BTreeSet::from([SoTerm::InframeDeletion]);
 
         apply_vep116_primary_indel_predicates_to_class(
             &mut terms,
@@ -13745,8 +13940,6 @@ mod tests {
             false,
         );
 
-        assert!(!class.start_lost);
-        assert!(!terms.contains(&SoTerm::StartLost));
         assert!(terms.contains(&SoTerm::InframeDeletion));
     }
 
@@ -13781,7 +13974,7 @@ mod tests {
             ..Default::default()
         };
         let mut terms = BTreeSet::from([SoTerm::InframeInsertion]);
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -13796,7 +13989,7 @@ mod tests {
             ..Default::default()
         };
         let mut valid_terms = BTreeSet::from([SoTerm::InframeInsertion]);
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut valid_terms,
             &valid,
             crate::vep_semantics::VepSemantics::V116,
@@ -13818,7 +14011,7 @@ mod tests {
         // VEP's partial_codon predicate vetoes frameshift_variant but does not
         // veto inframe_insertion. The codon and peptide predicate must still
         // add the insertion term after clearing the raw length-based term.
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -13839,7 +14032,7 @@ mod tests {
         };
         let mut terms = BTreeSet::from([SoTerm::FrameshiftVariant]);
 
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -13860,7 +14053,7 @@ mod tests {
             ..Default::default()
         };
         let mut terms = BTreeSet::from([SoTerm::InframeInsertion]);
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -13878,13 +14071,13 @@ mod tests {
         };
         let mut v115 = BTreeSet::from([SoTerm::InframeDeletion]);
         let mut v116 = v115.clone();
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut v115,
             &class,
             crate::vep_semantics::VepSemantics::V115,
             false,
         );
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut v116,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -13898,7 +14091,7 @@ mod tests {
     fn vep116_partial_codon_vetoes_only_its_guarded_indel_predicates() {
         let class = CodingClassification::default();
         let mut terms = BTreeSet::from([SoTerm::FrameshiftVariant, SoTerm::InframeDeletion]);
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
@@ -13915,7 +14108,7 @@ mod tests {
             ..Default::default()
         };
         let mut insertion_terms = BTreeSet::from([SoTerm::InframeInsertion]);
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut insertion_terms,
             &insertion,
             crate::vep_semantics::VepSemantics::V116,
@@ -24771,6 +24964,32 @@ mod tests {
         classify_coding_change(&t, &exons_ref, Some(&tr), &v)
     }
 
+    fn classify_deletion_with_cdna_v116(
+        utr_seq: &str,
+        cds_seq: &str,
+        del_start: i64,
+        del_end: i64,
+        ref_allele: &str,
+    ) -> Option<CodingClassification> {
+        let (tx, exons) = tx_with_cdna(utr_seq, cds_seq);
+        let exons: Vec<&ExonFeature> = exons.iter().collect();
+        let translation = translation(
+            "T1",
+            Some(cds_seq.len()),
+            Some(cds_seq.len() / 3),
+            None,
+            Some(cds_seq),
+        );
+        let variant = var("22", del_start, del_end, ref_allele, "-");
+        classify_coding_change_with_semantics(
+            &tx,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+    }
+
     fn classify_deletion_with_cds_only_cdna(
         utr_seq: &str,
         cds_seq: &str,
@@ -24787,49 +25006,150 @@ mod tests {
     }
 
     #[test]
-    fn issue_125_frameshift_deletion_preserving_atg_cofires_start_lost_and_retained() {
-        // Issue #125: chr1:152223252 AT>A pattern.
-        // Frameshift deletion AT the start codon that coincidentally preserves ATG.
-        //
-        // 5'UTR = "GCGC", CDS = "ATGGCTGAATGA"
-        // CDS layout: A(0) T(1) G(2) G(3) C(4) T(5) ...
-        // Delete "G" at CDS pos 2 (genomic 1006) → frameshift.
-        // Mutated CDS: "AT" + "GCTGAATGA" = "ATGCTGAATGA" → first 3 = "ATG" preserved!
-        // Amino acid level: old[0]=M, new[0]=M → start_lost=false from AA check.
-        // But ins_del_start_altered returns false (ATG preserved) + frameshift
-        // → nucleotide-level check co-fires start_lost alongside start_retained.
-        let c = classify_deletion_with_cdna("GCGC", "ATGGCTGAATGA", 1006, 1006, "G").unwrap();
+    fn issue_125_frameshift_deletion_preserving_atg_does_not_cofire_start_lost_v116() {
+        // VEP 116's first start_lost clause requires both an altered start and
+        // an out-of-frame allele. This deletion preserves ATG; its local
+        // peptide retains the reference peptide at an end, so the later
+        // peptide clause is false as well.
+        let c = classify_deletion_with_cdna_v116("GCGC", "ATGGCTGAATGA", 1006, 1006, "G").unwrap();
         assert!(
             c.start_retained,
-            "Frameshift preserving ATG: should emit start_retained. Got: start_retained={}, start_lost={}",
+            "ATG-preserving frameshift should emit start_retained. Got: start_retained={}, start_lost={}",
             c.start_retained, c.start_lost
         );
         assert!(
-            c.start_lost,
-            "Frameshift preserving ATG: should ALSO emit start_lost (VEP peptide check). Got: start_retained={}, start_lost={}",
-            c.start_retained, c.start_lost
+            !c.start_lost,
+            "VEP 116 must not infer start_lost from frameshift alone: {c:?}"
         );
     }
 
     #[test]
     fn issue_125_frameshift_deletion_with_cds_only_cdna_uses_cds_fallback() {
-        let c =
-            classify_deletion_with_cds_only_cdna("GCGC", "ATGGCTGAATGA", 1006, 1006, "G").unwrap();
+        let (tx, exons) = tx_with_cds_only_cdna("GCGC", "ATGGCTGAATGA");
+        let exons: Vec<&ExonFeature> = exons.iter().collect();
+        let translation = translation("T1", Some(12), Some(4), None, Some("ATGGCTGAATGA"));
+        let variant = var("22", 1006, 1006, "G", "-");
+        let c = classify_coding_change_with_semantics(
+            &tx,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .unwrap();
         assert!(
             c.start_retained,
             "CDS-only cache transcripts should still co-emit start_retained via CDS fallback"
         );
         assert!(
-            c.start_lost,
-            "Frameshift preserving ATG should still co-emit start_lost via peptide logic"
+            !c.start_lost,
+            "VEP's guarded peptide clause does not co-fire when the local reference peptide is retained"
         );
+    }
+
+    #[test]
+    fn start_lost_predicates_follow_vep_order_for_indels_and_boundary_mnvs() {
+        // Ensembl Variation 2fb834b, VariationEffect.pm:870-962 orders the
+        // length-changing predicate, `_inv_start_altered`, the peptide guard,
+        // and the distinct retained-start predicate.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L962
+        let (tx, exons) = tx_with_cdna("GCGC", "ATGGCTGAATGA");
+        let exons: Vec<&ExonFeature> = exons.iter().collect();
+        let deletion_from_utr_into_start = var("22", 1003, 1005, "CAT", "-");
+        assert!(vep116_inv_start_altered(
+            &tx,
+            &exons,
+            &deletion_from_utr_into_start,
+            Some("ATGGCTGAATGA"),
+        ));
+
+        let boundary_mnv = var("22", 1003, 1004, "CA", "TT");
+        assert!(vep116_inv_start_altered(
+            &tx,
+            &exons,
+            &boundary_mnv,
+            Some("ATGGCTGAATGA"),
+        ));
+
+        let mut incomplete_start = tx.clone();
+        incomplete_start.cds_start_nf = true;
+        assert!(!vep116_inv_start_altered(
+            &incomplete_start,
+            &exons,
+            &boundary_mnv,
+            Some("ATGGCTGAATGA"),
+        ));
+
+        let ambiguous = var("22", 1003, 1004, "CA", "NN");
+        assert!(!vep116_inv_start_altered(
+            &tx,
+            &exons,
+            &ambiguous,
+            Some("ATGGCTGAATGA"),
+        ));
+        let ambiguous_start_snv = var("22", 1004, 1004, "A", "N");
+        assert!(vep116_start_retained_variant(
+            &tx,
+            &exons,
+            &ambiguous_start_snv,
+            b"ATNGCTGAATGA",
+            0,
+            Some("ATGGCTGAATGA"),
+        ));
+
+        let (no_utr_tx, no_utr_exons) = tx_with_cdna("", "ATGGCTGAATGA");
+        let no_utr_exons: Vec<&ExonFeature> = no_utr_exons.iter().collect();
+        assert!(!vep116_inv_start_altered(
+            &no_utr_tx,
+            &no_utr_exons,
+            &var("22", 1000, 1000, "A", "G"),
+            Some("ATGGCTGAATGA"),
+        ));
+
+        // The final peptide clause is reached for a start-overlapping allele
+        // without a 5'UTR; its `alt_pep ne 'X'` guard still applies.
+        let start_snv = var("22", 1000, 1000, "A", "G");
+        let mut peptide_class = CodingClassification {
+            affected_ref_peptide: Some("MS".to_string()),
+            affected_alt_peptide: Some("M".to_string()),
+            codons: Some("ATGGCT/GTG".to_string()),
+            ..CodingClassification::default()
+        };
+        assert!(vep116_start_lost_from_predicates(
+            &peptide_class,
+            &no_utr_tx,
+            &no_utr_exons,
+            &start_snv,
+            Some("ATGGCTGAATGA"),
+            false,
+        ));
+        // `_get_peptide_alleles()` maps the `-` sentinel to an empty peptide
+        // before start_lost() checks Perl truthiness (VariationEffect.pm:772-791).
+        peptide_class.affected_alt_peptide = Some("-".to_string());
+        assert!(!vep116_start_lost_from_predicates(
+            &peptide_class,
+            &no_utr_tx,
+            &no_utr_exons,
+            &start_snv,
+            Some("ATGGCTGAATGA"),
+            false,
+        ));
+        peptide_class.affected_alt_peptide = Some("X".to_string());
+        assert!(!vep116_start_lost_from_predicates(
+            &peptide_class,
+            &no_utr_tx,
+            &no_utr_exons,
+            &start_snv,
+            Some("ATGGCTGAATGA"),
+            false,
+        ));
     }
 
     #[test]
     fn frameshift_deletion_destroying_atg_emits_start_lost_only() {
         // Delete "TG" from ATG → CDS starts with "A..." → ATG destroyed.
         // ins_del_start_altered returns true → start_lost, no start_retained.
-        let c = classify_deletion_with_cdna("GCGC", "ATGGCTGAATGA", 1005, 1006, "TG").unwrap();
+        let c = classify_deletion_with_cdna_v116("GCGC", "ATGGCTGAATGA", 1005, 1006, "TG").unwrap();
         assert!(
             c.start_lost,
             "Deletion destroying ATG should emit start_lost"
@@ -24875,8 +25195,33 @@ mod tests {
         classify_coding_change(&t, &exons_ref, Some(&tr), &v)
     }
 
+    fn classify_ins_with_cdna_v116(
+        utr_seq: &str,
+        cds_seq: &str,
+        ins_pos: i64,
+        alt_allele: &str,
+    ) -> Option<CodingClassification> {
+        let (tx, exons) = tx_with_cdna(utr_seq, cds_seq);
+        let exons: Vec<&ExonFeature> = exons.iter().collect();
+        let translation = translation(
+            "T1",
+            Some(cds_seq.len()),
+            Some(cds_seq.len() / 3),
+            None,
+            Some(cds_seq),
+        );
+        let variant = var("22", ins_pos, ins_pos, "-", alt_allele);
+        classify_coding_change_with_semantics(
+            &tx,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+    }
+
     #[test]
-    fn issue_125_frameshift_insertion_preserving_atg_cofires_start_lost_and_retained() {
+    fn issue_125_frameshift_insertion_disrupting_atg_emits_start_lost_only_v116() {
         // Frameshift insertion within start codon that preserves ATG.
         // 5'UTR = "GCGC", CDS = "ATGGCTGAATGA"
         // Insert "TT" after CDS pos 2 (genomic 1007, within codon 1).
@@ -24908,7 +25253,7 @@ mod tests {
         // start codon (cds_idx >= 2), but those don't pass the cds_idx < 2 gate.
         // This test validates that the cDNA-space check returns the correct
         // altered=true result for insertions that do destroy ATG.
-        let c = classify_ins_with_cdna("GCGC", "ATGGCTGAATGA", 1005, "TT").unwrap();
+        let c = classify_ins_with_cdna_v116("GCGC", "ATGGCTGAATGA", 1005, "TT").unwrap();
         assert!(
             c.start_lost,
             "Frameshift insertion disrupting ATG should emit start_lost"
@@ -32301,7 +32646,7 @@ mod tests {
             ..Default::default()
         };
         let mut terms = BTreeSet::from([SoTerm::InframeDeletion]);
-        let _ = apply_vep116_primary_indel_predicates(
+        apply_vep116_primary_indel_predicates(
             &mut terms,
             &class,
             crate::vep_semantics::VepSemantics::V116,
