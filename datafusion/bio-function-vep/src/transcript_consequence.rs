@@ -3364,13 +3364,44 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::FrameshiftVariant);
             }
 
-            if let Some(mut classification) = classify_coding_change_with_semantics(
+            let mut classification = classify_coding_change_with_semantics(
                 tx,
                 tx_exons,
                 tx_translation,
                 variant,
                 self.semantics,
-            ) {
+            );
+            if self.semantics.vep116_stop_predicates() {
+                // VEP evaluates start_lost on the TranscriptVariation even
+                // when a CDS endpoint is a mapper Gap and codon translation
+                // cannot produce a complete CodingClassification. Its
+                // nucleotide clauses need cDNA endpoints and the UTR/CDS
+                // sequence only; the in-frame peptide predicates then return
+                // false without mapped codon alleles.
+                // Ensembl Variation 2fb834b, VariationEffect.pm:870-882:
+                // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+                let predicate_class = classification
+                    .as_ref()
+                    .or(partial_boundary_classification.as_ref())
+                    .cloned()
+                    .unwrap_or_default();
+                let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
+                if vep116_start_lost_from_predicates(
+                    &predicate_class,
+                    tx,
+                    tx_exons,
+                    variant,
+                    translateable_seq.as_deref(),
+                    partial_terminal_codon_v116,
+                ) {
+                    terms.insert(SoTerm::StartLost);
+                    if let Some(classification) = classification.as_mut() {
+                        classification.start_lost = true;
+                        classification.missense = false;
+                    }
+                }
+            }
+            if let Some(mut classification) = classification {
                 // VEP's frameshift predicate returns 0 when stop_retained
                 // is true. Override frameshift → inframe_insertion.
                 if classification.stop_retained && terms.contains(&SoTerm::FrameshiftVariant) {
@@ -10646,10 +10677,12 @@ fn vep116_start_lost_from_predicates(
         && vep116_start_lost_from_peptide_alleles(class) == Some(true)
 }
 
-/// VEP 116 `start_retained_variant()` uses `_snp_start_altered()` for an SNP,
-/// and otherwise negates `_ins_del_start_altered()`. Missing mapped endpoints
-/// leave that latter predicate false.
+/// VEP 116 `start_retained_variant()` uses `_snp_start_altered()` for every
+/// equal-length allele, including MNVs, and otherwise negates
+/// `_ins_del_start_altered()`. Missing mapped endpoints leave that latter
+/// predicate false. The `snp` pre-predicate is based on equal allele lengths.
 /// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L947-L962
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L337-L370
 fn vep116_start_retained_variant(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -10663,7 +10696,7 @@ fn vep116_start_retained_variant(
     }
     let ref_len = normalize_allele_seq(&variant.ref_allele).len();
     let alt_len = normalize_allele_seq(&variant.alt_allele).len();
-    if ref_len == 1 && alt_len == 1 {
+    if ref_len == alt_len {
         // `_snp_start_altered()` returns false for ambiguous alleles, so its
         // negated start_retained_variant predicate is true.
         if !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele) {
@@ -25216,6 +25249,25 @@ mod tests {
             Some("ATGGCTGAATGA"),
         ));
 
+        // VEP's `snp` pre-predicate means any equal-length allele, including
+        // an MNV. It evaluates the resulting start codon with
+        // `_snp_start_altered`; it does not treat an MNV as a length-neutral
+        // indel. The prior one-base-only branch incorrectly co-fired
+        // start_retained_variant for this AT>CC start-codon MNV.
+        // Ensembl Variation 2fb834b, BaseVariationFeatureOverlapAllele.pm:337-370
+        // and VariationEffect.pm:947-962:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L337-L370
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L947-L962
+        let start_mnv = var("22", 1004, 1005, "AT", "CC");
+        assert!(!vep116_start_retained_variant(
+            &tx,
+            &exons,
+            &start_mnv,
+            b"CCGGCTGAATGA",
+            0,
+            Some("ATGGCTGAATGA"),
+        ));
+
         let (no_utr_tx, no_utr_exons) = tx_with_cdna("", "ATGGCTGAATGA");
         let no_utr_exons: Vec<&ExonFeature> = no_utr_exons.iter().collect();
         assert!(!vep116_inv_start_altered(
@@ -25262,6 +25314,77 @@ mod tests {
             Some("ATGGCTGAATGA"),
             false,
         ));
+    }
+
+    #[test]
+    fn vep116_start_lost_catches_deletion_from_utr_through_start_codon() {
+        // ClinVar 3691463 at chr12:112907038 is c.-1_2del on
+        // ENST00000202917. Its equal-sized VCF anchor is trimmed before
+        // mapping, leaving the one UTR plus two start-codon bases that VEP
+        // replays in `_inv_start_altered()`.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 906-945:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+        let mut transcript = tx(
+            "ENST00000202917",
+            "12",
+            112_906_962,
+            112_919_903,
+            1,
+            "protein_coding",
+            Some(112_907_040),
+            Some(112_919_553),
+        );
+        transcript.cdna_coding_start = Some(79);
+        transcript.cdna_coding_end = Some(87);
+        transcript.cdna_seq = Some("ATGATGGAT".to_string());
+        transcript.translateable_seq = Some("ATGATGGAT".to_string());
+        transcript.five_prime_utr_seq = Some("A".repeat(78));
+
+        let exons = [
+            exon("ENST00000202917", 1, 112_906_962, 112_907_219),
+            exon("ENST00000202917", 2, 112_908_536, 112_908_824),
+            exon("ENST00000202917", 3, 112_911_051, 112_911_235),
+            exon("ENST00000202917", 4, 112_916_509, 112_916_738),
+            exon("ENST00000202917", 5, 112_917_547, 112_917_700),
+            exon("ENST00000202917", 6, 112_919_389, 112_919_903),
+        ];
+        let exons: Vec<&ExonFeature> = exons.iter().collect();
+        let variant = VariantInput::from_vcf(
+            "12".to_string(),
+            112_907_038,
+            112_907_041,
+            "CAAT".to_string(),
+            "C".to_string(),
+        );
+
+        assert!(vep116_codon_overlap(&transcript, &exons, &variant, true));
+        assert!(!vep116_inv_start_altered(
+            &transcript,
+            &exons,
+            &variant,
+            Some("ATGATGGAT"),
+        ));
+        let reference = translation(
+            "ENSP00000202917",
+            Some(9),
+            Some(3),
+            Some("MM"),
+            Some("ATGATGGAT"),
+        );
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let mut terms = BTreeSet::new();
+        let _ =
+            engine.add_coding_terms(&mut terms, &variant, &transcript, &exons, Some(&reference));
+        assert!(
+            terms.contains(&SoTerm::StartLost),
+            "VEP's start_lost predicate runs even when the CDS mapper has a UTR Gap"
+        );
     }
 
     #[test]
