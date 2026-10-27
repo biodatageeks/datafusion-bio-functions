@@ -3017,7 +3017,16 @@ impl TranscriptConsequenceEngine {
         if cds_start <= 0 || cds_end <= 0 {
             return false;
         }
-        overlaps(variant.start, variant.end, cds_start, cds_end)
+        // A pure insertion is the empty VEP span `(start, start - 1)`, not
+        // the point interval stored by VariantInput. VariationEffect's
+        // `overlap()` does not normalize inverted endpoints
+        // (2fb834b, VariationEffect.pm:81-85), and core Mapper routes
+        // `start == end + 1` through `map_insert()`
+        // (c0cf13d, Mapper.pm:267-270).
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L267-L270
+        let span = vep_coords::VepSpan::from_variant(variant);
+        overlap_perl(cds_start, cds_end, span.start, span.end)
     }
 
     /// For insertions, check if the left flanking base (variant.start - 1)
@@ -3746,7 +3755,8 @@ impl TranscriptConsequenceEngine {
         } else {
             (cds_end - 2, cds_end)
         };
-        overlaps(variant.start, variant.end, s, e)
+        let span = vep_coords::VepSpan::from_variant(variant);
+        overlap_perl(s, e, span.start, span.end)
     }
 
     /// Traceability:
@@ -3774,7 +3784,8 @@ impl TranscriptConsequenceEngine {
         } else {
             (cds_start, cds_start + 2)
         };
-        overlaps(variant.start, variant.end, s, e)
+        let span = vep_coords::VepSpan::from_variant(variant);
+        overlap_perl(s, e, span.start, span.end)
     }
 
     /// Traceability:
@@ -3787,6 +3798,34 @@ impl TranscriptConsequenceEngine {
             return None;
         };
         let is_ins = variant.ref_allele == "-";
+        if is_ins {
+            // VEP's `_before_coding` / `_after_coding` see a gap between the
+            // flanks. Test that gap with VariationEffect's non-swapping
+            // overlap rule so the last CDS base remains coding while an
+            // insertion immediately outside either CDS edge is UTR.
+            // Ensembl Variation 2fb834b, VariationEffect.pm:696-728:
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L696-L728
+            let span = vep_coords::VepSpan::from_variant(variant);
+            if overlap_perl(cds_start, cds_end, span.start, span.end) {
+                return None;
+            }
+            if tx.strand >= 0 {
+                if span.end < cds_start {
+                    return Some(SoTerm::FivePrimeUtrVariant);
+                }
+                if span.start > cds_end {
+                    return Some(SoTerm::ThreePrimeUtrVariant);
+                }
+            } else {
+                if span.end < cds_start {
+                    return Some(SoTerm::ThreePrimeUtrVariant);
+                }
+                if span.start > cds_end {
+                    return Some(SoTerm::FivePrimeUtrVariant);
+                }
+            }
+            return None;
+        }
         if tx.strand >= 0 {
             // For insertions at the CDS start boundary, the inserted bases go
             // before the CDS — VEP treats this as 5' UTR.
@@ -5247,18 +5286,13 @@ fn vep116_overlaps_stop_codon_cil(
         return false;
     };
     let alt_seq = normalize_allele_seq(&variant.alt_allele);
-    let is_point_insertion =
-        vep_coords::VepSpan::from_variant(variant).is_insertion() && variant.start == variant.end;
-    let mut variant_start = variant.start;
-    // VariantInput stores a normalized pure insertion at n+1 as the point
-    // [n+1,n+1]. VEP's mapper keeps the empty interval (n+1,n), which matters
-    // when the subsequent CIL extension moves the insertion past a stop.
-    let variant_end = if is_point_insertion {
-        variant.end.saturating_sub(1)
-    } else {
-        variant.end
-    };
-    if variant_end < variant_start && feature_seq_len > 0 {
+    let span = vep_coords::VepSpan::from_variant(variant);
+    let mut variant_start = span.start;
+    let variant_end = span.end;
+    // VariationEffect.pm:1388-1427 extends VEP's empty insertion interval
+    // by feature_seq length in transcript orientation before the overlap.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1388-L1427
+    if span.is_insertion() && feature_seq_len > 0 {
         let vep_feature_seq = alt_seq
             .bytes()
             .all(|base| matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'N'));
@@ -9599,8 +9633,18 @@ fn classify_insertion_with_semantics_and_gap(
     // For an insertion at a RefSeq mapper edit gap, VEP replays the allele
     // over the mapped edited-CDS interval rather than inserting after the
     // genomic CDS anchor.
+    let mapped_insertion_point = vep_coords::VepTxMapper::with_phase(
+        tx,
+        tx_exons,
+        vep_coords::CdnaBaseMap::Output,
+        leading_n_offset,
+    )
+    .cds(vep_coords::VepSpan::from_variant(variant))
+    .start
+    .and_then(|cds_start| cds_start.checked_sub(1));
     let ins_point = mapper_gap_for_sequence
         .map(|(start, _)| start.saturating_sub(1))
+        .or(mapped_insertion_point)
         .unwrap_or_else(|| cds_idx + 1);
     let mutation_end = mapper_gap_for_sequence
         .map(|(_, end)| end)
@@ -9720,15 +9764,24 @@ fn classify_insertion_with_semantics_and_gap(
         class.protein_position_end = Some(pep_a);
     }
 
-    // Start codon check — use cds_idx < 2 because an insertion anchored
-    // at position 2 (0-based last base of codon 1) inserts AFTER the start
-    // codon and does not overlap it. VEP uses inverted coordinates for
-    // insertions (start > end), so overlap(S+3, S+2, S, S+2) = false.
-    //
-    // Traceability:
-    // - _overlaps_start_codon overlap gate:
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L965-L985>
-    if cds_idx < 2 && !tx.cds_start_nf {
+    // VEP tests the empty mapper interval against the start codon, rather than
+    // treating the insertion as overlap with its normalized point. The
+    // coordinate pair is `(start, start - 1)` by Core Mapper.pm:267-270, and
+    // VariationEffect.pm:965-985 passes those endpoints to `overlap()`.
+    let overlaps_start = if semantics.vep116_stop_predicates() && !tx_exons.is_empty() {
+        vep116_codon_overlap(tx, tx_exons, variant, true)
+    } else if let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) {
+        let (start, end) = if tx.strand >= 0 {
+            (cds_start, cds_start.saturating_add(2))
+        } else {
+            (cds_end.saturating_sub(2), cds_end)
+        };
+        let span = vep_coords::VepSpan::from_variant(variant);
+        overlap_perl(start, end, span.start, span.end)
+    } else {
+        false
+    };
+    if overlaps_start && !tx.cds_start_nf {
         // 1. Codon level: the literal "ATG", as in the SNV path.
         if mutated_cds_starts_with_atg(&mutated) {
             class.start_retained = true;
@@ -9785,7 +9838,23 @@ fn classify_insertion_with_semantics_and_gap(
         // the stop index by the inserted codon count: the stop codon
         // itself is preserved but moved.  VEP gates this on
         // `_overlaps_stop_codon` (strict overlap, not the wider window).
-        let overlaps_stop = ranges_overlap_usize(ins_point, ins_point, stop_nt_start, stop_nt_end);
+        let overlaps_stop = if semantics.vep116_stop_predicates() && !tx_exons.is_empty() {
+            vep116_codon_overlap(tx, tx_exons, variant, false)
+        } else if semantics.vep116_stop_predicates() {
+            if let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) {
+                let (start, end) = if tx.strand >= 0 {
+                    (cds_end.saturating_sub(2), cds_end)
+                } else {
+                    (cds_start, cds_start.saturating_add(2))
+                };
+                let span = vep_coords::VepSpan::from_variant(variant);
+                overlap_perl(start, end, span.start, span.end)
+            } else {
+                false
+            }
+        } else {
+            ranges_overlap_usize(ins_point, ins_point, stop_nt_start, stop_nt_end)
+        };
         if !class.stop_retained && overlaps_stop && alt_len.is_multiple_of(3) {
             let idx_diff = new_stop_idx as i64 - old_stop_idx as i64;
             let codon_diff = alt_len as i64 / 3;
@@ -10296,19 +10365,25 @@ fn ins_del_start_altered(
     let alt_allele = normalize_allele_seq(&variant.alt_allele);
     let is_ins = ref_allele.is_empty();
 
-    // Map variant anchors to cDNA coordinates.
-    // genomic_to_cdna_index_for_transcript returns 1-based indices;
-    // convert to 0-based for byte-level string operations.
-    let cdna_start =
-        genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start)?.checked_sub(1)?;
-    let cdna_end = if is_ins {
-        cdna_start
-    } else {
-        genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.end)?.checked_sub(1)?
-    };
+    // Map the VEP interval to cDNA. For an insertion, map_insert returns the
+    // two flanks as `(cdna_start, cdna_end) = (n+1, n)`; the replacement index
+    // is therefore `cdna_start - 1`, exactly as VariationEffect.pm:1028-1058
+    // splices at `$cdna_start - 1` with a zero-length REF span.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1028-L1058
     let (cdna_min, cdna_max) = if is_ins {
-        (cdna_start, cdna_start)
+        let mapper =
+            vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, 0);
+        let span = vep_coords::VepSpan::from_variant(variant);
+        let (cdna_start, _cdna_end) = mapper.cdna(span).both_truthy()?;
+        let insertion_index = cdna_start.checked_sub(1)?;
+        (insertion_index, insertion_index)
     } else {
+        // genomic_to_cdna_index_for_transcript returns 1-based indices;
+        // convert to 0-based for byte-level string operations.
+        let cdna_start =
+            genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start)?.checked_sub(1)?;
+        let cdna_end =
+            genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.end)?.checked_sub(1)?;
         (cdna_start.min(cdna_end), cdna_start.max(cdna_end))
     };
 
@@ -10327,8 +10402,7 @@ fn ins_del_start_altered(
     let mut mutated =
         Vec::with_capacity(seq_bytes.len().saturating_sub(ref_allele.len()) + alt_bytes.len());
     if is_ins {
-        // Insert after cdna_min
-        let splice = cdna_min + 1;
+        let splice = cdna_min;
         if splice > seq_bytes.len() {
             return Some(true);
         }
@@ -24439,6 +24513,158 @@ mod tests {
     }
 
     #[test]
+    fn insertion_interval_matches_vep_at_cds_start_stop_and_utr_edges() {
+        // Ensembl's empty insertion span (cdna_start, cdna_end) is (7, 6) here;
+        // `_ins_del_start_altered` replaces that zero-length span at index 6,
+        // before the mapped 3' flank. See VariationEffect.pm:1028-1058 at
+        // ensembl-variation 2fb834b.
+        let (t, exons) = tx_with_cdna("GCGC", "ATGGCTGAATGA");
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        // Insert C between the T and G of ATG. Correct placement changes ATG
+        // to ATC; the old `cdna_min + 1` placement puts C after the G.
+        let insertion = var("22", 1006, 1006, "-", "C");
+
+        assert_eq!(
+            ins_del_start_altered(&t, &exons_ref, &insertion, None),
+            Some(true),
+            "insertion between start-codon bases must be evaluated at VEP's empty span"
+        );
+
+        let negative = tx_with_cdna_on_strand("GCGC", "ATGGCTGAATGA", -1);
+        let negative_exons: Vec<&ExonFeature> = negative.1.iter().collect();
+        let negative_insertion = var("22", 1010, 1010, "-", "G");
+        assert_eq!(
+            ins_del_start_altered(&negative.0, &negative_exons, &negative_insertion, None),
+            Some(true),
+            "the negative-strand insertion must be spliced at VEP's transcript-order flank"
+        );
+
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        for (strand, before_term, after_term) in [
+            (1, SoTerm::FivePrimeUtrVariant, SoTerm::ThreePrimeUtrVariant),
+            (
+                -1,
+                SoTerm::ThreePrimeUtrVariant,
+                SoTerm::FivePrimeUtrVariant,
+            ),
+        ] {
+            let mut transcript = tx(
+                "T_EDGE",
+                "22",
+                1000,
+                1009,
+                strand,
+                "protein_coding",
+                Some(1003),
+                Some(1008),
+            );
+            transcript.cdna_coding_start = Some(if strand >= 0 { 4 } else { 2 });
+            transcript.cdna_coding_end = Some(if strand >= 0 { 9 } else { 7 });
+            transcript.spliced_seq = Some(if strand >= 0 {
+                "GGGATGAAAC".to_string()
+            } else {
+                "CATGAAAGGG".to_string()
+            });
+            transcript.three_prime_utr_seq = Some(if strand >= 0 {
+                "C".to_string()
+            } else {
+                "GGG".to_string()
+            });
+            let exon = exon("T_EDGE", 1, 1000, 1009);
+            let exons = [&exon];
+            let translation = translation("T_EDGE", Some(6), Some(2), None, Some("ATGAAA"));
+            let before = var("22", 1003, 1003, "-", "A");
+            let internal = var("22", 1004, 1004, "-", "A");
+            let after = var("22", 1009, 1009, "-", "A");
+            assert_eq!(
+                vep_coords::VepSpan::from_variant(&before),
+                vep_coords::VepSpan::new(1003, 1002)
+            );
+            assert!(!engine.overlaps_cds(&before, &transcript));
+            assert!(engine.overlaps_cds(&internal, &transcript));
+            assert!(!engine.overlaps_cds(&after, &transcript));
+            assert_eq!(engine.utr_term(&before, &transcript), Some(before_term));
+            assert_eq!(engine.utr_term(&internal, &transcript), None);
+            assert_eq!(engine.utr_term(&after, &transcript), Some(after_term));
+            let (before_terms, _) = engine.evaluate_transcript_overlap(
+                &before,
+                &transcript,
+                &exons,
+                Some(&translation),
+            );
+            let (internal_terms, _) = engine.evaluate_transcript_overlap(
+                &internal,
+                &transcript,
+                &exons,
+                Some(&translation),
+            );
+            let (after_terms, _) =
+                engine.evaluate_transcript_overlap(&after, &transcript, &exons, Some(&translation));
+            assert!(
+                before_terms.contains(&before_term),
+                "terms={before_terms:?}"
+            );
+            assert!(after_terms.contains(&after_term), "terms={after_terms:?}");
+            assert!(
+                !before_terms.contains(&SoTerm::FrameshiftVariant)
+                    && !after_terms.contains(&SoTerm::FrameshiftVariant),
+                "UTR insertions must not enter coding classification: before={before_terms:?}, after={after_terms:?}"
+            );
+            assert!(
+                internal_terms.contains(&SoTerm::FrameshiftVariant),
+                "internal CDS insertion remains coding: {internal_terms:?}"
+            );
+        }
+
+        let cil_tx = tx(
+            "T_CIL_EDGE",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        let cil_insertion = var("22", 1006, 1006, "-", "AAA");
+        assert!(!vep116_overlaps_stop_codon_cil(&cil_tx, &cil_insertion, 3));
+
+        // At an exon mapper boundary only one genomic flank maps. Core's
+        // map_insert adjusts that coordinate into the empty `(3,2)` cDNA span,
+        // which still overlaps the split start codon under VEP's overlap rule.
+        let mut split = tx(
+            "T_SPLIT_START",
+            "22",
+            1000,
+            1016,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1016),
+        );
+        split.cdna_coding_start = Some(1);
+        split.cdna_coding_end = Some(9);
+        split.spliced_seq = Some("ATGAAATAA".to_string());
+        let split_exons = [
+            exon("T_SPLIT_START", 1, 1000, 1001),
+            exon("T_SPLIT_START", 2, 1010, 1016),
+        ];
+        let split_refs: Vec<&ExonFeature> = split_exons.iter().collect();
+        let across_mapper_gap = var("22", 1010, 1010, "-", "C");
+        assert!(vep116_codon_overlap(
+            &split,
+            &split_refs,
+            &across_mapper_gap,
+            true,
+        ));
+    }
+
+    #[test]
     fn ins_del_start_altered_utr_deletion_preserves_translateable_suffix() {
         // 5'UTR = "GCATG", CDS = "ATGGCTGAATGA"
         // Full cDNA: GCATG|ATGGCTGAATGA, cdna_coding_start = 6
@@ -31509,21 +31735,22 @@ mod tests {
         let engine = TranscriptConsequenceEngine::default();
         let cds = "ATGGCTGAAGCTTGA";
         let cds_len = cds.len();
-        let tx_end = 1000 + cds_len as i64 - 1;
+        let cds_end = 1000 + cds_len as i64 - 1;
+        let tx_end = cds_end + 6;
         let mut t = tx(
             "T1",
             "1",
-            990,
-            1030,
+            1000,
+            tx_end,
             1,
             "protein_coding",
             Some(1000),
-            Some(tx_end),
+            Some(cds_end),
         );
         t.cdna_coding_start = Some(1);
         t.cdna_coding_end = Some(cds_len);
         t.spliced_seq = Some(format!("{cds}CCCGGG"));
-        let e = exon("T1", 1, 990, 1030);
+        let e = exon("T1", 1, 1000, tx_end);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
         // Insert "GGGAAA" at pos 1004 (within codon 1, after 1st base)
@@ -31554,21 +31781,22 @@ mod tests {
         let engine = TranscriptConsequenceEngine::default();
         let cds = "ATGGCTGAATGA";
         let cds_len = cds.len();
-        let tx_end = 1000 + cds_len as i64 - 1;
+        let cds_end = 1000 + cds_len as i64 - 1;
+        let tx_end = cds_end + 6;
         let mut t = tx(
             "T1",
             "1",
-            990,
-            1030,
+            1000,
+            tx_end,
             1,
             "protein_coding",
             Some(1000),
-            Some(tx_end),
+            Some(cds_end),
         );
         t.cdna_coding_start = Some(1);
         t.cdna_coding_end = Some(cds_len);
         t.spliced_seq = Some(format!("{cds}CCCGGG"));
-        let e = exon("T1", 1, 990, 1030);
+        let e = exon("T1", 1, 1000, tx_end);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
         let v = var("1", 1006, 1006, "-", "GCTGCT");
@@ -31597,20 +31825,21 @@ mod tests {
         let engine = TranscriptConsequenceEngine::default();
         let cds = "ATGGCTGAATGA";
         let cds_len = cds.len();
-        let tx_end = 1000 + cds_len as i64 - 1;
+        let cds_end = 1000 + cds_len as i64 - 1;
+        let tx_end = cds_end + 6;
         let mut t = tx(
             "T1",
             "1",
-            990,
-            1030,
+            1000,
+            tx_end,
             1,
             "protein_coding",
             Some(1000),
-            Some(tx_end),
+            Some(cds_end),
         );
         t.cdna_coding_end = Some(cds_len);
         t.spliced_seq = Some(format!("{cds}CCCGGG"));
-        let e = exon("T1", 1, 990, 1030);
+        let e = exon("T1", 1, 1000, tx_end);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
         let v = var("1", 1004, 1004, "-", "GCTGCT");
