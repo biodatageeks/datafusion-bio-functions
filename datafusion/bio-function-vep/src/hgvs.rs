@@ -3504,6 +3504,7 @@ mod tests {
             three_prime_utr_seq: None,
             translateable_seq: None,
             cdna_seq: None,
+            failed_bam_exon_seq: None,
             version: Some(1),
             cds_start_nf: false,
             cds_end_nf: false,

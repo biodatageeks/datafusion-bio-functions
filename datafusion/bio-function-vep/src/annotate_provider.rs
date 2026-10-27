@@ -4746,6 +4746,7 @@ impl AnnotateProvider {
                     three_prime_utr_seq,
                     translateable_seq,
                     cdna_seq,
+                    failed_bam_exon_seq: None,
                     version,
                     cds_start_nf,
                     cds_end_nf,
@@ -5436,6 +5437,7 @@ impl AnnotateProvider {
                     three_prime_utr_seq,
                     translateable_seq,
                     cdna_seq,
+                    failed_bam_exon_seq: None,
                     version: version_idx
                         .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                         .and_then(|v| i32::try_from(v).ok()),
@@ -9379,6 +9381,31 @@ where
         let Some(tx_exons) = sorted_transcript_exons(exons, exons_by_transcript, tx) else {
             continue;
         };
+
+        // A failed BAM edit restores the transcript's exon sequence but leaves
+        // its mapper in RefSeq cDNA coordinates. Variation's feature reference
+        // indexes `Transcript::spliced_seq` with those mapper coordinates, so
+        // retain the genome-derived exon concatenation for that path.
+        // <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627>
+        // <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L455-L465>
+        // <https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L835>
+        if tx
+            .bam_edit_status
+            .as_deref()
+            .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
+            && tx.failed_bam_exon_seq.is_none()
+        {
+            let chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
+            let overlaps_exon = all_intervals.get(chrom).is_some_and(|intervals| {
+                tx_exons
+                    .iter()
+                    .any(|exon| interval_overlaps_any(intervals, exon.start, exon.end))
+            });
+            if overlaps_exon {
+                tx.failed_bam_exon_seq =
+                    read_spliced_transcript_cdna_from_reference(reader, tx, &tx_exons)?;
+            }
+        }
 
         let should_infer_implicit_refseq_deletions = tx.spliced_seq.is_some()
             && is_refseq_transcript_for_hydration(tx, cache_source_type)
@@ -13388,6 +13415,7 @@ struct TranscriptPartitionState {
     three_prime_utr_seq: Option<String>,
     translateable_seq: Option<String>,
     cdna_seq: Option<String>,
+    failed_bam_exon_seq: Option<String>,
 }
 
 impl TranscriptPartitionState {
@@ -13399,6 +13427,7 @@ impl TranscriptPartitionState {
             three_prime_utr_seq: tx.three_prime_utr_seq.clone(),
             translateable_seq: tx.translateable_seq.clone(),
             cdna_seq: tx.cdna_seq.clone(),
+            failed_bam_exon_seq: tx.failed_bam_exon_seq.clone(),
         }
     }
 
@@ -13409,6 +13438,7 @@ impl TranscriptPartitionState {
         tx.three_prime_utr_seq = self.three_prime_utr_seq.clone();
         tx.translateable_seq = self.translateable_seq.clone();
         tx.cdna_seq = self.cdna_seq.clone();
+        tx.failed_bam_exon_seq = self.failed_bam_exon_seq.clone();
     }
 }
 
@@ -16957,6 +16987,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_bam_hydration_captures_genome_derived_exon_sequence() {
+        use std::io::Cursor;
+
+        let data = ">15\nAACCGGTTAA\n".to_string();
+        let index = fasta::fai::Index::from(vec![fasta::fai::Record::new("15", 10, 4, 10, 11)]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+
+        let mut transcript = make_tx("NM_FAILED_BAM.1", None, None, None, None);
+        transcript.chrom = "15".to_string();
+        transcript.start = 1;
+        transcript.end = 10;
+        transcript.strand = -1;
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.spliced_seq = Some("AACGGTTAA".to_string());
+        let exons = [ExonFeature {
+            transcript_id: transcript.transcript_id.clone(),
+            exon_number: 1,
+            start: 1,
+            end: 10,
+        }];
+        let exons_by_transcript = HashMap::from([(transcript.transcript_id.clone(), vec![0])]);
+        let no_indels = HashMap::new();
+        let input_intervals = HashMap::from([("15".to_string(), vec![(5, 5)])]);
+
+        hydrate_transcript_cdna_from_reference(
+            &mut reader,
+            std::slice::from_mut(&mut transcript),
+            &exons,
+            &exons_by_transcript,
+            &no_indels,
+            &input_intervals,
+            CacheSourceType::Merged,
+        )
+        .unwrap();
+
+        assert_eq!(
+            transcript.failed_bam_exon_seq.as_deref(),
+            Some("TTAACCGGTT")
+        );
+        assert_eq!(transcript.spliced_seq.as_deref(), Some("AACGGTTAA"));
+    }
+
     // Regression: the serial (workers==1) AnnotatingContig loop truncated a
     // contig at ~one buffer when a lookup stall arrived mid-buffer-fill after the
     // poll had already grabbed >=1 batch (`made_progress`) with nothing in
@@ -20424,6 +20498,7 @@ mod tests {
             three_prime_utr_seq: None,
             translateable_seq: None,
             cdna_seq: None,
+            failed_bam_exon_seq: None,
             version: None,
             cds_start_nf: false,
             cds_end_nf: false,

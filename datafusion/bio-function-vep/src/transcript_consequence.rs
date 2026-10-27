@@ -409,6 +409,9 @@ pub struct TranscriptFeature {
     /// Full transcript cDNA sequence from the `cdna_seq` parquet column.
     /// Used as fallback for 3' UTR extraction when `spliced_seq` is absent.
     pub cdna_seq: Option<String>,
+    /// Genome-derived exon concatenation used after VEP restores a transcript
+    /// whose BAM edit failed; its mapper remains in RefSeq cDNA coordinates.
+    pub failed_bam_exon_seq: Option<String>,
     /// Transcript version number (e.g. 6 for ENST00000379410.6).
     pub version: Option<i32>,
     /// CDS start not found (incomplete 5' end).
@@ -6514,7 +6517,18 @@ fn cached_translateable_seq_for_vep(
         .map(|seq| seq.to_ascii_uppercase())
 }
 
+fn failed_bam_exon_seq(tx: &TranscriptFeature) -> Option<&str> {
+    tx.bam_edit_status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
+        .then_some(tx.failed_bam_exon_seq.as_deref())
+        .flatten()
+}
+
 fn transcript_mrna_seq_for_vep_borrowed(tx: &TranscriptFeature) -> Option<&str> {
+    if let Some(seq) = failed_bam_exon_seq(tx) {
+        return Some(seq);
+    }
     if let Some(seq) = tx.spliced_seq.as_deref() {
         return Some(seq);
     }
@@ -6536,6 +6550,10 @@ fn reference_translateable_cds_metrics_for_vep(
             .take_while(|&base| base == b'N' || base == b'n')
             .count()
     };
+
+    if let Some(sequence) = failed_bam_translateable_seq_for_vep(tx, translation) {
+        return Some((leading_n_count(&sequence), sequence.len()));
+    }
 
     if let Some(sequence) = tx.translateable_seq.as_deref() {
         return Some((leading_n_count(sequence), sequence.len()));
@@ -6598,6 +6616,9 @@ fn cdna_seq_has_full_transcript_context_for_vep(tx: &TranscriptFeature, seq: &st
 }
 
 fn transcript_mrna_seq_for_vep(tx: &TranscriptFeature) -> Option<String> {
+    if let Some(seq) = failed_bam_exon_seq(tx) {
+        return Some(seq.to_ascii_uppercase());
+    }
     if let Some(seq) = tx.spliced_seq.as_deref() {
         return Some(seq.to_ascii_uppercase());
     }
@@ -6621,6 +6642,14 @@ fn canonical_ref_translation_for_hgvsp(
 ) -> String {
     if bam_edit_succeeded(tx) {
         return edited_ref_translation_for_hgvsp(tx, translation, fallback);
+    }
+    if failed_bam_exon_seq(tx).is_some() {
+        // AnnotationType/Transcript.pm restores the transcript after a failed
+        // BAM edit, and core Transcript::spliced_seq concatenates exon seqs.
+        // The retained mapper then indexes that unedited sequence.
+        // <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627>
+        // <https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L835>
+        return fallback;
     }
     translation
         .and_then(|translation| translation.translation_seq_canonical.clone())
@@ -6656,6 +6685,9 @@ fn failed_refseq_uses_cached_translation_for_consequence(
     translation: Option<&TranslationFeature>,
     cds_seq: &str,
 ) -> bool {
+    if failed_bam_exon_seq(tx).is_some() {
+        return false;
+    }
     if !tx
         .bam_edit_status
         .as_deref()
@@ -6731,6 +6763,9 @@ fn reference_translateable_seq_for_vep(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
 ) -> Option<String> {
+    if let Some(sequence) = failed_bam_translateable_seq_for_vep(tx, translation) {
+        return Some(sequence);
+    }
     if let Some(seq) = tx.translateable_seq.as_deref() {
         return Some(seq.to_ascii_uppercase());
     }
@@ -6760,10 +6795,38 @@ fn reference_translateable_seq_for_vep(
     cached_translateable_seq
 }
 
+fn failed_bam_translateable_seq_for_vep(
+    tx: &TranscriptFeature,
+    translation: Option<&TranslationFeature>,
+) -> Option<String> {
+    let sequence = failed_bam_exon_seq(tx)?;
+    let start_idx = tx.cdna_coding_start?.checked_sub(1)?;
+    let end_idx = tx.cdna_coding_end?;
+    let slice = sequence.get(start_idx..end_idx)?.to_ascii_uppercase();
+    let cached_sequence = cached_translateable_seq_for_vep(tx, translation);
+    let cached_phase = cached_sequence
+        .as_deref()
+        .map(|seq| {
+            seq.bytes()
+                .take_while(|&base| base == b'N' || base == b'n')
+                .count()
+        })
+        .unwrap_or(0);
+    let slice_phase = slice.bytes().take_while(|&base| base == b'N').count();
+    let prefix_n_count = cached_phase.saturating_sub(slice_phase);
+    let mut cds = String::with_capacity(prefix_n_count + slice.len());
+    cds.extend(std::iter::repeat_n('N', prefix_n_count));
+    cds.push_str(&slice);
+    Some(cds)
+}
+
 fn reference_translateable_seq_for_hgvsp(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
 ) -> Option<String> {
+    if failed_bam_exon_seq(tx).is_some() {
+        return reference_translateable_seq_for_vep(tx, translation);
+    }
     if bam_edit_succeeded(tx) {
         return reference_translateable_seq_for_vep(tx, translation);
     }
@@ -6777,7 +6840,8 @@ fn uses_canonical_reference_for_hgvsp(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
 ) -> bool {
-    !bam_edit_succeeded(tx)
+    failed_bam_exon_seq(tx).is_none()
+        && !bam_edit_succeeded(tx)
         && translation.is_some_and(|translation| translation.cds_sequence_canonical.is_some())
 }
 
@@ -12271,7 +12335,14 @@ fn mapped_transcript_reference_allele(
     if ref_len == 0 {
         return None;
     }
-    let transcript_seq = tx.spliced_seq.as_deref().or(tx.cdna_seq.as_deref())?;
+    // Variation `_get_ref_allele()` slices the transcript's spliced sequence by
+    // the mapper's cDNA coordinates. On BAM-edit failure those coordinates
+    // remain RefSeq-based while `Transcript::spliced_seq()` is exon-derived.
+    // <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L455-L465>
+    // <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627>
+    let transcript_seq = failed_bam_exon_seq(tx)
+        .or(tx.spliced_seq.as_deref())
+        .or(tx.cdna_seq.as_deref())?;
     let genomic_positions = genomic_range(variant.start, variant.end)?;
     if genomic_positions.len() != ref_len {
         return None;
@@ -13602,6 +13673,122 @@ mod tests {
     }
 
     #[test]
+    fn failed_bam_used_ref_indexes_the_unedited_exon_sequence_with_refseq_mapper_coords() {
+        let mut transcript = tx(
+            "NM_FAILED_BAM.1",
+            "15",
+            100,
+            109,
+            -1,
+            "protein_coding",
+            Some(100),
+            Some(109),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.has_rna_edit = true;
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 3,
+            end: 3,
+            replacement_len: None,
+            skip_refseq_offset: false,
+        }];
+        // The cache's edit-consistent sequence omits transcript base 3. The
+        // full cDNA models VEP's exon-concatenated sequence after BAM-edit
+        // failure, while the mapper still reports RefSeq cDNA coordinates.
+        transcript.spliced_seq = Some("AACGGTTAA".to_string());
+        transcript.failed_bam_exon_seq = Some("AACCGGTTAA".to_string());
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 108,
+                genomic_end: 109,
+                cdna_start: 1,
+                cdna_end: 2,
+                ori: -1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 106,
+                cdna_start: 3,
+                cdna_end: 9,
+                ori: -1,
+            },
+        ];
+        let exons = [exon("NM_FAILED_BAM.1", 1, 100, 109)];
+        let refs = exons.iter().collect::<Vec<_>>();
+        let variant = var("15", 103, 103, "A", "C");
+
+        assert_eq!(
+            used_ref_with_cache_policy(
+                &variant,
+                &transcript,
+                &refs,
+                None,
+                false,
+                Some(true),
+                Some("A"),
+            )
+            .as_deref(),
+            Some("C")
+        );
+    }
+
+    #[test]
+    fn failed_bam_consequence_and_hgvsp_use_the_unedited_exon_cds() {
+        let mut transcript = tx(
+            "NM_FAILED_PEPTIDE.1",
+            "7",
+            100,
+            113,
+            1,
+            "protein_coding",
+            Some(102),
+            Some(110),
+        );
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.cdna_coding_start = Some(3);
+        transcript.cdna_coding_end = Some(11);
+        transcript.translateable_seq = Some("ATGAACTAA".to_string());
+        transcript.spliced_seq = Some("GGATGAACTAACCC".to_string());
+        transcript.failed_bam_exon_seq = Some("GGATGCGCTAACCC".to_string());
+        let cached_translation = translation(
+            "NM_FAILED_PEPTIDE.1",
+            Some(9),
+            Some(2),
+            Some("MN"),
+            Some("ATGAACTAA"),
+        );
+
+        assert_eq!(
+            reference_translateable_seq_for_vep(&transcript, Some(&cached_translation)).as_deref(),
+            Some("ATGCGCTAA")
+        );
+        assert_eq!(
+            reference_translateable_seq_for_hgvsp(&transcript, Some(&cached_translation))
+                .as_deref(),
+            Some("ATGCGCTAA")
+        );
+        assert_eq!(
+            reference_aas_for_consequence(&transcript, Some(&cached_translation), "ATGCGCTAA",)
+                .map(|aas| aas.into_iter().collect::<String>())
+                .as_deref(),
+            Some("MR*")
+        );
+        assert_eq!(
+            canonical_ref_translation_for_hgvsp(
+                &transcript,
+                Some(&cached_translation),
+                "MR*".to_string(),
+            ),
+            "MR*"
+        );
+        assert!(!uses_canonical_reference_for_hgvsp(
+            &transcript,
+            Some(&cached_translation)
+        ));
+    }
+
+    #[test]
     fn cache_reference_policy_rejects_incomplete_and_nonconsecutive_mapping() {
         let mut transcript = tx("ENST_REFERENCE", "21", 100, 199, 1, "lncRNA", None, None);
         let variant = var("21", 100, 102, "CCC", "TTT");
@@ -13870,6 +14057,7 @@ mod tests {
             three_prime_utr_seq: None,
             translateable_seq: None,
             cdna_seq: None,
+            failed_bam_exon_seq: None,
             version: None,
             cds_start_nf: false,
             cds_end_nf: false,
