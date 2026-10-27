@@ -33375,6 +33375,7 @@ mod tests {
         ];
         let exons_ref = exons.iter().collect::<Vec<_>>();
         let exon_boundary_insertion = var("1", 110, 109, "-", "A");
+        let intronic_insertion = var("1", 120, 119, "-", "A");
 
         let source_bounds_result =
             original_variation_maps_to_cds(&with_cdna_bounds, &exons_ref, &exon_boundary_insertion);
@@ -33385,6 +33386,16 @@ mod tests {
         );
         assert!(source_bounds_result);
         assert_eq!(legacy_result, source_bounds_result);
+
+        let source_intronic_result =
+            original_variation_maps_to_cds(&with_cdna_bounds, &exons_ref, &intronic_insertion);
+        let legacy_intronic_result = original_variation_maps_to_cds(
+            &legacy_without_cdna_bounds,
+            &exons_ref,
+            &intronic_insertion,
+        );
+        assert!(!source_intronic_result);
+        assert_eq!(legacy_intronic_result, source_intronic_result);
     }
 
     #[test]
