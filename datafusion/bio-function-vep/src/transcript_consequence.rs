@@ -13731,6 +13731,22 @@ mod tests {
             .as_deref(),
             Some("C")
         );
+
+        let before_edit = var("15", 108, 108, "T", "C");
+        assert_eq!(
+            used_ref_with_cache_policy(
+                &before_edit,
+                &transcript,
+                &refs,
+                None,
+                false,
+                Some(true),
+                Some("T"),
+            )
+            .as_deref(),
+            Some("T"),
+            "before the failed BAM edit, feature and genomic references still agree"
+        );
     }
 
     #[test]
