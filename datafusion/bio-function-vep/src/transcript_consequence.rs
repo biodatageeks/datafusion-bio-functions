@@ -7863,7 +7863,8 @@ fn shifted_tva_protein_hgvs_data(
     let raw_frameshift = fallback
         .map(|protein| protein.frameshift)
         .unwrap_or_else(|| !alt_allele_len.abs_diff(ref_allele_len).is_multiple_of(3));
-    let frameshift = shifted_hgvsp_frameshift(raw_frameshift, &ref_peptide, semantics);
+    let frameshift =
+        shifted_hgvsp_frameshift_for_output(fallback, raw_frameshift, &ref_peptide, semantics);
     let protein = crate::hgvs::ProteinHgvsData {
         start: window_protein_start,
         end: window_protein_end,
@@ -7894,6 +7895,26 @@ fn shifted_hgvsp_frameshift(
     semantics: crate::vep_semantics::VepSemantics,
 ) -> bool {
     raw_frameshift && !(semantics.vep116_stop_predicates() && ref_peptide.starts_with('*'))
+}
+
+fn shifted_hgvsp_frameshift_for_output(
+    fallback: Option<&crate::hgvs::ProteinHgvsData>,
+    raw_frameshift: bool,
+    ref_peptide: &str,
+    semantics: crate::vep_semantics::VepSemantics,
+) -> bool {
+    // The consequence classifier already evaluated VEP's complete frameshift
+    // predicate on this transcript/variant. The shifted HGVSp peptide window
+    // can begin at the stop codon even when that source classification is a
+    // frameshift; reducing it to the first residue loses the CDS-boundary,
+    // partial-codon, stop-retained, and allele-length checks in VariationEffect.
+    // Only use the local stop rule when no consequence classification exists.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
+    if let Some(protein) = fallback {
+        protein.frameshift
+    } else {
+        shifted_hgvsp_frameshift(raw_frameshift, ref_peptide, semantics)
+    }
 }
 
 /// Traceability:
@@ -33930,6 +33951,71 @@ mod tests {
             "*",
             crate::vep_semantics::VepSemantics::V115,
         ));
+    }
+
+    #[test]
+    fn vep116_shifted_hgvsp_keeps_source_frameshift_for_clinvar_219_stop_windows() {
+        let cases = [
+            (
+                "ClinVar 2525900 ENST00000987786",
+                "ENST00000987786",
+                "ENSP00000657603",
+                247,
+                88,
+                "ENSP00000657603.1:p.Ter247LeufsTer88",
+            ),
+            (
+                "ClinVar 865979 ENST00000367397",
+                "ENST00000367397",
+                "ENSP00000356367",
+                675,
+                14,
+                "ENSP00000356367.1:p.Ter675LeufsTer14",
+            ),
+        ];
+
+        for (record, tx_id, protein_id, start, stop_distance, expected) in cases {
+            let ref_translation = format!("{}*", "A".repeat(start - 1));
+            let mut alt_translation = format!("{}L", "A".repeat(start - 1));
+            alt_translation.push_str(&"A".repeat(stop_distance - 2));
+            alt_translation.push('*');
+            let mut translation = translation(
+                tx_id,
+                Some(ref_translation.len() * 3),
+                Some(start),
+                Some(&ref_translation),
+                None,
+            );
+            translation.stable_id = Some(protein_id.to_string());
+            translation.version = Some(1);
+            let source_classification = crate::hgvs::ProteinHgvsData {
+                start,
+                end: start,
+                ref_peptide: "*".to_string(),
+                alt_peptide: "L".to_string(),
+                ref_translation: ref_translation.clone(),
+                alt_translation: alt_translation.clone(),
+                alt_translation_extension: Some(alt_translation),
+                frameshift: true,
+                start_lost: false,
+                stop_lost: false,
+                native_refseq: false,
+            };
+            let frameshift = shifted_hgvsp_frameshift_for_output(
+                Some(&source_classification),
+                true,
+                "*",
+                crate::vep_semantics::VepSemantics::V116,
+            );
+            let mut shifted = source_classification;
+            shifted.frameshift = frameshift;
+
+            assert_eq!(
+                crate::hgvs::format_hgvsp(&translation, &shifted, true).as_deref(),
+                Some(expected),
+                "source frameshift classification changed for {record}"
+            );
+        }
     }
 
     // ── shifted_tva_peptide_window codon widening tests ─────────────────
