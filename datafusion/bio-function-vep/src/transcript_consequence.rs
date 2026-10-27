@@ -8658,6 +8658,15 @@ fn spliced_cds_span_for_intron_deletion(
 
     let genomic_start = variant.start.min(variant.end);
     let genomic_end = variant.start.max(variant.end);
+    // Most deletions lie wholly inside one exon. Reject those with a cheap
+    // scan before sorting exons and constructing the transcript mapper.
+    if tx_exons.len() < 2
+        || tx_exons
+            .iter()
+            .any(|exon| genomic_start >= exon.start && genomic_end <= exon.end)
+    {
+        return None;
+    }
     let exons = start_sorted(tx_exons);
     let crosses_intron = exons.windows(2).any(|pair| {
         let intron_start = pair[0].end.saturating_add(1);
@@ -8735,6 +8744,9 @@ fn classify_coding_change_with_spliced_span(
     // mapped side of an allele whose endpoint lies in a deleted RefSeq edit.
     // Internal deleted-edit gaps remain eligible: when both allele endpoints
     // map, the mapped CDS span still defines the coding change.
+    // This rejects deleted RefSeq edit gaps at an allele endpoint. Ordinary
+    // intronic endpoints are not rejected here: their endpoint mapper lookup
+    // returns `None`, so they cannot produce a spliced span in the helper.
     if [genomic_positions[0], *genomic_positions.last()?]
         .into_iter()
         .any(|pos| {
@@ -18563,7 +18575,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_215_spliced_rna_edit_replaces_only_the_mapped_cds_width() {
+    fn issue_215_spliced_rna_edit_replaces_mapped_width_with_full_feature_allele() {
         let cds = "ATGAAACCTGAAGAACCTGGATAA";
         let mut transcript = tx(
             "NM_215_RNA_EDIT.1",
@@ -18594,23 +18606,23 @@ mod tests {
         );
         let deletion = var("22", 106, 205, &"N".repeat(100), "-");
 
-        let classification = classify_coding_change_with_semantics(
-            &transcript,
-            &exon_refs,
-            Some(&tr),
+        let assignments = TranscriptConsequenceEngine::default().evaluate_variant_with_context(
             &deletion,
-            crate::vep_semantics::VepSemantics::V116,
-        )
-        .expect("RNA-edited spliced CDS is classified from mapped endpoints");
-
-        assert_eq!(
-            (
-                classification.cds_position_start,
-                classification.cds_position_end
-            ),
-            (Some(7), Some(18))
+            &[transcript],
+            &exons,
+            &[tr],
+            &[],
+            &[],
+            &[],
+            &[],
         );
-        assert_eq!(classification.codons.as_deref(), Some("NNNNNNNNNNNN/-"));
+        let entry = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("NM_215_RNA_EDIT.1"))
+            .expect("RNA-edited transcript consequence is emitted");
+        assert_eq!(entry.cds_position.as_deref(), Some("7-18"));
+        assert_eq!(entry.codons.as_deref(), Some("NNNNNNNNNNNN/-"));
+        assert_eq!(entry.amino_acids.as_deref(), Some("XXXX/-"));
     }
 
     #[test]
