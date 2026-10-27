@@ -4140,6 +4140,29 @@ mod tests {
     }
 
     #[test]
+    fn start_lost_past_alt_translation_uses_initiator_for_later_resolved_start() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 4,
+            end: 7,
+            ref_peptide: "VWRP".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: "MKLVWRP".to_string(),
+            alt_translation: "MIR".to_string(),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: true,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true).as_deref(),
+            Some("ENSPHGVS000001.1:p.Met1_?7")
+        );
+    }
+
+    #[test]
     fn start_lost_frameshift_with_empty_reference_translation_keeps_hgvsp() {
         let translation = make_translation();
         let protein = ProteinHgvsData {
