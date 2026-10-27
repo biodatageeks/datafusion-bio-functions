@@ -9116,7 +9116,7 @@ fn classify_coding_change_with_semantics(
     );
     class.affected_ref_peptide = local_peptide_from_codon_window(tx.codon_table, local_ref_codon);
     class.affected_alt_peptide = local_peptide_from_codon_window(tx.codon_table, &local_alt_codon);
-    if skip_global_stop_compare {
+    if skip_global_stop_compare && !translation_seqedit_overlap {
         // Failed RefSeq BAM edits can leave the genomic codon representation
         // different from the trusted cached protein. VEP exposes that split
         // for NM_173600.2 at chr12:40526308: Codons is `Tga/Cga`, but both
@@ -9128,6 +9128,14 @@ fn classify_coding_change_with_semantics(
         // translation for `old_aas`; `new_aas` is the translated alternate
         // CDS. Use those same peptide-space windows for the VEP 116 stop
         // predicates while preserving the genomic codons for CSQ output.
+        // When a translation SeqEdit overlaps, however, preserve the local
+        // allele peptide windows above: VEP's codon() widens only the alternate
+        // codon window by the allele length delta and peptide() appends X to
+        // its partial remainder, while SeqEdits overlay only the reference
+        // peptide. Whole-protein translation drops that partial X.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-776,877:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L776
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L877-L877
         let peptide_end = local_last_codon.saturating_add(1);
         class.affected_ref_peptide = old_aas
             .get(local_first_codon..peptide_end)
@@ -28800,6 +28808,70 @@ mod tests {
         let got = classify_mt_snv("ATAGCTCCCTAA", 1002, "A", "T");
         assert_eq!(got.amino_acids.as_deref(), Some("M/I"));
         assert!(got.start_lost);
+    }
+
+    #[test]
+    fn mt_initiator_seqedit_keeps_vep_partial_alt_peptide_in_amino_acids() {
+        // The ND1 initiator is translated as Met and also has a reference-only
+        // SeqEdit to Met. VEP overlays the reference peptide whenever the
+        // mapped peptide range overlaps that edit, even when the visible
+        // reference residue is unchanged; its alternate peptide retains the
+        // partial-codon X used by pep_allele_string.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-776;
+        // VEP release/116.0, OutputFactory.pm:1723-1727:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L776
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1723-L1727
+        let mut transcript = tx(
+            "ENST00000361390",
+            "MT",
+            3307,
+            3315,
+            1,
+            "protein_coding",
+            Some(3307),
+            Some(3315),
+        );
+        transcript.codon_table = CodonTable::VertebrateMitochondrial;
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
+        transcript.translateable_seq = Some("ATACCCCCC".to_string());
+        transcript.translation_seq_edits = vec![TranslationSeqEdit {
+            code: "translation_seq_edit".to_string(),
+            start: 1,
+            end: 1,
+            alt_seq: "M".to_string(),
+        }];
+        let transcript_exon = exon("ENST00000361390", 1, 3307, 3315);
+        let exons = [&transcript_exon];
+        let cached_translation =
+            translation("ENST00000361390", Some(9), Some(3), None, Some("ATACCCCCC"));
+        let variant = var("MT", 3308, 3308, "T", "AC");
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("MT variant should classify");
+
+        assert_eq!(classification.codons.as_deref(), Some("aTa/aACa"));
+        assert_eq!(classification.affected_ref_peptide.as_deref(), Some("M"));
+        assert_eq!(classification.affected_alt_peptide.as_deref(), Some("NX"));
+        assert_eq!(classification.amino_acids.as_deref(), Some("M/NX"));
+        assert_eq!(
+            amino_acids_for_output(
+                &transcript,
+                &exons,
+                Some(&cached_translation),
+                &classification,
+                &variant,
+                crate::vep_semantics::VepSemantics::V116,
+            )
+            .as_deref(),
+            Some("M/NX")
+        );
     }
 
     #[test]
