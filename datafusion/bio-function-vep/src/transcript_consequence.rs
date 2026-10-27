@@ -33954,6 +33954,36 @@ mod tests {
     }
 
     #[test]
+    fn shifted_tva_replay_preserves_existing_frameshift_classification_at_stop_window() {
+        let (transcript, exons, translation) = star_insertion_fixture();
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let variant = star_insertion_variant(178, "A", "AT", 0, "T");
+        let shift = variant
+            .hgvs_shift_for_strand(transcript.strand)
+            .expect("the variant has a forward HGVS shift")
+            .clone();
+        let mut fallback = star_star_fallback();
+        fallback.frameshift = true;
+
+        let replay = shifted_tva_protein_hgvs_data(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            &shift,
+            Some(&fallback),
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("the shifted stop window maps to translated peptide coordinates");
+
+        assert!(replay.ref_peptide.starts_with('*'));
+        assert!(
+            replay.frameshift,
+            "the shifted peptide window must not overwrite the existing frameshift classification"
+        );
+    }
+
+    #[test]
     fn vep116_shifted_hgvsp_keeps_source_frameshift_for_clinvar_219_stop_windows() {
         let cases = [
             (
