@@ -3438,7 +3438,18 @@ impl TranscriptConsequenceEngine {
                     partial_boundary_classification.clone()
                 } else {
                     None
-                };
+                }
+                .or_else(|| {
+                    // VEP emits CDS/protein positions from the mapped variation
+                    // endpoints independently of whether a peptide can be
+                    // constructed. Preserve those positions when an intron
+                    // deletion has two mapped CDS endpoints but its local
+                    // peptide classification is unavailable.
+                    // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1723-L1738
+                    spliced_cds_span.and_then(|_| {
+                        partial_coding_overlap_classification(tx, tx_exons, tx_translation, variant)
+                    })
+                });
                 if self.semantics.vep116_stop_predicates() {
                     if vep116_protein_altering_variant(
                         classification.as_ref(),
@@ -18324,6 +18335,42 @@ mod tests {
         assert!(frameshift_entry.codons.is_some());
         assert!(frameshift_entry.amino_acids.is_some());
         assert!(frameshift_entry.hgvsp.is_some());
+    }
+
+    #[test]
+    fn issue_215_keeps_mapped_positions_when_peptide_classification_fails() {
+        let engine = TranscriptConsequenceEngine::default();
+        let short_cds = "ATGAAA";
+        let mut transcript = tx(
+            "T215",
+            "22",
+            100,
+            211,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(211),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(24);
+        transcript.translateable_seq = Some(short_cds.to_string());
+        let exon_features = [exon("T215", 1, 100, 111), exon("T215", 2, 200, 211)];
+        let exon_refs = exon_features.iter().collect::<Vec<_>>();
+        let tr = translation("T215", Some(24), Some(7), Some("MKPEEPG"), Some(short_cds));
+        let deletion = var("22", 106, 205, &"N".repeat(100), "-");
+        let mut terms = BTreeSet::new();
+
+        // The endpoint mapper still defines CDS/protein positions 7-18 / 3-6,
+        // even if the cached peptide sequence is too short to classify codons.
+        let class = engine
+            .add_coding_terms(&mut terms, &deletion, &transcript, &exon_refs, Some(&tr))
+            .expect("mapped endpoint coordinates remain available");
+
+        assert_eq!(class.cds_position_start, Some(7));
+        assert_eq!(class.cds_position_end, Some(18));
+        assert_eq!(class.protein_position_start, Some(3));
+        assert_eq!(class.protein_position_end, Some(6));
+        assert!(class.codons.is_none());
     }
 
     #[test]
