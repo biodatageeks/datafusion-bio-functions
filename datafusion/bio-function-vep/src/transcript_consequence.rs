@@ -9463,12 +9463,11 @@ fn classify_coding_change_with_spliced_span(
                 // Inframe insertion (ref_len < alt_len, handled in classify_insertion)
                 // This branch shouldn't be reached for pure insertions (ref="-"),
                 // but handle complex cases with both ref and alt bases.
-                let ref_codon = format_codon_display(
-                    &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
-                    start_idx,
-                    end_idx,
-                    codon_nt_start,
-                );
+                // VEP highlights reference codons using length(feature_seq),
+                // including bases beyond a spliced CDS endpoint. See pinned
+                // Variation `TranscriptVariationAllele::display_codon()`:
+                // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L901-L926
+                let ref_codon = format_ref_codon(&cds_seq.as_bytes()[codon_nt_start..codon_nt_end]);
                 // In frame, `(start_idx + alt_len - 1) / 3` is the last
                 // alternate codon, so VEP's window ends where it always did
                 // unless it is truncated by the CDS end.
@@ -18407,6 +18406,33 @@ mod tests {
             .expect("expected a T215 consequence for the partial final codon");
         assert_eq!(
             partial_last_codon_entry
+                .codons
+                .as_deref()
+                .and_then(|codons| codons.split_once('/').map(|(reference, _)| reference)),
+            Some("CCTGAAGAACCT")
+        );
+
+        // This delins maps to eleven CDS bases but has a fourteen-base
+        // feature-sequence ALT. VEP highlights the reference using the full
+        // feature_seq length, including the final base beyond the mapped CDS
+        // endpoint.
+        let spliced_delins = var("22", 106, 204, &"N".repeat(99), &"A".repeat(14));
+        let spliced_delins_result = engine.evaluate_variant_with_context(
+            &spliced_delins,
+            &[transcript.clone()],
+            &exon_features,
+            &[tr.clone()],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let spliced_delins_entry = spliced_delins_result
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("T215"))
+            .expect("expected a T215 consequence for the spliced delins");
+        assert_eq!(
+            spliced_delins_entry
                 .codons
                 .as_deref()
                 .and_then(|codons| codons.split_once('/').map(|(reference, _)| reference)),
