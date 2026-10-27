@@ -12412,7 +12412,9 @@ fn mapped_transcript_reference_allele(
     // remain RefSeq-based while `Transcript::spliced_seq()` is exon-derived.
     // <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L455-L465>
     // <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627>
-    let transcript_seq = failed_bam_exon_seq(tx)
+    let failed_bam_sequence = failed_bam_source_spliced_seq(tx);
+    let transcript_seq = failed_bam_sequence
+        .as_deref()
         .or(tx.spliced_seq.as_deref())
         .or(tx.cdna_seq.as_deref())?;
     let genomic_positions = genomic_range(variant.start, variant.end)?;
@@ -12459,6 +12461,78 @@ fn mapped_transcript_reference_allele(
         transcript_ref.push((seq[cdna - 1] as char).to_ascii_uppercase());
     }
     Some(transcript_ref)
+}
+
+/// Reconstruct the sequence `TranscriptVariation::_get_ref_allele()` reads
+/// after VEP rejects a BAM edit. VEP restores the prior edit state, then
+/// slices `Transcript::spliced_seq` with mapper cDNA coordinates. Prefer that
+/// cached sequence; when only source UTR/CDS components are present, join them
+/// if they exactly cover the mapper's cDNA range. The genome-derived exon
+/// sequence is a final fallback because it omits cache-native sequence edits
+/// such as RefSeq insertions.
+///
+/// Ensembl Variation 2fb834b, TranscriptVariation.pm:455-465; VEP release/116.0,
+/// AnnotationType/Transcript.pm:619-627; Ensembl core c0cf13d, Transcript.pm:823-878:
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L455-L465
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+/// https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
+fn failed_bam_source_spliced_seq(tx: &TranscriptFeature) -> Option<Cow<'_, str>> {
+    if !tx
+        .bam_edit_status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
+    {
+        return None;
+    }
+    if let Some(sequence) = tx.spliced_seq.as_deref() {
+        return Some(Cow::Borrowed(sequence));
+    }
+
+    let (Some(coding_start), Some(coding_end), Some(utr5), Some(utr3)) = (
+        tx.cdna_coding_start,
+        tx.cdna_coding_end,
+        tx.five_prime_utr_seq.as_deref(),
+        tx.three_prime_utr_seq.as_deref(),
+    ) else {
+        return failed_bam_exon_seq(tx).map(Cow::Borrowed);
+    };
+    let Some(coding_length) = coding_end
+        .checked_sub(coding_start)
+        .and_then(|length| length.checked_add(1))
+    else {
+        return failed_bam_exon_seq(tx).map(Cow::Borrowed);
+    };
+    let Some(expected_utr5_length) = coding_start.checked_sub(1) else {
+        return failed_bam_exon_seq(tx).map(Cow::Borrowed);
+    };
+    let Some(translateable) = tx
+        .translateable_seq
+        .as_deref()
+        .filter(|sequence| sequence.len() == coding_length)
+        .or_else(|| {
+            tx.cdna_seq
+                .as_deref()
+                .filter(|sequence| sequence.len() == coding_length)
+        })
+    else {
+        return failed_bam_exon_seq(tx).map(Cow::Borrowed);
+    };
+    if utr5.len() != expected_utr5_length {
+        return failed_bam_exon_seq(tx).map(Cow::Borrowed);
+    }
+
+    let sequence_length = utr5.len() + translateable.len() + utr3.len();
+    if tx
+        .cdna_mapper_segments
+        .iter()
+        .map(|segment| segment.cdna_end)
+        .max()
+        .is_some_and(|mapper_length| mapper_length != sequence_length)
+    {
+        return failed_bam_exon_seq(tx).map(Cow::Borrowed);
+    }
+
+    Some(Cow::Owned(format!("{utr5}{translateable}{utr3}")))
 }
 
 /// True when the missing cDNA interval between two mapped genomic bases is
@@ -13745,7 +13819,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_bam_used_ref_indexes_the_unedited_exon_sequence_with_refseq_mapper_coords() {
+    fn failed_bam_used_ref_indexes_source_spliced_seq_with_mapper_coords() {
         let mut transcript = tx(
             "NM_FAILED_BAM.1",
             "15",
@@ -13765,9 +13839,14 @@ mod tests {
             replacement_len: None,
             skip_refseq_offset: false,
         }];
-        // The cache's edit-consistent sequence omits transcript base 3. The
-        // full cDNA models VEP's exon-concatenated sequence after BAM-edit
-        // failure, while the mapper still reports RefSeq cDNA coordinates.
+        // VEP restores the pre-BAM edit state, then Variation slices the
+        // transcript's spliced_seq directly with mapper cDNA coordinates.
+        // Keep the cached reference and the genome-derived failed-BAM exon
+        // sequence distinct so this asserts which source sequence VEP uses.
+        // Ensembl Variation 2fb834b, TranscriptVariation.pm:455-465 and VEP
+        // release/116.0, Transcript.pm:619-627:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L455-L465
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
         transcript.spliced_seq = Some("AACGGTTAA".to_string());
         transcript.failed_bam_exon_seq = Some("AACCGGTTAA".to_string());
         transcript.cdna_mapper_segments = vec![
@@ -13801,7 +13880,7 @@ mod tests {
                 Some("A"),
             )
             .as_deref(),
-            Some("C")
+            Some("A")
         );
 
         let before_edit = var("15", 108, 108, "T", "C");
@@ -13818,6 +13897,57 @@ mod tests {
             .as_deref(),
             Some("T"),
             "before the failed BAM edit, feature and genomic references still agree"
+        );
+    }
+
+    #[test]
+    fn failed_bam_used_ref_composes_source_utr_and_cds_for_mapper_coords() {
+        let mut transcript = tx(
+            "NM_FAILED_BAM_COMPONENTS.1",
+            "15",
+            100,
+            111,
+            1,
+            "protein_coding",
+            Some(103),
+            Some(108),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.cdna_coding_start = Some(4);
+        transcript.cdna_coding_end = Some(9);
+        transcript.five_prime_utr_seq = Some("AAA".to_string());
+        transcript.translateable_seq = Some("CCCCCC".to_string());
+        transcript.three_prime_utr_seq = Some("GGG".to_string());
+        transcript.failed_bam_exon_seq = Some("TTTTTTTTTTTT".to_string());
+        transcript.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 100,
+            genomic_end: 111,
+            cdna_start: 1,
+            cdna_end: 12,
+            ori: 1,
+        }];
+        let exon = exon("NM_FAILED_BAM_COMPONENTS.1", 1, 100, 111);
+        let exons = [&exon];
+        let variant = var("15", 103, 103, "T", "A");
+
+        // The cache omits `spliced_seq` for these RefSeq rows, but its 5'UTR,
+        // translateable CDS, and 3'UTR lengths exactly cover mapper cDNA.
+        // Variation slices that source cDNA with mapper coordinates after a
+        // failed BAM edit; the genomic fallback deliberately carries T here.
+        // Ensembl Variation 2fb834b, TranscriptVariation.pm:455-465; VEP
+        // release/116.0, AnnotationType/Transcript.pm:619-627; Ensembl core
+        // c0cf13d, Transcript.pm:823-878:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L455-L465
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
+        assert_eq!(
+            failed_bam_source_spliced_seq(&transcript).as_deref(),
+            Some("AAACCCCCCGGG")
+        );
+        assert_eq!(
+            mapped_transcript_reference_allele(&variant, &transcript, &exons, true).as_deref(),
+            Some("C")
         );
     }
 
