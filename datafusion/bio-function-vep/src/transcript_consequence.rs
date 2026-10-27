@@ -3337,12 +3337,13 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::FrameshiftVariant);
             }
 
-            if let Some(mut classification) = classify_coding_change_with_semantics(
+            if let Some(mut classification) = classify_coding_change_with_spliced_span(
                 tx,
                 tx_exons,
                 tx_translation,
                 variant,
                 self.semantics,
+                spliced_cds_span,
             ) {
                 // VEP's frameshift predicate returns 0 when stop_retained
                 // is true. Override frameshift → inframe_insertion.
@@ -7531,6 +7532,10 @@ fn shifted_tva_coords_from_mapper(
             .into_iter()
             .all(|pos| exact_mapper_cdna_index_for_hgvsp(tx, pos).is_some())
             && !has_internal_mapper_gap;
+        // An internal intron/deleted-edit Gap is absent from transcript
+        // sequence. The CDS endpoints came from the mapper's first/last
+        // pieces, not a complete per-base index, so downstream RefSeq
+        // sequence projection must not treat this as an exact mapper index.
         (
             cdna_start,
             cdna_end,
@@ -8677,6 +8682,26 @@ fn classify_coding_change_with_semantics(
     variant: &VariantInput,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<CodingClassification> {
+    let spliced_cds_span =
+        spliced_cds_span_for_intron_deletion(tx, tx_exons, tx_translation, variant);
+    classify_coding_change_with_spliced_span(
+        tx,
+        tx_exons,
+        tx_translation,
+        variant,
+        semantics,
+        spliced_cds_span,
+    )
+}
+
+fn classify_coding_change_with_spliced_span(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+    semantics: crate::vep_semantics::VepSemantics,
+    spliced_cds_span: Option<(usize, usize)>,
+) -> Option<CodingClassification> {
     let translation = tx_translation?;
     let cds_seq = reference_translateable_seq_for_vep(tx, Some(translation))?;
     let ref_genomic = normalize_allele_seq(&variant.ref_allele);
@@ -8728,18 +8753,17 @@ fn classify_coding_change_with_semantics(
     let mut raw_cds_indices = Vec::with_capacity(genomic_positions.len());
     let mut cds_indices = Vec::with_capacity(genomic_positions.len());
     let mut spans_refseq_edit_gap = false;
-    let spliced_cds_span =
-        spliced_cds_span_for_intron_deletion(tx, tx_exons, Some(translation), variant);
     let spans_spliced_intron_gap = spliced_cds_span.is_some();
     if let Some((cds_start, cds_end)) = spliced_cds_span {
         // These are VEP's first and last CDS mapper pieces. Internal intron
         // bases are Gaps, so they do not add sequence positions to the span.
+        // `CdnaBaseMap::Output` has already applied the RefSeq output offset;
+        // applying the exon-geometry sequence correction again would shift
+        // these mapped endpoints twice.
         for cds_position in [cds_start, cds_end] {
             let raw_idx = cds_position.checked_sub(1)?;
             raw_cds_indices.push(raw_idx);
-            cds_indices.push(
-                adjust_refseq_cds_sequence_index(tx, raw_idx, leading_n_offset).unwrap_or(raw_idx),
-            );
+            cds_indices.push(raw_idx);
         }
     } else {
         for pos in &genomic_positions {
@@ -8812,7 +8836,16 @@ fn classify_coding_change_with_semantics(
     let ref_seq_slice = cds_seq[start_idx..=end_idx].to_string();
     let edited_ref_tx = edited_transcript_reference_allele(variant, tx, tx_exons)
         .filter(|seq| seq.len() == input_ref_len);
-    let effective_ref_tx = if spans_refseq_edit_gap {
+    let effective_ref_tx = if spans_spliced_intron_gap {
+        // For `_rna_edit` transcripts VEP replaces the mapped CDS width with
+        // the complete transcript-oriented feature allele. The genomic allele
+        // can include intronic bases, so its length can exceed that width.
+        // `feature_seq` is the variation-feature allele on the transcript
+        // strand, as defined by VariationFeatureOverlapAllele::feature_seq().
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L874
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeatureOverlapAllele.pm#L234-L263
+        ref_tx.clone()
+    } else if spans_refseq_edit_gap {
         if ref_len < input_ref_len {
             // VEP's `TranscriptVariationAllele::codon()` patches the reference
             // translateable sequence at the mapped CDS start for `_rna_edit`
@@ -8832,13 +8865,12 @@ fn classify_coding_change_with_semantics(
     };
     // VEP's reference codon comes from _translateable_seq(), even when the
     // supplied REF disagrees with it. Only actual _rna_edit attributes replace
-    // that span with reference feature_seq; BAM/mapper state alone does not.
+    // the mapped span with reference feature_seq; BAM/mapper state alone does
+    // not. Perl substr replaces the mapped width with the full feature allele,
+    // including when that allele contains intronic bases.
     // Capture attribute presence before hydration can infer coordinate edits.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L874
     let cds_seq = if tx.has_rna_edit && ref_seq_slice != effective_ref_tx {
-        if ref_seq_slice.len() != effective_ref_tx.len() {
-            return None;
-        }
         let mut edited_cds = cds_seq.into_bytes();
         edited_cds.splice(start_idx..=end_idx, effective_ref_tx.bytes());
         String::from_utf8(edited_cds).ok()?
@@ -9028,12 +9060,19 @@ fn classify_coding_change_with_semantics(
     // coding positions.
     let raw_cds_position_start = raw_start_idx + 1;
     let raw_cds_position_end = raw_end_idx + 1;
-    class.cds_position_start =
-        adjust_refseq_cds_output_position(tx, raw_cds_position_start, leading_n_offset)
-            .or(Some(raw_cds_position_start));
-    class.cds_position_end =
-        adjust_refseq_cds_output_position(tx, raw_cds_position_end, leading_n_offset)
-            .or(Some(raw_cds_position_end));
+    if spans_spliced_intron_gap {
+        // The span came from the Output mapper and already includes RefSeq
+        // output-space adjustments.
+        class.cds_position_start = Some(raw_cds_position_start);
+        class.cds_position_end = Some(raw_cds_position_end);
+    } else {
+        class.cds_position_start =
+            adjust_refseq_cds_output_position(tx, raw_cds_position_start, leading_n_offset)
+                .or(Some(raw_cds_position_start));
+        class.cds_position_end =
+            adjust_refseq_cds_output_position(tx, raw_cds_position_end, leading_n_offset)
+                .or(Some(raw_cds_position_end));
+    }
 
     let display_cds_position_start = class.cds_position_start.unwrap_or(raw_cds_position_start);
     let display_cds_position_end = class.cds_position_end.unwrap_or(raw_cds_position_end);
@@ -18416,6 +18455,177 @@ mod tests {
         assert!(frameshift_entry.codons.is_some());
         assert!(frameshift_entry.amino_acids.is_some());
         assert!(frameshift_entry.hgvsp.is_some());
+    }
+
+    #[test]
+    fn issue_215_spliced_endpoints_do_not_apply_refseq_offset_twice() {
+        let cds = "ATG".repeat(12);
+        let mut transcript = tx(
+            "NM_215_TEST.1",
+            "22",
+            100,
+            211,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(211),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(24);
+        transcript.translateable_seq = Some(cds.clone());
+        // A five-base transcript-only insertion upstream of the deletion is
+        // reflected in the Output mapper's endpoint coordinates.
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 2,
+            end: 1,
+            replacement_len: Some(5),
+            skip_refseq_offset: false,
+        }];
+        let exons = [
+            exon("NM_215_TEST.1", 1, 100, 111),
+            exon("NM_215_TEST.1", 2, 200, 211),
+        ];
+        let exon_refs = exons.iter().collect::<Vec<_>>();
+        let tr = translation(
+            "NM_215_TEST.1",
+            Some(36),
+            Some(12),
+            Some(&"M".repeat(12)),
+            Some(&cds),
+        );
+        let deletion = var("22", 106, 205, &"N".repeat(100), "-");
+        let mapped =
+            spliced_cds_span_for_intron_deletion(&transcript, &exon_refs, Some(&tr), &deletion)
+                .expect("both output-mapped coding endpoints are defined");
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exon_refs,
+            Some(&tr),
+            &deletion,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("mapped spliced coding deletion is classifiable");
+
+        assert_eq!(mapped, (12, 23));
+        assert_eq!(
+            (
+                classification.cds_position_start,
+                classification.cds_position_end
+            ),
+            (Some(mapped.0), Some(mapped.1))
+        );
+        assert_eq!(
+            (
+                classification.protein_position_start,
+                classification.protein_position_end,
+            ),
+            (Some(4), Some(8))
+        );
+        assert_eq!(
+            classification.codons.as_deref(),
+            Some("atGATGATGATGATG/atg")
+        );
+    }
+
+    #[test]
+    fn issue_215_spliced_rna_edit_replaces_only_the_mapped_cds_width() {
+        let cds = "ATGAAACCTGAAGAACCTGGATAA";
+        let mut transcript = tx(
+            "NM_215_RNA_EDIT.1",
+            "22",
+            100,
+            211,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(211),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.has_rna_edit = true;
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(24);
+        transcript.translateable_seq = Some(cds.to_string());
+        let exons = [
+            exon("NM_215_RNA_EDIT.1", 1, 100, 111),
+            exon("NM_215_RNA_EDIT.1", 2, 200, 211),
+        ];
+        let exon_refs = exons.iter().collect::<Vec<_>>();
+        let tr = translation(
+            "NM_215_RNA_EDIT.1",
+            Some(24),
+            Some(7),
+            Some("MKPEEPG*"),
+            Some(cds),
+        );
+        let deletion = var("22", 106, 205, &"N".repeat(100), "-");
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exon_refs,
+            Some(&tr),
+            &deletion,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("RNA-edited spliced CDS is classified from mapped endpoints");
+
+        assert_eq!(
+            (
+                classification.cds_position_start,
+                classification.cds_position_end
+            ),
+            (Some(7), Some(18))
+        );
+        assert_eq!(classification.codons.as_deref(), Some("NNNNNNNNNNNN/-"));
+    }
+
+    #[test]
+    fn issue_215_spliced_deletion_with_short_intron_uses_mapped_endpoints() {
+        let cds = "ATGAAACCTGAAGAACCTGGATAA";
+        let mut transcript = tx(
+            "T215_SHORT_INTRON",
+            "22",
+            100,
+            125,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(125),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(24);
+        transcript.translateable_seq = Some(cds.to_string());
+        let exons = [
+            exon("T215_SHORT_INTRON", 1, 100, 111),
+            exon("T215_SHORT_INTRON", 2, 114, 125),
+        ];
+        let exon_refs = exons.iter().collect::<Vec<_>>();
+        let tr = translation(
+            "T215_SHORT_INTRON",
+            Some(24),
+            Some(7),
+            Some("MKPEEPG*"),
+            Some(cds),
+        );
+        let deletion = var("22", 106, 119, &"N".repeat(14), "-");
+
+        let mapped =
+            spliced_cds_span_for_intron_deletion(&transcript, &exon_refs, Some(&tr), &deletion);
+        let mut terms = BTreeSet::new();
+        let classification = TranscriptConsequenceEngine::default()
+            .add_coding_terms(&mut terms, &deletion, &transcript, &exon_refs, Some(&tr))
+            .expect("short intron deletion retains a mapped coding classification");
+
+        assert_eq!(mapped, Some((7, 18)));
+        assert_eq!(
+            (
+                classification.cds_position_start,
+                classification.cds_position_end
+            ),
+            (Some(7), Some(18))
+        );
+        assert!(terms.contains(&SoTerm::InframeDeletion), "{terms:?}");
+        assert!(!terms.contains(&SoTerm::FrameshiftVariant), "{terms:?}");
     }
 
     #[test]

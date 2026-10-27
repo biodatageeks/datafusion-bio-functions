@@ -747,21 +747,47 @@ mod tests {
                 for coding in [None, Some((1, total)), Some((5, total - 6))] {
                     for shape in shapes {
                         for flavour in flavours {
+                            // A synthetic genomic mapper gap inside one exon
+                            // models the deleted RefSeq edit below. Do not
+                            // combine that gap with an otherwise unedited
+                            // Ensembl/RefSeq transcript: no exon or edit in
+                            // those fixtures could have produced it.
+                            if matches!(shape, MapperShape::GenomicGap)
+                                && !matches!(flavour, Flavour::RefSeqDeletionEdit)
+                            {
+                                continue;
+                            }
                             let id = match flavour {
                                 Flavour::Ensembl => "ENST00000000001.1",
                                 _ => "NM_000001.1",
                             };
                             let mut tx = tx_feature(id, strand, layout, coding);
                             tx.cdna_mapper_segments = mapper_segments(strand, layout, shape);
+                            let deleted_edit_position = if matches!(shape, MapperShape::GenomicGap)
+                            {
+                                let (start, end) = layout[0];
+                                let omitted_genomic_base = (start + end) / 2;
+                                let exons = exon_features(id, layout);
+                                let refs: Vec<&ExonFeature> = exons.iter().collect();
+                                super::super::genomic_to_cdna_index(
+                                    &refs,
+                                    strand,
+                                    omitted_genomic_base,
+                                )
+                                .map(|position| position as i64)
+                            } else {
+                                None
+                            };
                             match flavour {
                                 Flavour::Ensembl => tx.source = Some("Ensembl".to_string()),
                                 Flavour::RefSeqPlain => tx.source = Some("RefSeq".to_string()),
                                 Flavour::RefSeqDeletionEdit => {
                                     tx.source = Some("RefSeq".to_string());
                                     tx.has_rna_edit = true;
+                                    let edit_position = deleted_edit_position.unwrap_or(12);
                                     tx.refseq_edits = vec![RefSeqEdit {
-                                        start: 12,
-                                        end: 12,
+                                        start: edit_position,
+                                        end: edit_position,
                                         replacement_len: None,
                                         skip_refseq_offset: false,
                                     }];
@@ -948,9 +974,10 @@ mod tests {
                 defined += usize::from(legacy.is_some());
             }
         }
-        // 240 transcripts; guard against a matrix that silently shrank.
-        assert!(compared > 150_000, "compared {compared}");
-        assert!(defined > 50_000, "defined {defined}");
+        // The matrix excludes synthetic genomic gaps paired with transcripts
+        // that have no edit capable of producing them (168 valid fixtures).
+        assert!(compared > 140_000, "compared {compared}");
+        assert!(defined > 35_000, "defined {defined}");
     }
 
     /// `shifted_tva_coords_from_mapper` at functions `9936c6e`, verbatim.
@@ -1115,9 +1142,10 @@ mod tests {
     }
 
     /// The mapper-coordinate path agrees with the legacy path across ordinary
-    /// shifted spans. A deletion with mapped endpoints and an internal intron
-    /// is the intentional exception: VEP keeps its first and last mapped
-    /// pieces, whereas the legacy per-base path rejects the unmapped gap.
+    /// shifted spans. For an internal mapper Gap with mapped endpoints, VEP
+    /// keeps its first and last mapped pieces, whereas the legacy per-base
+    /// path rejects the unmapped bases. In these fixtures the gap is either
+    /// an ordinary intron or an explicit deleted RefSeq edit.
     #[test]
     fn f0_shifted_insertion_matches_legacy() {
         let mut compared = 0usize;
@@ -1144,14 +1172,41 @@ mod tests {
                                 VepTxMapper::new(&tx, &refs, Some(&tl), CdnaBaseMap::HgvspExact);
                             let cdna = mapper.cdna(span);
                             let cds = mapper.cds_of_cdna(cdna, false).both();
+                            let start = v.start.min(v.end);
+                            let end = v.start.max(v.end);
+                            let sorted_exons = super::super::start_sorted(&refs);
+                            let crosses_intron = sorted_exons.windows(2).any(|pair| {
+                                let intron_start = pair[0].end.saturating_add(1);
+                                let intron_end = pair[1].start.saturating_sub(1);
+                                intron_start <= intron_end
+                                    && start <= intron_end
+                                    && end >= intron_start
+                            });
+                            let crosses_deleted_refseq_edit =
+                                (start.saturating_add(1)..end).any(|pos| {
+                                    let Some(raw_cdna) =
+                                        super::super::genomic_to_cdna_index(&refs, tx.strand, pos)
+                                            .and_then(|cdna| i64::try_from(cdna).ok())
+                                    else {
+                                        return false;
+                                    };
+                                    tx.refseq_edits.iter().any(|edit| {
+                                        edit.replacement_len.is_none()
+                                            && raw_cdna >= edit.start
+                                            && raw_cdna <= edit.end
+                                    })
+                                });
                             let crosses_mapper_gap = !span.is_insertion()
                                 && mapper
                                     .cdna_pieces(span)
                                     .iter()
                                     .any(|piece| matches!(piece, MapperPiece::Gap));
                             assert!(
-                                legacy.is_none() && crosses_mapper_gap && cdna.both().is_some(),
-                                "unexpected shifted-coordinate divergence: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{} pieces={:?} legacy={legacy:?} new={new:?}",
+                                legacy.is_none()
+                                    && crosses_mapper_gap
+                                    && (crosses_intron || crosses_deleted_refseq_edit)
+                                    && cdna.both().is_some(),
+                                "unexpected shifted-coordinate divergence outside a mapper Gap from an intron or deleted RefSeq edit: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{} pieces={:?} legacy={legacy:?} new={new:?}",
                                 tx.transcript_id,
                                 tx.strand,
                                 tx.cdna_coding_start,
