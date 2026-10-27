@@ -7571,7 +7571,9 @@ fn shifted_tva_coords_from_mapper(
                 if cdna_positions.is_empty() {
                     return None;
                 }
-                cdna_positions.sort_unstable_by_key(|&(cdna, _)| cdna);
+                // Stable ordering preserves genomic mapper order when edited
+                // segments yield equal cDNA coordinates.
+                cdna_positions.sort_by_key(|&(cdna, _)| cdna);
                 let &(cdna_start, mapper_used_for_start) = cdna_positions.first()?;
                 let &(cdna_end, mapper_used_for_end) = cdna_positions.last()?;
                 (
@@ -15853,6 +15855,89 @@ mod tests {
                 cds_end: 270,
                 protein_start: 87,
                 protein_end: 90,
+                edited_insertion_gap: false,
+            })
+        );
+    }
+
+    #[test]
+    fn shifted_tva_coords_keep_reverse_exact_mapper_provenance_across_intronic_gap() {
+        let mut transcript = tx(
+            "NM_002111.8",
+            "4",
+            3074681,
+            3243960,
+            -1,
+            "protein_coding",
+            Some(3074826),
+            Some(3240065),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_non_polya_rna_edit = true;
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 11,
+            end: 10,
+            replacement_len: Some(6),
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3076091,
+                genomic_end: 3076100,
+                cdna_start: 1,
+                cdna_end: 10,
+                ori: -1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3076000,
+                genomic_end: 3076090,
+                cdna_start: 17,
+                cdna_end: 107,
+                ori: -1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3074936,
+                genomic_end: 3075088,
+                cdna_start: 108,
+                cdna_end: 260,
+                ori: -1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3074681,
+                genomic_end: 3074935,
+                cdna_start: 261,
+                cdna_end: 515,
+                ori: -1,
+            },
+        ];
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(515);
+        transcript.translateable_seq = Some("A".repeat(515));
+
+        let exons = vec![
+            exon("NM_002111.8", 3, 3074681, 3074935),
+            exon("NM_002111.8", 2, 3074936, 3075088),
+            exon("NM_002111.8", 1, 3076000, 3076100),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let translation = translation("NM_002111.8", Some(515), Some(171), None, None);
+        let shifted_deletion = var("4", 3075080, 3076000, "A", "-");
+
+        assert_eq!(
+            shifted_tva_coords_from_mapper(
+                &transcript,
+                &exons_ref,
+                &translation,
+                &shifted_deletion
+            ),
+            Some(ShiftedTvaCoords {
+                // The reverse-strand endpoints are still exact mapper values;
+                // the internal intron Gap must not reapply the upstream edit.
+                cds_start: 107,
+                cds_end: 116,
+                protein_start: 36,
+                protein_end: 39,
                 edited_insertion_gap: false,
             })
         );
