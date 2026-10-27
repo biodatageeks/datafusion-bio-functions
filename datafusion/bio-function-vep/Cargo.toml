@@ -40,14 +40,15 @@ parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
 # Pin all formats crates to the same full master rev. It includes the merged
 # RefSeq CDS-bound fix (#267), transcript SeqEdits column (#269), Character INFO
 # materialization (#266), percent-encoded VCF values (#264), MT codon_table
-# support (#262), and gene bounds (#270). The formats release is postponed.
+# support (#262), gene bounds (#270), and raw INFO escape preservation (#207).
+# The formats release is postponed.
 # Every formats crate in this workspace, the pileup crate's included, has to name
 # the same tag or rev, or the lockfile resolves two copies of datafusion-bio-format-core.
-datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "27e0dce7f49415db6820bd3c9e095ec475484982" }
-datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "27e0dce7f49415db6820bd3c9e095ec475484982" }
-datafusion-bio-format-gff = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "27e0dce7f49415db6820bd3c9e095ec475484982" }
-datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "27e0dce7f49415db6820bd3c9e095ec475484982" }
-datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "27e0dce7f49415db6820bd3c9e095ec475484982", optional = true }
+datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "bdc4d2c5de00fea7985d9b1b8b7ddb53fb9e06d0" }
+datafusion-bio-format-bed = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "bdc4d2c5de00fea7985d9b1b8b7ddb53fb9e06d0" }
+datafusion-bio-format-gff = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "bdc4d2c5de00fea7985d9b1b8b7ddb53fb9e06d0" }
+datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "bdc4d2c5de00fea7985d9b1b8b7ddb53fb9e06d0" }
+datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "bdc4d2c5de00fea7985d9b1b8b7ddb53fb9e06d0", optional = true }
 indicatif = "0.18.4"
 
 # `libc` is only used by `peak_rss_mb()` (getrusage) on UNIX; scoping it here
