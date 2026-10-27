@@ -33271,6 +33271,109 @@ mod tests {
     }
 
     #[test]
+    fn original_coding_predicate_rejects_missing_cdna_coding_bounds() {
+        // Pinned Ensembl core `TranscriptMapper::genomic2cds` returns a Gap
+        // for the full span when `cdna_coding_start` is undefined; Variation
+        // sets `pre->{coding}` only when `cds_coords` contains a Coordinate.
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L410-L430
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L519-L556
+        let tx = tx(
+            "ENSTCDSBOUNDSMISSING0001",
+            "1",
+            100,
+            109,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(109),
+        );
+        let exons = [exon("ENSTCDSBOUNDSMISSING0001", 1, 100, 109)];
+        let exons_ref = exons.iter().collect::<Vec<_>>();
+        let coding_substitution = var("1", 105, 105, "A", "C");
+
+        assert!(!original_variation_maps_to_cds(
+            &tx,
+            &exons_ref,
+            &coding_substitution
+        ));
+    }
+
+    #[test]
+    fn original_coding_predicate_maps_reverse_strand_cds_bounds() {
+        let mut tx = tx(
+            "ENSTCDSREVERSE0001",
+            "1",
+            100,
+            139,
+            -1,
+            "protein_coding",
+            Some(130),
+            Some(139),
+        );
+        // On the reverse strand the high-coordinate exon is first in cDNA.
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(10);
+        let exons = vec![
+            exon("ENSTCDSREVERSE0001", 2, 100, 109),
+            exon("ENSTCDSREVERSE0001", 1, 130, 139),
+        ];
+        let exons_ref = exons.iter().collect::<Vec<_>>();
+        let coding_exon_deletion = var("1", 139, 140, "AA", "-");
+        let noncoding_exon_deletion = var("1", 109, 110, "AA", "-");
+
+        assert!(original_variation_maps_to_cds(
+            &tx,
+            &exons_ref,
+            &coding_exon_deletion
+        ));
+        assert!(!original_variation_maps_to_cds(
+            &tx,
+            &exons_ref,
+            &noncoding_exon_deletion
+        ));
+    }
+
+    #[test]
+    fn original_coding_predicate_uses_edited_refseq_mapper_segments() {
+        let mut tx = tx(
+            "NM_000001.1",
+            "1",
+            100,
+            139,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(109),
+        );
+        tx.source = Some("RefSeq".to_string());
+        tx.bam_edit_status = Some("ok".to_string());
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(10);
+        tx.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 100,
+            genomic_end: 109,
+            cdna_start: 1,
+            cdna_end: 10,
+            ori: 1,
+        }];
+        let exons = vec![exon("NM_000001.1", 1, 100, 109)];
+        let exons_ref = exons.iter().collect::<Vec<_>>();
+        let edited_coding_deletion = var("1", 108, 109, "AA", "-");
+        let unmapped_deletion = var("1", 120, 121, "AA", "-");
+
+        assert!(original_variation_maps_to_cds(
+            &tx,
+            &exons_ref,
+            &edited_coding_deletion
+        ));
+        assert!(!original_variation_maps_to_cds(
+            &tx,
+            &exons_ref,
+            &unmapped_deletion
+        ));
+    }
+
+    #[test]
     fn shifted_tva_coords_accept_internal_intron_gaps_but_reject_endpoint_gaps() {
         let mut tx = tx(
             "ENSTINTRONGAP0001",
