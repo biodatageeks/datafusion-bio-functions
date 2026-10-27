@@ -7274,17 +7274,8 @@ fn shifted_output_allele_for_transcript(strand: i8, shifted_output_allele: &str)
     }
 }
 
-/// Replays VEP's cached `pre->{coding}` mapper predicate for the coordinates
-/// supplied. When 3-prime shifting is active, VEP prepares the shift before
-/// consequence evaluation and temporarily evaluates its feature at shifted
-/// coordinates; the SO consequence terms still describe the original variant.
-/// `cds_coords` classifies one Coordinate or any other nonempty mapper result
-/// as coding, while an empty result is non-coding. When cDNA coding bounds are
-/// absent, the genomic CDS/exon overlap path represents that partial mapping.
-/// The caller supplies the shifted span when VEP has a nonzero shift hash.
-/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L128-L137
-/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L243-L275
-/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L455-L556
+/// Convenience wrapper for tests of the unshifted VEP pre-coding predicate.
+#[cfg(test)]
 fn vep_pre_coding_predicate(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -7293,13 +7284,11 @@ fn vep_pre_coding_predicate(
     vep_pre_coding_predicate_with_shift(tx, tx_exons, variant, None)
 }
 
-/// Replays VEP's cached `$pre->{coding}` predicate. VEP computes exon/CDS
-/// overlap using the HGVS shift offset, but asks `cds_coords()` for the original
-/// mapper span. A Coordinate result is coding; any other nonempty mapper result
-/// (including a Gap) is also coding, while an empty result is non-coding. VEP
-/// additionally stretches exon bounds by 12 bases when a short intron is
-/// found. These checks use intervals, so long deletions do not trigger a
-/// per-base walk.
+/// Replays VEP's cached `$pre->{coding}` predicate. VEP computes transcript,
+/// CDS, and exon overlap using the HGVS shift offset, then treats any nonempty
+/// `cds_coords()` mapper result (including a `Gap`) as coding. A short intron
+/// stretches exon bounds by 12 bases. These checks use intervals, so long
+/// deletions do not trigger a per-base walk.
 /// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L128-L137
 /// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L455-L556
 /// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L848-L861
@@ -7307,6 +7296,8 @@ fn vep_pre_coding_predicate(
 /// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1027-L1035
 /// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L505-L526
 /// https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L410-L430
+/// https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L159-L232
+/// https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L431-L435
 fn vep_pre_coding_predicate_with_shift(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -7336,12 +7327,10 @@ fn vep_pre_coding_predicate_with_shift(
 
     // `_overlapped_introns` sets this transcript-wide flag before
     // `_overlapped_exons` expands every exon by 12 bases.
-    let has_frameshift_intron = tx_exons.windows(2).any(|pair| {
-        let (left, right) = if pair[0].start <= pair[1].start {
-            (pair[0], pair[1])
-        } else {
-            (pair[1], pair[0])
-        };
+    let mut genomic_exons = tx_exons.to_vec();
+    genomic_exons.sort_by_key(|exon| exon.start);
+    let has_frameshift_intron = genomic_exons.windows(2).any(|pair| {
+        let (left, right) = (pair[0], pair[1]);
         let intron_start = left.end.saturating_add(1);
         let intron_end = right.start.saturating_sub(1);
         intron_start <= intron_end && intron_end - intron_start <= 12
@@ -7359,15 +7348,10 @@ fn vep_pre_coding_predicate_with_shift(
         return false;
     }
 
-    // Core returns a Gap for unmapped ranges. In the source call path, VEP
-    // asks for cds_coords only for an original transcript variation, so any
-    // original span intersecting the transcript has a nonempty mapper result.
-    overlaps(
-        original_span.start.min(original_span.end),
-        original_span.start.max(original_span.end),
-        tx.start,
-        tx.end,
-    )
+    // Core's Mapper returns a Gap when the query has no overlapping map pair;
+    // VEP therefore treats shifted-in spans as nonempty mapper results too.
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L295-L304
+    true
 }
 
 fn tva_feature_seq_for_transcript(
@@ -33511,9 +33495,10 @@ mod tests {
             consequence.hgvsc.is_some(),
             "Shifted HGVSc should still be emitted for splice-only indels"
         );
-        assert!(
-            consequence.hgvsp.is_some(),
-            "VEP's shifted mapper state makes this splice-only variant eligible for HGVSp"
+        assert_eq!(
+            consequence.hgvsp.as_deref(),
+            Some("ENSPSHIFT0001.1:p.Ser4ArgfsTer?"),
+            "VEP's shifted mapper state produces this splice-only HGVSp"
         );
     }
 
@@ -33553,6 +33538,115 @@ mod tests {
             vep_pre_coding_predicate(&tx, &exons_ref, &long_span),
             "a long span with a mapped CDS piece remains coding without per-base expansion"
         );
+    }
+
+    #[test]
+    fn shifted_pre_coding_keeps_separate_exon_and_cds_overlap_checks() {
+        let tx = tx(
+            "ENSTSHIFTEDPRE0001",
+            "1",
+            100,
+            300,
+            1,
+            "protein_coding",
+            Some(150),
+            Some(250),
+        );
+        let exons = [exon("ENSTSHIFTEDPRE0001", 1, 100, 109)];
+        let exons_ref = exons.iter().collect::<Vec<_>>();
+        // The original span is outside the transcript. VEP shifts it into a
+        // UTR exon and the genomic CDS range, which are separate intervals.
+        let variant = var("1", 1, 55, "A", "-");
+        let shift = crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 100,
+            start: 101,
+            end: 155,
+            shifted_allele_string: "A".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "A".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+
+        assert!(vep_pre_coding_predicate_with_shift(
+            &tx,
+            &exons_ref,
+            &variant,
+            Some(&shift),
+        ));
+    }
+
+    #[test]
+    fn shifted_pre_coding_applies_negative_strand_offset_toward_lower_coordinates() {
+        let mut tx = tx(
+            "ENSTSHIFTEDREVERSE0001",
+            "1",
+            100,
+            144,
+            -1,
+            "protein_coding",
+            Some(100),
+            Some(144),
+        );
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(25);
+        let exons = [
+            exon("ENSTSHIFTEDREVERSE0001", 2, 100, 109),
+            exon("ENSTSHIFTEDREVERSE0001", 1, 130, 144),
+        ];
+        let exons_ref = exons.iter().collect::<Vec<_>>();
+        let variant = var("1", 110, 111, "A", "-");
+        let shift = crate::hgvs::HgvsGenomicShift {
+            strand: -1,
+            shift_length: 2,
+            start: 108,
+            end: 109,
+            shifted_allele_string: "A".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "A".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+
+        assert!(vep_pre_coding_predicate_with_shift(
+            &tx,
+            &exons_ref,
+            &variant,
+            Some(&shift),
+        ));
+    }
+
+    #[test]
+    fn shifted_pre_coding_finds_short_introns_with_unsorted_exons() {
+        let tx = tx(
+            "ENSTUNSORTEDINTRON0001",
+            "1",
+            100,
+            239,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(239),
+        );
+        let exons = [
+            exon("ENSTUNSORTEDINTRON0001", 1, 100, 109),
+            exon("ENSTUNSORTEDINTRON0001", 3, 180, 189),
+            exon("ENSTUNSORTEDINTRON0001", 2, 120, 129),
+            exon("ENSTUNSORTEDINTRON0001", 4, 230, 239),
+        ];
+        let exons_ref = exons.iter().collect::<Vec<_>>();
+        let intronic_variant = var("1", 110, 110, "A", "C");
+
+        assert!(vep_pre_coding_predicate(&tx, &exons_ref, &intronic_variant,));
     }
 
     #[test]
