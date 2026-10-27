@@ -9310,78 +9310,65 @@ fn classify_coding_change_with_semantics(
         }
     }
 
-    // Codons with VEP case convention (changed bases uppercase, context lowercase)
+    // Codons with VEP case convention (changed bases uppercase, context lowercase).
+    // A normal transcript overlap can use the mapped CDS interval directly.
+    // For a spliced intron deletion, VEP's display length comes from the full
+    // feature_seq while its codon window is built from the shorter mapped CDS
+    // endpoints, so the two spans must stay separate.
+    let codon_nt_start = first_codon * 3;
+    let codon_nt_end = ((last_codon + 1) * 3).min(cds_seq.len());
+    let format_ref_codon = |bases: &[u8]| {
+        if spans_spliced_intron_gap {
+            format_codon_display_for_feature_seq(bases, start_idx, input_ref_len, codon_nt_start)
+        } else {
+            format_codon_display(bases, start_idx, end_idx, codon_nt_start)
+        }
+    };
+    let format_alt_codon = |bases: &[u8], mapped_end: usize| {
+        if spans_spliced_intron_gap {
+            format_codon_display_for_feature_seq(bases, start_idx, alt_len, codon_nt_start)
+        } else if alt_len > 0 {
+            format_codon_display(bases, start_idx, mapped_end, codon_nt_start)
+        } else {
+            bases
+                .iter()
+                .map(|&b| (b as char).to_ascii_lowercase())
+                .collect()
+        }
+    };
     if ref_len == alt_len {
         // SNV / MNV: same-length substitution
-        let codon_nt_start = first_codon * 3;
-        let codon_nt_end = ((last_codon + 1) * 3).min(cds_seq.len());
         if codon_nt_end <= cds_seq.len() {
-            let ref_codon = format_codon_display(
-                &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
-                start_idx,
-                end_idx,
-                codon_nt_start,
-            );
-            let alt_codon =
-                format_codon_display(&local_alt_codon, start_idx, end_idx, codon_nt_start);
+            let ref_codon = format_ref_codon(&cds_seq.as_bytes()[codon_nt_start..codon_nt_end]);
+            let alt_codon = format_alt_codon(&local_alt_codon, end_idx);
             class.codons = Some(format!("{ref_codon}/{alt_codon}"));
         }
     } else {
         // Indels: different formatting for frameshift vs inframe
-        let codon_nt_start = first_codon * 3;
-        let codon_nt_end = ((last_codon + 1) * 3).min(cds_seq.len());
         if codon_nt_end <= cds_seq.len() {
             if frameshift {
                 // Frameshift: ref codon with changed bases uppercase,
                 // alt codon is the corresponding region from mutated CDS.
                 // Deletion: alt is shorter (remaining bases, all lowercase).
                 // Insertion within codon: alt is longer (inserted bases uppercase).
-                let ref_codon = format_codon_display(
-                    &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
-                    start_idx,
-                    end_idx,
-                    codon_nt_start,
-                );
-                if alt_len > 0 {
+                let ref_codon = format_ref_codon(&cds_seq.as_bytes()[codon_nt_start..codon_nt_end]);
+                let alt_codon = if !spans_spliced_intron_gap && alt_len > 0 {
                     // VEP display_codon highlights feature_seq for every
                     // nonempty ALT, including a deletion with replacement.
-                    let alt_codon = format_codon_display(
-                        &local_alt_codon,
-                        start_idx,
-                        start_idx + alt_len - 1,
-                        codon_nt_start,
-                    );
-                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                    format_alt_codon(&local_alt_codon, start_idx + alt_len - 1)
                 } else {
-                    // Frameshift deletion: all alt bases lowercase
-                    let alt_codon: String = local_alt_codon
-                        .iter()
-                        .map(|&b| (b as char).to_ascii_lowercase())
-                        .collect();
-                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
-                }
+                    format_alt_codon(&local_alt_codon, 0)
+                };
+                class.codons = Some(format!("{ref_codon}/{alt_codon}"));
             } else if alt_len < ref_len {
                 // Inframe deletion: ref codon with deleted bases uppercase, context lowercase.
                 // Highlight replacement bases; pure deletions have only lowercase
                 // context, or "-" if nothing is left (VEP display_codon:914-923).
-                let ref_codon = format_codon_display(
-                    &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
-                    start_idx,
-                    end_idx,
-                    codon_nt_start,
-                );
+                let ref_codon = format_ref_codon(&cds_seq.as_bytes()[codon_nt_start..codon_nt_end]);
                 let alt_codon = if alt_len > 0 {
-                    format_codon_display(
-                        &local_alt_codon,
-                        start_idx,
-                        start_idx + alt_len - 1,
-                        codon_nt_start,
-                    )
+                    format_alt_codon(&local_alt_codon, start_idx + alt_len - 1)
                 } else {
-                    local_alt_codon
-                        .iter()
-                        .map(|&b| (b as char).to_ascii_lowercase())
-                        .collect()
+                    format_alt_codon(&local_alt_codon, 0)
                 };
                 if alt_codon.is_empty() {
                     class.codons = Some(format!("{ref_codon}/-"));
@@ -9401,12 +9388,7 @@ fn classify_coding_change_with_semantics(
                 // In frame, `(start_idx + alt_len - 1) / 3` is the last
                 // alternate codon, so VEP's window ends where it always did
                 // unless it is truncated by the CDS end.
-                let alt_codon = format_codon_display(
-                    &local_alt_codon,
-                    start_idx,
-                    start_idx + alt_len - 1,
-                    codon_nt_start,
-                );
+                let alt_codon = format_alt_codon(&local_alt_codon, start_idx + alt_len - 1);
                 class.codons = Some(format!("{ref_codon}/{alt_codon}"));
             }
         }
@@ -10635,6 +10617,46 @@ fn format_codon_display(
         .map(|(i, &b)| {
             let abs_pos = codon_nt_offset + i;
             if abs_pos >= changed_start && abs_pos <= changed_end {
+                (b as char).to_ascii_uppercase()
+            } else {
+                (b as char).to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+/// Format codon output using the feature-sequence highlight length used by VEP.
+///
+/// VEP `display_codon()` lowercases the codon, then uppercases `length(feature_seq)`
+/// bases starting at the 1-based `codon_position`. `codon_position` is derived
+/// from the cDNA start and the transcript coding start (including exon phase).
+/// This differs from highlighting the mapped CDS endpoint span when an allele
+/// crosses an intron: the codon window uses mapped endpoints, but feature_seq
+/// still has the full normalized allele length.
+///
+/// Traceability at the pinned sources:
+/// - Ensembl Variation `TranscriptVariationAllele::display_codon()` applies
+///   `length(feature_seq)` from `codon_position`:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L901-L926>
+/// - `TranscriptVariation::codon_position()` derives that offset from cDNA and
+///   coding start, including the first exon phase:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L287-L306>
+/// - `VariationFeatureOverlapAllele::feature_seq()` is the transcript-oriented
+///   variation feature allele sequence:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeatureOverlapAllele.pm#L246-L269>
+fn format_codon_display_for_feature_seq(
+    bases: &[u8],
+    feature_start_idx: usize,
+    feature_seq_len: usize,
+    codon_nt_offset: usize,
+) -> String {
+    let codon_position = feature_start_idx.saturating_sub(codon_nt_offset);
+    let feature_end_exclusive = codon_position.saturating_add(feature_seq_len);
+    bases
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if i >= codon_position && i < feature_end_exclusive {
                 (b as char).to_ascii_uppercase()
             } else {
                 (b as char).to_ascii_lowercase()
@@ -18268,6 +18290,32 @@ mod tests {
         assert_eq!(entry.amino_acids.as_deref(), Some("PEEP/-"));
         assert_eq!(entry.hgvsp.as_deref(), Some("ENSP215.1:p.Pro3_Pro6del"));
 
+        // End at the second base of the final affected codon. The mapped CDS
+        // span therefore stops one base before the codon window, while VEP's
+        // longer feature_seq still highlights that available final base.
+        let partial_last_codon_deletion = var("22", 106, 204, &"N".repeat(99), "-");
+        let partial_last_codon_result = engine.evaluate_variant_with_context(
+            &partial_last_codon_deletion,
+            &[transcript.clone()],
+            &exon_features,
+            &[tr.clone()],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let partial_last_codon_entry = partial_last_codon_result
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("T215"))
+            .expect("expected a T215 consequence for the partial final codon");
+        assert_eq!(
+            partial_last_codon_entry
+                .codons
+                .as_deref()
+                .and_then(|codons| codons.split_once('/').map(|(reference, _)| reference)),
+            Some("CCTGAAGAACCT")
+        );
+
         // VEP drops protein HGVS when 3' shifting moves either protein
         // coordinate outside the translation, even though the unshifted
         // spliced deletion has complete coding endpoints.
@@ -18528,6 +18576,17 @@ mod tests {
     fn format_codon_display_with_offset() {
         // Codon at nt_offset=3, changed_start=4 (second base of codon)
         assert_eq!(format_codon_display(b"GCT", 4, 4, 3), "gCt");
+    }
+
+    #[test]
+    fn spliced_deletion_codon_display_uses_feature_sequence_length() {
+        // The mapped CDS span ends after two bases, but VEP's feature_seq
+        // covers four bases. display_codon highlights from codon_position
+        // for length(feature_seq), so the last available codon base is upper.
+        assert_eq!(
+            format_codon_display_for_feature_seq(b"ACGTACG", 2, 4, 0),
+            "acGTACg"
+        );
     }
 
     #[test]
