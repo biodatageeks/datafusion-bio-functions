@@ -7096,6 +7096,8 @@ fn literal_indel_protein_hgvs_data(
             Some(translation),
             old_aas.iter().collect(),
         ),
+        // `new_aas` translates only `mutated`; it cannot restore UTR bases
+        // when VEP 116's empty-CDS trim makes the source helper return None.
         alt_translation: translated_alt_protein_for_hgvs(tx, &mutated, semantics)
             .unwrap_or_else(|| new_aas.iter().collect()),
         alt_translation_extension: alternate_translation_for_vep_hgvs(
@@ -7284,6 +7286,8 @@ fn literal_shifted_indel_protein_hgvs_data(
                 .iter()
                 .collect(),
         ),
+        // This fallback translates the alternate CDS alone, with no UTR
+        // append, so it cannot undo VEP 116's trim-before-UTR result.
         alt_translation: translated_alt_protein_for_hgvs(tx, alternate_seq.as_bytes(), semantics)
             .unwrap_or_else(|| {
                 translate_protein_from_cds(alternate_seq.as_bytes())
@@ -25531,6 +25535,22 @@ mod tests {
                 crate::vep_semantics::VepSemantics::V116,
             ),
             Some("M".to_string())
+        );
+        assert_eq!(
+            translated_alt_protein_for_hgvs(
+                &transcript,
+                b"ATGA",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            Some("MN".to_string())
+        );
+        assert_eq!(
+            translated_alt_protein_for_hgvs(
+                &transcript,
+                b"ATGAA",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            Some("MK".to_string())
         );
     }
 
