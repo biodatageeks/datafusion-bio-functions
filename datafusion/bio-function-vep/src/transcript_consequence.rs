@@ -7489,17 +7489,17 @@ fn shifted_insertion_mapper_used_for_index(
 /// - Ensembl Variation `BaseTranscriptVariation::cds_coords()`
 ///   maps `vf->seq_region_start/end + shifting_offset` through
 ///   `TranscriptMapper::genomic2cds()`
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L505-L527>
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L505-L526>
 /// - Ensembl Variation `BaseTranscriptVariation::translation_coords()`
 ///   maps the same shifted genomic span through `TranscriptMapper::genomic2pep()`
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L540-L560>
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L540-L548>
 /// - Ensembl core `Mapper::map_insert()`
 ///   turns insertion boundaries into the cDNA interval between the mapped left
 ///   and right flanks, which can be a non-empty gap for edited RefSeq mappers
-///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
+///   <https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
 /// - Ensembl core `TranscriptMapper::genomic2cds()` / `genomic2pep()`
 ///   convert those shifted cDNA bounds into CDS / peptide coordinates
-///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L410-L538>
+///   <https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L410-L538>
 fn shifted_tva_coords_from_mapper(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -7521,8 +7521,14 @@ fn shifted_tva_coords_from_mapper(
         vep_coords::CdnaBaseMap::HgvspExact,
         leading_n_offset,
     );
-    let (cdna_start, cdna_end, raw_cds_start, raw_cds_end, mapper_used_for_index) = if is_insertion
-    {
+    let (
+        cdna_start,
+        cdna_end,
+        raw_cds_start,
+        raw_cds_end,
+        mapper_used_for_start,
+        mapper_used_for_end,
+    ) = if is_insertion {
         // `Mapper::map_insert()` over the transcript-ordered flanks, keeping
         // the one that maps when the other is a `Gap`, and the edited-cDNA
         // gap between two mapped flanks; then the single-piece
@@ -7531,13 +7537,8 @@ fn shifted_tva_coords_from_mapper(
         let cdna = mapper.cdna(span);
         let (cdna_start, cdna_end) = cdna.both()?;
         let (raw_cds_start, raw_cds_end) = mapper.cds_of_cdna(cdna, true).both()?;
-        (
-            cdna_start,
-            cdna_end,
-            raw_cds_start,
-            raw_cds_end,
-            shifted_insertion_mapper_used_for_index(tx, tx_exons, span),
-        )
+        let used = shifted_insertion_mapper_used_for_index(tx, tx_exons, span);
+        (cdna_start, cdna_end, raw_cds_start, raw_cds_end, used, used)
     } else {
         // VEP's `translation_coords()` keeps mapper pieces, then
         // `translation_start/end()` read the first and last pieces. Internal
@@ -7547,42 +7548,46 @@ fn shifted_tva_coords_from_mapper(
         // index adjustment below because an edit can create extra cDNA pieces
         // between those endpoints.
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L540-L548
-        let (cdna_start, cdna_end, mapper_used_for_index) = if refseq_has_edited_sequence_state(tx)
-        {
-            let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
-            let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
-            let mut mapper_used_for_index = true;
-            for pos in genomic_positions {
-                match genomic_to_cdna_index_for_hgvsp(tx, tx_exons, pos) {
-                    Some(cdna) => {
-                        if exact_mapper_cdna_index_for_hgvsp(tx, pos).is_none() {
-                            mapper_used_for_index = false;
+        // VEP's translation_start/end select the first and last retained
+        // mapper pieces; internal Gap pieces are allowed. Carry provenance
+        // with those endpoints so skipping an intron cannot trigger a second
+        // RefSeq offset on exact edited-mapper coordinates.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L365-L403
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L504-L538
+        let (cdna_start, cdna_end, mapper_used_for_start, mapper_used_for_end) =
+            if refseq_has_edited_sequence_state(tx) {
+                let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
+                let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
+                for pos in genomic_positions {
+                    match genomic_to_cdna_index_for_hgvsp(tx, tx_exons, pos) {
+                        Some(cdna) => {
+                            let used = exact_mapper_cdna_index_for_hgvsp(tx, pos).is_some();
+                            cdna_positions.push((cdna, used));
                         }
-                        cdna_positions.push(cdna);
+                        None if pos != shifted_variant.start && pos != shifted_variant.end => {}
+                        None => return None,
                     }
-                    None if pos != shifted_variant.start && pos != shifted_variant.end => {
-                        mapper_used_for_index = false;
-                    }
-                    None => return None,
                 }
-            }
-            if cdna_positions.is_empty() {
-                return None;
-            }
-            cdna_positions.sort_unstable();
-            (
-                *cdna_positions.first()?,
-                *cdna_positions.last()?,
-                mapper_used_for_index,
-            )
-        } else {
-            let cdna = mapper.cdna(span);
-            let (cdna_start, cdna_end) = cdna.both()?;
-            // This branch excludes successful BAM-edit mapper state; the
-            // downstream adjustment only uses this flag to bypass its offset
-            // when BAM edits were successfully applied.
-            (cdna_start, cdna_end, false)
-        };
+                if cdna_positions.is_empty() {
+                    return None;
+                }
+                cdna_positions.sort_unstable_by_key(|&(cdna, _)| cdna);
+                let &(cdna_start, mapper_used_for_start) = cdna_positions.first()?;
+                let &(cdna_end, mapper_used_for_end) = cdna_positions.last()?;
+                (
+                    cdna_start,
+                    cdna_end,
+                    mapper_used_for_start,
+                    mapper_used_for_end,
+                )
+            } else {
+                let cdna = mapper.cdna(span);
+                let (cdna_start, cdna_end) = cdna.both()?;
+                // This branch excludes successful BAM-edit mapper state; the
+                // downstream adjustment only uses this flag to bypass its offset
+                // when BAM edits were successfully applied.
+                (cdna_start, cdna_end, false, false)
+            };
         if cdna_end < coding_start || cdna_start > coding_end {
             return None;
         }
@@ -7599,7 +7604,8 @@ fn shifted_tva_coords_from_mapper(
             cdna_end,
             raw_cds_start,
             raw_cds_end,
-            mapper_used_for_index,
+            mapper_used_for_start,
+            mapper_used_for_end,
         )
     };
     let edited_insertion_gap =
@@ -7612,7 +7618,7 @@ fn shifted_tva_coords_from_mapper(
             Some(translation),
             raw_cds_start.checked_sub(1)?,
             leading_n_offset,
-            mapper_used_for_index,
+            mapper_used_for_start,
         )
         .and_then(|idx| idx.checked_add(1))
         .unwrap_or(raw_cds_start)
@@ -7625,7 +7631,7 @@ fn shifted_tva_coords_from_mapper(
             Some(translation),
             raw_cds_end.checked_sub(1)?,
             leading_n_offset,
-            mapper_used_for_index,
+            mapper_used_for_end,
         )
         .and_then(|idx| idx.checked_add(1))
         .unwrap_or(raw_cds_end)
@@ -7693,11 +7699,11 @@ fn shifted_tva_coords_from_mapper(
 /// - Ensembl Variation `TranscriptVariationAllele::codon()`
 ///   computes the local codon window from `translation_start/end` and
 ///   `_get_alternate_cds()` / `_translateable_seq()`
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L888>
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L890>
 /// - Ensembl Variation `TranscriptVariationAllele::_get_alternate_cds()`
 ///   builds the alternate CDS from `_translateable_seq()`, `cds_start/end`,
 ///   and the current shifted TVA `variation_feature_seq`
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2323-L2365>
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2388-L2418>
 fn shifted_tva_peptide_window(
     tx: &TranscriptFeature,
     translation: &TranslationFeature,
@@ -7762,7 +7768,7 @@ fn shifted_tva_peptide_window(
     //   transcript attributes exist (`scalar @edit_attrs > 0`).
     //   Generic RefSeq transcript state (`bam_edit_status`, mapper cache, lazy
     //   spliced sequence) is not sufficient by itself.
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L826-L876>
+    //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L826-L876>
     if is_reference
         && (coords.edited_insertion_gap
             || !uses_canonical_reference_for_hgvsp(tx, Some(translation)))
@@ -7780,7 +7786,7 @@ fn shifted_tva_peptide_window(
     //   `(allele_len - vf_nt_len)`:
     //     $codon = substr($cds, $codon_cds_start-1,
     //                      $codon_len + (length($allele_seq) - $vf_nt_len));
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L888>
+    //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L890>
     let codon_window_len = if is_reference {
         codon_len
     } else {
@@ -15769,6 +15775,84 @@ mod tests {
                 cds_end: 122,
                 protein_start: 39,
                 protein_end: 41,
+                edited_insertion_gap: false,
+            })
+        );
+    }
+
+    #[test]
+    fn shifted_tva_coords_keep_exact_mapper_provenance_across_intronic_gap() {
+        let mut transcript = tx(
+            "NM_002111.8",
+            "4",
+            3074681,
+            3243960,
+            1,
+            "protein_coding",
+            Some(3074826),
+            Some(3240065),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_non_polya_rna_edit = true;
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 256,
+            end: 255,
+            replacement_len: Some(6),
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3074681,
+                genomic_end: 3074935,
+                cdna_start: 1,
+                cdna_end: 255,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3074936,
+                genomic_end: 3075088,
+                cdna_start: 262,
+                cdna_end: 414,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3076000,
+                genomic_end: 3076100,
+                cdna_start: 415,
+                cdna_end: 515,
+                ori: 1,
+            },
+        ];
+        transcript.cdna_coding_start = Some(146);
+        transcript.cdna_coding_end = Some(9580);
+        transcript.translateable_seq = Some("A".repeat(9435));
+
+        let exons = vec![
+            exon("NM_002111.8", 1, 3074681, 3074935),
+            exon("NM_002111.8", 2, 3074936, 3075088),
+            exon("NM_002111.8", 3, 3076000, 3076100),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let translation = translation("NM_002111.8", Some(9435), Some(3144), None, None);
+        let shifted_deletion = var("4", 3075080, 3076000, "A", "-");
+
+        assert_eq!(
+            shifted_tva_coords_from_mapper(
+                &transcript,
+                &exons_ref,
+                &translation,
+                &shifted_deletion
+            ),
+            Some(ShiftedTvaCoords {
+                // Both endpoints are exact edited-mapper coordinates. The
+                // internal intron Gap is omitted by VEP's first/last endpoint
+                // selection and must not cause the cumulative edit offset to
+                // be applied a second time.
+                cds_start: 261,
+                cds_end: 270,
+                protein_start: 87,
+                protein_end: 90,
                 edited_insertion_gap: false,
             })
         );
@@ -33396,6 +33480,61 @@ mod tests {
         );
         assert!(!source_intronic_result);
         assert_eq!(legacy_intronic_result, source_intronic_result);
+
+        let mut reverse_with_cdna_bounds = tx(
+            "ENSTCDSINSERTREVERSE0001",
+            "1",
+            100,
+            139,
+            -1,
+            "protein_coding",
+            Some(100),
+            Some(139),
+        );
+        reverse_with_cdna_bounds.cdna_coding_start = Some(1);
+        reverse_with_cdna_bounds.cdna_coding_end = Some(20);
+        let mut reverse_legacy_without_cdna_bounds = reverse_with_cdna_bounds.clone();
+        reverse_legacy_without_cdna_bounds.cdna_coding_start = None;
+        reverse_legacy_without_cdna_bounds.cdna_coding_end = None;
+        let reverse_exons = vec![
+            exon("ENSTCDSINSERTREVERSE0001", 2, 100, 109),
+            exon("ENSTCDSINSERTREVERSE0001", 1, 130, 139),
+        ];
+        let reverse_exons_ref = reverse_exons.iter().collect::<Vec<_>>();
+        let reverse_exon_boundary_insertion = var("1", 130, 129, "-", "A");
+        let reverse_intronic_insertion = var("1", 120, 119, "-", "A");
+
+        let reverse_source_boundary_result = original_variation_maps_to_cds(
+            &reverse_with_cdna_bounds,
+            &reverse_exons_ref,
+            &reverse_exon_boundary_insertion,
+        );
+        let reverse_legacy_boundary_result = original_variation_maps_to_cds(
+            &reverse_legacy_without_cdna_bounds,
+            &reverse_exons_ref,
+            &reverse_exon_boundary_insertion,
+        );
+        assert!(reverse_source_boundary_result);
+        assert_eq!(
+            reverse_legacy_boundary_result,
+            reverse_source_boundary_result
+        );
+
+        let reverse_source_intronic_result = original_variation_maps_to_cds(
+            &reverse_with_cdna_bounds,
+            &reverse_exons_ref,
+            &reverse_intronic_insertion,
+        );
+        let reverse_legacy_intronic_result = original_variation_maps_to_cds(
+            &reverse_legacy_without_cdna_bounds,
+            &reverse_exons_ref,
+            &reverse_intronic_insertion,
+        );
+        assert!(!reverse_source_intronic_result);
+        assert_eq!(
+            reverse_legacy_intronic_result,
+            reverse_source_intronic_result
+        );
     }
 
     #[test]
