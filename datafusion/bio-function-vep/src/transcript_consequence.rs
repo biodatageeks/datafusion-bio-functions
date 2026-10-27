@@ -1549,6 +1549,7 @@ impl TranscriptConsequenceEngine {
                                     cc.protein_position_start
                                         .zip(cc.protein_position_end.or(cc.protein_position_start)),
                                     cc.protein_hgvs.as_ref(),
+                                    cc.stop_retained,
                                     self.semantics,
                                     self.shift_hgvs,
                                 );
@@ -1564,6 +1565,7 @@ impl TranscriptConsequenceEngine {
                                     pre_allows_protein_hgvs,
                                     None,
                                     None,
+                                    false,
                                     self.semantics,
                                     self.shift_hgvs,
                                 );
@@ -7815,6 +7817,7 @@ fn shifted_tva_protein_hgvs_data(
     variant: &VariantInput,
     shift: &crate::hgvs::HgvsGenomicShift,
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
+    source_stop_retained: bool,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
     let translation = tx_translation?;
@@ -7874,6 +7877,7 @@ fn shifted_tva_protein_hgvs_data(
     };
     let frameshift = shifted_hgvsp_frameshift_for_output(
         fallback,
+        source_stop_retained,
         coords.cds_start,
         coords.cds_end,
         alt_allele_len,
@@ -7914,6 +7918,7 @@ fn shifted_hgvsp_frameshift(
 
 fn shifted_hgvsp_frameshift_for_output(
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
+    source_stop_retained: bool,
     cds_start: usize,
     cds_end: usize,
     alternate_allele_len: usize,
@@ -7926,8 +7931,15 @@ fn shifted_hgvsp_frameshift_for_output(
     // frameshift; reducing it to the first residue loses the CDS-boundary,
     // partial-codon, stop-retained, and allele-length checks in VariationEffect.
     // Only use the local stop rule when no consequence classification exists.
+    // `stop_retained()` also returns before the length test and forces a
+    // non-frameshift result. Pass the original consequence's cached result
+    // through: shifting the TVA can change the classification even though
+    // OutputFactory keeps the consequence made before HGVSp formatting.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1324
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
-    let raw_frameshift = if let Some(protein) = fallback {
+    let raw_frameshift = if source_stop_retained {
+        false
+    } else if let Some(protein) = fallback {
         protein.frameshift
     } else {
         // Without a consequence payload, VEP's `_get_hgvs_protein_type()`
@@ -8168,6 +8180,7 @@ fn protein_hgvs_for_output(
         pre_allows_protein_hgvs,
         original_protein_bounds,
         fallback,
+        false,
         crate::vep_semantics::VepSemantics::V115,
         shift_hgvs,
     )
@@ -8199,6 +8212,7 @@ fn protein_hgvs_for_output_with_semantics(
     pre_allows_protein_hgvs: bool,
     original_protein_bounds: Option<(usize, usize)>,
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
+    source_stop_retained: bool,
     semantics: crate::vep_semantics::VepSemantics,
     shift_hgvs: bool,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
@@ -8331,6 +8345,7 @@ fn protein_hgvs_for_output_with_semantics(
         variant,
         shift,
         fallback,
+        source_stop_retained,
         semantics,
     );
 
@@ -26072,6 +26087,7 @@ mod tests {
             &variant,
             &shift,
             None,
+            false,
             crate::vep_semantics::VepSemantics::V115,
         )
         .expect("shifted protein hgvs");
@@ -26684,6 +26700,7 @@ mod tests {
             &v,
             &shift,
             None,
+            false,
             crate::vep_semantics::VepSemantics::V115,
         )
         .unwrap();
@@ -26758,6 +26775,7 @@ mod tests {
                     .or(short_class.protein_position_start),
             ),
             short_class.protein_hgvs.as_ref(),
+            short_class.stop_retained,
             crate::vep_semantics::VepSemantics::V116,
             true,
         )
@@ -27353,6 +27371,7 @@ mod tests {
                     true,
                     None,
                     Some(&fallback),
+                    false,
                     semantics,
                     true,
                 ),
@@ -32434,6 +32453,7 @@ mod tests {
                 true,
                 None,
                 Some(&fallback),
+                false,
                 crate::vep_semantics::VepSemantics::V116,
                 false,
             )
@@ -33649,23 +33669,40 @@ mod tests {
     fn shifted_hgvsp_frameshift_uses_mapped_cds_span_without_a_fallback() {
         let semantics = crate::vep_semantics::VepSemantics::V116;
         assert!(
-            !shifted_hgvsp_frameshift_for_output(None, 1, 9, 0, "I", semantics),
+            !shifted_hgvsp_frameshift_for_output(None, false, 1, 9, 0, "I", semantics),
             "a 9-nt mapped CDS deletion is in-frame even if its genomic span is not"
         );
         assert!(shifted_hgvsp_frameshift_for_output(
-            None, 1, 206, 0, "I", semantics,
+            None, false, 1, 206, 0, "I", semantics,
         ));
 
         let mut source_frameshift = star_star_fallback();
         source_frameshift.frameshift = true;
         assert!(shifted_hgvsp_frameshift_for_output(
             Some(&source_frameshift),
+            false,
             1,
             9,
             0,
             "*",
             semantics,
         ));
+    }
+
+    #[test]
+    fn shifted_hgvsp_frameshift_honors_source_stop_retained_without_protein_fallback() {
+        assert!(
+            !shifted_hgvsp_frameshift_for_output(
+                None,
+                true,
+                1,
+                206,
+                0,
+                "G",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            "VEP stop_retained suppresses frameshift even when the mapped CDS delta is non-triplet"
+        );
     }
 
     #[test]
@@ -34079,6 +34116,7 @@ mod tests {
             &variant,
             &shift,
             Some(&fallback),
+            false,
             crate::vep_semantics::VepSemantics::V116,
         )
         .expect("the shifted stop window maps to translated peptide coordinates");
@@ -34140,6 +34178,7 @@ mod tests {
             };
             let frameshift = shifted_hgvsp_frameshift_for_output(
                 Some(&source_classification),
+                false,
                 start * 3 - 2,
                 start * 3,
                 0,
