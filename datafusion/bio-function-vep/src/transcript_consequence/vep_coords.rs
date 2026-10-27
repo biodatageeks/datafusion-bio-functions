@@ -1140,12 +1140,55 @@ mod tests {
                     for v in spans {
                         let legacy = legacy_shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
                         let new = shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
-                        let source_has_endpoints = !VepSpan::from_variant(&v).is_insertion()
-                            && VepTxMapper::new(&tx, &refs, Some(&tl), CdnaBaseMap::HgvspExact)
-                                .translation(VepSpan::from_variant(&v))
-                                .both()
-                                .is_some();
-                        if legacy.is_none() && source_has_endpoints {
+                        let span = VepSpan::from_variant(&v);
+                        let source_mapper =
+                            VepTxMapper::new(&tx, &refs, Some(&tl), CdnaBaseMap::HgvspExact);
+                        let source_translation = if span.is_insertion() {
+                            None
+                        } else {
+                            source_mapper.translation(span).both()
+                        };
+                        let unedited_deletion = !span.is_insertion()
+                            && !super::super::refseq_has_edited_sequence_state(&tx);
+                        if unedited_deletion {
+                            let source_coords =
+                                source_mapper.cds(span).both().zip(source_translation).map(
+                                    |((cds_start, cds_end), (protein_start, protein_end))| {
+                                        ShiftedTvaCoords {
+                                            cds_start,
+                                            cds_end,
+                                            protein_start,
+                                            protein_end,
+                                            edited_insertion_gap: false,
+                                        }
+                                    },
+                                );
+                            if let Some(source_coords) = source_coords {
+                                assert_eq!(
+                                    new,
+                                    Some(source_coords),
+                                    "VEP mapper coordinates differ: tx={} strand={} variant={}-{} {}>{}",
+                                    tx.transcript_id,
+                                    tx.strand,
+                                    v.start,
+                                    v.end,
+                                    v.ref_allele,
+                                    v.alt_allele
+                                );
+                            } else {
+                                assert_eq!(
+                                    new,
+                                    None,
+                                    "VEP endpoint Gap must leave shifted coordinates undefined: tx={} strand={} variant={}-{} {}>{}",
+                                    tx.transcript_id,
+                                    tx.strand,
+                                    v.start,
+                                    v.end,
+                                    v.ref_allele,
+                                    v.alt_allele
+                                );
+                            }
+                        } else if legacy.is_none() && source_translation.is_some() {
                             assert!(
                                 new.is_some(),
                                 "VEP endpoint mapper is defined but shifted coords were not: tx={} strand={} variant={}-{} {}>{}",

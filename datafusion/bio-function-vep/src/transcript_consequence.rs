@@ -1454,8 +1454,13 @@ impl TranscriptConsequenceEngine {
                         } else {
                             None
                         };
-                        let original_allows_protein_hgvs =
-                            original_variation_maps_to_cds(tx, tx_exons, variant)
+                        // Build the source mapper predicate only when an
+                        // unshifted coding result or a shifted HGVS candidate
+                        // can emit HGVSp. Other transcript overlaps keep the
+                        // cheap no-HGVSp path.
+                        let needs_protein_hgvs = coding_class.is_some() || hgvs_shift.is_some();
+                        let original_allows_protein_hgvs = needs_protein_hgvs
+                            && (original_variation_maps_to_cds(tx, tx_exons, variant)
                                 || (variant.ref_allele == "-"
                                     && coding_class.is_some()
                                     && refseq_mapper_insertion_cds_gap(
@@ -1464,7 +1469,7 @@ impl TranscriptConsequenceEngine {
                                         tx_translation,
                                         variant,
                                     )
-                                    .is_some());
+                                    .is_some()));
                         let shifted_deletion_uses_protein_hgvs_reference =
                             shifted_deletion_uses_protein_hgvs_reference(
                                 tx,
@@ -7277,35 +7282,76 @@ fn original_variation_maps_to_cds(
     tx_exons: &[&ExonFeature],
     variant: &VariantInput,
 ) -> bool {
+    let Some((coding_start, coding_end)) = tx.cdna_coding_start.zip(tx.cdna_coding_end) else {
+        return false;
+    };
     let mapper =
         vep_coords::VepTxMapper::new(tx, tx_exons, None, vep_coords::CdnaBaseMap::HgvspExact);
     let span = vep_coords::VepSpan::from_variant(variant);
-    if tx.cdna_coding_start.is_some() && tx.cdna_coding_end.is_some() {
+    if span.is_insertion() {
+        // `cds_coords()` maps insertion flanks as a constant-size operation.
         return mapper
             .cds_pieces(span)
             .iter()
             .any(|piece| matches!(piece, vep_coords::MapperPiece::Coord { .. }));
     }
 
-    // Older cached rows and small unit fixtures may have genomic CDS bounds
-    // without the derived cDNA bounds. Map those same boundaries through the
-    // transcript mapper before applying the source predicate.
-    let Some((genomic_cds_start, genomic_cds_end)) = tx.cds_start.zip(tx.cds_end) else {
-        return false;
+    // Mapper coordinates are contiguous intervals. Intersect the genomic
+    // span with those intervals and test their cDNA ranges against the CDS,
+    // instead of visiting every base in a potentially very long deletion.
+    // Ensembl Core emits a Coordinate for mapped intersections and Gap pieces
+    // for uncovered intervals (`Mapper.pm:345-351,420-445`); VEP's predicate
+    // only needs to know whether at least one Coordinate exists.
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L345-L351
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L420-L445
+    let overlaps_cds = |cdna_start: usize, cdna_end: usize| {
+        cdna_start.min(cdna_end) <= coding_end && coding_start <= cdna_start.max(cdna_end)
     };
-    let Some((first, second)) =
-        genomic_to_cdna_index_for_hgvsp(tx, tx_exons, genomic_cds_start).zip(
-            genomic_to_cdna_index_for_hgvsp(tx, tx_exons, genomic_cds_end),
-        )
+    if refseq_has_edited_sequence_state(tx) && !tx.cdna_mapper_segments.is_empty() {
+        return tx.cdna_mapper_segments.iter().any(|segment| {
+            let genomic_start = span.start.max(segment.genomic_start);
+            let genomic_end = span.end.min(segment.genomic_end);
+            if genomic_start > genomic_end {
+                return false;
+            }
+            let Some((cdna_start, cdna_end)) = mapper_segment_cdna_index(segment, genomic_start)
+                .zip(mapper_segment_cdna_index(segment, genomic_end))
+            else {
+                return false;
+            };
+            overlaps_cds(cdna_start, cdna_end)
+        });
+    }
+
+    let Some(coords) = tx
+        .cdna_coords_cache
+        .0
+        .get_or_init(|| transcript_cdna_coords_uncached(tx, tx_exons))
+        .as_deref()
     else {
         return false;
     };
-    let (coding_start, coding_end) = (first.min(second), first.max(second));
-    mapper.cdna_pieces(span).iter().any(|piece| match piece {
-        vep_coords::MapperPiece::Coord { start, end } => {
-            *start <= coding_end && *end >= coding_start
+    coords.iter().any(|segment| {
+        let genomic_start = span.start.max(segment.start);
+        let genomic_end = span.end.min(segment.end);
+        if genomic_start > genomic_end {
+            return false;
         }
-        vep_coords::MapperPiece::Gap => false,
+        let cdna_index = |pos: i64| {
+            let offset = if tx.strand >= 0 {
+                pos.saturating_sub(segment.start)
+            } else {
+                segment.end.saturating_sub(pos)
+            };
+            usize::try_from(offset)
+                .ok()
+                .and_then(|offset| segment.cdna_start.checked_add(offset))
+        };
+        let Some((cdna_start, cdna_end)) = cdna_index(genomic_start).zip(cdna_index(genomic_end))
+        else {
+            return false;
+        };
+        overlaps_cds(cdna_start, cdna_end)
     })
 }
 
@@ -7494,6 +7540,9 @@ fn shifted_tva_coords_from_mapper(
         } else {
             let cdna = mapper.cdna(span);
             let (cdna_start, cdna_end) = cdna.both()?;
+            // This branch excludes successful BAM-edit mapper state; the
+            // downstream adjustment only uses this flag to bypass its offset
+            // when BAM edits were successfully applied.
             (cdna_start, cdna_end, false)
         };
         if cdna_end < coding_start || cdna_start > coding_end {
@@ -7554,7 +7603,16 @@ fn shifted_tva_coords_from_mapper(
             vep_coords::peptide_of_cds(cds_start),
             vep_coords::peptide_of_cds(cds_end),
         )
+    } else if !refseq_has_edited_sequence_state(tx) {
+        // In VEP, `genomic2pep()` preserves each mapper Coordinate/Gap piece;
+        // `translation_start/end()` select the first and last pieces. Mapping
+        // the endpoints independently is not equivalent across exon joins,
+        // where the genomic span includes bases that are not in cDNA.
+        mapper.translation(span).both()?
     } else {
+        // RefSeq edited transcripts need their per-base sequence-index
+        // adjustment because edit-created cDNA pieces can shift the peptide
+        // index after generic mapper coordinates have been obtained.
         let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
         let mut peptide_positions = Vec::with_capacity(genomic_positions.len());
         for pos in genomic_positions {
@@ -7821,9 +7879,8 @@ fn shifted_tva_protein_hgvs_data(
 }
 
 /// VEP 116's `frameshift()` returns false when the first affected reference
-/// peptide is the stop codon, regardless of the allele length delta. This
-/// matters when the shifted TVA has no original protein classification to
-/// reuse. https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1564
+/// peptide is the stop codon, regardless of the allele length delta or any
+/// reused frameshift classification. https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1564
 fn shifted_hgvsp_frameshift(
     raw_frameshift: bool,
     ref_peptide: &str,
@@ -19136,6 +19193,8 @@ mod tests {
             Some(1000),
             Some(1014),
         );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(cds.len());
         t.cds_start_nf = true;
         t.flags_str = Some("cds_start_NF".to_string());
         let e = exon("T246", 1, 1000, 1014);
@@ -33195,6 +33254,7 @@ mod tests {
         let splice_only = [SoTerm::SpliceAcceptorVariant];
         let coding_boundary_deletion = var("1", 109, 110, "AA", "-");
         let intronic_deletion = var("1", 120, 121, "AA", "-");
+        let long_span = var("1", 105, 1_000_000_000, "A", "-");
 
         assert!(
             original_variation_maps_to_cds(&tx, &exons_ref, &coding_boundary_deletion),
@@ -33203,6 +33263,10 @@ mod tests {
         assert!(
             !original_variation_maps_to_cds(&tx, &exons_ref, &intronic_deletion),
             "an intronic span with only Gap pieces is not coding"
+        );
+        assert!(
+            original_variation_maps_to_cds(&tx, &exons_ref, &long_span),
+            "a long span with a mapped CDS piece remains coding without per-base expansion"
         );
     }
 
