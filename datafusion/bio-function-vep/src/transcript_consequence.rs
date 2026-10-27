@@ -7350,7 +7350,7 @@ fn vep_pre_coding_predicate_with_shift(
 
     // Core's Mapper returns a Gap when the query has no overlapping map pair;
     // VEP therefore treats shifted-in spans as nonempty mapper results too.
-    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L295-L304
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L431-L435
     true
 }
 
@@ -33601,6 +33601,10 @@ mod tests {
         ];
         let exons_ref = exons.iter().collect::<Vec<_>>();
         let variant = var("1", 110, 111, "A", "-");
+        assert!(
+            !vep_pre_coding_predicate(&tx, &exons_ref, &variant),
+            "the same variant without the negative-strand shift remains intronic"
+        );
         let shift = crate::hgvs::HgvsGenomicShift {
             strand: -1,
             shift_length: 2,
