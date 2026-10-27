@@ -7462,7 +7462,8 @@ fn shifted_tva_coords_from_mapper(
         cdna_end,
         raw_cds_start,
         raw_cds_end,
-        mapper_used_for_index,
+        mapper_used_for_start_index,
+        mapper_used_for_end_index,
         has_internal_mapper_gap,
     ) = if is_insertion {
         // `Mapper::map_insert()` over the transcript-ordered flanks, keeping
@@ -7473,12 +7474,14 @@ fn shifted_tva_coords_from_mapper(
         let cdna = mapper.cdna(span);
         let (cdna_start, cdna_end) = cdna.both()?;
         let (raw_cds_start, raw_cds_end) = mapper.cds_of_cdna(cdna, true).both()?;
+        let mapper_used_for_index = shifted_insertion_mapper_used_for_index(tx, tx_exons, span);
         (
             cdna_start,
             cdna_end,
             raw_cds_start,
             raw_cds_end,
-            shifted_insertion_mapper_used_for_index(tx, tx_exons, span),
+            mapper_used_for_index,
+            mapper_used_for_index,
             false,
         )
     } else {
@@ -7530,20 +7533,27 @@ fn shifted_tva_coords_from_mapper(
                     .saturating_add(leading_n_offset),
             )
         };
-        let mapper_used_for_index = genomic_positions
-            .into_iter()
-            .all(|pos| exact_mapper_cdna_index_for_hgvsp(tx, pos).is_some())
-            && !has_internal_mapper_gap;
-        // An internal intron/deleted-edit Gap is absent from transcript
-        // sequence. The CDS endpoints came from the mapper's first/last
-        // pieces, not a complete per-base index, so downstream RefSeq
-        // sequence projection must not treat this as an exact mapper index.
+        // `cdna_start` and `cdna_end` came from the mapper's first and last
+        // pieces. Preserve each endpoint's exact mapper provenance separately:
+        // an internal intron/deleted-edit Gap does not turn either mapped
+        // endpoint into an exon-geometry fallback. This also prevents applying
+        // a RefSeq edit offset twice to output-mapped endpoint coordinates.
+        let (start_endpoint_pos, end_endpoint_pos) = if tx.strand >= 0 {
+            (span.start, span.end)
+        } else {
+            (span.end, span.start)
+        };
+        let mapper_used_for_start_index =
+            exact_mapper_cdna_index_for_hgvsp(tx, start_endpoint_pos).is_some();
+        let mapper_used_for_end_index =
+            exact_mapper_cdna_index_for_hgvsp(tx, end_endpoint_pos).is_some();
         (
             cdna_start,
             cdna_end,
             raw_cds_start,
             raw_cds_end,
-            mapper_used_for_index,
+            mapper_used_for_start_index,
+            mapper_used_for_end_index,
             has_internal_mapper_gap,
         )
     };
@@ -7557,7 +7567,7 @@ fn shifted_tva_coords_from_mapper(
             Some(translation),
             raw_cds_start.checked_sub(1)?,
             leading_n_offset,
-            mapper_used_for_index,
+            mapper_used_for_start_index,
         )
         .and_then(|idx| idx.checked_add(1))
         .unwrap_or(raw_cds_start)
@@ -7570,7 +7580,7 @@ fn shifted_tva_coords_from_mapper(
             Some(translation),
             raw_cds_end.checked_sub(1)?,
             leading_n_offset,
-            mapper_used_for_index,
+            mapper_used_for_end_index,
         )
         .and_then(|idx| idx.checked_add(1))
         .unwrap_or(raw_cds_end)
@@ -18572,6 +18582,86 @@ mod tests {
             classification.codons.as_deref(),
             Some("atGATGATGATGATG/atg")
         );
+    }
+
+    #[test]
+    fn issue_215_spliced_hgvsp_keeps_endpoint_mapper_provenance() {
+        let cds = "ATG".repeat(8);
+        let mut transcript = tx(
+            "NM_215_MAPPED_TEST.1",
+            "22",
+            100,
+            211,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(211),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.cdna_coding_start = Some(6);
+        transcript.cdna_coding_end = Some(29);
+        transcript.translateable_seq = Some(cds.clone());
+        // This upstream insertion is already present in the cached mapper
+        // coordinates for both coding endpoints.
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 2,
+            end: 1,
+            replacement_len: Some(5),
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 111,
+                cdna_start: 6,
+                cdna_end: 17,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 200,
+                genomic_end: 211,
+                cdna_start: 18,
+                cdna_end: 29,
+                ori: 1,
+            },
+        ];
+        let exons = [
+            exon("NM_215_MAPPED_TEST.1", 1, 100, 111),
+            exon("NM_215_MAPPED_TEST.1", 2, 200, 211),
+        ];
+        let exon_refs = exons.iter().collect::<Vec<_>>();
+        let tr = translation(
+            "NM_215_MAPPED_TEST.1",
+            Some(24),
+            Some(8),
+            Some(&"M".repeat(8)),
+            Some(&cds),
+        );
+        let deletion = var("22", 106, 205, &"N".repeat(100), "-");
+
+        let shifted = shifted_tva_coords_from_mapper(&transcript, &exon_refs, &tr, &deletion)
+            .expect("mapped spliced endpoints remain available for HGVSp");
+        let left_endpoint = shifted_tva_coords_from_mapper(
+            &transcript,
+            &exon_refs,
+            &tr,
+            &var("22", 106, 106, "N", "A"),
+        )
+        .expect("left endpoint has exact mapper provenance");
+        let right_endpoint = shifted_tva_coords_from_mapper(
+            &transcript,
+            &exon_refs,
+            &tr,
+            &var("22", 205, 205, "N", "A"),
+        )
+        .expect("right endpoint has exact mapper provenance");
+
+        assert_eq!(
+            (shifted.cds_start, shifted.cds_end),
+            (left_endpoint.cds_start, right_endpoint.cds_end)
+        );
+        assert_eq!((shifted.cds_start, shifted.cds_end), (7, 18));
     }
 
     #[test]
