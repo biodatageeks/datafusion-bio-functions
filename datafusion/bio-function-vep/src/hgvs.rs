@@ -2742,12 +2742,11 @@ pub fn format_hgvsp(
         } else {
             notation.end
         };
-        // `start_lost()` is tied to an overlap with the initiator codon. When
-        // a frameshift's resolved peptide starts downstream but its retained
-        // window still reaches the translation end, format the initiator
-        // reference residue from the full reference translation. VEP's
-        // start-lost override changes only ALT to `?` and clears the type, so
-        // the reference start/window remains anchored at residue 1.
+        // Only the past-alternate-translation early return (`alt=del`) needs
+        // the initiator anchor: it retains the original reference window,
+        // which can start downstream even though start loss overlaps residue
+        // 1. Keep a resolved nonterminal frameshift start, and fall back to
+        // that window if the full translation has no initiator residue.
         //
         // Traceability:
         // - Ensembl Variation `VariationEffect::start_lost()` requires the
@@ -2756,16 +2755,22 @@ pub fn format_hgvsp(
         // - `TranscriptVariationAllele::_get_hgvs_peptides()` overrides only
         //   ALT and type for start loss:
         //   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2154-L2158>
-        let (start, reference) =
-            if protein.frameshift && translation_end > notation.start && notation.start > 1 {
-                let initiator = peptide_char(&protein.ref_translation, 1)?;
-                (1, peptide_to_three_letter(&initiator.to_string()))
-            } else {
-                (
-                    notation.start,
-                    peptide_to_three_letter(&notation.ref_allele.replace('*', "X")),
-                )
-            };
+        let past_alt_translation_deletion = protein.frameshift
+            && notation.kind == "del"
+            && notation.alt_allele == "del"
+            && translation_end > notation.start
+            && notation.start > 1;
+        let initiator_reference = past_alt_translation_deletion
+            .then(|| peptide_char(&protein.ref_translation, 1))
+            .flatten()
+            .map(|initiator| peptide_to_three_letter(&initiator.to_string()));
+        let (start, reference) = match initiator_reference {
+            Some(reference) => (1, reference),
+            None => (
+                notation.start,
+                peptide_to_three_letter(&notation.ref_allele.replace('*', "X")),
+            ),
+        };
         return Some(if start != end {
             format!("{protein_id}:p.{reference}{start}_?{end}")
         } else {
@@ -2969,10 +2974,10 @@ fn resolve_frameshift_hgvs(
         // and `type = "del"` in this branch, then returns. Preserve the
         // clipped reference range and coordinates initialized from context.
         notation.alt_allele = "del".to_string();
-        // `_get_fs_peptides()` appends the reference stop before this early
-        // return. If the affected deletion range reaches that appended stop
-        // but the local peptide window omitted it, retain the terminal `*`
-        // sentinel so HGVS formats `Ter` at the range end.
+        // `ref_translation` was initialized with `append_terminal_stop()` at
+        // the top of this resolver. If the affected deletion range reaches
+        // that appended stop but the local peptide window omitted it, retain
+        // the terminal `*` so HGVS formats `Ter` at the range end.
         //
         // Traceability:
         // - Ensembl Variation 116 `_get_fs_peptides()` appends `*` to the
@@ -4108,6 +4113,52 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true).as_deref(),
             Some("ENSP00000392649.1:p.Met1_?39")
+        );
+    }
+
+    #[test]
+    fn start_lost_nonterminal_frameshift_preserves_resolved_reference_start() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2,
+            end: 4,
+            ref_peptide: "KLV".to_string(),
+            alt_peptide: "IR".to_string(),
+            ref_translation: "MKLVWRP".to_string(),
+            alt_translation: "MIR*".to_string(),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: true,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true).as_deref(),
+            Some("ENSPHGVS000001.1:p.Lys2_?4")
+        );
+    }
+
+    #[test]
+    fn start_lost_frameshift_with_empty_reference_translation_keeps_hgvsp() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2,
+            end: 2,
+            ref_peptide: "S".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: String::new(),
+            alt_translation: String::new(),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: true,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true).as_deref(),
+            Some("ENSPHGVS000001.1:p.Ser2?")
         );
     }
 
@@ -9729,7 +9780,7 @@ mod tests {
             end: 1024,
             ref_peptide: "K".to_string(),
             alt_peptide: "-".to_string(),
-            ref_translation: format!("{}K", "M".repeat(1022)),
+            ref_translation: format!("{}K*", "M".repeat(1022)),
             alt_translation: "M".repeat(1022),
             alt_translation_extension: None,
             frameshift: true,

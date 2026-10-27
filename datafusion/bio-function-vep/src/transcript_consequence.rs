@@ -9008,8 +9008,8 @@ fn classify_coding_change_with_semantics(
     }
     let ambiguous_alt_peptide = semantics.vep116_stop_predicates()
         && !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele);
-    let partial_codon = vep_partial_terminal_codon_for_cds(tx, tx_exons, &cds_seq, variant);
-    let partial_terminal_codon = semantics.vep116_stop_predicates() && partial_codon;
+    let partial_terminal_codon = semantics.vep116_stop_predicates()
+        && vep_partial_terminal_codon_for_cds(tx, tx_exons, &cds_seq, variant);
 
     // Per-codon stop analysis.
     //
@@ -32906,6 +32906,7 @@ mod tests {
         let pos = 35_860_925;
         let cds_prefix = "ATG".repeat(51);
         let cds = format!("{cds_prefix}CAGC");
+        // 155 bases place the variant in codon 52 after 51 complete codons.
         let transcript_start = pos - 155;
         let mut transcript = tx(
             id,
@@ -32947,6 +32948,44 @@ mod tests {
         for (reference, expected) in [("TTACAGT", "TTACAGT/-"), ("AAAAA", "AAAAA/-")] {
             assert_eq!(vep_codon_allele_string(reference, ""), expected);
         }
+    }
+
+    #[test]
+    fn issue_220_terminal_deletion_classification_emits_empty_alt_codon_dash() {
+        // ClinVar 638055's terminal deletion has golden Codons `TTACAGT/-`.
+        // This minimal CDS fixture exercises the classifier call site, not
+        // only the shared slash-joining helper.
+        let id = "ENST00000640287";
+        let pos = 31_789_935;
+        let cds = "TTACAGT";
+        let mut transcript = tx(
+            id,
+            "11",
+            pos,
+            pos + cds.len() as i64 - 1,
+            1,
+            "protein_coding",
+            Some(pos),
+            Some(pos + cds.len() as i64 - 1),
+        );
+        transcript.translateable_seq = Some(cds.to_string());
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        let exon = exon(id, 1, pos, pos + cds.len() as i64 - 1);
+        let exons = [&exon];
+        let translation = translation(id, Some(cds.len()), Some(2), Some("LQ"), Some(cds));
+        let variant = var("11", pos, pos + cds.len() as i64 - 1, cds, "-");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("terminal coding deletion should classify");
+
+        assert_eq!(class.codons.as_deref(), Some("TTACAGT/-"));
     }
 
     #[test]
