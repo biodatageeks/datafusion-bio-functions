@@ -7571,8 +7571,8 @@ fn shifted_tva_coords_from_mapper(
                 if cdna_positions.is_empty() {
                     return None;
                 }
-                // Stable ordering preserves genomic mapper order when edited
-                // segments yield equal cDNA coordinates.
+                // Stable key sorting keeps equal-cDNA ties in the input's
+                // ascending genomic order while selecting endpoints by cDNA.
                 cdna_positions.sort_by_key(|&(cdna, _)| cdna);
                 let &(cdna_start, mapper_used_for_start) = cdna_positions.first()?;
                 let &(cdna_end, mapper_used_for_end) = cdna_positions.last()?;
