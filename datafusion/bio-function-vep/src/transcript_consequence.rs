@@ -10343,8 +10343,24 @@ fn start_codon_context<'a>(
         }
     }
 
+    // VEP builds the sequence for `_ins_del_start_altered()` from the
+    // transcript's separate `_five_prime_utr` and `_translateable_seq` values.
+    // A cache can therefore carry a CDS-only `cdna_seq` while still providing
+    // the exact two source sequences needed for the predicate.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1050-L1058
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1083-L1095
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+    let cached_translateable_seq = translateable_seq.or(tx.translateable_seq.as_deref());
+    if let Some(utr) = tx.five_prime_utr_seq.as_deref() {
+        if !utr.is_empty() && utr.len() == atg_start {
+            if let Some(translateable) = cached_translateable_seq {
+                return Some((Some(utr), translateable));
+            }
+        }
+    }
+
     (atg_start == 0)
-        .then_some(translateable_seq.or(tx.cdna_seq.as_deref()))
+        .then_some(cached_translateable_seq.or(tx.cdna_seq.as_deref()))
         .flatten()
         .map(|seq| (None, seq))
 }
@@ -24928,6 +24944,34 @@ mod tests {
         assert_eq!(
             result, None,
             "CDS-only cdna_seq must not be treated as full cDNA for start-retained checks"
+        );
+    }
+
+    #[test]
+    fn ins_del_start_altered_uses_cached_utr_with_cds_only_cdna() {
+        let (mut t, exons) = tx_with_cds_only_cdna("GCGC", "ATGGCTGAATGA");
+        t.five_prime_utr_seq = Some("GCGC".to_string());
+        t.translateable_seq = Some("ATGGCTGAATGA".to_string());
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 1005, 1006, "TG", "-");
+
+        assert_eq!(
+            ins_del_start_altered(&t, &exons_ref, &v, None),
+            Some(true),
+            "VEP assembles its cached five-prime UTR and translateable sequence before replaying the indel"
+        );
+
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let mut terms = BTreeSet::new();
+        engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons_ref, Some("ATGGCTGAATGA"));
+        assert!(
+            terms.contains(&SoTerm::StartLost),
+            "the length-changing start-codon deletion must follow VEP's first start_lost predicate"
         );
     }
 
