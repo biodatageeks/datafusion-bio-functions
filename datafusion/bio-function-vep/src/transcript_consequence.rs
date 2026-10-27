@@ -8177,13 +8177,19 @@ fn protein_hgvs_for_output_with_semantics(
         //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1658-L1737
         return fallback.map(|protein| {
             let mut protein = protein.clone();
-            if protein.ref_peptide != "-" && protein.alt_peptide != "-" {
+            // Ensembl initializes HGVS protein start/end from the mapper
+            // before resolving peptide alleles. A deletion's empty ALT
+            // peptide (`-`) does not replace those coordinates; only an
+            // insertion's empty REF peptide keeps its clipped window.
+            // Ensembl Variation 116, TranscriptVariationAllele.pm:1765-1766:
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1765-L1766
+            if protein.ref_peptide != "-" {
                 if let Some((start, end)) = original_protein_bounds {
                     protein.start = start;
                     protein.end = end;
                 }
             } else if let Some((start, end)) = original_protein_bounds {
-                let _ = (start, end); // traceability: already-clipped HGVS insertion window wins
+                let _ = (start, end); // traceability: insertion's clipped window is distinct
             }
             protein
         });
@@ -25888,6 +25894,90 @@ mod tests {
             shifted_output_allele_for_transcript(-1, "-"),
             Some(String::new())
         );
+    }
+
+    #[test]
+    fn issue_221_start_lost_deletion_uses_translation_mapper_window() {
+        // ClinVar 4533193, chr3:36993547, ENST00000454028. VEP initializes
+        // both HGVS protein coordinates from `translation_start/end()` before
+        // resolving the peptide alleles. The deletion's ALT peptide is `-`,
+        // so the fallback must retain the mapper window (1..39), not the
+        // already-clipped consequence window (2..39).
+        // Ensembl Variation 116: TranscriptVariationAllele.pm:1765-1766
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1765-L1766
+        let ref_allele = "AATGTCGTTCGTGGCAGGGGTTATTCGGCGGCTGGACGAGACAGTGGTGAACCGCATCGCGGCGGGGGAAGTTATCCAGCGGCCAGCTAATGCTATCAAAGAGATGATTGAGAACTG";
+        let mut transcript = tx(
+            "ENST00000454028",
+            "3",
+            36_993_547,
+            36_993_662,
+            -1,
+            "protein_coding",
+            Some(36_993_547),
+            Some(36_993_662),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(116);
+        let exons: Vec<ExonFeature> = Vec::new();
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let mut translation = translation(
+            "ENST00000454028",
+            Some(116),
+            Some(39),
+            Some("MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN*"),
+            None,
+        );
+        translation.stable_id = Some("ENSP00000392649".to_string());
+        translation.version = Some(1);
+        let mut variant = VariantInput::from_vcf(
+            "3".into(),
+            36_993_547,
+            36_993_662,
+            ref_allele.to_string(),
+            "A".into(),
+        );
+        variant.hgvs_shift_reverse = Some(crate::hgvs::HgvsGenomicShift {
+            strand: -1,
+            shift_length: 0,
+            start: 36_993_547,
+            end: 36_993_662,
+            shifted_allele_string: "-".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: ref_allele.to_string(),
+            alt_orig_allele_string: "A".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+        let fallback = crate::hgvs::ProteinHgvsData {
+            start: 2,
+            end: 39,
+            ref_peptide: "MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN*".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: "MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN*".to_string(),
+            alt_translation: String::new(),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: true,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        let got = protein_hgvs_for_output_with_semantics(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            true,
+            Some((1, 39)),
+            Some(&fallback),
+            crate::vep_semantics::VepSemantics::V116,
+            true,
+        )
+        .expect("VEP retains HGVSp for the coding start-lost deletion");
+        assert_eq!((got.start, got.end), (1, 39));
     }
 
     #[test]
