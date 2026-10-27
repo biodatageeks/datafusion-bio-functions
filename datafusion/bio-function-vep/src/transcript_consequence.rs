@@ -1460,17 +1460,16 @@ impl TranscriptConsequenceEngine {
                         // cheap no-HGVSp path.
                         let needs_protein_hgvs = coding_class.is_some() || hgvs_shift.is_some();
                         let pre_allows_protein_hgvs = needs_protein_hgvs
-                            && (vep_pre_coding_predicate_with_shift(
-                                tx, tx_exons, variant, hgvs_shift,
-                            ) || (variant.ref_allele == "-"
-                                && coding_class.is_some()
-                                && refseq_mapper_insertion_cds_gap(
-                                    tx,
-                                    tx_exons,
-                                    tx_translation,
-                                    variant,
-                                )
-                                .is_some()));
+                            && (cached_hgvsp_pre_coding_predicate(tx, tx_exons, variant)
+                                || (variant.ref_allele == "-"
+                                    && coding_class.is_some()
+                                    && refseq_mapper_insertion_cds_gap(
+                                        tx,
+                                        tx_exons,
+                                        tx_translation,
+                                        variant,
+                                    )
+                                    .is_some()));
                         let shifted_deletion_uses_protein_hgvs_reference =
                             shifted_deletion_uses_protein_hgvs_reference(
                                 tx,
@@ -7284,6 +7283,21 @@ fn vep_pre_coding_predicate(
     vep_pre_coding_predicate_with_shift(tx, tx_exons, variant, None)
 }
 
+fn cached_hgvsp_pre_coding_predicate(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+) -> bool {
+    // OutputFactory asks for and caches `$pre` while building the consequence
+    // fields, before it calls `hgvs_protein()`. In the R5 VEP run, the latter's
+    // private `_return_3prime(1)` therefore does not change the cached
+    // predicate; only the translation endpoints use its shift offset.
+    // https://github.com/Ensembl/ensembl-vep/blob/release/116.0/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1700-L1704
+    // https://github.com/Ensembl/ensembl-vep/blob/release/116.0/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1743-L1754
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L337-L360
+    vep_pre_coding_predicate_with_shift(tx, tx_exons, variant, None)
+}
+
 /// Replays VEP's cached `$pre->{coding}` predicate. VEP computes transcript,
 /// CDS, and exon overlap using the HGVS shift offset, then treats any nonempty
 /// `cds_coords()` mapper result (including a `Gap`) as coding. A short intron
@@ -7781,12 +7795,10 @@ fn shifted_tva_peptide_window(
 }
 
 /// Traceability:
-/// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`:
-///   1. applies `_return_3prime(1)`
-///   2. recomputes shifted `translation_start/end`
-///   3. derives `$hgvs_notation->{alt}` from the shifted alternate TVA
-///   4. derives `$hgvs_notation->{ref}` from the shifted reference TVA
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1626-L1702>
+/// - Ensembl Variation 116 `TranscriptVariationAllele::hgvs_protein()` calls
+///   `_return_3prime(1)`, computes shifted `translation_start/end`, then reads
+///   the shifted alternate and reference TVA peptides.
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1626-L1702>
 ///
 /// Rust replays that by:
 /// - keeping HGVS notation start/end from the ORIGINAL protein consequence
@@ -7860,11 +7872,14 @@ fn shifted_tva_protein_hgvs_data(
     } else {
         canonical_ref_translation
     };
-    let raw_frameshift = fallback
-        .map(|protein| protein.frameshift)
-        .unwrap_or_else(|| !alt_allele_len.abs_diff(ref_allele_len).is_multiple_of(3));
-    let frameshift =
-        shifted_hgvsp_frameshift_for_output(fallback, raw_frameshift, &ref_peptide, semantics);
+    let frameshift = shifted_hgvsp_frameshift_for_output(
+        fallback,
+        coords.cds_start,
+        coords.cds_end,
+        alt_allele_len,
+        &ref_peptide,
+        semantics,
+    );
     let protein = crate::hgvs::ProteinHgvsData {
         start: window_protein_start,
         end: window_protein_end,
@@ -7899,7 +7914,9 @@ fn shifted_hgvsp_frameshift(
 
 fn shifted_hgvsp_frameshift_for_output(
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
-    raw_frameshift: bool,
+    cds_start: usize,
+    cds_end: usize,
+    alternate_allele_len: usize,
     ref_peptide: &str,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> bool {
@@ -7910,8 +7927,30 @@ fn shifted_hgvsp_frameshift_for_output(
     // partial-codon, stop-retained, and allele-length checks in VariationEffect.
     // Only use the local stop rule when no consequence classification exists.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
-    if let Some(protein) = fallback {
+    let raw_frameshift = if let Some(protein) = fallback {
         protein.frameshift
+    } else {
+        // Without a consequence payload, VEP's `_get_hgvs_protein_type()`
+        // still calls `frameshift()`. That predicate compares the alternate
+        // TVA sequence length with the mapped CDS span, excluding intronic
+        // bases in a multi-exon deletion.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2041-L2050
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
+        let mapped_cds_len = i64::try_from(cds_end)
+            .ok()
+            .zip(i64::try_from(cds_start).ok())
+            .and_then(|(end, start)| end.checked_sub(start)?.checked_add(1));
+        let Some(mapped_cds_len) = mapped_cds_len else {
+            return false;
+        };
+        let Some(allele_len) = i64::try_from(alternate_allele_len).ok() else {
+            return false;
+        };
+        !allele_len.abs_diff(mapped_cds_len).is_multiple_of(3)
+    };
+
+    if fallback.is_some() {
+        raw_frameshift
     } else {
         shifted_hgvsp_frameshift(raw_frameshift, ref_peptide, semantics)
     }
@@ -8171,13 +8210,13 @@ fn protein_hgvs_for_output_with_semantics(
         return None;
     }
 
-    // Ensembl gates HGVSp on cached `$pre->{coding}`. When HGVS shifting is
-    // active, VEP prepares the shift before consequence evaluation and
-    // computes the cached exon/CDS predicate with the shifted feature span;
-    // the reported SO terms still describe the original variant.
-    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L128-L137
-    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L455-L556
-    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1711-L1734
+    // The predicate supplied here is the cached pre-consequence coding state.
+    // OutputFactory requests `$pre` before it calls `hgvs_protein()`, and
+    // `_pre_consequence_predicates` caches that result. HGVS shifting changes
+    // the translation endpoint offset below, not this original-span predicate.
+    // https://github.com/Ensembl/ensembl-vep/blob/release/116.0/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1700-L1704
+    // https://github.com/Ensembl/ensembl-vep/blob/release/116.0/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1743-L1754
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L337-L360
     if !pre_allows_protein_hgvs {
         return None;
     }
@@ -33473,10 +33512,10 @@ mod tests {
         tr.stable_id = Some("ENSPSHIFT0001".to_string());
         tr.version = Some(1);
 
-        // Original variant is a splice acceptor deletion in the intron.
-        // HGVS 3' shifting moves the deletion into exon 2. VEP prepares that
-        // shift before it caches `pre->{coding}`, while the reported terms
-        // still describe the original splice-only variant.
+        // The original variant is a splice acceptor deletion in the intron.
+        // HGVS 3' shifting moves the deletion into exon 2, but VEP's cached
+        // `pre->{coding}` was requested while building the consequence fields,
+        // before `hgvs_protein()` applies its private HGVS shift.
         let mut v = var("1", 1028, 1029, "AG", "-");
         v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
             strand: 1,
@@ -33518,8 +33557,8 @@ mod tests {
         );
         assert_eq!(
             consequence.hgvsp.as_deref(),
-            Some("ENSPSHIFT0001.1:p.Ser4ArgfsTer?"),
-            "VEP's shifted mapper state produces this splice-only HGVSp"
+            None,
+            "an HGVS-only shift cannot turn an uncoded cached pre predicate into HGVSp"
         );
     }
 
@@ -33559,6 +33598,74 @@ mod tests {
             vep_pre_coding_predicate(&tx, &exons_ref, &long_span),
             "a long span with a mapped CDS piece remains coding without per-base expansion"
         );
+    }
+
+    #[test]
+    fn cached_hgvsp_pre_coding_gate_uses_the_original_span() {
+        let mut tx = tx(
+            "ENSTHGVSPRECACHE0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(190),
+        );
+        tx.cdna_coding_start = Some(11);
+        tx.cdna_coding_end = Some(91);
+        let exons = [exon("ENSTHGVSPRECACHE0001", 1, 100, 200)];
+        let exons_ref = exons.iter().collect::<Vec<_>>();
+        let variant = var("1", 100, 101, "AA", "-");
+        let shift = crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 10,
+            start: 110,
+            end: 111,
+            shifted_allele_string: "AA".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "AA".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+
+        assert!(vep_pre_coding_predicate_with_shift(
+            &tx,
+            &exons_ref,
+            &variant,
+            Some(&shift),
+        ));
+        assert!(
+            !cached_hgvsp_pre_coding_predicate(&tx, &exons_ref, &variant),
+            "VEP caches pre->{{coding}} before hgvs_protein applies its HGVS-only shift"
+        );
+    }
+
+    #[test]
+    fn shifted_hgvsp_frameshift_uses_mapped_cds_span_without_a_fallback() {
+        let semantics = crate::vep_semantics::VepSemantics::V116;
+        assert!(
+            !shifted_hgvsp_frameshift_for_output(None, 1, 9, 0, "I", semantics),
+            "a 9-nt mapped CDS deletion is in-frame even if its genomic span is not"
+        );
+        assert!(shifted_hgvsp_frameshift_for_output(
+            None, 1, 206, 0, "I", semantics,
+        ));
+
+        let mut source_frameshift = star_star_fallback();
+        source_frameshift.frameshift = true;
+        assert!(shifted_hgvsp_frameshift_for_output(
+            Some(&source_frameshift),
+            1,
+            9,
+            0,
+            "*",
+            semantics,
+        ));
     }
 
     #[test]
@@ -34033,7 +34140,9 @@ mod tests {
             };
             let frameshift = shifted_hgvsp_frameshift_for_output(
                 Some(&source_classification),
-                true,
+                start * 3 - 2,
+                start * 3,
+                0,
                 "*",
                 crate::vep_semantics::VepSemantics::V116,
             );
