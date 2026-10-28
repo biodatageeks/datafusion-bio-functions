@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::transcript_consequence::{
     ExonFeature, TranscriptCdnaMapperSegment, TranscriptFeature, TranslationFeature, VariantInput,
-    adjust_refseq_cdna_component, edited_transcript_sequence_cdna_index,
+    adjust_refseq_cdna_component, bam_edit_failed, edited_transcript_sequence_cdna_index,
     genomic_to_cdna_index_for_transcript, infer_refseq_deletion_edits_from_sequences,
     mapper_deleted_gap_cdna_index, raw_cdna_position_from_genomic,
     raw_cdna_position_from_sorted_exons, refseq_deleted_edit_cdna_index,
@@ -1251,6 +1251,20 @@ fn edited_transcript_reference_allele_for_hgvsc(
     variant_start: i64,
     variant_end: i64,
 ) -> Option<String> {
+    // On a failed BAM edit VEP rolls back to the prior transcript state and
+    // obtains the reference TVA allele from `spliced_seq` via mapper cDNA
+    // coordinates. The caller has already selected that source-backed allele;
+    // re-reading cached `cdna_seq` here can incorrectly treat a CDS-only
+    // sequence as the whole spliced transcript.
+    // Ensembl Variation 2fb834b, TranscriptVariation.pm:455-465 and
+    // TranscriptVariationAllele.pm:1507-1514; VEP release/116.0,
+    // AnnotationType/Transcript.pm:619-627:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L455-L465
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1507-L1514
+    // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+    if bam_edit_failed(tx) {
+        return None;
+    }
     if tx.refseq_edits.is_empty() || ref_allele.is_empty() || ref_allele == "-" {
         return None;
     }
@@ -8342,6 +8356,27 @@ mod tests {
         );
 
         assert_eq!(hgvsc.as_deref(), Some("NM_001172437.2:c.*3245_*3248del"));
+    }
+
+    #[test]
+    fn failed_bam_hgvsc_does_not_replace_source_reference_with_cds_only_cdna() {
+        let (mut tx, exons_owned) = make_nm_001172437_failed_bam_edit_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        tx.spliced_seq = None;
+        tx.has_rna_edit = true;
+        let mut cds_only_cdna = vec![b'A'; 2_355];
+        cds_only_cdna[1_575] = b'T';
+        tx.cdna_seq = Some(String::from_utf8(cds_only_cdna).expect("ASCII cDNA"));
+
+        assert_eq!(
+            edited_transcript_reference_allele_for_hgvsc(&tx, &exons, "C", 1_576, 1_576),
+            None,
+            "the caller's source-backed HGVSc reference must remain authoritative after BAM rollback"
+        );
+        assert_eq!(
+            format_hgvsc(&tx, &exons, None, None, "C", "A", 1_576, 1_576, None).as_deref(),
+            Some("NM_001172437.2:c.1316C>A")
+        );
     }
 
     #[test]
