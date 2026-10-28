@@ -19502,7 +19502,11 @@ mod tests {
         assert_eq!(unedited.affected_alt_peptide.as_deref(), Some("I"));
         assert_eq!(unedited.amino_acids.as_deref(), Some("I"));
         assert!(unedited.start_lost);
-        assert!(!unedited.synonymous);
+        // VEP's synonymous predicate independently accepts equal peptides
+        // unless start_retained/stop_retained or X applies.
+        // VariationEffect.pm:1076-1082:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1076-L1082
+        assert!(unedited.synonymous);
     }
 
     #[test]
