@@ -10224,7 +10224,6 @@ fn classify_insertion_with_semantics_and_gap(
     let translation_seqedit_overlap = translation_seqedit_range.is_some_and(|(start, end)| {
         translation_seq_edits_overlap(start, end, &tx.translation_seq_edits)
     });
-    let mut translation_seqedit_changed = false;
     if let (Some(reference_peptide), Some((translation_start, translation_end))) = (
         class.affected_ref_peptide.as_deref(),
         translation_seqedit_range.filter(|_| translation_seqedit_overlap),
@@ -10241,8 +10240,6 @@ fn classify_insertion_with_semantics_and_gap(
             translation_end,
             &tx.translation_seq_edits,
         );
-        translation_seqedit_changed =
-            edited_reference_peptide.as_deref() != Some(reference_peptide);
         class.affected_ref_peptide = edited_reference_peptide;
     }
     let ambiguous_alt_peptide = semantics.vep116_stop_predicates()
@@ -10524,7 +10521,7 @@ fn classify_insertion_with_semantics_and_gap(
         );
     }
 
-    if (replace_refseq_mapper_gap || translation_seqedit_changed)
+    if (replace_refseq_mapper_gap || translation_seqedit_overlap)
         && let (Some(ref_peptide), Some(alt_peptide)) = (
             class.affected_ref_peptide.as_deref(),
             class.affected_alt_peptide.as_deref(),
@@ -19602,6 +19599,62 @@ mod tests {
         assert_eq!(
             classification.amino_acids.as_deref(),
             Some(expected_amino_acids.as_str())
+        );
+    }
+
+    #[test]
+    fn frameshift_insertion_reports_overlapping_unchanged_seqedit_peptide() {
+        // VEP applies an overlapping reference SeqEdit even when the edit
+        // preserves the residue (M -> M); output still uses the peptide alleles.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-772:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
+        let mut transcript = tx(
+            "T_UNCHANGED_SEQEDIT_INSERTION",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        transcript.translation_seq_edits = vec![TranslationSeqEdit {
+            code: "translation_seq_edit".to_string(),
+            start: 1,
+            end: 1,
+            alt_seq: "M".to_string(),
+        }];
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(12);
+        let transcript_exon = exon("T_UNCHANGED_SEQEDIT_INSERTION", 1, 1000, 1011);
+        let exons = [&transcript_exon];
+        let cached_translation = translation(
+            "T_UNCHANGED_SEQEDIT_INSERTION",
+            Some(12),
+            Some(4),
+            None,
+            Some("ATGAAACCCTAA"),
+        );
+        let variant = var("22", 1002, 1002, "-", "T");
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("frameshift insertion should classify");
+
+        assert_eq!(classification.affected_ref_peptide.as_deref(), Some("M"));
+        let expected = format!(
+            "{}/{}",
+            classification.affected_ref_peptide.as_deref().unwrap(),
+            classification.affected_alt_peptide.as_deref().unwrap(),
+        );
+        assert_eq!(
+            classification.amino_acids.as_deref(),
+            Some(expected.as_str())
         );
     }
 
