@@ -277,6 +277,9 @@ fn translation_seqedit_range_for_variant(
     translation: Option<&TranslationFeature>,
     variant: &VariantInput,
 ) -> Option<(usize, usize)> {
+    if tx.translation_seq_edits.is_empty() {
+        return None;
+    }
     vep_coords::VepTxMapper::new(tx, tx_exons, translation, vep_coords::CdnaBaseMap::Output)
         .translation(vep_coords::VepSpan::from_variant(variant))
         .both_truthy()
@@ -10208,12 +10211,22 @@ fn classify_insertion_with_semantics_and_gap(
         class.affected_alt_peptide =
             local_peptide_from_codon_window(tx.codon_table, &mutated[codon_start..alt_end]);
     }
+    let translation_seqedit_range =
+        translation_seqedit_range_for_variant(tx, tx_exons, tx_translation, variant);
+    let translation_seqedit_overlap = translation_seqedit_range.is_some_and(|(start, end)| {
+        translation_seq_edits_overlap(start, end, &tx.translation_seq_edits)
+    });
     let mut translation_seqedit_changed = false;
-    if let Some(reference_peptide) = class.affected_ref_peptide.as_deref() {
-        let translation_start = class
-            .protein_position_start
-            .unwrap_or_else(|| codon_at.saturating_add(1));
-        let translation_end = class.protein_position_end.unwrap_or(translation_start);
+    if let (Some(reference_peptide), Some((translation_start, translation_end))) = (
+        class.affected_ref_peptide.as_deref(),
+        translation_seqedit_range.filter(|_| translation_seqedit_overlap),
+    ) {
+        // Match VEP's TranscriptVariation translation coordinates when
+        // deciding which reference peptide positions receive SeqEdits. The
+        // displayed protein coordinates can differ at mapper gaps and exon
+        // boundaries.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-772:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
         let edited_reference_peptide = overlay_reference_peptide_seq_edits(
             reference_peptide,
             translation_start,
@@ -19538,6 +19551,16 @@ mod tests {
             Some("ATGGCTTAA"),
         );
         let variant = var("22", 1004, 1004, "-", "TT");
+        assert_eq!(
+            translation_seqedit_range_for_variant(
+                &transcript,
+                &exons,
+                Some(&cached_translation),
+                &variant,
+            ),
+            Some((2, 2)),
+            "SeqEdit overlay uses the mapper's translation span"
+        );
 
         let classification = classify_coding_change_with_semantics(
             &transcript,
@@ -33698,14 +33721,18 @@ mod tests {
         let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
         // SNV at position 1007 (last CDS base, incomplete codon)
         let v = var("22", 1007, 1007, "A", "T");
-        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v);
-        if let Some(c) = c {
-            assert!(
-                !c.synonymous,
-                "SNV at incomplete terminal codon must NOT be synonymous (peptides contain X). Got: {:?}",
-                c
-            );
-        }
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+            .expect("SNV at incomplete terminal codon should classify");
+        assert!(
+            !c.synonymous,
+            "SNV at incomplete terminal codon must NOT be synonymous (peptides contain X). Got: {:?}",
+            c
+        );
+        assert!(
+            !c.missense,
+            "VEP's mapper-derived partial_codon predicate vetoes missense without any SeqEdit. Got: {:?}",
+            c
+        );
     }
 
     #[test]
