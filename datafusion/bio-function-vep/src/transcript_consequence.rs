@@ -1550,6 +1550,7 @@ impl TranscriptConsequenceEngine {
                                         .zip(cc.protein_position_end.or(cc.protein_position_start)),
                                     cc.protein_hgvs.as_ref(),
                                     cc.stop_retained,
+                                    cc.affected_ref_peptide.as_deref(),
                                     self.semantics,
                                     self.shift_hgvs,
                                 );
@@ -1566,6 +1567,7 @@ impl TranscriptConsequenceEngine {
                                     None,
                                     None,
                                     false,
+                                    None,
                                     self.semantics,
                                     self.shift_hgvs,
                                 );
@@ -7818,6 +7820,7 @@ fn shifted_tva_protein_hgvs_data(
     shift: &crate::hgvs::HgvsGenomicShift,
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
     source_stop_retained: bool,
+    source_ref_peptide: Option<&str>,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
     let translation = tx_translation?;
@@ -7878,6 +7881,9 @@ fn shifted_tva_protein_hgvs_data(
     let frameshift = shifted_hgvsp_frameshift_for_output(
         fallback,
         source_stop_retained,
+        semantics.vep116_stop_predicates()
+            && vep_partial_terminal_codon(tx, tx_exons, Some(translation), &shifted_variant),
+        source_ref_peptide,
         coords.cds_start,
         coords.cds_end,
         alt_allele_len,
@@ -7919,52 +7925,55 @@ fn shifted_hgvsp_frameshift(
 fn shifted_hgvsp_frameshift_for_output(
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
     source_stop_retained: bool,
+    source_partial_codon: bool,
+    source_ref_peptide: Option<&str>,
     cds_start: usize,
     cds_end: usize,
     alternate_allele_len: usize,
     ref_peptide: &str,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> bool {
-    // VEP 116's `stop_retained()` returns before the length test and forces a
-    // non-frameshift result. Pass the original consequence's cached result
-    // through: shifting the TVA can change the classification even though
-    // OutputFactory keeps the consequence made before HGVSp formatting.
+    // VEP calls `frameshift($self)` from `_get_hgvs_protein_type()` after
+    // `hgvs_protein()` has installed the HGVS shift. A cached source
+    // stop-retained or frameshift result remains authoritative, but a cached
+    // non-frameshift consequence is not the HGVS TVA's result: VEP evaluates
+    // the mapped CDS span, alternate allele length, and `_get_peptide_alleles`
+    // reference peptide here. OutputFactory computes the consequence before
+    // HGVSp, so pass its source reference peptide when available.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1324
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
-    // The consequence classifier already evaluated VEP's complete frameshift
-    // predicate on this transcript/variant. The shifted HGVSp peptide window
-    // can begin at the stop codon even when that source classification is a
-    // frameshift; reducing it to the first residue loses the CDS-boundary,
-    // partial-codon, stop-retained, and allele-length checks in VariationEffect.
-    // Only use the local stop rule when no consequence classification exists.
-    let raw_frameshift = if semantics.vep116_stop_predicates() && source_stop_retained {
-        false
-    } else if let Some(protein) = fallback {
-        protein.frameshift
-    } else {
-        // Without a consequence payload, VEP's `_get_hgvs_protein_type()`
-        // still calls `frameshift()`. That predicate compares the alternate
-        // TVA sequence length with the mapped CDS span, excluding intronic
-        // bases in a multi-exon deletion.
-        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2041-L2050
-        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
-        let mapped_cds_len = i64::try_from(cds_end)
-            .ok()
-            .zip(i64::try_from(cds_start).ok())
-            .and_then(|(end, start)| end.checked_sub(start)?.checked_add(1));
-        let Some(mapped_cds_len) = mapped_cds_len else {
-            return false;
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1588-L1614
+    let raw_frameshift =
+        if semantics.vep116_stop_predicates() && (source_stop_retained || source_partial_codon) {
+            false
+        } else if fallback.is_some_and(|protein| protein.frameshift) {
+            true
+        } else {
+            // VEP's `frameshift()` compares the alternate TVA sequence length
+            // with the mapped CDS span, excluding intronic bases.
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2041-L2050
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
+            let mapped_cds_len = i64::try_from(cds_end)
+                .ok()
+                .zip(i64::try_from(cds_start).ok())
+                .and_then(|(end, start)| end.checked_sub(start)?.checked_add(1));
+            let Some(mapped_cds_len) = mapped_cds_len else {
+                return false;
+            };
+            let Some(allele_len) = i64::try_from(alternate_allele_len).ok() else {
+                return false;
+            };
+            !allele_len.abs_diff(mapped_cds_len).is_multiple_of(3)
         };
-        let Some(allele_len) = i64::try_from(alternate_allele_len).ok() else {
-            return false;
-        };
-        !allele_len.abs_diff(mapped_cds_len).is_multiple_of(3)
-    };
 
-    if fallback.is_some() {
+    if fallback.is_some_and(|protein| protein.frameshift) {
         raw_frameshift
     } else {
-        shifted_hgvsp_frameshift(raw_frameshift, ref_peptide, semantics)
+        shifted_hgvsp_frameshift(
+            raw_frameshift,
+            source_ref_peptide.unwrap_or(ref_peptide),
+            semantics,
+        )
     }
 }
 
@@ -8181,6 +8190,7 @@ fn protein_hgvs_for_output(
         original_protein_bounds,
         fallback,
         false,
+        fallback.map(|protein| protein.ref_peptide.as_str()),
         crate::vep_semantics::VepSemantics::V115,
         shift_hgvs,
     )
@@ -8213,6 +8223,7 @@ fn protein_hgvs_for_output_with_semantics(
     original_protein_bounds: Option<(usize, usize)>,
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
     source_stop_retained: bool,
+    source_ref_peptide: Option<&str>,
     semantics: crate::vep_semantics::VepSemantics,
     shift_hgvs: bool,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
@@ -8346,6 +8357,7 @@ fn protein_hgvs_for_output_with_semantics(
         shift,
         fallback,
         source_stop_retained,
+        source_ref_peptide,
         semantics,
     );
 
@@ -26088,6 +26100,7 @@ mod tests {
             &shift,
             None,
             false,
+            None,
             crate::vep_semantics::VepSemantics::V115,
         )
         .expect("shifted protein hgvs");
@@ -26701,6 +26714,7 @@ mod tests {
             &shift,
             None,
             false,
+            None,
             crate::vep_semantics::VepSemantics::V115,
         )
         .unwrap();
@@ -26776,6 +26790,7 @@ mod tests {
             ),
             short_class.protein_hgvs.as_ref(),
             short_class.stop_retained,
+            short_class.affected_ref_peptide.as_deref(),
             crate::vep_semantics::VepSemantics::V116,
             true,
         )
@@ -27372,6 +27387,7 @@ mod tests {
                     None,
                     Some(&fallback),
                     false,
+                    Some(fallback.ref_peptide.as_str()),
                     semantics,
                     true,
                 ),
@@ -32454,6 +32470,7 @@ mod tests {
                 None,
                 Some(&fallback),
                 false,
+                Some(fallback.ref_peptide.as_str()),
                 crate::vep_semantics::VepSemantics::V116,
                 false,
             )
@@ -33669,11 +33686,11 @@ mod tests {
     fn shifted_hgvsp_frameshift_uses_mapped_cds_span_without_a_fallback() {
         let semantics = crate::vep_semantics::VepSemantics::V116;
         assert!(
-            !shifted_hgvsp_frameshift_for_output(None, false, 1, 9, 0, "I", semantics),
+            !shifted_hgvsp_frameshift_for_output(None, false, false, None, 1, 9, 0, "I", semantics),
             "a 9-nt mapped CDS deletion is in-frame even if its genomic span is not"
         );
         assert!(shifted_hgvsp_frameshift_for_output(
-            None, false, 1, 206, 0, "I", semantics,
+            None, false, false, None, 1, 206, 0, "I", semantics,
         ));
 
         let mut source_frameshift = star_star_fallback();
@@ -33681,6 +33698,8 @@ mod tests {
         assert!(shifted_hgvsp_frameshift_for_output(
             Some(&source_frameshift),
             false,
+            false,
+            Some(source_frameshift.ref_peptide.as_str()),
             1,
             9,
             0,
@@ -33690,11 +33709,94 @@ mod tests {
     }
 
     #[test]
+    fn shifted_hgvsp_frameshift_obeys_the_source_partial_codon_guard() {
+        let mut source_frameshift = star_star_fallback();
+        source_frameshift.frameshift = true;
+        assert!(!shifted_hgvsp_frameshift_for_output(
+            Some(&source_frameshift),
+            false,
+            true,
+            Some(source_frameshift.ref_peptide.as_str()),
+            1,
+            2,
+            0,
+            "I",
+            crate::vep_semantics::VepSemantics::V116,
+        ));
+        assert!(shifted_hgvsp_frameshift_for_output(
+            Some(&source_frameshift),
+            false,
+            true,
+            Some(source_frameshift.ref_peptide.as_str()),
+            1,
+            2,
+            0,
+            "I",
+            crate::vep_semantics::VepSemantics::V115,
+        ));
+    }
+
+    #[test]
+    fn shifted_hgvsp_recomputes_frameshift_from_source_peptide_when_consequence_is_not_frameshift()
+    {
+        let semantics = crate::vep_semantics::VepSemantics::V116;
+        let ref_translation = format!("{}*", "A".repeat(44));
+        let alt_translation = format!("{}M*", "A".repeat(44));
+        let mut source_classification = crate::hgvs::ProteinHgvsData {
+            start: 45,
+            end: 45,
+            ref_peptide: "A".to_string(),
+            alt_peptide: "A".to_string(),
+            ref_translation: ref_translation.clone(),
+            alt_translation: alt_translation.clone(),
+            alt_translation_extension: Some(alt_translation),
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        let frameshift = shifted_hgvsp_frameshift_for_output(
+            Some(&source_classification),
+            false,
+            false,
+            Some("A"),
+            1,
+            2,
+            0,
+            "*",
+            semantics,
+        );
+        assert!(frameshift, "the shifted TVA has a 2-nt mapped CDS delta");
+
+        source_classification.ref_peptide = "*".to_string();
+        source_classification.alt_peptide = "M".to_string();
+        source_classification.frameshift = frameshift;
+        let mut translation = translation(
+            "ENST00000986425",
+            Some(135),
+            Some(45),
+            Some(&ref_translation),
+            None,
+        );
+        translation.stable_id = Some("ENSP00000656242".to_string());
+        translation.version = Some(1);
+
+        assert_eq!(
+            crate::hgvs::format_hgvsp(&translation, &source_classification, true).as_deref(),
+            Some("ENSP00000656242.1:p.Ter45MetfsTer2"),
+            "ClinVar 5003617 golden HGVSp"
+        );
+    }
+
+    #[test]
     fn shifted_hgvsp_frameshift_honors_source_stop_retained_without_protein_fallback() {
         assert!(
             !shifted_hgvsp_frameshift_for_output(
                 None,
                 true,
+                false,
+                None,
                 1,
                 206,
                 0,
@@ -33713,6 +33815,8 @@ mod tests {
         assert!(!shifted_hgvsp_frameshift_for_output(
             Some(&source_classification),
             true,
+            false,
+            Some(source_classification.ref_peptide.as_str()),
             1,
             206,
             0,
@@ -33722,6 +33826,8 @@ mod tests {
         assert!(shifted_hgvsp_frameshift_for_output(
             Some(&source_classification),
             true,
+            false,
+            Some(source_classification.ref_peptide.as_str()),
             1,
             206,
             0,
@@ -33747,6 +33853,7 @@ mod tests {
             Some((20, 20)),
             Some(&source_classification),
             true,
+            Some(source_classification.ref_peptide.as_str()),
             crate::vep_semantics::VepSemantics::V116,
             true,
         )
@@ -34176,6 +34283,7 @@ mod tests {
             &shift,
             Some(&fallback),
             false,
+            Some(fallback.ref_peptide.as_str()),
             crate::vep_semantics::VepSemantics::V116,
         )
         .expect("the shifted stop window maps to translated peptide coordinates");
@@ -34238,6 +34346,8 @@ mod tests {
             let frameshift = shifted_hgvsp_frameshift_for_output(
                 Some(&source_classification),
                 false,
+                false,
+                Some(source_classification.ref_peptide.as_str()),
                 start * 3 - 2,
                 start * 3,
                 0,
