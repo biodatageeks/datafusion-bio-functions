@@ -10392,14 +10392,14 @@ fn start_codon_context<'a>(
     if let Some(seq) = tx.spliced_seq.as_deref() {
         let coding_end = tx.cdna_coding_end?;
         if atg_start < coding_end && coding_end <= seq.len() {
-            // Core's five_prime_utr() returns a sequence object even when the
-            // CDS starts at cDNA position 1, so VariationEffect's `unless $utr`
-            // guard still runs with an empty UTR. Preserve that distinction
-            // between absent sequence and a present, empty sequence.
+            // Keep the empty slice as sequence context for
+            // `_ins_del_start_altered()`. `_inv_start_altered()` separately
+            // rejects it because core returns no UTR object for an empty
+            // sequence.
             // Ensembl core c0cf13d, Transcript.pm:1746-1761; Variation 2fb834b,
-            // VariationEffect.pm:906-945:
+            // VariationEffect.pm:923-927:
             // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
-            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L923-L927
             return Some((Some(&seq[..atg_start]), &seq[atg_start..coding_end]));
         }
     }
@@ -10568,6 +10568,16 @@ fn vep116_inv_start_altered(
     let Some((Some(utr), translateable)) = start_codon_context(tx, translateable_seq) else {
         return false;
     };
+    // VEP exits unless `_five_prime_utr()` returns an object. Core returns
+    // `undef` when the sliced 5'UTR sequence is empty, so an empty Rust slice
+    // must not reach the start-codon replay.
+    // Ensembl core c0cf13d, Transcript.pm:1746-1761; Variation 2fb834b,
+    // VariationEffect.pm:923-927:
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L923-L927
+    if utr.is_empty() {
+        return false;
+    }
     let mapper =
         vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, 0);
     let Some((cdna_start, cdna_end)) = mapper
@@ -25445,16 +25455,16 @@ mod tests {
 
         let (no_utr_tx, no_utr_exons) = tx_with_cdna("", "ATGGCTGAATGA");
         let no_utr_exons: Vec<&ExonFeature> = no_utr_exons.iter().collect();
-        assert!(vep116_inv_start_altered(
+        assert!(!vep116_inv_start_altered(
             &no_utr_tx,
             &no_utr_exons,
             &var("22", 1000, 1000, "A", "G"),
             Some("ATGGCTGAATGA"),
         ));
 
-        // With no 5'UTR object missing, core supplies an empty sequence object,
-        // so VariationEffect's `_inv_start_altered()` predicate runs and can
-        // return start_lost before either peptide guard is reached.
+        // With no 5'UTR object, `_inv_start_altered()` is false. The later
+        // peptide clause can still call start_lost when its own source guards
+        // pass; a dash/empty or X alternate peptide is rejected by those guards.
         let start_snv = var("22", 1000, 1000, "A", "G");
         let mut peptide_class = CodingClassification {
             affected_ref_peptide: Some("MS".to_string()),
@@ -25470,10 +25480,10 @@ mod tests {
             Some("ATGGCTGAATGA"),
             false,
         ));
-        // These peptide values cannot suppress the earlier `_inv_start_altered`
-        // branch, as specified by VariationEffect.pm:851-879.
+        // With the UTR-only predicate skipped, the source peptide guard
+        // rejects an empty alternate and X (VariationEffect.pm:872-882).
         peptide_class.affected_alt_peptide = Some("-".to_string());
-        assert!(vep116_start_lost_from_predicates(
+        assert!(!vep116_start_lost_from_predicates(
             &peptide_class,
             &no_utr_tx,
             &no_utr_exons,
@@ -25482,13 +25492,33 @@ mod tests {
             false,
         ));
         peptide_class.affected_alt_peptide = Some("X".to_string());
-        assert!(vep116_start_lost_from_predicates(
+        assert!(!vep116_start_lost_from_predicates(
             &peptide_class,
             &no_utr_tx,
             &no_utr_exons,
             &start_snv,
             Some("ATGGCTGAATGA"),
             false,
+        ));
+    }
+
+    #[test]
+    fn inv_start_altered_skips_absent_five_prime_utr_per_vep() {
+        // VEP's `_inv_start_altered()` returns false unless `_five_prime_utr()`
+        // returns a UTR object. Core returns `undef` for an empty UTR sequence.
+        // Ensembl core c0cf13d, Transcript.pm:1746-1761; Variation 2fb834b,
+        // VariationEffect.pm:923-927:
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L923-L927
+        let (no_utr_tx, no_utr_exons) = tx_with_cdna("", "ATGGCTGAATGA");
+        let no_utr_exons: Vec<&ExonFeature> = no_utr_exons.iter().collect();
+        let start_snv = var("22", 1000, 1000, "A", "G");
+
+        assert!(!vep116_inv_start_altered(
+            &no_utr_tx,
+            &no_utr_exons,
+            &start_snv,
+            Some("ATGGCTGAATGA"),
         ));
     }
 
