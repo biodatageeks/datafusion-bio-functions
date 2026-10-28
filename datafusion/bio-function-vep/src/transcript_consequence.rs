@@ -10024,6 +10024,9 @@ fn classify_insertion_with_semantics_and_gap(
     // treating the insertion as overlap with its normalized point. The
     // coordinate pair is `(start, start - 1)` by Core Mapper.pm:267-270, and
     // VariationEffect.pm:965-985 passes those endpoints to `overlap()`.
+    // Ensembl core c0cf13d and Variation 2fb834b:
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Mapper.pm#L267-L270
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L965-L985
     let overlaps_start = if semantics.vep116_stop_predicates() && !tx_exons.is_empty() {
         vep116_codon_overlap(tx, tx_exons, variant, true)
     } else if !semantics.vep116_stop_predicates() {
