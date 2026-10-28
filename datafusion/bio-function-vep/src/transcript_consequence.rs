@@ -25580,7 +25580,11 @@ mod tests {
         let minus_insertion = var("22", 1002, 1002, "-", "A");
         assert!(vep116_overlaps_stop_codon_cil(&minus, &minus_insertion, 1));
         let minus_outside = var("22", 1005, 1005, "-", "AA");
-        assert!(!vep116_overlaps_stop_codon_cil(&minus, &minus_outside, 3,));
+        assert!(!vep116_overlaps_stop_codon_cil(
+            &minus,
+            &minus_outside,
+            minus_outside.alt_allele.len(),
+        ));
     }
 
     #[test]
