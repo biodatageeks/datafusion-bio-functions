@@ -10924,6 +10924,11 @@ fn vep116_inv_start_altered(
     mutated.splice(start..end, alt.bytes());
 
     let atg_start = utr.len();
+    // Keep the source's literal, case-sensitive comparison: VariationEffect.pm
+    // tests `$new_sc ne 'ATG'`, so lowercase cached bases are also treated as
+    // an altered start by VEP.
+    // Ensembl Variation 2fb834b, VariationEffect.pm:906-945:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
     mutated
         .get(atg_start..atg_start.saturating_add(3))
         .is_none_or(|codon| codon != b"ATG")
@@ -11021,8 +11026,7 @@ fn vep116_start_retained_variant(
             .get(leading_n_offset..leading_n_offset.saturating_add(3))
             .is_some_and(|codon| codon.eq_ignore_ascii_case(b"ATG"));
     }
-    let altered = ref_len != alt_len
-        && crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
+    let altered = crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
         && translateable_seq.is_some_and(|seq| {
             ins_del_start_altered(tx, tx_exons, variant, Some(seq)).unwrap_or(false)
         });
@@ -34338,6 +34342,47 @@ mod tests {
             !c.missense,
             "VEP's mapper-derived partial_codon predicate vetoes missense without any SeqEdit. Got: {:?}",
             c
+        );
+    }
+
+    #[test]
+    fn non_seqedit_x_to_q_uses_vep_partial_codon_missense_rule() {
+        // The reference NNN codon translates to X; the unambiguous MNV makes
+        // it CAA/Q. VEP permits X/Q missense when partial_codon is false,
+        // regardless of whether the reference X came from a SeqEdit.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:1085-1098:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1085-L1098
+        let cds = "ATGNNNTAA";
+        let transcript = tx(
+            "T_NON_SEQEDIT_XQ",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        let exon = exon("T_NON_SEQEDIT_XQ", 1, 1000, 1008);
+        let exons = [&exon];
+        let translation = translation("T_NON_SEQEDIT_XQ", Some(9), Some(3), None, Some(cds));
+        let variant = var("22", 1003, 1005, "NNN", "CAA");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("unambiguous NNN-to-CAA coding MNV should classify");
+
+        assert!(transcript.translation_seq_edits.is_empty());
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("X"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("Q"));
+        assert!(
+            class.missense,
+            "VEP permits X/Q missense when not partial: {class:?}"
         );
     }
 
