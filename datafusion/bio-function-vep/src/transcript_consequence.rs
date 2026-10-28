@@ -1717,14 +1717,17 @@ impl TranscriptConsequenceEngine {
                         }
                         // VEP classifies and clips HGVS from the genomic feature
                         // slice, independently of USED_REF's transcript mapping.
-                        // Keep USED_REF as the display allele and pass the genomic
-                        // reference separately for RNA-edit classification.
+                        // Preserve the input REF if the genomic slice is absent;
+                        // only `_rna_edit` attributes use the transcript feature REF.
                         let feature_reference = used_ref.as_deref().unwrap_or(&variant.ref_allele);
-                        let hgvsc_ref_allele = if tx.has_rna_edit {
-                            feature_reference
-                        } else {
-                            genomic_reference.unwrap_or(feature_reference)
-                        };
+                        let given_hgvsc_reference =
+                            given_ref.as_deref().unwrap_or(&variant.ref_allele);
+                        let hgvsc_ref_allele = hgvsc_reference_for_output(
+                            tx.has_rna_edit,
+                            feature_reference,
+                            given_hgvsc_reference,
+                            genomic_reference,
+                        );
                         // Compute HGVSc notation.
                         let hgvsc_started = profiling.then(Instant::now);
                         if let Some(profile) = profile.as_deref_mut() {
@@ -12275,6 +12278,31 @@ fn mapper_insertion_gap_cdna_position(tx: &TranscriptFeature, variant_start: i64
 fn given_ref_for_output(variant: &VariantInput) -> Option<String> {
     let allele = normalize_allele_seq(&variant.ref_allele);
     (!allele.is_empty()).then_some(allele)
+}
+
+/// Select the reference allele used by VEP's transcript HGVS formatter.
+///
+/// VEP extracts REF from the genomic feature slice, then substitutes the
+/// transcript feature allele only when `_rna_edit` attributes are present.
+/// If the genomic slice was unavailable to the caller, the VCF REF is the
+/// source-backed fallback; USED_REF describes transcript mapping and can be
+/// different for edited RefSeq rows.
+/// Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:1463-1477, 1507-1514;
+/// Ensembl VEP release/116.0, OutputFactory.pm:1743-1748:
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1463-L1477
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1507-L1514
+/// https://github.com/Ensembl/ensembl-vep/blob/release/116.0/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1743-L1748
+fn hgvsc_reference_for_output<'a>(
+    has_rna_edit: bool,
+    feature_reference: &'a str,
+    given_reference: &'a str,
+    genomic_reference: Option<&'a str>,
+) -> &'a str {
+    if has_rna_edit {
+        feature_reference
+    } else {
+        genomic_reference.unwrap_or(given_reference)
+    }
 }
 
 fn used_ref_with_cache_policy(
@@ -23344,6 +23372,21 @@ mod tests {
 
         // Nothing shared between the HGVS reference and the alt: no reduction.
         assert!(minimised_substitution(&v, "TCC").is_none());
+    }
+
+    #[test]
+    fn hgvsc_reference_fallback_uses_given_ref_and_preserves_rna_edit_rule() {
+        // VEP takes REF from its genomic slice, or the input REF when that
+        // slice is unavailable. Only `_rna_edit` attributes switch to the
+        // transcript feature allele (TranscriptVariationAllele.pm:1463-1477,
+        // 1507-1514).
+        assert_eq!(
+            hgvsc_reference_for_output(false, "C", "T", None),
+            "T",
+            "USED_REF must not replace the input REF when the genomic slice is absent"
+        );
+        assert_eq!(hgvsc_reference_for_output(false, "C", "T", Some("G")), "G");
+        assert_eq!(hgvsc_reference_for_output(true, "A", "T", Some("G")), "A");
     }
 
     #[test]
