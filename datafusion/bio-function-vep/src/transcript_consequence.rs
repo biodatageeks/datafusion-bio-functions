@@ -6878,7 +6878,19 @@ fn failed_bam_translateable_seq_for_vep(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
 ) -> Option<String> {
-    let sequence = failed_bam_exon_seq(tx)?;
+    // VEP restores the transcript's edit state after a failed BAM edit, then
+    // lazily derives `translateable_seq()` from `spliced_seq()` and the cDNA
+    // coding bounds. The genome-derived exon fallback omits source transcript
+    // edits such as RefSeq insertions, so it cannot be indexed with the retained
+    // mapper coordinates here.
+    // Ensembl VEP release/116.0, AnnotationType/Transcript.pm:619-627;
+    // Ensembl core c0cf13d, Transcript.pm:823-878 and 903-925;
+    // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:1083-1092.
+    // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L903-L925
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1083-L1092
+    let sequence = failed_bam_source_spliced_seq(tx)?;
     let start_idx = tx.cdna_coding_start?.checked_sub(1)?;
     let end_idx = tx.cdna_coding_end?;
     let slice = sequence.get(start_idx..end_idx)?.to_ascii_uppercase();
@@ -13987,13 +13999,18 @@ mod tests {
             Some("AAACCCCCCGGG")
         );
         assert_eq!(
+            reference_translateable_seq_for_vep(&transcript, None).as_deref(),
+            Some("CCCCCC"),
+            "failed-BAM codons use the cached translateable sequence from the source spliced transcript"
+        );
+        assert_eq!(
             mapped_transcript_reference_allele(&variant, &transcript, &exons, true).as_deref(),
             Some("C")
         );
     }
 
     #[test]
-    fn failed_bam_consequence_and_hgvsp_use_the_unedited_exon_cds() {
+    fn failed_bam_consequence_and_hgvsp_use_source_translateable_seq() {
         let mut transcript = tx(
             "NM_FAILED_PEPTIDE.1",
             "7",
@@ -14018,28 +14035,39 @@ mod tests {
             Some("ATGAACTAA"),
         );
 
+        // VEP restores the edit state after a failed BAM edit, then
+        // Transcript::translateable_seq() derives CDS from spliced_seq and
+        // its coding bounds. The genome-derived exon sequence omits the
+        // source RefSeq edits represented in the transcript sequence.
+        // Ensembl VEP release/116.0, AnnotationType/Transcript.pm:619-627;
+        // Ensembl core c0cf13d, Transcript.pm:823-878 and 903-925;
+        // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:1083-1092.
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L903-L925
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1083-L1092
         assert_eq!(
             reference_translateable_seq_for_vep(&transcript, Some(&cached_translation)).as_deref(),
-            Some("ATGCGCTAA")
+            Some("ATGAACTAA")
         );
         assert_eq!(
             reference_translateable_seq_for_hgvsp(&transcript, Some(&cached_translation))
                 .as_deref(),
-            Some("ATGCGCTAA")
+            Some("ATGAACTAA")
         );
         assert_eq!(
-            reference_aas_for_consequence(&transcript, Some(&cached_translation), "ATGCGCTAA",)
+            reference_aas_for_consequence(&transcript, Some(&cached_translation), "ATGAACTAA",)
                 .map(|aas| aas.into_iter().collect::<String>())
                 .as_deref(),
-            Some("MR*")
+            Some("MN*")
         );
         assert_eq!(
             canonical_ref_translation_for_hgvsp(
                 &transcript,
                 Some(&cached_translation),
-                "MR*".to_string(),
+                "MN*".to_string(),
             ),
-            "MR*"
+            "MN*"
         );
         assert!(!uses_canonical_reference_for_hgvsp(
             &transcript,
