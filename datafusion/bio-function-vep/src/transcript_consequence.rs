@@ -19398,7 +19398,7 @@ mod tests {
     }
 
     #[test]
-    fn mt_nd2_initiator_seqedit_makes_att_reference_peptide_methionine() {
+    fn issue_205_locks_mt_nd2_initiator_seqedit_start_lost_parity() {
         // The refreshed MT transcript cache carries this amino_acid_sub edit.
         // VEP overlays it on the reference peptide, then uses that peptide for
         // both `Amino_acids` and its ordered start_lost predicate.
@@ -19450,6 +19450,23 @@ mod tests {
         assert_eq!(classification.amino_acids.as_deref(), Some("M/I"));
         assert!(classification.start_lost);
         assert!(!classification.synonymous);
+
+        // Negative control: without the source SeqEdit the genomic ATT codon
+        // translates to I on both sides (MT:4472 T>C is synonymous), so it
+        // must not be called start_lost.
+        transcript.translation_seq_edits.clear();
+        let unedited = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("unedited negative-control variant should classify");
+        assert_eq!(unedited.affected_ref_peptide.as_deref(), Some("I"));
+        assert_eq!(unedited.affected_alt_peptide.as_deref(), Some("I"));
+        assert!(!unedited.start_lost);
+        assert!(unedited.synonymous);
     }
 
     #[test]
