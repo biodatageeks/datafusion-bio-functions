@@ -212,9 +212,9 @@ use crate::transcript_consequence::{
     RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind, SvFeatureKind,
     TranscriptCdnaMapperSegment, TranscriptConsequence, TranscriptConsequenceEngine,
     TranscriptEngineProfile, TranscriptFeature, TranslationFeature, TranslationSeqEdit,
-    VariantInput, exact_mapper_cdna_index_for_transcript, genomic_to_cdna_index_for_transcript,
-    infer_refseq_deletion_edits_from_sequences, is_mitochondrial_contig,
-    mapper_cdna_start_for_insertion, refseq_edit_offset_delta,
+    VariantInput, bam_edit_failed, bam_edit_status_failed, exact_mapper_cdna_index_for_transcript,
+    genomic_to_cdna_index_for_transcript, infer_refseq_deletion_edits_from_sequences,
+    is_mitochondrial_contig, mapper_cdna_start_for_insertion, refseq_edit_offset_delta,
 };
 
 #[cfg(feature = "parquet-cache")]
@@ -8689,7 +8689,7 @@ fn cached_or_synthesized_spliced_seq(
     if cached.is_some() {
         return cached;
     }
-    if bam_edit_status.is_some_and(|status| status.eq_ignore_ascii_case("failed")) {
+    if bam_edit_status_failed(bam_edit_status) {
         return None;
     }
     synthesize_spliced_seq(
@@ -9421,12 +9421,7 @@ where
         // <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627>
         // <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L455-L465>
         // <https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L835>
-        if tx
-            .bam_edit_status
-            .as_deref()
-            .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
-            && tx.failed_bam_exon_seq.is_none()
-        {
+        if bam_edit_failed(tx) && tx.failed_bam_exon_seq.is_none() {
             let chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
             let overlaps_exon = all_intervals.get(chrom).is_some_and(|intervals| {
                 tx_exons

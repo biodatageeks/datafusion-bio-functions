@@ -6617,15 +6617,17 @@ fn failed_bam_exon_seq(tx: &TranscriptFeature) -> Option<&str> {
         .flatten()
 }
 
-fn bam_edit_failed(tx: &TranscriptFeature) -> bool {
+pub(crate) fn bam_edit_status_failed(status: Option<&str>) -> bool {
+    status.is_some_and(|status| status.eq_ignore_ascii_case("failed"))
+}
+
+pub(crate) fn bam_edit_failed(tx: &TranscriptFeature) -> bool {
     // This status is independent of exon-sequence hydration. VEP rolls its
     // edited transcript attributes back when the BAM edit fails, even if no
     // genome-derived exon sequence was materialized for the row.
     // Ensembl VEP release/116.0, AnnotationType/Transcript.pm:619-627:
     // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
-    tx.bam_edit_status
-        .as_deref()
-        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
+    bam_edit_status_failed(tx.bam_edit_status.as_deref())
 }
 
 fn transcript_mrna_seq_for_vep_cow(tx: &TranscriptFeature) -> Option<Cow<'_, str>> {
@@ -12630,6 +12632,8 @@ fn failed_bam_source_spliced_seq(tx: &TranscriptFeature) -> Option<Cow<'_, str>>
         return None;
     }
     if let Some(sequence) = tx.spliced_seq.as_deref() {
+        // This is VEP's cache-native sequence, which `_get_ref_allele()` reads
+        // directly after rollback; component reconstructions need validation.
         return Some(Cow::Borrowed(sequence));
     }
 
@@ -12659,13 +12663,12 @@ fn failed_bam_source_spliced_seq(tx: &TranscriptFeature) -> Option<Cow<'_, str>>
     }
 
     let sequence_length = utr5.len() + translateable.len() + utr3.len();
-    if tx
+    let mapper_length = tx
         .cdna_mapper_segments
         .iter()
         .map(|segment| segment.cdna_end)
-        .max()
-        .is_some_and(|mapper_length| mapper_length != sequence_length)
-    {
+        .max()?;
+    if mapper_length != sequence_length {
         return None;
     }
 
@@ -14136,6 +14139,33 @@ mod tests {
             reference_translateable_seq_for_vep(&transcript, None).as_deref(),
             Some("ATGAACTAA")
         );
+    }
+
+    #[test]
+    fn failed_bam_component_reconstruction_requires_mapper_length() {
+        let mut transcript = tx(
+            "NM_FAILED_NO_MAPPER.1",
+            "15",
+            100,
+            111,
+            1,
+            "protein_coding",
+            Some(103),
+            Some(108),
+        );
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.cdna_coding_start = Some(4);
+        transcript.cdna_coding_end = Some(9);
+        transcript.five_prime_utr_seq = Some("AAA".to_string());
+        transcript.translateable_seq = Some("CCCCCC".to_string());
+        transcript.three_prime_utr_seq = Some("GGG".to_string());
+
+        // Component lengths are insufficient without a mapper extent to show
+        // that they cover the same restored cDNA sequence VEP would slice.
+        // Ensembl core c0cf13d, Transcript.pm:823-878 and 903-925:
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L903-L925
+        assert_eq!(failed_bam_source_spliced_seq(&transcript), None);
     }
 
     #[test]
