@@ -10842,6 +10842,11 @@ fn vep116_inv_start_altered(
     mutated.splice(start..end, alt.bytes());
 
     let atg_start = utr.len();
+    // Keep the source's literal, case-sensitive comparison: VariationEffect.pm
+    // tests `$new_sc ne 'ATG'`, so lowercase cached bases are also treated as
+    // an altered start by VEP.
+    // Ensembl Variation 2fb834b, VariationEffect.pm:906-945:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
     mutated
         .get(atg_start..atg_start.saturating_add(3))
         .is_none_or(|codon| codon != b"ATG")
@@ -10939,8 +10944,7 @@ fn vep116_start_retained_variant(
             .get(leading_n_offset..leading_n_offset.saturating_add(3))
             .is_some_and(|codon| codon.eq_ignore_ascii_case(b"ATG"));
     }
-    let altered = ref_len != alt_len
-        && crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
+    let altered = crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
         && translateable_seq.is_some_and(|seq| {
             ins_del_start_altered(tx, tx_exons, variant, Some(seq)).unwrap_or(false)
         });
