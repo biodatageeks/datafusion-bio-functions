@@ -33824,6 +33824,47 @@ mod tests {
     }
 
     #[test]
+    fn non_seqedit_x_to_q_uses_vep_partial_codon_missense_rule() {
+        // The reference NNN codon translates to X; the unambiguous MNV makes
+        // it CAA/Q. VEP permits X/Q missense when partial_codon is false,
+        // regardless of whether the reference X came from a SeqEdit.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:1085-1098:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1085-L1098
+        let cds = "ATGNNNTAA";
+        let transcript = tx(
+            "T_NON_SEQEDIT_XQ",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        let exon = exon("T_NON_SEQEDIT_XQ", 1, 1000, 1008);
+        let exons = [&exon];
+        let translation = translation("T_NON_SEQEDIT_XQ", Some(9), Some(3), None, Some(cds));
+        let variant = var("22", 1003, 1005, "NNN", "CAA");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("unambiguous NNN-to-CAA coding MNV should classify");
+
+        assert!(transcript.translation_seq_edits.is_empty());
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("X"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("Q"));
+        assert!(
+            class.missense,
+            "VEP permits X/Q missense when not partial: {class:?}"
+        );
+    }
+
+    #[test]
     fn issue_101_snv_at_complete_codon_still_synonymous() {
         // Regression guard: SNV at a COMPLETE codon that doesn't change
         // the amino acid should still get synonymous_variant.
