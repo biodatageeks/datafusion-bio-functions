@@ -6927,10 +6927,7 @@ fn reference_translateable_seq_for_hgvsp(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
 ) -> Option<String> {
-    if bam_edit_failed(tx) {
-        return reference_translateable_seq_for_vep(tx, translation);
-    }
-    if bam_edit_succeeded(tx) {
+    if bam_edit_failed(tx) || bam_edit_succeeded(tx) {
         return reference_translateable_seq_for_vep(tx, translation);
     }
     translation
@@ -14144,6 +14141,11 @@ mod tests {
         assert_eq!(
             transcript_mrna_seq_for_vep(&transcript).as_deref(),
             Some("GGATGAACTAACCC")
+        );
+        assert_eq!(
+            three_prime_utr_seq(&transcript).as_deref(),
+            Some("CCC"),
+            "3'UTR padding uses the same restored source transcript as CDS slicing"
         );
     }
 
