@@ -22554,6 +22554,8 @@ mod tests {
         t.cdna_coding_start = Some(1);
         t.cdna_coding_end = Some(9);
         t.bam_edit_status = Some("ok".to_string());
+        // VEP's REF override applies to a real `_rna_edit` attribute.
+        t.has_rna_edit = true;
         t.has_non_polya_rna_edit = true;
         t.spliced_seq = Some("ACGATGTAA".to_string());
         let exons = vec![exon("NM_EDIT.1", 1, 100, 108)];
