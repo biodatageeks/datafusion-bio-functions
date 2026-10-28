@@ -10940,7 +10940,12 @@ fn vep116_start_lost_from_predicates(
     let mapper =
         vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, phase);
     mapper
-        .translation(vep_coords::VepSpan::from_variant(variant))
+        // VEP's translation_start() is derived by genomic2pep() even when a
+        // cache lacks cDNA coding bounds; preserve that mapped peptide start.
+        // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:365-379, 540-561:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L365-L379
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L540-L561
+        .translation_with_genomic_cds_fallback(vep_coords::VepSpan::from_variant(variant))
         .start
         == Some(1)
         && vep116_start_lost_from_peptide_alleles(class) == Some(true)
@@ -26271,6 +26276,37 @@ mod tests {
             &no_utr_exons,
             &start_snv,
             Some("ATGGCTGAATGA"),
+        ));
+    }
+
+    #[test]
+    fn vep116_start_lost_peptide_guard_keeps_genomic_cds_fallback() {
+        // VEP derives translation_start through the transcript mapper from
+        // genomic coordinates. Older cache rows can have genomic CDS bounds
+        // without cDNA coding bounds, so the peptide clause must keep the
+        // corresponding mapper fallback.
+        // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:365-379, 540-561:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L365-L379
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L540-L561
+        let (mut tx, exons) = tx_with_cdna("", "ATGGCTGAATGA");
+        tx.cdna_coding_start = None;
+        tx.cdna_coding_end = None;
+        let exons: Vec<&ExonFeature> = exons.iter().collect();
+        let start_snv = var("22", 1000, 1000, "A", "C");
+        let class = CodingClassification {
+            affected_ref_peptide: Some("MS".to_string()),
+            affected_alt_peptide: Some("P".to_string()),
+            codons: Some("ATG/TGG".to_string()),
+            ..CodingClassification::default()
+        };
+
+        assert!(vep116_start_lost_from_predicates(
+            &class,
+            &tx,
+            &exons,
+            &start_snv,
+            Some("ATGGCTGAATGA"),
+            false,
         ));
     }
 
