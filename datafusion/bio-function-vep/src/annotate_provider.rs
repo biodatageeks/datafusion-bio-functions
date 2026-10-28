@@ -4658,18 +4658,16 @@ impl AnnotateProvider {
                 let has_rna_edit = !refseq_edits.is_empty() || has_non_polya_rna_edit;
                 let cdna_seq =
                     cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let spliced_seq = spliced_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or_else(|| {
-                        synthesize_spliced_seq(
-                            five_prime_utr_seq.as_deref(),
-                            translateable_seq.as_deref(),
-                            three_prime_utr_seq.as_deref(),
-                            cdna_coding_start,
-                            cdna_coding_end,
-                            cdna_seq.as_deref(),
-                        )
-                    });
+                let spliced_seq = cached_or_synthesized_spliced_seq(
+                    spliced_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    bam_edit_status.as_deref(),
+                    five_prime_utr_seq.as_deref(),
+                    translateable_seq.as_deref(),
+                    three_prime_utr_seq.as_deref(),
+                    cdna_coding_start,
+                    cdna_coding_end,
+                    cdna_seq.as_deref(),
+                );
                 let version = version_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .and_then(|v| i32::try_from(v).ok());
@@ -5336,18 +5334,16 @@ impl AnnotateProvider {
                 );
                 let cdna_seq =
                     cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let spliced_seq = spliced_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or_else(|| {
-                        synthesize_spliced_seq(
-                            five_prime_utr_seq.as_deref(),
-                            translateable_seq.as_deref(),
-                            three_prime_utr_seq.as_deref(),
-                            cdna_coding_start,
-                            cdna_coding_end,
-                            cdna_seq.as_deref(),
-                        )
-                    });
+                let spliced_seq = cached_or_synthesized_spliced_seq(
+                    spliced_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    bam_edit_status.as_deref(),
+                    five_prime_utr_seq.as_deref(),
+                    translateable_seq.as_deref(),
+                    three_prime_utr_seq.as_deref(),
+                    cdna_coding_start,
+                    cdna_coding_end,
+                    cdna_seq.as_deref(),
+                );
                 let mut refseq_edits = refseq_edits_idx
                     .map(|idx| refseq_edits_from_list_column(batch.column(idx).as_ref(), row))
                     .unwrap_or_default();
@@ -8668,6 +8664,42 @@ fn synthesize_spliced_seq(
         spliced_seq.push_str(seq);
     }
     (!spliced_seq.is_empty()).then_some(spliced_seq.to_ascii_uppercase())
+}
+
+/// Preserve a cache-native source sequence when available. On failed BAM edits,
+/// VEP rolls back the edit state and leaves the source transcript intact; do
+/// not substitute an unchecked UTR/CDS concatenation for its `spliced_seq`.
+/// The failed-BAM consequence path validates the cached components against
+/// mapper cDNA bounds before reconstructing a source sequence.
+///
+/// Ensembl VEP release/116.0, AnnotationType/Transcript.pm:619-627; Ensembl
+/// core c0cf13d, Transcript.pm:823-878:
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+/// https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
+fn cached_or_synthesized_spliced_seq(
+    cached: Option<String>,
+    bam_edit_status: Option<&str>,
+    five_prime_utr_seq: Option<&str>,
+    translateable_seq: Option<&str>,
+    three_prime_utr_seq: Option<&str>,
+    cdna_coding_start: Option<usize>,
+    cdna_coding_end: Option<usize>,
+    cdna_seq: Option<&str>,
+) -> Option<String> {
+    if cached.is_some() {
+        return cached;
+    }
+    if bam_edit_status.is_some_and(|status| status.eq_ignore_ascii_case("failed")) {
+        return None;
+    }
+    synthesize_spliced_seq(
+        five_prime_utr_seq,
+        translateable_seq,
+        three_prime_utr_seq,
+        cdna_coding_start,
+        cdna_coding_end,
+        cdna_seq,
+    )
 }
 
 fn row_source_is_refseq(tx: &TranscriptFeature) -> bool {
@@ -19253,25 +19285,46 @@ mod tests {
                 Field::new("spliced_seq", DataType::Utf8, true),
             ];
             let mut columns: Vec<Arc<dyn Array>> = vec![
-                Arc::new(StringArray::from(vec!["padded", "bam_ok", "cached"])),
-                Arc::new(StringArray::from(vec!["1"; 3])),
-                Arc::new(Int64Array::from(vec![100_i64; 3])),
-                Arc::new(Int64Array::from(vec![200_i64; 3])),
-                Arc::new(Int64Array::from(vec![1_i64; 3])),
-                Arc::new(StringArray::from(vec!["protein_coding"; 3])),
-                Arc::new(StringArray::from(vec![None, Some("ok"), None])),
-                Arc::new(Int64Array::from(vec![Some(1_i64); 3])),
-                Arc::new(Int64Array::from(vec![Some(15_i64); 3])),
+                Arc::new(StringArray::from(vec![
+                    "padded",
+                    "bam_ok",
+                    "cached",
+                    "bam_failed",
+                ])),
+                Arc::new(StringArray::from(vec!["1"; 4])),
+                Arc::new(Int64Array::from(vec![100_i64; 4])),
+                Arc::new(Int64Array::from(vec![200_i64; 4])),
+                Arc::new(Int64Array::from(vec![1_i64; 4])),
+                Arc::new(StringArray::from(vec!["protein_coding"; 4])),
+                Arc::new(StringArray::from(vec![
+                    None,
+                    Some("ok"),
+                    None,
+                    Some("failed"),
+                ])),
+                Arc::new(Int64Array::from(vec![Some(1_i64); 4])),
+                Arc::new(Int64Array::from(vec![Some(15_i64); 4])),
                 Arc::new(StringArray::from(vec![
                     Some("NNGCTGAAAAAATGA"),
                     Some("GCTGAAAAAATGA"),
                     Some("GCTGAAAAAATGA"),
+                    Some("NNGCTGAAAAAATGA"),
                 ])),
-                Arc::new(StringArray::from(vec![None, Some("GCTGAAAAAATGAGG"), None])),
+                Arc::new(StringArray::from(vec![
+                    None,
+                    Some("GCTGAAAAAATGAGG"),
+                    None,
+                    None,
+                ])),
             ];
             if include_utr_column {
                 fields.push(Field::new("three_prime_utr_seq", DataType::Utf8, true));
-                columns.push(Arc::new(StringArray::from(vec![None, None, Some("GGG")])));
+                columns.push(Arc::new(StringArray::from(vec![
+                    None,
+                    None,
+                    Some("GGG"),
+                    None,
+                ])));
             }
             let schema = Arc::new(Schema::new(fields));
             let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
@@ -19325,6 +19378,15 @@ mod tests {
                     .find(|tx| tx.transcript_id == "padded")
                     .unwrap();
                 assert_eq!(padded.spliced_seq.as_deref(), Some("NNGCTGAAAAAATGA"));
+                let failed = transcripts
+                    .iter()
+                    .find(|tx| tx.transcript_id == "bam_failed")
+                    .unwrap();
+                assert_eq!(failed.bam_edit_status.as_deref(), Some("failed"));
+                assert_eq!(
+                    failed.spliced_seq, None,
+                    "a synthesized phase-padded cDNA must not masquerade as VEP's restored source spliced_seq"
+                );
             }
         }
     }
