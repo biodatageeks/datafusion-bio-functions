@@ -1540,6 +1540,27 @@ impl TranscriptConsequenceEngine {
                                     variant,
                                     self.semantics,
                                 );
+                                // `partial_codon()` is memoized on the TVA,
+                                // like `stop_retained()`. This consequence has
+                                // already evaluated that source-span guard;
+                                // an HGVS-only shift leaves its predicate cache
+                                // intact.
+                                // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1324
+                                // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1588-L1614
+                                let source_partial_codon =
+                                    (self.semantics.vep116_stop_predicates()
+                                        && !cc
+                                            .protein_hgvs
+                                            .as_ref()
+                                            .is_some_and(|protein| protein.frameshift))
+                                    .then(|| {
+                                        vep_partial_terminal_codon(
+                                            tx,
+                                            tx_exons,
+                                            tx_translation,
+                                            variant,
+                                        )
+                                    });
                                 let protein_hgvs = protein_hgvs_for_output_with_semantics(
                                     tx,
                                     tx_exons,
@@ -1550,6 +1571,7 @@ impl TranscriptConsequenceEngine {
                                         .zip(cc.protein_position_end.or(cc.protein_position_start)),
                                     cc.protein_hgvs.as_ref(),
                                     cc.stop_retained,
+                                    source_partial_codon,
                                     cc.affected_ref_peptide.as_deref(),
                                     self.semantics,
                                     self.shift_hgvs,
@@ -1567,6 +1589,7 @@ impl TranscriptConsequenceEngine {
                                     None,
                                     None,
                                     false,
+                                    None,
                                     None,
                                     self.semantics,
                                     self.shift_hgvs,
@@ -7820,6 +7843,7 @@ fn shifted_tva_protein_hgvs_data(
     shift: &crate::hgvs::HgvsGenomicShift,
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
     source_stop_retained: bool,
+    source_partial_codon: Option<bool>,
     source_ref_peptide: Option<&str>,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
@@ -7878,11 +7902,14 @@ fn shifted_tva_protein_hgvs_data(
     } else {
         canonical_ref_translation
     };
+    let source_partial_codon = source_partial_codon.or_else(|| {
+        (semantics.vep116_stop_predicates() && !fallback.is_some_and(|protein| protein.frameshift))
+            .then(|| vep_partial_terminal_codon(tx, tx_exons, Some(translation), &shifted_variant))
+    });
     let frameshift = shifted_hgvsp_frameshift_for_output(
         fallback,
         source_stop_retained,
-        semantics.vep116_stop_predicates()
-            && vep_partial_terminal_codon(tx, tx_exons, Some(translation), &shifted_variant),
+        source_partial_codon,
         source_ref_peptide,
         coords.cds_start,
         coords.cds_end,
@@ -7925,7 +7952,7 @@ fn shifted_hgvsp_frameshift(
 fn shifted_hgvsp_frameshift_for_output(
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
     source_stop_retained: bool,
-    source_partial_codon: bool,
+    source_partial_codon: Option<bool>,
     source_ref_peptide: Option<&str>,
     cds_start: usize,
     cds_end: usize,
@@ -7935,45 +7962,62 @@ fn shifted_hgvsp_frameshift_for_output(
 ) -> bool {
     // VEP calls `frameshift($self)` from `_get_hgvs_protein_type()` after
     // `hgvs_protein()` has installed the HGVS shift. A cached source
-    // stop-retained or frameshift result remains authoritative, but a cached
-    // non-frameshift consequence is not the HGVS TVA's result: VEP evaluates
-    // the mapped CDS span, alternate allele length, and `_get_peptide_alleles`
-    // reference peptide here. OutputFactory computes the consequence before
-    // HGVSp, so pass its source reference peptide when available.
+    // stop-retained, partial-codon, and reference-peptide result remains
+    // authoritative. Those predicates use the TVA cache; `hgvs_transcript()`
+    // invalidates it only for consequence-shifted transcripts, not an
+    // HGVS-only shift. For a cached false frameshift under V116, replay the
+    // remaining mapped-span and allele-length checks on the shifted TVA.
+    // VEP's guards are `return 0 if partial_codon(@_)` and
+    // `return 0 if stop_retained(@_)`, before comparing mapped and ALT lengths.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1467-L1469
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1711-L1734
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1324
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1588-L1614
-    let raw_frameshift =
-        if semantics.vep116_stop_predicates() && (source_stop_retained || source_partial_codon) {
+    let recompute_mapped_length_frameshift = || {
+        // VEP's `frameshift()` compares the alternate TVA sequence length
+        // with the mapped CDS span, excluding intronic bases.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2041-L2050
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
+        let mapped_cds_len = i64::try_from(cds_end)
+            .ok()
+            .zip(i64::try_from(cds_start).ok())
+            .and_then(|(end, start)| end.checked_sub(start)?.checked_add(1));
+        let Some(mapped_cds_len) = mapped_cds_len else {
+            return false;
+        };
+        let Some(allele_len) = i64::try_from(alternate_allele_len).ok() else {
+            return false;
+        };
+        !allele_len.abs_diff(mapped_cds_len).is_multiple_of(3)
+    };
+
+    let raw_frameshift = if semantics.vep116_stop_predicates() {
+        if source_stop_retained || source_partial_codon == Some(true) {
             false
         } else if fallback.is_some_and(|protein| protein.frameshift) {
             true
         } else {
-            // VEP's `frameshift()` compares the alternate TVA sequence length
-            // with the mapped CDS span, excluding intronic bases.
-            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2041-L2050
-            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1565
-            let mapped_cds_len = i64::try_from(cds_end)
-                .ok()
-                .zip(i64::try_from(cds_start).ok())
-                .and_then(|(end, start)| end.checked_sub(start)?.checked_add(1));
-            let Some(mapped_cds_len) = mapped_cds_len else {
-                return false;
-            };
-            let Some(allele_len) = i64::try_from(alternate_allele_len).ok() else {
-                return false;
-            };
-            !allele_len.abs_diff(mapped_cds_len).is_multiple_of(3)
-        };
+            recompute_mapped_length_frameshift()
+        }
+    } else {
+        fallback
+            .map(|protein| protein.frameshift)
+            .unwrap_or_else(recompute_mapped_length_frameshift)
+    };
 
     if fallback.is_some_and(|protein| protein.frameshift) {
         raw_frameshift
     } else {
-        shifted_hgvsp_frameshift(
-            raw_frameshift,
-            source_ref_peptide.unwrap_or(ref_peptide),
-            semantics,
-        )
+        let source_peptide_cache_exists = fallback.is_some() || source_partial_codon.is_some();
+        let reference_peptide = if source_peptide_cache_exists {
+            source_ref_peptide
+        } else {
+            Some(ref_peptide)
+        };
+        reference_peptide.map_or(raw_frameshift, |reference_peptide| {
+            shifted_hgvsp_frameshift(raw_frameshift, reference_peptide, semantics)
+        })
     }
 }
 
@@ -8190,6 +8234,7 @@ fn protein_hgvs_for_output(
         original_protein_bounds,
         fallback,
         false,
+        None,
         fallback.map(|protein| protein.ref_peptide.as_str()),
         crate::vep_semantics::VepSemantics::V115,
         shift_hgvs,
@@ -8223,6 +8268,7 @@ fn protein_hgvs_for_output_with_semantics(
     original_protein_bounds: Option<(usize, usize)>,
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
     source_stop_retained: bool,
+    source_partial_codon: Option<bool>,
     source_ref_peptide: Option<&str>,
     semantics: crate::vep_semantics::VepSemantics,
     shift_hgvs: bool,
@@ -8357,6 +8403,7 @@ fn protein_hgvs_for_output_with_semantics(
         shift,
         fallback,
         source_stop_retained,
+        source_partial_codon,
         source_ref_peptide,
         semantics,
     );
@@ -26101,6 +26148,7 @@ mod tests {
             None,
             false,
             None,
+            None,
             crate::vep_semantics::VepSemantics::V115,
         )
         .expect("shifted protein hgvs");
@@ -26715,6 +26763,7 @@ mod tests {
             None,
             false,
             None,
+            None,
             crate::vep_semantics::VepSemantics::V115,
         )
         .unwrap();
@@ -26790,6 +26839,7 @@ mod tests {
             ),
             short_class.protein_hgvs.as_ref(),
             short_class.stop_retained,
+            None,
             short_class.affected_ref_peptide.as_deref(),
             crate::vep_semantics::VepSemantics::V116,
             true,
@@ -27387,6 +27437,7 @@ mod tests {
                     None,
                     Some(&fallback),
                     false,
+                    None,
                     Some(fallback.ref_peptide.as_str()),
                     semantics,
                     true,
@@ -32470,6 +32521,7 @@ mod tests {
                 None,
                 Some(&fallback),
                 false,
+                None,
                 Some(fallback.ref_peptide.as_str()),
                 crate::vep_semantics::VepSemantics::V116,
                 false,
@@ -33686,11 +33738,11 @@ mod tests {
     fn shifted_hgvsp_frameshift_uses_mapped_cds_span_without_a_fallback() {
         let semantics = crate::vep_semantics::VepSemantics::V116;
         assert!(
-            !shifted_hgvsp_frameshift_for_output(None, false, false, None, 1, 9, 0, "I", semantics),
+            !shifted_hgvsp_frameshift_for_output(None, false, None, None, 1, 9, 0, "I", semantics),
             "a 9-nt mapped CDS deletion is in-frame even if its genomic span is not"
         );
         assert!(shifted_hgvsp_frameshift_for_output(
-            None, false, false, None, 1, 206, 0, "I", semantics,
+            None, false, None, None, 1, 206, 0, "I", semantics,
         ));
 
         let mut source_frameshift = star_star_fallback();
@@ -33698,7 +33750,7 @@ mod tests {
         assert!(shifted_hgvsp_frameshift_for_output(
             Some(&source_frameshift),
             false,
-            false,
+            Some(false),
             Some(source_frameshift.ref_peptide.as_str()),
             1,
             9,
@@ -33709,13 +33761,56 @@ mod tests {
     }
 
     #[test]
+    fn shifted_hgvsp_frameshift_uses_empty_mapped_span_for_insertions() {
+        let semantics = crate::vep_semantics::VepSemantics::V116;
+        assert!(shifted_hgvsp_frameshift_for_output(
+            None,
+            false,
+            None,
+            Some("A"),
+            2,
+            1,
+            1,
+            "I",
+            semantics,
+        ));
+        assert!(!shifted_hgvsp_frameshift_for_output(
+            None,
+            false,
+            None,
+            Some("A"),
+            2,
+            1,
+            3,
+            "I",
+            semantics,
+        ));
+    }
+
+    #[test]
+    fn shifted_hgvsp_keeps_v115_cached_non_frameshift_classification() {
+        let source_non_frameshift = star_star_fallback();
+        assert!(!shifted_hgvsp_frameshift_for_output(
+            Some(&source_non_frameshift),
+            false,
+            Some(false),
+            Some("A"),
+            1,
+            206,
+            0,
+            "I",
+            crate::vep_semantics::VepSemantics::V115,
+        ));
+    }
+
+    #[test]
     fn shifted_hgvsp_frameshift_obeys_the_source_partial_codon_guard() {
         let mut source_frameshift = star_star_fallback();
         source_frameshift.frameshift = true;
         assert!(!shifted_hgvsp_frameshift_for_output(
             Some(&source_frameshift),
             false,
-            true,
+            Some(true),
             Some(source_frameshift.ref_peptide.as_str()),
             1,
             2,
@@ -33726,7 +33821,7 @@ mod tests {
         assert!(shifted_hgvsp_frameshift_for_output(
             Some(&source_frameshift),
             false,
-            true,
+            Some(true),
             Some(source_frameshift.ref_peptide.as_str()),
             1,
             2,
@@ -33759,7 +33854,7 @@ mod tests {
         let frameshift = shifted_hgvsp_frameshift_for_output(
             Some(&source_classification),
             false,
-            false,
+            Some(false),
             Some("A"),
             1,
             2,
@@ -33795,7 +33890,7 @@ mod tests {
             !shifted_hgvsp_frameshift_for_output(
                 None,
                 true,
-                false,
+                None,
                 None,
                 1,
                 206,
@@ -33815,7 +33910,7 @@ mod tests {
         assert!(!shifted_hgvsp_frameshift_for_output(
             Some(&source_classification),
             true,
-            false,
+            Some(false),
             Some(source_classification.ref_peptide.as_str()),
             1,
             206,
@@ -33826,7 +33921,7 @@ mod tests {
         assert!(shifted_hgvsp_frameshift_for_output(
             Some(&source_classification),
             true,
-            false,
+            Some(false),
             Some(source_classification.ref_peptide.as_str()),
             1,
             206,
@@ -33853,6 +33948,7 @@ mod tests {
             Some((20, 20)),
             Some(&source_classification),
             true,
+            None,
             Some(source_classification.ref_peptide.as_str()),
             crate::vep_semantics::VepSemantics::V116,
             true,
@@ -33869,6 +33965,33 @@ mod tests {
             .as_deref(),
             Some("ENSPSTARINS0001.1:p.Ter20=")
         );
+    }
+
+    #[test]
+    fn shifted_hgvsp_recomputes_cached_non_frameshift_through_output_path() {
+        let (transcript, exons, translation) = star_insertion_fixture();
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let variant = star_insertion_variant(177, "T", "TA", 1, "A");
+        let source_classification = star_star_fallback();
+
+        let protein = protein_hgvs_for_output_with_semantics(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            true,
+            Some((20, 20)),
+            Some(&source_classification),
+            false,
+            Some(false),
+            Some("A"),
+            crate::vep_semantics::VepSemantics::V116,
+            true,
+        )
+        .expect("shifted HGVSp with a cached non-frameshift consequence");
+
+        assert!(protein.frameshift);
+        assert!(protein.ref_peptide.starts_with('*'));
     }
 
     #[test]
@@ -34283,6 +34406,7 @@ mod tests {
             &shift,
             Some(&fallback),
             false,
+            None,
             Some(fallback.ref_peptide.as_str()),
             crate::vep_semantics::VepSemantics::V116,
         )
@@ -34346,7 +34470,7 @@ mod tests {
             let frameshift = shifted_hgvsp_frameshift_for_output(
                 Some(&source_classification),
                 false,
-                false,
+                Some(false),
                 Some(source_classification.ref_peptide.as_str()),
                 start * 3 - 2,
                 start * 3,
