@@ -6585,22 +6585,33 @@ fn cached_translateable_seq_for_vep(
 }
 
 fn failed_bam_exon_seq(tx: &TranscriptFeature) -> Option<&str> {
-    tx.bam_edit_status
-        .as_deref()
-        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
+    bam_edit_failed(tx)
         .then_some(tx.failed_bam_exon_seq.as_deref())
         .flatten()
 }
 
-fn transcript_mrna_seq_for_vep_borrowed(tx: &TranscriptFeature) -> Option<&str> {
-    if let Some(seq) = failed_bam_exon_seq(tx) {
+fn bam_edit_failed(tx: &TranscriptFeature) -> bool {
+    // This status is independent of exon-sequence hydration. VEP rolls its
+    // edited transcript attributes back when the BAM edit fails, even if no
+    // genome-derived exon sequence was materialized for the row.
+    // Ensembl VEP release/116.0, AnnotationType/Transcript.pm:619-627:
+    // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+    tx.bam_edit_status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
+}
+
+fn transcript_mrna_seq_for_vep_cow(tx: &TranscriptFeature) -> Option<Cow<'_, str>> {
+    if bam_edit_failed(tx)
+        && let Some(seq) = failed_bam_source_spliced_seq(tx)
+    {
         return Some(seq);
     }
     if let Some(seq) = tx.spliced_seq.as_deref() {
-        return Some(seq);
+        return Some(Cow::Borrowed(seq));
     }
     let seq = tx.cdna_seq.as_deref()?;
-    cdna_seq_has_full_transcript_context_for_vep(tx, seq).then_some(seq)
+    cdna_seq_has_full_transcript_context_for_vep(tx, seq).then_some(Cow::Borrowed(seq))
 }
 
 /// Return the phase and length of the same reference CDS selected by
@@ -6629,7 +6640,7 @@ fn reference_translateable_cds_metrics_for_vep(
     let cached_sequence = translation.and_then(|translation| translation.cds_sequence.as_deref());
     let cached_phase = cached_sequence.map(leading_n_count).unwrap_or(0);
     if let (Some(sequence), Some(start), Some(end)) = (
-        transcript_mrna_seq_for_vep_borrowed(tx),
+        transcript_mrna_seq_for_vep_cow(tx),
         tx.cdna_coding_start,
         tx.cdna_coding_end,
     ) {
@@ -6683,7 +6694,9 @@ fn cdna_seq_has_full_transcript_context_for_vep(tx: &TranscriptFeature, seq: &st
 }
 
 fn transcript_mrna_seq_for_vep(tx: &TranscriptFeature) -> Option<String> {
-    if let Some(seq) = failed_bam_exon_seq(tx) {
+    if bam_edit_failed(tx)
+        && let Some(seq) = failed_bam_source_spliced_seq(tx)
+    {
         return Some(seq.to_ascii_uppercase());
     }
     if let Some(seq) = tx.spliced_seq.as_deref() {
@@ -6710,7 +6723,7 @@ fn canonical_ref_translation_for_hgvsp(
     if bam_edit_succeeded(tx) {
         return edited_ref_translation_for_hgvsp(tx, translation, fallback);
     }
-    if failed_bam_exon_seq(tx).is_some() {
+    if bam_edit_failed(tx) {
         // AnnotationType/Transcript.pm restores the transcript after a failed
         // BAM edit, and core Transcript::spliced_seq concatenates exon seqs.
         // The retained mapper then indexes that unedited sequence.
@@ -6752,14 +6765,7 @@ fn failed_refseq_uses_cached_translation_for_consequence(
     translation: Option<&TranslationFeature>,
     cds_seq: &str,
 ) -> bool {
-    if failed_bam_exon_seq(tx).is_some() {
-        return false;
-    }
-    if !tx
-        .bam_edit_status
-        .as_deref()
-        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
-    {
+    if !bam_edit_failed(tx) || failed_bam_source_spliced_seq(tx).is_some() {
         return false;
     }
 
@@ -6915,7 +6921,7 @@ fn reference_translateable_seq_for_hgvsp(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
 ) -> Option<String> {
-    if failed_bam_exon_seq(tx).is_some() {
+    if bam_edit_failed(tx) {
         return reference_translateable_seq_for_vep(tx, translation);
     }
     if bam_edit_succeeded(tx) {
@@ -6931,7 +6937,7 @@ fn uses_canonical_reference_for_hgvsp(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
 ) -> bool {
-    failed_bam_exon_seq(tx).is_none()
+    !bam_edit_failed(tx)
         && !bam_edit_succeeded(tx)
         && translation.is_some_and(|translation| translation.cds_sequence_canonical.is_some())
 }
@@ -12530,11 +12536,7 @@ fn mapped_transcript_reference_allele(
 /// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
 /// https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
 fn failed_bam_source_spliced_seq(tx: &TranscriptFeature) -> Option<Cow<'_, str>> {
-    if !tx
-        .bam_edit_status
-        .as_deref()
-        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
-    {
+    if !bam_edit_failed(tx) {
         return None;
     }
     if let Some(sequence) = tx.spliced_seq.as_deref() {
@@ -14068,6 +14070,79 @@ mod tests {
                 "MN*".to_string(),
             ),
             "MN*"
+        );
+        assert!(!uses_canonical_reference_for_hgvsp(
+            &transcript,
+            Some(&cached_translation)
+        ));
+    }
+
+    #[test]
+    fn failed_bam_mrna_prefers_source_spliced_seq_over_genome_exon_fallback() {
+        let mut transcript = tx(
+            "NM_FAILED_SOURCE_FIRST.1",
+            "7",
+            100,
+            113,
+            1,
+            "protein_coding",
+            Some(102),
+            Some(110),
+        );
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.cdna_coding_start = Some(3);
+        transcript.cdna_coding_end = Some(11);
+        transcript.spliced_seq = Some("GGATGAACTAACCC".to_string());
+        transcript.failed_bam_exon_seq = Some("GGATGCGCTAACCC".to_string());
+
+        // On BAM failure VEP restores the source transcript and Variation
+        // slices that source spliced sequence with its retained mapper. The
+        // hydrated exon sequence is a fallback only when source cDNA is absent.
+        // Ensembl Variation 2fb834b, TranscriptVariation.pm:455-465; VEP
+        // release/116.0, AnnotationType/Transcript.pm:619-627:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L455-L465
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+        assert_eq!(
+            transcript_mrna_seq_for_vep_cow(&transcript).as_deref(),
+            Some("GGATGAACTAACCC")
+        );
+        assert_eq!(
+            transcript_mrna_seq_for_vep(&transcript).as_deref(),
+            Some("GGATGAACTAACCC")
+        );
+    }
+
+    #[test]
+    fn failed_bam_reference_selection_uses_status_without_hydrated_exons() {
+        let mut transcript = tx(
+            "NM_FAILED_UNHYDRATED.1",
+            "7",
+            100,
+            113,
+            1,
+            "protein_coding",
+            Some(102),
+            Some(110),
+        );
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.cdna_coding_start = Some(3);
+        transcript.cdna_coding_end = Some(11);
+        transcript.spliced_seq = Some("GGATGAACTAACCC".to_string());
+        let mut cached_translation = translation(
+            "NM_FAILED_UNHYDRATED.1",
+            Some(9),
+            Some(3),
+            Some("BAD"),
+            Some("CCCCCCCCC"),
+        );
+        cached_translation.cds_sequence_canonical = Some("GGGGGGGGG".to_string());
+
+        assert_eq!(failed_bam_exon_seq(&transcript), None);
+        assert_eq!(
+            reference_translateable_seq_for_hgvsp(&transcript, Some(&cached_translation))
+                .as_deref(),
+            Some("ATGAACTAA"),
+            "failed status selects VEP's restored source sequence even without an exon fallback"
         );
         assert!(!uses_canonical_reference_for_hgvsp(
             &transcript,
