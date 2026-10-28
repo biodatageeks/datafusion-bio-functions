@@ -24864,6 +24864,27 @@ mod tests {
             Some(true),
             "the negative-strand insertion must be spliced at VEP's transcript-order flank"
         );
+        let negative_cds = "ATGGCTGAATGA";
+        let negative_translation = translation(
+            "T1",
+            Some(negative_cds.len()),
+            Some(4),
+            None,
+            Some(negative_cds),
+        );
+        let negative_class = classify_insertion_with_semantics_and_gap(
+            &negative.0,
+            &negative_exons,
+            Some(&negative_translation),
+            negative_cds,
+            &negative_insertion,
+            "G",
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        )
+        .expect("negative-strand insertion should classify through the mapped span");
+        assert_eq!(negative_class.affected_ref_peptide.as_deref(), Some("M"));
+        assert!(negative_class.start_lost, "{negative_class:?}");
 
         let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
             5000,
@@ -25036,6 +25057,8 @@ mod tests {
         );
         let minus_insertion = var("22", 1002, 1002, "-", "A");
         assert!(vep116_overlaps_stop_codon_cil(&minus, &minus_insertion, 1));
+        let minus_outside = var("22", 1005, 1005, "-", "AAA");
+        assert!(!vep116_overlaps_stop_codon_cil(&minus, &minus_outside, 3,));
     }
 
     #[test]
