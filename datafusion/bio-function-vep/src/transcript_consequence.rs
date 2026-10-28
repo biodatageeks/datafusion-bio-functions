@@ -14136,6 +14136,11 @@ mod tests {
         // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
         // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L903-L925
         assert_eq!(
+            failed_bam_translateable_seq_for_vep(&transcript, None),
+            None,
+            "the genome-derived exon fallback must not replace the cached CDS"
+        );
+        assert_eq!(
             reference_translateable_seq_for_vep(&transcript, None).as_deref(),
             Some("ATGAACTAA")
         );
@@ -14166,6 +14171,18 @@ mod tests {
         // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
         // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L903-L925
         assert_eq!(failed_bam_source_spliced_seq(&transcript), None);
+        transcript.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 100,
+            genomic_end: 111,
+            cdna_start: 1,
+            cdna_end: 13,
+            ori: 1,
+        }];
+        assert_eq!(
+            failed_bam_source_spliced_seq(&transcript),
+            None,
+            "component lengths that disagree with the mapper extent are not source cDNA"
+        );
     }
 
     #[test]
