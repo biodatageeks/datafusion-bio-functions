@@ -18438,6 +18438,10 @@ mod tests {
                 .and_then(|codons| codons.split_once('/').map(|(reference, _)| reference)),
             Some("CCTGAAGAACCT")
         );
+        assert_eq!(
+            spliced_delins_entry.codons.as_deref(),
+            Some("CCTGAAGAACCT/AAAAAAAAAAAAAAt")
+        );
 
         // VEP drops protein HGVS when 3' shifting moves either protein
         // coordinate outside the translation, even though the unshifted
