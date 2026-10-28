@@ -423,7 +423,7 @@ pub struct TranscriptFeature {
     /// Sequence from the `cdna_seq` parquet column. At formats pin
     /// `6af1fa1`, the reader populates this column from the VEP cache's
     /// `translateable_seq`, so it is CDS sequence rather than full cDNA.
-    /// https://github.com/biodatageeks/datafusion-bio-formats/blob/6af1fa1480b2fc527e3b218585eae3a087f2aca9/datafusion/bio-format-ensembl-cache/src/transcript.rs#L1663-L1664
+    /// [Formats pin transcript reader mapping](https://github.com/biodatageeks/datafusion-bio-formats/blob/6af1fa1480b2fc527e3b218585eae3a087f2aca9/datafusion/bio-format-ensembl-cache/src/transcript.rs#L1663-L1664).
     pub cdna_seq: Option<String>,
     /// Genome-derived exon concatenation used after VEP restores a transcript
     /// whose BAM edit failed; its mapper remains in RefSeq cDNA coordinates.
