@@ -3739,7 +3739,9 @@ impl TranscriptConsequenceEngine {
                 });
                 let start_retained = if ref_len == alt_len {
                     start_sequence
-                        .and_then(|cds| mutated_cds_first3(cds, variant, tx, tx.cds_start?))
+                        .and_then(|cds| {
+                            mutated_cds_first3(cds, variant, tx, tx_exons, tx.cds_start?)
+                        })
                         .is_some_and(|codon| codon.eq_ignore_ascii_case("ATG"))
                 } else {
                     !altered_by_indel
@@ -3780,7 +3782,7 @@ impl TranscriptConsequenceEngine {
                                 let cds = cds_seq.unwrap();
                                 let cds_start = tx.cds_start.unwrap_or(0);
                                 let mutated_first3 =
-                                    mutated_cds_first3(cds, variant, tx, cds_start);
+                                    mutated_cds_first3(cds, variant, tx, tx_exons, cds_start);
                                 if mutated_first3.as_deref() == Some("ATG") {
                                     terms.insert(SoTerm::StartRetainedVariant);
                                     if is_frameshift {
@@ -10305,7 +10307,6 @@ fn classify_insertion_with_semantics_and_gap(
     let translation_seqedit_overlap = translation_seqedit_range.is_some_and(|(start, end)| {
         translation_seq_edits_overlap(start, end, &tx.translation_seq_edits)
     });
-    let mut translation_seqedit_changed = false;
     if let (Some(reference_peptide), Some((translation_start, translation_end))) = (
         class.affected_ref_peptide.as_deref(),
         translation_seqedit_range.filter(|_| translation_seqedit_overlap),
@@ -10322,8 +10323,6 @@ fn classify_insertion_with_semantics_and_gap(
             translation_end,
             &tx.translation_seq_edits,
         );
-        translation_seqedit_changed =
-            edited_reference_peptide.as_deref() != Some(reference_peptide);
         class.affected_ref_peptide = edited_reference_peptide;
     }
     let ambiguous_alt_peptide = semantics.vep116_stop_predicates()
@@ -10605,7 +10604,7 @@ fn classify_insertion_with_semantics_and_gap(
         );
     }
 
-    if (replace_refseq_mapper_gap || translation_seqedit_changed)
+    if (replace_refseq_mapper_gap || translation_seqedit_overlap)
         && let (Some(ref_peptide), Some(alt_peptide)) = (
             class.affected_ref_peptide.as_deref(),
             class.affected_alt_peptide.as_deref(),
@@ -11044,6 +11043,7 @@ fn mutated_cds_first3(
     cds_seq: &str,
     variant: &VariantInput,
     tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
     cds_start: i64,
 ) -> Option<String> {
     let cds_bytes = cds_seq.as_bytes();
@@ -11053,6 +11053,41 @@ fn mutated_cds_first3(
     let ref_allele = normalize_allele_seq(&variant.ref_allele);
     let alt_allele = normalize_allele_seq(&variant.alt_allele);
     let is_ins = ref_allele.is_empty();
+
+    if ref_allele.len() == alt_allele.len() {
+        // VEP `_snp_start_altered()` overlays the allele at the mapper-derived
+        // cDNA coordinates in the spliced transcript. Genomic offsets cross
+        // introns and can exceed the CDS buffer for a split start codon.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:992-1025:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L992-L1025
+        let mapper = vep_coords::VepTxMapper::with_phase(
+            tx,
+            tx_exons,
+            vep_coords::CdnaBaseMap::Output,
+            leading_n,
+        );
+        let (mapped_start, mapped_end) = mapper
+            .cds(vep_coords::VepSpan::from_variant(variant))
+            .both_truthy()?;
+        let start_idx = mapped_start.checked_sub(1)?;
+        let end_idx = mapped_end;
+        if start_idx > end_idx || end_idx > cds_bytes.len() {
+            return None;
+        }
+        let alt_tx = if tx.strand >= 0 {
+            alt_allele.to_ascii_uppercase()
+        } else {
+            reverse_complement(&alt_allele)?.to_ascii_uppercase()
+        };
+        let mut mutated =
+            Vec::with_capacity(cds_bytes.len() - (end_idx - start_idx) + alt_tx.len());
+        mutated.extend_from_slice(&cds_bytes[..start_idx]);
+        mutated.extend_from_slice(alt_tx.as_bytes());
+        mutated.extend_from_slice(&cds_bytes[end_idx..]);
+        return mutated
+            .get(leading_n..leading_n.saturating_add(3))
+            .map(|codon| String::from_utf8_lossy(codon).to_ascii_uppercase());
+    }
 
     if tx.strand >= 0 {
         if is_ins {
@@ -20128,6 +20163,62 @@ mod tests {
     }
 
     #[test]
+    fn frameshift_insertion_reports_overlapping_unchanged_seqedit_peptide() {
+        // VEP applies an overlapping reference SeqEdit even when the edit
+        // preserves the residue (M -> M); output still uses the peptide alleles.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-772:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
+        let mut transcript = tx(
+            "T_UNCHANGED_SEQEDIT_INSERTION",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        transcript.translation_seq_edits = vec![TranslationSeqEdit {
+            code: "translation_seq_edit".to_string(),
+            start: 1,
+            end: 1,
+            alt_seq: "M".to_string(),
+        }];
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(12);
+        let transcript_exon = exon("T_UNCHANGED_SEQEDIT_INSERTION", 1, 1000, 1011);
+        let exons = [&transcript_exon];
+        let cached_translation = translation(
+            "T_UNCHANGED_SEQEDIT_INSERTION",
+            Some(12),
+            Some(4),
+            None,
+            Some("ATGAAACCCTAA"),
+        );
+        let variant = var("22", 1002, 1002, "-", "T");
+
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("frameshift insertion should classify");
+
+        assert_eq!(classification.affected_ref_peptide.as_deref(), Some("M"));
+        let expected = format!(
+            "{}/{}",
+            classification.affected_ref_peptide.as_deref().unwrap(),
+            classification.affected_alt_peptide.as_deref().unwrap(),
+        );
+        assert_eq!(
+            classification.amino_acids.as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
     fn classify_snv_synonymous() {
         // GCT → GCC: both Ala = synonymous
         // Change T→C at index 5 (pos 1005)
@@ -25817,6 +25908,27 @@ mod tests {
             Some(true),
             "the negative-strand insertion must be spliced at VEP's transcript-order flank"
         );
+        let negative_cds = "ATGGCTGAATGA";
+        let negative_translation = translation(
+            "T1",
+            Some(negative_cds.len()),
+            Some(4),
+            None,
+            Some(negative_cds),
+        );
+        let negative_class = classify_insertion_with_semantics_and_gap(
+            &negative.0,
+            &negative_exons,
+            Some(&negative_translation),
+            negative_cds,
+            &negative_insertion,
+            "G",
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        )
+        .expect("negative-strand insertion should classify through the mapped span");
+        assert_eq!(negative_class.affected_ref_peptide.as_deref(), Some("M"));
+        assert!(negative_class.start_lost, "{negative_class:?}");
 
         let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
             5000,
@@ -25989,6 +26101,8 @@ mod tests {
         );
         let minus_insertion = var("22", 1002, 1002, "-", "A");
         assert!(vep116_overlaps_stop_codon_cil(&minus, &minus_insertion, 1));
+        let minus_outside = var("22", 1005, 1005, "-", "AAA");
+        assert!(!vep116_overlaps_stop_codon_cil(&minus, &minus_outside, 3,));
     }
 
     #[test]
@@ -26258,6 +26372,46 @@ mod tests {
             !c.start_lost,
             "VEP's guarded peptide clause does not co-fire when the local reference peptide is retained"
         );
+    }
+
+    #[test]
+    fn no_translation_split_start_codon_mnv_uses_spliced_cds_coordinates() {
+        let mut transcript = tx(
+            "T_SPLIT_START",
+            "22",
+            1000,
+            2010,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2010),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(12);
+        transcript.spliced_seq = Some("ATGAAACCCTAA".to_string());
+        transcript.translateable_seq = Some("ATGAAACCCTAA".to_string());
+        let first_exon = exon("T_SPLIT_START", 1, 1000, 1000);
+        let second_exon = exon("T_SPLIT_START", 2, 2000, 2010);
+        let exons = [&first_exon, &second_exon];
+        let variant = var("22", 2000, 2000, "T", "C");
+        let mut terms = BTreeSet::new();
+
+        TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .add_start_stop_heuristic_terms(
+            &mut terms,
+            &variant,
+            &transcript,
+            &exons,
+            Some("ATGAAACCCTAA"),
+        );
+
+        assert!(!terms.contains(&SoTerm::StartRetainedVariant));
+        assert!(terms.contains(&SoTerm::StartLost));
     }
 
     #[test]
