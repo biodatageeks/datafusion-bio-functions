@@ -205,6 +205,10 @@ fn overlay_reference_peptide_seq_edits(
     if translation_start == 0 || translation_end == 0 {
         return None;
     }
+    // VEP swaps translation endpoints when start > end before scanning edits;
+    // normalize an empty mapper span such as (3, 2) to (2, 3) the same way.
+    // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:747-752:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L747-L752
     let (translation_start, translation_end) = if translation_start <= translation_end {
         (translation_start, translation_end)
     } else {
@@ -256,6 +260,8 @@ fn translation_seq_edits_overlap(
     if translation_start == 0 || translation_end == 0 {
         return false;
     }
+    // Keep SeqEdit overlap consistent with the source's normalized TV range
+    // above (TranscriptVariationAllele.pm:747-752 at 2fb834b).
     let (translation_start, translation_end) = if translation_start <= translation_end {
         (translation_start, translation_end)
     } else {
@@ -20160,6 +20166,62 @@ mod tests {
             classification.amino_acids.as_deref(),
             Some(expected_amino_acids.as_str())
         );
+    }
+
+    #[test]
+    fn insertion_after_seqedit_uses_vep_normalized_span() {
+        // VEP swaps (3, 2) to (2, 3) before testing SeqEdit overlap, so the
+        // residue-2 edit replaces the boundary insertion's reference peptide.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:747-752:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L747-L752
+        let mut transcript = tx(
+            "T_SEQEDIT_AFTER_BOUNDARY",
+            "22",
+            1000,
+            1008,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        transcript.translation_seq_edits = vec![TranslationSeqEdit {
+            code: "translation_seq_edit".to_string(),
+            start: 2,
+            end: 2,
+            alt_seq: "U".to_string(),
+        }];
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
+        let transcript_exon = exon("T_SEQEDIT_AFTER_BOUNDARY", 1, 1000, 1008);
+        let exons = [&transcript_exon];
+        let cached_translation = translation(
+            "T_SEQEDIT_AFTER_BOUNDARY",
+            Some(9),
+            Some(3),
+            None,
+            Some("ATGGCTTAA"),
+        );
+        let variant = var("22", 1006, 1006, "-", "A");
+
+        assert_eq!(
+            translation_seqedit_range_for_variant(
+                &transcript,
+                &exons,
+                Some(&cached_translation),
+                &variant,
+            ),
+            Some((3, 2)),
+            "the insertion boundary must remain an empty translation interval"
+        );
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("boundary insertion should classify");
+        assert_eq!(classification.affected_ref_peptide.as_deref(), Some("U"));
     }
 
     #[test]
