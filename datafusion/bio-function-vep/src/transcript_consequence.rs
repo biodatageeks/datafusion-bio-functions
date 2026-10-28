@@ -33889,7 +33889,7 @@ mod tests {
                 1,
                 semantics,
             ),
-            "when consequence data exists, its reference peptide fills the missing side cache"
+            "the fallback source peptide pair supplies the stop predicate when the affected-side cache is unavailable"
         );
 
         let mut fallback_without_a_peptide_pair = star_star_fallback();
@@ -33907,6 +33907,37 @@ mod tests {
                 semantics,
             ),
             "fallback reference peptide cannot trigger VEP's stop guard without its alternate pair"
+        );
+    }
+
+    #[test]
+    fn fallback_protein_data_preserves_the_source_deletion_peptide_dash() {
+        // VEP's peptide() returns `-` for the deleted stop codon, and
+        // `_get_peptide_alleles()` tests that truthy value before normalizing
+        // it. The fallback builder must preserve the same source pair.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L772-L797
+        let class = classify_deletion("ATGAAATAA", 1006, 1008, "TAA")
+            .expect("deletion of the terminal stop codon");
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("*"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("-"));
+        let fallback = class
+            .protein_hgvs
+            .as_ref()
+            .expect("classified fallback protein peptides");
+        assert_eq!(fallback.ref_peptide, "*");
+        assert_eq!(fallback.alt_peptide, "-");
+        assert!(
+            !shifted_hgvsp_frameshift_for_output(
+                Some(fallback),
+                false,
+                Some(false),
+                None,
+                2,
+                1,
+                1,
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            "the preserved `-` supplies the complete VEP source peptide pair"
         );
     }
 
