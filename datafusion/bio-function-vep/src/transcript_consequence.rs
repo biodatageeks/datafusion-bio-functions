@@ -12704,6 +12704,8 @@ fn failed_bam_source_spliced_seq(tx: &TranscriptFeature) -> Option<Cow<'_, str>>
         .as_deref()
         .filter(|sequence| sequence.len() == coding_length)
         .or_else(|| {
+            // With no UTR bases, full cDNA is also the coding span; the
+            // coordinate-length guard below ensures it matches that span.
             tx.cdna_seq
                 .as_deref()
                 .filter(|sequence| sequence.len() == coding_length)
@@ -14266,12 +14268,30 @@ mod tests {
             "the source CDS must win over the genome-derived exon base"
         );
 
+        transcript.translateable_seq = None;
+        transcript.cdna_seq = Some("ATGAACTAA".to_string());
+        assert_eq!(
+            failed_bam_source_spliced_seq(&transcript).as_deref(),
+            Some("ATGAACTAA"),
+            "full cDNA can supply the coding span when both UTRs are empty"
+        );
+
         transcript.cdna_coding_end = Some(6);
         transcript.translateable_seq = Some("ATGAAA".to_string());
         assert_eq!(
             failed_bam_source_spliced_seq(&transcript),
             None,
             "a missing 3'UTR cannot stand in for bases still covered by the mapper"
+        );
+
+        transcript.cdna_coding_start = Some(2);
+        transcript.cdna_coding_end = Some(9);
+        transcript.five_prime_utr_seq = None;
+        transcript.translateable_seq = Some("TGAACTAA".to_string());
+        assert_eq!(
+            failed_bam_source_spliced_seq(&transcript),
+            None,
+            "a missing 5'UTR cannot stand in for bases before the coding start"
         );
     }
 
