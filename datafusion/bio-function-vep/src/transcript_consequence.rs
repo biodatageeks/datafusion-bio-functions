@@ -196,6 +196,17 @@ pub struct TranslationSeqEdit {
     pub alt_seq: String,
 }
 
+fn peptide_allele_string(reference: &str, alternate: &str) -> String {
+    // VEP omits the slash when the reference and alternate peptides are equal.
+    // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:618-629:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L618-L629
+    if reference == alternate {
+        reference.to_string()
+    } else {
+        format!("{reference}/{alternate}")
+    }
+}
+
 fn overlay_reference_peptide_seq_edits(
     peptide: &str,
     translation_start: usize,
@@ -9395,13 +9406,7 @@ fn classify_coding_change_with_semantics(
             .affected_ref_peptide
             .as_deref()
             .zip(class.affected_alt_peptide.as_deref())
-            .map(|(reference, alternate)| {
-                if reference == alternate {
-                    reference.to_string()
-                } else {
-                    format!("{reference}/{alternate}")
-                }
-            });
+            .map(|(reference, alternate)| peptide_allele_string(reference, alternate));
     } else if first_codon < old_aas.len() {
         let (ref_start, ref_end) = if ref_len == alt_len && skip_global_stop_compare {
             (
@@ -10529,13 +10534,24 @@ fn classify_insertion_with_semantics_and_gap(
         );
     }
 
-    if (replace_refseq_mapper_gap || translation_seqedit_overlap)
+    if translation_seqedit_overlap {
+        // VEP leaves the peptide allele undefined when a shortening SeqEdit
+        // removes a mapped translation position; clear the earlier heuristic
+        // string instead of retaining stale Amino_acids output.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-772:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
+        class.amino_acids = class
+            .affected_ref_peptide
+            .as_deref()
+            .zip(class.affected_alt_peptide.as_deref())
+            .map(|(ref_peptide, alt_peptide)| peptide_allele_string(ref_peptide, alt_peptide));
+    } else if replace_refseq_mapper_gap
         && let (Some(ref_peptide), Some(alt_peptide)) = (
             class.affected_ref_peptide.as_deref(),
             class.affected_alt_peptide.as_deref(),
         )
     {
-        class.amino_acids = Some(format!("{ref_peptide}/{alt_peptide}"));
+        class.amino_acids = Some(peptide_allele_string(ref_peptide, alt_peptide));
     }
 
     // Extend with 3' UTR for HGVS stop-loss/frameshift extension distance.
@@ -13698,6 +13714,12 @@ fn translate_codon(codon: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peptide_allele_string_omits_slash_for_identical_peptides() {
+        assert_eq!(peptide_allele_string("U", "U"), "U");
+        assert_eq!(peptide_allele_string("M", "I"), "M/I");
+    }
 
     #[test]
     fn reference_peptide_overlays_only_seqedit_positions_in_the_variant_span() {
@@ -19700,6 +19722,63 @@ mod tests {
         )
         .expect("boundary insertion should classify");
         assert_eq!(classification.affected_ref_peptide.as_deref(), Some("U"));
+    }
+
+    #[test]
+    fn insertion_inside_shortened_seqedit_clears_amino_acids() {
+        // VEP returns an undefined reference peptide when a shortening SeqEdit
+        // removes the mapped residue; stale insertion output must not survive.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-772:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
+        let mut transcript = tx(
+            "T_SHORT_SEQEDIT_INSERTION",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        transcript.translation_seq_edits = vec![TranslationSeqEdit {
+            code: "translation_seq_edit".to_string(),
+            start: 2,
+            end: 3,
+            alt_seq: "U".to_string(),
+        }];
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(12);
+        let transcript_exon = exon("T_SHORT_SEQEDIT_INSERTION", 1, 1000, 1011);
+        let exons = [&transcript_exon];
+        let cached_translation = translation(
+            "T_SHORT_SEQEDIT_INSERTION",
+            Some(12),
+            Some(4),
+            None,
+            Some("ATGGCTGAATAA"),
+        );
+        let variant = var("22", 1008, 1008, "-", "A");
+
+        assert_eq!(
+            translation_seqedit_range_for_variant(
+                &transcript,
+                &exons,
+                Some(&cached_translation),
+                &variant,
+            ),
+            Some((3, 3)),
+            "insertion must map inside the residue removed by the SeqEdit"
+        );
+        let classification = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("insertion inside edited codon should classify");
+        assert_eq!(classification.affected_ref_peptide, None);
+        assert_eq!(classification.amino_acids, None);
     }
 
     #[test]
