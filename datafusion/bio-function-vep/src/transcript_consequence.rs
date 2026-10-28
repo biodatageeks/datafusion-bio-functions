@@ -19482,9 +19482,13 @@ mod tests {
         assert!(classification.start_lost);
         assert!(!classification.synonymous);
 
-        // Negative control: without the source SeqEdit the genomic ATT codon
-        // translates to I on both sides (MT:4472 T>C is synonymous), so it
-        // must not be called start_lost.
+        // Negative control: without the source SeqEdit the displayed reference
+        // peptide falls back to I/I. The independent `_inv_start_altered`
+        // predicate still reports start_lost because ATT>C changes the literal
+        // start triplet away from ATG; this isolates the SeqEdit's contribution
+        // to reference peptide output from the nucleotide-level consequence.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:906-945:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
         transcript.translation_seq_edits.clear();
         let unedited = classify_coding_change_with_semantics(
             &transcript,
@@ -19496,8 +19500,9 @@ mod tests {
         .expect("unedited negative-control variant should classify");
         assert_eq!(unedited.affected_ref_peptide.as_deref(), Some("I"));
         assert_eq!(unedited.affected_alt_peptide.as_deref(), Some("I"));
-        assert!(!unedited.start_lost);
-        assert!(unedited.synonymous);
+        assert_eq!(unedited.amino_acids.as_deref(), Some("I"));
+        assert!(unedited.start_lost);
+        assert!(!unedited.synonymous);
     }
 
     #[test]
