@@ -3629,8 +3629,11 @@ impl TranscriptConsequenceEngine {
                 let altered_by_indel = ref_len != alt_len
                     && unambiguous
                     && ins_del_start_altered(tx, tx_exons, variant, cds_seq).unwrap_or(false);
-                let start_retained = if ref_len == 1 && alt_len == 1 {
-                    cds_seq
+                let start_sequence = cds_seq.or_else(|| {
+                    start_codon_context(tx, None).map(|(_, translateable)| translateable)
+                });
+                let start_retained = if ref_len == alt_len {
+                    start_sequence
                         .and_then(|cds| mutated_cds_first3(cds, variant, tx, tx.cds_start?))
                         .is_some_and(|codon| codon.eq_ignore_ascii_case("ATG"))
                 } else {
@@ -10387,14 +10390,21 @@ fn start_codon_context<'a>(
     if let Some(seq) = tx.spliced_seq.as_deref() {
         let coding_end = tx.cdna_coding_end?;
         if atg_start < coding_end && coding_end <= seq.len() {
-            let utr = (atg_start > 0).then_some(&seq[..atg_start]);
-            return Some((utr, &seq[atg_start..coding_end]));
+            // Core's five_prime_utr() returns a sequence object even when the
+            // CDS starts at cDNA position 1, so VariationEffect's `unless $utr`
+            // guard still runs with an empty UTR. Preserve that distinction
+            // between absent sequence and a present, empty sequence.
+            // Ensembl core c0cf13d, Transcript.pm:1746-1761; Variation 2fb834b,
+            // VariationEffect.pm:906-945:
+            // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+            return Some((Some(&seq[..atg_start]), &seq[atg_start..coding_end]));
         }
     }
 
     if let Some(seq) = tx.cdna_seq.as_deref() {
         if atg_start == 0 {
-            return Some((None, seq));
+            return Some((Some(&seq[..0]), seq));
         }
         if let Some(coding_end) = tx.cdna_coding_end {
             if atg_start < coding_end && coding_end <= seq.len() {
@@ -10420,9 +10430,12 @@ fn start_codon_context<'a>(
     }
 
     (atg_start == 0)
-        .then_some(cached_translateable_seq.or(tx.cdna_seq.as_deref()))
+        .then(|| {
+            cached_translateable_seq
+                .or(tx.cdna_seq.as_deref())
+                .map(|seq| (Some(""), seq))
+        })
         .flatten()
-        .map(|seq| (None, seq))
 }
 
 /// Returns `true` if the indel destroys the start codon (ATG at the original
@@ -25323,15 +25336,16 @@ mod tests {
 
         let (no_utr_tx, no_utr_exons) = tx_with_cdna("", "ATGGCTGAATGA");
         let no_utr_exons: Vec<&ExonFeature> = no_utr_exons.iter().collect();
-        assert!(!vep116_inv_start_altered(
+        assert!(vep116_inv_start_altered(
             &no_utr_tx,
             &no_utr_exons,
             &var("22", 1000, 1000, "A", "G"),
             Some("ATGGCTGAATGA"),
         ));
 
-        // The final peptide clause is reached for a start-overlapping allele
-        // without a 5'UTR; its `alt_pep ne 'X'` guard still applies.
+        // With no 5'UTR object missing, core supplies an empty sequence object,
+        // so VariationEffect's `_inv_start_altered()` predicate runs and can
+        // return start_lost before either peptide guard is reached.
         let start_snv = var("22", 1000, 1000, "A", "G");
         let mut peptide_class = CodingClassification {
             affected_ref_peptide: Some("MS".to_string()),
@@ -25347,10 +25361,10 @@ mod tests {
             Some("ATGGCTGAATGA"),
             false,
         ));
-        // `_get_peptide_alleles()` maps the `-` sentinel to an empty peptide
-        // before start_lost() checks Perl truthiness (VariationEffect.pm:772-791).
+        // These peptide values cannot suppress the earlier `_inv_start_altered`
+        // branch, as specified by VariationEffect.pm:851-879.
         peptide_class.affected_alt_peptide = Some("-".to_string());
-        assert!(!vep116_start_lost_from_predicates(
+        assert!(vep116_start_lost_from_predicates(
             &peptide_class,
             &no_utr_tx,
             &no_utr_exons,
@@ -25359,7 +25373,7 @@ mod tests {
             false,
         ));
         peptide_class.affected_alt_peptide = Some("X".to_string());
-        assert!(!vep116_start_lost_from_predicates(
+        assert!(vep116_start_lost_from_predicates(
             &peptide_class,
             &no_utr_tx,
             &no_utr_exons,
@@ -25367,6 +25381,27 @@ mod tests {
             Some("ATGGCTGAATGA"),
             false,
         ));
+    }
+
+    #[test]
+    fn no_classification_start_retained_fallback_checks_equal_length_mnv() {
+        let (tx, exons) = tx_with_cdna("", "ATGGCTGAATGA");
+        let exons: Vec<&ExonFeature> = exons.iter().collect();
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        let mnv = var("22", 1000, 1001, "AT", "CC");
+        let mut terms = BTreeSet::new();
+
+        engine.add_start_stop_heuristic_terms(&mut terms, &mnv, &tx, &exons, None);
+
+        assert!(
+            !terms.contains(&SoTerm::StartRetainedVariant),
+            "equal-length MNV that destroys ATG must use VEP's SNP predicate"
+        );
     }
 
     #[test]
