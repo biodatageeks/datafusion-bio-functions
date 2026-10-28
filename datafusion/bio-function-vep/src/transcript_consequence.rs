@@ -12683,11 +12683,7 @@ fn failed_bam_source_spliced_seq(tx: &TranscriptFeature) -> Option<Cow<'_, str>>
         return Some(Cow::Borrowed(sequence));
     }
 
-    let (Some(coding_start), Some(coding_end), Some(utr3)) = (
-        tx.cdna_coding_start,
-        tx.cdna_coding_end,
-        tx.three_prime_utr_seq.as_deref(),
-    ) else {
+    let (Some(coding_start), Some(coding_end)) = (tx.cdna_coding_start, tx.cdna_coding_end) else {
         return None;
     };
     // Core's five_prime_utr() returns undef when the slice before the coding
@@ -12716,12 +12712,26 @@ fn failed_bam_source_spliced_seq(tx: &TranscriptFeature) -> Option<Cow<'_, str>>
         return None;
     }
 
-    let sequence_length = utr5.len() + translateable.len() + utr3.len();
+    // Core's three_prime_utr() returns undef when the slice after the coding
+    // end is empty. Only infer an absent cached UTR as empty when the mapper
+    // proves there are no cDNA positions after that coding end.
+    // Ensembl core c0cf13d, Transcript.pm:1781-1796:
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1781-L1796
     let mapper_length = tx
         .cdna_mapper_segments
         .iter()
         .map(|segment| segment.cdna_end)
         .max()?;
+    let expected_utr3_length = mapper_length.checked_sub(coding_end)?;
+    let utr3 = tx
+        .three_prime_utr_seq
+        .as_deref()
+        .or_else(|| (expected_utr3_length == 0).then_some(""))?;
+    if utr3.len() != expected_utr3_length {
+        return None;
+    }
+
+    let sequence_length = utr5.len() + translateable.len() + utr3.len();
     if mapper_length != sequence_length {
         return None;
     }
@@ -14208,6 +14218,60 @@ mod tests {
             mapped_transcript_reference_allele(&variant, &transcript, &exons, true).as_deref(),
             Some("A"),
             "the source CDS must win over the genome-derived exon base"
+        );
+    }
+
+    #[test]
+    fn failed_bam_component_reconstruction_treats_null_zero_length_utr3_as_empty() {
+        // Core's three_prime_utr() returns no object when slicing from
+        // cdna_coding_end yields an empty sequence. A mapper extent equal to
+        // that coding end proves the absent cached UTR is zero length.
+        // Ensembl core c0cf13d, Transcript.pm:1765-1796:
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1765-L1796
+        let mut transcript = tx(
+            "NM_FAILED_ZERO_UTR3.1",
+            "15",
+            100,
+            108,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        );
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
+        transcript.five_prime_utr_seq = Some(String::new());
+        transcript.translateable_seq = Some("ATGAACTAA".to_string());
+        transcript.three_prime_utr_seq = None;
+        transcript.failed_bam_exon_seq = Some("ATGCGCTAA".to_string());
+        transcript.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 100,
+            genomic_end: 108,
+            cdna_start: 1,
+            cdna_end: 9,
+            ori: 1,
+        }];
+        let exon = exon("NM_FAILED_ZERO_UTR3.1", 1, 100, 108);
+        let exons = [&exon];
+        let variant = var("15", 103, 103, "C", "T");
+
+        assert_eq!(
+            failed_bam_source_spliced_seq(&transcript).as_deref(),
+            Some("ATGAACTAA")
+        );
+        assert_eq!(
+            mapped_transcript_reference_allele(&variant, &transcript, &exons, true).as_deref(),
+            Some("A"),
+            "the source CDS must win over the genome-derived exon base"
+        );
+
+        transcript.cdna_coding_end = Some(6);
+        transcript.translateable_seq = Some("ATGAAA".to_string());
+        assert_eq!(
+            failed_bam_source_spliced_seq(&transcript),
+            None,
+            "a missing 3'UTR cannot stand in for bases still covered by the mapper"
         );
     }
 
