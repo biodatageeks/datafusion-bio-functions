@@ -12683,14 +12683,22 @@ fn failed_bam_source_spliced_seq(tx: &TranscriptFeature) -> Option<Cow<'_, str>>
         return Some(Cow::Borrowed(sequence));
     }
 
-    let (Some(coding_start), Some(coding_end), Some(utr5), Some(utr3)) = (
+    let (Some(coding_start), Some(coding_end), Some(utr3)) = (
         tx.cdna_coding_start,
         tx.cdna_coding_end,
-        tx.five_prime_utr_seq.as_deref(),
         tx.three_prime_utr_seq.as_deref(),
     ) else {
         return None;
     };
+    // Core's five_prime_utr() returns undef when the slice before the coding
+    // start is empty. A coding start at cDNA position 1 therefore means the
+    // absent cached UTR is exactly an empty component, not missing sequence.
+    // Ensembl core c0cf13d, Transcript.pm:1746-1761:
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+    let utr5 = tx
+        .five_prime_utr_seq
+        .as_deref()
+        .or_else(|| (coding_start == 1).then_some(""))?;
     let coding_length = coding_end
         .checked_sub(coding_start)
         .and_then(|length| length.checked_add(1))?;
@@ -14152,6 +14160,54 @@ mod tests {
         assert_eq!(
             mapped_transcript_reference_allele(&variant, &transcript, &exons, true).as_deref(),
             Some("C")
+        );
+    }
+
+    #[test]
+    fn failed_bam_component_reconstruction_treats_null_zero_length_utr_as_empty() {
+        // Core returns no 5'UTR object when cdna_coding_start is 1 because
+        // its sequence slice has length zero. That null component still means
+        // the CDS and 3'UTR fully specify the source spliced sequence.
+        // Ensembl core c0cf13d, Transcript.pm:823-878, 1746-1761:
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+        let mut transcript = tx(
+            "NM_FAILED_ZERO_UTR5.1",
+            "15",
+            100,
+            111,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
+        transcript.translateable_seq = Some("ATGAACTAA".to_string());
+        transcript.five_prime_utr_seq = None;
+        transcript.three_prime_utr_seq = Some("CCC".to_string());
+        transcript.failed_bam_exon_seq = Some("ATGCGCTAACCC".to_string());
+        transcript.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 100,
+            genomic_end: 111,
+            cdna_start: 1,
+            cdna_end: 12,
+            ori: 1,
+        }];
+        let exon = exon("NM_FAILED_ZERO_UTR5.1", 1, 100, 111);
+        let exons = [&exon];
+        let variant = var("15", 103, 103, "C", "T");
+
+        assert_eq!(
+            failed_bam_source_spliced_seq(&transcript).as_deref(),
+            Some("ATGAACTAACCC")
+        );
+        assert_eq!(
+            mapped_transcript_reference_allele(&variant, &transcript, &exons, true).as_deref(),
+            Some("A"),
+            "the source CDS must win over the genome-derived exon base"
         );
     }
 
