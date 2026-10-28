@@ -3798,7 +3798,7 @@ impl TranscriptConsequenceEngine {
             return None;
         };
         let is_ins = variant.ref_allele == "-";
-        if is_ins {
+        if is_ins && self.semantics.vep116_stop_predicates() {
             // VEP's `_before_coding` / `_after_coding` see a gap between the
             // flanks. Test that gap with VariationEffect's non-swapping
             // overlap rule so the last CDS base remains coding while an
@@ -9633,18 +9633,19 @@ fn classify_insertion_with_semantics_and_gap(
     // For an insertion at a RefSeq mapper edit gap, VEP replays the allele
     // over the mapped edited-CDS interval rather than inserting after the
     // genomic CDS anchor.
-    let mapped_insertion_point = vep_coords::VepTxMapper::with_phase(
-        tx,
-        tx_exons,
-        vep_coords::CdnaBaseMap::Output,
-        leading_n_offset,
-    )
-    .cds(vep_coords::VepSpan::from_variant(variant))
-    .start
-    .and_then(|cds_start| cds_start.checked_sub(1));
     let ins_point = mapper_gap_for_sequence
         .map(|(start, _)| start.saturating_sub(1))
-        .or(mapped_insertion_point)
+        .or_else(|| {
+            vep_coords::VepTxMapper::with_phase(
+                tx,
+                tx_exons,
+                vep_coords::CdnaBaseMap::Output,
+                leading_n_offset,
+            )
+            .cds(vep_coords::VepSpan::from_variant(variant))
+            .start
+            .and_then(|cds_start| cds_start.checked_sub(1))
+        })
         .unwrap_or_else(|| cds_idx + 1);
     let mutation_end = mapper_gap_for_sequence
         .map(|(_, end)| end)
@@ -9770,6 +9771,10 @@ fn classify_insertion_with_semantics_and_gap(
     // VariationEffect.pm:965-985 passes those endpoints to `overlap()`.
     let overlaps_start = if semantics.vep116_stop_predicates() && !tx_exons.is_empty() {
         vep116_codon_overlap(tx, tx_exons, variant, true)
+    } else if !semantics.vep116_stop_predicates() {
+        // Preserve the V115 CDS-index gate for insertions whose start codon
+        // spans an exon boundary; VEP 116 uses the mapper interval above.
+        cds_idx < 2
     } else if let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) {
         let (start, end) = if tx.strand >= 0 {
             (cds_start, cds_start.saturating_add(2))
@@ -24662,6 +24667,54 @@ mod tests {
             &across_mapper_gap,
             true,
         ));
+
+        // The V115 compatibility branch historically gates this insertion
+        // with the CDS index. Keep that behavior for a start codon split over
+        // the exon boundary; the V116 mapper predicate above is separate.
+        let v115_class = classify_insertion_with_semantics_and_gap(
+            &split,
+            &split_refs,
+            None,
+            "ATGAAATAA",
+            &across_mapper_gap,
+            "C",
+            crate::vep_semantics::VepSemantics::V115,
+            false,
+        )
+        .expect("split-start insertion should classify under V115");
+        assert!(
+            v115_class.start_lost,
+            "V115 start-codon classification was lost"
+        );
+    }
+
+    #[test]
+    fn vep116_cil_insertion_extension_overlaps_stop_on_both_strands() {
+        let plus = tx(
+            "T_PLUS_CIL_OVERLAP",
+            "22",
+            1000,
+            1005,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1005),
+        );
+        let plus_insertion = var("22", 1004, 1004, "-", "A");
+        assert!(vep116_overlaps_stop_codon_cil(&plus, &plus_insertion, 1));
+
+        let minus = tx(
+            "T_MINUS_CIL_OVERLAP",
+            "22",
+            1000,
+            1005,
+            -1,
+            "protein_coding",
+            Some(1000),
+            Some(1005),
+        );
+        let minus_insertion = var("22", 1002, 1002, "-", "A");
+        assert!(vep116_overlaps_stop_codon_cil(&minus, &minus_insertion, 1));
     }
 
     #[test]
