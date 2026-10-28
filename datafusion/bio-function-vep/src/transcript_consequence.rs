@@ -20106,12 +20106,14 @@ mod tests {
         assert!(!classification.synonymous);
 
         // Negative control: without the source SeqEdit the displayed reference
-        // peptide falls back to I/I. The independent `_inv_start_altered`
-        // predicate still reports start_lost because ATT>C changes the literal
-        // start triplet away from ATG; this isolates the SeqEdit's contribution
-        // to reference peptide output from the nucleotide-level consequence.
-        // Ensembl Variation 2fb834b, VariationEffect.pm:906-945:
-        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+        // peptide falls back to I/I. This transcript has no 5'UTR object, so
+        // `_inv_start_altered()` returns false; equal peptides also fail the
+        // later peptide start_lost clause.
+        // Ensembl core c0cf13d, Transcript.pm:1746-1761; Variation 2fb834b,
+        // VariationEffect.pm:872-882, 923-927:
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L872-L882
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L923-L927
         transcript.translation_seq_edits.clear();
         let unedited = classify_coding_change_with_semantics(
             &transcript,
@@ -20124,7 +20126,7 @@ mod tests {
         assert_eq!(unedited.affected_ref_peptide.as_deref(), Some("I"));
         assert_eq!(unedited.affected_alt_peptide.as_deref(), Some("I"));
         assert_eq!(unedited.amino_acids.as_deref(), Some("I"));
-        assert!(unedited.start_lost);
+        assert!(!unedited.start_lost);
         // VEP's synonymous predicate independently accepts equal peptides
         // unless start_retained/stop_retained or X applies.
         // VariationEffect.pm:1076-1082:
@@ -26652,7 +26654,7 @@ mod tests {
     }
 
     #[test]
-    fn no_translation_split_start_codon_mnv_uses_spliced_cds_coordinates() {
+    fn no_translation_split_start_codon_variant_uses_spliced_cds_coordinates() {
         let mut transcript = tx(
             "T_SPLIT_START",
             "22",
@@ -26660,19 +26662,25 @@ mod tests {
             2010,
             1,
             "protein_coding",
-            Some(1000),
+            Some(1001),
             Some(2010),
         );
-        transcript.cdna_coding_start = Some(1);
-        transcript.cdna_coding_end = Some(12);
-        transcript.spliced_seq = Some("ATGAAACCCTAA".to_string());
+        transcript.cdna_coding_start = Some(2);
+        transcript.cdna_coding_end = Some(13);
+        transcript.spliced_seq = Some("CATGAAACCCTAA".to_string());
         transcript.translateable_seq = Some("ATGAAACCCTAA".to_string());
-        let first_exon = exon("T_SPLIT_START", 1, 1000, 1000);
+        let first_exon = exon("T_SPLIT_START", 1, 1000, 1001);
         let second_exon = exon("T_SPLIT_START", 2, 2000, 2010);
         let exons = [&first_exon, &second_exon];
         let variant = var("22", 2000, 2000, "T", "C");
         let mut terms = BTreeSet::new();
 
+        // The one-base 5'UTR makes `_five_prime_utr()` return an object, so
+        // VEP's `_inv_start_altered()` replays the split ATG in spliced cDNA.
+        // Ensembl core c0cf13d, Transcript.pm:1746-1761; Variation 2fb834b,
+        // VariationEffect.pm:923-941:
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L923-L941
         TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
             5000,
             5000,
