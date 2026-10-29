@@ -29921,15 +29921,15 @@ mod tests {
             "ENST00000454028",
             "3",
             36_993_547,
-            36_993_662,
+            36_993_663,
             -1,
             "protein_coding",
             Some(36_993_547),
-            Some(36_993_662),
+            Some(36_993_663),
         );
         transcript.cdna_coding_start = Some(1);
         transcript.cdna_coding_end = Some(116);
-        let exons: Vec<ExonFeature> = Vec::new();
+        let exons = [exon("ENST00000454028", 1, 36_993_547, 36_993_663)];
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
         let mut translation = translation(
             "ENST00000454028",
@@ -30048,6 +30048,9 @@ mod tests {
         transcript.cdna_coding_start = Some(15);
         transcript.cdna_coding_end = Some(131);
         transcript.translateable_seq = Some(cds.to_string());
+        // Exact 5' UTR from the R5 transcript cache; VEP's
+        // `_ins_del_start_altered()` evaluates the full UTR+CDS sequence.
+        transcript.five_prime_utr_seq = Some("CTTCTGGCGCCAAA".to_string());
         transcript.three_prime_utr_seq = Some("TGCA".to_string());
         let exons = [exon(id, 1, 36_993_534, 36_993_663)];
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
@@ -30074,7 +30077,8 @@ mod tests {
         let protein = class.protein_hgvs.as_ref().expect("HGVSp payload");
         assert_eq!(
             crate::hgvs::format_hgvsp(&translation, protein, true).as_deref(),
-            Some("ENSP00000392649.1:p.Met1_?39")
+            Some("ENSP00000392649.1:p.Met1_?39"),
+            "classification={class:#?}"
         );
         assert_eq!(
             class.codons.as_deref(),
@@ -30087,7 +30091,7 @@ mod tests {
         // A regular peptide deletion also keeps the mapper-derived HGVS
         // window. This is the shared V115/V116 default before `_clip_alleles`;
         // the start-lost ClinVar case is not a special coordinate heuristic.
-        let transcript = tx(
+        let mut transcript = tx(
             "T_UNSHIFTED_DELETION",
             "1",
             100,
@@ -30097,8 +30101,10 @@ mod tests {
             Some(100),
             Some(110),
         );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(11);
         let translation = translation("T_UNSHIFTED_DELETION", Some(11), Some(3), Some("MK*"), None);
-        let exons: Vec<ExonFeature> = Vec::new();
+        let exons = [exon("T_UNSHIFTED_DELETION", 1, 100, 110)];
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
         let mut variant = VariantInput::from_vcf("1".into(), 101, 102, "AT".into(), "A".into());
         variant.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
@@ -37232,6 +37238,10 @@ mod tests {
     fn issue_220_golden_x_peptides_keep_missense_for_16_2047742() {
         // Golden ClinVar 1776749, ENST00000561841: VEP reports XP/XS and
         // missense_variant&coding_sequence_variant&NMD_transcript_variant.
+        // The pinned cache marks cds_start_nf=true; Variation's overlap guard
+        // returns false for that attribute before evaluating peptide alleles.
+        // 2fb834b, VariationEffect.pm:965-985:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L965-L985
         let id = "ENST00000561841";
         let pos = 2_047_742;
         let mut transcript = tx(
@@ -37245,6 +37255,7 @@ mod tests {
             Some(pos + 3),
         );
         transcript.translateable_seq = Some("NNGCCC".to_string());
+        transcript.cds_start_nf = true;
         let exon = exon(id, 1, pos - 2, pos + 3);
         let exons = [&exon];
         let translation = translation(id, Some(6), Some(2), Some("XP"), Some("NNGCCC"));
@@ -37287,7 +37298,8 @@ mod tests {
     #[test]
     fn issue_220_golden_x_peptides_keep_missense_for_17_75629084() {
         // Golden ClinVar 2633463, ENST00000581825: XLLAS/XPEAE is an
-        // unequal equal-length peptide change and VEP reports missense.
+        // unequal equal-length peptide change and VEP reports missense. The
+        // pinned cache also marks cds_start_nf=true; see the source guard above.
         let id = "ENST00000581825";
         let pos = 75_629_084;
         let ref_allele = "GATGCCAGCAGA";
@@ -37304,6 +37316,7 @@ mod tests {
             Some(pos + ref_allele.len() as i64 - 1),
         );
         transcript.translateable_seq = Some(ref_cds.to_string());
+        transcript.cds_start_nf = true;
         let exon = exon(id, 1, pos, pos + ref_allele.len() as i64 - 1);
         let exons = [&exon];
         let translation = translation(id, Some(15), Some(5), Some("XLLAS"), Some(ref_cds));
@@ -37334,7 +37347,8 @@ mod tests {
 
     #[test]
     fn issue_220_golden_x_peptides_keep_missense_for_2_232334660() {
-        // Golden ClinVar 854843, ENST00000418143: XV/XL is missense.
+        // Golden ClinVar 854843, ENST00000418143: XV/XL is missense. The
+        // pinned cache also marks cds_start_nf=true; see the source guard above.
         let id = "ENST00000418143";
         let pos = 232_334_660;
         let cds = "NNGGtg";
@@ -37349,6 +37363,7 @@ mod tests {
             Some(pos + 1),
         );
         transcript.translateable_seq = Some(cds.to_string());
+        transcript.cds_start_nf = true;
         let exon = exon(id, 1, pos - 2, pos + 1);
         let exons = [&exon];
         let translation = translation(id, Some(6), Some(2), Some("XV"), Some(cds));

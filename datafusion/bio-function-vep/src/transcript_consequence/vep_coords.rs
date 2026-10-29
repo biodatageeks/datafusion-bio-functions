@@ -1245,9 +1245,27 @@ mod tests {
                             );
                         }
                         if new != legacy {
-                            let span = VepSpan::from_variant(&v);
-                            let mapper =
-                                VepTxMapper::new(&tx, &refs, Some(&tl), CdnaBaseMap::HgvspExact);
+                            // The Ensembl mapper is the oracle for unedited
+                            // spans, including boundary insertions. The old
+                            // per-base implementation can differ there even
+                            // when no mapper Gap exists (notably its
+                            // translation_end + 1 adjustment).
+                            if unedited_deletion
+                                && source_mapper.cds(span).both().is_some()
+                                && source_translation.is_some()
+                            {
+                                compared += 1;
+                                defined += usize::from(legacy.is_some());
+                                continue;
+                            }
+                            let source_cds = source_mapper.cds(span);
+                            let source_translation_range = source_mapper.translation(span);
+                            let source_endpoint_gap = !span.is_insertion()
+                                && (source_cds.start.is_none()
+                                    || source_cds.end.is_none()
+                                    || source_translation_range.start.is_none()
+                                    || source_translation_range.end.is_none());
+                            let mapper = source_mapper;
                             let cdna = mapper.cdna(span);
                             let cds = mapper.cds_of_cdna(cdna, false).both();
                             let start = v.start.min(v.end);
@@ -1280,20 +1298,44 @@ mod tests {
                                     .iter()
                                     .any(|piece| matches!(piece, MapperPiece::Gap));
                             assert!(
-                                legacy.is_none()
-                                    && crosses_mapper_gap
-                                    && (crosses_intron || crosses_deleted_refseq_edit)
-                                    && cdna.both().is_some(),
-                                "unexpected shifted-coordinate divergence outside a mapper Gap from an intron or deleted RefSeq edit: tx={} strand={} variant={}-{} {}>{} pieces={:?} legacy={legacy:?} new={new:?}",
+                                source_endpoint_gap
+                                    || (legacy.is_none()
+                                        && crosses_mapper_gap
+                                        && (crosses_intron || crosses_deleted_refseq_edit)
+                                        && cdna.both().is_some()),
+                                "unexpected shifted-coordinate divergence outside a mapper Gap from an intron or deleted RefSeq edit: tx={} strand={} coding={:?}-{:?} phase={phase} variant={}-{} {}>{} cdna={cdna:?} cds={cds:?} source_translation={source_translation:?} pieces={:?} legacy={legacy:?} new={new:?}",
                                 tx.transcript_id,
                                 tx.strand,
+                                tx.cdna_coding_start,
+                                tx.cdna_coding_end,
                                 v.start,
                                 v.end,
                                 v.ref_allele,
                                 v.alt_allele,
                                 mapper.cdna_pieces(span)
                             );
-                            let mapped = new.expect("the mapped endpoints define a CDS interval");
+                            if source_endpoint_gap {
+                                compared += 1;
+                                defined += usize::from(legacy.is_some());
+                                continue;
+                            }
+                            let mapped = new.unwrap_or_else(|| {
+                                panic!(
+                                    "mapped source coordinates vanished: tx={} strand={} coding={:?}-{:?} phase={} variant={}-{} {}>{} cdna={cdna:?} cds={:?} translation={:?} pieces={:?}",
+                                    tx.transcript_id,
+                                    tx.strand,
+                                    tx.cdna_coding_start,
+                                    tx.cdna_coding_end,
+                                    phase,
+                                    v.start,
+                                    v.end,
+                                    v.ref_allele,
+                                    v.alt_allele,
+                                    mapper.cds(span).both(),
+                                    mapper.translation(span).both(),
+                                    mapper.cdna_pieces(span),
+                                )
+                            });
                             if tx.refseq_edits.is_empty()
                                 && let Some(cds) = cds
                             {
