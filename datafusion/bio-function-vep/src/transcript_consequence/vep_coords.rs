@@ -1143,13 +1143,13 @@ mod tests {
         }
     }
 
-    /// The mapper-coordinate path agrees with the legacy path across ordinary
-    /// shifted spans. For an internal mapper Gap with mapped endpoints, VEP
-    /// keeps its first and last mapped pieces, whereas the legacy per-base
-    /// path rejects the unmapped bases. In these fixtures the gap is either
-    /// an ordinary intron or an explicit deleted RefSeq edit.
+    /// The mapper path agrees with the legacy path across ordinary shifted
+    /// spans. For an internal mapper Gap with mapped endpoints, VEP keeps its
+    /// first and last mapped pieces, while the legacy per-base path rejects
+    /// unmapped bases. These fixtures cover ordinary introns and deleted
+    /// RefSeq edits; the source mapper provides the positive control.
     #[test]
-    fn f0_shifted_insertion_matches_legacy() {
+    fn f0_shifted_coords_match_legacy_except_source_endpoint_gaps() {
         let mut compared = 0usize;
         let mut defined = 0usize;
         for (tx, exons) in matrix() {
@@ -1168,6 +1168,82 @@ mod tests {
                     for v in spans {
                         let legacy = legacy_shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
                         let new = shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
+                        let span = VepSpan::from_variant(&v);
+                        let source_mapper =
+                            VepTxMapper::new(&tx, &refs, Some(&tl), CdnaBaseMap::HgvspExact);
+                        let source_translation = if span.is_insertion() {
+                            None
+                        } else {
+                            source_mapper.translation(span).both()
+                        };
+                        let unedited_deletion = !span.is_insertion()
+                            && !super::super::refseq_has_edited_sequence_state(&tx);
+                        if unedited_deletion {
+                            let source_coords =
+                                source_mapper.cds(span).both().zip(source_translation).map(
+                                    |((cds_start, cds_end), (protein_start, protein_end))| {
+                                        ShiftedTvaCoords {
+                                            cds_start,
+                                            cds_end,
+                                            protein_start,
+                                            protein_end,
+                                            edited_insertion_gap: false,
+                                        }
+                                    },
+                                );
+                            if let Some(source_coords) = source_coords {
+                                assert_eq!(
+                                    new,
+                                    Some(source_coords),
+                                    "VEP mapper coordinates differ: tx={} strand={} variant={}-{} {}>{}",
+                                    tx.transcript_id,
+                                    tx.strand,
+                                    v.start,
+                                    v.end,
+                                    v.ref_allele,
+                                    v.alt_allele
+                                );
+                            } else {
+                                assert_eq!(
+                                    new,
+                                    None,
+                                    "VEP endpoint Gap must leave shifted coordinates undefined: tx={} strand={} variant={}-{} {}>{}",
+                                    tx.transcript_id,
+                                    tx.strand,
+                                    v.start,
+                                    v.end,
+                                    v.ref_allele,
+                                    v.alt_allele
+                                );
+                            }
+                        } else if legacy.is_none() && source_translation.is_some() {
+                            assert!(
+                                new.is_some(),
+                                "VEP endpoint mapper is defined but shifted coords were not: tx={} strand={} variant={}-{} {}>{}",
+                                tx.transcript_id,
+                                tx.strand,
+                                v.start,
+                                v.end,
+                                v.ref_allele,
+                                v.alt_allele
+                            );
+                        } else {
+                            assert_eq!(
+                                new,
+                                legacy,
+                                "shifted coords differ: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{}",
+                                tx.transcript_id,
+                                tx.strand,
+                                tx.cdna_coding_start,
+                                tx.cdna_coding_end,
+                                tx.cdna_mapper_segments,
+                                tx.refseq_edits,
+                                v.start,
+                                v.end,
+                                v.ref_allele,
+                                v.alt_allele
+                            );
+                        }
                         if new != legacy {
                             let span = VepSpan::from_variant(&v);
                             let mapper =
@@ -1208,13 +1284,9 @@ mod tests {
                                     && crosses_mapper_gap
                                     && (crosses_intron || crosses_deleted_refseq_edit)
                                     && cdna.both().is_some(),
-                                "unexpected shifted-coordinate divergence outside a mapper Gap from an intron or deleted RefSeq edit: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{} pieces={:?} legacy={legacy:?} new={new:?}",
+                                "unexpected shifted-coordinate divergence outside a mapper Gap from an intron or deleted RefSeq edit: tx={} strand={} variant={}-{} {}>{} pieces={:?} legacy={legacy:?} new={new:?}",
                                 tx.transcript_id,
                                 tx.strand,
-                                tx.cdna_coding_start,
-                                tx.cdna_coding_end,
-                                tx.cdna_mapper_segments,
-                                tx.refseq_edits,
                                 v.start,
                                 v.end,
                                 v.ref_allele,
