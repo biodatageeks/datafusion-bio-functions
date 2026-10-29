@@ -211,10 +211,10 @@ use crate::transcript_consequence::{
     MirnaFeature, MotifFeature, PreparedContext, ProteinDomainFeature, RefSeqEdit,
     RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind, SvFeatureKind,
     TranscriptCdnaMapperSegment, TranscriptConsequence, TranscriptConsequenceEngine,
-    TranscriptEngineProfile, TranscriptFeature, TranslationFeature, VariantInput,
-    exact_mapper_cdna_index_for_transcript, genomic_to_cdna_index_for_transcript,
-    infer_refseq_deletion_edits_from_sequences, is_mitochondrial_contig,
-    mapper_cdna_start_for_insertion, refseq_edit_offset_delta,
+    TranscriptEngineProfile, TranscriptFeature, TranslationFeature, TranslationSeqEdit,
+    VariantInput, bam_edit_failed, bam_edit_status_failed, exact_mapper_cdna_index_for_transcript,
+    genomic_to_cdna_index_for_transcript, infer_refseq_deletion_edits_from_sequences,
+    is_mitochondrial_contig, mapper_cdna_start_for_insertion, refseq_edit_offset_delta,
 };
 
 #[cfg(feature = "parquet-cache")]
@@ -4416,6 +4416,7 @@ impl AnnotateProvider {
                 "flags_str",
                 "refseq_match",
                 "refseq_edits",
+                "translation_seq_edits",
                 "is_gencode_basic",
                 "is_gencode_primary",
                 "cdna_mapper_segments",
@@ -4500,6 +4501,7 @@ impl AnnotateProvider {
             let flags_str_idx = schema.index_of("flags_str").ok();
             let refseq_match_idx = schema.index_of("refseq_match").ok();
             let refseq_edits_idx = schema.index_of("refseq_edits").ok();
+            let translation_seq_edits_idx = schema.index_of("translation_seq_edits").ok();
             let is_gencode_basic_idx = schema.index_of("is_gencode_basic").ok();
             let is_gencode_primary_idx = schema.index_of("is_gencode_primary").ok();
             let cdna_mapper_segments_idx = schema.index_of("cdna_mapper_segments").ok();
@@ -4592,6 +4594,11 @@ impl AnnotateProvider {
                         .then(left.end.cmp(&right.end))
                         .then(left.replacement_len.cmp(&right.replacement_len))
                 });
+                let translation_seq_edits = translation_seq_edits_idx
+                    .map(|idx| {
+                        translation_seq_edits_from_list_column(batch.column(idx).as_ref(), row)
+                    })
+                    .unwrap_or_default();
                 let is_gencode_basic = is_gencode_basic_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                     .unwrap_or(false);
@@ -4651,18 +4658,16 @@ impl AnnotateProvider {
                 let has_rna_edit = !refseq_edits.is_empty() || has_non_polya_rna_edit;
                 let cdna_seq =
                     cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let spliced_seq = spliced_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or_else(|| {
-                        synthesize_spliced_seq(
-                            five_prime_utr_seq.as_deref(),
-                            translateable_seq.as_deref(),
-                            three_prime_utr_seq.as_deref(),
-                            cdna_coding_start,
-                            cdna_coding_end,
-                            cdna_seq.as_deref(),
-                        )
-                    });
+                let spliced_seq = cached_or_synthesized_spliced_seq(
+                    spliced_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    bam_edit_status.as_deref(),
+                    five_prime_utr_seq.as_deref(),
+                    translateable_seq.as_deref(),
+                    three_prime_utr_seq.as_deref(),
+                    cdna_coding_start,
+                    cdna_coding_end,
+                    cdna_seq.as_deref(),
+                );
                 let version = version_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .and_then(|v| i32::try_from(v).ok());
@@ -4728,6 +4733,7 @@ impl AnnotateProvider {
                     source_cache,
                     refseq_match,
                     refseq_edits,
+                    translation_seq_edits,
                     has_rna_edit,
                     is_gencode_basic,
                     is_gencode_primary,
@@ -4738,6 +4744,7 @@ impl AnnotateProvider {
                     three_prime_utr_seq,
                     translateable_seq,
                     cdna_seq,
+                    failed_bam_exon_seq: None,
                     version,
                     cds_start_nf,
                     cds_end_nf,
@@ -5237,6 +5244,7 @@ impl AnnotateProvider {
             let flags_str_idx = schema.index_of("flags_str").ok();
             let refseq_match_idx = schema.index_of("refseq_match").ok();
             let refseq_edits_idx = schema.index_of("refseq_edits").ok();
+            let translation_seq_edits_idx = schema.index_of("translation_seq_edits").ok();
             let is_gencode_basic_idx = schema.index_of("is_gencode_basic").ok();
             let is_gencode_primary_idx = schema.index_of("is_gencode_primary").ok();
             let cdna_mapper_segments_idx = schema.index_of("cdna_mapper_segments").ok();
@@ -5326,18 +5334,16 @@ impl AnnotateProvider {
                 );
                 let cdna_seq =
                     cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let spliced_seq = spliced_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or_else(|| {
-                        synthesize_spliced_seq(
-                            five_prime_utr_seq.as_deref(),
-                            translateable_seq.as_deref(),
-                            three_prime_utr_seq.as_deref(),
-                            cdna_coding_start,
-                            cdna_coding_end,
-                            cdna_seq.as_deref(),
-                        )
-                    });
+                let spliced_seq = cached_or_synthesized_spliced_seq(
+                    spliced_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    bam_edit_status.as_deref(),
+                    five_prime_utr_seq.as_deref(),
+                    translateable_seq.as_deref(),
+                    three_prime_utr_seq.as_deref(),
+                    cdna_coding_start,
+                    cdna_coding_end,
+                    cdna_seq.as_deref(),
+                );
                 let mut refseq_edits = refseq_edits_idx
                     .map(|idx| refseq_edits_from_list_column(batch.column(idx).as_ref(), row))
                     .unwrap_or_default();
@@ -5347,6 +5353,11 @@ impl AnnotateProvider {
                         .then(left.end.cmp(&right.end))
                         .then(left.replacement_len.cmp(&right.replacement_len))
                 });
+                let translation_seq_edits = translation_seq_edits_idx
+                    .map(|idx| {
+                        translation_seq_edits_from_list_column(batch.column(idx).as_ref(), row)
+                    })
+                    .unwrap_or_default();
                 let source_col = source_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                     .filter(|source| !source.is_empty() && source != "-");
@@ -5407,6 +5418,7 @@ impl AnnotateProvider {
                     refseq_match: refseq_match_idx
                         .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
                     refseq_edits,
+                    translation_seq_edits,
                     has_rna_edit,
                     is_gencode_basic: is_gencode_basic_idx
                         .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
@@ -5421,6 +5433,7 @@ impl AnnotateProvider {
                     three_prime_utr_seq,
                     translateable_seq,
                     cdna_seq,
+                    failed_bam_exon_seq: None,
                     version: version_idx
                         .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                         .and_then(|v| i32::try_from(v).ok()),
@@ -8653,6 +8666,42 @@ fn synthesize_spliced_seq(
     (!spliced_seq.is_empty()).then_some(spliced_seq.to_ascii_uppercase())
 }
 
+/// Preserve a cache-native source sequence when available. On failed BAM edits,
+/// VEP rolls back the edit state and leaves the source transcript intact; do
+/// not substitute an unchecked UTR/CDS concatenation for its `spliced_seq`.
+/// The failed-BAM consequence path validates the cached components against
+/// mapper cDNA bounds before reconstructing a source sequence.
+///
+/// Ensembl VEP release/116.0, AnnotationType/Transcript.pm:619-627; Ensembl
+/// core c0cf13d, Transcript.pm:823-878:
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+/// https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
+fn cached_or_synthesized_spliced_seq(
+    cached: Option<String>,
+    bam_edit_status: Option<&str>,
+    five_prime_utr_seq: Option<&str>,
+    translateable_seq: Option<&str>,
+    three_prime_utr_seq: Option<&str>,
+    cdna_coding_start: Option<usize>,
+    cdna_coding_end: Option<usize>,
+    cdna_seq: Option<&str>,
+) -> Option<String> {
+    if cached.is_some() {
+        return cached;
+    }
+    if bam_edit_status_failed(bam_edit_status) {
+        return None;
+    }
+    synthesize_spliced_seq(
+        five_prime_utr_seq,
+        translateable_seq,
+        three_prime_utr_seq,
+        cdna_coding_start,
+        cdna_coding_end,
+        cdna_seq,
+    )
+}
+
 fn row_source_is_refseq(tx: &TranscriptFeature) -> bool {
     tx.source_cache
         .as_deref()
@@ -9365,6 +9414,26 @@ where
             continue;
         };
 
+        // A failed BAM edit restores the transcript's exon sequence but leaves
+        // its mapper in RefSeq cDNA coordinates. Variation's feature reference
+        // indexes `Transcript::spliced_seq` with those mapper coordinates, so
+        // retain the genome-derived exon concatenation for that path.
+        // <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627>
+        // <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L455-L465>
+        // <https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L835>
+        if bam_edit_failed(tx) && tx.failed_bam_exon_seq.is_none() {
+            let chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
+            let overlaps_exon = all_intervals.get(chrom).is_some_and(|intervals| {
+                tx_exons
+                    .iter()
+                    .any(|exon| interval_overlaps_any(intervals, exon.start, exon.end))
+            });
+            if overlaps_exon {
+                tx.failed_bam_exon_seq =
+                    read_spliced_transcript_cdna_from_reference(reader, tx, &tx_exons)?;
+            }
+        }
+
         let should_infer_implicit_refseq_deletions = tx.spliced_seq.is_some()
             && is_refseq_transcript_for_hydration(tx, cache_source_type)
             && tx.bam_edit_status.as_deref() == Some("ok")
@@ -9877,6 +9946,58 @@ fn refseq_edits_from_list_column(col: &dyn Array, row: usize) -> Vec<RefSeqEdit>
             end: end_col.value(i),
             replacement_len,
             skip_refseq_offset,
+        });
+    }
+    edits
+}
+
+fn translation_seq_edits_from_list_column(col: &dyn Array, row: usize) -> Vec<TranslationSeqEdit> {
+    use datafusion::arrow::array::{Int64Array, ListArray, StructArray};
+
+    let Some(list_array) = col.as_any().downcast_ref::<ListArray>() else {
+        return Vec::new();
+    };
+    if list_array.is_null(row) {
+        return Vec::new();
+    }
+    let start = list_array.value_offsets()[row] as usize;
+    let end = list_array.value_offsets()[row + 1] as usize;
+    if start == end {
+        return Vec::new();
+    }
+    let Some(struct_array) = list_array.values().as_any().downcast_ref::<StructArray>() else {
+        return Vec::new();
+    };
+    let start_col = struct_array
+        .column_by_name("start")
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>());
+    let end_col = struct_array
+        .column_by_name("end")
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>());
+    let (Some(start_col), Some(end_col)) = (start_col, end_col) else {
+        return Vec::new();
+    };
+
+    let mut edits = Vec::with_capacity(end - start);
+    for index in start..end {
+        if struct_array.is_null(index) || start_col.is_null(index) || end_col.is_null(index) {
+            continue;
+        }
+        let Some(alt_seq) = struct_array
+            .column_by_name("alt_seq")
+            .and_then(|column| string_at(column.as_ref(), index))
+        else {
+            continue;
+        };
+        let code = struct_array
+            .column_by_name("code")
+            .and_then(|column| string_at(column.as_ref(), index))
+            .unwrap_or_default();
+        edits.push(TranslationSeqEdit {
+            code,
+            start: start_col.value(index),
+            end: end_col.value(index),
+            alt_seq,
         });
     }
     edits
@@ -10557,6 +10678,7 @@ const TRANSCRIPT_CONTEXT_COLUMNS: &[&str] = &[
     "flags_str",
     "refseq_match",
     "refseq_edits",
+    "translation_seq_edits",
     "is_gencode_basic",
     "is_gencode_primary",
     "cdna_mapper_segments",
@@ -13320,6 +13442,7 @@ struct TranscriptPartitionState {
     three_prime_utr_seq: Option<String>,
     translateable_seq: Option<String>,
     cdna_seq: Option<String>,
+    failed_bam_exon_seq: Option<String>,
 }
 
 impl TranscriptPartitionState {
@@ -13331,6 +13454,7 @@ impl TranscriptPartitionState {
             three_prime_utr_seq: tx.three_prime_utr_seq.clone(),
             translateable_seq: tx.translateable_seq.clone(),
             cdna_seq: tx.cdna_seq.clone(),
+            failed_bam_exon_seq: tx.failed_bam_exon_seq.clone(),
         }
     }
 
@@ -13341,6 +13465,7 @@ impl TranscriptPartitionState {
         tx.three_prime_utr_seq = self.three_prime_utr_seq.clone();
         tx.translateable_seq = self.translateable_seq.clone();
         tx.cdna_seq = self.cdna_seq.clone();
+        tx.failed_bam_exon_seq = self.failed_bam_exon_seq.clone();
     }
 }
 
@@ -16889,6 +17014,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_bam_hydration_captures_genome_derived_exon_sequence() {
+        use std::io::Cursor;
+
+        let data = ">15\nAACCGGTTAA\n".to_string();
+        let index = fasta::fai::Index::from(vec![fasta::fai::Record::new("15", 10, 4, 10, 11)]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+
+        let mut transcript = make_tx("NM_FAILED_BAM.1", None, None, None, None);
+        transcript.chrom = "15".to_string();
+        transcript.start = 1;
+        transcript.end = 10;
+        transcript.strand = -1;
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.spliced_seq = Some("AACGGTTAA".to_string());
+        let exons = [ExonFeature {
+            transcript_id: transcript.transcript_id.clone(),
+            exon_number: 1,
+            start: 1,
+            end: 10,
+        }];
+        let exons_by_transcript = HashMap::from([(transcript.transcript_id.clone(), vec![0])]);
+        let no_indels = HashMap::new();
+        let input_intervals = HashMap::from([("15".to_string(), vec![(5, 5)])]);
+
+        hydrate_transcript_cdna_from_reference(
+            &mut reader,
+            std::slice::from_mut(&mut transcript),
+            &exons,
+            &exons_by_transcript,
+            &no_indels,
+            &input_intervals,
+            CacheSourceType::Merged,
+        )
+        .unwrap();
+
+        assert_eq!(
+            transcript.failed_bam_exon_seq.as_deref(),
+            Some("TTAACCGGTT")
+        );
+        assert_eq!(transcript.spliced_seq.as_deref(), Some("AACGGTTAA"));
+    }
+
     // Regression: the serial (workers==1) AnnotatingContig loop truncated a
     // contig at ~one buffer when a lookup stall arrived mid-buffer-fill after the
     // poll had already grabbed >=1 batch (`made_progress`) with nothing in
@@ -18720,6 +18889,66 @@ mod tests {
         Arc::new(list_builder.finish())
     }
 
+    fn translation_seq_edit_list_data_type() -> DataType {
+        let fields = datafusion::arrow::datatypes::Fields::from(vec![
+            Field::new("code", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("alt_seq", DataType::Utf8, false),
+        ]);
+        DataType::List(Arc::new(Field::new("item", DataType::Struct(fields), true)))
+    }
+
+    fn translation_seq_edit_array(rows: Vec<Option<Vec<TranslationSeqEdit>>>) -> Arc<dyn Array> {
+        use datafusion::arrow::array::{ArrayBuilder, StructBuilder};
+
+        let fields = vec![
+            Field::new("code", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("alt_seq", DataType::Utf8, false),
+        ];
+        let struct_builder = StructBuilder::new(
+            fields,
+            vec![
+                Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+            ],
+        );
+        let mut list_builder = ListBuilder::new(struct_builder);
+        for row in rows {
+            match row {
+                Some(edits) => {
+                    for edit in edits {
+                        let values = list_builder.values();
+                        values
+                            .field_builder::<StringBuilder>(0)
+                            .expect("code builder")
+                            .append_value(edit.code);
+                        values
+                            .field_builder::<Int64Builder>(1)
+                            .expect("start builder")
+                            .append_value(edit.start);
+                        values
+                            .field_builder::<Int64Builder>(2)
+                            .expect("end builder")
+                            .append_value(edit.end);
+                        values
+                            .field_builder::<StringBuilder>(3)
+                            .expect("alternate sequence builder")
+                            .append_value(edit.alt_seq);
+                        values.append(true);
+                    }
+                    list_builder.append(true);
+                }
+                None => list_builder.append(false),
+            }
+        }
+        Arc::new(list_builder.finish())
+    }
+
     #[cfg(feature = "parquet-cache")]
     type TestCompactPrediction = (i32, &'static str, &'static str, f32);
 
@@ -18888,6 +19117,11 @@ mod tests {
             Field::new("display_xref_id", DataType::Utf8, true),
             Field::new("refseq_match", DataType::Utf8, true),
             Field::new("refseq_edits", refseq_edit_list_data_type(), true),
+            Field::new(
+                "translation_seq_edits",
+                translation_seq_edit_list_data_type(),
+                true,
+            ),
             Field::new("is_gencode_basic", DataType::Boolean, false),
             Field::new("is_gencode_primary", DataType::Boolean, false),
             Field::new("cdna_coding_start", DataType::Int64, true),
@@ -18937,6 +19171,12 @@ mod tests {
                     replacement_len: Some(1),
                     skip_refseq_offset: true,
                 }])]),
+                translation_seq_edit_array(vec![Some(vec![TranslationSeqEdit {
+                    code: "translation_seq_edit".to_string(),
+                    start: 1,
+                    end: 1,
+                    alt_seq: "U".to_string(),
+                }])]),
                 Arc::new(BooleanArray::from(vec![true])) as Arc<dyn Array>,
                 Arc::new(BooleanArray::from(vec![false])) as Arc<dyn Array>,
                 Arc::new(Int64Array::from(vec![Some(4_i64)])) as Arc<dyn Array>,
@@ -18952,6 +19192,8 @@ mod tests {
         )
         .unwrap();
 
+        let (parsed, _) =
+            AnnotateProvider::parse_transcript_batches("tx", std::slice::from_ref(&batch)).unwrap();
         let session = Arc::new(SessionContext::new());
         let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
         session.register_table("tx", Arc::new(table)).unwrap();
@@ -18972,6 +19214,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(transcripts.len(), 1);
+        assert_eq!(parsed.len(), 1);
         let tx = &transcripts[0];
         assert_eq!(tx.gene_stable_id.as_deref(), Some("ENSG_TYPED"));
         assert_eq!(tx.gene_hgnc_id_native.as_deref(), Some("HGNC:TYPED"));
@@ -18988,6 +19231,16 @@ mod tests {
                 skip_refseq_offset: true,
             }]
         );
+        assert_eq!(
+            tx.translation_seq_edits,
+            vec![TranslationSeqEdit {
+                code: "translation_seq_edit".to_string(),
+                start: 1,
+                end: 1,
+                alt_seq: "U".to_string(),
+            }]
+        );
+        assert_eq!(parsed[0].translation_seq_edits, tx.translation_seq_edits);
         assert!(tx.is_gencode_basic);
         assert!(!tx.is_gencode_primary);
         assert_eq!(tx.five_prime_utr_seq.as_deref(), Some("AAA"));
@@ -19027,25 +19280,46 @@ mod tests {
                 Field::new("spliced_seq", DataType::Utf8, true),
             ];
             let mut columns: Vec<Arc<dyn Array>> = vec![
-                Arc::new(StringArray::from(vec!["padded", "bam_ok", "cached"])),
-                Arc::new(StringArray::from(vec!["1"; 3])),
-                Arc::new(Int64Array::from(vec![100_i64; 3])),
-                Arc::new(Int64Array::from(vec![200_i64; 3])),
-                Arc::new(Int64Array::from(vec![1_i64; 3])),
-                Arc::new(StringArray::from(vec!["protein_coding"; 3])),
-                Arc::new(StringArray::from(vec![None, Some("ok"), None])),
-                Arc::new(Int64Array::from(vec![Some(1_i64); 3])),
-                Arc::new(Int64Array::from(vec![Some(15_i64); 3])),
+                Arc::new(StringArray::from(vec![
+                    "padded",
+                    "bam_ok",
+                    "cached",
+                    "bam_failed",
+                ])),
+                Arc::new(StringArray::from(vec!["1"; 4])),
+                Arc::new(Int64Array::from(vec![100_i64; 4])),
+                Arc::new(Int64Array::from(vec![200_i64; 4])),
+                Arc::new(Int64Array::from(vec![1_i64; 4])),
+                Arc::new(StringArray::from(vec!["protein_coding"; 4])),
+                Arc::new(StringArray::from(vec![
+                    None,
+                    Some("ok"),
+                    None,
+                    Some("failed"),
+                ])),
+                Arc::new(Int64Array::from(vec![Some(1_i64); 4])),
+                Arc::new(Int64Array::from(vec![Some(15_i64); 4])),
                 Arc::new(StringArray::from(vec![
                     Some("NNGCTGAAAAAATGA"),
                     Some("GCTGAAAAAATGA"),
                     Some("GCTGAAAAAATGA"),
+                    Some("NNGCTGAAAAAATGA"),
                 ])),
-                Arc::new(StringArray::from(vec![None, Some("GCTGAAAAAATGAGG"), None])),
+                Arc::new(StringArray::from(vec![
+                    None,
+                    Some("GCTGAAAAAATGAGG"),
+                    None,
+                    None,
+                ])),
             ];
             if include_utr_column {
                 fields.push(Field::new("three_prime_utr_seq", DataType::Utf8, true));
-                columns.push(Arc::new(StringArray::from(vec![None, None, Some("GGG")])));
+                columns.push(Arc::new(StringArray::from(vec![
+                    None,
+                    None,
+                    Some("GGG"),
+                    None,
+                ])));
             }
             let schema = Arc::new(Schema::new(fields));
             let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
@@ -19099,6 +19373,15 @@ mod tests {
                     .find(|tx| tx.transcript_id == "padded")
                     .unwrap();
                 assert_eq!(padded.spliced_seq.as_deref(), Some("NNGCTGAAAAAATGA"));
+                let failed = transcripts
+                    .iter()
+                    .find(|tx| tx.transcript_id == "bam_failed")
+                    .unwrap();
+                assert_eq!(failed.bam_edit_status.as_deref(), Some("failed"));
+                assert_eq!(
+                    failed.spliced_seq, None,
+                    "a synthesized phase-padded cDNA must not masquerade as VEP's restored source spliced_seq"
+                );
             }
         }
     }
@@ -20261,6 +20544,7 @@ mod tests {
             source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
+            translation_seq_edits: Vec::new(),
             has_rna_edit: false,
             is_gencode_basic: false,
             is_gencode_primary: false,
@@ -20271,6 +20555,7 @@ mod tests {
             three_prime_utr_seq: None,
             translateable_seq: None,
             cdna_seq: None,
+            failed_bam_exon_seq: None,
             version: None,
             cds_start_nf: false,
             cds_end_nf: false,
