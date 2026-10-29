@@ -3377,6 +3377,7 @@ impl TranscriptConsequenceEngine {
                     &predicate_class,
                     tx,
                     tx_exons,
+                    tx_translation,
                     variant,
                     translateable_seq.as_deref(),
                     partial_terminal_codon,
@@ -3565,6 +3566,7 @@ impl TranscriptConsequenceEngine {
                     &predicate_class,
                     tx,
                     tx_exons,
+                    tx_translation,
                     variant,
                     translateable_seq.as_deref(),
                     partial_terminal_codon_v116,
@@ -10245,6 +10247,7 @@ fn classify_coding_change_with_spliced_span(
             &class,
             tx,
             tx_exons,
+            tx_translation,
             variant,
             Some(cds_seq.as_str()),
             partial_terminal_codon,
@@ -11175,6 +11178,7 @@ fn classify_insertion_with_semantics_and_gap(
             &class,
             tx,
             tx_exons,
+            tx_translation,
             variant,
             Some(cds_seq),
             partial_terminal_codon_v116,
@@ -11547,6 +11551,7 @@ fn vep116_start_lost_from_predicates(
     class: &CodingClassification,
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
     translateable_seq: Option<&str>,
     partial_terminal_codon: bool,
@@ -11567,18 +11572,53 @@ fn vep116_start_lost_from_predicates(
     // this clean copy, before the result below is cached on the class.
     let mut start_lost_cache_view = class.clone();
     start_lost_cache_view.start_lost = false;
+    let phase = translateable_seq
+        .map(|seq| {
+            seq.bytes()
+                .take_while(|&base| base == b'N' || base == b'n')
+                .count()
+        })
+        .unwrap_or(0);
+
     // VEP's frameshift() uses the mapped CDS width, and does not call a
-    // frameshift when either mapped CDS endpoint is undefined. This matters
-    // for start-overlapping deletions that cross introns: genomic REF length
-    // includes intronic bases, while the CDS span does not.
+    // frameshift when either mapped CDS endpoint is undefined. Display CDS
+    // flanks are not an insertion's replacement interval: an ordinary
+    // insertion maps to an empty interval (end = start - 1). At a RefSeq
+    // insertion-edit gap, the mapped gap itself is replaced.
     // Ensembl Variation 2fb834b, VariationEffect.pm:1541-1564 and
     // BaseTranscriptVariation.pm:252-265:
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1564
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L252-L265
-    let mapped_ref_len = class
-        .cds_position_start
-        .zip(class.cds_position_end)
-        .and_then(|(start, end)| end.checked_sub(start)?.checked_add(1));
+    // Core c0cf13d, TranscriptMapper.pm:410-419 accepts insertion spans with
+    // start == end + 1; :430-468 maps the supplied span into CDS coordinates.
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L410-L419
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L430-L468
+    let span = vep_coords::VepSpan::from_variant(variant);
+    let mapped_ref_span = if span.is_insertion() {
+        refseq_mapper_insertion_cds_gap(tx, tx_exons, tx_translation, variant).or_else(|| {
+            vep_coords::VepTxMapper::with_phase(
+                tx,
+                tx_exons,
+                vep_coords::CdnaBaseMap::Output,
+                phase,
+            )
+            .cds(span)
+            .both()
+        })
+    } else {
+        vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, phase)
+            .cds(span)
+            .both()
+    };
+    let mapped_ref_len = mapped_ref_span.and_then(|(start, end)| {
+        if start <= end {
+            end.checked_sub(start)?.checked_add(1)
+        } else if span.is_insertion() {
+            Some(0)
+        } else {
+            None
+        }
+    });
     let frameshift = frameshift_under_semantics(
         mapped_ref_len
             .is_some_and(|mapped_ref_len| !mapped_ref_len.abs_diff(alt_len).is_multiple_of(3)),
@@ -11597,13 +11637,6 @@ fn vep116_start_lost_from_predicates(
         return true;
     }
 
-    let phase = translateable_seq
-        .map(|seq| {
-            seq.bytes()
-                .take_while(|&base| base == b'N' || base == b'n')
-                .count()
-        })
-        .unwrap_or(0);
     let mapper =
         vep_coords::VepTxMapper::with_phase(tx, tx_exons, vep_coords::CdnaBaseMap::Output, phase);
     mapper
@@ -28370,6 +28403,7 @@ mod tests {
             &peptide_class,
             &no_utr_tx,
             &no_utr_exons,
+            None,
             &start_snv,
             Some("ATGGCTGAATGA"),
             false,
@@ -28381,6 +28415,7 @@ mod tests {
             &peptide_class,
             &no_utr_tx,
             &no_utr_exons,
+            None,
             &start_snv,
             Some("ATGGCTGAATGA"),
             false,
@@ -28390,6 +28425,7 @@ mod tests {
             &peptide_class,
             &no_utr_tx,
             &no_utr_exons,
+            None,
             &start_snv,
             Some("ATGGCTGAATGA"),
             false,
@@ -28472,6 +28508,44 @@ mod tests {
     }
 
     #[test]
+    fn vep116_start_lost_insertion_uses_empty_mapped_cds_span() {
+        // The display flank coordinates are 1..2, but the mapper replacement
+        // interval is empty. VEP compares the 3-base allele with that mapped
+        // width, so it is in-frame and does not set start_lost.
+        // Variation 2fb834b, VariationEffect.pm:1541-1564 and
+        // BaseTranscriptVariation.pm:252-265; core c0cf13d,
+        // TranscriptMapper.pm:410-419, 430-468.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1564
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L252-L265
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L410-L419
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/TranscriptMapper.pm#L430-L468
+        let cds = "GTGGCTGAATGA";
+        let (mut tx, exons) = tx_with_cdna("", cds);
+        tx.translateable_seq = Some(cds.to_string());
+        let exons: Vec<&ExonFeature> = exons.iter().collect();
+        let tr = translation("T1", Some(cds.len()), Some(4), Some("VAE*"), Some(cds));
+        let insertion = var("22", 1001, 1001, "-", "TTA");
+        let mapped_span =
+            vep_coords::VepTxMapper::with_phase(&tx, &exons, vep_coords::CdnaBaseMap::Output, 0)
+                .cds(vep_coords::VepSpan::from_variant(&insertion))
+                .both();
+        assert_eq!(mapped_span, Some((2, 1)));
+
+        let class = classify_coding_change_with_semantics(
+            &tx,
+            &exons,
+            Some(&tr),
+            &insertion,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("the coding insertion should be classifiable");
+
+        assert_eq!(class.cds_position_start, Some(1));
+        assert_eq!(class.cds_position_end, Some(2));
+        assert!(!class.start_lost);
+    }
+
+    #[test]
     fn vep116_start_lost_peptide_guard_keeps_genomic_cds_fallback() {
         // VEP derives translation_start through the transcript mapper from
         // genomic coordinates. Older cache rows can have genomic CDS bounds
@@ -28496,6 +28570,7 @@ mod tests {
             &class,
             &tx,
             &exons,
+            None,
             &start_snv,
             Some("ATGGCTGAATGA"),
             false,
