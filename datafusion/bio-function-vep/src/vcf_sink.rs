@@ -14,7 +14,7 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_bio_format_core::metadata::{
-    VCF_FORMAT_KEYS_COLUMN, VCF_HEADER_RAW_LINES_KEY, VCF_INFO_KEYS_COLUMN,
+    VCF_FORMAT_KEYS_COLUMN, VCF_HEADER_RAW_LINES_KEY, VCF_INFO_KEYS_COLUMN, VCF_RAW_INFO_COLUMN,
 };
 use datafusion_bio_format_vcf::header_builder::header_file_format;
 use datafusion_bio_format_vcf::serializer::{VcfRecordLine, batch_to_vcf_lines_for_file_format};
@@ -1552,11 +1552,12 @@ fn run_assembler_thread_bgzf(
 
 /// The columns the annotation output carries, in output order: the core VCF
 /// columns, the input's INFO fields, `CSQ`, the per-sample FORMAT columns, and
-/// — when the record layout is preserved — the two carried key-order columns.
+/// — when the record layout is preserved — the carried key-order and raw INFO
+/// columns.
 ///
-/// Those two go last, matching where the VCF reader puts them, and they are not
-/// INFO fields: the writer reads them to order INFO and FORMAT, and never emits
-/// them on a line.
+/// Those columns go last, matching where the VCF reader puts them. They are not
+/// INFO fields: the writer reads them for record reconstruction and never emits
+/// them as columns on a line.
 fn annotation_output_columns(
     core_vcf: &[&str],
     info_fields: &[String],
@@ -1564,7 +1565,11 @@ fn annotation_output_columns(
     preserve_record_layout: bool,
 ) -> Vec<String> {
     let layout: &[&str] = if preserve_record_layout {
-        &[VCF_INFO_KEYS_COLUMN, VCF_FORMAT_KEYS_COLUMN]
+        &[
+            VCF_INFO_KEYS_COLUMN,
+            VCF_FORMAT_KEYS_COLUMN,
+            VCF_RAW_INFO_COLUMN,
+        ]
     } else {
         &[]
     };
@@ -2333,12 +2338,14 @@ mod tests {
                 renamed,
                 Field::new("CSQ", DataType::Utf8, true),
                 Field::new(VCF_INFO_KEYS_COLUMN, DataType::Utf8, true),
+                Field::new(VCF_RAW_INFO_COLUMN, DataType::Utf8, true),
             ])),
             vec![
                 Arc::new(StringArray::from(vec!["chr1"; rows])),
                 Arc::new(Float32Array::from(vec![0.5; rows])),
                 Arc::new(StringArray::from(vec!["G|missense_variant"; rows])),
                 Arc::new(StringArray::from(info_keys)),
+                Arc::new(StringArray::from(vec![Some("CLNVI=5271%2B80"); rows])),
             ],
         )
         .unwrap()
@@ -2350,7 +2357,16 @@ mod tests {
         let schema = batch.schema();
 
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, ["chrom", "AF", "CSQ", VCF_INFO_KEYS_COLUMN]);
+        assert_eq!(
+            names,
+            [
+                "chrom",
+                "AF",
+                "CSQ",
+                VCF_INFO_KEYS_COLUMN,
+                VCF_RAW_INFO_COLUMN
+            ]
+        );
         let restored = schema.field_with_name("AF").unwrap();
         assert_eq!(restored.metadata()["bio.vcf.field.field_type"], "INFO");
         assert!(!restored.metadata().contains_key(VEP_SOURCE_FIELD_NAME_KEY));
@@ -3800,15 +3816,21 @@ mod tests {
     }
 
     #[test]
-    fn preserving_the_record_layout_carries_its_two_columns() {
+    fn preserving_the_record_layout_carries_its_three_columns() {
         let names = annotation_output_columns(&["chrom"], &[], &[], true);
         assert_eq!(
             names,
-            ["chrom", "CSQ", VCF_INFO_KEYS_COLUMN, VCF_FORMAT_KEYS_COLUMN]
+            [
+                "chrom",
+                "CSQ",
+                VCF_INFO_KEYS_COLUMN,
+                VCF_FORMAT_KEYS_COLUMN,
+                VCF_RAW_INFO_COLUMN
+            ]
         );
         // Last, matching the reader's schema, and quoted like any other column.
         assert!(annotation_select_list(&names).ends_with(&format!(
-            "`{VCF_INFO_KEYS_COLUMN}`, `{VCF_FORMAT_KEYS_COLUMN}`"
+            "`{VCF_INFO_KEYS_COLUMN}`, `{VCF_FORMAT_KEYS_COLUMN}`, `{VCF_RAW_INFO_COLUMN}`"
         )));
     }
 

@@ -5936,6 +5936,37 @@ fn apply_vep116_stop_predicate_flags(
     class.stop_gained = stop_gained;
 }
 
+/// Ensembl Variation 116 `missense_variant()` compares the affected peptide
+/// alleles directly. Unlike `synonymous_variant()`, it has no X-peptide veto;
+/// only the explicit `partial_codon()` predicate suppresses missense.
+///
+/// Traceability:
+/// - Ensembl Variation `VariationEffect::missense_variant()` at the pinned
+///   commit checks start/stop/partial-codon/stop-retained, then requires
+///   unequal peptide strings of equal length:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1085-L1098>
+fn vep_missense_variant(
+    ref_peptide: Option<&str>,
+    alt_peptide: Option<&str>,
+    start_lost: bool,
+    stop_lost: bool,
+    stop_gained: bool,
+    partial_codon: bool,
+    stop_retained: bool,
+) -> bool {
+    let (Some(ref_peptide), Some(alt_peptide)) = (ref_peptide, alt_peptide) else {
+        return false;
+    };
+
+    !start_lost
+        && !stop_lost
+        && !stop_gained
+        && !partial_codon
+        && !stop_retained
+        && ref_peptide != alt_peptide
+        && ref_peptide.len() == alt_peptide.len()
+}
+
 fn apply_vep116_nucleotide_stop_fallbacks(
     class: &mut CodingClassification,
     semantics: crate::vep_semantics::VepSemantics,
@@ -6470,6 +6501,7 @@ fn build_protein_hgvs_data(
     new_aas: &[char],
     frameshift: bool,
     translation: Option<&TranslationFeature>,
+    semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
     let raw_start = class.protein_position_start?;
     let raw_end = class
@@ -6625,12 +6657,11 @@ fn local_peptide_from_codon_window(table: CodonTable, codon: &[u8]) -> Option<St
 /// VEP's alternate codon: `window_len` bases from `codon_start` of the
 /// alternate CDS with the cached 3'UTR appended.
 ///
-/// `window_len` is the unclamped codon span plus the allele length delta, so
-/// a codon window truncated by the CDS end (an incomplete terminal codon)
-/// reads into the 3'UTR, and Perl `substr` stops at the end of the sequence.
-/// `_trim_incomplete_codon()` is a no-op (its condition is an assignment), so
-/// the partial codon stays before the UTR. The UTR is read only when the
-/// window passes the end of `mutated` (vepyr#230).
+/// `window_len` is the unclamped codon span plus the allele length delta.
+/// VEP 116 calls `_trim_incomplete_codon()` before adding the UTR. The pinned
+/// helper returns the original sequence when at least one whole codon remains,
+/// and an empty sequence when fewer than three bases remain. `codon()` then
+/// slices the widened alternate window from that resulting sequence.
 ///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::codon()`
@@ -6644,15 +6675,19 @@ fn vep_alternate_codon_window(
     mutated: &[u8],
     codon_start: usize,
     window_len: usize,
+    semantics: crate::vep_semantics::VepSemantics,
 ) -> Vec<u8> {
-    let window_end = codon_start.saturating_add(window_len);
-    if window_end <= mutated.len() {
-        return mutated[codon_start..window_end].to_vec();
+    let mut alternate_cds = mutated.to_vec();
+    if semantics.vep116_stop_predicates() {
+        let Some(trimmed) = vep116_trim_incomplete_codon(&alternate_cds) else {
+            return Vec::new();
+        };
+        alternate_cds = trimmed;
     }
     let utr = three_prime_utr_seq(tx).unwrap_or_default();
-    mutated
+    alternate_cds.extend_from_slice(utr.as_bytes());
+    alternate_cds
         .iter()
-        .chain(utr.as_bytes())
         .skip(codon_start)
         .take(window_len)
         .copied()
@@ -7053,18 +7088,46 @@ fn preferred_alt_translation_extension_for_hgvsp(
     preferred.or(direct)
 }
 
-/// Traceability:
-/// - Ensembl Variation `TranscriptVariationAllele::_trim_incomplete_codon()`
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2463-L2469>
-/// - Ensembl Variation `TranscriptVariationAllele::_get_alternate_cds()`
-///   trims the alternate CDS before appending 3'UTR and translating for
-///   frameshift / stop-loss HGVS. In release/115 the called
-///   `_trim_incomplete_codon()` helper is effectively a no-op because it uses
-///   assignment (`=`) instead of comparison, so VEP appends the UTR to the
-///   untrimmed alternate CDS in practice.
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2470-L2499>
-fn translated_alt_protein_for_hgvs(tx: &TranscriptFeature, mutated_cds: &[u8]) -> Option<String> {
-    let mut alt_cds = mutated_cds.to_vec();
+/// Mirror VEP 116's `_trim_incomplete_codon()` implementation, including its
+/// assignment in the condition: when at least one complete codon remains it
+/// returns the original sequence; when fewer than three bases remain it falls
+/// through and slices to an empty sequence. Empty input returns undef before
+/// UTR append.
+///
+/// Source: Ensembl Variation 2fb834b,
+/// `TranscriptVariationAllele.pm:2523-2534`:
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2523-L2534>
+fn vep116_trim_incomplete_codon(seq: &[u8]) -> Option<Vec<u8>> {
+    if seq.is_empty() {
+        return None;
+    }
+    let keep_length = seq.len() - seq.len() % 3;
+    Some(if keep_length > 0 {
+        seq.to_vec()
+    } else {
+        Vec::new()
+    })
+}
+
+/// Build a direct alternate-CDS translation while preserving the selected
+/// VEP version's trim-before-UTR behavior. This is used for both the fallback
+/// and `alt_translation` fields so a missing extension cannot restore a
+/// trimmed-away CDS from UTR bases.
+///
+/// VEP 116 source: `TranscriptVariationAllele.pm:2414-2427,2523-2534` at
+/// Ensembl Variation commit `2fb834b`.
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2414-L2427>
+/// <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2523-L2534>
+fn translated_alt_protein_for_hgvs(
+    tx: &TranscriptFeature,
+    mutated_cds: &[u8],
+    semantics: crate::vep_semantics::VepSemantics,
+) -> Option<String> {
+    let mut alt_cds = if semantics.vep116_stop_predicates() {
+        vep116_trim_incomplete_codon(mutated_cds)?
+    } else {
+        mutated_cds.to_vec()
+    };
     if let Some(utr) = three_prime_utr_seq(tx) {
         alt_cds.extend_from_slice(utr.as_bytes());
     }
@@ -7072,17 +7135,17 @@ fn translated_alt_protein_for_hgvs(tx: &TranscriptFeature, mutated_cds: &[u8]) -
 }
 
 /// Traceability:
-/// - Ensembl Variation `TranscriptVariationAllele::_get_alternate_cds()`
-///   builds alternate CDS directly from `_translateable_seq`, local CDS
-///   coordinates, then appends `_three_prime_utr()` before translation.
-///   Release/115 still calls `_trim_incomplete_codon()`, but that helper is a
-///   no-op in practice because it uses assignment instead of comparison.
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2323-L2499>
+/// - Ensembl Variation 116 `_get_alternate_cds()` calls
+///   `_trim_incomplete_codon()` before appending `_three_prime_utr()`:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2414-L2427>
+/// - Its pinned assignment behavior is mirrored by the helper above:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2523-L2534>
 fn alternate_translation_for_vep_hgvs(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     translation: &TranslationFeature,
     variant: &VariantInput,
+    semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<String> {
     let reference_cds_seq = reference_translateable_seq_for_hgvsp(tx, Some(translation))?;
     let leading_n_offset = reference_cds_seq
@@ -7171,6 +7234,10 @@ fn alternate_translation_for_vep_hgvs(
     alternate_seq.push_str(upstream_seq);
     alternate_seq.push_str(&alt_allele);
     alternate_seq.push_str(downstream_seq);
+    if semantics.vep116_stop_predicates() {
+        alternate_seq =
+            String::from_utf8(vep116_trim_incomplete_codon(alternate_seq.as_bytes())?).ok()?;
+    }
     if let Some(utr) = three_prime_utr_seq(tx) {
         alternate_seq.push_str(&utr);
     }
@@ -7194,6 +7261,7 @@ fn literal_indel_protein_hgvs_data(
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
     class: &CodingClassification,
+    semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
     let translation = tx_translation?;
     let cds_seq = reference_translateable_seq_for_hgvsp(tx, Some(translation))?;
@@ -7391,15 +7459,18 @@ fn literal_indel_protein_hgvs_data(
             Some(translation),
             old_aas.iter().collect(),
         ),
-        alt_translation: translated_alt_protein_for_hgvs(tx, &mutated)
+        // `new_aas` translates only `mutated`; it cannot restore UTR bases
+        // when VEP 116's empty-CDS trim makes the source helper return None.
+        alt_translation: translated_alt_protein_for_hgvs(tx, &mutated, semantics)
             .unwrap_or_else(|| new_aas.iter().collect()),
         alt_translation_extension: alternate_translation_for_vep_hgvs(
             tx,
             tx_exons,
             translation,
             variant,
+            semantics,
         )
-        .or_else(|| translated_alt_protein_for_hgvs(tx, &mutated)),
+        .or_else(|| translated_alt_protein_for_hgvs(tx, &mutated, semantics)),
         frameshift: !ref_len.abs_diff(alt_len).is_multiple_of(3),
         start_lost: class.start_lost,
         stop_lost: class.stop_lost,
@@ -7431,6 +7502,7 @@ fn literal_shifted_indel_protein_hgvs_data(
     variant: &VariantInput,
     shift: &crate::hgvs::HgvsGenomicShift,
     original: &crate::hgvs::ProteinHgvsData,
+    semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
     let translation = tx_translation?;
     let reference_cds_seq = reference_translateable_seq_for_hgvsp(tx, Some(translation))?;
@@ -7577,14 +7649,20 @@ fn literal_shifted_indel_protein_hgvs_data(
                 .iter()
                 .collect(),
         ),
-        alt_translation: translated_alt_protein_for_hgvs(tx, alternate_seq.as_bytes())
+        // This fallback translates the alternate CDS alone, with no UTR
+        // append, so it cannot undo VEP 116's trim-before-UTR result.
+        alt_translation: translated_alt_protein_for_hgvs(tx, alternate_seq.as_bytes(), semantics)
             .unwrap_or_else(|| {
                 translate_protein_from_cds(alternate_seq.as_bytes())
                     .unwrap_or_default()
                     .into_iter()
                     .collect()
             }),
-        alt_translation_extension: translated_alt_protein_for_hgvs(tx, alternate_seq.as_bytes()),
+        alt_translation_extension: translated_alt_protein_for_hgvs(
+            tx,
+            alternate_seq.as_bytes(),
+            semantics,
+        ),
         frameshift: !vf_nt_len.abs_diff(rotated_alt.len()).is_multiple_of(3),
         start_lost: original.start_lost,
         stop_lost: original.stop_lost,
@@ -8091,6 +8169,7 @@ fn shifted_tva_peptide_window(
     window_protein_end: usize,
     variation_feature_seq: &str,
     is_reference: bool,
+    semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<(String, String, Option<String>)> {
     let reference_cds_seq = if coords.edited_insertion_gap {
         reference_translateable_seq_for_vep(tx, Some(translation))?
@@ -8178,22 +8257,14 @@ fn shifted_tva_peptide_window(
     let codon = &cds.as_bytes()[codon_start_idx..codon_end_idx];
     let peptide = local_peptide_from_codon_window(tx.codon_table, codon)?;
     let alt_translation = (!is_reference).then(|| {
-        translated_alt_protein_for_hgvs(tx, cds.as_bytes()).unwrap_or_else(|| {
+        translated_alt_protein_for_hgvs(tx, cds.as_bytes(), semantics).unwrap_or_else(|| {
             translate_protein_from_cds(cds.as_bytes())
                 .unwrap_or_default()
                 .into_iter()
                 .collect()
         })
     });
-    let alt_translation_extension = (!is_reference)
-        .then(|| translated_alt_protein_for_hgvs(tx, cds.as_bytes()))
-        .flatten();
-
-    Some((
-        peptide,
-        cds,
-        alt_translation.or(alt_translation_extension.clone()),
-    ))
+    Some((peptide, cds, alt_translation))
 }
 
 /// Traceability:
@@ -8255,6 +8326,7 @@ fn shifted_tva_protein_hgvs_data(
         window_protein_end,
         alt_feature_seq,
         false,
+        semantics,
     )?;
     let (ref_peptide, _, _) = shifted_tva_peptide_window(
         tx,
@@ -8264,6 +8336,7 @@ fn shifted_tva_protein_hgvs_data(
         window_protein_end,
         ref_feature_seq,
         true,
+        semantics,
     )?;
     let canonical_ref_translation: String = canonical_ref_translation_for_hgvsp(
         tx,
@@ -8303,7 +8376,11 @@ fn shifted_tva_protein_hgvs_data(
                 .into_iter()
                 .collect()
         }),
-        alt_translation_extension: translated_alt_protein_for_hgvs(tx, alt_cds.as_bytes()),
+        alt_translation_extension: translated_alt_protein_for_hgvs(
+            tx,
+            alt_cds.as_bytes(),
+            semantics,
+        ),
         frameshift,
         start_lost: fallback.map(|protein| protein.start_lost).unwrap_or(false),
         stop_lost: fallback.map(|protein| protein.stop_lost).unwrap_or(false),
@@ -8792,13 +8869,20 @@ fn protein_hgvs_for_output_with_semantics(
         //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1774-L1805
         return fallback.map(|protein| {
             let mut protein = protein.clone();
-            if protein.ref_peptide != "-" && protein.alt_peptide != "-" {
+            // Ensembl initializes HGVS protein start/end from the mapper
+            // before clipping peptides. With ALT `-`, `_clip_alleles()` has
+            // no common peptide prefix or suffix to remove, so deletions
+            // retain those bounds;
+            // insertions with REF `-` keep their clipped window. VEP 116:
+            // TranscriptVariationAllele.pm:1765-1766, 1802-1805, 2182-2243
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1765-L1766
+            // VEP 115 initializes the same mapper bounds at :1701-1702:
+            // https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1701-L1702
+            if protein.ref_peptide != "-" {
                 if let Some((start, end)) = original_protein_bounds {
                     protein.start = start;
                     protein.end = end;
                 }
-            } else if let Some((start, end)) = original_protein_bounds {
-                let _ = (start, end); // traceability: already-clipped HGVS insertion window wins
             }
             protein
         });
@@ -8871,11 +8955,18 @@ fn protein_hgvs_for_output_with_semantics(
                 variant,
                 shift,
                 original,
+                semantics,
             )
         });
-        if let Some(shifted_class) =
-            classify_coding_change(tx, tx_exons, tx_translation, &shifted_variant)
-        {
+        // This shifted reclassification is still part of the selected VEP
+        // output path; preserve the caller's semantic version here as well.
+        if let Some(shifted_class) = classify_coding_change_with_semantics(
+            tx,
+            tx_exons,
+            tx_translation,
+            &shifted_variant,
+            semantics,
+        ) {
             if let (Some(class_protein), Some(literal_shifted_protein)) = (
                 shifted_class.protein_hgvs.as_ref(),
                 literal_shifted.as_ref(),
@@ -8901,6 +8992,7 @@ fn protein_hgvs_for_output_with_semantics(
                 tx_translation,
                 &shifted_variant,
                 &shifted_class,
+                semantics,
             );
             if let (Some(class_protein), Some(literal_protein)) =
                 (shifted_class.protein_hgvs.as_ref(), literal.as_ref())
@@ -9729,6 +9821,7 @@ fn classify_coding_change_with_spliced_span(
         &mutated,
         local_codon_start,
         (local_codon_span + alt_len).saturating_sub(ref_len),
+        semantics,
     );
     class.affected_ref_peptide = local_peptide_from_codon_window(tx.codon_table, local_ref_codon);
     class.affected_alt_peptide = local_peptide_from_codon_window(tx.codon_table, &local_alt_codon);
@@ -9932,18 +10025,30 @@ fn classify_coding_change_with_spliced_span(
             });
             (aa_changed, has_x)
         };
-        // VEP's missense predicate checks partial_codon, not whether a peptide
-        // contains X. X from a stop-readthrough SeqEdit remains a valid
-        // reference peptide and may produce missense_variant (e.g. X/Q).
+        // VEP 116 compares the peptide alleles and has no X-peptide veto;
+        // the separate partial-codon predicate is its incomplete-terminal
+        // guard. Keep VEP 115's established X behavior.
+        // Variation `2fb834b`, VariationEffect.pm:1085-1098:
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1085-L1098
-        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1588-L1613
-        if aa_changed
-            && !class.stop_gained
-            && !class.stop_lost
-            && !class.start_lost
-            && !class.stop_retained
-            && !partial_terminal_codon
-        {
+        let missense = if semantics.vep116_stop_predicates() {
+            vep_missense_variant(
+                class.affected_ref_peptide.as_deref(),
+                class.affected_alt_peptide.as_deref(),
+                class.start_lost,
+                class.stop_lost,
+                class.stop_gained,
+                partial_terminal_codon,
+                class.stop_retained,
+            )
+        } else {
+            aa_changed
+                && !class.stop_gained
+                && !class.stop_lost
+                && !class.start_lost
+                && !class.stop_retained
+                && !has_x
+        };
+        if missense {
             class.missense = true;
         } else if !aa_changed && !class.stop_retained && !class.start_retained && !has_x {
             class.synonymous = true;
@@ -10087,7 +10192,7 @@ fn classify_coding_change_with_spliced_span(
         if codon_nt_end <= cds_seq.len() {
             let ref_codon = format_ref_codon(&cds_seq.as_bytes()[codon_nt_start..codon_nt_end]);
             let alt_codon = format_alt_codon(&local_alt_codon, end_idx);
-            class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+            class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
         }
     } else {
         // Indels: different formatting for frameshift vs inframe
@@ -10105,7 +10210,7 @@ fn classify_coding_change_with_spliced_span(
                 } else {
                     format_alt_codon(&local_alt_codon, 0)
                 };
-                class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
             } else if alt_len < ref_len {
                 // Inframe deletion: ref codon with deleted bases uppercase, context lowercase.
                 // Highlight replacement bases; pure deletions have only lowercase
@@ -10116,11 +10221,7 @@ fn classify_coding_change_with_spliced_span(
                 } else {
                     format_alt_codon(&local_alt_codon, 0)
                 };
-                if alt_codon.is_empty() {
-                    class.codons = Some(format!("{ref_codon}/-"));
-                } else {
-                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
-                }
+                class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
             } else {
                 // Inframe insertion (ref_len < alt_len, handled in classify_insertion)
                 // This branch shouldn't be reached for pure insertions (ref="-"),
@@ -10134,7 +10235,7 @@ fn classify_coding_change_with_spliced_span(
                 // alternate codon, so VEP's window ends where it always did
                 // unless it is truncated by the CDS end.
                 let alt_codon = format_alt_codon(&local_alt_codon, start_idx + alt_len - 1);
-                class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
             }
         }
     }
@@ -10194,8 +10295,8 @@ fn classify_coding_change_with_spliced_span(
         preferred_alt_translation_extension_for_hgvsp(
             tx,
             frameshift,
-            alternate_translation_for_vep_hgvs(tx, tx_exons, translation, variant),
-            translated_alt_protein_for_hgvs(tx, &mutated),
+            alternate_translation_for_vep_hgvs(tx, tx_exons, translation, variant, semantics),
+            translated_alt_protein_for_hgvs(tx, &mutated, semantics),
         )
     } else {
         None
@@ -10222,6 +10323,7 @@ fn classify_coding_change_with_spliced_span(
         &hgvs_new_aas,
         frameshift,
         Some(translation),
+        semantics,
     );
     if let Some(protein_hgvs) = class.protein_hgvs.as_mut() {
         protein_hgvs.alt_translation_extension = preferred_hgvs_alt_translation;
@@ -10249,8 +10351,9 @@ fn classify_coding_change_with_spliced_span(
                 tx_exons,
                 translation,
                 variant,
+                semantics,
             )
-            .or_else(|| translated_alt_protein_for_hgvs(tx, &mutated)),
+            .or_else(|| translated_alt_protein_for_hgvs(tx, &mutated, semantics)),
             frameshift: false,
             start_lost: class.start_lost,
             stop_lost: class.stop_lost,
@@ -11012,7 +11115,7 @@ fn classify_insertion_with_semantics_and_gap(
                     }
                 })
                 .collect();
-            class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+            class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
         }
     } else {
         // Inframe insertion within codon: ref=lowercase, alt=codon+inserted(uppercase)
@@ -11064,7 +11167,7 @@ fn classify_insertion_with_semantics_and_gap(
                     }
                 })
                 .collect();
-            class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+            class.codons = Some(vep_codon_allele_string(&ref_codon, &alt_codon));
         }
     }
     if semantics.vep116_stop_predicates() {
@@ -11100,7 +11203,7 @@ fn classify_insertion_with_semantics_and_gap(
 
     // Extend with 3' UTR for HGVS stop-loss/frameshift extension distance.
     let preferred_hgvs_alt_translation = if class.stop_lost || frameshift {
-        let direct_alt_translation = translated_alt_protein_for_hgvs(tx, &mutated);
+        let direct_alt_translation = translated_alt_protein_for_hgvs(tx, &mutated, semantics);
         if replace_refseq_mapper_gap {
             // `_get_alternate_cds()` builds from the exact mapper CDS interval.
             // The generic transcript replay only sees the genomic insertion
@@ -11111,7 +11214,13 @@ fn classify_insertion_with_semantics_and_gap(
                 tx,
                 frameshift,
                 tx_translation.and_then(|translation| {
-                    alternate_translation_for_vep_hgvs(tx, tx_exons, translation, variant)
+                    alternate_translation_for_vep_hgvs(
+                        tx,
+                        tx_exons,
+                        translation,
+                        variant,
+                        semantics,
+                    )
                 }),
                 direct_alt_translation,
             )
@@ -11141,6 +11250,7 @@ fn classify_insertion_with_semantics_and_gap(
         &hgvs_new_aas,
         frameshift,
         tx_translation,
+        semantics,
     );
     if let Some(protein_hgvs) = class.protein_hgvs.as_mut() {
         protein_hgvs.alt_translation_extension = preferred_hgvs_alt_translation;
@@ -11791,6 +11901,21 @@ fn format_codon_display_for_feature_seq(
             }
         })
         .collect()
+}
+
+/// Join VEP display codons, representing an empty alternate codon with `-`.
+///
+/// Traceability:
+/// - Ensembl Variation 116 `codon_allele_string()` joins reference/alternate
+///   codons with `/`; `codon()` stores `-` for an empty codon:
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L642-L651>
+///   <https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L876-L881>
+fn vep_codon_allele_string(ref_codon: &str, alt_codon: &str) -> String {
+    if alt_codon.is_empty() {
+        format!("{ref_codon}/-")
+    } else {
+        format!("{ref_codon}/{alt_codon}")
+    }
 }
 
 /// Determine which exon (if any) the variant overlaps.
@@ -24222,7 +24347,14 @@ mod tests {
         let insertion = var("1", 106, 106, "C", "CA");
 
         assert_eq!(
-            alternate_translation_for_vep_hgvs(&t, &exons_ref, &tr, &insertion).as_deref(),
+            alternate_translation_for_vep_hgvs(
+                &t,
+                &exons_ref,
+                &tr,
+                &insertion,
+                crate::vep_semantics::VepSemantics::V115,
+            )
+            .as_deref(),
             Some("MNTGA")
         );
     }
@@ -27212,6 +27344,7 @@ mod tests {
             &['E', 'K'],
             false,
             Some(&tr),
+            crate::vep_semantics::VepSemantics::V115,
         )
         .expect("start_lost HGVSp payload");
 
@@ -29130,7 +29263,7 @@ mod tests {
     }
 
     #[test]
-    fn translated_alt_protein_for_hgvs_appends_utr_without_trimming_incomplete_codon() {
+    fn translated_alt_protein_for_hgvs_preserves_vep115_utr_behavior() {
         let mut t = tx(
             "ENST0001",
             "1",
@@ -29142,17 +29275,133 @@ mod tests {
             Some(180),
         );
         t.cdna_coding_end = Some(7);
-        // CDS = ATGAAAT, UTR = TAA. Ensembl release/115 calls
-        // `_trim_incomplete_codon()`, but that helper uses assignment rather
-        // than comparison and therefore leaves the incomplete trailing CDS
-        // base in place. The effective translated sequence is ATGAAATTAA ->
-        // MKL.
+        // VEP 115 leaves the incomplete trailing CDS base in place before
+        // appending the UTR: ATGAAATTAA -> MKL.
         t.spliced_seq = Some("ATGAAATTAA".into());
 
         assert_eq!(
-            translated_alt_protein_for_hgvs(&t, b"ATGAAAT").as_deref(),
+            translated_alt_protein_for_hgvs(
+                &t,
+                b"ATGAAAT",
+                crate::vep_semantics::VepSemantics::V115,
+            )
+            .as_deref(),
             Some("MKL")
         );
+    }
+
+    #[test]
+    fn vep116_trim_incomplete_codon_matches_pinned_assignment_boundaries() {
+        // The assignment condition intentionally keeps 4- and 5-base inputs
+        // intact; this is not ordinary trimming to a multiple of three.
+        assert_eq!(vep116_trim_incomplete_codon(b""), None);
+        assert_eq!(vep116_trim_incomplete_codon(b"A"), Some(Vec::new()));
+        assert_eq!(vep116_trim_incomplete_codon(b"AT"), Some(Vec::new()));
+        assert_eq!(vep116_trim_incomplete_codon(b"ATG"), Some(b"ATG".to_vec()));
+        assert_eq!(
+            vep116_trim_incomplete_codon(b"ATGA"),
+            Some(b"ATGA".to_vec())
+        );
+        assert_eq!(
+            vep116_trim_incomplete_codon(b"ATGAA"),
+            Some(b"ATGAA".to_vec())
+        );
+    }
+
+    #[test]
+    fn vep116_hgvsp_translation_does_not_restore_an_empty_cds_before_utr() {
+        let mut transcript = tx(
+            "ENSTVEPUTR",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(102),
+        );
+        transcript.three_prime_utr_seq = Some("ATG".to_string());
+
+        assert_eq!(
+            translated_alt_protein_for_hgvs(
+                &transcript,
+                b"",
+                crate::vep_semantics::VepSemantics::V115,
+            ),
+            Some("M".to_string())
+        );
+        assert_eq!(
+            translated_alt_protein_for_hgvs(
+                &transcript,
+                b"",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            None
+        );
+        assert_eq!(
+            translated_alt_protein_for_hgvs(
+                &transcript,
+                b"A",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            Some("M".to_string())
+        );
+        assert_eq!(
+            translated_alt_protein_for_hgvs(
+                &transcript,
+                b"ATGA",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            Some("MN".to_string())
+        );
+        assert_eq!(
+            translated_alt_protein_for_hgvs(
+                &transcript,
+                b"ATGAA",
+                crate::vep_semantics::VepSemantics::V116,
+            ),
+            Some("MK".to_string())
+        );
+    }
+
+    #[test]
+    fn literal_indel_hgvsp_does_not_restore_an_empty_v116_cds_from_utr() {
+        let mut transcript = tx(
+            "ENSTLITERALUTR",
+            "1",
+            1000,
+            1002,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1002),
+        );
+        transcript.translateable_seq = Some("ATG".to_string());
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(3);
+        transcript.three_prime_utr_seq = Some("ATG".to_string());
+        let exons = vec![exon("ENSTLITERALUTR", 1, 1000, 1002)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let translation = translation("ENSTLITERALUTR", Some(3), Some(1), Some("M"), Some("ATG"));
+        let variant = var("1", 1000, 1002, "ATG", "-");
+        let class = CodingClassification {
+            protein_position_start: Some(1),
+            protein_position_end: Some(1),
+            ..Default::default()
+        };
+
+        let protein = literal_indel_protein_hgvs_data(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("literal deletion HGVS payload");
+
+        assert_eq!(protein.alt_translation, "");
+        assert_eq!(protein.alt_translation_extension, None);
     }
 
     #[test]
@@ -29659,6 +29908,252 @@ mod tests {
     }
 
     #[test]
+    fn issue_221_start_lost_deletion_uses_translation_mapper_window() {
+        // ClinVar 4533193, chr3:36993547, ENST00000454028. VEP initializes
+        // both HGVS protein coordinates from `translation_start/end()` before
+        // resolving the peptide alleles. The deletion's ALT peptide is `-`,
+        // so the fallback must retain the mapper window (1..39), not the
+        // already-clipped consequence window (2..39).
+        // Ensembl Variation 116: TranscriptVariationAllele.pm:1765-1766
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1765-L1766
+        let ref_allele = "AATGTCGTTCGTGGCAGGGGTTATTCGGCGGCTGGACGAGACAGTGGTGAACCGCATCGCGGCGGGGGAAGTTATCCAGCGGCCAGCTAATGCTATCAAAGAGATGATTGAGAACTG";
+        let mut transcript = tx(
+            "ENST00000454028",
+            "3",
+            36_993_547,
+            36_993_662,
+            -1,
+            "protein_coding",
+            Some(36_993_547),
+            Some(36_993_662),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(116);
+        let exons: Vec<ExonFeature> = Vec::new();
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let mut translation = translation(
+            "ENST00000454028",
+            Some(116),
+            Some(39),
+            Some("MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN*"),
+            None,
+        );
+        translation.stable_id = Some("ENSP00000392649".to_string());
+        translation.version = Some(1);
+        let mut variant = VariantInput::from_vcf(
+            "3".into(),
+            36_993_547,
+            36_993_662,
+            ref_allele.to_string(),
+            "A".into(),
+        );
+        variant.hgvs_shift_reverse = Some(crate::hgvs::HgvsGenomicShift {
+            strand: -1,
+            shift_length: 0,
+            start: 36_993_547,
+            end: 36_993_662,
+            shifted_allele_string: "-".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: ref_allele.to_string(),
+            alt_orig_allele_string: "A".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+        let fallback = crate::hgvs::ProteinHgvsData {
+            start: 2,
+            end: 39,
+            ref_peptide: "S".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: "MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN*".to_string(),
+            alt_translation: String::new(),
+            alt_translation_extension: None,
+            frameshift: true,
+            start_lost: true,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        let got = protein_hgvs_for_output_with_semantics(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            true,
+            Some((1, 39)),
+            Some(&fallback),
+            false,
+            None,
+            None,
+            crate::vep_semantics::VepSemantics::V116,
+            true,
+        )
+        .expect("VEP retains HGVSp for the coding start-lost deletion");
+        assert_eq!((got.start, got.end), (1, 39));
+        assert_eq!(
+            crate::hgvs::format_hgvsp(&translation, &got, true).as_deref(),
+            Some("ENSP00000392649.1:p.Met1_?39")
+        );
+
+        let got_v115 = protein_hgvs_for_output_with_semantics(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            true,
+            Some((1, 39)),
+            Some(&fallback),
+            false,
+            None,
+            None,
+            crate::vep_semantics::VepSemantics::V115,
+            true,
+        )
+        .expect("VEP 115 also retains HGVSp for the coding start-lost deletion");
+        assert_eq!((got_v115.start, got_v115.end), (1, 39));
+        assert_eq!(
+            crate::hgvs::format_hgvsp(&translation, &got_v115, true).as_deref(),
+            Some("ENSP00000392649.1:p.Met1_?39")
+        );
+    }
+
+    #[test]
+    fn issue_221_clinvar_4533193_uses_full_mapper_deletion_span() {
+        // ClinVar 4533193, chr3:36993547, ENST00000454028. The VCF allele is
+        // an anchored deletion beginning one base before the cached CDS. VEP
+        // minimizes unequal-length alleles before annotation, and codon() then
+        // sizes its alternate window from the mapper's CDS span and allele
+        // length (ensembl-vep release/116.0 Parser.pm:855-881,964-1020 at
+        // 57ea5c52340acc1f156267f810ad162e26597082;
+        // ensembl-variation 2fb834b TranscriptVariationAllele.pm:841-881).
+        // The frameshift protein path starts at translation_start from the
+        // transcript mapper (TranscriptVariationAllele.pm:2314-2358 at
+        // 2fb834b); _get_alternate_cds trims before UTR append at
+        // TranscriptVariationAllele.pm:2414-2427,2523-2534.
+        let id = "ENST00000454028";
+        let cds = "ATGTCGTTCGTGGCAGGGGTTATTCGGCGGCTGGACGAGACAGTGGTGAACCGCATCGCGGCGGGGGAAGTTATCCAGCGGCCAGCTAATGCTATCAAAGAGATGATTGAGAACTGA";
+        let raw_ref = format!("A{}", &cds[..116]);
+        let mut transcript = tx(
+            id,
+            "3",
+            36_993_534,
+            36_993_663,
+            1,
+            "nonsense_mediated_decay",
+            Some(36_993_548),
+            Some(36_996_624),
+        );
+        transcript.cdna_coding_start = Some(15);
+        transcript.cdna_coding_end = Some(131);
+        transcript.translateable_seq = Some(cds.to_string());
+        transcript.three_prime_utr_seq = Some("TGCA".to_string());
+        let exons = [exon(id, 1, 36_993_534, 36_993_663)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let mut translation = translation(
+            id,
+            Some(117),
+            Some(38),
+            Some("MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN"),
+            Some(cds),
+        );
+        translation.stable_id = Some("ENSP00000392649".to_string());
+        translation.version = Some(1);
+        let variant =
+            VariantInput::from_vcf("3".into(), 36_993_547, 36_993_663, raw_ref, "A".into());
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("the deletion overlaps the translated start codon");
+        let protein = class.protein_hgvs.as_ref().expect("HGVSp payload");
+        assert_eq!(
+            crate::hgvs::format_hgvsp(&translation, protein, true).as_deref(),
+            Some("ENSP00000392649.1:p.Met1_?39")
+        );
+        assert_eq!(
+            class.codons.as_deref(),
+            Some(format!("{}a/t", &cds[..116]).as_str())
+        );
+    }
+
+    #[test]
+    fn unshifted_non_start_lost_deletion_uses_mapper_window_in_v115_and_v116() {
+        // A regular peptide deletion also keeps the mapper-derived HGVS
+        // window. This is the shared V115/V116 default before `_clip_alleles`;
+        // the start-lost ClinVar case is not a special coordinate heuristic.
+        let transcript = tx(
+            "T_UNSHIFTED_DELETION",
+            "1",
+            100,
+            110,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(110),
+        );
+        let translation = translation("T_UNSHIFTED_DELETION", Some(11), Some(3), Some("MK*"), None);
+        let exons: Vec<ExonFeature> = Vec::new();
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let mut variant = VariantInput::from_vcf("1".into(), 101, 102, "AT".into(), "A".into());
+        variant.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 0,
+            start: 101,
+            end: 102,
+            shifted_allele_string: "-".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "AT".to_string(),
+            alt_orig_allele_string: "A".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+        let fallback = crate::hgvs::ProteinHgvsData {
+            start: 2,
+            end: 2,
+            ref_peptide: "K".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: "MK*".to_string(),
+            alt_translation: "M*".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        for semantics in [
+            crate::vep_semantics::VepSemantics::V115,
+            crate::vep_semantics::VepSemantics::V116,
+        ] {
+            let got = protein_hgvs_for_output_with_semantics(
+                &transcript,
+                &exons_ref,
+                Some(&translation),
+                &variant,
+                true,
+                Some((1, 2)),
+                Some(&fallback),
+                false,
+                None,
+                None,
+                semantics,
+                true,
+            )
+            .expect("unshifted deletion retains HGVSp");
+            assert_eq!((got.start, got.end), (1, 2), "VEP {}", semantics.as_str());
+        }
+    }
+
+    #[test]
     fn protein_hgvs_for_output_drops_insertion_outside_translation() {
         // vepyr#226: the insertion at 181^182 lies past the stop (CDS 120..179,
         // cDNA 21..80), so VEP's `translation_start/end` guard
@@ -29971,8 +30466,14 @@ mod tests {
         tr.version = Some(4);
 
         let v = var("20", 1031, 1030, "-", "CTTATAGACAGGGCCCCGCGGCCGGCACT");
-        let alt_translation =
-            alternate_translation_for_vep_hgvs(&t, &exons_ref, &tr, &v).expect("alt translation");
+        let alt_translation = alternate_translation_for_vep_hgvs(
+            &t,
+            &exons_ref,
+            &tr,
+            &v,
+            crate::vep_semantics::VepSemantics::V115,
+        )
+        .expect("alt translation");
         assert!(alt_translation.starts_with(&format!("{}KVPAAGPCL*", "A".repeat(30))));
 
         let protein = crate::hgvs::ProteinHgvsData {
@@ -30034,8 +30535,14 @@ mod tests {
 
         let alt_genomic = reverse_complement("T").expect("genomic insertion");
         let v = var("20", 2051, 2050, "-", &alt_genomic);
-        let alt_translation =
-            alternate_translation_for_vep_hgvs(&t, &exons_ref, &tr, &v).expect("alt translation");
+        let alt_translation = alternate_translation_for_vep_hgvs(
+            &t,
+            &exons_ref,
+            &tr,
+            &v,
+            crate::vep_semantics::VepSemantics::V115,
+        )
+        .expect("alt translation");
         assert_eq!(alt_translation.chars().nth(13), Some('C'));
 
         let protein = crate::hgvs::ProteinHgvsData {
@@ -36722,6 +37229,239 @@ mod tests {
     }
 
     #[test]
+    fn issue_220_golden_x_peptides_keep_missense_for_16_2047742() {
+        // Golden ClinVar 1776749, ENST00000561841: VEP reports XP/XS and
+        // missense_variant&coding_sequence_variant&NMD_transcript_variant.
+        let id = "ENST00000561841";
+        let pos = 2_047_742;
+        let mut transcript = tx(
+            id,
+            "16",
+            pos - 2,
+            pos + 3,
+            1,
+            "protein_coding",
+            Some(pos),
+            Some(pos + 3),
+        );
+        transcript.translateable_seq = Some("NNGCCC".to_string());
+        let exon = exon(id, 1, pos - 2, pos + 3);
+        let exons = [&exon];
+        let translation = translation(id, Some(6), Some(2), Some("XP"), Some("NNGCCC"));
+        let variant = var("16", pos, pos + 1, "GC", "AT");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("golden record is coding");
+
+        assert_eq!(
+            class.affected_ref_peptide.as_deref(),
+            Some("XP"),
+            "{class:#?}"
+        );
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("XS"));
+        assert!(
+            class.missense,
+            "VEP 116 allows X-containing unequal peptides: {class:?}"
+        );
+
+        let v115 = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V115,
+        )
+        .expect("golden record is coding");
+        assert!(
+            !v115.missense,
+            "VEP 115 behavior remains unchanged for the X-containing peptide: {v115:?}"
+        );
+    }
+
+    #[test]
+    fn issue_220_golden_x_peptides_keep_missense_for_17_75629084() {
+        // Golden ClinVar 2633463, ENST00000581825: XLLAS/XPEAE is an
+        // unequal equal-length peptide change and VEP reports missense.
+        let id = "ENST00000581825";
+        let pos = 75_629_084;
+        let ref_allele = "GATGCCAGCAGA";
+        let alt_allele = "TCTGCCTCTGGG";
+        let ref_cds = "NNTCTGCTGGCATCA";
+        let mut transcript = tx(
+            id,
+            "17",
+            pos,
+            pos + ref_allele.len() as i64 - 1,
+            -1,
+            "protein_coding",
+            Some(pos),
+            Some(pos + ref_allele.len() as i64 - 1),
+        );
+        transcript.translateable_seq = Some(ref_cds.to_string());
+        let exon = exon(id, 1, pos, pos + ref_allele.len() as i64 - 1);
+        let exons = [&exon];
+        let translation = translation(id, Some(15), Some(5), Some("XLLAS"), Some(ref_cds));
+        let variant = var(
+            "17",
+            pos,
+            pos + ref_allele.len() as i64 - 1,
+            ref_allele,
+            alt_allele,
+        );
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("golden record is coding");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("XLLAS"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("XPEAE"));
+        assert!(
+            class.missense,
+            "VEP 116 allows X-containing unequal peptides: {class:?}"
+        );
+    }
+
+    #[test]
+    fn issue_220_golden_x_peptides_keep_missense_for_2_232334660() {
+        // Golden ClinVar 854843, ENST00000418143: XV/XL is missense.
+        let id = "ENST00000418143";
+        let pos = 232_334_660;
+        let cds = "NNGGtg";
+        let mut transcript = tx(
+            id,
+            "2",
+            pos - 2,
+            pos + 1,
+            1,
+            "protein_coding",
+            Some(pos),
+            Some(pos + 1),
+        );
+        transcript.translateable_seq = Some(cds.to_string());
+        let exon = exon(id, 1, pos - 2, pos + 1);
+        let exons = [&exon];
+        let translation = translation(id, Some(6), Some(2), Some("XV"), Some(cds));
+        let variant = var("2", pos, pos + 1, "GG", "CT");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("golden record is coding");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("XV"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("XL"));
+        assert!(
+            class.missense,
+            "VEP 116 allows X-containing unequal peptides: {class:?}"
+        );
+    }
+
+    #[test]
+    fn issue_220_golden_x_peptides_keep_missense_for_5_35860925() {
+        // Golden ClinVar 640639, ENST00000515665: QX/HX remains missense;
+        // this X comes from the partial local peptide window, not partial_codon.
+        let id = "ENST00000515665";
+        let pos = 35_860_925;
+        let cds_prefix = "ATG".repeat(51);
+        let cds = format!("{cds_prefix}CAGC");
+        // 155 bases place the variant in codon 52 after 51 complete codons.
+        let transcript_start = pos - 155;
+        let mut transcript = tx(
+            id,
+            "5",
+            transcript_start,
+            pos + 1,
+            1,
+            "protein_coding",
+            Some(transcript_start),
+            Some(pos + 1),
+        );
+        transcript.translateable_seq = Some(cds.clone());
+        let exon = exon(id, 1, transcript_start, pos + 1);
+        let exons = [&exon];
+        let protein = format!("{}Q", "M".repeat(51));
+        let translation = translation(id, Some(cds.len()), Some(52), Some(&protein), Some(&cds));
+        let variant = var("5", pos, pos + 1, "GC", "TT");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("golden record is coding");
+
+        assert_eq!(class.affected_ref_peptide.as_deref(), Some("QX"));
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("HX"));
+        assert!(
+            class.missense,
+            "VEP 116 allows X-containing unequal peptides: {class:?}"
+        );
+    }
+
+    #[test]
+    fn issue_220_golden_terminal_deletions_render_empty_alt_codons_as_dash() {
+        // Golden ClinVar 638055 (11:31789935) and 633614 (20:59877463).
+        for (reference, expected) in [("TTACAGT", "TTACAGT/-"), ("AAAAA", "AAAAA/-")] {
+            assert_eq!(vep_codon_allele_string(reference, ""), expected);
+        }
+    }
+
+    #[test]
+    fn issue_220_terminal_deletion_classification_emits_empty_alt_codon_dash() {
+        // ClinVar 638055's terminal deletion has golden Codons `TTACAGT/-`.
+        // This minimal CDS fixture exercises the classifier call site, not
+        // only the shared slash-joining helper.
+        let id = "ENST00000640287";
+        let pos = 31_789_935;
+        let cds = "TTACAGT";
+        let mut transcript = tx(
+            id,
+            "11",
+            pos,
+            pos + cds.len() as i64 - 1,
+            1,
+            "protein_coding",
+            Some(pos),
+            Some(pos + cds.len() as i64 - 1),
+        );
+        transcript.translateable_seq = Some(cds.to_string());
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        let exon = exon(id, 1, pos, pos + cds.len() as i64 - 1);
+        let exons = [&exon];
+        let translation = translation(id, Some(cds.len()), Some(2), Some("LQ"), Some(cds));
+        let variant = var("11", pos, pos + cds.len() as i64 - 1, cds, "-");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exons,
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("terminal coding deletion should classify");
+
+        assert_eq!(class.codons.as_deref(), Some("TTACAGT/-"));
+    }
+
+    #[test]
     fn partial_terminal_codon_remains_enabled_for_v115() {
         let terms = incomplete_cds_terms(
             crate::vep_semantics::VepSemantics::V115,
@@ -38213,17 +38953,34 @@ mod tests {
         };
 
         // Reference: single codon at protein position 3
-        let (ref_pep, _, _) = super::shifted_tva_peptide_window(&t, &tr, coords, 3, 3, "G", true)
-            .expect("ref peptide should be produced");
+        let (ref_pep, _, _) = super::shifted_tva_peptide_window(
+            &t,
+            &tr,
+            coords,
+            3,
+            3,
+            "G",
+            true,
+            crate::vep_semantics::VepSemantics::V115,
+        )
+        .expect("ref peptide should be produced");
         assert_eq!(ref_pep, "A", "Reference peptide should be single Ala");
 
         // Alternate: widened window captures the inserted codon as well.
         //   Alt CDS = "ATGGCGGC" + "GGCG" + "GCCTAA" = "ATGGCGGCGGCGGCCTAA"
         //   codon_start=6: without fix → alt[6..9]="GCG"→"A" (WRONG)
         //                  with fix    → alt[6..12]="GCGGCG"→"AA" (CORRECT)
-        let (alt_pep, _, _) =
-            super::shifted_tva_peptide_window(&t, &tr, coords, 3, 3, "GGCG", false)
-                .expect("alt peptide should be produced");
+        let (alt_pep, _, _) = super::shifted_tva_peptide_window(
+            &t,
+            &tr,
+            coords,
+            3,
+            3,
+            "GGCG",
+            false,
+            crate::vep_semantics::VepSemantics::V115,
+        )
+        .expect("alt peptide should be produced");
         assert_eq!(
             alt_pep, "AA",
             "Alternate peptide should contain 2 Ala residues from widened codon window"
@@ -38263,20 +39020,78 @@ mod tests {
         };
 
         // Reference: two codons at protein positions 3-4
-        let (ref_pep, _, _) =
-            super::shifted_tva_peptide_window(&t, &tr, coords, 3, 4, "AAAG", true)
-                .expect("ref peptide should be produced");
+        let (ref_pep, _, _) = super::shifted_tva_peptide_window(
+            &t,
+            &tr,
+            coords,
+            3,
+            4,
+            "AAAG",
+            true,
+            crate::vep_semantics::VepSemantics::V115,
+        )
+        .expect("ref peptide should be produced");
         assert_eq!(ref_pep, "KA", "Reference peptide should be Lys+Ala");
 
         // Alternate: narrowed window.
         //   Alt CDS = "ATGGCG" + "A" + "CCTAA" = "ATGGCGACCTAA"
         //   codon_start=6: ref window=6 bases, with fix → 6+(1-4)=3 → alt[6..9]="ACC"→"T"
-        let (alt_pep, _, _) = super::shifted_tva_peptide_window(&t, &tr, coords, 3, 4, "A", false)
-            .expect("alt peptide should be produced");
+        let (alt_pep, _, _) = super::shifted_tva_peptide_window(
+            &t,
+            &tr,
+            coords,
+            3,
+            4,
+            "A",
+            false,
+            crate::vep_semantics::VepSemantics::V115,
+        )
+        .expect("alt peptide should be produced");
         assert_eq!(
             alt_pep, "T",
             "Alternate peptide should be single Thr from narrowed codon window"
         );
+    }
+
+    #[test]
+    fn shifted_tva_peptide_window_keeps_empty_v116_cds_empty_before_utr() {
+        let mut transcript = tx(
+            "TSTEMPTYALT",
+            "1",
+            1000,
+            1002,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1002),
+        );
+        transcript.translateable_seq = Some("ATG".to_string());
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(3);
+        transcript.three_prime_utr_seq = Some("ATG".to_string());
+        let translation = translation("TSTEMPTYALT", Some(3), Some(1), None, Some("ATG"));
+        let coords = super::ShiftedTvaCoords {
+            cds_start: 1,
+            cds_end: 3,
+            protein_start: 1,
+            protein_end: 1,
+            edited_insertion_gap: false,
+        };
+
+        let (_, alternate_cds, alternate_translation) = super::shifted_tva_peptide_window(
+            &transcript,
+            &translation,
+            coords,
+            1,
+            1,
+            "-",
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("shifted alternate peptide window");
+
+        assert!(alternate_cds.is_empty());
+        assert_eq!(alternate_translation.as_deref(), Some(""));
     }
 
     #[test]
@@ -38290,7 +39105,6 @@ mod tests {
         // The Lys at pos 4 stops the 3' peptide shift so the dup stays at pos 3.
         let cds = "ATGGCGGCGAAATAA";
 
-        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(5000, 5000, true);
         let mut t = tx(
             "ENSTDUP001",
             "1",
@@ -38343,17 +39157,33 @@ mod tests {
             three_prime_context: "AAAT".to_string(),
         });
 
-        let assignments =
-            engine.evaluate_variant_with_context(&v, &[t], &exons, &[tr], &[], &[], &[], &[]);
-        let consequence = assignments
-            .iter()
-            .find(|e| e.transcript_id.as_deref() == Some("ENSTDUP001"))
-            .expect("expected transcript consequence");
-        assert_eq!(
-            consequence.hgvsp.as_deref(),
-            Some("ENSPDUP001.1:p.Ala3dup"),
-            "In-frame insertion of Ala in Ala repeat should produce p.Ala3dup"
-        );
+        for semantics in [
+            crate::vep_semantics::VepSemantics::V115,
+            crate::vep_semantics::VepSemantics::V116,
+        ] {
+            let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+                5000, 5000, true, semantics,
+            );
+            let assignments = engine.evaluate_variant_with_context(
+                &v,
+                &[t.clone()],
+                &exons,
+                &[tr.clone()],
+                &[],
+                &[],
+                &[],
+                &[],
+            );
+            let consequence = assignments
+                .iter()
+                .find(|e| e.transcript_id.as_deref() == Some("ENSTDUP001"))
+                .expect("expected transcript consequence");
+            assert_eq!(
+                consequence.hgvsp.as_deref(),
+                Some("ENSPDUP001.1:p.Ala3dup"),
+                "In-frame insertion of Ala in Ala repeat should produce p.Ala3dup under {semantics:?}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
