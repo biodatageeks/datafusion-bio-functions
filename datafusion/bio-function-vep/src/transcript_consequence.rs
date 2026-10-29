@@ -11567,8 +11567,21 @@ fn vep116_start_lost_from_predicates(
     // this clean copy, before the result below is cached on the class.
     let mut start_lost_cache_view = class.clone();
     start_lost_cache_view.start_lost = false;
+    // VEP's frameshift() uses the mapped CDS width, and does not call a
+    // frameshift when either mapped CDS endpoint is undefined. This matters
+    // for start-overlapping deletions that cross introns: genomic REF length
+    // includes intronic bases, while the CDS span does not.
+    // Ensembl Variation 2fb834b, VariationEffect.pm:1541-1564 and
+    // BaseTranscriptVariation.pm:252-265:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1564
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L252-L265
+    let mapped_ref_len = class
+        .cds_position_start
+        .zip(class.cds_position_end)
+        .and_then(|(start, end)| end.checked_sub(start)?.checked_add(1));
     let frameshift = frameshift_under_semantics(
-        !ref_len.abs_diff(alt_len).is_multiple_of(3),
+        mapped_ref_len
+            .is_some_and(|mapped_ref_len| !mapped_ref_len.abs_diff(alt_len).is_multiple_of(3)),
         class,
         crate::vep_semantics::VepSemantics::V116,
         partial_terminal_codon,
@@ -28401,6 +28414,61 @@ mod tests {
             &start_snv,
             Some("ATGGCTGAATGA"),
         ));
+    }
+
+    #[test]
+    fn vep116_start_lost_frameshift_uses_mapped_cds_span_across_intron() {
+        // VariationEffect::frameshift compares the alternate allele length with
+        // the mapped CDS interval. A 103-base genomic deletion here removes
+        // only six CDS bases because 97 bases belong to the intron; the mapped
+        // ATGAAA/- codon deletion is in-frame and must not take start_lost's
+        // early altered-by-indel path.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:868-882, 1541-1564:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L868-L882
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1541-L1564
+        let cds = "ATGAAACCTGAAGAA";
+        let mut transcript = tx(
+            "T-start-intron",
+            "22",
+            100,
+            211,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(211),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        transcript.spliced_seq = Some(cds.to_string());
+        transcript.translateable_seq = Some(cds.to_string());
+        let exon_features = [
+            exon("T-start-intron", 1, 100, 102),
+            exon("T-start-intron", 2, 200, 211),
+        ];
+        let exon_refs = exon_features.iter().collect::<Vec<_>>();
+        let tr = translation(
+            "T-start-intron",
+            Some(15),
+            Some(5),
+            Some("MKPEE"),
+            Some(cds),
+        );
+        let genomic_ref = format!("ATG{}AAA", "A".repeat(97));
+        assert_eq!(genomic_ref.len(), 103);
+        let deletion = var("22", 100, 202, &genomic_ref, "-");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exon_refs,
+            Some(&tr),
+            &deletion,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("the mapped start-codon-spanning deletion should be classifiable");
+        assert_eq!(class.cds_position_start, Some(1));
+        assert_eq!(class.cds_position_end, Some(6));
+        assert_eq!(class.codons.as_deref(), Some("ATGAAA/-"));
+        assert!(!class.start_lost);
     }
 
     #[test]
