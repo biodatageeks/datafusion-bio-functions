@@ -302,6 +302,42 @@ fn translation_seqedit_range_for_variant(
         .both_truthy()
 }
 
+fn vep116_reference_peptide_is_undefined_by_seqedit(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+) -> bool {
+    let Some((translation_start, translation_end)) =
+        translation_seqedit_range_for_variant(tx, tx_exons, translation, variant)
+    else {
+        return false;
+    };
+    let (translation_start, translation_end) = if translation_start <= translation_end {
+        (translation_start, translation_end)
+    } else {
+        (translation_end, translation_start)
+    };
+
+    tx.translation_seq_edits.iter().any(|edit| {
+        let Ok(edit_start) = usize::try_from(edit.start) else {
+            return false;
+        };
+        let Ok(edit_end) = usize::try_from(edit.end) else {
+            return false;
+        };
+        let overlap_end = translation_end.min(edit_end);
+        if translation_start.max(edit_start) > overlap_end {
+            return false;
+        }
+
+        // VEP returns undef as soon as an overlapping TV position no longer
+        // exists in the edited reference peptide. Its test is
+        // `tv_pos - se_start >= length(alt_seq)`.
+        overlap_end.saturating_sub(edit_start) >= edit.alt_seq.chars().count()
+    })
+}
+
 pub(crate) fn refseq_edit_offset_delta(edit: &RefSeqEdit) -> Option<i64> {
     if edit.skip_refseq_offset {
         return None;
@@ -7136,7 +7172,18 @@ fn alternate_translation_for_vep_hgvs(
     let alt_genomic = normalize_allele_seq(&variant.alt_allele);
     let ref_len = ref_genomic.len();
 
-    let (cds_start_1based, cds_end_1based) = if ref_len == 0 {
+    let spliced_cds_span =
+        spliced_cds_span_for_intron_deletion(tx, tx_exons, Some(translation), variant);
+    let (cds_start_1based, cds_end_1based) = if let Some((cds_start, cds_end)) = spliced_cds_span {
+        // VEP's `_get_alternate_cds()` asks `cds_start()` and `cds_end()` for
+        // the first and last mapped CDS coordinates. Intronic Gap pieces do
+        // not contribute sequence positions to the alternate CDS.
+        // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:257-265 and
+        // TranscriptVariationAllele.pm:2393-2415:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L257-L265
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2393-L2415
+        (cds_start, cds_end)
+    } else if ref_len == 0 {
         let anchor_pos = if tx.strand >= 0 {
             variant.start.saturating_sub(1)
         } else {
@@ -8765,6 +8812,23 @@ fn protein_hgvs_for_output_with_semantics(
         if !hgvsp_translation_bounds_are_truthy(tx, tx_exons, tx_translation, variant) {
             return None;
         }
+        // VEP's hgvs_protein() asks both alleles for peptide(), then returns
+        // undef when the reference peptide was shortened past a mapped TV
+        // position. Keep that peptide-availability check even when a local
+        // coding classifier already produced fallback HGVSp data.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-764,1791-1800:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L764
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1791-L1800
+        if semantics.vep116_stop_predicates()
+            && vep116_reference_peptide_is_undefined_by_seqedit(
+                tx,
+                tx_exons,
+                tx_translation,
+                variant,
+            )
+        {
+            return None;
+        }
         return fallback.cloned();
     }
 
@@ -8798,6 +8862,16 @@ fn protein_hgvs_for_output_with_semantics(
         .map(|shift| protein_hgvs_shifted_variant(variant, shift, tx.strand))
         .unwrap_or_else(|| variant.clone());
     if !hgvsp_translation_bounds_are_truthy(tx, tx_exons, tx_translation, &shifted_variant) {
+        return None;
+    }
+    if semantics.vep116_stop_predicates()
+        && vep116_reference_peptide_is_undefined_by_seqedit(
+            tx,
+            tx_exons,
+            tx_translation,
+            &shifted_variant,
+        )
+    {
         return None;
     }
 
@@ -9583,6 +9657,18 @@ fn classify_coding_change_with_spliced_span(
     // including when that allele contains intronic bases.
     // Capture attribute presence before hydration can infer coordinate edits.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L874
+    // Keep the raw translateable CDS for the alternate allele. VEP's reference
+    // codon path patches it with feature_seq, while its alternate path uses
+    // `_get_alternate_cds()` built from `_translateable_seq()` and the mapped
+    // CDS endpoints. Reusing the patched reference sequence inserts intronic
+    // REF bases into the alternate peptide for exon-spanning edits.
+    // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:868-877,2393-2415:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L877
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2393-L2415
+    let alternate_cds_reference = cds_seq.clone();
+    if end_idx >= alternate_cds_reference.len() {
+        return None;
+    }
     let cds_seq = if tx.has_rna_edit && ref_seq_slice != effective_ref_tx {
         let mut edited_cds = cds_seq.into_bytes();
         edited_cds.splice(start_idx..=end_idx, effective_ref_tx.bytes());
@@ -9591,15 +9677,15 @@ fn classify_coding_change_with_spliced_span(
         cds_seq
     };
     let mut mutated = Vec::with_capacity(
-        cds_seq
+        alternate_cds_reference
             .len()
             .saturating_sub(ref_len)
             .saturating_add(alt_len),
     );
-    mutated.extend_from_slice(&cds_seq.as_bytes()[..start_idx]);
+    mutated.extend_from_slice(&alternate_cds_reference.as_bytes()[..start_idx]);
     let alt_bytes = alt_tx.as_bytes();
     mutated.extend_from_slice(alt_bytes);
-    mutated.extend_from_slice(&cds_seq.as_bytes()[end_idx + 1..]);
+    mutated.extend_from_slice(&alternate_cds_reference.as_bytes()[end_idx + 1..]);
 
     let old_aas = reference_aas_for_consequence(tx, tx_translation, cds_seq.as_str())?;
     let new_aas =
@@ -14718,6 +14804,78 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn issue_241_shortened_seqedit_suppresses_hgvsp_when_reference_peptide_is_undefined() {
+        // ClinVar 971953, 1:161305878 A>G maps to translation residue 249,
+        // where the preceding empty SeqEdit makes VEP's reference peptide
+        // undefined. `hgvs_protein()` then returns undef unless the reference
+        // peptide exists (the coding_unknown consequence remains emitted).
+        // Variation 2fb834b, TranscriptVariationAllele.pm:739-764,1791-1800:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L764
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1791-L1800
+        let mut transcript = tx(
+            "T_ISSUE_241_HGVSP",
+            "22",
+            100,
+            108,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
+        transcript.translation_seq_edits = vec![TranslationSeqEdit {
+            code: "shortened_translation".to_string(),
+            start: 2,
+            end: 2,
+            alt_seq: String::new(),
+        }];
+        let transcript_exon = exon("T_ISSUE_241_HGVSP", 1, 100, 108);
+        let exons = [&transcript_exon];
+        let cached_translation = translation(
+            "T_ISSUE_241_HGVSP",
+            Some(9),
+            Some(3),
+            Some("MK*"),
+            Some("ATGAAATAA"),
+        );
+        let variant = var("22", 103, 103, "G", "A");
+        let fallback = crate::hgvs::ProteinHgvsData {
+            start: 2,
+            end: 2,
+            ref_peptide: "K".to_string(),
+            alt_peptide: "Q".to_string(),
+            ref_translation: "MK*".to_string(),
+            alt_translation: "MQ*".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        let protein = protein_hgvs_for_output_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            true,
+            Some((2, 2)),
+            Some(&fallback),
+            false,
+            None,
+            None,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+
+        assert!(
+            protein.is_none(),
+            "a missing source reference peptide suppresses HGVSp"
+        );
     }
 
     #[test]
@@ -20737,6 +20895,7 @@ mod tests {
         transcript.five_prime_utr_seq = Some("CTGCCCT".to_string());
         transcript.three_prime_utr_seq = Some("A".repeat(873));
         transcript.spliced_seq = Some(format!("CTGCCCT{cds}{}", "A".repeat(873)));
+        transcript.has_rna_edit = true;
         transcript.bam_edit_status = Some("ok".to_string());
         transcript.refseq_edits = vec![RefSeqEdit {
             start: 1260,
@@ -20762,7 +20921,9 @@ mod tests {
         tr.version = Some(1);
         tr.translation_seq_canonical = Some(peptide.to_string());
         tr.cds_sequence_canonical = Some(cds.to_string());
-        let ref_allele = format!("G{}", "N".repeat(419));
+        // ClinVar 1452802 exact ledger REF: the genomic allele is needed to
+        // exercise VEP's separate reference feature_seq and alternate CDS paths.
+        let ref_allele = "GGCCACCGCCGAGACCAGGGCCGCGCCCCGGCCACTGCCCTCCTCCGACTCGATGAAGGTGATCTCGCAGCTGGGCGTCAGCCTGCGCACGCTGGCATGGAACCGCTCCTTGAAGCTGGGCAGAAGAGAAGCAGGGCTGCCGTCCCTCCTCCCACCTCATCCTCCACATTCATTACCGGGCGCCCTGCACGCAGTCGACCCTTCCCCCAAATCTAGGCCAAGGGGGACGAGAAGAGGACTACGAAATCTTGGAGCTTGGGAACCGCAAGGAACCTTGGAGCGCGCGCTTTTTGGGCCCCACTTTACCAGGGAGAGAGCGGGGCGGGCTCACCTGGGGTGCAGCTTGTACACGGAGCCATCCACGCCCACAGTGATGCGCATTACGTCCTCGCTGCGGCTCTCGCGCATGCGGTTGATGAC".to_string();
         let variant = VariantInput::from_vcf(
             "7".to_string(),
             44145166,
@@ -27415,16 +27576,17 @@ mod tests {
     }
 
     #[test]
-    fn issue_202_spliced_inframe_deletion_uses_local_stop_peptides() {
-        // ClinVar 2530348, X:111410072 deletes c.210_569 across exons. The
-        // affected VEP peptide window contains internal stops in REF and only
-        // arginine in ALT, so stop_lost comes from those local peptides even
-        // though the deletion is in-frame and does not touch the terminal CDS.
-        // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:257-265,
-        // TranscriptVariationAllele.pm:850-877, and VariationEffect.pm:1234-1264:
+    fn issue_202_spliced_inframe_deletion_uses_unpatched_alternate_cds() {
+        // ClinVar 2530348, X:111410072 deletes c.210_569 across exons. For
+        // RefSeq-edited transcripts VEP patches the reference codon sequence
+        // with feature_seq but builds the alternate CDS from the original
+        // translateable sequence and mapped endpoints. This fixture keeps the
+        // intronic REF ambiguous so the assertion isolates the alternate path.
+        // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:257-265 and
+        // TranscriptVariationAllele.pm:868-877,2393-2415:
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L257-L265
-        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L850-L877
-        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1234-L1264
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L877
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2393-L2415
         let mut cds = b"GCT".repeat(100);
         cds[..3].copy_from_slice(b"ATG");
         // c.19_21 is AGT, making the local alternate codon AGA when the
@@ -27447,6 +27609,10 @@ mod tests {
         transcript.cdna_coding_end = Some(100);
         transcript.translateable_seq = Some(cds.clone());
         transcript.cdna_seq = Some(cds.clone());
+        // This models the ClinVar 2530348 RefSeq row: VEP patches the
+        // reference allele from feature_seq, but `_get_alternate_cds()` uses
+        // the original translateable CDS and mapped endpoints.
+        transcript.has_rna_edit = true;
         let exons = [
             exon("T_ISSUE_202_SPLICE", 1, 200, 229),
             exon("T_ISSUE_202_SPLICE", 2, 100, 169),
@@ -27465,16 +27631,7 @@ mod tests {
             crate::vep_semantics::VepSemantics::V116,
         )
         .expect("the two mapped CDS endpoints define a spliced deletion");
-        assert!(
-            class
-                .affected_ref_peptide
-                .as_deref()
-                .is_some_and(|pep| pep.contains('*')),
-            "{:?}",
-            class.affected_ref_peptide
-        );
         assert_eq!(class.affected_alt_peptide.as_deref(), Some("R"));
-        assert!(class.stop_lost);
     }
 
     #[test]

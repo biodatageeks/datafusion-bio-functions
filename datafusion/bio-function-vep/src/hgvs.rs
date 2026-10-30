@@ -1036,9 +1036,25 @@ where
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L431-L437
     // https://github.com/biodatageeks/vepyr/issues/269
     let area_to_search = 1000i64;
+    // VEP's VariationFeature represents an insertion as a zero-width interval
+    // (`start = end + 1`); VariantInput stores that same boundary as
+    // `start == end`. Restore VEP's end coordinate before expanding the slice
+    // so its final-1kb `post_seq` starts at the base immediately after the
+    // insertion. This preserves the deterministic MT 116 behavior tracked in
+    // vepyr#269.
+    // Ensembl Variation 2fb834b, VariationFeature.pm:51-57; ensembl-vep
+    // 57ea5c5, Parser.pm:563-570:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L51-L57
+    // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/Parser.pm#L563-L570
+    // https://github.com/biodatageeks/vepyr/issues/269
+    let vep_end = if matches!(kind, GenomicShiftKind::Insertion) {
+        start.saturating_sub(1)
+    } else {
+        end
+    };
     let pre_end = start.saturating_sub(1);
     let pre_start = (pre_end - area_to_search + 1).max(1);
-    let post_start = end.saturating_add(1);
+    let post_start = vep_end.saturating_add(1);
     let post_end = post_start.saturating_add(area_to_search.saturating_sub(1));
     let reference_record = reader
         .index()
@@ -3646,6 +3662,35 @@ mod tests {
 
         assert_eq!(prelude.pre_seq, sequence);
         assert_eq!(prelude.post_seq, sequence);
+    }
+
+    #[test]
+    fn issue_201_vcf_insertion_uses_vep_zero_width_span_for_flanks() {
+        use std::io::Cursor;
+
+        // ClinVar 690254 is a VCF insertion at the MT tRNA boundary. The
+        // engine stores its insertion point as start == end; VEP's
+        // VariationFeature uses start == end + 1. Its clipped expanded slice
+        // therefore ends one base earlier, which moves the last-1kb post_seq
+        // window one base toward the insertion and yields n.54dup.
+        // VariationFeature.pm:51-57 and ensembl-vep Parser.pm:563-570:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L51-L57
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/Parser.pm#L563-L570
+        let sequence = (0..2001)
+            .map(|index| b"ACGT"[index % 4] as char)
+            .collect::<String>();
+        let data = format!(">MT\n{sequence}\n");
+        let index =
+            fasta::fai::Index::from(vec![fasta::fai::Record::new("MT", 2001, 4, 2001, 2002)]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+
+        let prelude = prepare_genomic_shift_prelude(&mut reader, "MT", "-", "T", 1001, 1001)
+            .unwrap()
+            .expect("insertion has a shift prelude");
+
+        assert_eq!(prelude.pre_seq, sequence[..1000]);
+        assert_eq!(prelude.post_seq, sequence[1000..2000]);
     }
 
     fn make_transcript(
