@@ -2216,7 +2216,24 @@ fn apply_shifted_insertion_duplication(
     let alt_len = feature_alt.len() as i64;
     let display_start = shift.display_start();
     notation.kind = "dup".to_string();
-    if dup_from_five_prime {
+    // `hgvs_variant_notation()` checks the first insertion-repeat candidate at
+    // `substr(ref_sequence, ref_end, ...)` (zero-based) before its second
+    // candidate. For VEP's shifted insertion gap this is the transcript 3'
+    // flank, so preserve that first match when both repeat flanks are equal.
+    // Ensembl Variation 2fb834b, Utils/Sequence.pm:507-510, 570-589 and
+    // TranscriptVariationAllele.pm:1474-1492:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L507-L510
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L570-L589
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1474-L1492
+    if dup_from_three_prime {
+        if tx.strand >= 0 {
+            notation.start = display_start;
+            notation.end = display_start + alt_len - 1;
+        } else {
+            notation.start = display_start - alt_len;
+            notation.end = display_start - 1;
+        }
+    } else if dup_from_five_prime {
         if tx.strand >= 0 {
             notation.start = display_start - alt_len;
             notation.end = display_start - 1;
@@ -5402,6 +5419,64 @@ mod tests {
             "TCTGTTGCTG",
             Some(&shift)
         ));
+    }
+
+    #[test]
+    fn issue_201_mt_insertion_matches_golden_dup_coordinate_after_shift() {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "ENST00000387460".to_string();
+        tx.version = Some(2);
+        tx.start = 15_888;
+        tx.end = 15_953;
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 15_888,
+            end: 15_953,
+        };
+        let exons = [&exon];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 1,
+            start: 15_941,
+            end: 15_940,
+            shifted_compare_allele: "T".to_string(),
+            shifted_allele_string: "T".to_string(),
+            shifted_output_allele: "T".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "T".to_string(),
+            five_prime_flanking_seq: "".to_string(),
+            three_prime_flanking_seq: "T".to_string(),
+            five_prime_context: "T".to_string(),
+            three_prime_context: "T".to_string(),
+        };
+
+        // ClinVar 690254 (MT:15939 C>CT) is golden
+        // ENST00000387460.2:n.54dup, while the old helper returned n.53dup.
+        // For VEP's one-base insertion gap, lookup direction 1 indexes the
+        // reference sequence at `ref_end` (zero-based), selecting the base on
+        // the transcript's 3' side first. That is the source tie-break when
+        // both repeat flanks match (2fb834b, Utils/Sequence.pm:507-510,
+        // 570-589 and TranscriptVariationAllele.pm:1474-1492):
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L507-L510
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L570-L589
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1474-L1492
+        // The MT-end flank bug is deterministic and is tracked in vepyr#269.
+        // https://github.com/biodatageeks/vepyr/issues/269
+        assert_eq!(
+            format_hgvsc(
+                &tx,
+                &exons,
+                Some("53"),
+                None,
+                "-",
+                "T",
+                15_940,
+                15_939,
+                Some(&shift),
+            ),
+            Some("ENST00000387460.2:n.54dup".to_string())
+        );
     }
 
     #[test]
