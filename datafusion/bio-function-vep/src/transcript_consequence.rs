@@ -11415,7 +11415,14 @@ fn ins_del_start_altered(
         mutated.extend_from_slice(&seq_bytes[after..]);
     }
 
-    if let Some(utr) = utr {
+    // Ensembl's Perl `if ($utr)` is false when the UTR sequence is empty;
+    // Core returns no 5'UTR object for an empty slice, so skip this early ATG
+    // check and continue to the translateable-suffix comparison.
+    // Ensembl core c0cf13d, Transcript.pm:1746-1761:
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+    // Ensembl Variation 2fb834b, VariationEffect.pm:1050-1071:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1050-L1071
+    if let Some(utr) = utr.filter(|utr| !utr.is_empty()) {
         let atg_start = utr.len();
         if mutated.len() >= atg_start + 3 {
             let new_sc = &mutated[atg_start..atg_start + 3];
@@ -27784,6 +27791,41 @@ mod tests {
             result,
             Some(false),
             "Insertion after start codon should preserve ATG"
+        );
+    }
+
+    #[test]
+    fn clinvar_96674_empty_utr_skips_the_start_codon_early_return() {
+        // Golden ClinVar 96674 has an in-frame insertion after the start
+        // codon, but no start_lost or start_retained_variant term. Its cache
+        // transcript has an empty 5'UTR and a CDS beginning at cDNA 1.
+        // VariationEffect.pm's `if ($utr)` skips the early ATG-preserved
+        // return when Core's `_five_prime_utr()` has no non-empty sequence;
+        // `_ins_del_start_altered()` then compares the translated suffix.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:1050-1071:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1050-L1071
+        // Ensembl core c0cf13d, Transcript.pm:1746-1761:
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+        let cds = "ATGGCTGAATGA";
+        let (t, exons) = tx_with_cds_only_cdna("", cds);
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let insertion = var("22", 1002, 1002, "-", "GGAGCC");
+
+        assert_eq!(
+            ins_del_start_altered(&t, &exons_ref, &insertion, None),
+            Some(true),
+            "with no 5'UTR object, VEP compares the changed translateable suffix"
+        );
+        assert!(
+            !vep116_start_retained_variant(
+                &t,
+                &exons_ref,
+                &insertion,
+                cds.as_bytes(),
+                0,
+                Some(cds),
+            ),
+            "start_retained_variant negates the source predicate for this insertion"
         );
     }
 
