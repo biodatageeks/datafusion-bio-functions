@@ -9589,13 +9589,17 @@ fn classify_coding_change_with_spliced_span(
     // including when that allele contains intronic bases.
     // Capture attribute presence before hydration can infer coordinate edits.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L874
-    let cds_seq = if tx.has_rna_edit && ref_seq_slice != effective_ref_tx {
-        let mut edited_cds = cds_seq.into_bytes();
+    let ref_cds_seq = if tx.has_rna_edit && ref_seq_slice != effective_ref_tx {
+        let mut edited_cds = cds_seq.clone().into_bytes();
         edited_cds.splice(start_idx..=end_idx, effective_ref_tx.bytes());
-        String::from_utf8(edited_cds).ok()?
+        Some(String::from_utf8(edited_cds).ok()?)
     } else {
-        cds_seq
+        None
     };
+    // The alternate CDS is built from the unpatched translateable sequence:
+    // _get_alternate_cds() joins the bases before cds_start, the ALT, and the
+    // bases after cds_end. Only the reference codon carries the patch above.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L866-L875
     let mut mutated = Vec::with_capacity(
         cds_seq
             .len()
@@ -9606,6 +9610,7 @@ fn classify_coding_change_with_spliced_span(
     let alt_bytes = alt_tx.as_bytes();
     mutated.extend_from_slice(alt_bytes);
     mutated.extend_from_slice(&cds_seq.as_bytes()[end_idx + 1..]);
+    let cds_seq = ref_cds_seq.unwrap_or(cds_seq);
 
     let old_aas = reference_aas_for_consequence(tx, tx_translation, cds_seq.as_str())?;
     let new_aas =
@@ -20810,6 +20815,68 @@ mod tests {
         assert_eq!(entry.cds_position.as_deref(), Some("7-18"));
         assert_eq!(entry.codons.as_deref(), Some("NNNNNNNNNNNN/-"));
         assert_eq!(entry.amino_acids.as_deref(), Some("XXXX/-"));
+    }
+
+    #[test]
+    fn issue_215_spliced_rna_edit_builds_the_alternate_from_the_unpatched_cds() {
+        // VEP patches only the reference CDS with the full feature allele;
+        // _get_alternate_cds() splices the ALT into the unpatched
+        // _translateable_seq() over the mapped CDS span, so no intronic REF
+        // base survives in the alternate codon.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L866-L875
+        let cds = "ATGAAACCTGAAGAACCTGGATAA";
+        let mut transcript = tx(
+            "NM_215_RNA_EDIT_ALT.1",
+            "22",
+            100,
+            211,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(211),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.has_rna_edit = true;
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(24);
+        transcript.translateable_seq = Some(cds.to_string());
+        let exons = [
+            exon("NM_215_RNA_EDIT_ALT.1", 1, 100, 111),
+            exon("NM_215_RNA_EDIT_ALT.1", 2, 200, 211),
+        ];
+        let tr = translation(
+            "NM_215_RNA_EDIT_ALT.1",
+            Some(24),
+            Some(7),
+            Some("MKPEEPG*"),
+            Some(cds),
+        );
+        // CDS 7-12, the 88-base intron 112-199, then CDS 13-17.
+        let ref_allele = format!("CCTGAA{}GAACC", "A".repeat(88));
+        let deletion = var("22", 106, 204, &ref_allele, "-");
+
+        let assignments = TranscriptConsequenceEngine::default().evaluate_variant_with_context(
+            &deletion,
+            &[transcript],
+            &exons,
+            &[tr],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let entry = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("NM_215_RNA_EDIT_ALT.1"))
+            .expect("RNA-edited transcript consequence is emitted");
+        assert_eq!(entry.cds_position.as_deref(), Some("7-17"));
+        // Alternate CDS ATGAAA + TGGATAA: the codon window keeps CDS 18 only.
+        let codons = entry.codons.as_deref().expect("codons are emitted");
+        assert_eq!(
+            codons.split_once('/').map(|(_, alt)| alt),
+            Some("t"),
+            "{codons}"
+        );
     }
 
     #[test]
