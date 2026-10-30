@@ -1759,7 +1759,7 @@ impl TranscriptConsequenceEngine {
                         let given_hgvsc_reference =
                             given_ref.as_deref().unwrap_or(&variant.ref_allele);
                         let hgvsc_ref_allele = hgvsc_reference_for_output(
-                            self.bam_edited != Some(false),
+                            use_feature_ref_for_output(self.bam_edited, tx.has_rna_edit),
                             feature_reference,
                             given_hgvsc_reference,
                             genomic_reference,
@@ -1892,7 +1892,7 @@ impl TranscriptConsequenceEngine {
                             hgvs_shift,
                             hgvsc_detail_profile.as_mut(),
                             self.semantics,
-                            self.bam_edited != Some(false),
+                            use_feature_ref_for_output(self.bam_edited, tx.has_rna_edit),
                             rna_edit_classification_reference(
                                 tx.has_rna_edit,
                                 hgvsc_ref_allele,
@@ -2518,13 +2518,8 @@ impl TranscriptConsequenceEngine {
             // `CodingSequenceVariant` is inserted only by `add_coding_terms`,
             // after the variant has been shown to overlap the CDS. Therefore
             // this VEP `coding_unknown()` call is always within the CDS.
-            let coding_unknown = vep116_coding_unknown_with_table(
-                &terms,
-                coding_class.as_ref(),
-                tx.codon_table,
-                true,
-                complete_overlap,
-            );
+            let coding_unknown =
+                vep116_coding_unknown(&terms, coding_class.as_ref(), true, complete_overlap);
             if !coding_unknown {
                 terms.remove(&SoTerm::CodingSequenceVariant);
             }
@@ -6308,22 +6303,6 @@ fn vep116_coding_unknown(
     within_cds: bool,
     complete_overlap: bool,
 ) -> bool {
-    vep116_coding_unknown_with_table(
-        terms,
-        classification,
-        CodonTable::Standard,
-        within_cds,
-        complete_overlap,
-    )
-}
-
-fn vep116_coding_unknown_with_table(
-    terms: &BTreeSet<SoTerm>,
-    classification: Option<&CodingClassification>,
-    _codon_table: CodonTable,
-    within_cds: bool,
-    complete_overlap: bool,
-) -> bool {
     if !within_cds || complete_overlap {
         return false;
     }
@@ -9053,6 +9032,8 @@ fn protein_hgvs_for_output_with_semantics(
     // alternate CDS before reading local peptide windows. At a terminal
     // frameshift whose start lies beyond that translation, VEP returns
     // `alt=del,type=del`; the ambiguous `*/X` fallback must not override it.
+    // VEP's source translation has no transcript-table argument, so this source
+    // condition applies to equivalent non-MT transcripts as well as MT rows.
     // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:2314-2339:
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2314-L2339
     let source_terminal_frameshift_deletion = shifted.as_ref().is_some_and(|protein| {
@@ -13007,6 +12988,18 @@ fn hgvsc_reference_for_output<'a>(
     }
 }
 
+/// Cache metadata selects VEP's global `use_transcript_ref` policy. If metadata
+/// is absent, preserve the previous RNA-edit-only override until the cache can
+/// state that policy explicitly. VEP 116 passes `use_transcript_ref` through
+/// `AnnotationType::Transcript::annotate_InputBuffer()` to the variation
+/// adaptor, while `_rna_edit` attributes independently override HGVSc alleles:
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L99-L99
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L153-L162
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1507-L1514
+fn use_feature_ref_for_output(bam_edited: Option<bool>, has_rna_edit: bool) -> bool {
+    bam_edited.unwrap_or(has_rna_edit)
+}
+
 fn used_ref_with_cache_policy(
     variant: &VariantInput,
     tx: &TranscriptFeature,
@@ -14705,12 +14698,11 @@ mod tests {
             ..Default::default()
         };
         let terms = BTreeSet::from([SoTerm::CodingSequenceVariant]);
-        assert!(vep116_coding_unknown_with_table(
+        assert!(vep116_coding_unknown(
             &terms,
             Some(&classification),
-            CodonTable::Standard,
             true,
-            false,
+            false
         ));
     }
 
@@ -14755,7 +14747,9 @@ mod tests {
                 );
                 assert_eq!(result[0].given_ref.as_deref(), Some("C"));
                 assert_eq!(result[0].used_ref.as_deref(), Some(expected));
-                let feature_or_genomic_ref = if policy.is_none() { "C" } else { "A" };
+                // `None` retains the historical RNA-edit-only reference rule;
+                // this non-RNA-edited fixture uses its genomic reference.
+                let feature_or_genomic_ref = "A";
                 let expected_hgvs = if strand == 1 {
                     format!("ENST_REFERENCE:n.6{feature_or_genomic_ref}>T")
                 } else {

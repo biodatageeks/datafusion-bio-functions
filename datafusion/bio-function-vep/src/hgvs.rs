@@ -1028,16 +1028,39 @@ where
     let pre_start = (pre_end - area_to_search + 1).max(1);
     let post_start = end.saturating_add(1);
     let post_end = post_start.saturating_add(area_to_search.saturating_sub(1));
-    let clipped_slice = if post_end >= pre_start && post_end > 0 {
-        read_reference_sequence(reader, chrom, pre_start, post_end)?
+    let reference_record = reader
+        .index()
+        .as_ref()
+        .iter()
+        .find(|record| record.name() == chrom.as_bytes())
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "reference FASTA index has no sequence named {chrom}"
+            ))
+        })?;
+    let sequence_length = i64::try_from(reference_record.length()).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "reference FASTA sequence length is too large for {chrom}: {error}"
+        ))
+    })?;
+    let clipped_start = pre_start.max(1);
+    let clipped_end = post_end.min(sequence_length);
+    let (pre_seq, post_seq) = if clipped_end >= clipped_start && post_end > 0 {
+        let clipped_length = clipped_end - clipped_start + 1;
+        let pre_length = clipped_length.min(area_to_search);
+        let post_length = clipped_length.min(area_to_search);
+        let pre_flank_end = clipped_start + pre_length - 1;
+        let post_flank_start = clipped_end - post_length + 1;
+        let pre_seq = read_reference_sequence(reader, chrom, clipped_start, pre_flank_end)?;
+        let post_seq = if post_flank_start == clipped_start && pre_flank_end == clipped_end {
+            pre_seq.clone()
+        } else {
+            read_reference_sequence(reader, chrom, post_flank_start, clipped_end)?
+        };
+        (pre_seq, post_seq)
     } else {
-        String::new()
+        (String::new(), String::new())
     };
-    let slice_bytes = clipped_slice.as_bytes();
-    let pre_end = slice_bytes.len().min(area_to_search as usize);
-    let post_start = slice_bytes.len().saturating_sub(area_to_search as usize);
-    let pre_seq = String::from_utf8_lossy(&slice_bytes[..pre_end]).into_owned();
-    let post_seq = String::from_utf8_lossy(&slice_bytes[post_start..]).into_owned();
 
     Ok(Some(GenomicShiftPrelude {
         seq_to_check,
