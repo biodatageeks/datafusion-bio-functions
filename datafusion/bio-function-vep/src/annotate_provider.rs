@@ -4395,6 +4395,8 @@ impl AnnotateProvider {
                 "cdna_coding_start",
                 "cdna_coding_end",
                 "gene_stable_id",
+                "gene_start",
+                "gene_end",
                 "gene_symbol",
                 "gene_symbol_source",
                 "gene_hgnc_id_native",
@@ -4463,6 +4465,16 @@ impl AnnotateProvider {
             let end_idx = schema.index_of("end").map_err(|_| {
                 DataFusionError::Execution(format!(
                     "annotate_vep(): transcript table '{table}' is missing required column end"
+                ))
+            })?;
+            let gene_start_idx = schema.index_of("gene_start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column gene_start"
+                ))
+            })?;
+            let gene_end_idx = schema.index_of("gene_end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column gene_end"
                 ))
             })?;
             let strand_idx = schema.index_of("strand").map_err(|_| {
@@ -4536,6 +4548,17 @@ impl AnnotateProvider {
                 let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
                     continue;
                 };
+                let gene_start = int64_at(batch.column(gene_start_idx).as_ref(), row)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "annotate_vep(): transcript table '{table}' has a null gene_start at row {row}"
+                        ))
+                    })?;
+                let gene_end = int64_at(batch.column(gene_end_idx).as_ref(), row).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "annotate_vep(): transcript table '{table}' has a null gene_end at row {row}"
+                    ))
+                })?;
                 let Some(strand_raw) = int64_at(batch.column(strand_idx).as_ref(), row) else {
                     continue;
                 };
@@ -4724,6 +4747,8 @@ impl AnnotateProvider {
                     cdna_mapper_segments,
                     mature_mirna_regions,
                     gene_stable_id,
+                    gene_start,
+                    gene_end,
                     gene_symbol,
                     gene_symbol_source,
                     gene_hgnc_id_native,
@@ -5208,6 +5233,16 @@ impl AnnotateProvider {
                     "annotate_vep(): transcript table '{table}' is missing required column end"
                 ))
             })?;
+            let gene_start_idx = schema.index_of("gene_start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column gene_start"
+                ))
+            })?;
+            let gene_end_idx = schema.index_of("gene_end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column gene_end"
+                ))
+            })?;
             let strand_idx = schema.index_of("strand").map_err(|_| {
                 DataFusionError::Execution(format!(
                     "annotate_vep(): transcript table '{table}' is missing required column strand"
@@ -5278,6 +5313,17 @@ impl AnnotateProvider {
                 let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
                     continue;
                 };
+                let gene_start = int64_at(batch.column(gene_start_idx).as_ref(), row)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "annotate_vep(): transcript table '{table}' has a null gene_start at row {row}"
+                        ))
+                    })?;
+                let gene_end = int64_at(batch.column(gene_end_idx).as_ref(), row).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "annotate_vep(): transcript table '{table}' has a null gene_end at row {row}"
+                    ))
+                })?;
                 let Some(strand_raw) = int64_at(batch.column(strand_idx).as_ref(), row) else {
                     continue;
                 };
@@ -5405,6 +5451,8 @@ impl AnnotateProvider {
                     mature_mirna_regions,
                     gene_stable_id: gene_stable_id_idx
                         .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    gene_start,
+                    gene_end,
                     gene_symbol: gene_symbol_idx
                         .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
                     gene_symbol_source: gene_symbol_source_idx
@@ -10657,6 +10705,8 @@ const TRANSCRIPT_CONTEXT_COLUMNS: &[&str] = &[
     "cdna_coding_start",
     "cdna_coding_end",
     "gene_stable_id",
+    "gene_start",
+    "gene_end",
     "gene_symbol",
     "gene_symbol_source",
     "gene_hgnc_id_native",
@@ -13918,7 +13968,13 @@ fn cache_regions_for_coords(
 }
 
 fn transcript_cache_regions(transcript: &TranscriptFeature) -> Vec<TranscriptCacheRegion> {
-    cache_regions_for_coords(&transcript.chrom, transcript.start, transcript.end, 0, 0)
+    cache_regions_for_coords(
+        &transcript.chrom,
+        transcript.gene_start,
+        transcript.gene_end,
+        0,
+        0,
+    )
 }
 
 fn collect_buffer_cache_regions(
@@ -14151,13 +14207,12 @@ fn build_stateful_buffer_local_transcripts_cow(
         transcript_cache_regions,
         &active_regions,
     );
-    // Donor scope = the buffer-range (min/max) transcript set, matching Ensembl
-    // VEP's `filter_features_by_min_max($buffer->min_max)` before `merge_features`
-    // (AnnotationSource.pm). Region-wide donors over-donate: with grid-aligned
-    // buffers, the upstream TENM3 buffer (max 182,076,628) must NOT see the
-    // 182,143,918 Ensembl donor; region scope would still pull it in via the
-    // active 1Mb region (#108 false positives).
-    apply_buffer_local_hgnc_propagation(&mut buffer, transcripts);
+    apply_buffer_local_hgnc_propagation_in_regions(
+        &mut buffer,
+        transcripts,
+        transcript_cache_regions,
+        &active_regions,
+    );
 
     // Re-persist only the transcripts that actually diverged from base (Owned).
     // Borrowed transcripts equal base, so restoring them next buffer is a no-op;
@@ -14274,6 +14329,37 @@ fn apply_buffer_local_hgnc_propagation(
 ) {
     let (hgnc_by_symbol, gene_fill_by_stable_id) =
         collect_hgnc_donors(transcripts.iter().map(|bt| bt.as_ref(base)));
+    apply_hgnc_donors(transcripts, base, &hgnc_by_symbol, &gene_fill_by_stable_id);
+}
+
+/// Restrict HGNC donor candidates to min/max-overlapping transcripts whose
+/// gene bounds overlap a cache region requested for this buffer.
+///
+/// Traceability to Ensembl VEP release/116.0:
+/// - `AnnotationSource::get_regions_from_coords()` selects cache bins for each
+///   buffered variant using its coordinates plus the configured flank
+///   (`AnnotationSource.pm:189-200`):
+///   <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L189-L200>
+/// - The cache loader iterates genes overlapping each bin, then their
+///   transcripts (`AnnotationSource/Database/Transcript.pm:216-226,237,250-286`):
+///   <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L216-L226>
+/// - VEP filters those loaded features by buffer min/max before
+///   `merge_features()` (`AnnotationSource.pm:138-144`), where it collects and
+///   copies `_gene_hgnc_id` by `_gene_symbol` (`AnnotationType/Transcript.pm:289-308`):
+///   <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L138-L144>
+///   <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L289-L308>
+fn apply_buffer_local_hgnc_propagation_in_regions(
+    transcripts: &mut [CowTranscript],
+    base: &[TranscriptFeature],
+    transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
+    active_regions: &HashSet<TranscriptCacheRegion>,
+) {
+    let donors = transcripts.iter().map(|bt| bt.as_ref(base)).filter(|tx| {
+        transcript_cache_regions
+            .get(&tx.transcript_id)
+            .is_some_and(|regions| regions.iter().any(|region| active_regions.contains(region)))
+    });
+    let (hgnc_by_symbol, gene_fill_by_stable_id) = collect_hgnc_donors(donors);
     apply_hgnc_donors(transcripts, base, &hgnc_by_symbol, &gene_fill_by_stable_id);
 }
 
@@ -19015,6 +19101,8 @@ mod tests {
                 Field::new("chrom", DataType::Utf8, false),
                 Field::new("start", DataType::Int64, false),
                 Field::new("end", DataType::Int64, false),
+                Field::new("gene_start", DataType::Int64, false),
+                Field::new("gene_end", DataType::Int64, false),
                 Field::new("strand", DataType::Int64, false),
                 Field::new("biotype", DataType::Utf8, false),
                 Field::new("bam_edit_status", DataType::Utf8, true),
@@ -19029,6 +19117,8 @@ mod tests {
                 Arc::new(StringArray::from(vec!["1"; 4])),
                 Arc::new(Int64Array::from(vec![100_i64; 4])),
                 Arc::new(Int64Array::from(vec![200_i64; 4])),
+                Arc::new(Int64Array::from(vec![90_i64; 4])),
+                Arc::new(Int64Array::from(vec![210_i64; 4])),
                 Arc::new(Int64Array::from(vec![1_i64; 4])),
                 Arc::new(StringArray::from(vec!["protein_coding"; 4])),
                 Arc::new(StringArray::from(vec![Some("ok"); 4])),
@@ -19106,6 +19196,8 @@ mod tests {
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
+            Field::new("gene_start", DataType::Int64, false),
+            Field::new("gene_end", DataType::Int64, false),
             Field::new("strand", DataType::Int64, false),
             Field::new("biotype", DataType::Utf8, false),
             Field::new("gene_stable_id", DataType::Utf8, true),
@@ -19155,6 +19247,8 @@ mod tests {
                 Arc::new(StringArray::from(vec!["1"])) as Arc<dyn Array>,
                 Arc::new(Int64Array::from(vec![100_i64])) as Arc<dyn Array>,
                 Arc::new(Int64Array::from(vec![200_i64])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![90_i64])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![210_i64])) as Arc<dyn Array>,
                 Arc::new(Int64Array::from(vec![1_i64])) as Arc<dyn Array>,
                 Arc::new(StringArray::from(vec!["protein_coding"])) as Arc<dyn Array>,
                 Arc::new(StringArray::from(vec![Some("ENSG_TYPED")])) as Arc<dyn Array>,
@@ -19271,6 +19365,8 @@ mod tests {
                 Field::new("chrom", DataType::Utf8, false),
                 Field::new("start", DataType::Int64, false),
                 Field::new("end", DataType::Int64, false),
+                Field::new("gene_start", DataType::Int64, false),
+                Field::new("gene_end", DataType::Int64, false),
                 Field::new("strand", DataType::Int64, false),
                 Field::new("biotype", DataType::Utf8, false),
                 Field::new("bam_edit_status", DataType::Utf8, true),
@@ -19289,6 +19385,8 @@ mod tests {
                 Arc::new(StringArray::from(vec!["1"; 4])),
                 Arc::new(Int64Array::from(vec![100_i64; 4])),
                 Arc::new(Int64Array::from(vec![200_i64; 4])),
+                Arc::new(Int64Array::from(vec![90_i64; 4])),
+                Arc::new(Int64Array::from(vec![210_i64; 4])),
                 Arc::new(Int64Array::from(vec![1_i64; 4])),
                 Arc::new(StringArray::from(vec!["protein_coding"; 4])),
                 Arc::new(StringArray::from(vec![
@@ -20535,6 +20633,8 @@ mod tests {
             cdna_mapper_segments: Vec::new(),
             mature_mirna_regions: Vec::new(),
             gene_stable_id: gene_stable_id.map(|s| s.to_string()),
+            gene_start: 1,
+            gene_end: 100,
             gene_symbol: symbol.map(|s| s.to_string()),
             gene_symbol_source: symbol_source.map(|s| s.to_string()),
             gene_hgnc_id_native: native_hgnc_id.map(|s| s.to_string()),
@@ -21184,6 +21284,8 @@ mod tests {
         tx_recipient.chrom = "chr1".to_string();
         tx_recipient.start = 110_874_957;
         tx_recipient.end = 110_963_922;
+        tx_recipient.gene_start = 110_874_957;
+        tx_recipient.gene_end = 110_963_922;
         tx_recipient.biotype = "protein_coding".to_string();
         let mut tx_donor = make_tx(
             "ENST00000369763",
@@ -21195,6 +21297,8 @@ mod tests {
         tx_donor.chrom = "chr1".to_string();
         tx_donor.start = 110_947_190;
         tx_donor.end = 110_963_922;
+        tx_donor.gene_start = 110_947_190;
+        tx_donor.gene_end = 110_963_922;
         tx_donor.biotype = "protein_coding".to_string();
         let shared = minimal_shared_contig_annotation_context_with_context(
             vec![tx_recipient, tx_donor],
@@ -21292,6 +21396,8 @@ mod tests {
         tx_recipient.chrom = "chr1".to_string();
         tx_recipient.start = 110_874_957;
         tx_recipient.end = 110_963_922;
+        tx_recipient.gene_start = 110_874_957;
+        tx_recipient.gene_end = 110_963_922;
         tx_recipient.biotype = "protein_coding".to_string();
 
         let mut tx_donor = make_tx(
@@ -21304,6 +21410,8 @@ mod tests {
         tx_donor.chrom = "chr1".to_string();
         tx_donor.start = 110_947_190;
         tx_donor.end = 110_963_922;
+        tx_donor.gene_start = 110_947_190;
+        tx_donor.gene_end = 110_963_922;
         tx_donor.biotype = "protein_coding".to_string();
 
         let shared = minimal_shared_contig_annotation_context_with_context(
@@ -22916,6 +23024,8 @@ mod tests {
         tx_recipient.chrom = "chr1".to_string();
         tx_recipient.start = 110_874_957;
         tx_recipient.end = 110_963_922;
+        tx_recipient.gene_start = 110_874_957;
+        tx_recipient.gene_end = 110_963_922;
         tx_recipient.biotype = "protein_coding".to_string();
 
         let mut tx_donor = make_tx(
@@ -22928,6 +23038,8 @@ mod tests {
         tx_donor.chrom = "chr1".to_string();
         tx_donor.start = 110_947_190;
         tx_donor.end = 110_963_922;
+        tx_donor.gene_start = 110_947_190;
+        tx_donor.gene_end = 110_963_922;
         tx_donor.biotype = "protein_coding".to_string();
 
         let transcripts = vec![tx_recipient, tx_donor];
@@ -22979,6 +23091,8 @@ mod tests {
         tx_recipient.chrom = "chr1".to_string();
         tx_recipient.start = 155_045_191;
         tx_recipient.end = 155_063_991;
+        tx_recipient.gene_start = 155_045_191;
+        tx_recipient.gene_end = 155_063_991;
         tx_recipient.biotype = "lncRNA".to_string();
 
         let mut tx_donor = make_tx(
@@ -22991,6 +23105,8 @@ mod tests {
         tx_donor.chrom = "chr1".to_string();
         tx_donor.start = 155_045_191;
         tx_donor.end = 155_051_172;
+        tx_donor.gene_start = 155_045_191;
+        tx_donor.gene_end = 155_051_172;
         tx_donor.biotype = "lncRNA".to_string();
 
         let transcripts = vec![tx_recipient, tx_donor];
@@ -23030,6 +23146,106 @@ mod tests {
         );
     }
 
+    fn linc02718_sparse_gene_buffer(touches_region_23: bool) -> Vec<TranscriptFeature> {
+        let mut transcripts: Vec<_> = [
+            "NR_187205.1",
+            "NR_187206.1",
+            "NR_187207.1",
+            "NR_187208.1",
+            "NR_187209.1",
+            "NR_187210.1",
+        ]
+        .into_iter()
+        .map(|id| {
+            let mut tx = make_tx(
+                id,
+                Some("105376592"),
+                Some("LINC02718"),
+                Some("EntrezGene"),
+                None,
+            );
+            tx.chrom = "chr11".to_string();
+            tx.start = 22_829_414;
+            tx.end = 23_205_797;
+            tx.gene_start = 22_829_414;
+            tx.gene_end = 23_205_797;
+            tx
+        })
+        .collect();
+        let mut donor = make_tx(
+            "ENST_LINC02718_HGNC_DONOR",
+            Some("ENSG_LINC02718"),
+            Some("LINC02718"),
+            Some("HGNC"),
+            Some("HGNC:54235"),
+        );
+        donor.chrom = "chr11".to_string();
+        donor.start = 23_050_000;
+        donor.end = 23_100_000;
+        donor.gene_start = 23_050_000;
+        donor.gene_end = 23_100_000;
+        transcripts.push(donor);
+
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+        let positions: Vec<i64> = if touches_region_23 {
+            vec![22_800_000, 23_050_000, 24_100_000]
+        } else {
+            vec![22_800_000, 24_100_000]
+        };
+        build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &[make_buffer_batch_many("chr11", &positions)],
+            "chr11",
+            22_800_000,
+            24_100_000,
+            5_000,
+            5_000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_hgnc_donor_is_ignored_from_untouched_gene_region() {
+        // The buffer min/max spans region 23, but its variants request only
+        // regions 22 and 24. VEP loads genes overlapping requested cache bins
+        // and passes their min/max-overlapping transcripts to merge_features.
+        // See ensembl-vep release/116.0 AnnotationSource.pm:138-144,189-200
+        // and AnnotationSource/Database/Transcript.pm:237,250-286.
+        let scoped = linc02718_sparse_gene_buffer(false);
+        for transcript in scoped
+            .iter()
+            .filter(|tx| tx.transcript_id.starts_with("NR_18720"))
+        {
+            assert_eq!(
+                transcript.gene_hgnc_id, None,
+                "a donor in untouched cache region 23 cannot fill {}",
+                transcript.transcript_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_hgnc_donor_is_used_from_touched_gene_region() {
+        let scoped = linc02718_sparse_gene_buffer(true);
+        for transcript in scoped
+            .iter()
+            .filter(|tx| tx.transcript_id.starts_with("NR_18720"))
+        {
+            assert_eq!(
+                transcript.gene_hgnc_id.as_deref(),
+                Some("HGNC:54235"),
+                "a donor in requested cache region 23 fills {}",
+                transcript.transcript_id
+            );
+        }
+    }
+
     #[test]
     fn test_stateful_buffer_local_transcripts_carry_hgnc_across_adjacent_buffers() {
         let mut tx_donor = make_tx(
@@ -23041,6 +23257,8 @@ mod tests {
         );
         tx_donor.start = 100;
         tx_donor.end = 200;
+        tx_donor.gene_start = 100;
+        tx_donor.gene_end = 200;
 
         let mut tx_recipient = make_tx(
             "XR_RECIPIENT",
@@ -23051,6 +23269,8 @@ mod tests {
         );
         tx_recipient.start = 100;
         tx_recipient.end = 700_000;
+        tx_recipient.gene_start = 100;
+        tx_recipient.gene_end = 700_000;
 
         let transcripts = vec![tx_donor, tx_recipient];
         let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
@@ -23110,6 +23330,8 @@ mod tests {
         tx_donor.chrom = "chr7".to_string();
         tx_donor.start = 40_134_044;
         tx_donor.end = 40_861_613;
+        tx_donor.gene_start = 40_134_044;
+        tx_donor.gene_end = 40_861_613;
 
         let mut tx_recipient = make_tx(
             "XR_007060157.1",
@@ -23121,6 +23343,8 @@ mod tests {
         tx_recipient.chrom = "chr7".to_string();
         tx_recipient.start = 40_135_005;
         tx_recipient.end = 41_038_816;
+        tx_recipient.gene_start = 40_135_005;
+        tx_recipient.gene_end = 41_038_816;
 
         let transcripts = vec![tx_donor, tx_recipient];
         let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
@@ -23179,6 +23403,8 @@ mod tests {
         );
         tx_donor.start = 100;
         tx_donor.end = 200;
+        tx_donor.gene_start = 100;
+        tx_donor.gene_end = 200;
 
         let mut tx_region0 = make_tx(
             "XR_REGION0",
@@ -23189,6 +23415,8 @@ mod tests {
         );
         tx_region0.start = 100;
         tx_region0.end = 700_000;
+        tx_region0.gene_start = 100;
+        tx_region0.gene_end = 700_000;
 
         let mut tx_region1 = make_tx(
             "XR_REGION1",
@@ -23199,6 +23427,8 @@ mod tests {
         );
         tx_region1.start = 1_050_000;
         tx_region1.end = 1_060_000;
+        tx_region1.gene_start = 1_050_000;
+        tx_region1.gene_end = 1_060_000;
 
         let transcripts = vec![tx_donor, tx_region0, tx_region1];
         let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
