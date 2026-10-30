@@ -27827,6 +27827,17 @@ mod tests {
             ),
             "start_retained_variant negates the source predicate for this insertion"
         );
+
+        // The same insertion with an actual non-empty 5'UTR still takes
+        // VariationEffect.pm's ATG-preserved early return.
+        let (utr_tx, utr_exons) = tx_with_cdna("GCGC", cds);
+        let utr_exons_ref: Vec<&ExonFeature> = utr_exons.iter().collect();
+        let utr_insertion = var("22", 1006, 1006, "-", "GGAGCC");
+        assert_eq!(
+            ins_del_start_altered(&utr_tx, &utr_exons_ref, &utr_insertion, None),
+            Some(false),
+            "the non-empty 5'UTR preserves the unchanged ATG early return"
+        );
     }
 
     #[test]
