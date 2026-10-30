@@ -1016,26 +1016,28 @@ where
     let seq_to_check = seq_to_check.as_bytes().to_vec();
     let hgvs_output = alt_allele.as_bytes().to_vec();
 
-    // Traceability:
-    // - Ensembl Variation `TranscriptVariationAllele::_genomic_shift()`
-    //   expands the VF slice by 1000bp on both sides, then passes both
-    //   `pre_seq` and `post_seq` into `perform_shift()`
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L425-L465>
+    // VEP 116 expands one reference slice by 1000bp on each side, clips it to
+    // the sequence region, then takes pre_seq from the first 1000 bases and
+    // post_seq from the last 1000 bases. At a contig end those windows overlap;
+    // preserve this deterministic VEP bug for parity and track it in vepyr#269.
+    // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:431-437:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L431-L437
+    // https://github.com/biodatageeks/vepyr/issues/269
     let area_to_search = 1000i64;
     let pre_end = start.saturating_sub(1);
     let pre_start = (pre_end - area_to_search + 1).max(1);
     let post_start = end.saturating_add(1);
     let post_end = post_start.saturating_add(area_to_search.saturating_sub(1));
-    let pre_seq: String = if pre_end >= pre_start && pre_end > 0 {
-        read_reference_sequence(reader, chrom, pre_start, pre_end)?
+    let clipped_slice = if post_end >= pre_start && post_end > 0 {
+        read_reference_sequence(reader, chrom, pre_start, post_end)?
     } else {
         String::new()
     };
-    let post_seq: String = if post_end >= post_start && post_start > 0 {
-        read_reference_sequence(reader, chrom, post_start, post_end)?
-    } else {
-        String::new()
-    };
+    let slice_bytes = clipped_slice.as_bytes();
+    let pre_end = slice_bytes.len().min(area_to_search as usize);
+    let post_start = slice_bytes.len().saturating_sub(area_to_search as usize);
+    let pre_seq = String::from_utf8_lossy(&slice_bytes[..pre_end]).into_owned();
+    let post_seq = String::from_utf8_lossy(&slice_bytes[post_start..]).into_owned();
 
     Ok(Some(GenomicShiftPrelude {
         seq_to_check,
@@ -3534,6 +3536,32 @@ fn format_hgvsp_notation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_201_mt_end_flank_uses_suffix_of_clipped_slice() {
+        use std::io::Cursor;
+
+        // ClinVar 690254, MT:15939 C>CT is at the end of a short feature
+        // slice. VEP clips the 1kb-expanded slice to the contig, then takes
+        // post_seq from the final 1kb of that clipped slice; it can overlap
+        // the pre-variant sequence. This deterministic VEP 116 behavior is
+        // tracked for correction in vepyr#269.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:431-437:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L431-L437
+        // https://github.com/biodatageeks/vepyr/issues/269
+        let sequence = "ACGTACGTACGT";
+        let data = format!(">MT\n{sequence}\n");
+        let index = fasta::fai::Index::from(vec![fasta::fai::Record::new("MT", 12, 4, 12, 13)]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+
+        let prelude = prepare_genomic_shift_prelude(&mut reader, "MT", "A", "-", 9, 9)
+            .unwrap()
+            .expect("deletion has a shift prelude");
+
+        assert_eq!(prelude.pre_seq, sequence);
+        assert_eq!(prelude.post_seq, sequence);
+    }
 
     fn make_transcript(
         biotype: &str,
