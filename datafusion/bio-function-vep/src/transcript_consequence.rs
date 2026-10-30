@@ -36457,9 +36457,12 @@ mod tests {
 
     #[test]
     fn vep116_start_predicates_keep_literal_case_comparisons() {
-        // The R6 golden records use uppercase cache sequences. This lowercase
-        // control locks the literal Perl eq/ne behavior for future cache rows:
-        // VariationEffect.pm compares the mapped start sequence to "ATG".
+        // The R6 golden records use uppercase cache sequences. VEP 116 also
+        // uppercases the input allele string before consequence processing;
+        // the paired lowercase control below locks the literal Perl eq/ne
+        // behavior without changing the production case normalization.
+        // Ensembl VEP release/116.0, Parser.pm:553-554:
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/Parser.pm#L553-L554
         // Ensembl Variation 2fb834b, VariationEffect.pm:992-1022, 1028-1075:
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L992-L1022
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1028-L1075
@@ -36481,6 +36484,27 @@ mod tests {
             b"atggctgaatga",
             0,
             Some("atggctgaatga"),
+        ));
+
+        let (uppercase_transcript, uppercase_exons) = tx_with_cdna("GCGC", "ATGGCTGAATGA");
+        let uppercase_exons: Vec<&ExonFeature> = uppercase_exons.iter().collect();
+        assert_eq!(
+            ins_del_start_altered(
+                &uppercase_transcript,
+                &uppercase_exons,
+                &deletion_after_start,
+                None,
+            ),
+            Some(false),
+            "the uppercase production sequence preserves ATG"
+        );
+        assert!(vep116_start_retained_variant(
+            &uppercase_transcript,
+            &uppercase_exons,
+            &equal_length_variant,
+            b"ATGGCTGAATGA",
+            0,
+            Some("ATGGCTGAATGA"),
         ));
     }
 
