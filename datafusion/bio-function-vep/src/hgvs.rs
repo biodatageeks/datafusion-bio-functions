@@ -3693,6 +3693,61 @@ mod tests {
         assert_eq!(prelude.post_seq, sequence[1000..2000]);
     }
 
+    #[test]
+    fn issue_201_insertion_flanks_use_zero_width_span_on_autosome() {
+        use std::io::Cursor;
+
+        // VariationFeature's insertion coordinates are independent of contig:
+        // `start = end + 1` applies on autosomes as it does on MT.
+        // Ensembl Variation 2fb834b, VariationFeature.pm:51-57; ensembl-vep
+        // 57ea5c5, Parser.pm:563-570:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L51-L57
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/Parser.pm#L563-L570
+        let sequence = (0..2001)
+            .map(|index| b"ACGT"[index % 4] as char)
+            .collect::<String>();
+        let data = format!(">1\n{sequence}\n");
+        let index =
+            fasta::fai::Index::from(vec![fasta::fai::Record::new("1", 2001, 3, 2001, 2002)]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+
+        let prelude = prepare_genomic_shift_prelude(&mut reader, "1", "-", "T", 1001, 1001)
+            .unwrap()
+            .expect("autosomal insertion has a shift prelude");
+
+        assert_eq!(prelude.pre_seq, sequence[..1000]);
+        assert_eq!(prelude.post_seq, sequence[1000..2000]);
+    }
+
+    #[test]
+    fn issue_201_zero_width_insertion_at_contig_start_keeps_clipped_overlap() {
+        use std::io::Cursor;
+
+        // The saturated pre-end is empty before clipping. VEP then clips the
+        // expanded insertion slice to coordinate 1 and takes both flanks from
+        // that clipped slice, so the overlapping windows remain valid.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:431-437 and
+        // VariationFeature.pm:51-57:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L431-L437
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L51-L57
+        let sequence = (0..2001)
+            .map(|index| b"ACGT"[index % 4] as char)
+            .collect::<String>();
+        let data = format!(">1\n{sequence}\n");
+        let index =
+            fasta::fai::Index::from(vec![fasta::fai::Record::new("1", 2001, 3, 2001, 2002)]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+
+        let prelude = prepare_genomic_shift_prelude(&mut reader, "1", "-", "T", 1, 1)
+            .unwrap()
+            .expect("contig-start insertion has a shift prelude");
+
+        assert_eq!(prelude.pre_seq, sequence[..1000]);
+        assert_eq!(prelude.post_seq, sequence[..1000]);
+    }
+
     fn make_transcript(
         biotype: &str,
         strand: i8,

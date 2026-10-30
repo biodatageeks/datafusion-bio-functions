@@ -333,7 +333,13 @@ fn vep116_reference_peptide_is_undefined_by_seqedit(
 
         // VEP returns undef as soon as an overlapping TV position no longer
         // exists in the edited reference peptide. Its test is
-        // `tv_pos - se_start >= length(alt_seq)`.
+        // `tv_pos - se_start >= length(alt_seq)`. The TV positions are
+        // contiguous and that predicate only becomes more likely as the
+        // position increases, so checking the highest overlapping TV position
+        // is equivalent to VEP's per-position loop for both single- and
+        // multi-residue spans.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:747-764:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L747-L764
         overlap_end.saturating_sub(edit_start) >= edit.alt_seq.chars().count()
     })
 }
@@ -8812,6 +8818,9 @@ fn protein_hgvs_for_output_with_semantics(
         if !hgvsp_translation_bounds_are_truthy(tx, tx_exons, tx_translation, variant) {
             return None;
         }
+        // `vep116_stop_predicates()` is the existing release-semantic gate;
+        // this V116 SeqEdit peptide rule shares that gate even though the
+        // method name reflects its original callers.
         // VEP's hgvs_protein() asks both alleles for peptide(), then returns
         // undef when the reference peptide was shortened past a mapped TV
         // position. Keep that peptide-availability check even when a local
@@ -27580,8 +27589,9 @@ mod tests {
         // ClinVar 2530348, X:111410072 deletes c.210_569 across exons. For
         // RefSeq-edited transcripts VEP patches the reference codon sequence
         // with feature_seq but builds the alternate CDS from the original
-        // translateable sequence and mapped endpoints. This fixture keeps the
-        // intronic REF ambiguous so the assertion isolates the alternate path.
+        // translateable sequence and mapped endpoints. The transcript-oriented
+        // feature REF below includes the mapped exon pieces and an intronic
+        // spacer, preserving the reference stop for the independent predicate.
         // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:257-265 and
         // TranscriptVariationAllele.pm:868-877,2393-2415:
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L257-L265
@@ -27620,8 +27630,16 @@ mod tests {
         let exon_refs = exons.iter().collect::<Vec<_>>();
         let tr = translation("T_ISSUE_202_SPLICE", Some(300), Some(100), None, Some(&cds));
         // The deleted genomic interval includes 30 intronic bases; the two
-        // exon pieces map to exactly 60 coding bases (c.21_80).
-        let deletion = var("X", 120, 209, &"N".repeat(90), "-");
+        // exon pieces map to exactly 60 coding bases (c.21_80). On this minus
+        // strand transcript, feature_seq is the reverse complement of c.21_30,
+        // an intronic spacer, and c.31_80 in transcript orientation.
+        let feature_ref_tx = format!("{}{}{}", &cds[20..30], "A".repeat(30), &cds[30..80]);
+        let genomic_ref = reverse_complement_for_semantics(
+            &feature_ref_tx,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("feature REF is a DNA sequence");
+        let deletion = var("X", 120, 209, &genomic_ref, "-");
 
         let class = classify_coding_change_with_semantics(
             &transcript,
@@ -27631,7 +27649,16 @@ mod tests {
             crate::vep_semantics::VepSemantics::V116,
         )
         .expect("the two mapped CDS endpoints define a spliced deletion");
+        assert!(
+            class
+                .affected_ref_peptide
+                .as_deref()
+                .is_some_and(|peptide| peptide.contains('*')),
+            "{:?}",
+            class.affected_ref_peptide
+        );
         assert_eq!(class.affected_alt_peptide.as_deref(), Some("R"));
+        assert!(class.stop_lost, "{class:?}");
     }
 
     #[test]
