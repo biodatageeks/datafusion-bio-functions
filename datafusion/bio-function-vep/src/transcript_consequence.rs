@@ -5910,24 +5910,15 @@ fn apply_vep116_stop_predicate_flags(
                     && reference.contains('*')
                     && !alternate.contains('*')
         );
-    // VEP's stop_retained predicate returns early when partial_codon is true,
-    // before reaching the ref_eq_alt_sequence terminal-insertion case. Keep
-    // that gate on the shortcut as well: otherwise a stop in the inserted
-    // peptide is mislabeled stop_retained instead of stop_gained. This shortcut
-    // also intentionally precedes the generic peptide-X check: VEP applies its
-    // terminal ref_eq_alt_sequence rule when ALT starts with `*`, even if a
-    // later peptide residue is `X`.
+    // VEP only takes the direct ref_eq_alt_sequence path for a non-empty ALT
+    // peptide without X. An ambiguous peptide must instead use the length/CIL
+    // fallback in apply_vep116_nucleotide_stop_fallbacks.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1319
-    let terminal_stop_after_translation = !partial_terminal_codon
-        && ref_peptide == Some("-")
-        && alt_peptide.is_some_and(|alternate| alternate.starts_with('*'))
-        && ref_eq_alt_sequence;
     let stop_retained = !stop_lost
-        && (terminal_stop_after_translation
-            || (!partial_terminal_codon
-                && alt_peptide.is_some_and(|alternate| {
-                    !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
-                })));
+        && !partial_terminal_codon
+        && alt_peptide.is_some_and(|alternate| {
+            !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
+        });
     let stop_gained = !stop_retained
         && !stop_lost
         && ref_peptide.is_some_and(|reference| !reference.contains('*'))
@@ -6016,14 +6007,21 @@ fn frameshift_under_semantics(
     semantics: crate::vep_semantics::VepSemantics,
     partial_terminal_codon: bool,
 ) -> bool {
+    let peptide_pair_starts_at_stop = matches!(
+        (
+            class.affected_ref_peptide.as_deref(),
+            class.affected_alt_peptide.as_deref()
+        ),
+        (Some(reference), Some(_)) if reference.starts_with('*')
+    );
+    // VariationEffect.pm obtains the pair through _get_peptide_alleles before
+    // checking whether REF begins with '*'; no pair means the width-based
+    // frameshift result stands.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L772-L797
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1551-L1564
     raw_frameshift
         && !(semantics.vep116_stop_predicates()
-            && (partial_terminal_codon
-                || class.stop_retained
-                || class
-                    .affected_ref_peptide
-                    .as_deref()
-                    .is_some_and(|peptide| peptide.starts_with('*'))))
+            && (partial_terminal_codon || class.stop_retained || peptide_pair_starts_at_stop))
 }
 
 fn apply_vep116_primary_indel_predicates(
@@ -6041,10 +6039,11 @@ fn apply_vep116_primary_indel_predicates(
     // `_get_codon_alleles()` checks frameshift before either in-frame
     // predicate. Clear the raw length-based term for the VEP stop-family
     // exceptions before deriving insertion/deletion from the codon alleles.
-    if partial_terminal_codon
-        || class.stop_retained
-        || ref_peptide.is_some_and(|peptide| peptide.starts_with('*'))
-    {
+    let peptide_pair_starts_at_stop = matches!(
+        (ref_peptide, alt_peptide),
+        (Some(reference), Some(_)) if reference.starts_with('*')
+    );
+    if partial_terminal_codon || class.stop_retained || peptide_pair_starts_at_stop {
         terms.remove(&SoTerm::FrameshiftVariant);
     }
 
@@ -11421,7 +11420,10 @@ fn ins_del_start_altered(
         if mutated.len() >= atg_start + 3 {
             let new_sc = &mutated[atg_start..atg_start + 3];
             let new_utr = &mutated[..utr.len()];
-            if new_utr.eq_ignore_ascii_case(utr.as_bytes()) && new_sc.eq_ignore_ascii_case(b"ATG") {
+            // Ensembl's Perl `eq` here is literal: lowercase cached bases do
+            // not equal the source's uppercase "ATG" spelling.
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1060-L1065
+            if new_utr == utr.as_bytes() && new_sc == b"ATG" {
                 return Some(false);
             }
         }
@@ -11436,7 +11438,9 @@ fn ins_del_start_altered(
     }
 
     let translated_suffix = &mutated[mutated.len() - translateable.len()..];
-    Some(!translated_suffix.eq_ignore_ascii_case(translateable.as_bytes()))
+    // Ensembl compares the translated suffix with Perl `ne`, preserving case.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1068-L1071
+    Some(translated_suffix != translateable.as_bytes())
 }
 
 /// VEP 116 `_inv_start_altered()` replays a sequence allele in mapped cDNA
@@ -11676,9 +11680,12 @@ fn vep116_start_retained_variant(
         if !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele) {
             return true;
         }
+        // VariationEffect.pm's `_snp_start_altered()` uses literal Perl `eq`
+        // against "ATG", so this mapped triplet comparison is case-sensitive.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L992-L1022
         return mutated_cds
             .get(leading_n_offset..leading_n_offset.saturating_add(3))
-            .is_some_and(|codon| codon.eq_ignore_ascii_case(b"ATG"));
+            .is_some_and(|codon| codon == b"ATG");
     }
     let altered = crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
         && translateable_seq.is_some_and(|seq| {
@@ -16387,7 +16394,7 @@ mod tests {
     }
 
     #[test]
-    fn vep116_terminal_insertion_uses_post_translation_stop_with_partial_tail() {
+    fn vep116_terminal_insertion_with_x_peptide_skips_direct_ref_eq_alt_path() {
         let mut insertion = CodingClassification {
             protein_position_start: Some(756),
             protein_position_end: Some(757),
@@ -16406,8 +16413,8 @@ mod tests {
             false,
             ref_eq_alt,
         );
-        assert!(insertion.stop_retained, "{insertion:?}");
-        assert!(!insertion.stop_gained, "{insertion:?}");
+        assert!(!insertion.stop_retained, "{insertion:?}");
+        assert!(insertion.stop_gained, "{insertion:?}");
     }
 
     #[test]
@@ -16435,7 +16442,7 @@ mod tests {
     }
 
     #[test]
-    fn vep116_hunk9_rejects_frameshift_when_reference_peptide_starts_stop() {
+    fn vep116_hunk9_requires_peptide_pair_before_stop_first_frameshift_suppression() {
         let class = CodingClassification {
             affected_ref_peptide: Some("*Q".to_string()),
             ..Default::default()
@@ -16446,9 +16453,20 @@ mod tests {
             crate::vep_semantics::VepSemantics::V115,
             false,
         ));
-        assert!(!frameshift_under_semantics(
+        assert!(frameshift_under_semantics(
             true,
             &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        ));
+
+        let paired_peptides = CodingClassification {
+            affected_alt_peptide: Some("X".to_string()),
+            ..class.clone()
+        };
+        assert!(!frameshift_under_semantics(
+            true,
+            &paired_peptides,
             crate::vep_semantics::VepSemantics::V116,
             false,
         ));
@@ -36379,6 +36397,91 @@ mod tests {
             Some(&translation),
         );
         (terms, classification)
+    }
+
+    #[test]
+    fn clinvar_219_ambiguous_terminal_peptide_does_not_bypass_the_x_gate() {
+        // ClinVar 1601873 is golden as stop_gained&frameshift_variant. VEP's
+        // stop_retained fast path requires a non-empty ALT peptide without X;
+        // an ALT peptide beginning with '*' still follows the CIL path if it
+        // contains X.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:1290-1319:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1319
+        let mut class = CodingClassification {
+            affected_ref_peptide: Some("-".to_string()),
+            affected_alt_peptide: Some("*X".to_string()),
+            ..CodingClassification::default()
+        };
+
+        apply_vep116_stop_predicate_flags(
+            &mut class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+            true,
+        );
+
+        assert!(!class.stop_retained, "{class:?}");
+        assert!(class.stop_gained, "{class:?}");
+    }
+
+    #[test]
+    fn clinvar_219_frameshift_stop_exception_requires_both_peptides() {
+        // Golden ClinVar 3633451 is a frameshift_variant despite its ambiguous
+        // inserted sequence. VEP's stop-first-residue exception is reached
+        // only after _get_peptide_alleles returns a pair.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:772-797, 1551-1564:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L772-L797
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1551-L1564
+        let class = CodingClassification {
+            affected_ref_peptide: Some("*".to_string()),
+            affected_alt_peptide: None,
+            ..CodingClassification::default()
+        };
+
+        assert!(frameshift_under_semantics(
+            true,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        ));
+
+        let mut terms = BTreeSet::from([SoTerm::FrameshiftVariant]);
+        apply_vep116_primary_indel_predicates(
+            &mut terms,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+        assert!(terms.contains(&SoTerm::FrameshiftVariant), "{terms:?}");
+    }
+
+    #[test]
+    fn vep116_start_predicates_keep_literal_case_comparisons() {
+        // The R6 golden records use uppercase cache sequences. This lowercase
+        // control locks the literal Perl eq/ne behavior for future cache rows:
+        // VariationEffect.pm compares the mapped start sequence to "ATG".
+        // Ensembl Variation 2fb834b, VariationEffect.pm:992-1022, 1028-1075:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L992-L1022
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1028-L1075
+        let (transcript, exons) = tx_with_cdna("GCGC", "atggctgaatga");
+        let exons: Vec<&ExonFeature> = exons.iter().collect();
+        let deletion_after_start = var("22", 1007, 1007, "g", "-");
+
+        assert_eq!(
+            ins_del_start_altered(&transcript, &exons, &deletion_after_start, None),
+            Some(true),
+            "literal start-codon comparison must not treat lowercase atg as ATG"
+        );
+
+        let equal_length_variant = var("22", 1004, 1004, "a", "a");
+        assert!(!vep116_start_retained_variant(
+            &transcript,
+            &exons,
+            &equal_length_variant,
+            b"atggctgaatga",
+            0,
+            Some("atggctgaatga"),
+        ));
     }
 
     #[test]
