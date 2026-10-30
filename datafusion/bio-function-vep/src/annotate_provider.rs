@@ -11054,6 +11054,7 @@ struct SharedContigAnnotationContext {
     structural: Arc<Vec<StructuralFeature>>,
     translateable_seq_by_tx: Arc<HashMap<String, String>>,
     transcript_cache_regions: Arc<HashMap<String, Vec<TranscriptCacheRegion>>>,
+    gene_cache_regions: Arc<HashMap<String, Vec<TranscriptCacheRegion>>>,
     tmp_provider: Arc<AnnotateProvider>,
     engine: Arc<TranscriptConsequenceEngine>,
     #[cfg(feature = "parquet-cache")]
@@ -13612,6 +13613,7 @@ fn prepare_buffer_annotation_context(
     let mut transcripts = build_stateful_buffer_local_transcripts_cow(
         &shared.base_transcripts,
         &shared.transcript_cache_regions,
+        &shared.gene_cache_regions,
         &mut worker.persisted_buffer_transcripts,
         &context_batches,
         chrom,
@@ -13968,9 +13970,13 @@ fn cache_regions_for_coords(
 }
 
 fn transcript_cache_regions(transcript: &TranscriptFeature) -> Vec<TranscriptCacheRegion> {
+    cache_regions_for_coords(&transcript.chrom, transcript.start, transcript.end, 0, 0)
+}
+
+fn gene_cache_regions(transcript: &TranscriptFeature) -> Vec<TranscriptCacheRegion> {
     // VEP visits genes overlapping a requested cache bin, then adds every
-    // transcript of those genes to that region's feature set. Track the gene
-    // span here because this map also scopes cached HGNC carry-over.
+    // transcript of those genes to that region's feature set. Use this map only
+    // for donor eligibility; transcript-span regions still scope carry-over.
     // <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L237-L286>
     cache_regions_for_coords(
         &transcript.chrom,
@@ -14140,9 +14146,14 @@ fn build_stateful_buffer_local_transcripts(
     upstream_distance: i64,
     downstream_distance: i64,
 ) -> Result<Vec<TranscriptFeature>> {
+    let gene_cache_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+        .iter()
+        .map(|tx| (tx.transcript_id.clone(), gene_cache_regions(tx)))
+        .collect();
     let buffer = build_stateful_buffer_local_transcripts_cow(
         transcripts,
         transcript_cache_regions,
+        &gene_cache_regions,
         persisted_transcripts,
         buffer_batches,
         chrom,
@@ -14160,6 +14171,7 @@ fn build_stateful_buffer_local_transcripts(
 fn build_stateful_buffer_local_transcripts_cow(
     transcripts: &[TranscriptFeature],
     transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
+    gene_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
     persisted_transcripts: &mut PersistedBufferTranscripts,
     buffer_batches: &[RecordBatch],
     chrom: &str,
@@ -14214,7 +14226,7 @@ fn build_stateful_buffer_local_transcripts_cow(
     apply_buffer_local_hgnc_propagation_in_regions(
         &mut buffer,
         transcripts,
-        transcript_cache_regions,
+        gene_cache_regions,
         &active_regions,
     );
 
@@ -14356,11 +14368,11 @@ fn apply_buffer_local_hgnc_propagation(
 fn apply_buffer_local_hgnc_propagation_in_regions(
     transcripts: &mut [CowTranscript],
     base: &[TranscriptFeature],
-    transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
+    gene_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
     active_regions: &HashSet<TranscriptCacheRegion>,
 ) {
     let donors = transcripts.iter().map(|bt| bt.as_ref(base)).filter(|tx| {
-        transcript_cache_regions
+        gene_cache_regions
             .get(&tx.transcript_id)
             .is_some_and(|regions| regions.iter().any(|region| active_regions.contains(region)))
     });
@@ -16125,6 +16137,12 @@ async fn prepare_contig_data(
             .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
             .collect(),
     );
+    let gene_cache_regions = Arc::new(
+        base_transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), gene_cache_regions(tx)))
+            .collect(),
+    );
     let overlap_width_bp = compute_overlap_width_bp(&base_transcripts);
     let tx_ids: HashSet<String> = base_transcripts
         .iter()
@@ -16354,6 +16372,7 @@ async fn prepare_contig_data(
         structural: Arc::new(Vec::new()),
         translateable_seq_by_tx: Arc::new(translateable_seq),
         transcript_cache_regions,
+        gene_cache_regions,
         tmp_provider: Arc::new(tmp_provider),
         engine: Arc::new(engine),
         #[cfg(feature = "parquet-cache")]
@@ -18422,6 +18441,10 @@ mod tests {
             .iter()
             .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
             .collect();
+        let gene_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), gene_cache_regions(tx)))
+            .collect();
 
         Arc::new(SharedContigAnnotationContext {
             config: minimal_contig_annotation_config(),
@@ -18437,6 +18460,7 @@ mod tests {
             structural: Arc::new(Vec::new()),
             translateable_seq_by_tx: Arc::new(HashMap::new()),
             transcript_cache_regions: Arc::new(cache_regions),
+            gene_cache_regions: Arc::new(gene_regions),
             tmp_provider: Arc::new(tmp_provider),
             engine: Arc::new(TranscriptConsequenceEngine::new_with_hgvs_shift(
                 5000, 5000, false,
@@ -23198,16 +23222,24 @@ mod tests {
             .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
             .collect();
         let recipient_regions = transcript_regions.get("NR_187205.1").unwrap();
-        assert!(recipient_regions.contains(&TranscriptCacheRegion {
+        assert_eq!(
+            recipient_regions,
+            &[TranscriptCacheRegion {
+                chrom: "11".to_string(),
+                region_index: 23,
+            }]
+        );
+        let recipient_gene_regions = gene_cache_regions(&transcripts[0]);
+        assert!(recipient_gene_regions.contains(&TranscriptCacheRegion {
             chrom: "11".to_string(),
             region_index: 22,
         }));
-        assert!(recipient_regions.contains(&TranscriptCacheRegion {
+        assert!(recipient_gene_regions.contains(&TranscriptCacheRegion {
             chrom: "11".to_string(),
             region_index: 23,
         }));
         assert!(transcripts[0].start >= 23_000_000);
-        let donor_regions = transcript_regions.get("ENST_LINC02718_HGNC_DONOR").unwrap();
+        let donor_regions = gene_cache_regions(transcripts.last().unwrap());
         assert_eq!(
             donor_regions,
             &[TranscriptCacheRegion {
@@ -23309,6 +23341,37 @@ mod tests {
             chrom: "11".to_string(),
             region_index: 23,
         }));
+    }
+
+    #[test]
+    fn test_gene_cache_regions_do_not_change_transcript_carry_regions() {
+        let mut tx = make_tx("XR_SPANNING_GENE", None, None, None, None);
+        tx.chrom = "chr2".to_string();
+        tx.start = 1_050_000;
+        tx.end = 1_200_000;
+        tx.gene_start = 900_000;
+        tx.gene_end = 1_200_000;
+
+        assert_eq!(
+            transcript_cache_regions(&tx),
+            vec![TranscriptCacheRegion {
+                chrom: "2".to_string(),
+                region_index: 1,
+            }]
+        );
+        assert_eq!(
+            gene_cache_regions(&tx),
+            vec![
+                TranscriptCacheRegion {
+                    chrom: "2".to_string(),
+                    region_index: 0,
+                },
+                TranscriptCacheRegion {
+                    chrom: "2".to_string(),
+                    region_index: 1,
+                },
+            ]
+        );
     }
 
     #[test]
