@@ -1759,7 +1759,7 @@ impl TranscriptConsequenceEngine {
                         let given_hgvsc_reference =
                             given_ref.as_deref().unwrap_or(&variant.ref_allele);
                         let hgvsc_ref_allele = hgvsc_reference_for_output(
-                            use_feature_ref_for_output(self.bam_edited, tx.has_rna_edit),
+                            hgvsc_uses_feature_reference(self.bam_edited, tx.has_rna_edit),
                             feature_reference,
                             given_hgvsc_reference,
                             genomic_reference,
@@ -1892,7 +1892,7 @@ impl TranscriptConsequenceEngine {
                             hgvs_shift,
                             hgvsc_detail_profile.as_mut(),
                             self.semantics,
-                            use_feature_ref_for_output(self.bam_edited, tx.has_rna_edit),
+                            self.bam_edited.unwrap_or(tx.has_rna_edit),
                             rna_edit_classification_reference(
                                 tx.has_rna_edit,
                                 hgvsc_ref_allele,
@@ -12988,16 +12988,18 @@ fn hgvsc_reference_for_output<'a>(
     }
 }
 
-/// Cache metadata selects VEP's global `use_transcript_ref` policy. If metadata
-/// is absent, preserve the previous RNA-edit-only override until the cache can
-/// state that policy explicitly. VEP 116 passes `use_transcript_ref` through
-/// `AnnotationType::Transcript::annotate_InputBuffer()` to the variation
-/// adaptor, while `_rna_edit` attributes independently override HGVSc alleles:
+/// Select the allele used by HGVSc. Cache metadata enables VEP's global
+/// `use_transcript_ref` policy, while `_rna_edit` independently overrides the
+/// displayed HGVSc reference even when that global policy is false. If metadata
+/// is absent, preserve the previous RNA-edit-only default. VEP 116 passes
+/// `use_transcript_ref` through `AnnotationType::Transcript::annotate_InputBuffer()`
+/// to the variation adaptor, and `_rna_edit` attributes independently override
+/// HGVSc alleles:
 /// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L99-L99
 /// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L153-L162
 /// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1507-L1514
-fn use_feature_ref_for_output(bam_edited: Option<bool>, has_rna_edit: bool) -> bool {
-    bam_edited.unwrap_or(has_rna_edit)
+fn hgvsc_uses_feature_reference(bam_edited: Option<bool>, has_rna_edit: bool) -> bool {
+    bam_edited.unwrap_or(false) || has_rna_edit
 }
 
 fn used_ref_with_cache_policy(
@@ -15374,13 +15376,15 @@ mod tests {
             let exons = [exon(id, 1, 100, 199)];
             let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
             let variant = var("21", 105, 105, "C", "T");
-            for (policy, reference, hgvsc_reference) in [(true, "G", "G"), (false, "C", "A")] {
+            for (policy, reference, hgvsc_reference) in
+                [(Some(true), "G", "G"), (Some(false), "C", "C")]
+            {
                 // The RNA-edit override restores the reference TVA's feature
                 // allele, not unconditionally the cached edited sequence. With
                 // use_feature_ref=false and no_ref_check=true VEP constructs
                 // that TVA from the supplied REF (VFO.pm:368-395,424).
                 let result = TranscriptConsequenceEngine::default()
-                    .with_reference_policy(Some(policy))
+                    .with_reference_policy(policy)
                     .evaluate_variant_prepared_with_reference(&variant, &context, Some("A"), None);
                 assert_eq!(result[0].used_ref.as_deref(), Some(reference));
                 assert_eq!(
