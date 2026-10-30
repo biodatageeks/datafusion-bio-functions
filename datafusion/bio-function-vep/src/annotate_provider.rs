@@ -13968,6 +13968,10 @@ fn cache_regions_for_coords(
 }
 
 fn transcript_cache_regions(transcript: &TranscriptFeature) -> Vec<TranscriptCacheRegion> {
+    // VEP visits genes overlapping a requested cache bin, then adds every
+    // transcript of those genes to that region's feature set. Track the gene
+    // span here because this map also scopes cached HGNC carry-over.
+    // <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L237-L286>
     cache_regions_for_coords(
         &transcript.chrom,
         transcript.gene_start,
@@ -14287,11 +14291,11 @@ struct HgncGeneFill {
     gene_hgnc_id_native: Option<String>,
 }
 
-/// Build the HGNC/gene donor maps from a donor source. To be partition
-/// INVARIANT, the donor source must be the full active cache-region transcript
-/// set (not just buffer-range-overlapping ones) — otherwise a recipient's
-/// native-HGNC donor that falls outside a partition's buffer range is missed,
-/// dropping the donated HGNC id (the t8 parity bug).
+/// Build the HGNC/gene donor maps from the supplied candidate subset. Production
+/// callers use the buffer min/max-overlapping features VEP passes to
+/// `merge_features`; the stateful caller also restricts them to active gene
+/// cache bins. Region-wide donors can reintroduce the TENM3 over-donation, while
+/// ignoring active bins can donate from a cache region VEP never loaded.
 fn collect_hgnc_donors<'a>(
     donors: impl IntoIterator<Item = &'a TranscriptFeature>,
 ) -> (HashMap<String, String>, HashMap<String, HgncGeneFill>) {
@@ -23168,8 +23172,8 @@ mod tests {
                 None,
             );
             tx.chrom = "chr11".to_string();
-            tx.start = 22_829_414;
-            tx.end = 22_900_000;
+            tx.start = 23_050_000;
+            tx.end = 23_180_000;
             tx.gene_start = 22_829_414;
             tx.gene_end = 23_205_797;
             tx
@@ -23196,9 +23200,13 @@ mod tests {
         let recipient_regions = transcript_regions.get("NR_187205.1").unwrap();
         assert!(recipient_regions.contains(&TranscriptCacheRegion {
             chrom: "11".to_string(),
+            region_index: 22,
+        }));
+        assert!(recipient_regions.contains(&TranscriptCacheRegion {
+            chrom: "11".to_string(),
             region_index: 23,
         }));
-        assert!(transcripts[0].end <= 23_000_000);
+        assert!(transcripts[0].start >= 23_000_000);
         let donor_regions = transcript_regions.get("ENST_LINC02718_HGNC_DONOR").unwrap();
         assert_eq!(
             donor_regions,
