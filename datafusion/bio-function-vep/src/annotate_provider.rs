@@ -4548,6 +4548,12 @@ impl AnnotateProvider {
                 let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
                     continue;
                 };
+                let Some(strand_raw) = int64_at(batch.column(strand_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(biotype) = string_at(batch.column(biotype_idx).as_ref(), row) else {
+                    continue;
+                };
                 let gene_start = int64_at(batch.column(gene_start_idx).as_ref(), row)
                     .ok_or_else(|| {
                         DataFusionError::Execution(format!(
@@ -4559,12 +4565,6 @@ impl AnnotateProvider {
                         "annotate_vep(): transcript table '{table}' has a null gene_end at row {row}"
                     ))
                 })?;
-                let Some(strand_raw) = int64_at(batch.column(strand_idx).as_ref(), row) else {
-                    continue;
-                };
-                let Some(biotype) = string_at(batch.column(biotype_idx).as_ref(), row) else {
-                    continue;
-                };
 
                 let strand = if strand_raw >= 0 { 1 } else { -1 };
                 let cds_start = cds_start_idx
@@ -5313,6 +5313,12 @@ impl AnnotateProvider {
                 let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
                     continue;
                 };
+                let Some(strand_raw) = int64_at(batch.column(strand_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(biotype) = string_at(batch.column(biotype_idx).as_ref(), row) else {
+                    continue;
+                };
                 let gene_start = int64_at(batch.column(gene_start_idx).as_ref(), row)
                     .ok_or_else(|| {
                         DataFusionError::Execution(format!(
@@ -5324,12 +5330,6 @@ impl AnnotateProvider {
                         "annotate_vep(): transcript table '{table}' has a null gene_end at row {row}"
                     ))
                 })?;
-                let Some(strand_raw) = int64_at(batch.column(strand_idx).as_ref(), row) else {
-                    continue;
-                };
-                let Some(biotype) = string_at(batch.column(biotype_idx).as_ref(), row) else {
-                    continue;
-                };
 
                 let cds_start = cds_start_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
@@ -14332,8 +14332,9 @@ fn apply_buffer_local_hgnc_propagation(
     apply_hgnc_donors(transcripts, base, &hgnc_by_symbol, &gene_fill_by_stable_id);
 }
 
-/// Restrict HGNC donor candidates to min/max-overlapping transcripts whose
-/// gene bounds overlap a cache region requested for this buffer.
+/// `transcripts` is already the buffer's min/max-overlapping feature set. Restrict
+/// its HGNC donor candidates further to genes whose cache bins this buffer
+/// actually requested; VEP cannot donate from features outside that loaded set.
 ///
 /// Traceability to Ensembl VEP release/116.0:
 /// - `AnnotationSource::get_regions_from_coords()` selects cache bins for each
@@ -20616,14 +20617,16 @@ mod tests {
         symbol_source: Option<&str>,
         native_hgnc_id: Option<&str>,
     ) -> TranscriptFeature {
+        let start = 1;
+        let end = 100;
         TranscriptFeature {
             transcript_id: id.to_string(),
             transcript_uid: None,
             db_id: None,
             codon_table: CodonTable::Standard,
             chrom: "chr2".to_string(),
-            start: 1,
-            end: 100,
+            start,
+            end,
             strand: 1,
             biotype: "snoRNA".to_string(),
             cds_start: None,
@@ -20633,8 +20636,8 @@ mod tests {
             cdna_mapper_segments: Vec::new(),
             mature_mirna_regions: Vec::new(),
             gene_stable_id: gene_stable_id.map(|s| s.to_string()),
-            gene_start: 1,
-            gene_end: 100,
+            gene_start: start,
+            gene_end: end,
             gene_symbol: symbol.map(|s| s.to_string()),
             gene_symbol_source: symbol_source.map(|s| s.to_string()),
             gene_hgnc_id_native: native_hgnc_id.map(|s| s.to_string()),
@@ -23166,7 +23169,7 @@ mod tests {
             );
             tx.chrom = "chr11".to_string();
             tx.start = 22_829_414;
-            tx.end = 23_205_797;
+            tx.end = 22_900_000;
             tx.gene_start = 22_829_414;
             tx.gene_end = 23_205_797;
             tx
@@ -23190,12 +23193,48 @@ mod tests {
             .iter()
             .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
             .collect();
+        let recipient_regions = transcript_regions.get("NR_187205.1").unwrap();
+        assert!(recipient_regions.contains(&TranscriptCacheRegion {
+            chrom: "11".to_string(),
+            region_index: 23,
+        }));
+        assert!(transcripts[0].end <= 23_000_000);
+        let donor_regions = transcript_regions.get("ENST_LINC02718_HGNC_DONOR").unwrap();
+        assert_eq!(
+            donor_regions,
+            &[TranscriptCacheRegion {
+                chrom: "11".to_string(),
+                region_index: 23,
+            }]
+        );
         let mut persisted_transcripts = HashMap::new();
         let positions: Vec<i64> = if touches_region_23 {
             vec![22_800_000, 23_050_000, 24_100_000]
         } else {
             vec![22_800_000, 24_100_000]
         };
+        let active_regions = collect_buffer_cache_regions(
+            &[make_buffer_batch_many("chr11", &positions)],
+            5_000,
+            5_000,
+        )
+        .unwrap();
+        assert!(active_regions.contains(&TranscriptCacheRegion {
+            chrom: "11".to_string(),
+            region_index: 22,
+        }));
+        assert!(active_regions.contains(&TranscriptCacheRegion {
+            chrom: "11".to_string(),
+            region_index: 24,
+        }));
+        assert_eq!(
+            active_regions.contains(&TranscriptCacheRegion {
+                chrom: "11".to_string(),
+                region_index: 23,
+            }),
+            touches_region_23,
+            "region 23 is active only when the buffer requests it"
+        );
         build_stateful_buffer_local_transcripts(
             &transcripts,
             &transcript_regions,
@@ -23244,6 +23283,24 @@ mod tests {
                 transcript.transcript_id
             );
         }
+    }
+
+    #[test]
+    fn test_buffer_cache_regions_include_neighbor_bin_reached_by_flank() {
+        let regions = collect_buffer_cache_regions(
+            &[make_buffer_batch_many("chr11", &[22_999_999])],
+            5_000,
+            5_000,
+        )
+        .unwrap();
+        assert!(regions.contains(&TranscriptCacheRegion {
+            chrom: "11".to_string(),
+            region_index: 22,
+        }));
+        assert!(regions.contains(&TranscriptCacheRegion {
+            chrom: "11".to_string(),
+            region_index: 23,
+        }));
     }
 
     #[test]
