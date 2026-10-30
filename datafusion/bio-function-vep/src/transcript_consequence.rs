@@ -1892,7 +1892,9 @@ impl TranscriptConsequenceEngine {
                             hgvs_shift,
                             hgvsc_detail_profile.as_mut(),
                             self.semantics,
-                            self.bam_edited.unwrap_or(tx.has_rna_edit),
+                            // This is the formatter's global policy; the
+                            // `_rna_edit` allele override above remains separate.
+                            hgvsc_formatter_uses_transcript_ref(self.bam_edited, tx.has_rna_edit),
                             rna_edit_classification_reference(
                                 tx.has_rna_edit,
                                 hgvsc_ref_allele,
@@ -13002,6 +13004,16 @@ fn hgvsc_uses_feature_reference(bam_edited: Option<bool>, has_rna_edit: bool) ->
     bam_edited.unwrap_or(false) || has_rna_edit
 }
 
+/// VEP's formatter follows the cache-wide policy. Unknown metadata retains the
+/// old RNA-edit-only default; an explicit false policy remains false even when
+/// the independent `_rna_edit` allele override applies. VEP passes the global
+/// `use_transcript_ref` value through its transcript annotator:
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L99-L99
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L153-L162
+fn hgvsc_formatter_uses_transcript_ref(bam_edited: Option<bool>, has_rna_edit: bool) -> bool {
+    bam_edited.unwrap_or(has_rna_edit)
+}
+
 fn used_ref_with_cache_policy(
     variant: &VariantInput,
     tx: &TranscriptFeature,
@@ -15358,6 +15370,26 @@ mod tests {
             .as_deref(),
             Some("G")
         );
+    }
+
+    #[test]
+    fn cache_reference_policy_keeps_rna_edit_override_separate_from_formatter_policy() {
+        for (bam_edited, has_rna_edit, feature_reference, formatter_policy) in [
+            (Some(true), false, true, true),
+            (Some(false), true, true, false),
+            (None, true, true, true),
+            (Some(false), false, false, false),
+            (None, false, false, false),
+        ] {
+            assert_eq!(
+                hgvsc_uses_feature_reference(bam_edited, has_rna_edit),
+                feature_reference
+            );
+            assert_eq!(
+                hgvsc_formatter_uses_transcript_ref(bam_edited, has_rna_edit),
+                formatter_policy
+            );
+        }
     }
 
     #[test]
