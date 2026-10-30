@@ -997,6 +997,18 @@ pub(crate) struct GenomicShiftPrelude {
     post_seq: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReferenceFlankWindow {
+    start: i64,
+    end: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GenomicShiftFlankWindows {
+    pre: ReferenceFlankWindow,
+    post: ReferenceFlankWindow,
+}
+
 /// Parse the shiftable indel and read the strand-independent reference flanks
 /// once. Returns `None` when the variant is not a shiftable indel.
 pub(crate) fn prepare_genomic_shift_prelude<R>(
@@ -1043,19 +1055,16 @@ where
             "reference FASTA sequence length is too large for {chrom}: {error}"
         ))
     })?;
-    let clipped_start = pre_start.max(1);
-    let clipped_end = post_end.min(sequence_length);
-    let (pre_seq, post_seq) = if clipped_end >= clipped_start && post_end > 0 {
-        let clipped_length = clipped_end - clipped_start + 1;
-        let pre_length = clipped_length.min(area_to_search);
-        let post_length = clipped_length.min(area_to_search);
-        let pre_flank_end = clipped_start + pre_length - 1;
-        let post_flank_start = clipped_end - post_length + 1;
-        let pre_seq = read_reference_sequence(reader, chrom, clipped_start, pre_flank_end)?;
-        let post_seq = if post_flank_start == clipped_start && pre_flank_end == clipped_end {
+    // Reconstruct the two 1000-base windows of VEP's clipped slice directly;
+    // this keeps large deletion interiors out of FASTA I/O and allocation.
+    let (pre_seq, post_seq) = if let Some(windows) =
+        clipped_flank_windows(pre_start, post_end, sequence_length, area_to_search)
+    {
+        let pre_seq = read_reference_sequence(reader, chrom, windows.pre.start, windows.pre.end)?;
+        let post_seq = if windows.post == windows.pre {
             pre_seq.clone()
         } else {
-            read_reference_sequence(reader, chrom, post_flank_start, clipped_end)?
+            read_reference_sequence(reader, chrom, windows.post.start, windows.post.end)?
         };
         (pre_seq, post_seq)
     } else {
@@ -1069,6 +1078,31 @@ where
         pre_seq,
         post_seq,
     }))
+}
+
+fn clipped_flank_windows(
+    slice_start: i64,
+    slice_end: i64,
+    sequence_length: i64,
+    area_to_search: i64,
+) -> Option<GenomicShiftFlankWindows> {
+    let clipped_start = slice_start.max(1);
+    let clipped_end = slice_end.min(sequence_length);
+    if clipped_end < clipped_start || slice_end <= 0 {
+        return None;
+    }
+
+    let clipped_length = clipped_end - clipped_start + 1;
+    let flank_length = clipped_length.min(area_to_search);
+    let pre = ReferenceFlankWindow {
+        start: clipped_start,
+        end: clipped_start + flank_length - 1,
+    };
+    let post = ReferenceFlankWindow {
+        start: clipped_end - flank_length + 1,
+        end: clipped_end,
+    };
+    Some(GenomicShiftFlankWindows { pre, post })
 }
 
 /// Convenience wrapper preserving the original single-call API: prepares the
@@ -3559,6 +3593,34 @@ fn format_hgvsp_notation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipped_flank_windows_do_not_read_a_long_deletion_interior() {
+        assert_eq!(
+            clipped_flank_windows(4_000, 101_000, 200_000, 1_000),
+            Some(GenomicShiftFlankWindows {
+                pre: ReferenceFlankWindow {
+                    start: 4_000,
+                    end: 4_999,
+                },
+                post: ReferenceFlankWindow {
+                    start: 100_001,
+                    end: 101_000,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn clipped_flank_windows_keep_overlap_at_a_contig_end() {
+        assert_eq!(
+            clipped_flank_windows(2, 22, 12, 1_000),
+            Some(GenomicShiftFlankWindows {
+                pre: ReferenceFlankWindow { start: 2, end: 12 },
+                post: ReferenceFlankWindow { start: 2, end: 12 },
+            })
+        );
+    }
 
     #[test]
     fn issue_201_mt_end_flank_uses_suffix_of_clipped_slice() {
