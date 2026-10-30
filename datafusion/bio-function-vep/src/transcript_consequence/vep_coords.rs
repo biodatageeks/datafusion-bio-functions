@@ -587,6 +587,7 @@ mod tests {
             source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
+            translation_seq_edits: Vec::new(),
             has_rna_edit: false,
             is_gencode_basic: false,
             is_gencode_primary: false,
@@ -597,6 +598,7 @@ mod tests {
             three_prime_utr_seq: None,
             translateable_seq: None,
             cdna_seq: None,
+            failed_bam_exon_seq: None,
             version: None,
             cds_start_nf: false,
             cds_end_nf: false,
@@ -747,21 +749,47 @@ mod tests {
                 for coding in [None, Some((1, total)), Some((5, total - 6))] {
                     for shape in shapes {
                         for flavour in flavours {
+                            // A synthetic genomic mapper gap inside one exon
+                            // models the deleted RefSeq edit below. Do not
+                            // combine that gap with an otherwise unedited
+                            // Ensembl/RefSeq transcript: no exon or edit in
+                            // those fixtures could have produced it.
+                            if matches!(shape, MapperShape::GenomicGap)
+                                && !matches!(flavour, Flavour::RefSeqDeletionEdit)
+                            {
+                                continue;
+                            }
                             let id = match flavour {
                                 Flavour::Ensembl => "ENST00000000001.1",
                                 _ => "NM_000001.1",
                             };
                             let mut tx = tx_feature(id, strand, layout, coding);
                             tx.cdna_mapper_segments = mapper_segments(strand, layout, shape);
+                            let deleted_edit_position = if matches!(shape, MapperShape::GenomicGap)
+                            {
+                                let (start, end) = layout[0];
+                                let omitted_genomic_base = (start + end) / 2;
+                                let exons = exon_features(id, layout);
+                                let refs: Vec<&ExonFeature> = exons.iter().collect();
+                                super::super::genomic_to_cdna_index(
+                                    &refs,
+                                    strand,
+                                    omitted_genomic_base,
+                                )
+                                .map(|position| position as i64)
+                            } else {
+                                None
+                            };
                             match flavour {
                                 Flavour::Ensembl => tx.source = Some("Ensembl".to_string()),
                                 Flavour::RefSeqPlain => tx.source = Some("RefSeq".to_string()),
                                 Flavour::RefSeqDeletionEdit => {
                                     tx.source = Some("RefSeq".to_string());
                                     tx.has_rna_edit = true;
+                                    let edit_position = deleted_edit_position.unwrap_or(12);
                                     tx.refseq_edits = vec![RefSeqEdit {
-                                        start: 12,
-                                        end: 12,
+                                        start: edit_position,
+                                        end: edit_position,
                                         replacement_len: None,
                                         skip_refseq_offset: false,
                                     }];
@@ -948,9 +976,10 @@ mod tests {
                 defined += usize::from(legacy.is_some());
             }
         }
-        // 240 transcripts; guard against a matrix that silently shrank.
-        assert!(compared > 150_000, "compared {compared}");
-        assert!(defined > 50_000, "defined {defined}");
+        // The matrix excludes synthetic genomic gaps paired with transcripts
+        // that have no edit capable of producing them (168 valid fixtures).
+        assert!(compared > 140_000, "compared {compared}");
+        assert!(defined > 35_000, "defined {defined}");
     }
 
     /// `shifted_tva_coords_from_mapper` at functions `9936c6e`, verbatim.
@@ -1114,12 +1143,13 @@ mod tests {
         }
     }
 
-    /// Commit 2 of F0: the insertion branch of `shifted_tva_coords_from_mapper`
-    /// goes through `VepTxMapper` (HgvspExact). Every shifted insertion span
-    /// `(P, P-1)` and every deletion of length 1..=6 over the matrix, with a
-    /// leading-N phase of 0, 1 and 2, must give the same coordinates.
+    /// The mapper path agrees with the legacy path across ordinary shifted
+    /// spans. For an internal mapper Gap with mapped endpoints, VEP keeps its
+    /// first and last mapped pieces, while the legacy per-base path rejects
+    /// unmapped bases. These fixtures cover ordinary introns and deleted
+    /// RefSeq edits; the source mapper provides the positive control.
     #[test]
-    fn f0_shifted_insertion_matches_legacy() {
+    fn f0_shifted_coords_match_legacy_except_source_endpoint_gaps() {
         let mut compared = 0usize;
         let mut defined = 0usize;
         for (tx, exons) in matrix() {
@@ -1138,21 +1168,182 @@ mod tests {
                     for v in spans {
                         let legacy = legacy_shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
                         let new = shifted_tva_coords_from_mapper(&tx, &refs, &tl, &v);
-                        assert_eq!(
-                            new,
-                            legacy,
-                            "shifted coords differ: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{}",
-                            tx.transcript_id,
-                            tx.strand,
-                            tx.cdna_coding_start,
-                            tx.cdna_coding_end,
-                            tx.cdna_mapper_segments,
-                            tx.refseq_edits,
-                            v.start,
-                            v.end,
-                            v.ref_allele,
-                            v.alt_allele
-                        );
+                        let span = VepSpan::from_variant(&v);
+                        let source_mapper =
+                            VepTxMapper::new(&tx, &refs, Some(&tl), CdnaBaseMap::HgvspExact);
+                        let source_translation = if span.is_insertion() {
+                            None
+                        } else {
+                            source_mapper.translation(span).both()
+                        };
+                        let unedited_deletion = !span.is_insertion()
+                            && !super::super::refseq_has_edited_sequence_state(&tx);
+                        if unedited_deletion {
+                            let source_coords =
+                                source_mapper.cds(span).both().zip(source_translation).map(
+                                    |((cds_start, cds_end), (protein_start, protein_end))| {
+                                        ShiftedTvaCoords {
+                                            cds_start,
+                                            cds_end,
+                                            protein_start,
+                                            protein_end,
+                                            edited_insertion_gap: false,
+                                        }
+                                    },
+                                );
+                            if let Some(source_coords) = source_coords {
+                                assert_eq!(
+                                    new,
+                                    Some(source_coords),
+                                    "VEP mapper coordinates differ: tx={} strand={} variant={}-{} {}>{}",
+                                    tx.transcript_id,
+                                    tx.strand,
+                                    v.start,
+                                    v.end,
+                                    v.ref_allele,
+                                    v.alt_allele
+                                );
+                            } else {
+                                assert_eq!(
+                                    new,
+                                    None,
+                                    "VEP endpoint Gap must leave shifted coordinates undefined: tx={} strand={} variant={}-{} {}>{}",
+                                    tx.transcript_id,
+                                    tx.strand,
+                                    v.start,
+                                    v.end,
+                                    v.ref_allele,
+                                    v.alt_allele
+                                );
+                            }
+                        } else if legacy.is_none() && source_translation.is_some() {
+                            assert!(
+                                new.is_some(),
+                                "VEP endpoint mapper is defined but shifted coords were not: tx={} strand={} variant={}-{} {}>{}",
+                                tx.transcript_id,
+                                tx.strand,
+                                v.start,
+                                v.end,
+                                v.ref_allele,
+                                v.alt_allele
+                            );
+                        } else {
+                            assert_eq!(
+                                new,
+                                legacy,
+                                "shifted coords differ: tx={} strand={} coding={:?}-{:?} segments={:?} edits={:?} phase={phase} variant={}-{} {}>{}",
+                                tx.transcript_id,
+                                tx.strand,
+                                tx.cdna_coding_start,
+                                tx.cdna_coding_end,
+                                tx.cdna_mapper_segments,
+                                tx.refseq_edits,
+                                v.start,
+                                v.end,
+                                v.ref_allele,
+                                v.alt_allele
+                            );
+                        }
+                        if new != legacy {
+                            // The Ensembl mapper is the oracle for unedited
+                            // spans, including boundary insertions. The old
+                            // per-base implementation can differ there even
+                            // when no mapper Gap exists (notably its
+                            // translation_end + 1 adjustment).
+                            if unedited_deletion
+                                && source_mapper.cds(span).both().is_some()
+                                && source_translation.is_some()
+                            {
+                                compared += 1;
+                                defined += usize::from(legacy.is_some());
+                                continue;
+                            }
+                            let source_cds = source_mapper.cds(span);
+                            let source_translation_range = source_mapper.translation(span);
+                            let source_endpoint_gap = !span.is_insertion()
+                                && (source_cds.start.is_none()
+                                    || source_cds.end.is_none()
+                                    || source_translation_range.start.is_none()
+                                    || source_translation_range.end.is_none());
+                            let mapper = source_mapper;
+                            let cdna = mapper.cdna(span);
+                            let cds = mapper.cds_of_cdna(cdna, false).both();
+                            let start = v.start.min(v.end);
+                            let end = v.start.max(v.end);
+                            let sorted_exons = super::super::start_sorted(&refs);
+                            let crosses_intron = sorted_exons.windows(2).any(|pair| {
+                                let intron_start = pair[0].end.saturating_add(1);
+                                let intron_end = pair[1].start.saturating_sub(1);
+                                intron_start <= intron_end
+                                    && start <= intron_end
+                                    && end >= intron_start
+                            });
+                            let crosses_deleted_refseq_edit =
+                                (start.saturating_add(1)..end).any(|pos| {
+                                    let Some(raw_cdna) =
+                                        super::super::genomic_to_cdna_index(&refs, tx.strand, pos)
+                                            .and_then(|cdna| i64::try_from(cdna).ok())
+                                    else {
+                                        return false;
+                                    };
+                                    tx.refseq_edits.iter().any(|edit| {
+                                        edit.replacement_len.is_none()
+                                            && raw_cdna >= edit.start
+                                            && raw_cdna <= edit.end
+                                    })
+                                });
+                            let crosses_mapper_gap = !span.is_insertion()
+                                && mapper
+                                    .cdna_pieces(span)
+                                    .iter()
+                                    .any(|piece| matches!(piece, MapperPiece::Gap));
+                            assert!(
+                                source_endpoint_gap
+                                    || (legacy.is_none()
+                                        && crosses_mapper_gap
+                                        && (crosses_intron || crosses_deleted_refseq_edit)
+                                        && cdna.both().is_some()),
+                                "unexpected shifted-coordinate divergence outside a mapper Gap from an intron or deleted RefSeq edit: tx={} strand={} coding={:?}-{:?} phase={phase} variant={}-{} {}>{} cdna={cdna:?} cds={cds:?} source_translation={source_translation:?} pieces={:?} legacy={legacy:?} new={new:?}",
+                                tx.transcript_id,
+                                tx.strand,
+                                tx.cdna_coding_start,
+                                tx.cdna_coding_end,
+                                v.start,
+                                v.end,
+                                v.ref_allele,
+                                v.alt_allele,
+                                mapper.cdna_pieces(span)
+                            );
+                            if source_endpoint_gap {
+                                compared += 1;
+                                defined += usize::from(legacy.is_some());
+                                continue;
+                            }
+                            let mapped = new.unwrap_or_else(|| {
+                                panic!(
+                                    "mapped source coordinates vanished: tx={} strand={} coding={:?}-{:?} phase={} variant={}-{} {}>{} cdna={cdna:?} cds={:?} translation={:?} pieces={:?}",
+                                    tx.transcript_id,
+                                    tx.strand,
+                                    tx.cdna_coding_start,
+                                    tx.cdna_coding_end,
+                                    phase,
+                                    v.start,
+                                    v.end,
+                                    v.ref_allele,
+                                    v.alt_allele,
+                                    mapper.cds(span).both(),
+                                    mapper.translation(span).both(),
+                                    mapper.cdna_pieces(span),
+                                )
+                            });
+                            if tx.refseq_edits.is_empty()
+                                && let Some(cds) = cds
+                            {
+                                assert_eq!((mapped.cds_start, mapped.cds_end), cds);
+                            }
+                            assert_eq!(mapped.protein_start, peptide_of_cds(mapped.cds_start));
+                            assert_eq!(mapped.protein_end, peptide_of_cds(mapped.cds_end));
+                        }
                         compared += 1;
                         defined += usize::from(legacy.is_some());
                     }
