@@ -27932,8 +27932,8 @@ mod tests {
         // ClinVar 852228 is A>ATGGGT at the first coding base of CTLA4
         // (ENST00000295854): the refreshed cache has cDNA/CDS beginning with
         // ATG at cDNA 1, no 5'UTR sequence, and a five-base insertion after
-        // cDNA 1. VEP 116 reports frameshift_variant&start_lost and HGVSp
-        // p.Ala2?.
+        // cDNA 1. VEP 116 reports frameshift_variant&start_lost; the golden
+        // panel also records HGVSp p.Ala2?.
         // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 947-963,
         // 1028-1071; TranscriptVariationAllele.pm:2154-2159:
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
@@ -28002,6 +28002,10 @@ mod tests {
         let (terms, classification) =
             engine.evaluate_transcript_overlap(&variant, &tx, &exon_refs, Some(&translation));
 
+        assert!(
+            terms.contains(&SoTerm::FrameshiftVariant),
+            "terms: {terms:?}"
+        );
         assert!(terms.contains(&SoTerm::StartLost), "terms: {terms:?}");
         assert!(
             !terms.contains(&SoTerm::StartRetainedVariant),
