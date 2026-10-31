@@ -3501,7 +3501,32 @@ impl TranscriptConsequenceEngine {
         // keeps its historical classification path for compatibility.
         if self.semantics.vep116_stop_predicates() && has_partial_cds_endpoint && ref_len == alt_len
         {
-            return partial_boundary_classification;
+            let mut classification = partial_boundary_classification;
+            // The partial-CDS guard suppresses codon and peptide classification,
+            // but VEP still evaluates start_lost's nucleotide predicates on the
+            // TranscriptVariation, including `_inv_start_altered()` for an
+            // equal-length boundary MNV.
+            // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 906-945:
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+            let predicate_class = classification.clone().unwrap_or_default();
+            let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
+            if vep116_start_lost_from_predicates(
+                &predicate_class,
+                tx,
+                tx_exons,
+                tx_translation,
+                variant,
+                translateable_seq.as_deref(),
+                partial_terminal_codon_v116,
+            ) {
+                terms.insert(SoTerm::StartLost);
+                if let Some(classification) = classification.as_mut() {
+                    classification.start_lost = true;
+                    classification.missense = false;
+                }
+            }
+            return classification;
         }
 
         if ref_len != alt_len {
@@ -27928,6 +27953,94 @@ mod tests {
     }
 
     #[test]
+    fn clinvar_825785_boundary_mnv_disrupts_the_start_codon() {
+        // ClinVar 825785 is GA>TT at chr2:47783288 in NM_001406804.1. The
+        // RefSeq cache places the two bases at cDNA 144-145: the final 5'UTR
+        // base and the first ATG base (cDNA 145-147). VEP reports
+        // start_lost&5_prime_UTR_variant.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 906-945:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+        let mut transcript = tx(
+            "NM_001406804.1",
+            "2",
+            47_783_145,
+            47_806_953,
+            1,
+            "protein_coding",
+            Some(47_783_289),
+            Some(47_783_303),
+        );
+        transcript.cdna_coding_start = Some(145);
+        transcript.cdna_coding_end = Some(159);
+        transcript.five_prime_utr_seq = Some(format!("{}G", "C".repeat(143)));
+        transcript.translateable_seq = Some("ATGCCAACAAGGCCT".to_string());
+        // The merged cache stores CDS-only cDNA here, shorter than the cDNA
+        // coding end; start_codon_context must use the cached UTR + translateable
+        // sequences, as VEP does.
+        transcript.cdna_seq = transcript.translateable_seq.clone();
+        transcript.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 47_783_145,
+            genomic_end: 47_783_470,
+            cdna_start: 1,
+            cdna_end: 326,
+            ori: 1,
+        }];
+        let exons = vec![exon("NM_001406804.1", 1, 47_783_145, 47_783_470)];
+        let exon_refs: Vec<&ExonFeature> = exons.iter().collect();
+        let variant = VariantInput::from_vcf(
+            "2".to_string(),
+            47_783_288,
+            47_783_289,
+            "GA".to_string(),
+            "TT".to_string(),
+        );
+        let translation = translation(
+            "NM_001406804.1",
+            Some(15),
+            Some(5),
+            None,
+            transcript.translateable_seq.as_deref(),
+        );
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        assert!(vep116_codon_overlap(
+            &transcript,
+            &exon_refs,
+            &variant,
+            true
+        ));
+        assert!(vep116_inv_start_altered(
+            &transcript,
+            &exon_refs,
+            &variant,
+            transcript.translateable_seq.as_deref(),
+        ));
+        let (terms, class) = engine.evaluate_transcript_overlap(
+            &variant,
+            &transcript,
+            &exon_refs,
+            Some(&translation),
+        );
+        assert!(terms.contains(&SoTerm::StartLost), "terms: {terms:?}");
+        assert!(class.expect("coding consequence").start_lost);
+        assert!(vep116_start_lost_from_predicates(
+            &CodingClassification::default(),
+            &transcript,
+            &exon_refs,
+            None,
+            &variant,
+            transcript.translateable_seq.as_deref(),
+            false,
+        ));
+    }
+
+    #[test]
     fn clinvar_852228_empty_utr_start_loss_matches_vep() {
         // ClinVar 852228 is A>ATGGGT at the first coding base of CTLA4
         // (ENST00000295854): the refreshed cache has cDNA/CDS beginning with
@@ -34903,8 +35016,7 @@ mod tests {
             !terms.iter().any(|term| {
                 matches!(
                     term,
-                    SoTerm::StartLost
-                        | SoTerm::StartRetainedVariant
+                    SoTerm::StartRetainedVariant
                         | SoTerm::StopGained
                         | SoTerm::MissenseVariant
                         | SoTerm::SynonymousVariant
@@ -34950,7 +35062,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_cds_start_boundary_equal_length_mnv_does_not_infer_start_loss() {
+    fn partial_cds_start_boundary_equal_length_mnv_uses_vep_start_loss_predicate() {
         let cds = "ATGGAATGA";
         let mut transcript = tx(
             "T_CDS_START_BOUNDARY",
@@ -34999,6 +35111,15 @@ mod tests {
         assert!(classification.codons.is_none());
         assert!(classification.amino_acids.is_none());
         assert!(classification.protein_hgvs.is_none());
+        // VEP's start_lost predicate still invokes `_inv_start_altered()` on
+        // this partial-CDS MNV; the 10-base UTR is present and the variant
+        // changes the overlapped ATG to TTG. It must report start_lost without
+        // inferring a complete peptide consequence.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 906-945:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+        assert!(terms.contains(&SoTerm::StartLost), "terms: {terms:?}");
+        assert!(classification.start_lost);
         assert_no_partial_boundary_codon_consequences(&terms);
     }
 
