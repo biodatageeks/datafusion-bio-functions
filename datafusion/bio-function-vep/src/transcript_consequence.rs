@@ -1799,13 +1799,28 @@ impl TranscriptConsequenceEngine {
                             profile.transcript_flags += started.elapsed();
                         }
                         // The selected use_feature_ref policy supplies the
-                        // transcript allele to HGVSc, including failed-BAM rows
-                        // whose mapper still indexes the restored spliced_seq.
+                        // transcript allele to HGVSc only when the full variant
+                        // maps to spliced cDNA. VEP's TranscriptVariation falls
+                        // back to the feature slice for intronic or otherwise
+                        // incomplete mappings, and hgvs_transcript extracts REF
+                        // from that slice. Ensembl Variation 2fb834b,
+                        // TranscriptVariation.pm:453-467 and
+                        // TranscriptVariationAllele.pm:1474-1478:
+                        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L453-L467
+                        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1474-L1478
                         let feature_reference = used_ref.as_deref().unwrap_or(&variant.ref_allele);
                         let given_hgvsc_reference =
                             given_ref.as_deref().unwrap_or(&variant.ref_allele);
+                        let use_feature_reference =
+                            hgvsc_uses_feature_reference(self.bam_edited, tx.has_rna_edit)
+                                && complete_unedited_reference_mapping(
+                                    variant,
+                                    tx,
+                                    tx_exons_for_hgvsc,
+                                )
+                                .is_some();
                         let hgvsc_ref_allele = hgvsc_reference_for_output(
-                            hgvsc_uses_feature_reference(self.bam_edited, tx.has_rna_edit),
+                            use_feature_reference,
                             feature_reference,
                             given_hgvsc_reference,
                             genomic_reference,
@@ -15646,6 +15661,48 @@ mod tests {
             hgvsc_reference_for_output(true, "C", "G", Some("G")),
             "C",
             "use_feature_ref selects spliced_seq even when the failed BAM attributes were rolled back"
+        );
+    }
+
+    #[test]
+    fn intronic_hgvsc_uses_genomic_ref_when_given_ref_mismatches_under_feature_policy() {
+        // A failed-BAM cache enables use_feature_ref globally, but this variant
+        // is intronic and therefore does not map completely to spliced cDNA.
+        // VEP uses the genomic feature slice for HGVSc (G>A) while USED_REF
+        // remains the submitted C. Ensembl Variation 2fb834b,
+        // TranscriptVariation.pm:453-467 and TranscriptVariationAllele.pm:
+        // 1474-1478:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L453-L467
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1474-L1478
+        let id = "ENST_INTRON_REF.1";
+        let mut transcript = tx(
+            id,
+            "21",
+            100,
+            209,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(209),
+        );
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(20);
+        transcript.spliced_seq = Some("ATGAAACCCGGGTTTAAACC".to_string());
+        let transcripts = [transcript];
+        let exons = [exon(id, 1, 100, 109), exon(id, 2, 200, 209)];
+        let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+        let variant = var("21", 150, 150, "C", "A");
+
+        let result = TranscriptConsequenceEngine::default()
+            .with_reference_policy(Some(true))
+            .evaluate_variant_prepared_with_reference(&variant, &context, Some("G"), None);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].used_ref.as_deref(), Some("C"));
+        assert_eq!(
+            result[0].hgvsc.as_deref(),
+            Some("ENST_INTRON_REF.1:c.10+41G>A")
         );
     }
 
