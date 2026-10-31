@@ -3558,6 +3558,8 @@ mod tests {
             cdna_mapper_segments: Vec::new(),
             mature_mirna_regions: Vec::new(),
             gene_stable_id: None,
+            gene_start: 90,
+            gene_end: 140,
             gene_symbol: None,
             gene_symbol_source: None,
             gene_hgnc_id_native: None,

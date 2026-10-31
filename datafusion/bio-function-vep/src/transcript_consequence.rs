@@ -390,6 +390,10 @@ pub struct TranscriptFeature {
     pub mature_mirna_regions: Vec<(i64, i64)>,
     // Gene metadata for per-transcript CSQ serialization.
     pub gene_stable_id: Option<String>,
+    /// 1-based inclusive gene bounds from the transcript cache, used to mirror
+    /// the cache regions from which VEP loads transcripts.
+    pub gene_start: i64,
+    pub gene_end: i64,
     pub gene_symbol: Option<String>,
     pub gene_symbol_source: Option<String>,
     /// Native HGNC ID parsed directly from the raw VEP transcript object or
@@ -15435,6 +15439,8 @@ mod tests {
             cdna_mapper_segments: Vec::new(),
             mature_mirna_regions: Vec::new(),
             gene_stable_id: None,
+            gene_start: start,
+            gene_end: end,
             gene_symbol: None,
             gene_symbol_source: None,
             gene_hgnc_id_native: None,
