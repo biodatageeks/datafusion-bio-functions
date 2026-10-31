@@ -997,6 +997,18 @@ pub(crate) struct GenomicShiftPrelude {
     post_seq: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReferenceFlankWindow {
+    start: i64,
+    end: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GenomicShiftFlankWindows {
+    pre: ReferenceFlankWindow,
+    post: ReferenceFlankWindow,
+}
+
 /// Parse the shiftable indel and read the strand-independent reference flanks
 /// once. Returns `None` when the variant is not a shiftable indel.
 pub(crate) fn prepare_genomic_shift_prelude<R>(
@@ -1016,25 +1028,63 @@ where
     let seq_to_check = seq_to_check.as_bytes().to_vec();
     let hgvs_output = alt_allele.as_bytes().to_vec();
 
-    // Traceability:
-    // - Ensembl Variation `TranscriptVariationAllele::_genomic_shift()`
-    //   expands the VF slice by 1000bp on both sides, then passes both
-    //   `pre_seq` and `post_seq` into `perform_shift()`
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L425-L465>
+    // VEP 116 expands one reference slice by 1000bp on each side, clips it to
+    // the sequence region, then takes pre_seq from the first 1000 bases and
+    // post_seq from the last 1000 bases. At a contig end those windows overlap;
+    // preserve this deterministic VEP bug for parity and track it in vepyr#269.
+    // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:431-437:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L431-L437
+    // https://github.com/biodatageeks/vepyr/issues/269
     let area_to_search = 1000i64;
+    // VEP's VariationFeature represents an insertion as a zero-width interval
+    // (`start = end + 1`); VariantInput stores that same boundary as
+    // `start == end`. Restore VEP's end coordinate before expanding the slice
+    // so its final-1kb `post_seq` starts at the base immediately after the
+    // insertion. This preserves the deterministic MT 116 behavior tracked in
+    // vepyr#269.
+    // Ensembl Variation 2fb834b, VariationFeature.pm:51-57; ensembl-vep
+    // 57ea5c5, Parser.pm:563-570:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L51-L57
+    // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/Parser.pm#L563-L570
+    // https://github.com/biodatageeks/vepyr/issues/269
+    let vep_end = if matches!(kind, GenomicShiftKind::Insertion) {
+        start.saturating_sub(1)
+    } else {
+        end
+    };
     let pre_end = start.saturating_sub(1);
     let pre_start = (pre_end - area_to_search + 1).max(1);
-    let post_start = end.saturating_add(1);
+    let post_start = vep_end.saturating_add(1);
     let post_end = post_start.saturating_add(area_to_search.saturating_sub(1));
-    let pre_seq: String = if pre_end >= pre_start && pre_end > 0 {
-        read_reference_sequence(reader, chrom, pre_start, pre_end)?
+    let reference_record = reader
+        .index()
+        .as_ref()
+        .iter()
+        .find(|record| record.name() == chrom.as_bytes())
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "reference FASTA index has no sequence named {chrom}"
+            ))
+        })?;
+    let sequence_length = i64::try_from(reference_record.length()).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "reference FASTA sequence length is too large for {chrom}: {error}"
+        ))
+    })?;
+    // Reconstruct the two 1000-base windows of VEP's clipped slice directly;
+    // this keeps large deletion interiors out of FASTA I/O and allocation.
+    let (pre_seq, post_seq) = if let Some(windows) =
+        clipped_flank_windows(pre_start, post_end, sequence_length, area_to_search)
+    {
+        let pre_seq = read_reference_sequence(reader, chrom, windows.pre.start, windows.pre.end)?;
+        let post_seq = if windows.post == windows.pre {
+            pre_seq.clone()
+        } else {
+            read_reference_sequence(reader, chrom, windows.post.start, windows.post.end)?
+        };
+        (pre_seq, post_seq)
     } else {
-        String::new()
-    };
-    let post_seq: String = if post_end >= post_start && post_start > 0 {
-        read_reference_sequence(reader, chrom, post_start, post_end)?
-    } else {
-        String::new()
+        (String::new(), String::new())
     };
 
     Ok(Some(GenomicShiftPrelude {
@@ -1044,6 +1094,31 @@ where
         pre_seq,
         post_seq,
     }))
+}
+
+fn clipped_flank_windows(
+    slice_start: i64,
+    slice_end: i64,
+    sequence_length: i64,
+    area_to_search: i64,
+) -> Option<GenomicShiftFlankWindows> {
+    let clipped_start = slice_start.max(1);
+    let clipped_end = slice_end.min(sequence_length);
+    if clipped_end < clipped_start || slice_end <= 0 {
+        return None;
+    }
+
+    let clipped_length = clipped_end - clipped_start + 1;
+    let flank_length = clipped_length.min(area_to_search);
+    let pre = ReferenceFlankWindow {
+        start: clipped_start,
+        end: clipped_start + flank_length - 1,
+    };
+    let post = ReferenceFlankWindow {
+        start: clipped_end - flank_length + 1,
+        end: clipped_end,
+    };
+    Some(GenomicShiftFlankWindows { pre, post })
 }
 
 /// Convenience wrapper preserving the original single-call API: prepares the
@@ -2141,7 +2216,24 @@ fn apply_shifted_insertion_duplication(
     let alt_len = feature_alt.len() as i64;
     let display_start = shift.display_start();
     notation.kind = "dup".to_string();
-    if dup_from_five_prime {
+    // `hgvs_variant_notation()` checks the first insertion-repeat candidate at
+    // `substr(ref_sequence, ref_end, ...)` (zero-based) before its second
+    // candidate. For VEP's shifted insertion gap this is the transcript 3'
+    // flank, so preserve that first match when both repeat flanks are equal.
+    // Ensembl Variation 2fb834b, Utils/Sequence.pm:507-510, 570-589 and
+    // TranscriptVariationAllele.pm:1474-1492:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L507-L510
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L570-L589
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1474-L1492
+    if dup_from_three_prime {
+        if tx.strand >= 0 {
+            notation.start = display_start;
+            notation.end = display_start + alt_len - 1;
+        } else {
+            notation.start = display_start - alt_len;
+            notation.end = display_start - 1;
+        }
+    } else if dup_from_five_prime {
         if tx.strand >= 0 {
             notation.start = display_start - alt_len;
             notation.end = display_start - 1;
@@ -3535,6 +3627,144 @@ fn format_hgvsp_notation(
 mod tests {
     use super::*;
 
+    #[test]
+    fn clipped_flank_windows_do_not_read_a_long_deletion_interior() {
+        assert_eq!(
+            clipped_flank_windows(4_000, 101_000, 200_000, 1_000),
+            Some(GenomicShiftFlankWindows {
+                pre: ReferenceFlankWindow {
+                    start: 4_000,
+                    end: 4_999,
+                },
+                post: ReferenceFlankWindow {
+                    start: 100_001,
+                    end: 101_000,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn clipped_flank_windows_keep_overlap_at_a_contig_end() {
+        assert_eq!(
+            clipped_flank_windows(2, 22, 12, 1_000),
+            Some(GenomicShiftFlankWindows {
+                pre: ReferenceFlankWindow { start: 2, end: 12 },
+                post: ReferenceFlankWindow { start: 2, end: 12 },
+            })
+        );
+    }
+
+    #[test]
+    fn issue_201_mt_end_flank_uses_suffix_of_clipped_slice() {
+        use std::io::Cursor;
+
+        // ClinVar 690254, MT:15939 C>CT is at the end of a short feature
+        // slice. VEP clips the 1kb-expanded slice to the contig, then takes
+        // post_seq from the final 1kb of that clipped slice; it can overlap
+        // the pre-variant sequence. This deterministic VEP 116 behavior is
+        // tracked for correction in vepyr#269.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:431-437:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L431-L437
+        // https://github.com/biodatageeks/vepyr/issues/269
+        let sequence = "ACGTACGTACGT";
+        let data = format!(">MT\n{sequence}\n");
+        let index = fasta::fai::Index::from(vec![fasta::fai::Record::new("MT", 12, 4, 12, 13)]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+
+        let prelude = prepare_genomic_shift_prelude(&mut reader, "MT", "A", "-", 9, 9)
+            .unwrap()
+            .expect("deletion has a shift prelude");
+
+        assert_eq!(prelude.pre_seq, sequence);
+        assert_eq!(prelude.post_seq, sequence);
+    }
+
+    #[test]
+    fn issue_201_vcf_insertion_uses_vep_zero_width_span_for_flanks() {
+        use std::io::Cursor;
+
+        // ClinVar 690254 is a VCF insertion at the MT tRNA boundary. The
+        // engine stores its insertion point as start == end; VEP's
+        // VariationFeature uses start == end + 1. Its clipped expanded slice
+        // therefore ends one base earlier, which moves the last-1kb post_seq
+        // window one base toward the insertion and yields n.54dup.
+        // VariationFeature.pm:51-57 and ensembl-vep Parser.pm:563-570:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L51-L57
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/Parser.pm#L563-L570
+        let sequence = (0..2001)
+            .map(|index| b"ACGT"[index % 4] as char)
+            .collect::<String>();
+        let data = format!(">MT\n{sequence}\n");
+        let index =
+            fasta::fai::Index::from(vec![fasta::fai::Record::new("MT", 2001, 4, 2001, 2002)]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+
+        let prelude = prepare_genomic_shift_prelude(&mut reader, "MT", "-", "T", 1001, 1001)
+            .unwrap()
+            .expect("insertion has a shift prelude");
+
+        assert_eq!(prelude.pre_seq, sequence[..1000]);
+        assert_eq!(prelude.post_seq, sequence[1000..2000]);
+    }
+
+    #[test]
+    fn issue_201_insertion_flanks_use_zero_width_span_on_autosome() {
+        use std::io::Cursor;
+
+        // VariationFeature's insertion coordinates are independent of contig:
+        // `start = end + 1` applies on autosomes as it does on MT.
+        // Ensembl Variation 2fb834b, VariationFeature.pm:51-57; ensembl-vep
+        // 57ea5c5, Parser.pm:563-570:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L51-L57
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/Parser.pm#L563-L570
+        let sequence = (0..2001)
+            .map(|index| b"ACGT"[index % 4] as char)
+            .collect::<String>();
+        let data = format!(">1\n{sequence}\n");
+        let index =
+            fasta::fai::Index::from(vec![fasta::fai::Record::new("1", 2001, 3, 2001, 2002)]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+
+        let prelude = prepare_genomic_shift_prelude(&mut reader, "1", "-", "T", 1001, 1001)
+            .unwrap()
+            .expect("autosomal insertion has a shift prelude");
+
+        assert_eq!(prelude.pre_seq, sequence[..1000]);
+        assert_eq!(prelude.post_seq, sequence[1000..2000]);
+    }
+
+    #[test]
+    fn issue_201_zero_width_insertion_at_contig_start_keeps_clipped_overlap() {
+        use std::io::Cursor;
+
+        // The saturated pre-end is empty before clipping. VEP then clips the
+        // expanded insertion slice to coordinate 1 and takes both flanks from
+        // that clipped slice, so the overlapping windows remain valid.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:431-437 and
+        // VariationFeature.pm:51-57:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L431-L437
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/VariationFeature.pm#L51-L57
+        let sequence = (0..2001)
+            .map(|index| b"ACGT"[index % 4] as char)
+            .collect::<String>();
+        let data = format!(">1\n{sequence}\n");
+        let index =
+            fasta::fai::Index::from(vec![fasta::fai::Record::new("1", 2001, 3, 2001, 2002)]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+
+        let prelude = prepare_genomic_shift_prelude(&mut reader, "1", "-", "T", 1, 1)
+            .unwrap()
+            .expect("contig-start insertion has a shift prelude");
+
+        assert_eq!(prelude.pre_seq, sequence[..1000]);
+        assert_eq!(prelude.post_seq, sequence[..1000]);
+    }
+
     fn make_transcript(
         biotype: &str,
         strand: i8,
@@ -3558,6 +3788,8 @@ mod tests {
             cdna_mapper_segments: Vec::new(),
             mature_mirna_regions: Vec::new(),
             gene_stable_id: None,
+            gene_start: 90,
+            gene_end: 140,
             gene_symbol: None,
             gene_symbol_source: None,
             gene_hgnc_id_native: None,
@@ -5189,6 +5421,64 @@ mod tests {
             "TCTGTTGCTG",
             Some(&shift)
         ));
+    }
+
+    #[test]
+    fn issue_201_mt_insertion_matches_golden_dup_coordinate_after_shift() {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "ENST00000387460".to_string();
+        tx.version = Some(2);
+        tx.start = 15_888;
+        tx.end = 15_953;
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 15_888,
+            end: 15_953,
+        };
+        let exons = [&exon];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 1,
+            start: 15_941,
+            end: 15_940,
+            shifted_compare_allele: "T".to_string(),
+            shifted_allele_string: "T".to_string(),
+            shifted_output_allele: "T".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "T".to_string(),
+            five_prime_flanking_seq: "".to_string(),
+            three_prime_flanking_seq: "T".to_string(),
+            five_prime_context: "T".to_string(),
+            three_prime_context: "T".to_string(),
+        };
+
+        // ClinVar 690254 (MT:15939 C>CT) is golden
+        // ENST00000387460.2:n.54dup, while the old helper returned n.53dup.
+        // For VEP's one-base insertion gap, lookup direction 1 indexes the
+        // reference sequence at `ref_end` (zero-based), selecting the base on
+        // the transcript's 3' side first. That is the source tie-break when
+        // both repeat flanks match (2fb834b, Utils/Sequence.pm:507-510,
+        // 570-589 and TranscriptVariationAllele.pm:1474-1492):
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L507-L510
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L570-L589
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1474-L1492
+        // The MT-end flank bug is deterministic and is tracked in vepyr#269.
+        // https://github.com/biodatageeks/vepyr/issues/269
+        assert_eq!(
+            format_hgvsc(
+                &tx,
+                &exons,
+                Some("53"),
+                None,
+                "-",
+                "T",
+                15_940,
+                15_939,
+                Some(&shift),
+            ),
+            Some("ENST00000387460.2:n.54dup".to_string())
+        );
     }
 
     #[test]

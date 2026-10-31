@@ -302,6 +302,48 @@ fn translation_seqedit_range_for_variant(
         .both_truthy()
 }
 
+fn vep116_reference_peptide_is_undefined_by_seqedit(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+) -> bool {
+    let Some((translation_start, translation_end)) =
+        translation_seqedit_range_for_variant(tx, tx_exons, translation, variant)
+    else {
+        return false;
+    };
+    let (translation_start, translation_end) = if translation_start <= translation_end {
+        (translation_start, translation_end)
+    } else {
+        (translation_end, translation_start)
+    };
+
+    tx.translation_seq_edits.iter().any(|edit| {
+        let Ok(edit_start) = usize::try_from(edit.start) else {
+            return false;
+        };
+        let Ok(edit_end) = usize::try_from(edit.end) else {
+            return false;
+        };
+        let overlap_end = translation_end.min(edit_end);
+        if translation_start.max(edit_start) > overlap_end {
+            return false;
+        }
+
+        // VEP returns undef as soon as an overlapping TV position no longer
+        // exists in the edited reference peptide. Its test is
+        // `tv_pos - se_start >= length(alt_seq)`. The TV positions are
+        // contiguous and that predicate only becomes more likely as the
+        // position increases, so checking the highest overlapping TV position
+        // is equivalent to VEP's per-position loop for both single- and
+        // multi-residue spans.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:747-764:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L747-L764
+        overlap_end.saturating_sub(edit_start) >= edit.alt_seq.chars().count()
+    })
+}
+
 pub(crate) fn refseq_edit_offset_delta(edit: &RefSeqEdit) -> Option<i64> {
     if edit.skip_refseq_offset {
         return None;
@@ -390,6 +432,10 @@ pub struct TranscriptFeature {
     pub mature_mirna_regions: Vec<(i64, i64)>,
     // Gene metadata for per-transcript CSQ serialization.
     pub gene_stable_id: Option<String>,
+    /// 1-based inclusive gene bounds from the transcript cache, used to mirror
+    /// the cache regions from which VEP loads transcripts.
+    pub gene_start: i64,
+    pub gene_end: i64,
     pub gene_symbol: Option<String>,
     pub gene_symbol_source: Option<String>,
     /// Native HGNC ID parsed directly from the raw VEP transcript object or
@@ -1752,15 +1798,29 @@ impl TranscriptConsequenceEngine {
                         {
                             profile.transcript_flags += started.elapsed();
                         }
-                        // VEP classifies and clips HGVS from the genomic feature
-                        // slice, independently of USED_REF's transcript mapping.
-                        // Preserve the input REF if the genomic slice is absent;
-                        // only `_rna_edit` attributes use the transcript feature REF.
+                        // The selected use_feature_ref policy supplies the
+                        // transcript allele to HGVSc only when the full variant
+                        // maps to spliced cDNA. VEP's TranscriptVariation falls
+                        // back to the feature slice for intronic or otherwise
+                        // incomplete mappings, and hgvs_transcript extracts REF
+                        // from that slice. Ensembl Variation 2fb834b,
+                        // TranscriptVariation.pm:453-467 and
+                        // TranscriptVariationAllele.pm:1474-1478:
+                        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L453-L467
+                        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1474-L1478
                         let feature_reference = used_ref.as_deref().unwrap_or(&variant.ref_allele);
                         let given_hgvsc_reference =
                             given_ref.as_deref().unwrap_or(&variant.ref_allele);
+                        let use_feature_reference =
+                            hgvsc_uses_feature_reference(self.bam_edited, tx.has_rna_edit)
+                                && complete_unedited_reference_mapping(
+                                    variant,
+                                    tx,
+                                    tx_exons_for_hgvsc,
+                                )
+                                .is_some();
                         let hgvsc_ref_allele = hgvsc_reference_for_output(
-                            tx.has_rna_edit,
+                            use_feature_reference,
                             feature_reference,
                             given_hgvsc_reference,
                             genomic_reference,
@@ -1893,7 +1953,9 @@ impl TranscriptConsequenceEngine {
                             hgvs_shift,
                             hgvsc_detail_profile.as_mut(),
                             self.semantics,
-                            self.bam_edited != Some(false),
+                            // This is the formatter's global policy; the
+                            // `_rna_edit` allele override above remains separate.
+                            hgvsc_formatter_uses_transcript_ref(self.bam_edited, tx.has_rna_edit),
                             rna_edit_classification_reference(
                                 tx.has_rna_edit,
                                 hgvsc_ref_allele,
@@ -2519,13 +2581,8 @@ impl TranscriptConsequenceEngine {
             // `CodingSequenceVariant` is inserted only by `add_coding_terms`,
             // after the variant has been shown to overlap the CDS. Therefore
             // this VEP `coding_unknown()` call is always within the CDS.
-            let coding_unknown = vep116_coding_unknown_with_table(
-                &terms,
-                coding_class.as_ref(),
-                tx.codon_table,
-                true,
-                complete_overlap,
-            );
+            let coding_unknown =
+                vep116_coding_unknown(&terms, coding_class.as_ref(), true, complete_overlap);
             if !coding_unknown {
                 terms.remove(&SoTerm::CodingSequenceVariant);
             }
@@ -3501,7 +3558,32 @@ impl TranscriptConsequenceEngine {
         // keeps its historical classification path for compatibility.
         if self.semantics.vep116_stop_predicates() && has_partial_cds_endpoint && ref_len == alt_len
         {
-            return partial_boundary_classification;
+            let mut classification = partial_boundary_classification;
+            // The partial-CDS guard suppresses codon and peptide classification,
+            // but VEP still evaluates start_lost's nucleotide predicates on the
+            // TranscriptVariation, including `_inv_start_altered()` for an
+            // equal-length boundary MNV.
+            // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 906-945:
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+            let predicate_class = classification.clone().unwrap_or_default();
+            let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
+            if vep116_start_lost_from_predicates(
+                &predicate_class,
+                tx,
+                tx_exons,
+                tx_translation,
+                variant,
+                translateable_seq.as_deref(),
+                partial_terminal_codon_v116,
+            ) {
+                terms.insert(SoTerm::StartLost);
+                if let Some(classification) = classification.as_mut() {
+                    classification.start_lost = true;
+                    classification.missense = false;
+                }
+            }
+            return classification;
         }
 
         if ref_len != alt_len {
@@ -5910,24 +5992,15 @@ fn apply_vep116_stop_predicate_flags(
                     && reference.contains('*')
                     && !alternate.contains('*')
         );
-    // VEP's stop_retained predicate returns early when partial_codon is true,
-    // before reaching the ref_eq_alt_sequence terminal-insertion case. Keep
-    // that gate on the shortcut as well: otherwise a stop in the inserted
-    // peptide is mislabeled stop_retained instead of stop_gained. This shortcut
-    // also intentionally precedes the generic peptide-X check: VEP applies its
-    // terminal ref_eq_alt_sequence rule when ALT starts with `*`, even if a
-    // later peptide residue is `X`.
+    // VEP only takes the direct ref_eq_alt_sequence path for a non-empty ALT
+    // peptide without X. An ambiguous peptide must instead use the length/CIL
+    // fallback in apply_vep116_nucleotide_stop_fallbacks.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1319
-    let terminal_stop_after_translation = !partial_terminal_codon
-        && ref_peptide == Some("-")
-        && alt_peptide.is_some_and(|alternate| alternate.starts_with('*'))
-        && ref_eq_alt_sequence;
     let stop_retained = !stop_lost
-        && (terminal_stop_after_translation
-            || (!partial_terminal_codon
-                && alt_peptide.is_some_and(|alternate| {
-                    !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
-                })));
+        && !partial_terminal_codon
+        && alt_peptide.is_some_and(|alternate| {
+            !alternate.is_empty() && !alternate.contains('X') && ref_eq_alt_sequence
+        });
     let stop_gained = !stop_retained
         && !stop_lost
         && ref_peptide.is_some_and(|reference| !reference.contains('*'))
@@ -6016,14 +6089,21 @@ fn frameshift_under_semantics(
     semantics: crate::vep_semantics::VepSemantics,
     partial_terminal_codon: bool,
 ) -> bool {
+    let peptide_pair_starts_at_stop = matches!(
+        (
+            class.affected_ref_peptide.as_deref(),
+            class.affected_alt_peptide.as_deref()
+        ),
+        (Some(reference), Some(_)) if reference.starts_with('*')
+    );
+    // VariationEffect.pm obtains the pair through _get_peptide_alleles before
+    // checking whether REF begins with '*'; no pair means the width-based
+    // frameshift result stands.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L772-L797
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1551-L1564
     raw_frameshift
         && !(semantics.vep116_stop_predicates()
-            && (partial_terminal_codon
-                || class.stop_retained
-                || class
-                    .affected_ref_peptide
-                    .as_deref()
-                    .is_some_and(|peptide| peptide.starts_with('*'))))
+            && (partial_terminal_codon || class.stop_retained || peptide_pair_starts_at_stop))
 }
 
 fn apply_vep116_primary_indel_predicates(
@@ -6041,10 +6121,11 @@ fn apply_vep116_primary_indel_predicates(
     // `_get_codon_alleles()` checks frameshift before either in-frame
     // predicate. Clear the raw length-based term for the VEP stop-family
     // exceptions before deriving insertion/deletion from the codon alleles.
-    if partial_terminal_codon
-        || class.stop_retained
-        || ref_peptide.is_some_and(|peptide| peptide.starts_with('*'))
-    {
+    let peptide_pair_starts_at_stop = matches!(
+        (ref_peptide, alt_peptide),
+        (Some(reference), Some(_)) if reference.starts_with('*')
+    );
+    if partial_terminal_codon || class.stop_retained || peptide_pair_starts_at_stop {
         terms.remove(&SoTerm::FrameshiftVariant);
     }
 
@@ -6309,40 +6390,22 @@ fn vep116_coding_unknown(
     within_cds: bool,
     complete_overlap: bool,
 ) -> bool {
-    vep116_coding_unknown_with_table(
-        terms,
-        classification,
-        CodonTable::Standard,
-        within_cds,
-        complete_overlap,
-    )
-}
-
-fn vep116_coding_unknown_with_table(
-    terms: &BTreeSet<SoTerm>,
-    classification: Option<&CodingClassification>,
-    codon_table: CodonTable,
-    within_cds: bool,
-    complete_overlap: bool,
-) -> bool {
     if !within_cds || complete_overlap {
         return false;
     }
 
     let peptide_unknown = classification.is_none_or(|classification| {
-        let codon_peptide_alleles = classification
-            .codons
-            .as_deref()
-            .and_then(|codons| pep_allele_string_from_codon_allele_string_in(codon_table, codons));
+        // VEP's coding_unknown predicate uses the peptide alleles returned by
+        // `_get_peptide_alleles()`. It does not infer a peptide from Codons
+        // when a SeqEdit has made `peptide()` undefined (ClinVar 971953).
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-772 and
+        // Utils/VariationEffect.pm:1616-1637:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1616-L1637
         let output_peptide_alleles = classification
             .amino_acids
             .as_deref()
-            .and_then(|alleles| alleles.split_once('/'))
-            .or_else(|| {
-                codon_peptide_alleles
-                    .as_deref()
-                    .and_then(|alleles| alleles.split_once('/'))
-            });
+            .and_then(|alleles| alleles.split_once('/'));
         let predicate_peptides = classification
             .affected_ref_peptide
             .as_deref()
@@ -7158,7 +7221,18 @@ fn alternate_translation_for_vep_hgvs(
     let alt_genomic = normalize_allele_seq(&variant.alt_allele);
     let ref_len = ref_genomic.len();
 
-    let (cds_start_1based, cds_end_1based) = if ref_len == 0 {
+    let spliced_cds_span =
+        spliced_cds_span_for_intron_deletion(tx, tx_exons, Some(translation), variant);
+    let (cds_start_1based, cds_end_1based) = if let Some((cds_start, cds_end)) = spliced_cds_span {
+        // VEP's `_get_alternate_cds()` asks `cds_start()` and `cds_end()` for
+        // the first and last mapped CDS coordinates. Intronic Gap pieces do
+        // not contribute sequence positions to the alternate CDS.
+        // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:257-265 and
+        // TranscriptVariationAllele.pm:2393-2415:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L257-L265
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2393-L2415
+        (cds_start, cds_end)
+    } else if ref_len == 0 {
         let anchor_pos = if tx.strand >= 0 {
             variant.start.saturating_sub(1)
         } else {
@@ -8787,6 +8861,26 @@ fn protein_hgvs_for_output_with_semantics(
         if !hgvsp_translation_bounds_are_truthy(tx, tx_exons, tx_translation, variant) {
             return None;
         }
+        // `vep116_stop_predicates()` is the existing release-semantic gate;
+        // this V116 SeqEdit peptide rule shares that gate even though the
+        // method name reflects its original callers.
+        // VEP's hgvs_protein() asks both alleles for peptide(), then returns
+        // undef when the reference peptide was shortened past a mapped TV
+        // position. Keep that peptide-availability check even when a local
+        // coding classifier already produced fallback HGVSp data.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-764,1791-1800:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L764
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1791-L1800
+        if semantics.vep116_stop_predicates()
+            && vep116_reference_peptide_is_undefined_by_seqedit(
+                tx,
+                tx_exons,
+                tx_translation,
+                variant,
+            )
+        {
+            return None;
+        }
         return fallback.cloned();
     }
 
@@ -8820,6 +8914,16 @@ fn protein_hgvs_for_output_with_semantics(
         .map(|shift| protein_hgvs_shifted_variant(variant, shift, tx.strand))
         .unwrap_or_else(|| variant.clone());
     if !hgvsp_translation_bounds_are_truthy(tx, tx_exons, tx_translation, &shifted_variant) {
+        return None;
+    }
+    if semantics.vep116_stop_predicates()
+        && vep116_reference_peptide_is_undefined_by_seqedit(
+            tx,
+            tx_exons,
+            tx_translation,
+            &shifted_variant,
+        )
+    {
         return None;
     }
 
@@ -9052,7 +9156,23 @@ fn protein_hgvs_for_output_with_semantics(
     // guard. `hgvs_protein()` calls `_return_3prime()` first and suppresses
     // HGVSp when the shifted `translation_start/end` fall outside the CDS,
     // even if the unshifted consequence peptide is an ambiguous `*/X`.
+    // `_get_fs_peptides()` checks the shifted start against the translated
+    // alternate CDS before reading local peptide windows. At a terminal
+    // frameshift whose start lies beyond that translation, VEP returns
+    // `alt=del,type=del`; the ambiguous `*/X` fallback must not override it.
+    // VEP's source translation has no transcript-table argument, so this source
+    // condition applies to equivalent non-MT transcripts as well as MT rows.
+    // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:2314-2339:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2314-L2339
+    let source_terminal_frameshift_deletion = shifted.as_ref().is_some_and(|protein| {
+        let alternate_translation = protein
+            .alt_translation_extension
+            .as_deref()
+            .unwrap_or(&protein.alt_translation);
+        protein.frameshift && protein.start > alternate_translation.len()
+    });
     if semantics.vep116_stop_predicates()
+        && !source_terminal_frameshift_deletion
         && fallback.is_some_and(|protein| {
             protein.ref_peptide.contains('*') && protein.alt_peptide.contains('X')
         })
@@ -9589,6 +9709,18 @@ fn classify_coding_change_with_spliced_span(
     // including when that allele contains intronic bases.
     // Capture attribute presence before hydration can infer coordinate edits.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L874
+    // Keep the raw translateable CDS for the alternate allele. VEP's reference
+    // codon path patches it with feature_seq, while its alternate path uses
+    // `_get_alternate_cds()` built from `_translateable_seq()` and the mapped
+    // CDS endpoints. Reusing the patched reference sequence inserts intronic
+    // REF bases into the alternate peptide for exon-spanning edits.
+    // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:868-877,2393-2415:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L877
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2393-L2415
+    let alternate_cds_reference = cds_seq.clone();
+    if end_idx >= alternate_cds_reference.len() {
+        return None;
+    }
     let ref_cds_seq = if tx.has_rna_edit && ref_seq_slice != effective_ref_tx {
         let mut edited_cds = cds_seq.clone().into_bytes();
         edited_cds.splice(start_idx..=end_idx, effective_ref_tx.bytes());
@@ -9601,15 +9733,15 @@ fn classify_coding_change_with_spliced_span(
     // bases after cds_end. Only the reference codon carries the patch above.
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L866-L875
     let mut mutated = Vec::with_capacity(
-        cds_seq
+        alternate_cds_reference
             .len()
             .saturating_sub(ref_len)
             .saturating_add(alt_len),
     );
-    mutated.extend_from_slice(&cds_seq.as_bytes()[..start_idx]);
+    mutated.extend_from_slice(&alternate_cds_reference.as_bytes()[..start_idx]);
     let alt_bytes = alt_tx.as_bytes();
     mutated.extend_from_slice(alt_bytes);
-    mutated.extend_from_slice(&cds_seq.as_bytes()[end_idx + 1..]);
+    mutated.extend_from_slice(&alternate_cds_reference.as_bytes()[end_idx + 1..]);
     let cds_seq = ref_cds_seq.unwrap_or(cds_seq);
 
     let old_aas = reference_aas_for_consequence(tx, tx_translation, cds_seq.as_str())?;
@@ -11421,12 +11553,22 @@ fn ins_del_start_altered(
         mutated.extend_from_slice(&seq_bytes[after..]);
     }
 
-    if let Some(utr) = utr {
+    // VariationEffect.pm uses Perl `if ($utr)`: Core returns no 5'UTR object
+    // for an empty slice, so an empty 5'UTR must not trigger the preserved-ATG
+    // early return; continue to the translateable-suffix comparison.
+    // Ensembl Variation 2fb834b, VariationEffect.pm:1050-1071; core
+    // Transcript.pm:1746-1761:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1050-L1071
+    // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+    if let Some(utr) = utr.filter(|utr| !utr.is_empty()) {
         let atg_start = utr.len();
         if mutated.len() >= atg_start + 3 {
             let new_sc = &mutated[atg_start..atg_start + 3];
             let new_utr = &mutated[..utr.len()];
-            if new_utr.eq_ignore_ascii_case(utr.as_bytes()) && new_sc.eq_ignore_ascii_case(b"ATG") {
+            // Ensembl's Perl `eq` here is literal: lowercase cached bases do
+            // not equal the source's uppercase "ATG" spelling.
+            // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1060-L1065
+            if new_utr == utr.as_bytes() && new_sc == b"ATG" {
                 return Some(false);
             }
         }
@@ -11441,7 +11583,9 @@ fn ins_del_start_altered(
     }
 
     let translated_suffix = &mutated[mutated.len() - translateable.len()..];
-    Some(!translated_suffix.eq_ignore_ascii_case(translateable.as_bytes()))
+    // Ensembl compares the translated suffix with Perl `ne`, preserving case.
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1068-L1071
+    Some(translated_suffix != translateable.as_bytes())
 }
 
 /// VEP 116 `_inv_start_altered()` replays a sequence allele in mapped cDNA
@@ -11681,9 +11825,12 @@ fn vep116_start_retained_variant(
         if !crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele) {
             return true;
         }
+        // VariationEffect.pm's `_snp_start_altered()` uses literal Perl `eq`
+        // against "ATG", so this mapped triplet comparison is case-sensitive.
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L992-L1022
         return mutated_cds
             .get(leading_n_offset..leading_n_offset.saturating_add(3))
-            .is_some_and(|codon| codon.eq_ignore_ascii_case(b"ATG"));
+            .is_some_and(|codon| codon == b"ATG");
     }
     let altered = crate::hgvs::vep116_seq_is_unambiguous_dna(&variant.alt_allele)
         && translateable_seq.is_some_and(|seq| {
@@ -12971,27 +13118,51 @@ fn given_ref_for_output(variant: &VariantInput) -> Option<String> {
 
 /// Select the reference allele used by VEP's transcript HGVS formatter.
 ///
-/// VEP extracts REF from the genomic feature slice, then substitutes the
-/// transcript feature allele only when `_rna_edit` attributes are present.
-/// If the genomic slice was unavailable to the caller, the VCF REF is the
-/// source-backed fallback; USED_REF describes transcript mapping and can be
-/// different for edited RefSeq rows.
-/// Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:1463-1477, 1507-1514;
-/// Ensembl VEP release/116.0, OutputFactory.pm:1743-1748:
-/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1463-L1477
-/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1507-L1514
-/// https://github.com/Ensembl/ensembl-vep/blob/release/116.0/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1743-L1748
+/// When `use_feature_ref` is enabled, VEP slices the transcript's spliced
+/// sequence with mapper cDNA coordinates. A failed BAM edit rolls back its
+/// attributes and edit state before this lookup; it does not switch this
+/// lookup back to the genomic feature sequence. Ensembl Variation 2fb834b,
+/// TranscriptVariation.pm:453-467; Ensembl VEP release/116.0,
+/// AnnotationType/Transcript.pm:619-627; Ensembl core c0cf13d,
+/// Transcript.pm:823-878:
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L453-L467
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+/// https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L878
 fn hgvsc_reference_for_output<'a>(
-    has_rna_edit: bool,
+    use_feature_ref: bool,
     feature_reference: &'a str,
     given_reference: &'a str,
     genomic_reference: Option<&'a str>,
 ) -> &'a str {
-    if has_rna_edit {
+    if use_feature_ref {
         feature_reference
     } else {
         genomic_reference.unwrap_or(given_reference)
     }
+}
+
+/// Select the allele used by HGVSc. Cache metadata enables VEP's global
+/// `use_transcript_ref` policy, while `_rna_edit` independently overrides the
+/// displayed HGVSc reference even when that global policy is false. If metadata
+/// is absent, preserve the previous RNA-edit-only default. VEP 116 passes
+/// `use_transcript_ref` through `AnnotationType::Transcript::annotate_InputBuffer()`
+/// to the variation adaptor, and `_rna_edit` attributes independently override
+/// HGVSc alleles:
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L99-L99
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L153-L162
+/// https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1507-L1514
+fn hgvsc_uses_feature_reference(bam_edited: Option<bool>, has_rna_edit: bool) -> bool {
+    bam_edited.unwrap_or(false) || has_rna_edit
+}
+
+/// VEP's formatter follows the cache-wide policy. Unknown metadata retains the
+/// old RNA-edit-only default; an explicit false policy remains false even when
+/// the independent `_rna_edit` allele override applies. VEP passes the global
+/// `use_transcript_ref` value through its transcript annotator:
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L99-L99
+/// https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L153-L162
+fn hgvsc_formatter_uses_transcript_ref(bam_edited: Option<bool>, has_rna_edit: bool) -> bool {
+    bam_edited.unwrap_or(has_rna_edit)
 }
 
 fn used_ref_with_cache_policy(
@@ -13501,7 +13672,15 @@ pub(crate) fn edited_transcript_sequence_cdna_index(
     tx: &TranscriptFeature,
     cdna: usize,
 ) -> Option<usize> {
-    if use_cdna_mapper_for_general_coords(tx) {
+    // A failed BAM edit restores the transcript sequence and attributes after
+    // the cache mapper was materialized. Reconcile that retained mapper cDNA
+    // coordinate with the restored spliced_seq using the RefSeq edit offset.
+    // VEP then slices spliced_seq directly at its mapper cDNA endpoints.
+    // Ensembl Variation 2fb834b, TranscriptVariation.pm:453-467; Ensembl VEP
+    // release/116.0, AnnotationType/Transcript.pm:619-627:
+    // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L453-L467
+    // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+    if use_cdna_mapper_for_general_coords(tx) && !bam_edit_failed(tx) {
         return Some(cdna);
     }
     let adjusted = cdna as i64 + refseq_sequence_offset_for_cdna(tx, cdna as i64).unwrap_or(0);
@@ -13651,7 +13830,10 @@ pub(crate) fn refseq_sequence_offset_for_cdna(
     ) {
         return None;
     }
-    if use_cdna_mapper_for_general_coords(tx) {
+    // A failed BAM edit restores the sequence and attributes, while its cached
+    // mapper coordinates still include the RefSeq edit. Apply that offset when
+    // mapping into the restored spliced sequence.
+    if use_cdna_mapper_for_general_coords(tx) && !bam_edit_failed(tx) {
         return None;
     }
 
@@ -14656,6 +14838,112 @@ mod tests {
     }
 
     #[test]
+    fn issue_241_shortened_seqedit_keeps_coding_entry() {
+        // ClinVar 971953, 1:161305878 A>G, NM_001315491.2 has a codon pair
+        // (Tag/Cag) but VEP has no peptide because a preceding SeqEdit shortens
+        // the translation. Its coding_unknown predicate retains the coding
+        // entry when peptide() is undefined.
+        // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:739-772 and
+        // Utils/VariationEffect.pm:1616-1637:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L772
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1616-L1637
+        let edits = [TranslationSeqEdit {
+            code: "shortened_translation".to_string(),
+            start: 10,
+            end: 11,
+            alt_seq: "M".to_string(),
+        }];
+        assert_eq!(
+            overlay_reference_peptide_seq_edits("MA", 10, 11, &edits),
+            None
+        );
+
+        let classification = CodingClassification {
+            codons: Some("Tag/Cag".to_string()),
+            ..Default::default()
+        };
+        let terms = BTreeSet::from([SoTerm::CodingSequenceVariant]);
+        assert!(vep116_coding_unknown(
+            &terms,
+            Some(&classification),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn issue_241_shortened_seqedit_suppresses_hgvsp_when_reference_peptide_is_undefined() {
+        // ClinVar 971953, 1:161305878 A>G maps to translation residue 249,
+        // where the preceding empty SeqEdit makes VEP's reference peptide
+        // undefined. `hgvs_protein()` then returns undef unless the reference
+        // peptide exists (the coding_unknown consequence remains emitted).
+        // Variation 2fb834b, TranscriptVariationAllele.pm:739-764,1791-1800:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L739-L764
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1791-L1800
+        let mut transcript = tx(
+            "T_ISSUE_241_HGVSP",
+            "22",
+            100,
+            108,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(9);
+        transcript.translation_seq_edits = vec![TranslationSeqEdit {
+            code: "shortened_translation".to_string(),
+            start: 2,
+            end: 2,
+            alt_seq: String::new(),
+        }];
+        let transcript_exon = exon("T_ISSUE_241_HGVSP", 1, 100, 108);
+        let exons = [&transcript_exon];
+        let cached_translation = translation(
+            "T_ISSUE_241_HGVSP",
+            Some(9),
+            Some(3),
+            Some("MK*"),
+            Some("ATGAAATAA"),
+        );
+        let variant = var("22", 103, 103, "G", "A");
+        let fallback = crate::hgvs::ProteinHgvsData {
+            start: 2,
+            end: 2,
+            ref_peptide: "K".to_string(),
+            alt_peptide: "Q".to_string(),
+            ref_translation: "MK*".to_string(),
+            alt_translation: "MQ*".to_string(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        let protein = protein_hgvs_for_output_with_semantics(
+            &transcript,
+            &exons,
+            Some(&cached_translation),
+            &variant,
+            true,
+            Some((2, 2)),
+            Some(&fallback),
+            false,
+            None,
+            None,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+
+        assert!(
+            protein.is_none(),
+            "a missing source reference peptide suppresses HGVSp"
+        );
+    }
+
+    #[test]
     fn cache_reference_policy_selects_complete_noncoding_reference_on_both_strands() {
         for strand in [1, -1] {
             let transcript = tx(
@@ -14696,14 +14984,20 @@ mod tests {
                 );
                 assert_eq!(result[0].given_ref.as_deref(), Some("C"));
                 assert_eq!(result[0].used_ref.as_deref(), Some(expected));
-                // Genomic HGVSc remains independent even with known-false or
-                // UNKNOWN transcript-reference policy.
+                // `None` retains the historical RNA-edit-only reference rule;
+                // this non-RNA-edited fixture uses its genomic reference.
+                let feature_or_genomic_ref = "A";
                 let expected_hgvs = if strand == 1 {
-                    "ENST_REFERENCE:n.6A>T"
+                    format!("ENST_REFERENCE:n.6{feature_or_genomic_ref}>T")
                 } else {
-                    "ENST_REFERENCE:n.95T>A"
+                    let ref_on_transcript = if feature_or_genomic_ref == "A" {
+                        "T"
+                    } else {
+                        "G"
+                    };
+                    format!("ENST_REFERENCE:n.95{ref_on_transcript}>A")
                 };
-                assert_eq!(result[0].hgvsc.as_deref(), Some(expected_hgvs));
+                assert_eq!(result[0].hgvsc.as_deref(), Some(expected_hgvs.as_str()));
             }
         }
     }
@@ -14770,7 +15064,7 @@ mod tests {
                 Some("A"),
             )
             .as_deref(),
-            Some("A")
+            Some("C")
         );
 
         let before_edit = var("15", 108, 108, "T", "C");
@@ -15302,6 +15596,26 @@ mod tests {
     }
 
     #[test]
+    fn cache_reference_policy_keeps_rna_edit_override_separate_from_formatter_policy() {
+        for (bam_edited, has_rna_edit, feature_reference, formatter_policy) in [
+            (Some(true), false, true, true),
+            (Some(false), true, true, false),
+            (None, true, true, true),
+            (Some(false), false, false, false),
+            (None, false, false, false),
+        ] {
+            assert_eq!(
+                hgvsc_uses_feature_reference(bam_edited, has_rna_edit),
+                feature_reference
+            );
+            assert_eq!(
+                hgvsc_formatter_uses_transcript_ref(bam_edited, has_rna_edit),
+                formatter_policy
+            );
+        }
+    }
+
+    #[test]
     fn cache_reference_policy_preserves_actual_rna_edit_reference_for_hgvs() {
         for id in ["NR_REFERENCE.1", "ENST_REFERENCE"] {
             let mut transcript = tx(id, "21", 100, 199, 1, "lncRNA", None, None);
@@ -15317,21 +15631,136 @@ mod tests {
             let exons = [exon(id, 1, 100, 199)];
             let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
             let variant = var("21", 105, 105, "C", "T");
-            for (policy, reference) in [(true, "G"), (false, "C")] {
+            for (policy, reference, hgvsc_reference) in
+                [(Some(true), "G", "G"), (Some(false), "C", "C")]
+            {
                 // The RNA-edit override restores the reference TVA's feature
                 // allele, not unconditionally the cached edited sequence. With
                 // use_feature_ref=false and no_ref_check=true VEP constructs
                 // that TVA from the supplied REF (VFO.pm:368-395,424).
                 let result = TranscriptConsequenceEngine::default()
-                    .with_reference_policy(Some(policy))
+                    .with_reference_policy(policy)
                     .evaluate_variant_prepared_with_reference(&variant, &context, Some("A"), None);
                 assert_eq!(result[0].used_ref.as_deref(), Some(reference));
                 assert_eq!(
                     result[0].hgvsc.as_deref(),
-                    Some(format!("{id}:n.6{reference}>T").as_str())
+                    Some(format!("{id}:n.6{hgvsc_reference}>T").as_str())
                 );
             }
         }
+    }
+
+    #[test]
+    fn issue_209_failed_bam_uses_transcript_reference_for_hgvsc() {
+        // ClinVar 4517684, 1:151767299 G>A, NM_001134939.1 has GIVEN_REF=G
+        // and VEP USED_REF=C. With use_feature_ref enabled, the HGVSc allele
+        // follows the transcript feature reference even after BAM rollback.
+        // Ensembl Variation 2fb834b, TranscriptVariation.pm:453-467:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L453-L467
+        assert_eq!(
+            hgvsc_reference_for_output(true, "C", "G", Some("G")),
+            "C",
+            "use_feature_ref selects spliced_seq even when the failed BAM attributes were rolled back"
+        );
+    }
+
+    #[test]
+    fn intronic_hgvsc_uses_genomic_ref_when_given_ref_mismatches_under_feature_policy() {
+        // A failed-BAM cache enables use_feature_ref globally, but this variant
+        // is intronic and therefore does not map completely to spliced cDNA.
+        // VEP uses the genomic feature slice for HGVSc (G>A) while USED_REF
+        // remains the submitted C. Ensembl Variation 2fb834b,
+        // TranscriptVariation.pm:453-467 and TranscriptVariationAllele.pm:
+        // 1474-1478:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L453-L467
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1474-L1478
+        let id = "ENST_INTRON_REF.1";
+        let mut transcript = tx(
+            id,
+            "21",
+            100,
+            209,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(209),
+        );
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(20);
+        transcript.spliced_seq = Some("ATGAAACCCGGGTTTAAACC".to_string());
+        let transcripts = [transcript];
+        let exons = [exon(id, 1, 100, 109), exon(id, 2, 200, 209)];
+        let context = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+        let variant = var("21", 150, 150, "C", "A");
+
+        let result = TranscriptConsequenceEngine::default()
+            .with_reference_policy(Some(true))
+            .evaluate_variant_prepared_with_reference(&variant, &context, Some("G"), None);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].used_ref.as_deref(), Some("C"));
+        assert_eq!(
+            result[0].hgvsc.as_deref(),
+            Some("ENST_INTRON_REF.1:c.10+41G>A")
+        );
+    }
+
+    #[test]
+    fn issue_209_failed_bam_oaz_uses_rollback_spliced_coordinates() {
+        // ClinVar 4517684, 1:151767299 G>A, NM_001134939.1 has a failed BAM
+        // edit and an upstream one-base RefSeq edit. VEP rolls that edit back
+        // before slicing the spliced sequence at mapper cDNA coordinates;
+        // the reference at the mapped endpoint is C (USED_REF=C in the golden).
+        // Ensembl Variation 2fb834b, TranscriptVariation.pm:453-467; Ensembl
+        // VEP release/116.0, AnnotationType/Transcript.pm:619-627:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariation.pm#L453-L467
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627
+        let mut transcript = tx(
+            "NM_001134939.1",
+            "1",
+            151_762_969,
+            151_771_330,
+            1,
+            "protein_coding",
+            Some(151_763_136),
+            Some(151_771_105),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("failed".to_string());
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 261,
+            end: 261,
+            replacement_len: None,
+            skip_refseq_offset: false,
+        }];
+        let mut sequence = vec![b'A'; 851];
+        sequence[333] = b'C'; // VEP spliced_seq at cDNA position 334.
+        sequence[334] = b'G'; // The cached mapper endpoint is cDNA position 335.
+        transcript.spliced_seq = Some(String::from_utf8(sequence).unwrap());
+        transcript.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 151_767_225,
+            genomic_end: 151_767_299,
+            cdna_start: 261,
+            cdna_end: 335,
+            ori: 1,
+        }];
+        let exons = [exon("NM_001134939.1", 1, 151_767_225, 151_767_299)];
+        let variant = var("1", 151_767_299, 151_767_299, "G", "A");
+
+        assert_eq!(
+            used_ref_with_cache_policy(
+                &variant,
+                &transcript,
+                &exons.iter().collect::<Vec<_>>(),
+                None,
+                false,
+                Some(true),
+                Some("G"),
+            )
+            .as_deref(),
+            Some("C")
+        );
     }
 
     #[test]
@@ -15435,6 +15864,8 @@ mod tests {
             cdna_mapper_segments: Vec::new(),
             mature_mirna_regions: Vec::new(),
             gene_stable_id: None,
+            gene_start: start,
+            gene_end: end,
             gene_symbol: None,
             gene_symbol_source: None,
             gene_hgnc_id_native: None,
@@ -16392,7 +16823,7 @@ mod tests {
     }
 
     #[test]
-    fn vep116_terminal_insertion_uses_post_translation_stop_with_partial_tail() {
+    fn vep116_terminal_insertion_with_x_peptide_skips_direct_ref_eq_alt_path() {
         let mut insertion = CodingClassification {
             protein_position_start: Some(756),
             protein_position_end: Some(757),
@@ -16411,8 +16842,8 @@ mod tests {
             false,
             ref_eq_alt,
         );
-        assert!(insertion.stop_retained, "{insertion:?}");
-        assert!(!insertion.stop_gained, "{insertion:?}");
+        assert!(!insertion.stop_retained, "{insertion:?}");
+        assert!(insertion.stop_gained, "{insertion:?}");
     }
 
     #[test]
@@ -16440,7 +16871,7 @@ mod tests {
     }
 
     #[test]
-    fn vep116_hunk9_rejects_frameshift_when_reference_peptide_starts_stop() {
+    fn vep116_hunk9_requires_peptide_pair_before_stop_first_frameshift_suppression() {
         let class = CodingClassification {
             affected_ref_peptide: Some("*Q".to_string()),
             ..Default::default()
@@ -16451,9 +16882,20 @@ mod tests {
             crate::vep_semantics::VepSemantics::V115,
             false,
         ));
-        assert!(!frameshift_under_semantics(
+        assert!(frameshift_under_semantics(
             true,
             &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        ));
+
+        let paired_peptides = CodingClassification {
+            affected_alt_peptide: Some("X".to_string()),
+            ..class.clone()
+        };
+        assert!(!frameshift_under_semantics(
+            true,
+            &paired_peptides,
             crate::vep_semantics::VepSemantics::V116,
             false,
         ));
@@ -17590,7 +18032,6 @@ mod tests {
             1,
         )
         .unwrap();
-
         let original =
             classify_coding_change(&transcript, &exons_ref, Some(&translation), &variant)
                 .expect("original classification");
@@ -20542,6 +20983,183 @@ mod tests {
         assert!(frameshift_entry.codons.is_some());
         assert!(frameshift_entry.amino_acids.is_some());
         assert!(frameshift_entry.hgvsp.is_some());
+    }
+
+    #[test]
+    fn issue_215_clinvar_1452802_uses_spliced_alternate_cds_for_hgvsp() {
+        // ClinVar 1452802, 7:44145166 REF>G deletes c.154_356 across the
+        // intron. VEP's mapped CDS endpoints remove those 203 spliced bases;
+        // the next codon is CTG (Leu), followed by TAA, so HGVSp is
+        // p.Val52LeufsTer2.
+        // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:257-265,
+        // 505-526; TranscriptVariationAllele.pm:850-877, 2314-2340:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L257-L265
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L505-L526
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L850-L877
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2314-L2340
+        let cds = "ATGTCCAGCGACACGGGCGACCGCAAGCAGATCTACAACATCCTGAGCACGCTGGGGCTGCGACCCTCGACCACCGACTGCGACATCGTGCGCCGCGCCTGCGAGAGCGTGTCTACGCGCGCTGCGCACATGTGCTCGGCGGGGCTGGCGGGCGTCATCAACCGCATGCGCGAGAGCCGCAGCGAGGACGTAATGCGCATCACTGTGGGCGTGGATGGCTCCGTGTACAAGCTGCACCCCAGCTTCAAGGAGCGGTTCCATGCCAGCGTGCGCAGGCTGACGCCCAGCTGCGAGATCACCTTCATCGAGTCGGAGGAGGGCAGTGGCCGGGGCGCGGCCCTGGTCTCGGCGGTGGCCTGTAAGAAGGCCTGTATGCTGGGCCAGTGA";
+        let peptide = "MSSDTGDRKQIYNILSTLGLRPSTTDCDIVRRACESVSTRAAHMCSAGLAGVINRMRESRSEDVMRITVGVDGSVYKLHPSFKERFHASVRRLTPSCEITFIESEEGSGRGAALVSAVACKKACMLGQ";
+        let mut transcript = tx(
+            "NM_001354801.1",
+            "7",
+            44144271,
+            44146633,
+            -1,
+            "protein_coding",
+            Some(44145136),
+            Some(44146626),
+        );
+        transcript.version = Some(1);
+        transcript.cdna_coding_start = Some(8);
+        transcript.cdna_coding_end = Some(394);
+        transcript.five_prime_utr_seq = Some("CTGCCCT".to_string());
+        transcript.three_prime_utr_seq = Some("A".repeat(873));
+        transcript.spliced_seq = Some(format!("CTGCCCT{cds}{}", "A".repeat(873)));
+        transcript.has_rna_edit = true;
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 1260,
+            end: 1259,
+            replacement_len: Some(8),
+            skip_refseq_offset: false,
+        }];
+        transcript.translateable_seq = Some(cds.to_string());
+        transcript.cdna_seq = Some(cds.to_string());
+        let exons = [
+            exon("NM_001354801.1", 1, 44146619, 44146633),
+            exon("NM_001354801.1", 2, 44145497, 44145730),
+            exon("NM_001354801.1", 3, 44144271, 44145280),
+        ];
+        let mut tr = translation(
+            "NM_001354801.1",
+            Some(387),
+            Some(128),
+            Some(peptide),
+            Some(cds),
+        );
+        tr.stable_id = Some("NP_001341730".to_string());
+        tr.version = Some(1);
+        tr.translation_seq_canonical = Some(peptide.to_string());
+        tr.cds_sequence_canonical = Some(cds.to_string());
+        // ClinVar 1452802 exact ledger REF: the genomic allele is needed to
+        // exercise VEP's separate reference feature_seq and alternate CDS paths.
+        let ref_allele = "GGCCACCGCCGAGACCAGGGCCGCGCCCCGGCCACTGCCCTCCTCCGACTCGATGAAGGTGATCTCGCAGCTGGGCGTCAGCCTGCGCACGCTGGCATGGAACCGCTCCTTGAAGCTGGGCAGAAGAGAAGCAGGGCTGCCGTCCCTCCTCCCACCTCATCCTCCACATTCATTACCGGGCGCCCTGCACGCAGTCGACCCTTCCCCCAAATCTAGGCCAAGGGGGACGAGAAGAGGACTACGAAATCTTGGAGCTTGGGAACCGCAAGGAACCTTGGAGCGCGCGCTTTTTGGGCCCCACTTTACCAGGGAGAGAGCGGGGCGGGCTCACCTGGGGTGCAGCTTGTACACGGAGCCATCCACGCCCACAGTGATGCGCATTACGTCCTCGCTGCGGCTCTCGCGCATGCGGTTGATGAC".to_string();
+        let variant = VariantInput::from_vcf(
+            "7".to_string(),
+            44145166,
+            44145585,
+            ref_allele,
+            "G".to_string(),
+        );
+        assert_eq!((variant.start, variant.end), (44145167, 44145585));
+
+        let result = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .evaluate_variant_with_context(
+            &variant,
+            &[transcript],
+            &exons,
+            &[tr],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let entry = result
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("NM_001354801.1"))
+            .expect("NM_001354801.1 consequence is emitted");
+        assert_eq!(
+            entry.hgvsp.as_deref(),
+            Some("NP_001341730.1:p.Val52LeufsTer2")
+        );
+    }
+
+    #[test]
+    fn issue_215_clinvar_3780850_spliced_start_deletion_is_start_lost() {
+        // ClinVar 3780850, 9:95247431 REF>C maps to c.1_250del across the
+        // first two exons. VEP's cDNA endpoints therefore overlap the complete
+        // start codon, and `_ins_del_start_altered()` sees a shortened CDS.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 947-962,
+        // 1028-1075; BaseTranscriptVariation.pm:257-265:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L947-L962
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1028-L1075
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L257-L265
+        let cds = "ATGGCTCAAGATTCAGTAGATCTTTCTTGTGATTATCAGTTTTGGATGCAGAAGCTTTCTGTATGGGATCAGGCTTCCACTTTGGAAACCCAGCAAGACACCTGTCTTCACGTGGCTCAGTTCCAGGAGTTCCTAAGGAAGATGTATGAAGCCTTGAAAGAGATGGATTCTAATACAGTCATTGAAAGATTCCCCACAATTGGTCAACTGTTGGCAAAAGCTTGTTGGAATCCTTTTATTTTAGCATATGATGAAAGCCAAAAAATTCTAATATGGTGCTTATGTTGTCTAATTAACAAAGAACCACAGAATTCTGGACAATCAAAACTTAACTCCTGGATACAGGTGGAATTATACTGA";
+        let peptide = "MAQDSVDLSCDYQFWMQKLSVWDQASTLETQQDTCLHVAQFQEFLRKMYEALKEMDSNTVIERFPTIGQLLAKACWNPFILAYDESQKILIWCLCCLINKEPQNSGQSKLNSWIQVELY";
+        let mut transcript = tx(
+            "ENST00000649334",
+            "9",
+            95101710,
+            95249291,
+            -1,
+            "protein_coding",
+            Some(95186631),
+            Some(95249291),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(360);
+        transcript.translateable_seq = Some(cds.to_string());
+        transcript.cdna_seq = Some(cds.to_string());
+        let exons = [
+            exon("ENST00000649334", 1, 95249127, 95249291),
+            exon("ENST00000649334", 2, 95247432, 95247516),
+        ];
+        let mut tr = translation(
+            "ENST00000649334",
+            Some(360),
+            Some(119),
+            Some(peptide),
+            Some(cds),
+        );
+        tr.stable_id = Some("ENSP00000497735".to_string());
+        tr.version = Some(1);
+        let ref_allele = format!("C{}", "N".repeat(1860));
+        let variant = VariantInput::from_vcf(
+            "9".to_string(),
+            95247431,
+            95249291,
+            ref_allele,
+            "C".to_string(),
+        );
+        assert_eq!((variant.start, variant.end), (95247432, 95249291));
+
+        let result = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .evaluate_variant_with_context(
+            &variant,
+            &[transcript.clone()],
+            &exons,
+            &[tr],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let entry = result
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENST00000649334"))
+            .expect("ENST00000649334 consequence is emitted");
+        assert!(
+            entry.terms.contains(&SoTerm::StartLost),
+            "{:?}",
+            entry.terms
+        );
+        assert!(
+            !entry.terms.contains(&SoTerm::StartRetainedVariant),
+            "{:?}",
+            entry.terms
+        );
+        assert_eq!(entry.hgvsp.as_deref(), Some("ENSP00000497735.1:p.Ala2_?84"));
     }
 
     #[test]
@@ -27140,6 +27758,83 @@ mod tests {
     }
 
     #[test]
+    fn issue_202_spliced_inframe_deletion_uses_unpatched_alternate_cds() {
+        // ClinVar 2530348, X:111410072 deletes c.210_569 across exons. For
+        // RefSeq-edited transcripts VEP patches the reference codon sequence
+        // with feature_seq but builds the alternate CDS from the original
+        // translateable sequence and mapped endpoints. The transcript-oriented
+        // feature REF below includes the mapped exon pieces and an intronic
+        // spacer, preserving the reference stop for the independent predicate.
+        // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:257-265 and
+        // TranscriptVariationAllele.pm:868-877,2393-2415:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L257-L265
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L877
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2393-L2415
+        let mut cds = b"GCT".repeat(100);
+        cds[..3].copy_from_slice(b"ATG");
+        // c.19_21 is AGT, making the local alternate codon AGA when the
+        // in-frame deletion joins it to c.81's A.
+        cds[18..21].copy_from_slice(b"AGT");
+        cds[24..27].copy_from_slice(b"TAA");
+        cds[80] = b'A';
+        let cds = String::from_utf8(cds).expect("synthetic CDS is ASCII");
+        let mut transcript = tx(
+            "T_ISSUE_202_SPLICE",
+            "X",
+            100,
+            229,
+            -1,
+            "protein_coding",
+            Some(100),
+            Some(229),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(100);
+        transcript.translateable_seq = Some(cds.clone());
+        transcript.cdna_seq = Some(cds.clone());
+        // This models the ClinVar 2530348 RefSeq row: VEP patches the
+        // reference allele from feature_seq, but `_get_alternate_cds()` uses
+        // the original translateable CDS and mapped endpoints.
+        transcript.has_rna_edit = true;
+        let exons = [
+            exon("T_ISSUE_202_SPLICE", 1, 200, 229),
+            exon("T_ISSUE_202_SPLICE", 2, 100, 169),
+        ];
+        let exon_refs = exons.iter().collect::<Vec<_>>();
+        let tr = translation("T_ISSUE_202_SPLICE", Some(300), Some(100), None, Some(&cds));
+        // The deleted genomic interval includes 30 intronic bases; the two
+        // exon pieces map to exactly 60 coding bases (c.21_80). On this minus
+        // strand transcript, feature_seq is the reverse complement of c.21_30,
+        // an intronic spacer, and c.31_80 in transcript orientation.
+        let feature_ref_tx = format!("{}{}{}", &cds[20..30], "A".repeat(30), &cds[30..80]);
+        let genomic_ref = reverse_complement_for_semantics(
+            &feature_ref_tx,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("feature REF is a DNA sequence");
+        let deletion = var("X", 120, 209, &genomic_ref, "-");
+
+        let class = classify_coding_change_with_semantics(
+            &transcript,
+            &exon_refs,
+            Some(&tr),
+            &deletion,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .expect("the two mapped CDS endpoints define a spliced deletion");
+        assert!(
+            class
+                .affected_ref_peptide
+                .as_deref()
+                .is_some_and(|peptide| peptide.contains('*')),
+            "{:?}",
+            class.affected_ref_peptide
+        );
+        assert_eq!(class.affected_alt_peptide.as_deref(), Some("R"));
+        assert!(class.stop_lost, "{class:?}");
+    }
+
+    #[test]
     fn issue_202_complex_runoff_reports_incomplete_terminal_codon() {
         let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
             5000,
@@ -27833,6 +28528,360 @@ mod tests {
             result,
             Some(false),
             "Insertion after start codon should preserve ATG"
+        );
+    }
+
+    #[test]
+    fn clinvar_96674_empty_utr_skips_the_start_codon_early_return() {
+        // Golden ClinVar 96674 has an in-frame insertion after the start
+        // codon, but no start_lost or start_retained_variant term. Its cache
+        // transcript has an empty 5'UTR and a CDS beginning at cDNA 1.
+        // VariationEffect.pm's `if ($utr)` skips the early ATG-preserved
+        // return when Core's `_five_prime_utr()` has no non-empty sequence;
+        // `_ins_del_start_altered()` then compares the translated suffix.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:1050-1071:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1050-L1071
+        // Ensembl core c0cf13d, Transcript.pm:1746-1761:
+        // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
+        let cds = "ATGGAGCCCGAGCCCGAGCCCGCGGCCGTGGAGGTTCCCGCGGGGCGCGTGCTCAGGGGCAGCTTGGTGGCTGCCGAGTGGAGGCCAGAAGAGGGCTTCGTGGAGTTGAAGTCTCCCGCGGGCAAATTCTGGCAGACCATGGGCTTCTCAGAGCAGGGCCGGCAGCGCCTTCACCCGGAAGAGGCCTTGTATCTTCTGGAGTGTGGCTCCATCCACCTCTTCCACCAAGACCTGCCACTGTCTATCCAGGAAGCTTACCAGCTGCTGCTGACCGACCACACTGTGACCTTCCTGCAGTACCAGGTCTTCAGCCACCTGAAGAGGTTGGGTTATGTGGTTCGACGATTCCAACCAAGCTCTGTCCTGTCCCCGTATGAGAGGCAGCTTAACCTGGATGCCAGCGTGCAGCACTTGGAGGATGGAGATGGCAAGAGAAAGAGGAGCAGCTCCAGCCCTCGACAGCCGCCACACCCTTCTGCGCGCCCCAGCCCCAGAGCTGCTCCCGGCCAACGTGGCTGGGCGGGAGACAGACGCTGA";
+        let mut t = tx(
+            "ENST00000583173",
+            "17",
+            75_516_561,
+            75_523_287,
+            1,
+            "protein_coding",
+            Some(75_516_561),
+            Some(75_522_085),
+        );
+        t.cdna_seq = Some(cds.to_string());
+        t.translateable_seq = Some(cds.to_string());
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(537);
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_516_561,
+                genomic_end: 75_516_616,
+                cdna_start: 1,
+                cdna_end: 56,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_517_009,
+                genomic_end: 75_517_072,
+                cdna_start: 57,
+                cdna_end: 120,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_517_161,
+                genomic_end: 75_517_244,
+                cdna_start: 121,
+                cdna_end: 204,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_517_557,
+                genomic_end: 75_517_655,
+                cdna_start: 205,
+                cdna_end: 303,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_518_995,
+                genomic_end: 75_519_047,
+                cdna_start: 304,
+                cdna_end: 356,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_521_409,
+                genomic_end: 75_521_510,
+                cdna_start: 357,
+                cdna_end: 458,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_522_007,
+                genomic_end: 75_522_333,
+                cdna_start: 459,
+                cdna_end: 785,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_523_275,
+                genomic_end: 75_523_287,
+                cdna_start: 786,
+                cdna_end: 798,
+                ori: 1,
+            },
+        ];
+        let exons = vec![
+            exon("ENST00000583173", 1, 75_516_561, 75_516_616),
+            exon("ENST00000583173", 2, 75_517_009, 75_517_072),
+            exon("ENST00000583173", 3, 75_517_161, 75_517_244),
+            exon("ENST00000583173", 4, 75_517_557, 75_517_655),
+            exon("ENST00000583173", 5, 75_518_995, 75_519_047),
+            exon("ENST00000583173", 6, 75_521_409, 75_521_510),
+            exon("ENST00000583173", 7, 75_522_007, 75_522_333),
+            exon("ENST00000583173", 8, 75_523_275, 75_523_287),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let insertion = VariantInput::from_vcf(
+            "17".to_string(),
+            75_516_562,
+            75_516_562,
+            "T".to_string(),
+            "TGGAGCC".to_string(),
+        );
+
+        assert_eq!(
+            ins_del_start_altered(&t, &exons_ref, &insertion, None),
+            Some(true),
+            "with no 5'UTR object, VEP compares the changed translateable suffix"
+        );
+        assert!(
+            !vep116_start_retained_variant(
+                &t,
+                &exons_ref,
+                &insertion,
+                cds.as_bytes(),
+                0,
+                Some(cds),
+            ),
+            "start_retained_variant negates the source predicate for this insertion"
+        );
+
+        // The same insertion with an actual non-empty 5'UTR still takes
+        // VariationEffect.pm's ATG-preserved early return.
+        let (utr_tx, utr_exons) = tx_with_cdna("GCGC", cds);
+        let utr_exons_ref: Vec<&ExonFeature> = utr_exons.iter().collect();
+        let utr_insertion = var("22", 1006, 1006, "-", "GGAGCC");
+        assert_eq!(
+            ins_del_start_altered(&utr_tx, &utr_exons_ref, &utr_insertion, None),
+            Some(false),
+            "the non-empty 5'UTR preserves the unchanged ATG early return"
+        );
+    }
+
+    #[test]
+    fn clinvar_825785_boundary_mnv_disrupts_the_start_codon() {
+        // ClinVar 825785 is GA>TT at chr2:47783288 in NM_001406804.1. The
+        // RefSeq cache places the two bases at cDNA 144-145: the final 5'UTR
+        // base and the first ATG base (cDNA 145-147). VEP reports
+        // start_lost&5_prime_UTR_variant.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 906-945:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+        let mut transcript = tx(
+            "NM_001406804.1",
+            "2",
+            47_783_145,
+            47_806_953,
+            1,
+            "protein_coding",
+            Some(47_783_289),
+            Some(47_783_303),
+        );
+        transcript.cdna_coding_start = Some(145);
+        transcript.cdna_coding_end = Some(159);
+        transcript.five_prime_utr_seq = Some(format!("{}G", "C".repeat(143)));
+        transcript.translateable_seq = Some("ATGCCAACAAGGCCT".to_string());
+        // The merged cache stores CDS-only cDNA here, shorter than the cDNA
+        // coding end; start_codon_context must use the cached UTR + translateable
+        // sequences, as VEP does.
+        transcript.cdna_seq = transcript.translateable_seq.clone();
+        transcript.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 47_783_145,
+            genomic_end: 47_783_470,
+            cdna_start: 1,
+            cdna_end: 326,
+            ori: 1,
+        }];
+        let exons = vec![exon("NM_001406804.1", 1, 47_783_145, 47_783_470)];
+        let exon_refs: Vec<&ExonFeature> = exons.iter().collect();
+        let variant = VariantInput::from_vcf(
+            "2".to_string(),
+            47_783_288,
+            47_783_289,
+            "GA".to_string(),
+            "TT".to_string(),
+        );
+        let translation = translation(
+            "NM_001406804.1",
+            Some(15),
+            Some(5),
+            None,
+            transcript.translateable_seq.as_deref(),
+        );
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        assert!(vep116_codon_overlap(
+            &transcript,
+            &exon_refs,
+            &variant,
+            true
+        ));
+        assert!(vep116_inv_start_altered(
+            &transcript,
+            &exon_refs,
+            &variant,
+            transcript.translateable_seq.as_deref(),
+        ));
+        let (terms, class) = engine.evaluate_transcript_overlap(
+            &variant,
+            &transcript,
+            &exon_refs,
+            Some(&translation),
+        );
+        assert!(terms.contains(&SoTerm::StartLost), "terms: {terms:?}");
+        assert!(
+            terms.contains(&SoTerm::FivePrimeUtrVariant),
+            "terms: {terms:?}"
+        );
+        assert!(class.expect("coding consequence").start_lost);
+        let preserved_atg = VariantInput::from_vcf(
+            "2".to_string(),
+            47_783_288,
+            47_783_289,
+            "GA".to_string(),
+            "CA".to_string(),
+        );
+        assert!(!vep116_inv_start_altered(
+            &transcript,
+            &exon_refs,
+            &preserved_atg,
+            transcript.translateable_seq.as_deref(),
+        ));
+        assert!(!vep116_start_lost_from_predicates(
+            &CodingClassification::default(),
+            &transcript,
+            &exon_refs,
+            Some(&translation),
+            &preserved_atg,
+            transcript.translateable_seq.as_deref(),
+            false,
+        ));
+        let (control_terms, _) = engine.evaluate_transcript_overlap(
+            &preserved_atg,
+            &transcript,
+            &exon_refs,
+            Some(&translation),
+        );
+        assert!(
+            !control_terms.contains(&SoTerm::StartLost),
+            "terms: {control_terms:?}"
+        );
+        assert!(vep116_start_lost_from_predicates(
+            &CodingClassification::default(),
+            &transcript,
+            &exon_refs,
+            // The helper-level call isolates the nucleotide predicates; the
+            // engine evaluation above exercises the normal translated path.
+            None,
+            &variant,
+            transcript.translateable_seq.as_deref(),
+            false,
+        ));
+    }
+
+    #[test]
+    fn clinvar_852228_empty_utr_start_loss_matches_vep() {
+        // ClinVar 852228 is A>ATGGGT at the first coding base of CTLA4
+        // (ENST00000295854): the refreshed cache has cDNA/CDS beginning with
+        // ATG at cDNA 1, no 5'UTR sequence, and a five-base insertion after
+        // cDNA 1. VEP 116 reports frameshift_variant&start_lost; the golden
+        // panel also records HGVSp p.Ala2?.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 947-963,
+        // 1028-1071; TranscriptVariationAllele.pm:2154-2159:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L947-L963
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1028-L1071
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2154-L2159
+        let cds = "ATGGCTTGCCTTGGATTTCAGCGGCACAAGGCTCAGCTGAACCTGGCTACCAGGACCTGGCCCTGCACTCTCCTGTTTTTTCTTCTCTTCATCCCTGTCTTCTGCAAAGCAATGCACGTGGCCCAGCCTGCTGTGGTACTGGCCAGCAGCCGAGGCATCGCCAGCTTTGTGTGTGAGTATGCATCTCCAGGCAAAGCCACTGAGGTCCGGGTGACAGTGCTTCGGCAGGCTGACAGCCAGGTGACTGAAGTCTGTGCGGCAACCTACATGATGGGGAATGAGTTGACCTTCCTAGATGATTCCATCTGCACGGGCACCTCCAGTGGAAATCAAGTGAACCTCACTATCCAAGGACTGAGGGCCATGGACACGGGACTCTACATCTGCAAGGTGGAGCTCATGTACCCACCGCCATACTACCTGGGCATAGGCAACGGAACCCAGATTTATGTAATTGCTAAAGAAAAGAAGCCCTCTTACAACAGGGGTCTATGTGAAAATGCCCCCAACAGAGCCAGAATGTGA";
+        let mut tx = tx(
+            "ENST00000295854",
+            "2",
+            203_867_943,
+            203_872_775,
+            1,
+            "protein_coding",
+            Some(203_867_943),
+            Some(203_872_775),
+        );
+        tx.cdna_seq = Some(cds.to_string());
+        tx.translateable_seq = Some(cds.to_string());
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(525);
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 203_867_943,
+                genomic_end: 203_868_051,
+                cdna_start: 1,
+                cdna_end: 109,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 203_870_586,
+                genomic_end: 203_870_933,
+                cdna_start: 110,
+                cdna_end: 457,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 203_872_708,
+                genomic_end: 203_872_775,
+                cdna_start: 458,
+                cdna_end: 525,
+                ori: 1,
+            },
+        ];
+        let exons = vec![
+            exon("ENST00000295854", 1, 203_867_943, 203_868_051),
+            exon("ENST00000295854", 2, 203_870_586, 203_870_933),
+            exon("ENST00000295854", 3, 203_872_708, 203_872_775),
+        ];
+        let exon_refs: Vec<&ExonFeature> = exons.iter().collect();
+        let variant = VariantInput::from_vcf(
+            "2".to_string(),
+            203_867_943,
+            203_867_943,
+            "A".to_string(),
+            "ATGGGT".to_string(),
+        );
+        let translation = translation("ENST00000295854", Some(525), Some(175), None, Some(cds));
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &tx, &exon_refs, Some(&translation));
+
+        assert!(
+            terms.contains(&SoTerm::FrameshiftVariant),
+            "terms: {terms:?}"
+        );
+        assert!(terms.contains(&SoTerm::StartLost), "terms: {terms:?}");
+        assert!(
+            !terms.contains(&SoTerm::StartRetainedVariant),
+            "terms: {terms:?}"
+        );
+        let classification = classification.expect("coding insertion classification");
+        assert!(
+            classification.start_lost,
+            "classification: {classification:?}"
+        );
+        assert!(
+            !classification.start_retained,
+            "classification: {classification:?}"
         );
     }
 
@@ -32370,6 +33419,125 @@ mod tests {
     }
 
     #[test]
+    fn issue_200_mt_terminal_frameshift_uses_vep_standard_alt_translation() {
+        use std::io::Cursor;
+
+        use noodles_fasta as fasta;
+
+        // ClinVar 9646, MT:9203 CAT>C in ATP6. The one-base HGVS shift maps
+        // the deletion to translation position 227, while VEP's standard-code
+        // alternate CDS has 226 translated residues. `_get_fs_peptides()`
+        // therefore emits a terminal stop deletion before comparing its
+        // ambiguous local peptide windows.
+        // Ensembl Variation 2fb834b, BaseTranscriptVariation.pm:1146-1163;
+        // TranscriptVariationAllele.pm:711-736, 2314-2327:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1146-L1163
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L711-L736
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2314-L2327
+        // Preserve this deterministic VEP 116 frameshift translation path for
+        // parity and track its correction in vepyr#269:
+        // https://github.com/biodatageeks/vepyr/issues/269
+        let cds = format!("{}ACATAA", "ATG".repeat(225));
+        let peptide = format!("{}T", "M".repeat(225));
+        let mut transcript = tx(
+            "ATP6",
+            "MT",
+            8527,
+            9207,
+            1,
+            "protein_coding",
+            Some(8527),
+            Some(9207),
+        );
+        transcript.codon_table = CodonTable::VertebrateMitochondrial;
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(681);
+        transcript.translateable_seq = Some(cds.clone());
+        transcript.cdna_seq = Some(cds.clone());
+        transcript.spliced_seq = Some(cds.clone());
+        let exon = exon("ATP6", 1, 8527, 9207);
+        let mut tr = translation("ATP6", Some(681), Some(226), Some(&peptide), Some(&cds));
+        tr.stable_id = Some("YP_003024031".to_string());
+        tr.version = Some(1);
+        let mut variant = VariantInput::from_vcf(
+            "MT".to_string(),
+            9203,
+            9205,
+            "CAT".to_string(),
+            "C".to_string(),
+        );
+        // Keep the reference contig longer than the 1kb shift window: the
+        // observed ATP6 transcript ends at the CDS boundary, but chrMT itself
+        // continues beyond this variant.
+        let genome = format!("{}{}{}", "N".repeat(8526), cds, "C".repeat(1000));
+        let data = format!(">MT\n{genome}\n");
+        let index = fasta::fai::Index::from(vec![fasta::fai::Record::new(
+            "MT",
+            genome.len() as u64,
+            4,
+            genome.len() as u64,
+            genome.len() as u64 + 1,
+        )]);
+        let mut reader =
+            fasta::io::indexed_reader::IndexedReader::new(Cursor::new(data.into_bytes()), index);
+        let (vep_ref, vep_alt) = crate::allele::vcf_to_vep_allele(
+            &variant.parser_ref_allele,
+            &variant.parser_alt_allele,
+        );
+        let vep_start = crate::allele::vep_norm_start(
+            variant.parser_start,
+            &variant.parser_ref_allele,
+            &variant.parser_alt_allele,
+        );
+        let vep_end = crate::allele::vep_norm_end(
+            variant.parser_start,
+            &variant.parser_ref_allele,
+            &variant.parser_alt_allele,
+        );
+        variant.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "MT",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            variant
+                .hgvs_shift_forward
+                .as_ref()
+                .map(|shift| shift.shift_length),
+            Some(1)
+        );
+        let result = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            true,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .evaluate_variant_with_context(
+            &variant,
+            &[transcript],
+            &[exon],
+            &[tr],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let entry = result
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ATP6"))
+            .expect("ATP6 consequence is emitted");
+        assert_eq!(
+            entry.hgvsp.as_deref(),
+            Some("YP_003024031.1:p.Ter227delextTer?")
+        );
+    }
+
+    #[test]
     fn mt_atg_to_ata_start_is_synonymous_not_start_retained() {
         // MT:8529 G>A in ATP6 (ATG>ATA at codon 1): table 2 reads both as Met,
         // but VEP's start_retained_variant compares the mutated codon with the
@@ -34717,8 +35885,7 @@ mod tests {
             !terms.iter().any(|term| {
                 matches!(
                     term,
-                    SoTerm::StartLost
-                        | SoTerm::StartRetainedVariant
+                    SoTerm::StartRetainedVariant
                         | SoTerm::StopGained
                         | SoTerm::MissenseVariant
                         | SoTerm::SynonymousVariant
@@ -34764,7 +35931,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_cds_start_boundary_equal_length_mnv_does_not_infer_start_loss() {
+    fn partial_cds_start_boundary_equal_length_mnv_uses_vep_start_loss_predicate() {
         let cds = "ATGGAATGA";
         let mut transcript = tx(
             "T_CDS_START_BOUNDARY",
@@ -34813,6 +35980,15 @@ mod tests {
         assert!(classification.codons.is_none());
         assert!(classification.amino_acids.is_none());
         assert!(classification.protein_hgvs.is_none());
+        // VEP's start_lost predicate still invokes `_inv_start_altered()` on
+        // this partial-CDS MNV; the 10-base UTR is present and the variant
+        // changes the overlapped ATG to TTG. It must report start_lost without
+        // inferring a complete peptide consequence.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 906-945:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L906-L945
+        assert!(terms.contains(&SoTerm::StartLost), "terms: {terms:?}");
+        assert!(classification.start_lost);
         assert_no_partial_boundary_codon_consequences(&terms);
     }
 
@@ -36446,6 +37622,115 @@ mod tests {
             Some(&translation),
         );
         (terms, classification)
+    }
+
+    #[test]
+    fn clinvar_219_ambiguous_terminal_peptide_does_not_bypass_the_x_gate() {
+        // ClinVar 1601873 is golden as stop_gained&frameshift_variant. VEP's
+        // stop_retained fast path requires a non-empty ALT peptide without X;
+        // an ALT peptide beginning with '*' still follows the CIL path if it
+        // contains X.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:1290-1319:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1319
+        let mut class = CodingClassification {
+            affected_ref_peptide: Some("-".to_string()),
+            affected_alt_peptide: Some("*X".to_string()),
+            ..CodingClassification::default()
+        };
+
+        apply_vep116_stop_predicate_flags(
+            &mut class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+            true,
+        );
+
+        assert!(!class.stop_retained, "{class:?}");
+        assert!(class.stop_gained, "{class:?}");
+    }
+
+    #[test]
+    fn clinvar_219_frameshift_stop_exception_requires_both_peptides() {
+        // Golden ClinVar 3633451 is a frameshift_variant despite its ambiguous
+        // inserted sequence. VEP's stop-first-residue exception is reached
+        // only after _get_peptide_alleles returns a pair.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:772-797, 1551-1564:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L772-L797
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1551-L1564
+        let class = CodingClassification {
+            affected_ref_peptide: Some("*".to_string()),
+            affected_alt_peptide: None,
+            ..CodingClassification::default()
+        };
+
+        assert!(frameshift_under_semantics(
+            true,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        ));
+
+        let mut terms = BTreeSet::from([SoTerm::FrameshiftVariant]);
+        apply_vep116_primary_indel_predicates(
+            &mut terms,
+            &class,
+            crate::vep_semantics::VepSemantics::V116,
+            false,
+        );
+        assert!(terms.contains(&SoTerm::FrameshiftVariant), "{terms:?}");
+    }
+
+    #[test]
+    fn vep116_start_predicates_keep_literal_case_comparisons() {
+        // The R6 golden records use uppercase cache sequences. VEP 116 also
+        // uppercases the input allele string before consequence processing;
+        // the paired lowercase control below locks the literal Perl eq/ne
+        // behavior without changing the production case normalization.
+        // Ensembl VEP release/116.0, Parser.pm:553-554:
+        // https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/Parser.pm#L553-L554
+        // Ensembl Variation 2fb834b, VariationEffect.pm:992-1022, 1028-1075:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L992-L1022
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1028-L1075
+        let (transcript, exons) = tx_with_cdna("GCGC", "atggctgaatga");
+        let exons: Vec<&ExonFeature> = exons.iter().collect();
+        let deletion_after_start = var("22", 1007, 1007, "g", "-");
+
+        assert_eq!(
+            ins_del_start_altered(&transcript, &exons, &deletion_after_start, None),
+            Some(true),
+            "literal start-codon comparison must not treat lowercase atg as ATG"
+        );
+
+        let equal_length_variant = var("22", 1004, 1004, "a", "a");
+        assert!(!vep116_start_retained_variant(
+            &transcript,
+            &exons,
+            &equal_length_variant,
+            b"atggctgaatga",
+            0,
+            Some("atggctgaatga"),
+        ));
+
+        let (uppercase_transcript, uppercase_exons) = tx_with_cdna("GCGC", "ATGGCTGAATGA");
+        let uppercase_exons: Vec<&ExonFeature> = uppercase_exons.iter().collect();
+        assert_eq!(
+            ins_del_start_altered(
+                &uppercase_transcript,
+                &uppercase_exons,
+                &deletion_after_start,
+                None,
+            ),
+            Some(false),
+            "the uppercase production sequence preserves ATG"
+        );
+        assert!(vep116_start_retained_variant(
+            &uppercase_transcript,
+            &uppercase_exons,
+            &equal_length_variant,
+            b"ATGGCTGAATGA",
+            0,
+            Some("ATGGCTGAATGA"),
+        ));
     }
 
     #[test]
