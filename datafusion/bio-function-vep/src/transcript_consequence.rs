@@ -27806,10 +27806,97 @@ mod tests {
         // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1050-L1071
         // Ensembl core c0cf13d, Transcript.pm:1746-1761:
         // https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L1746-L1761
-        let cds = "ATGGCTGAATGA";
-        let (t, exons) = tx_with_cds_only_cdna("", cds);
+        let cds = "ATGGAGCCCGAGCCCGAGCCCGCGGCCGTGGAGGTTCCCGCGGGGCGCGTGCTCAGGGGCAGCTTGGTGGCTGCCGAGTGGAGGCCAGAAGAGGGCTTCGTGGAGTTGAAGTCTCCCGCGGGCAAATTCTGGCAGACCATGGGCTTCTCAGAGCAGGGCCGGCAGCGCCTTCACCCGGAAGAGGCCTTGTATCTTCTGGAGTGTGGCTCCATCCACCTCTTCCACCAAGACCTGCCACTGTCTATCCAGGAAGCTTACCAGCTGCTGCTGACCGACCACACTGTGACCTTCCTGCAGTACCAGGTCTTCAGCCACCTGAAGAGGTTGGGTTATGTGGTTCGACGATTCCAACCAAGCTCTGTCCTGTCCCCGTATGAGAGGCAGCTTAACCTGGATGCCAGCGTGCAGCACTTGGAGGATGGAGATGGCAAGAGAAAGAGGAGCAGCTCCAGCCCTCGACAGCCGCCACACCCTTCTGCGCGCCCCAGCCCCAGAGCTGCTCCCGGCCAACGTGGCTGGGCGGGAGACAGACGCTGA";
+        let mut t = tx(
+            "ENST00000583173",
+            "17",
+            75_516_561,
+            75_523_287,
+            1,
+            "protein_coding",
+            Some(75_516_561),
+            Some(75_522_085),
+        );
+        t.cdna_seq = Some(cds.to_string());
+        t.translateable_seq = Some(cds.to_string());
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(537);
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_516_561,
+                genomic_end: 75_516_616,
+                cdna_start: 1,
+                cdna_end: 56,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_517_009,
+                genomic_end: 75_517_072,
+                cdna_start: 57,
+                cdna_end: 120,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_517_161,
+                genomic_end: 75_517_244,
+                cdna_start: 121,
+                cdna_end: 204,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_517_557,
+                genomic_end: 75_517_655,
+                cdna_start: 205,
+                cdna_end: 303,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_518_995,
+                genomic_end: 75_519_047,
+                cdna_start: 304,
+                cdna_end: 356,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_521_409,
+                genomic_end: 75_521_510,
+                cdna_start: 357,
+                cdna_end: 458,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_522_007,
+                genomic_end: 75_522_333,
+                cdna_start: 459,
+                cdna_end: 785,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 75_523_275,
+                genomic_end: 75_523_287,
+                cdna_start: 786,
+                cdna_end: 798,
+                ori: 1,
+            },
+        ];
+        let exons = vec![
+            exon("ENST00000583173", 1, 75_516_561, 75_516_616),
+            exon("ENST00000583173", 2, 75_517_009, 75_517_072),
+            exon("ENST00000583173", 3, 75_517_161, 75_517_244),
+            exon("ENST00000583173", 4, 75_517_557, 75_517_655),
+            exon("ENST00000583173", 5, 75_518_995, 75_519_047),
+            exon("ENST00000583173", 6, 75_521_409, 75_521_510),
+            exon("ENST00000583173", 7, 75_522_007, 75_522_333),
+            exon("ENST00000583173", 8, 75_523_275, 75_523_287),
+        ];
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
-        let insertion = var("22", 1002, 1002, "-", "GGAGCC");
+        let insertion = VariantInput::from_vcf(
+            "17".to_string(),
+            75_516_562,
+            75_516_562,
+            "T".to_string(),
+            "TGGAGCC".to_string(),
+        );
 
         assert_eq!(
             ins_del_start_altered(&t, &exons_ref, &insertion, None),
@@ -27837,6 +27924,97 @@ mod tests {
             ins_del_start_altered(&utr_tx, &utr_exons_ref, &utr_insertion, None),
             Some(false),
             "the non-empty 5'UTR preserves the unchanged ATG early return"
+        );
+    }
+
+    #[test]
+    fn clinvar_852228_empty_utr_start_loss_matches_vep() {
+        // ClinVar 852228 is A>ATGGGT at the first coding base of CTLA4
+        // (ENST00000295854): the refreshed cache has cDNA/CDS beginning with
+        // ATG at cDNA 1, no 5'UTR sequence, and a five-base insertion after
+        // cDNA 1. VEP 116 reports frameshift_variant&start_lost and HGVSp
+        // p.Ala2?.
+        // Ensembl Variation 2fb834b, VariationEffect.pm:870-882, 947-963,
+        // 1028-1071; TranscriptVariationAllele.pm:2154-2159:
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L870-L882
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L947-L963
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1028-L1071
+        // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2154-L2159
+        let cds = "ATGGCTTGCCTTGGATTTCAGCGGCACAAGGCTCAGCTGAACCTGGCTACCAGGACCTGGCCCTGCACTCTCCTGTTTTTTCTTCTCTTCATCCCTGTCTTCTGCAAAGCAATGCACGTGGCCCAGCCTGCTGTGGTACTGGCCAGCAGCCGAGGCATCGCCAGCTTTGTGTGTGAGTATGCATCTCCAGGCAAAGCCACTGAGGTCCGGGTGACAGTGCTTCGGCAGGCTGACAGCCAGGTGACTGAAGTCTGTGCGGCAACCTACATGATGGGGAATGAGTTGACCTTCCTAGATGATTCCATCTGCACGGGCACCTCCAGTGGAAATCAAGTGAACCTCACTATCCAAGGACTGAGGGCCATGGACACGGGACTCTACATCTGCAAGGTGGAGCTCATGTACCCACCGCCATACTACCTGGGCATAGGCAACGGAACCCAGATTTATGTAATTGCTAAAGAAAAGAAGCCCTCTTACAACAGGGGTCTATGTGAAAATGCCCCCAACAGAGCCAGAATGTGA";
+        let mut tx = tx(
+            "ENST00000295854",
+            "2",
+            203_867_943,
+            203_872_775,
+            1,
+            "protein_coding",
+            Some(203_867_943),
+            Some(203_872_775),
+        );
+        tx.cdna_seq = Some(cds.to_string());
+        tx.translateable_seq = Some(cds.to_string());
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(525);
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 203_867_943,
+                genomic_end: 203_868_051,
+                cdna_start: 1,
+                cdna_end: 109,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 203_870_586,
+                genomic_end: 203_870_933,
+                cdna_start: 110,
+                cdna_end: 457,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 203_872_708,
+                genomic_end: 203_872_775,
+                cdna_start: 458,
+                cdna_end: 525,
+                ori: 1,
+            },
+        ];
+        let exons = vec![
+            exon("ENST00000295854", 1, 203_867_943, 203_868_051),
+            exon("ENST00000295854", 2, 203_870_586, 203_870_933),
+            exon("ENST00000295854", 3, 203_872_708, 203_872_775),
+        ];
+        let exon_refs: Vec<&ExonFeature> = exons.iter().collect();
+        let variant = VariantInput::from_vcf(
+            "2".to_string(),
+            203_867_943,
+            203_867_943,
+            "A".to_string(),
+            "ATGGGT".to_string(),
+        );
+        let translation = translation("ENST00000295854", Some(525), Some(175), None, Some(cds));
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            false,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        let (terms, classification) =
+            engine.evaluate_transcript_overlap(&variant, &tx, &exon_refs, Some(&translation));
+
+        assert!(terms.contains(&SoTerm::StartLost), "terms: {terms:?}");
+        assert!(
+            !terms.contains(&SoTerm::StartRetainedVariant),
+            "terms: {terms:?}"
+        );
+        let classification = classification.expect("coding insertion classification");
+        assert!(
+            classification.start_lost,
+            "classification: {classification:?}"
+        );
+        assert!(
+            !classification.start_retained,
+            "classification: {classification:?}"
         );
     }
 
