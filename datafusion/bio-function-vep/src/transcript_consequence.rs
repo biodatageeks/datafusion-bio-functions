@@ -28028,11 +28028,49 @@ mod tests {
             Some(&translation),
         );
         assert!(terms.contains(&SoTerm::StartLost), "terms: {terms:?}");
+        assert!(
+            terms.contains(&SoTerm::FivePrimeUtrVariant),
+            "terms: {terms:?}"
+        );
         assert!(class.expect("coding consequence").start_lost);
+        let preserved_atg = VariantInput::from_vcf(
+            "2".to_string(),
+            47_783_288,
+            47_783_289,
+            "GA".to_string(),
+            "CA".to_string(),
+        );
+        assert!(!vep116_inv_start_altered(
+            &transcript,
+            &exon_refs,
+            &preserved_atg,
+            transcript.translateable_seq.as_deref(),
+        ));
+        assert!(!vep116_start_lost_from_predicates(
+            &CodingClassification::default(),
+            &transcript,
+            &exon_refs,
+            Some(&translation),
+            &preserved_atg,
+            transcript.translateable_seq.as_deref(),
+            false,
+        ));
+        let (control_terms, _) = engine.evaluate_transcript_overlap(
+            &preserved_atg,
+            &transcript,
+            &exon_refs,
+            Some(&translation),
+        );
+        assert!(
+            !control_terms.contains(&SoTerm::StartLost),
+            "terms: {control_terms:?}"
+        );
         assert!(vep116_start_lost_from_predicates(
             &CodingClassification::default(),
             &transcript,
             &exon_refs,
+            // The helper-level call isolates the nucleotide predicates; the
+            // engine evaluation above exercises the normal translated path.
             None,
             &variant,
             transcript.translateable_seq.as_deref(),
