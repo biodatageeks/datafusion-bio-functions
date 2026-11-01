@@ -28,7 +28,7 @@ toml = "0.8"
 # Streaming MD5 of plugin build inputs (`plugin_cache::source_verify`).
 md-5 = "0.10"
 tempfile = "3"
-noodles-core = "0.16"
+noodles-core = "0.21"
 noodles-fasta = "0.49"
 # Keep these on the same noodles revision already used by datafusion-bio-formats.
 # `noodles-core` is aliased because the FASTA path above still uses 0.16.
