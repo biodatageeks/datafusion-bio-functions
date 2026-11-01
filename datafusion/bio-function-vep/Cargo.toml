@@ -36,7 +36,7 @@ noodles-core-tabix = { package = "noodles-core", git = "https://github.com/bioda
 noodles-csi = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-tabix = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
 noodles-bgzf = { git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
-parquet = { version = "=58.0.0", features = ["arrow", "async", "zstd"] }
+parquet = { version = "=59.3.2", features = ["arrow", "async", "zstd"] }
 # Pin all formats crates to the same full master rev. It includes the merged
 # RefSeq CDS-bound fix (#267), transcript SeqEdits column (#269), Character INFO
 # materialization (#266), percent-encoded VCF values (#264), MT codon_table
