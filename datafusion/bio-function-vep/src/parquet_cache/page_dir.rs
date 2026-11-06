@@ -137,7 +137,7 @@ impl PageDir {
     }
 
     /// Merged candidate page row-ranges covering any of `positions`.
-    pub fn resolve_ranges(&self, positions: &[u64]) -> Vec<(u64, u64)> {
+    fn resolve_pages(&self, positions: &[u64]) -> Vec<usize> {
         let mut pages: Vec<usize> = Vec::new();
         for &p in positions {
             for &(rs, re) in &self.runs {
@@ -180,6 +180,19 @@ impl PageDir {
         }
         pages.sort_unstable();
         pages.dedup();
+        pages
+    }
+
+    /// Individual key pages, kept separate so their decoded payloads can be reused.
+    pub(crate) fn resolve_page_ranges(&self, positions: &[u64]) -> Vec<(u64, u64)> {
+        self.resolve_pages(positions)
+            .into_iter()
+            .map(|page| (self.first_row[page], self.end_row[page]))
+            .collect()
+    }
+
+    pub fn resolve_ranges(&self, positions: &[u64]) -> Vec<(u64, u64)> {
+        let pages = self.resolve_pages(positions);
         // Merge adjacent page row-ranges.
         let mut out: Vec<(u64, u64)> = Vec::new();
         for &pg in &pages {
@@ -384,6 +397,7 @@ mod tests {
         assert_eq!(pd.num_runs(), 1);
         // Adjacent pages → merged into one contiguous range covering both.
         assert_eq!(pd.resolve_ranges(&[50]), vec![(0, 200)]);
+        assert_eq!(pd.resolve_page_ranges(&[50]), vec![(0, 100), (100, 200)]);
         // A value only in the first page still returns just that page.
         assert_eq!(pd.resolve_ranges(&[10]), vec![(0, 100)]);
         // A value only in the second page returns just that page.

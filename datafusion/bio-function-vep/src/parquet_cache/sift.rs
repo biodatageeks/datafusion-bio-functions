@@ -34,6 +34,7 @@ use crate::parquet_cache::write::point_lookup_writer_properties;
 
 /// Coalescing-reader window (bytes) — matches the variation lookup.
 const COALESCE_GAP_BYTES: u64 = 64 * 1024;
+pub(crate) mod decoded_pages;
 
 /// Write already-sorted (`key` ascending) translation_sift batches to a single
 /// no-dictionary, page-indexed Parquet shard. Rows MUST be globally sorted by
@@ -64,6 +65,7 @@ pub fn write_sift_parquet(path: &Path, batches: &[RecordBatch]) -> Result<usize>
 
 /// Per-chromosome Parquet translation_sift point-lookup.
 pub struct SinglePathParquetSiftLookup {
+    decoded_cache: Option<decoded_pages::DecodedPageCache>,
     profile: bool,
     point_loads: AtomicU64,
     requested_keys: AtomicU64,
@@ -103,6 +105,7 @@ impl SinglePathParquetSiftLookup {
             projection.push("key".to_string());
         }
         Ok(Self {
+            decoded_cache: None,
             profile: std::env::var_os("VEP_ENGINE_PROFILE").is_some_and(|value| value == "1"),
             point_loads: AtomicU64::new(0),
             requested_keys: AtomicU64::new(0),
@@ -121,6 +124,13 @@ impl SinglePathParquetSiftLookup {
     /// for the matched keys, in `key` order) and the distinct keys found — the
     /// same `(RecordBatch, present)` contract as the Parquet `take_keys`.
     pub async fn take_keys(&self, keys: &[u64]) -> Result<(RecordBatch, Vec<u64>)> {
+        if let Some(result) = self.take_keys_cached(keys).await? {
+            return Ok(result);
+        }
+        self.take_keys_uncached(keys).await
+    }
+
+    async fn take_keys_uncached(&self, keys: &[u64]) -> Result<(RecordBatch, Vec<u64>)> {
         let mut sorted: Vec<u64> = keys.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -267,6 +277,214 @@ fn distinct_present(batch: &RecordBatch, probe_set: &HashSet<u64>) -> Result<Vec
         }
     }
     Ok(out)
+}
+
+impl SinglePathParquetSiftLookup {
+    pub(crate) fn with_page_cache(mut self, budget: Arc<decoded_pages::PageCacheBudget>) -> Self {
+        self.decoded_cache = Some(decoded_pages::DecodedPageCache::new(budget));
+        self
+    }
+
+    async fn take_keys_cached(&self, keys: &[u64]) -> Result<Option<(RecordBatch, Vec<u64>)>> {
+        let Some(cache) = &self.decoded_cache else {
+            return Ok(None);
+        };
+        let mut sorted = keys.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let ranges = self.page_dir.resolve_page_ranges(&sorted);
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let requested: HashSet<u64> = sorted.iter().copied().collect();
+        let mut pages = Vec::new();
+        let mut selected: Vec<(usize, usize)> = Vec::new();
+        for range in ranges {
+            let Some(page) = cache.get(self, range).await? else {
+                // Admission failure is not a negative lookup. Re-run the original
+                // exact point reader, including any overlapping key pages.
+                return Ok(None);
+            };
+            let ka = page
+                .batch
+                .column_by_name("key")
+                .and_then(|a| a.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    DataFusionError::Execution("cached SIFT page has no UInt64 key".into())
+                })?;
+            let page_index = pages.len();
+            let values = ka.values();
+            if page.keys_sorted && !values.is_empty() {
+                // Sorted pages need only the requested keys in their extent,
+                // not a 512-row hash probe for every repeated single-position hit.
+                let first = sorted.partition_point(|key| *key < values[0]);
+                let end = sorted.partition_point(|key| *key <= values[values.len() - 1]);
+                for key in &sorted[first..end] {
+                    let lo = values.partition_point(|value| value < key);
+                    let hi = values.partition_point(|value| value <= key);
+                    selected.extend((lo..hi).map(|row| (page_index, row)));
+                }
+            } else {
+                // Legacy unsorted pages preserve physical order and duplicates.
+                selected.extend(
+                    values.iter().enumerate().filter_map(|(row, key)| {
+                        requested.contains(key).then_some((page_index, row))
+                    }),
+                );
+            }
+            // Keep leases pinned until the independently owned result is built.
+            pages.push(page);
+        }
+        let schema = self.payload_schema()?;
+        let batch = if selected.is_empty() {
+            RecordBatch::new_empty(schema)
+        } else {
+            use datafusion::arrow::array::{MutableArrayData, make_array};
+            let columns = (0..schema.fields().len())
+                .map(|column| {
+                    let data: Vec<_> = pages
+                        .iter()
+                        .map(|page| page.batch.column(column).to_data())
+                        .collect();
+                    let mut output =
+                        MutableArrayData::new(data.iter().collect(), false, selected.len());
+                    for &(page, row) in &selected {
+                        output.extend(page, row, row + 1);
+                    }
+                    make_array(output.freeze())
+                })
+                .collect();
+            RecordBatch::try_new(schema, columns)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+        };
+        let present = distinct_present(&batch, &requested)?;
+        Ok(Some((batch, present)))
+    }
+
+    fn payload_schema(&self) -> Result<Arc<datafusion::arrow::datatypes::Schema>> {
+        let schema = self.meta.schema();
+        let mut roots: Vec<_> = self
+            .projection
+            .iter()
+            .filter_map(|n| schema.index_of(n).ok())
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        schema
+            .project(&roots)
+            .map(Arc::new)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+
+    /// Upper bounds from the footer's per-page *unencoded* byte counts. If an
+    /// older file lacks these counts, or uses dictionaries/nested payloads,
+    /// keep the original bounded point reader instead of guessing an expansion.
+    fn decoded_page_bound(&self, range: (u64, u64)) -> Option<(usize, usize)> {
+        use datafusion::arrow::datatypes::DataType;
+        let metadata = self.meta.metadata();
+        let offsets = metadata.offset_index()?;
+        let mut raw = 0usize;
+        let mut rows = 0usize;
+        let mut compressed = 0usize;
+        let mut rg_start = 0u64;
+        for rg_index in 0..metadata.num_row_groups() {
+            let rg = metadata.row_group(rg_index);
+            let rg_rows = u64::try_from(rg.num_rows()).ok()?;
+            let rg_end = rg_start.checked_add(rg_rows)?;
+            if range.0 < rg_end && range.1 > rg_start {
+                for column in &self.projection {
+                    let index = self.meta.schema().index_of(column).ok()?;
+                    let column_meta = rg.column(index);
+                    if column_meta.dictionary_page_offset().is_some() {
+                        return None;
+                    }
+                    let offset = offsets.get(rg_index)?.get(index)?;
+                    let locations = offset.page_locations();
+                    for (page, location) in locations.iter().enumerate() {
+                        let first =
+                            rg_start.checked_add(u64::try_from(location.first_row_index).ok()?)?;
+                        let end = match locations.get(page + 1) {
+                            Some(next) => {
+                                rg_start.checked_add(u64::try_from(next.first_row_index).ok()?)?
+                            }
+                            None => rg_end,
+                        };
+                        if first >= range.1 || end <= range.0 {
+                            continue;
+                        }
+                        let page_rows = usize::try_from(end.checked_sub(first)?).ok()?;
+                        let bytes = match self.meta.schema().field(index).data_type() {
+                            DataType::UInt64 => page_rows.checked_mul(8)?,
+                            DataType::Binary | DataType::LargeBinary => usize::try_from(
+                                *offset.unencoded_byte_array_data_bytes()?.get(page)?,
+                            )
+                            .ok()?,
+                            _ => return None,
+                        };
+                        raw = raw.checked_add(bytes)?;
+                        rows = rows.checked_add(page_rows)?;
+                        compressed = compressed
+                            .checked_add(usize::try_from(location.compressed_page_size).ok()?)?;
+                    }
+                }
+            }
+            rg_start = rg_end;
+        }
+        if rows == 0 {
+            return None;
+        }
+        // Cover Arrow offsets/validity/alignment and a concatenation copy. The
+        // scratch reservation additionally covers compressed reads and decoder
+        // working buffers, and is checked before any bulk payload read.
+        let resident = raw
+            .checked_mul(2)?
+            .checked_add(rows.checked_mul(64)?)?
+            .checked_add(64 * 1024)?;
+        let scratch = raw
+            .checked_mul(4)?
+            .checked_add(rows.checked_mul(128)?)?
+            .checked_add(compressed)?
+            .checked_add(4 * 1024 * 1024)?;
+        Some((resident, scratch))
+    }
+
+    async fn read_page_range(
+        &self,
+        range: (u64, u64),
+        counters: &IoCounters,
+    ) -> Result<RecordBatch> {
+        let roots: Vec<_> = self
+            .projection
+            .iter()
+            .filter_map(|n| self.meta.schema().index_of(n).ok())
+            .collect();
+        let reader = CoalescingAsyncReader::new(
+            self.open_async().await?,
+            counters.clone(),
+            COALESCE_GAP_BYTES,
+        );
+        let mut stream =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.meta.clone())
+                .with_projection(ProjectionMask::roots(self.meta.parquet_schema(), roots))
+                .with_row_selection(selection_from_ranges(&[range]))
+                .with_batch_size(8192)
+                .build()
+                .map_err(|e| DataFusionError::Execution(format!("build SIFT page stream: {e}")))?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("read SIFT page: {e}")))?
+        {
+            batches.push(batch);
+        }
+        let schema = self.payload_schema()?;
+        if batches.len() == 1 {
+            return Ok(batches.pop().unwrap());
+        }
+        concat_batches(&schema, &batches)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
 }
 
 #[cfg(test)]

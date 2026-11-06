@@ -80,6 +80,16 @@ pub(crate) struct BudgetLease {
     bytes: usize,
 }
 
+impl BudgetLease {
+    pub(crate) fn shrink(&mut self, bytes: usize) {
+        assert!(bytes <= self.bytes);
+        self.budget
+            .used
+            .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+        self.bytes = bytes;
+    }
+}
+
 impl Drop for BudgetLease {
     fn drop(&mut self) {
         self.budget.used.fetch_sub(self.bytes, Ordering::Relaxed);

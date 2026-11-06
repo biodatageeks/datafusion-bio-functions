@@ -97,6 +97,7 @@ struct EngineAnnotationProfile {
     hgvs_shift: Duration,
     evaluate_prepared: Duration,
     collapse_pick_sort: Duration,
+    sift_warm: Duration,
     csq_format: Duration,
     sift_polyphen: Duration,
     domains: Duration,
@@ -121,7 +122,7 @@ impl EngineAnnotationProfile {
 
     fn summary_line(&self) -> String {
         format!(
-            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} non_variant_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s plugin_take={:.6}s",
+            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} non_variant_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s plugin_take={:.6}s sift_warm={:.6}s collapse_pick_sort_excluding_sift_warm={:.6}s",
             self.rows,
             self.null_chrom_rows,
             self.null_alt_rows,
@@ -152,6 +153,10 @@ impl EngineAnnotationProfile {
             self.typed_columns.as_secs_f64(),
             self.finish_builders.as_secs_f64(),
             self.plugin_take.as_secs_f64(),
+            self.sift_warm.as_secs_f64(),
+            self.collapse_pick_sort
+                .saturating_sub(self.sift_warm)
+                .as_secs_f64(),
         )
     }
 }
@@ -3529,6 +3534,30 @@ fn lookup_sift_polyphen(
     #[cfg(feature = "parquet-cache")] sift_store: &Option<SiftPredictionStoreRef>,
     #[cfg(not(feature = "parquet-cache"))] _sift_kv: &Option<()>,
 ) -> (String, String) {
+    lookup_sift_polyphen_for_row(
+        transcript_id,
+        transcript_uid,
+        protein_position,
+        amino_acids,
+        cache,
+        #[cfg(feature = "parquet-cache")]
+        sift_store,
+        #[cfg(not(feature = "parquet-cache"))]
+        _sift_kv,
+        None,
+    )
+}
+
+fn lookup_sift_polyphen_for_row(
+    transcript_id: Option<&str>,
+    transcript_uid: Option<u32>,
+    protein_position: Option<&str>,
+    amino_acids: Option<&str>,
+    cache: &mut SiftPolyphenCache,
+    #[cfg(feature = "parquet-cache")] sift_store: &Option<SiftPredictionStoreRef>,
+    #[cfg(not(feature = "parquet-cache"))] _sift_kv: &Option<()>,
+    row_predictions: Option<&HashMap<u64, CachedPredictions>>,
+) -> (String, String) {
     let empty = || (String::new(), String::new());
 
     // VEP only produces SIFT/PolyPhen for single amino acid substitutions.
@@ -3563,8 +3592,15 @@ fn lookup_sift_polyphen(
                 return empty();
             };
             let key = ((uid as u64) << 32) | (pos as u64);
-            let Ok(found) = store.get_position_predictions(&[key]) else {
-                return empty();
+            let fetched;
+            let found = if let Some(found) = row_predictions {
+                found
+            } else {
+                fetched = match store.get_position_predictions(&[key]) {
+                    Ok(found) => found,
+                    Err(_) => return empty(),
+                };
+                &fetched
             };
             let Some(preds) = found.get(&key) else {
                 return empty();
@@ -3686,7 +3722,6 @@ fn position_predictions_from_batch(
 #[derive(Clone)]
 struct PositionSlicedParquetSiftStore {
     lookup: Arc<crate::parquet_cache::sift::SinglePathParquetSiftLookup>,
-    cache: Arc<Mutex<HashMap<u64, Option<CachedPredictions>>>>,
     blob_version: crate::cache_common::SiftBlobVersion,
 }
 
@@ -3704,47 +3739,8 @@ impl crate::cache_common::SiftPredictionStore for PositionSlicedParquetSiftStore
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
-        let mut out = HashMap::with_capacity(keys.len());
-        let mut uncached = Vec::new();
-        let mut seen_uncached = HashSet::new();
-        {
-            let cache = self.cache.lock().map_err(|error| {
-                DataFusionError::Execution(format!("Parquet SIFT position cache poisoned: {error}"))
-            })?;
-            for &key in keys {
-                if out.contains_key(&key) {
-                    continue;
-                }
-                if let Some(cached) = cache.get(&key) {
-                    if let Some(predictions) = cached {
-                        out.insert(key, predictions.clone());
-                    }
-                    continue;
-                }
-                if seen_uncached.insert(key) {
-                    uncached.push(key);
-                }
-            }
-        }
-        if uncached.is_empty() {
-            return Ok(out);
-        }
-
-        let (batch, _present) =
-            crate::cache::lookup_exec::block_on(self.lookup.take_keys(&uncached))?;
-        let fetched = position_predictions_from_batch(&batch, self.blob_version)?;
-        let mut cache = self.cache.lock().map_err(|error| {
-            DataFusionError::Execution(format!("Parquet SIFT position cache poisoned: {error}"))
-        })?;
-        for key in uncached {
-            if let Some(predictions) = fetched.get(&key) {
-                cache.insert(key, Some(predictions.clone()));
-                out.insert(key, predictions.clone());
-            } else {
-                cache.insert(key, None);
-            }
-        }
-        Ok(out)
+        let (batch, _) = crate::cache::lookup_exec::block_on(self.lookup.take_keys(keys))?;
+        position_predictions_from_batch(&batch, self.blob_version)
     }
 }
 
@@ -3755,6 +3751,7 @@ impl crate::cache_common::SiftPredictionStore for PositionSlicedParquetSiftStore
 async fn load_parquet_sift_prediction_store_for_chrom(
     cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     chrom: &str,
+    budget: Arc<crate::parquet_cache::sift::decoded_pages::PageCacheBudget>,
 ) -> Result<Option<SiftPredictionStoreRef>> {
     let Some(path) = cache.context_path("translation_sift", chrom) else {
         return Ok(None);
@@ -3773,8 +3770,7 @@ async fn load_parquet_sift_prediction_store_for_chrom(
         .await?;
         let blob_version = crate::cache_common::sift_blob_version_from_metadata(schema.metadata());
         return Ok(Some(Arc::new(PositionSlicedParquetSiftStore {
-            lookup: Arc::new(lookup),
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            lookup: Arc::new(lookup.with_page_cache(budget)),
             blob_version,
         }) as SiftPredictionStoreRef));
     }
@@ -6184,6 +6180,9 @@ impl AnnotateProvider {
         let cache_root = Some(cache.base_dir().to_path_buf());
 
         let config = ContigAnnotationConfig {
+            #[cfg(feature = "parquet-cache")]
+            sift_page_budget: crate::parquet_cache::sift::decoded_pages::PageCacheBudget::from_env(
+            )?,
             reference_budget: crate::cache_budget::CacheBudget::from_env(
                 "VEP_REFERENCE_CACHE_MB",
                 128,
@@ -6826,6 +6825,9 @@ impl AnnotateProvider {
             let most_str: &str;
             // Store assignment results from cache-miss path for annotation column population.
             let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
+            // Only this row's requested keys, shared by CSQ and typed output.
+            // No unbounded execution-lifetime per-position memo is retained.
+            let mut row_predictions: Option<HashMap<u64, CachedPredictions>> = None;
             // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
             let mut row_variant: Option<VariantInput> = None;
             let mut csq_already_projected = false;
@@ -7046,14 +7048,9 @@ impl AnnotateProvider {
                 }
                 row_variant = Some(variant);
 
-                // Batch the position-sliced SIFT demand fetch: collect this
-                // row's missense `(transcript_uid, position)` keys and warm the
-                // store in a single `take_rows`, so the per-consequence
-                // `lookup_sift_polyphen` calls below (CSQ + typed columns) hit
-                // the memoized cache instead of issuing one take per
-                // consequence. Only the position-sliced store benefits; the
-                // legacy transcript-id store ignores this. SIFT is emitted only
-                // under `--everything`.
+                // Fetch and decode requested positions once for this row. The
+                // store reuses decoded Parquet pages across rows, while this map
+                // serves both CSQ and typed outputs without repeating Arrow takes.
                 #[cfg(feature = "parquet-cache")]
                 if flags.everything && needs_sift_polyphen {
                     if let Some(store) = sift_store {
@@ -7071,8 +7068,10 @@ impl AnnotateProvider {
                                     warm_keys.push(key);
                                 }
                             }
-                            if !warm_keys.is_empty() {
-                                let _ = store.get_position_predictions(&warm_keys);
+                            let started = engine_profile_enabled.then(Instant::now);
+                            row_predictions = Some(store.get_position_predictions(&warm_keys)?);
+                            if let Some(started) = started {
+                                engine_profile.sift_warm += started.elapsed();
                             }
                         }
                     }
@@ -7339,7 +7338,7 @@ impl AnnotateProvider {
                                     engine_profile,
                                     sift_polyphen,
                                     {
-                                        lookup_sift_polyphen(
+                                        lookup_sift_polyphen_for_row(
                                             tc.transcript_id.as_deref(),
                                             tx_opt.and_then(|tx| tx.transcript_uid),
                                             tc.protein_position.as_deref(),
@@ -7349,6 +7348,7 @@ impl AnnotateProvider {
                                             sift_store,
                                             #[cfg(not(feature = "parquet-cache"))]
                                             _sift_kv,
+                                            row_predictions.as_ref(),
                                         )
                                     }
                                 )
@@ -7994,7 +7994,7 @@ impl AnnotateProvider {
 
                         // SIFT, PolyPhen
                         if flags.everything {
-                            let (sift_str, polyphen_str) = lookup_sift_polyphen(
+                            let (sift_str, polyphen_str) = lookup_sift_polyphen_for_row(
                                 tc.transcript_id.as_deref(),
                                 tx_opt.and_then(|tx| tx.transcript_uid),
                                 tc.protein_position.as_deref(),
@@ -8004,6 +8004,7 @@ impl AnnotateProvider {
                                 sift_store,
                                 #[cfg(not(feature = "parquet-cache"))]
                                 _sift_kv,
+                                row_predictions.as_ref(),
                             );
                             append_opt_str(
                                 b_sift.values(),
@@ -10186,6 +10187,8 @@ impl Debug for AnnotateProvider {
 /// Bundled configuration for per-contig annotation (extracted from AnnotateProvider).
 #[derive(Clone)]
 struct ContigAnnotationConfig {
+    #[cfg(feature = "parquet-cache")]
+    sift_page_budget: Arc<crate::parquet_cache::sift::decoded_pages::PageCacheBudget>,
     reference_budget: Arc<crate::cache_budget::CacheBudget>,
     vcf_table: String,
     options_json: Option<String>,
@@ -16125,8 +16128,12 @@ async fn prepare_contig_data(
     let sift_prediction_store =
         if use_lookup_sift && config.flags.everything && config.needs_sift_polyphen {
             let sift_started = Instant::now();
-            let store =
-                load_parquet_sift_prediction_store_for_chrom(cache.as_parquet(), &chrom).await?;
+            let store = load_parquet_sift_prediction_store_for_chrom(
+                cache.as_parquet(),
+                &chrom,
+                Arc::clone(&config.sift_page_budget),
+            )
+            .await?;
             record_contig_profile(&pipeline_profile, |profile| {
                 profile.sift_load += sift_started.elapsed();
             });
@@ -18378,6 +18385,10 @@ mod tests {
 
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
         ContigAnnotationConfig {
+            #[cfg(feature = "parquet-cache")]
+            sift_page_budget: crate::parquet_cache::sift::decoded_pages::PageCacheBudget::new(
+                256 * 1024 * 1024,
+            ),
             reference_budget: crate::cache_budget::CacheBudget::new(128 * 1024 * 1024),
             vcf_table: "vcf".to_string(),
             options_json: None,
@@ -20114,6 +20125,66 @@ mod tests {
     }
 
     // ── lookup_sift_polyphen ───────────────────────────────────────────
+
+    #[cfg(feature = "parquet-cache")]
+    #[test]
+    fn row_prediction_reuse_formats_values_and_absences_without_reloading() {
+        struct NoReload;
+        impl crate::cache_common::SiftPredictionStore for NoReload {
+            fn get_many(&self, _: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+                panic!("position-sliced row must not request transcript predictions")
+            }
+            fn is_position_sliced(&self) -> bool {
+                true
+            }
+            fn get_position_predictions(
+                &self,
+                _: &[u64],
+            ) -> Result<HashMap<u64, CachedPredictions>> {
+                panic!("the row already fetched both positive and negative results")
+            }
+        }
+        let store: Option<SiftPredictionStoreRef> = Some(Arc::new(NoReload));
+        let predictions = HashMap::from([(
+            (7u64 << 32) | 42,
+            CachedPredictions {
+                sift: vec![CompactPrediction {
+                    position: 42,
+                    amino_acid: CompactPrediction::encode_amino_acid("I").unwrap(),
+                    prediction: CompactPrediction::encode_prediction("deleterious"),
+                    score: 0.01,
+                }],
+                ..Default::default()
+            },
+        )]);
+        let mut cache = SiftPolyphenCache::new();
+        for _output in ["CSQ", "typed"] {
+            assert_eq!(
+                lookup_sift_polyphen_for_row(
+                    None,
+                    Some(7),
+                    Some("42"),
+                    Some("V/I"),
+                    &mut cache,
+                    &store,
+                    Some(&predictions)
+                ),
+                ("deleterious(0.01)".to_owned(), String::new())
+            );
+            assert_eq!(
+                lookup_sift_polyphen_for_row(
+                    None,
+                    Some(7),
+                    Some("43"),
+                    Some("V/I"),
+                    &mut cache,
+                    &store,
+                    Some(&predictions)
+                ),
+                (String::new(), String::new())
+            );
+        }
+    }
 
     fn make_sift_cache(entries: Vec<(&str, i32, &str, &str, f32, &str, f32)>) -> SiftPolyphenCache {
         let mut cache = SiftPolyphenCache::new();
