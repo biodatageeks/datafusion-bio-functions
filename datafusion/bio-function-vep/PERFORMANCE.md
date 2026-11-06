@@ -8,7 +8,7 @@ cache format or the annotation API.
 | Internal diagnostic setting | Default | Meaning |
 |---|---:|---|
 | `VEP_REFERENCE_CACHE_MB` | 128 MiB | Admission limit for newly owned reference CDS and peptide payloads |
-| `VEP_SIFT_CACHE_MB` | 64 MiB | Admission limit for decoded prediction pages, their slots, and residency tables |
+| `VEP_SIFT_CACHE_MB` | 128 MiB | Admission limit for decoded prediction pages, their slots, and residency tables |
 
 The limits are shared across workers and active/prefetched contigs. They are
 ceilings, not eager allocations. Zero disables the corresponding reuse. Invalid
@@ -75,8 +75,13 @@ vep-rs v0.5.0 reference on the same input took 32.72 seconds; its annotation
 feature coverage differs, so it is a timing reference, not a parity oracle.
 These are one measured run after warm-up, not whole-ClinVar results.
 
-Output allocation is capped at 1,024 input rows per Arrow batch after preparing
+Output allocation is capped at 256 input rows per Arrow batch after preparing
 the full VEP input-buffer context. This does not change the 5,000-input-unit
 state transitions, transcript hydration, HGNC persistence, warm-up or partition
 seams. It limits transient CSQ/VCF copies; one very large record and the total
 output retained for a whole input buffer are still not byte-bounded.
+
+The prediction cache default is 128 MiB. A 64 MiB experiment on ClinVar chr17
+caused repeated eviction and decoding (about 121 GB of decoded pages) and was
+rejected despite exact output parity. Smaller payload limits do not guarantee
+lower process RSS when repeated decoding increases allocator churn.

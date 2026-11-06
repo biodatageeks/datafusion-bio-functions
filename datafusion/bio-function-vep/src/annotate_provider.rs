@@ -14492,7 +14492,7 @@ fn warm_up_worker_state(
 
 // This limits Arrow/VCF output allocations, not VEP input-buffer state.
 // Context preparation still sees the entire original 5,000-input-unit buffer.
-const ANNOTATION_OUTPUT_CHUNK_ROWS: usize = 1024;
+const ANNOTATION_OUTPUT_CHUNK_ROWS: usize = 256;
 
 fn annotation_output_chunks(batch: &RecordBatch) -> impl Iterator<Item = RecordBatch> + '_ {
     (0..batch.num_rows())
