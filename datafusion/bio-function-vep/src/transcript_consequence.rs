@@ -12670,7 +12670,7 @@ pub(crate) fn genomic_to_cdna_index_for_transcript(
     // Use the cached coord table (built once per transcript) instead of
     // rebuilding `exon_segments` on every call.
     match transcript_cdna_coords(tx, tx_exons) {
-        Some(coords) => cdna_index_from_sorted_coords(tx.strand, pos, &coords),
+        Some(coords) => cdna_index_from_sorted_coords(tx.strand, pos, coords),
         None => genomic_to_cdna_index(tx_exons, tx.strand, pos),
     }
 }
@@ -12738,15 +12738,15 @@ pub(crate) fn raw_exon_cdna_start_for_insertion(
 /// Genomic→cDNA coordinate table for the transcript, memoized once on the
 /// transcript and reused across every overlapping variant/allele (redundancy C).
 /// The first caller pays the `to_vec()` + sort in [`transcript_cdna_coords_uncached`];
-/// later callers clone the cached `Vec` (cheap — a handful of exon segments).
-fn transcript_cdna_coords(
-    tx: &TranscriptFeature,
+/// Later callers borrow that table for the lifetime of the immutable transcript.
+fn transcript_cdna_coords<'a>(
+    tx: &'a TranscriptFeature,
     tx_exons: &[&ExonFeature],
-) -> Option<Vec<TranscriptCdnaCoord>> {
+) -> Option<&'a [TranscriptCdnaCoord]> {
     tx.cdna_coords_cache
         .0
         .get_or_init(|| transcript_cdna_coords_uncached(tx, tx_exons))
-        .clone()
+        .as_deref()
 }
 
 /// Map a genomic position to its 1-based cDNA index using a prebuilt,
@@ -13005,7 +13005,7 @@ pub(crate) fn raw_cdna_position_from_genomic(
     }
 
     let coords = transcript_cdna_coords(tx, tx_exons)?;
-    raw_cdna_position_from_sorted_coords(tx.strand, genomic_pos, coords)
+    raw_cdna_position_from_sorted_coords(tx.strand, genomic_pos, coords.iter().copied())
 }
 
 /// Resolve the unshifted transcript-sequence cDNA bounds Ensembl uses when
@@ -14763,10 +14763,42 @@ fn translate_protein_from_cds(cds: &[u8]) -> Option<Vec<char>> {
 fn translate_protein_from_cds_in(table: CodonTable, cds: &[u8]) -> Option<Vec<char>> {
     let codon_count = cds.len() / 3;
     let mut out = Vec::with_capacity(codon_count);
-    for codon_idx in 0..codon_count {
-        let base = codon_idx * 3;
-        let codon = std::str::from_utf8(&cds[base..base + 3]).ok()?;
-        out.push(translate_codon_in(table, codon)?);
+    // A/C/G/T codons dominate full translations. Index their genetic code
+    // directly, avoiding a UTF-8 check and string match for every triplet.
+    // Keep the original path for every other byte sequence: notably N plus
+    // another unusual symbol, lowercase, and invalid UTF-8 retain their exact
+    // historical behavior. Trailing incomplete codons are still ignored.
+    const BASE: [u8; 256] = {
+        let mut values = [u8::MAX; 256];
+        values[b'A' as usize] = 0;
+        values[b'C' as usize] = 1;
+        values[b'G' as usize] = 2;
+        values[b'T' as usize] = 3;
+        values
+    };
+    const STANDARD: &[u8; 64] = b"KNKNTTTTRSRSIIMIQHQHPPPPRRRRLLLLEDEDAAAAGGGGVVVV*Y*YSSSS*CWCLFLF";
+    const MITOCHONDRIAL: [u8; 64] = {
+        let mut values = *STANDARD;
+        values[8] = b'*'; // AGA
+        values[10] = b'*'; // AGG
+        values[12] = b'M'; // ATA
+        values[56] = b'W'; // TGA
+        values
+    };
+    let code = match table {
+        CodonTable::Standard => STANDARD,
+        CodonTable::VertebrateMitochondrial => &MITOCHONDRIAL,
+    };
+    for codon in cds.chunks_exact(3) {
+        let a = BASE[codon[0] as usize];
+        let b = BASE[codon[1] as usize];
+        let c = BASE[codon[2] as usize];
+        let aa = if (a | b | c) < 4 {
+            code[((a << 4) | (b << 2) | c) as usize] as char
+        } else {
+            translate_codon_in(table, std::str::from_utf8(codon).ok()?)?
+        };
+        out.push(aa);
     }
     Some(out)
 }
@@ -14913,6 +14945,55 @@ fn translate_codon(codon: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_translation_matches_original_for_every_ascii_codon() {
+        for table in [CodonTable::Standard, CodonTable::VertebrateMitochondrial] {
+            // Exhaustive ASCII includes all DNA codons, N combined with any
+            // symbol, lowercase, stop markers, and unsupported ambiguity codes.
+            for a in 0..=127u8 {
+                for b in 0..=127u8 {
+                    for c in 0..=127u8 {
+                        let codon = [a, b, c];
+                        let expected =
+                            translate_codon_in(table, std::str::from_utf8(&codon).unwrap())
+                                .map(|aa| vec![aa]);
+                        assert_eq!(
+                            translate_protein_from_cds_in(table, &codon),
+                            expected,
+                            "table={table:?} codon={codon:?}"
+                        );
+                    }
+                }
+            }
+            // Preserve per-triplet UTF-8 rejection and incomplete-tail rules,
+            // including a valid multi-byte sequence crossing a codon boundary.
+            for cds in [
+                b"".as_slice(),
+                b"A",
+                b"AT",
+                b"ATGA",
+                b"ATGAA",
+                b"ATGNNNTGATAA",
+                b"N\xc3\xa9",
+                b"\xc3\xa9N",
+                b"\xe2\x82\xac",
+                b"N\xffN",
+                b"AA\xc3\xa9NN",
+                b"ATG\xff",
+            ] {
+                let expected: Option<Vec<_>> = cds
+                    .chunks_exact(3)
+                    .map(|codon| translate_codon_in(table, std::str::from_utf8(codon).ok()?))
+                    .collect();
+                assert_eq!(
+                    translate_protein_from_cds_in(table, cds),
+                    expected,
+                    "table={table:?} cds={cds:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn reference_derivation_once_and_local_substitution_work_is_window_bounded() {
@@ -22330,8 +22411,23 @@ mod tests {
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let uncached = transcript_cdna_coords_uncached(&t, &refs);
         // First call populates the per-transcript cache; second hits it.
-        assert_eq!(transcript_cdna_coords(&t, &refs), uncached);
-        assert_eq!(transcript_cdna_coords(&t, &refs), uncached);
+        assert_eq!(transcript_cdna_coords(&t, &refs), uncached.as_deref());
+        assert_eq!(transcript_cdna_coords(&t, &refs), uncached.as_deref());
+        let cached = transcript_cdna_coords(&t, &refs).unwrap();
+        assert!(std::ptr::eq(
+            cached,
+            transcript_cdna_coords(&t, &refs).unwrap(),
+        ));
+        // A cloned transcript owns a fresh cache, including when its exon
+        // geometry differs. No borrowed table may leak across transcript views.
+        let clone = t.clone();
+        let changed = [exon("tx1", 1, 100, 105), exon("tx1", 2, 200, 210)];
+        let changed_refs: Vec<_> = changed.iter().collect();
+        assert_eq!(
+            transcript_cdna_coords(&clone, &changed_refs),
+            transcript_cdna_coords_uncached(&clone, &changed_refs).as_deref(),
+        );
+        assert_ne!(transcript_cdna_coords(&clone, &changed_refs), Some(cached));
     }
 
     #[test]

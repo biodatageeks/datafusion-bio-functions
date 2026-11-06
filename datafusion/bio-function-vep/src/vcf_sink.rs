@@ -331,6 +331,9 @@ fn format_vcf_body_chunk(
         coordinate_zero_based,
         file_format,
     )?;
+    // Lines own their strings. Release the Arrow CSQ buffers before allocating
+    // the contiguous body, rather than keeping three copies of dense output.
+    drop(batch);
     let (bytes, line_count) = vcf_lines_to_body_chunk(lines);
     pipeline_trace::emit(
         "vcf_format",
@@ -2230,6 +2233,9 @@ pub async fn annotate_to_vcf(
                 profile.rows += input_rows;
                 profile.lines += lines.len();
             }
+            // The formatter owns every output line; the Arrow batch is no
+            // longer needed while assembling/writing the contiguous body.
+            drop(batch);
             let line_count = lines.len();
             total_rows += line_count;
             let write_started = Instant::now();

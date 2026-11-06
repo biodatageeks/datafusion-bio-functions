@@ -11967,7 +11967,8 @@ fn accumulate_boundaries(
 /// needs to know how many transcripts cover each *variant* — a buffer's span
 /// alone cannot tell it that, because buffers hold a fixed number of variants
 /// and therefore span far more base pairs in gene deserts than in dense regions.
-/// Collection is opt-in so the default path allocates nothing extra.
+/// Collection is limited to the balanced stateful parallel path; serial and
+/// streaming paths allocate no position vector.
 fn accumulate_boundaries_inner(
     batches: &[RecordBatch],
     input_buffer_size: usize,
@@ -16051,12 +16052,13 @@ async fn prepare_contig_data(
             unreachable!("parquet-cache feature is required")
         }
     };
-    // Cost-weighted grid split (opt-in). Resolved before the count pass because
-    // the weights need every row's position, which only that pass sees.
+    // Balance whole buffers by transcript overlap by default. The count pass
+    // supplies their positions; VEP_GRID_BALANCE=0 retains uniform partitions
+    // for diagnostic ablation. Buffer seams and state replay stay unchanged.
     let grid_balance_enabled = stateful_parallel
-        && pipeline_trace::enabled_from_env_value(
-            std::env::var("VEP_GRID_BALANCE").ok().as_deref(),
-        );
+        && pipeline_trace::enabled_from_env_value(Some(
+            std::env::var("VEP_GRID_BALANCE").as_deref().unwrap_or("1"),
+        ));
     // Run the grid count pass (VCF positions only) CONCURRENTLY with the context
     // load (Parquet transcripts/exons) — independent IO, so the count is hidden
     // behind context load instead of running as a serial prelude before workers.
@@ -16200,7 +16202,7 @@ async fn prepare_contig_data(
         let (boundaries, _total_rows, grid_positions) = grid_count
             .take()
             .expect("stateful_parallel implies the count future ran")?;
-        // Cost-weighted grid split (opt-in via VEP_GRID_BALANCE). The default
+        // Cost-weighted grid split (disabled with VEP_GRID_BALANCE=0). The old
         // equal-buffer-count split equalises variants per worker, not work, so
         // gene-dense slices straggle; weighting by transcript overlap equalises
         // the thing that actually costs. Slice boundaries do not affect output

@@ -58,3 +58,19 @@ and exact output-body digests, and compare both wall time and peak RSS. Competit
 timings require the same input and worker count; vep-rs has known differences in
 regulatory and edited RefSeq support, so it is a timing reference rather than the
 correctness oracle.
+
+## Whole-buffer worker balancing
+
+Merged and RefSeq VCF output now balances whole input buffers by transcript
+coverage rather than assigning an equal number of buffers to each worker.
+This preserves the existing buffer boundaries, warm-up replay and output order.
+Set `VEP_GRID_BALANCE=0` to reproduce uniform scheduling for diagnostic ablation.
+At one worker the scheduling policy is unchanged. Planning temporarily retains
+one `(position, input_units)` pair per input row on the contig.
+
+ClinVar chr17 (277,114 records, eight workers) measured 53.79 seconds process
+wall with balancing versus 132.65 seconds for uniform partitions using the
+same A+B native binary. Both matched the original output body exactly. The
+vep-rs v0.5.0 reference on the same input took 32.72 seconds; its annotation
+feature coverage differs, so it is a timing reference, not a parity oracle.
+These are one measured run after warm-up, not whole-ClinVar results.
