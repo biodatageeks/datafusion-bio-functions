@@ -14490,6 +14490,21 @@ fn warm_up_worker_state(
     Ok(())
 }
 
+// This limits Arrow/VCF output allocations, not VEP input-buffer state.
+// Context preparation still sees the entire original 5,000-input-unit buffer.
+const ANNOTATION_OUTPUT_CHUNK_ROWS: usize = 1024;
+
+fn annotation_output_chunks(batch: &RecordBatch) -> impl Iterator<Item = RecordBatch> + '_ {
+    (0..batch.num_rows())
+        .step_by(ANNOTATION_OUTPUT_CHUNK_ROWS)
+        .map(|start| {
+            batch.slice(
+                start,
+                (batch.num_rows() - start).min(ANNOTATION_OUTPUT_CHUNK_ROWS),
+            )
+        })
+}
+
 fn annotate_worker_window(
     worker: &mut AnnotationWorkerState,
     window_batches: &[RecordBatch],
@@ -14552,7 +14567,10 @@ fn annotate_worker_window(
             profile.prepared_context += prepared_context_started.elapsed();
         });
 
-        for batch in &buffer_batches {
+        // Keep the whole-buffer prepared context and persisted state intact.
+        // Only split its stateless annotation/output work, so dense CSQ buffers
+        // cannot force multi-hundred-megabyte formatter copies in one batch.
+        for batch in buffer_batches.iter().flat_map(annotation_output_chunks) {
             // SIFT/PolyPhen predictions are fetched on demand by the transcript
             // engine (`lookup_sift_polyphen`), which only queries the store for
             // single-amino-acid substitutions and memoizes per transcript. Eagerly
@@ -14567,7 +14585,7 @@ fn annotate_worker_window(
 
             let engine_started = Instant::now();
             let annotated = tmp_provider.annotate_batch_with_transcript_engine(
-                batch,
+                &batch,
                 engine,
                 &ctx,
                 &worker.colocated_map,
@@ -21699,6 +21717,34 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn output_chunks_preserve_multiallelic_rows_ties_and_input_buffer_grid() {
+        let rows = 2 * ANNOTATION_OUTPUT_CHUNK_ROWS + 7;
+        let starts: Vec<_> = (0..rows).map(|i| 100 + (i / 5) as i64).collect();
+        let alts: Vec<_> = (0..rows)
+            .map(|i| if i % 3 == 0 { "A,C,G" } else { "T" })
+            .collect();
+        let input = make_buffer_batch_many_with_alts("chr1", &starts, &alts);
+        let chunks: Vec<_> = annotation_output_chunks(&input).collect();
+        assert_eq!(
+            chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            [
+                ANNOTATION_OUTPUT_CHUNK_ROWS,
+                ANNOTATION_OUTPUT_CHUNK_ROWS,
+                7
+            ]
+        );
+        let rebuilt = datafusion::arrow::compute::concat_batches(&input.schema(), &chunks).unwrap();
+        assert_eq!(rebuilt, input);
+        assert_eq!(
+            chunks.iter().map(batch_input_units).sum::<usize>(),
+            batch_input_units(&input)
+        );
+        let original_grid = accumulate_boundaries(std::slice::from_ref(&input), 5000).unwrap();
+        assert_eq!(accumulate_boundaries(&chunks, 5000).unwrap(), original_grid);
+        assert_eq!(annotation_output_chunks(&input.slice(0, 0)).count(), 0);
     }
 
     #[test]

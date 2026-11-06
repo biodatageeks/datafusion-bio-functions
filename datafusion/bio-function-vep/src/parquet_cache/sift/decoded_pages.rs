@@ -23,7 +23,7 @@ pub(crate) struct PageCacheBudget {
 impl PageCacheBudget {
     pub(crate) fn from_env() -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            payload: CacheBudget::from_env("VEP_SIFT_CACHE_MB", 256)?,
+            payload: CacheBudget::from_env("VEP_SIFT_CACHE_MB", 64)?,
             scratch: CacheBudget::new(2 * FILL_BYTES),
         }))
     }
