@@ -11845,57 +11845,83 @@ fn admission_allows(
         && next_start < head + workers.max(1) + lookahead
 }
 
-/// Per-buffer cost weight used by the balanced grid split: how many contig
-/// transcripts overlap the buffer's position span, plus a constant for the fixed
-/// per-buffer cost that is paid even in gene deserts.
-///
-/// Buffers already hold a fixed number of VEP input units, so *variants* per
-/// buffer are equalised by construction. What is not equalised is how many
-/// transcripts each variant is evaluated against — that is why gene-dense slices
-/// become the stragglers under the equal-buffer-count split.
+/// A scheduling estimate from cached spliced coding length. The floor retains
+/// noncoding work; the cap keeps malformed/outlying metadata from owning a
+/// contig's entire schedule. No transcript sequence is constructed here.
+fn coding_length_cost(
+    cds_len: Option<usize>,
+    protein_len: Option<usize>,
+    cds_sequence_len: Option<usize>,
+) -> u64 {
+    let nt = cds_len
+        .filter(|&n| n > 0)
+        .or_else(|| cds_sequence_len.filter(|&n| n > 0))
+        .or_else(|| protein_len.map(|n| n.saturating_mul(3)))
+        .unwrap_or(0);
+    (1 + (nt / 768).min(255)) as u64
+}
+
+#[cfg(test)]
 fn buffer_transcript_weights(
     boundaries: &[GridBufferBoundary],
     positions: &[(i64, u32)],
     spans: impl IntoIterator<Item = (i64, i64)>,
 ) -> Vec<u64> {
+    buffer_transcript_cost_weights(
+        boundaries,
+        positions,
+        spans.into_iter().map(|(s, e)| (s, e, 1)),
+    )
+}
+
+/// Sum transcript costs at each original input row, weighted by ALT units.
+/// Endpoint prefix sums preserve inclusive spans and overlapping transcripts;
+/// u128 accumulation prevents saturated endpoints from canceling each other.
+fn buffer_transcript_cost_weights(
+    boundaries: &[GridBufferBoundary],
+    positions: &[(i64, u32)],
+    spans: impl IntoIterator<Item = (i64, i64, u64)>,
+) -> Vec<u64> {
     if boundaries.len() < 2 || positions.is_empty() {
         return Vec::new();
     }
     let b = boundaries.len() - 1;
-    // Transcript coverage depth at a position = (#starts <= p) - (#ends < p),
-    // read off two sorted endpoint arrays.
-    let mut starts: Vec<i64> = Vec::new();
-    let mut ends: Vec<i64> = Vec::new();
-    for (s, e) in spans {
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    for (s, e, cost) in spans {
         let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-        starts.push(lo);
-        ends.push(hi);
+        let cost = u128::from(cost.max(1));
+        starts.push((lo, cost));
+        ends.push((hi, cost));
     }
-    starts.sort_unstable();
-    ends.sort_unstable();
-
+    starts.sort_unstable_by_key(|&(pos, _)| pos);
+    ends.sort_unstable_by_key(|&(pos, _)| pos);
+    for endpoints in [&mut starts, &mut ends] {
+        let mut sum = 0u128;
+        for (_, cost) in endpoints {
+            sum = sum.saturating_add(*cost);
+            *cost = sum;
+        }
+    }
+    let prefix = |endpoints: &[(i64, u128)], n: usize| {
+        n.checked_sub(1).map_or(0, |index| endpoints[index].1)
+    };
     let mut weights = vec![0u64; b];
     for (i, w) in weights.iter_mut().enumerate() {
         let from = boundaries[i].global_row.min(positions.len());
         let to = boundaries[i + 1].global_row.min(positions.len());
-        let mut sum = 0u64;
         for &(p, row_units) in &positions[from..to] {
-            let covering = starts.partition_point(|&s| s <= p) - ends.partition_point(|&e| e < p);
-            // Scale by input units: the buffer grid and the annotation workload
-            // both count each ALT separately, so a 10-ALT row is ~10x the work
-            // of a single-ALT row at the same transcript depth.
-            sum += covering as u64 * row_units.max(1) as u64;
+            let opened = prefix(&starts, starts.partition_point(|&(s, _)| s <= p));
+            let closed = prefix(&ends, ends.partition_point(|&(e, _)| e < p));
+            let covering = (opened - closed).min(u128::from(u64::MAX)) as u64;
+            *w = w.saturating_add(covering.saturating_mul(u64::from(row_units.max(1))));
         }
-        *w = sum;
     }
-    // Fixed per-buffer term. Measured on chr1: the buffer-invariant cost
-    // (buffer-local transcript selection scans every contig transcript) is ~12%
-    // of per-buffer CPU, so bias by an eighth of the mean. Without it a buffer
-    // in a gene desert looks free and they all pile onto one worker.
-    let total: u64 = weights.iter().sum();
-    let fixed = (total / (b as u64).max(1)) / 8;
-    for w in weights.iter_mut() {
-        *w += fixed + 1;
+    // Preserve the existing fixed per-buffer floor (one eighth of mean cost).
+    let total = weights.iter().fold(0u64, |sum, w| sum.saturating_add(*w));
+    let fixed = total / (b as u64).max(1) / 8;
+    for w in &mut weights {
+        *w = w.saturating_add(fixed).saturating_add(1);
     }
     weights
 }
@@ -11910,11 +11936,11 @@ fn plan_grid_partitions_balanced(
     overlap_width_bp: i64,
     weights: &[u64],
 ) -> Vec<WorkerGridSlice> {
-    let workers = workers.max(1);
     if boundaries.len() < 2 {
         return Vec::new();
     }
     let b = boundaries.len() - 1;
+    let workers = workers.max(1).min(b);
     if weights.len() != b {
         return plan_grid_partitions(boundaries, workers, overlap_width_bp);
     }
@@ -11949,6 +11975,63 @@ fn plan_grid_partitions_balanced(
             let hi = b - (workers - k);
             cuts[k] = cuts[k].max(cuts[k - 1] + 1).min(hi);
         }
+    }
+    // A heavy indivisible buffer can cross several quantiles. Repairing the
+    // repeated cuts above then assigns tiny slices to later workers while an
+    // earlier slice exceeds the minimum possible maximum load. Find that
+    // minimum with greedy feasibility; u128 retains sums above u64::MAX.
+    let sum: u128 = weights.iter().map(|&w| u128::from(w)).sum();
+    let mut low = sum
+        .div_ceil(workers as u128)
+        .max(u128::from(*weights.iter().max().unwrap()));
+    let mut high = sum;
+    while low < high {
+        let limit = low + (high - low) / 2;
+        let mut parts = 1usize;
+        let mut current = 0u128;
+        for &weight in weights {
+            let weight = u128::from(weight);
+            if current + weight > limit {
+                parts += 1;
+                current = 0;
+            }
+            current += weight;
+        }
+        if parts <= workers {
+            high = limit;
+        } else {
+            low = limit + 1;
+        }
+    }
+    let current_max = cuts
+        .windows(2)
+        .map(|pair| {
+            weights[pair[0]..pair[1]]
+                .iter()
+                .map(|&w| u128::from(w))
+                .sum::<u128>()
+        })
+        .max()
+        .unwrap_or(0);
+    // Avoid changing seams when the previous policy already attains the optimum.
+    if current_max > low {
+        cuts.clear();
+        cuts.push(0);
+        let mut remaining = workers;
+        let mut current = 0u128;
+        for (i, &weight) in weights.iter().enumerate() {
+            let weight = u128::from(weight);
+            let last_cut = cuts[cuts.len() - 1];
+            if i > last_cut && (current + weight > low || b - i == remaining - 1) {
+                debug_assert!(remaining > 1);
+                cuts.push(i);
+                remaining -= 1;
+                current = 0;
+            }
+            current += weight;
+        }
+        cuts.push(b);
+        debug_assert_eq!(cuts.len(), workers + 1);
     }
     build_grid_slices(boundaries, &cuts, overlap_width_bp)
 }
@@ -16336,15 +16419,38 @@ async fn prepare_contig_data(
         // Cost-weighted grid split (disabled with VEP_GRID_BALANCE=0). The old
         // equal-buffer-count split equalises variants per worker, not work, so
         // gene-dense slices straggle; weighting by transcript overlap equalises
-        // the thing that actually costs. Slice boundaries do not affect output
+        // the work. Coding-length costs also account for long peptide/CDS
+        // processing in sparse overlap regions. Slice boundaries do not affect output
         // (every worker count already yields byte-identical VCFs), so this is a
         // scheduling change only.
         let slices = if grid_balance_enabled {
             let t_w = Instant::now();
-            let weights = buffer_transcript_weights(
+            let coding_costs: HashMap<_, _> = tl
+                .iter()
+                .map(|translation| {
+                    (
+                        translation.transcript_id.as_str(),
+                        coding_length_cost(
+                            translation.cds_len,
+                            translation.protein_len,
+                            translation.cds_sequence.as_ref().map(String::len),
+                        ),
+                    )
+                })
+                .collect();
+            let weights = buffer_transcript_cost_weights(
                 &boundaries,
                 &grid_positions,
-                base_transcripts.iter().map(|tx| (tx.start, tx.end)),
+                base_transcripts.iter().map(|tx| {
+                    (
+                        tx.start,
+                        tx.end,
+                        coding_costs
+                            .get(tx.transcript_id.as_str())
+                            .copied()
+                            .unwrap_or(1),
+                    )
+                }),
             );
             let planned = plan_grid_partitions_balanced(
                 &boundaries,
@@ -16371,7 +16477,7 @@ async fn prepare_contig_data(
                             && boundaries[*i].global_row < s.emit_end_row
                     })
                     .map(|(_, w)| *w)
-                    .sum();
+                    .fold(0u64, u64::saturating_add);
                 pipeline_trace::emit(
                     "grid_balance",
                     "slice",
@@ -20962,6 +21068,83 @@ mod tests {
     }
 
     #[test]
+    fn coding_length_cost_handles_missing_metadata_priority_and_outliers() {
+        assert_eq!(coding_length_cost(None, None, None), 1);
+        assert_eq!(coding_length_cost(Some(0), None, None), 1);
+        assert_eq!(coding_length_cost(Some(768), Some(99_999), Some(99_999)), 2);
+        assert_eq!(coding_length_cost(None, Some(256), None), 2);
+        assert_eq!(coding_length_cost(None, None, Some(1536)), 3);
+        assert_eq!(coding_length_cost(Some(0), Some(256), Some(1536)), 3);
+        assert_eq!(coding_length_cost(Some(usize::MAX), None, None), 256);
+        assert_eq!(coding_length_cost(None, Some(usize::MAX), None), 256);
+    }
+
+    #[test]
+    fn weighted_endpoint_prefixes_preserve_coverage_when_totals_exceed_u64() {
+        let bs = vec![gb(0, 0), gb(1, 100), gb(2, 200), gb(3, i64::MAX)];
+        let weights = buffer_transcript_cost_weights(
+            &bs,
+            &[(0, 1), (100, u32::MAX), (200, 1)],
+            [(150, -50, u64::MAX), (50, 150, u64::MAX)],
+        );
+        assert_eq!(weights[0], u64::MAX);
+        assert_eq!(weights[1], u64::MAX);
+        assert!(
+            weights[2] > 0 && weights[2] < u64::MAX,
+            "all transcripts end before 200; the desert keeps only the fixed floor"
+        );
+    }
+
+    #[test]
+    fn weighted_transcripts_keep_alt_units_inclusive_ends_and_zero_unit_floor() {
+        let bs = vec![gb(0, 0), gb(1, 100), gb(2, 200), gb(3, i64::MAX)];
+        let weights = buffer_transcript_cost_weights(
+            &bs,
+            &[(0, 0), (100, 10), (200, 1)],
+            [(0, 100, 2), (100, 0, 8)],
+        );
+        assert_eq!(weights[0] - weights[2], 10);
+        assert_eq!(weights[1] - weights[2], 100);
+        assert!(weights.iter().all(|&w| w > 0));
+    }
+
+    #[test]
+    fn weighted_grid_distinguishes_coding_length_at_equal_overlap_depth() {
+        let bs = vec![
+            gb(0, 0),
+            gb(1, 100),
+            gb(2, 200),
+            gb(3, 300),
+            gb(4, i64::MAX),
+        ];
+        let positions = vec![(0, 1), (100, 1), (200, 1), (300, 1)];
+        let spans = [
+            (0, 50, 768usize),
+            (100, 150, 768),
+            (200, 250, 768),
+            (300, 350, 76_800),
+        ];
+        let weights = buffer_transcript_cost_weights(
+            &bs,
+            &positions,
+            spans.into_iter().map(|(start, end, coding_len)| {
+                (start, end, coding_length_cost(Some(coding_len), None, None))
+            }),
+        );
+        assert!(
+            weights[3] > weights[2],
+            "equal overlap counts must not hide a transcript with 100 times more coding sequence"
+        );
+        let slices = plan_grid_partitions_balanced(&bs, 2, 0, &weights);
+        assert_eq!(
+            slices[0].emit_end_row, 3,
+            "reserve the expensive final buffer for its own worker"
+        );
+        assert_eq!(slices[1].emit_start_row, 3);
+        assert_eq!(slices[1].emit_end_row, 4);
+    }
+
+    #[test]
     fn weights_count_transcripts_overlapping_each_buffer() {
         // 4 buffers of one row each; the row's position decides its cost.
         let bs = vec![
@@ -21011,6 +21194,123 @@ mod tests {
         );
         // depth 1 x 10 units vs depth 1 x 1 unit, before the shared fixed term
         assert_eq!(multi[1] - single[1], 9);
+    }
+
+    #[test]
+    fn balanced_split_minimizes_maximum_cost_when_one_buffer_crosses_quantiles() {
+        let weights = [4u64, 4, 9, 9, 1, 1, 4, 4];
+        let boundaries: Vec<_> = (0..=weights.len()).map(|i| gb(i, i as i64 * 100)).collect();
+        let slices = plan_grid_partitions_balanced(&boundaries, 4, 0, &weights);
+        let maximum = slices
+            .iter()
+            .map(|s| {
+                weights[s.emit_start_row..s.emit_end_row]
+                    .iter()
+                    .map(|&w| u128::from(w))
+                    .sum::<u128>()
+            })
+            .max()
+            .unwrap();
+        assert_eq!(
+            maximum, 10,
+            "quantile rounding must not overload one worker while leaving another almost idle"
+        );
+    }
+
+    #[test]
+    fn balanced_split_matches_exhaustive_minimum_for_small_grids() {
+        fn optimum(weights: &[u64], parts: usize) -> u128 {
+            if parts == 1 {
+                return weights.iter().map(|&w| u128::from(w)).sum();
+            }
+            (1..=weights.len() - parts + 1)
+                .map(|cut| {
+                    let left: u128 = weights[..cut].iter().map(|&w| u128::from(w)).sum();
+                    left.max(optimum(&weights[cut..], parts - 1))
+                })
+                .min()
+                .unwrap()
+        }
+        for len in 1usize..=6 {
+            let boundaries: Vec<_> = (0..=len).map(|i| gb(i, i as i64 * 10)).collect();
+            for mut encoded in 0..3usize.pow(len as u32) {
+                let weights: Vec<_> = (0..len)
+                    .map(|_| {
+                        let value = [0u64, 1, 7][encoded % 3];
+                        encoded /= 3;
+                        value
+                    })
+                    .collect();
+                for workers in 0..=len + 2 {
+                    let slices = plan_grid_partitions_balanced(&boundaries, workers, 0, &weights);
+                    let expected_parts = workers.max(1).min(len);
+                    assert_eq!(slices.len(), expected_parts);
+                    assert_eq!(slices[0].emit_start_row, 0);
+                    assert_eq!(slices.last().unwrap().emit_end_row, len);
+                    for pair in slices.windows(2) {
+                        assert_eq!(pair[0].emit_end_row, pair[1].emit_start_row);
+                    }
+                    let maximum = slices
+                        .iter()
+                        .map(|s| {
+                            assert!(s.emit_start_row < s.emit_end_row);
+                            weights[s.emit_start_row..s.emit_end_row]
+                                .iter()
+                                .map(|&w| u128::from(w))
+                                .sum::<u128>()
+                        })
+                        .max()
+                        .unwrap();
+                    assert_eq!(
+                        maximum,
+                        optimum(&weights, expected_parts),
+                        "weights={weights:?}, workers={workers}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn balanced_split_minimax_preserves_cost_above_u64_and_caps_worker_count() {
+        let weights = [u64::MAX, 1, u64::MAX, 1];
+        let boundaries: Vec<_> = (0..=weights.len()).map(|i| gb(i, i as i64 * 100)).collect();
+        let slices = plan_grid_partitions_balanced(&boundaries, 2, 0, &weights);
+        assert_eq!(slices[0].emit_end_row, 2);
+        assert_eq!(slices[1].emit_start_row, 2);
+        let many = plan_grid_partitions_balanced(&boundaries, usize::MAX, 0, &weights);
+        assert_eq!(many.len(), weights.len());
+        assert!(many.iter().all(|s| s.emit_end_row - s.emit_start_row == 1));
+    }
+
+    #[test]
+    fn balanced_split_minimax_keeps_tie_ownership_and_warmup() {
+        let weights = [4u64, 4, 9, 9, 1, 1, 4, 4];
+        let mut boundaries: Vec<_> = (0..=weights.len())
+            .map(|i| gb(i * 5000, i as i64 * 100))
+            .collect();
+        boundaries[2].pos = boundaries[1].pos;
+        boundaries[2].rows_before_pos = 3;
+        let slices = plan_grid_partitions_balanced(&boundaries, 4, 0, &weights);
+        assert_eq!(slices[1].emit_start_row, 10000);
+        assert_eq!(slices[1].warm_up_start_row, 10000);
+        assert_eq!(slices[1].skip_leading_rows, 3);
+        let warmed = plan_grid_partitions_balanced(&boundaries, 4, 50, &weights);
+        assert_eq!(warmed[1].emit_start_row, 10000);
+        assert_eq!(warmed[1].warm_up_start_row, 0);
+        assert_eq!(warmed[1].scan_lo_pos, 0);
+        assert_eq!(warmed.last().unwrap().scan_hi_pos, i64::MAX);
+    }
+
+    #[test]
+    fn balanced_split_keeps_existing_optimal_seams() {
+        let weights = [4u64, 4, 9, 9];
+        let boundaries: Vec<_> = (0..=weights.len()).map(|i| gb(i, i as i64 * 100)).collect();
+        let slices = plan_grid_partitions_balanced(&boundaries, 3, 0, &weights);
+        assert_eq!(
+            slices.iter().map(|s| s.emit_end_row).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
     }
 
     #[test]

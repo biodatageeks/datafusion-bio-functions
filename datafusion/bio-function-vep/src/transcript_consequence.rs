@@ -14,7 +14,11 @@ use crate::so_terms::{ALL_SO_TERMS, SoTerm};
 mod reference_memo;
 mod vep_coords;
 pub(crate) use reference_memo::SharedReferenceMemos;
-use reference_memo::{ReferenceEntry, ReferenceMemo, substitute_peptide_window};
+use reference_memo::{
+    HgvsSequence, HgvsSubstitutionSource, ReferenceEntry, ReferenceMemo, substitute_peptide_window,
+};
+
+type EngineProteinHgvsData = crate::hgvs::ProteinHgvsDataWithSequences<HgvsSequence>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VariantInput {
@@ -1620,7 +1624,7 @@ impl TranscriptConsequenceEngine {
                         profile.tx_overlap_candidates += 1;
                     }
                     let transcript_eval_started = profiling.then(Instant::now);
-                    let (mut terms, coding_class) = self.evaluate_transcript_overlap_inner(
+                    let (mut terms, mut coding_class) = self.evaluate_transcript_overlap_inner(
                         variant,
                         tx,
                         tx_exons,
@@ -1704,7 +1708,7 @@ impl TranscriptConsequenceEngine {
                                 && start.is_some_and(|p| p <= n_pad_len)
                         };
                         let (cds_position, protein_position, amino_acids, codons, protein_hgvs) =
-                            if let Some(ref cc) = coding_class {
+                            if let Some(ref mut cc) = coding_class {
                                 let use_unknown_start_format =
                                     cds_start_is_unknown(cc.cds_position_start);
                                 let cds_pos = if use_unknown_start_format {
@@ -1764,7 +1768,7 @@ impl TranscriptConsequenceEngine {
                                         cc.affected_ref_peptide.as_deref(),
                                         cc.affected_alt_peptide.as_deref(),
                                     );
-                                let protein_hgvs = protein_hgvs_for_output_with_semantics(
+                                let protein_hgvs = protein_hgvs_for_output_owned_with_semantics(
                                     tx,
                                     tx_exons,
                                     tx_translation,
@@ -1772,7 +1776,7 @@ impl TranscriptConsequenceEngine {
                                     pre_allows_protein_hgvs,
                                     cc.protein_position_start
                                         .zip(cc.protein_position_end.or(cc.protein_position_start)),
-                                    cc.protein_hgvs.as_ref(),
+                                    cc.protein_hgvs.take(),
                                     cc.stop_retained,
                                     source_partial_codon,
                                     source_ref_peptide,
@@ -1783,7 +1787,7 @@ impl TranscriptConsequenceEngine {
                             } else {
                                 // VEP can still emit HGVSp for HGVS-shifted indels whose
                                 // original consequence stayed coding_sequence_variant.
-                                let protein_hgvs = protein_hgvs_for_output_with_semantics(
+                                let protein_hgvs = protein_hgvs_for_output_owned_with_semantics(
                                     tx,
                                     tx_exons,
                                     tx_translation,
@@ -2022,7 +2026,7 @@ impl TranscriptConsequenceEngine {
                                     profile.transcript_hgvsp_prepare += started.elapsed();
                                 }
                                 let format_started = profiling.then(Instant::now);
-                                let formatted = crate::hgvs::format_hgvsp(
+                                let formatted = crate::hgvs::format_hgvsp_with_sequences(
                                     &effective_translation,
                                     data,
                                     self.shift_hgvs,
@@ -5472,16 +5476,16 @@ fn vep_partial_terminal_codon_with_metrics(
 /// translation row while the transcript row still carries it, so preserve the
 /// translation row as-is but backfill the missing stable ID from the transcript
 /// metadata for HGVS emission.
-fn translation_for_hgvsp(
+fn translation_for_hgvsp<'a>(
     tx: &TranscriptFeature,
-    translation: &TranslationFeature,
-) -> TranslationFeature {
+    translation: &'a TranslationFeature,
+) -> Cow<'a, TranslationFeature> {
     if translation.stable_id.is_some() || tx.translation_stable_id.is_none() {
-        return translation.clone();
+        return Cow::Borrowed(translation);
     }
     let mut out = translation.clone();
     out.stable_id = tx.translation_stable_id.clone();
-    out
+    Cow::Owned(out)
 }
 
 /// VEP's `_snp_start_altered` / `start_retained_variant` test: the mutated
@@ -5997,7 +6001,7 @@ struct CodingClassification {
     /// 1-based protein end position.
     protein_position_end: Option<usize>,
     /// Peptide-context HGVS input used to replay Ensembl's protein formatter.
-    protein_hgvs: Option<crate::hgvs::ProteinHgvsData>,
+    protein_hgvs: Option<EngineProteinHgvsData>,
     /// VEP `_get_peptide_alleles()` reference peptide for the affected local
     /// codon window. Kept separately from the display `Amino_acids` value
     /// because the release-116 stop predicates inspect this exact peptide.
@@ -6629,7 +6633,8 @@ fn build_protein_hgvs_data(
     frameshift: bool,
     translation: Option<&TranslationFeature>,
     semantics: crate::vep_semantics::VepSemantics,
-) -> Option<crate::hgvs::ProteinHgvsData> {
+    substitution: Option<HgvsSubstitutionSource<'_>>,
+) -> Option<EngineProteinHgvsData> {
     let raw_start = class.protein_position_start?;
     let raw_end = class
         .protein_position_end
@@ -6663,17 +6668,29 @@ fn build_protein_hgvs_data(
     } else {
         (raw_start, raw_end)
     };
-    Some(crate::hgvs::ProteinHgvsData {
+    let (ref_translation, alt_translation) = substitution
+        .and_then(|source| {
+            source.memo.hgvs_substitution_sequences(
+                translation?,
+                source.reference,
+                new_aas,
+                source.codons,
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                canonical_ref_translation_for_hgvsp(tx, translation, old_aas.iter().collect())
+                    .into(),
+                new_aas.iter().collect::<String>().into(),
+            )
+        });
+    Some(EngineProteinHgvsData {
         start,
         end,
         ref_peptide,
         alt_peptide,
-        ref_translation: canonical_ref_translation_for_hgvsp(
-            tx,
-            translation,
-            old_aas.iter().collect(),
-        ),
-        alt_translation: new_aas.iter().collect(),
+        ref_translation,
+        alt_translation,
         alt_translation_extension: None,
         frameshift,
         start_lost: class.start_lost,
@@ -7400,7 +7417,7 @@ fn literal_indel_protein_hgvs_data(
     variant: &VariantInput,
     class: &CodingClassification,
     semantics: crate::vep_semantics::VepSemantics,
-) -> Option<crate::hgvs::ProteinHgvsData> {
+) -> Option<EngineProteinHgvsData> {
     let translation = tx_translation?;
     let cds_seq = reference_translateable_seq_for_hgvsp(tx, Some(translation))?;
     let ref_genomic = normalize_allele_seq(&variant.ref_allele);
@@ -7587,20 +7604,22 @@ fn literal_indel_protein_hgvs_data(
 
     let _ = (raw_start_idx, raw_end_idx); // traceability only
 
-    Some(crate::hgvs::ProteinHgvsData {
+    Some(EngineProteinHgvsData {
         start,
         end,
         ref_peptide,
         alt_peptide,
-        ref_translation: canonical_ref_translation_for_hgvsp(
+        ref_translation: (canonical_ref_translation_for_hgvsp(
             tx,
             Some(translation),
-            old_aas.iter().collect(),
-        ),
+            old_aas.iter().collect::<String>(),
+        ))
+        .into(),
         // `new_aas` translates only `mutated`; it cannot restore UTR bases
         // when VEP 116's empty-CDS trim makes the source helper return None.
-        alt_translation: translated_alt_protein_for_hgvs(tx, &mutated, semantics)
-            .unwrap_or_else(|| new_aas.iter().collect()),
+        alt_translation: (translated_alt_protein_for_hgvs(tx, &mutated, semantics)
+            .unwrap_or_else(|| new_aas.iter().collect::<String>()))
+        .into(),
         alt_translation_extension: alternate_translation_for_vep_hgvs(
             tx,
             tx_exons,
@@ -7639,9 +7658,9 @@ fn literal_shifted_indel_protein_hgvs_data(
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
     shift: &crate::hgvs::HgvsGenomicShift,
-    original: &crate::hgvs::ProteinHgvsData,
+    original: &EngineProteinHgvsData,
     semantics: crate::vep_semantics::VepSemantics,
-) -> Option<crate::hgvs::ProteinHgvsData> {
+) -> Option<EngineProteinHgvsData> {
     let translation = tx_translation?;
     let reference_cds_seq = reference_translateable_seq_for_hgvsp(tx, Some(translation))?;
     let leading_n_offset = reference_cds_seq
@@ -7775,27 +7794,29 @@ fn literal_shifted_indel_protein_hgvs_data(
         (raw_start, raw_end)
     };
 
-    Some(crate::hgvs::ProteinHgvsData {
+    Some(EngineProteinHgvsData {
         start,
         end,
         ref_peptide,
         alt_peptide,
-        ref_translation: canonical_ref_translation_for_hgvsp(
+        ref_translation: (canonical_ref_translation_for_hgvsp(
             tx,
             Some(translation),
             translate_protein_from_cds_in(tx.codon_table, reference_cds_seq.as_bytes())?
                 .iter()
-                .collect(),
-        ),
+                .collect::<String>(),
+        ))
+        .into(),
         // This fallback translates the alternate CDS alone, with no UTR
         // append, so it cannot undo VEP 116's trim-before-UTR result.
-        alt_translation: translated_alt_protein_for_hgvs(tx, alternate_seq.as_bytes(), semantics)
+        alt_translation: (translated_alt_protein_for_hgvs(tx, alternate_seq.as_bytes(), semantics)
             .unwrap_or_else(|| {
                 translate_protein_from_cds(alternate_seq.as_bytes())
                     .unwrap_or_default()
                     .into_iter()
-                    .collect()
-            }),
+                    .collect::<String>()
+            }))
+        .into(),
         alt_translation_extension: translated_alt_protein_for_hgvs(
             tx,
             alternate_seq.as_bytes(),
@@ -7811,9 +7832,9 @@ fn literal_shifted_indel_protein_hgvs_data(
 fn maybe_prefer_literal_shifted_refseq_insertion_candidate(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
-    shifted: Option<crate::hgvs::ProteinHgvsData>,
-    literal_shifted: Option<crate::hgvs::ProteinHgvsData>,
-) -> Option<crate::hgvs::ProteinHgvsData> {
+    shifted: Option<EngineProteinHgvsData>,
+    literal_shifted: Option<EngineProteinHgvsData>,
+) -> Option<EngineProteinHgvsData> {
     let (shifted, literal_shifted, translation) = match (shifted, literal_shifted, translation) {
         (Some(shifted), Some(literal_shifted), Some(translation)) => {
             (shifted, literal_shifted, translation)
@@ -7822,8 +7843,9 @@ fn maybe_prefer_literal_shifted_refseq_insertion_candidate(
     };
 
     let translation = translation_for_hgvsp(tx, translation);
-    let shifted_hgvsp = crate::hgvs::format_hgvsp(&translation, &shifted, true);
-    let literal_hgvsp = crate::hgvs::format_hgvsp(&translation, &literal_shifted, true);
+    let shifted_hgvsp = crate::hgvs::format_hgvsp_with_sequences(&translation, &shifted, true);
+    let literal_hgvsp =
+        crate::hgvs::format_hgvsp_with_sequences(&translation, &literal_shifted, true);
     let shifted_is_dup = shifted_hgvsp
         .as_deref()
         .is_some_and(|value| value.ends_with("dup"));
@@ -8425,12 +8447,12 @@ fn shifted_tva_protein_hgvs_data(
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
     shift: &crate::hgvs::HgvsGenomicShift,
-    fallback: Option<&crate::hgvs::ProteinHgvsData>,
+    fallback: Option<&EngineProteinHgvsData>,
     source_stop_retained: bool,
     source_partial_codon: Option<bool>,
     source_ref_peptide: Option<&str>,
     semantics: crate::vep_semantics::VepSemantics,
-) -> Option<crate::hgvs::ProteinHgvsData> {
+) -> Option<EngineProteinHgvsData> {
     let translation = tx_translation?;
     let reference_cds_seq = reference_translateable_seq_for_hgvsp(tx, Some(translation))?;
     let shifted_variant =
@@ -8502,18 +8524,19 @@ fn shifted_tva_protein_hgvs_data(
         alt_allele_len,
         semantics,
     );
-    let protein = crate::hgvs::ProteinHgvsData {
+    let protein = EngineProteinHgvsData {
         start: window_protein_start,
         end: window_protein_end,
         ref_peptide,
         alt_peptide,
-        ref_translation,
-        alt_translation: alt_translation.unwrap_or_else(|| {
+        ref_translation: ref_translation.into(),
+        alt_translation: (alt_translation.unwrap_or_else(|| {
             translate_protein_from_cds(alt_cds.as_bytes())
                 .unwrap_or_default()
                 .into_iter()
-                .collect()
-        }),
+                .collect::<String>()
+        }))
+        .into(),
         alt_translation_extension: translated_alt_protein_for_hgvs(
             tx,
             alt_cds.as_bytes(),
@@ -8554,7 +8577,7 @@ fn shifted_hgvsp_frameshift(
 }
 
 fn shifted_hgvsp_frameshift_for_output(
-    fallback: Option<&crate::hgvs::ProteinHgvsData>,
+    fallback: Option<&EngineProteinHgvsData>,
     source_stop_retained: bool,
     source_partial_codon: Option<bool>,
     source_ref_peptide: Option<&str>,
@@ -8842,6 +8865,7 @@ fn refseq_transcript_shift_for_hgvs_protein(
 ///   HGVS is derived from the HGVS-shifted indel state rather than the
 ///   original unshifted consequence state
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1626-L1749>
+#[cfg(test)]
 fn protein_hgvs_for_output(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -8849,9 +8873,9 @@ fn protein_hgvs_for_output(
     variant: &VariantInput,
     pre_allows_protein_hgvs: bool,
     original_protein_bounds: Option<(usize, usize)>,
-    fallback: Option<&crate::hgvs::ProteinHgvsData>,
+    fallback: Option<&EngineProteinHgvsData>,
     shift_hgvs: bool,
-) -> Option<crate::hgvs::ProteinHgvsData> {
+) -> Option<EngineProteinHgvsData> {
     protein_hgvs_for_output_with_semantics(
         tx,
         tx_exons,
@@ -8886,6 +8910,7 @@ fn hgvsp_translation_bounds_are_truthy(
         .is_some()
 }
 
+#[cfg(test)]
 fn protein_hgvs_for_output_with_semantics(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -8893,13 +8918,43 @@ fn protein_hgvs_for_output_with_semantics(
     variant: &VariantInput,
     pre_allows_protein_hgvs: bool,
     original_protein_bounds: Option<(usize, usize)>,
-    fallback: Option<&crate::hgvs::ProteinHgvsData>,
+    fallback: Option<&EngineProteinHgvsData>,
     source_stop_retained: bool,
     source_partial_codon: Option<bool>,
     source_ref_peptide: Option<&str>,
     semantics: crate::vep_semantics::VepSemantics,
     shift_hgvs: bool,
-) -> Option<crate::hgvs::ProteinHgvsData> {
+) -> Option<EngineProteinHgvsData> {
+    protein_hgvs_for_output_owned_with_semantics(
+        tx,
+        tx_exons,
+        tx_translation,
+        variant,
+        pre_allows_protein_hgvs,
+        original_protein_bounds,
+        fallback.cloned(),
+        source_stop_retained,
+        source_partial_codon,
+        source_ref_peptide,
+        semantics,
+        shift_hgvs,
+    )
+}
+
+fn protein_hgvs_for_output_owned_with_semantics(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+    pre_allows_protein_hgvs: bool,
+    original_protein_bounds: Option<(usize, usize)>,
+    fallback: Option<EngineProteinHgvsData>,
+    source_stop_retained: bool,
+    source_partial_codon: Option<bool>,
+    source_ref_peptide: Option<&str>,
+    semantics: crate::vep_semantics::VepSemantics,
+    shift_hgvs: bool,
+) -> Option<EngineProteinHgvsData> {
     // Ensembl Variation 116's hgvs_protein() returns undef for an ALT outside
     // /^[ACGT-]+$/i, before either the unshifted or shifted formatting path.
     if semantics.vep116_stop_predicates()
@@ -8943,7 +8998,7 @@ fn protein_hgvs_for_output_with_semantics(
         {
             return None;
         }
-        return fallback.cloned();
+        return fallback;
     }
 
     let ref_norm = normalize_allele_seq(&variant.ref_allele);
@@ -9005,7 +9060,7 @@ fn protein_hgvs_for_output_with_semantics(
     }
 
     let Some(shift) = shift.as_ref() else {
-        return fallback.cloned();
+        return fallback;
     };
 
     // vepyr#226. VEP's only "outside the translated region" test is the
@@ -9035,8 +9090,7 @@ fn protein_hgvs_for_output_with_semantics(
         //   Otherwise HGVS protein uses the original TVA peptide state and the
         //   original `translation_start/end` window.
         //   https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1774-L1805
-        return fallback.map(|protein| {
-            let mut protein = protein.clone();
+        return fallback.map(|mut protein| {
             // Ensembl initializes HGVS protein start/end from the mapper
             // before clipping peptides. With ALT `-`, `_clip_alleles()` has
             // no common peptide prefix or suffix to remove, so deletions
@@ -9056,7 +9110,7 @@ fn protein_hgvs_for_output_with_semantics(
         });
     }
     if ref_norm.len() == alt_norm.len() {
-        return fallback.cloned();
+        return fallback;
     }
 
     let shifted = shifted_tva_protein_hgvs_data(
@@ -9065,7 +9119,7 @@ fn protein_hgvs_for_output_with_semantics(
         tx_translation,
         variant,
         shift,
-        fallback,
+        fallback.as_ref(),
         source_stop_retained,
         source_partial_codon,
         source_ref_peptide,
@@ -9115,7 +9169,7 @@ fn protein_hgvs_for_output_with_semantics(
     if is_insertion && refseq_uses_transcript_shift_for_hgvsp(tx) {
         let shifted_variant =
             protein_hgvs_shifted_variant_for_reference(tx, tx_translation, variant, shift);
-        let literal_shifted = fallback.and_then(|original| {
+        let literal_shifted = fallback.as_ref().and_then(|original| {
             literal_shifted_indel_protein_hgvs_data(
                 tx,
                 tx_exons,
@@ -9235,14 +9289,14 @@ fn protein_hgvs_for_output_with_semantics(
     });
     if semantics.vep116_stop_predicates()
         && !source_terminal_frameshift_deletion
-        && fallback.is_some_and(|protein| {
+        && fallback.as_ref().is_some_and(|protein| {
             protein.ref_peptide.contains('*') && protein.alt_peptide.contains('X')
         })
     {
-        return fallback.cloned();
+        return fallback;
     }
 
-    shifted_preferred.or_else(|| fallback.cloned())
+    shifted_preferred.or(fallback)
 }
 
 /// Traceability:
@@ -9408,9 +9462,9 @@ fn rotate_hgvs_protein_allele(allele: &str, shift_length: usize, strand: i8) -> 
 /// VEP's end state is equality on that window (e.g. `p.GluGlu25=`) rather than
 /// duplication. This is only used for shifted RefSeq insertions.
 fn refseq_shifted_insertion_equal_window(
-    class_protein: &crate::hgvs::ProteinHgvsData,
-    window_protein: &crate::hgvs::ProteinHgvsData,
-) -> Option<crate::hgvs::ProteinHgvsData> {
+    class_protein: &EngineProteinHgvsData,
+    window_protein: &EngineProteinHgvsData,
+) -> Option<EngineProteinHgvsData> {
     if class_protein.frameshift
         || class_protein.start_lost
         || class_protein.stop_lost
@@ -9438,7 +9492,7 @@ fn refseq_shifted_insertion_equal_window(
             .get(upstream_start.checked_sub(1)?..upstream_end)?
             .to_string();
         if upstream_ref == class_protein.alt_peptide {
-            return Some(crate::hgvs::ProteinHgvsData {
+            return Some(EngineProteinHgvsData {
                 start: upstream_start,
                 end: upstream_end,
                 ref_peptide: upstream_ref.clone(),
@@ -9453,7 +9507,7 @@ fn refseq_shifted_insertion_equal_window(
             });
         }
     }
-    Some(crate::hgvs::ProteinHgvsData {
+    Some(EngineProteinHgvsData {
         start: window_protein.start,
         end: window_protein.end,
         ref_peptide: window_protein.ref_peptide.clone(),
@@ -10585,6 +10639,22 @@ fn classify_coding_change_with_spliced_span_cached(
         frameshift,
         Some(translation),
         semantics,
+        if local_substitution
+            && !frameshift
+            && !class.start_lost
+            && !class.stop_lost
+            && !bam_edit_succeeded(tx)
+        {
+            reference_memo
+                .zip(reusable)
+                .map(|(memo, reference)| HgvsSubstitutionSource {
+                    memo,
+                    reference,
+                    codons: start_idx / 3..end_idx / 3 + 1,
+                })
+        } else {
+            None
+        },
     );
     if let Some(protein_hgvs) = class.protein_hgvs.as_mut() {
         protein_hgvs.alt_translation_extension = preferred_hgvs_alt_translation;
@@ -10596,17 +10666,18 @@ fn classify_coding_change_with_spliced_span_cached(
         && old_aas[first_codon] == '*'
         && hgvs_new_aas[first_codon] == '*'
     {
-        class.protein_hgvs = Some(crate::hgvs::ProteinHgvsData {
+        class.protein_hgvs = Some(EngineProteinHgvsData {
             start: first_codon + 1,
             end: first_codon + 1,
             ref_peptide: "*".to_string(),
             alt_peptide: "*".to_string(),
-            ref_translation: canonical_ref_translation_for_hgvsp(
+            ref_translation: (canonical_ref_translation_for_hgvsp(
                 tx,
                 Some(translation),
-                old_aas.iter().collect(),
-            ),
-            alt_translation: hgvs_new_aas.iter().collect(),
+                old_aas.iter().collect::<String>(),
+            ))
+            .into(),
+            alt_translation: (hgvs_new_aas.iter().collect::<String>()).into(),
             alt_translation_extension: alternate_translation_for_vep_hgvs(
                 tx,
                 tx_exons,
@@ -11513,6 +11584,7 @@ fn classify_insertion_with_semantics_and_gap(
         frameshift,
         tx_translation,
         semantics,
+        None,
     );
     if let Some(protein_hgvs) = class.protein_hgvs.as_mut() {
         protein_hgvs.alt_translation_extension = preferred_hgvs_alt_translation;
@@ -14995,6 +15067,419 @@ mod tests {
         }
     }
 
+    fn shared_hgvs_fixture() -> (TranscriptFeature, TranslationFeature, ExonFeature) {
+        let cds = format!("ATG{}TGA{}TAA", "GCT".repeat(300), "GCT".repeat(300));
+        let end = 100 + cds.len() as i64 - 1;
+        let mut transcript = tx(
+            "overlay",
+            "2",
+            100,
+            end,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(end),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        let mut translation = translation("overlay", Some(cds.len()), None, None, Some(&cds));
+        translation.stable_id = Some("ENSP_OVERLAY".to_string());
+        translation.version = Some(1);
+        (transcript, translation, exon("overlay", 1, 100, end))
+    }
+
+    #[test]
+    fn hgvs_substitution_overlay_is_lazy_exact_and_keeps_its_budget_lease() {
+        for table in [CodonTable::Standard, CodonTable::VertebrateMitochondrial] {
+            for strand in [1, -1] {
+                for semantics in [
+                    crate::vep_semantics::VepSemantics::V115,
+                    crate::vep_semantics::VepSemantics::V116,
+                ] {
+                    let (mut transcript, translation, exon) = shared_hgvs_fixture();
+                    transcript.codon_table = table;
+                    transcript.strand = strand;
+                    let variant = if strand == 1 {
+                        var("2", 105, 106, "TG", "AA")
+                    } else {
+                        var("2", transcript.end - 6, transcript.end - 5, "CA", "TT")
+                    };
+                    let budget = crate::cache_budget::CacheBudget::new(1024 * 1024);
+                    let memo = ReferenceMemo::new(Arc::clone(&budget));
+                    let actual = classify_coding_change_with_spliced_span_cached(
+                        &transcript,
+                        &[&exon],
+                        Some(&translation),
+                        &variant,
+                        semantics,
+                        None,
+                        Some(&memo),
+                    )
+                    .unwrap();
+                    let control = classify_coding_change_with_semantics(
+                        &transcript,
+                        &[&exon],
+                        Some(&translation),
+                        &variant,
+                        semantics,
+                    )
+                    .unwrap();
+                    let actual = actual.protein_hgvs.unwrap();
+                    let control = control.protein_hgvs.unwrap();
+                    assert_eq!(actual.alt_translation.deferred_window(), Some((2, false)));
+                    let original_bounds = Some((actual.start, actual.end));
+                    let actual = protein_hgvs_for_output_owned_with_semantics(
+                        &transcript,
+                        &[&exon],
+                        Some(&translation),
+                        &variant,
+                        true,
+                        original_bounds,
+                        Some(actual),
+                        false,
+                        None,
+                        Some("AA"),
+                        semantics,
+                        true,
+                    )
+                    .unwrap();
+                    let expected =
+                        crate::hgvs::format_hgvsp_with_sequences(&translation, &control, true);
+                    assert!(
+                        expected.is_some(),
+                        "fixture must produce an HGVS protein annotation"
+                    );
+                    assert_eq!(
+                        crate::hgvs::format_hgvsp_with_sequences(&translation, &actual, true),
+                        expected
+                    );
+                    assert_eq!(
+                        actual.alt_translation.deferred_window(),
+                        Some((2, false)),
+                        "ordinary output selection and formatting must not materialize the alternate protein"
+                    );
+                    let charged = budget.used();
+                    assert!(charged > 0 && charged <= budget.limit());
+                    drop(memo);
+                    assert_eq!(
+                        budget.used(),
+                        charged,
+                        "payload retains both underlying reference charges"
+                    );
+                    assert_eq!(actual.ref_translation, control.ref_translation);
+                    assert_eq!(
+                        actual.alt_translation, control.alt_translation,
+                        "reconstruct the complete protein including internal and terminal stops"
+                    );
+                    assert_eq!(actual.alt_translation.deferred_window(), Some((2, true)));
+                    drop(actual);
+                    assert_eq!(budget.used(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hgvs_canonical_text_admission_failure_preserves_the_owned_fallback() {
+        let (transcript, translation, exon) = shared_hgvs_fixture();
+        let probe_budget = crate::cache_budget::CacheBudget::new(1024 * 1024);
+        let probe = ReferenceMemo::new(Arc::clone(&probe_budget));
+        assert!(matches!(
+            probe.get(&transcript, &translation),
+            ReferenceEntry::Ready(_)
+        ));
+        let base_charge = probe_budget.used();
+        drop(probe);
+        assert_eq!(probe_budget.used(), 0);
+        let budget = crate::cache_budget::CacheBudget::new(base_charge);
+        let memo = ReferenceMemo::new(Arc::clone(&budget));
+        let variant = var("2", 103, 103, "G", "A");
+        let actual = classify_coding_change_with_spliced_span_cached(
+            &transcript,
+            &[&exon],
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+            None,
+            Some(&memo),
+        )
+        .unwrap();
+        let control = classify_coding_change_with_semantics(
+            &transcript,
+            &[&exon],
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        )
+        .unwrap();
+        assert_eq!(
+            actual
+                .protein_hgvs
+                .as_ref()
+                .unwrap()
+                .alt_translation
+                .deferred_window(),
+            None
+        );
+        assert_eq!(format!("{actual:?}"), format!("{control:?}"));
+        assert_eq!(budget.peak(), base_charge);
+        drop(memo);
+        assert_eq!(budget.used(), 0, "owned fallback does not pin a reference");
+    }
+
+    #[test]
+    fn hgvs_shared_representation_keeps_complex_cases_on_the_owned_path() {
+        for case in [
+            "bam-ok",
+            "bam-failed",
+            "rna-edit",
+            "translation-edit",
+            "ambiguous",
+            "deletion",
+            "insertion",
+            "partial-cds",
+            "start-loss",
+            "stop-loss",
+        ] {
+            let (mut transcript, mut translation, exon) = shared_hgvs_fixture();
+            // Keep a single terminal stop for the stop-loss fallback control.
+            for sequence in translation
+                .cds_sequence
+                .iter_mut()
+                .chain(translation.cds_sequence_canonical.iter_mut())
+            {
+                *sequence = sequence.replace("TGA", "GCT");
+            }
+            let mut variant = var("2", 103, 103, "G", "A");
+            match case {
+                "bam-ok" => transcript.bam_edit_status = Some("ok".to_string()),
+                "bam-failed" => transcript.bam_edit_status = Some("failed".to_string()),
+                "rna-edit" => transcript.has_rna_edit = true,
+                "translation-edit" => transcript.translation_seq_edits.push(TranslationSeqEdit {
+                    code: "amino_acid_sub".to_string(),
+                    start: 2,
+                    end: 2,
+                    alt_seq: "A".to_string(),
+                }),
+                "ambiguous" => variant = var("2", 103, 103, "G", "N"),
+                "deletion" => variant = var("2", 103, 103, "G", "-"),
+                "insertion" => variant = var("2", 103, 102, "-", "G"),
+                "partial-cds" => {
+                    translation.cds_sequence.as_mut().unwrap().pop();
+                    translation.cds_sequence_canonical.as_mut().unwrap().pop();
+                }
+                "start-loss" => variant = var("2", 100, 100, "A", "C"),
+                "stop-loss" => variant = var("2", transcript.end - 2, transcript.end - 2, "T", "C"),
+                _ => unreachable!(),
+            }
+            let memo = ReferenceMemo::new(crate::cache_budget::CacheBudget::new(1024 * 1024));
+            let actual = classify_coding_change_with_spliced_span_cached(
+                &transcript,
+                &[&exon],
+                Some(&translation),
+                &variant,
+                crate::vep_semantics::VepSemantics::V116,
+                None,
+                Some(&memo),
+            );
+            let control = classify_coding_change_with_semantics(
+                &transcript,
+                &[&exon],
+                Some(&translation),
+                &variant,
+                crate::vep_semantics::VepSemantics::V116,
+            );
+            assert!(
+                actual.is_some(),
+                "{case} must exercise a coding classification"
+            );
+            if let Some(protein) = actual
+                .as_ref()
+                .and_then(|class| class.protein_hgvs.as_ref())
+            {
+                assert_eq!(protein.alt_translation.deferred_window(), None, "{case}");
+            }
+            assert_eq!(format!("{actual:?}"), format!("{control:?}"), "{case}");
+        }
+    }
+
+    #[test]
+    fn protein_hgvs_reuses_canonical_reference_across_substitutions() {
+        let cds = format!("ATG{}TAA", "GCT".repeat(10_000));
+        let end = 100 + cds.len() as i64 - 1;
+        let mut transcript = tx(
+            "shared",
+            "2",
+            100,
+            end,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(end),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        let exon = exon("shared", 1, 100, end);
+        let mut translation = translation("shared", Some(cds.len()), None, None, Some(&cds));
+        // HGVS canonical and consequence peptides deliberately differ.
+        translation.translation_seq_canonical = Some(format!("M{}", "S".repeat(10_000)));
+        translation.stable_id = Some("ENSP_SHARED".to_string());
+        translation.version = Some(1);
+        let budget = crate::cache_budget::CacheBudget::new(1024 * 1024);
+        let memo = ReferenceMemo::new(Arc::clone(&budget));
+        let mut payloads = Vec::new();
+        for offset in [3, 15_003] {
+            let variant = var("2", 100 + offset, 100 + offset, "G", "A");
+            let actual = classify_coding_change_with_spliced_span_cached(
+                &transcript,
+                &[&exon],
+                Some(&translation),
+                &variant,
+                crate::vep_semantics::VepSemantics::V116,
+                None,
+                Some(&memo),
+            )
+            .unwrap();
+            let control = classify_coding_change_with_semantics(
+                &transcript,
+                &[&exon],
+                Some(&translation),
+                &variant,
+                crate::vep_semantics::VepSemantics::V116,
+            )
+            .unwrap();
+            let actual = actual.protein_hgvs.unwrap();
+            let control = control.protein_hgvs.unwrap();
+            assert_eq!(
+                actual.ref_translation.as_str(),
+                translation.translation_seq_canonical.as_deref().unwrap()
+            );
+            assert_eq!(
+                crate::hgvs::format_hgvsp_with_sequences(&translation, &actual, true),
+                crate::hgvs::format_hgvsp_with_sequences(&translation, &control, true)
+            );
+            assert_eq!(
+                crate::hgvs::format_hgvsp_with_sequences(&translation, &actual, true),
+                Some(format!("ENSP_SHARED.1:p.Ala{}Thr", offset / 3 + 1))
+            );
+            payloads.push(actual);
+        }
+        assert_eq!(
+            payloads[0].ref_translation.as_ptr(),
+            payloads[1].ref_translation.as_ptr(),
+            "canonical HGVS reference must share one allocation across variants"
+        );
+    }
+
+    #[test]
+    fn protein_hgvs_output_reuses_owned_translation_allocations() {
+        let cds = format!("ATG{}TAA", "GCT".repeat(10_000));
+        let reference = format!("M{}*", "A".repeat(10_000));
+        let alternate = format!("MT{}*", "A".repeat(9_999));
+        let end = 100 + cds.len() as i64 - 1;
+        let mut transcript = tx(
+            "copy",
+            "2",
+            100,
+            end,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(end),
+        );
+        transcript.cdna_coding_start = Some(1);
+        transcript.cdna_coding_end = Some(cds.len());
+        let exon = exon("copy", 1, 100, end);
+        let exons = [&exon];
+        let mut translation = translation(
+            "copy",
+            Some(cds.len()),
+            Some(reference.len()),
+            Some(&reference),
+            Some(&cds),
+        );
+        translation.stable_id = Some("ENSP_COPY".to_string());
+        translation.version = Some(1);
+
+        for semantics in [
+            crate::vep_semantics::VepSemantics::V115,
+            crate::vep_semantics::VepSemantics::V116,
+        ] {
+            for (label, shift_hgvs, zero_shift) in [
+                ("disabled", false, false),
+                ("no-existing-shift", true, false),
+                ("zero-shift", true, true),
+            ] {
+                let mut variant = var("2", 103, 103, "G", "A");
+                if zero_shift {
+                    variant.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+                        strand: 1,
+                        shift_length: 0,
+                        start: 103,
+                        end: 103,
+                        shifted_allele_string: "A".to_string(),
+                        shifted_compare_allele: "G".to_string(),
+                        shifted_output_allele: "A".to_string(),
+                        ref_orig_allele_string: "G".to_string(),
+                        alt_orig_allele_string: "A".to_string(),
+                        five_prime_flanking_seq: String::new(),
+                        three_prime_flanking_seq: String::new(),
+                        five_prime_context: String::new(),
+                        three_prime_context: String::new(),
+                    });
+                }
+                let fallback = EngineProteinHgvsData {
+                    start: 2,
+                    end: 2,
+                    ref_peptide: "A".to_string(),
+                    alt_peptide: "T".to_string(),
+                    ref_translation: (reference.clone()).into(),
+                    alt_translation: (alternate.clone()).into(),
+                    alt_translation_extension: None,
+                    frameshift: false,
+                    start_lost: false,
+                    stop_lost: false,
+                    native_refseq: false,
+                };
+                let expected = fallback.clone();
+                let reference_allocation = fallback.ref_translation.as_ptr();
+                let alternate_allocation = fallback.alt_translation.as_ptr();
+                let actual = protein_hgvs_for_output_owned_with_semantics(
+                    &transcript,
+                    &exons,
+                    Some(&translation),
+                    &variant,
+                    true,
+                    Some((2, 2)),
+                    Some(fallback),
+                    false,
+                    None,
+                    Some("A"),
+                    semantics,
+                    shift_hgvs,
+                )
+                .expect("valid coding substitution keeps HGVSp");
+                assert_eq!(actual, expected, "{label}");
+                assert_eq!(
+                    crate::hgvs::format_hgvsp_with_sequences(&translation, &actual, shift_hgvs)
+                        .as_deref(),
+                    Some("ENSP_COPY.1:p.Ala2Thr"),
+                    "{label}",
+                );
+                assert_eq!(
+                    actual.ref_translation.as_ptr(),
+                    reference_allocation,
+                    "{label}: reference translation must move without another allocation"
+                );
+                assert_eq!(
+                    actual.alt_translation.as_ptr(),
+                    alternate_allocation,
+                    "{label}: alternate translation must move without another allocation"
+                );
+            }
+        }
+    }
+
     #[test]
     fn production_reference_defaults_reuse_long_cds_across_prepared_contexts() {
         use crate::cache_budget::{CacheBudget, reference_cache_default_mb};
@@ -15415,13 +15900,13 @@ mod tests {
             Some("ATGAAATAA"),
         );
         let variant = var("22", 103, 103, "G", "A");
-        let fallback = crate::hgvs::ProteinHgvsData {
+        let fallback = EngineProteinHgvsData {
             start: 2,
             end: 2,
             ref_peptide: "K".to_string(),
             alt_peptide: "Q".to_string(),
-            ref_translation: "MK*".to_string(),
-            alt_translation: "MQ*".to_string(),
+            ref_translation: ("MK*".to_string()).into(),
+            alt_translation: ("MQ*".to_string()).into(),
             alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
@@ -18420,6 +18905,41 @@ mod tests {
     }
 
     #[test]
+    fn hgvs_translation_metadata_reuses_unchanged_sequences_and_preserves_id_fallback() {
+        let (mut transcript, mut translation, _) = shared_hgvs_fixture();
+        for stable_id in [Some("ENSP_ORIGINAL"), None] {
+            translation.stable_id = stable_id.map(str::to_owned);
+            transcript.translation_stable_id = None;
+            let cds_allocation = translation.cds_sequence.as_ref().unwrap().as_ptr();
+            let effective = translation_for_hgvsp(&transcript, &translation);
+            assert_eq!(format!("{effective:?}"), format!("{translation:?}"));
+            assert_eq!(
+                effective.cds_sequence.as_ref().unwrap().as_ptr(),
+                cds_allocation,
+                "unchanged HGVS metadata must borrow the original sequence allocation"
+            );
+        }
+        transcript.translation_stable_id = Some("ENSP_FALLBACK".to_owned());
+        translation.version = Some(7);
+        let effective = translation_for_hgvsp(&transcript, &translation);
+        let mut expected = translation.clone();
+        expected.stable_id = transcript.translation_stable_id.clone();
+        assert_eq!(format!("{effective:?}"), format!("{expected:?}"));
+        assert_eq!(effective.version, Some(7));
+        assert!(
+            translation.stable_id.is_none(),
+            "backfilling must not mutate the cached source"
+        );
+        translation.stable_id = Some("ENSP_ORIGINAL".to_owned());
+        let effective = translation_for_hgvsp(&transcript, &translation);
+        assert_eq!(effective.stable_id.as_deref(), Some("ENSP_ORIGINAL"));
+        assert_eq!(
+            effective.cds_sequence.as_ref().unwrap().as_ptr(),
+            translation.cds_sequence.as_ref().unwrap().as_ptr()
+        );
+    }
+
+    #[test]
     fn translation_for_hgvsp_falls_back_to_transcript_stable_id() {
         let mut transcript = tx(
             "ENSTTEST0001",
@@ -18566,7 +19086,7 @@ mod tests {
         // so both ref and alt are set to "EE" → p.GluGlu25= (matching VEP).
         assert_eq!(protein.ref_peptide, "EE");
         assert_eq!(protein.alt_peptide, "EE");
-        let formatted = crate::hgvs::format_hgvsp(
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(
             &translation_for_hgvsp(&transcript, &translation),
             &protein,
             true,
@@ -18963,7 +19483,7 @@ mod tests {
             true,
         )
         .expect("shifted protein hgvs");
-        let formatted = crate::hgvs::format_hgvsp(
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(
             &translation_for_hgvsp(&transcript, &translation),
             &protein,
             true,
@@ -19109,7 +19629,7 @@ mod tests {
         )
         .expect("boundary insertion protein HGVS");
         assert_eq!(
-            crate::hgvs::format_hgvsp(
+            crate::hgvs::format_hgvsp_with_sequences(
                 &translation_for_hgvsp(&boundary_transcript, &boundary_translation),
                 &boundary_protein,
                 true,
@@ -19154,7 +19674,7 @@ mod tests {
         )
         .expect("legacy edited-mapper protein HGVS");
         assert_eq!(
-            crate::hgvs::format_hgvsp(
+            crate::hgvs::format_hgvsp_with_sequences(
                 &translation_for_hgvsp(&legacy, &translation),
                 &legacy_protein,
                 true
@@ -19256,20 +19776,20 @@ mod tests {
 
     #[test]
     fn refseq_shifted_insertion_equal_window_prefers_upstream_repeat_block() {
-        let class_protein = crate::hgvs::ProteinHgvsData {
+        let class_protein = EngineProteinHgvsData {
             start: 27,
             end: 27,
             ref_peptide: "E".to_string(),
             alt_peptide: "EE".to_string(),
-            ref_translation: format!("M{}", "E".repeat(40)),
-            alt_translation: format!("M{}", "E".repeat(41)),
+            ref_translation: (format!("M{}", "E".repeat(40))).into(),
+            alt_translation: (format!("M{}", "E".repeat(41))).into(),
             alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
             native_refseq: true,
         };
-        let window_protein = crate::hgvs::ProteinHgvsData {
+        let window_protein = EngineProteinHgvsData {
             start: 26,
             end: 27,
             ref_peptide: "EE".to_string(),
@@ -19314,26 +19834,26 @@ mod tests {
             Some("ATG"),
         );
 
-        let shifted_dup = crate::hgvs::ProteinHgvsData {
+        let shifted_dup = EngineProteinHgvsData {
             start: 41,
             end: 41,
             ref_peptide: "-".to_string(),
             alt_peptide: "QQQQQ".to_string(),
-            ref_translation: format!("{}QQQQQP*", "A".repeat(35)),
-            alt_translation: format!("{}QQQQQQQQQQP*", "A".repeat(35)),
+            ref_translation: (format!("{}QQQQQP*", "A".repeat(35))).into(),
+            alt_translation: (format!("{}QQQQQQQQQQP*", "A".repeat(35))).into(),
             alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
             native_refseq: true,
         };
-        let literal_delins = crate::hgvs::ProteinHgvsData {
+        let literal_delins = EngineProteinHgvsData {
             start: 39,
             end: 39,
             ref_peptide: "P".to_string(),
             alt_peptide: "QQQQ".to_string(),
-            ref_translation: format!("{}QQQQQP*", "A".repeat(35)),
-            alt_translation: format!("{}QQQQQQQQP*", "A".repeat(35)),
+            ref_translation: (format!("{}QQQQQP*", "A".repeat(35))).into(),
+            alt_translation: (format!("{}QQQQQQQQP*", "A".repeat(35))).into(),
             alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
@@ -19341,7 +19861,7 @@ mod tests {
             native_refseq: true,
         };
 
-        let formatted_shifted = crate::hgvs::format_hgvsp(
+        let formatted_shifted = crate::hgvs::format_hgvsp_with_sequences(
             &translation_for_hgvsp(&transcript, &translation),
             &shifted_dup,
             true,
@@ -19351,7 +19871,7 @@ mod tests {
             Some("NP_PREFSHIFT:p.Gln36_Gln40dup")
         );
 
-        let formatted_literal = crate::hgvs::format_hgvsp(
+        let formatted_literal = crate::hgvs::format_hgvsp_with_sequences(
             &translation_for_hgvsp(&transcript, &translation),
             &literal_delins,
             true,
@@ -19368,7 +19888,7 @@ mod tests {
             Some(literal_delins),
         )
         .expect("preferred candidate");
-        let formatted_preferred = crate::hgvs::format_hgvsp(
+        let formatted_preferred = crate::hgvs::format_hgvsp_with_sequences(
             &translation_for_hgvsp(&transcript, &translation),
             &preferred,
             true,
@@ -19404,13 +19924,14 @@ mod tests {
             Some("ATG"),
         );
 
-        let protein = crate::hgvs::ProteinHgvsData {
+        let protein = EngineProteinHgvsData {
             start: 37,
             end: 38,
             ref_peptide: "QQ".to_string(),
             alt_peptide: "-".to_string(),
-            ref_translation: format!("{}QQQQQQQQQQQQQQQQQQQQQQQPPPPPPPPPPP", "A".repeat(17)),
-            alt_translation: format!("{}QQQQQQQQQQQQQQQQQQQQQPPPPPPPPPPP", "A".repeat(17)),
+            ref_translation: (format!("{}QQQQQQQQQQQQQQQQQQQQQQQPPPPPPPPPPP", "A".repeat(17)))
+                .into(),
+            alt_translation: (format!("{}QQQQQQQQQQQQQQQQQQQQQPPPPPPPPPPP", "A".repeat(17))).into(),
             alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
@@ -19418,7 +19939,7 @@ mod tests {
             native_refseq: true,
         };
 
-        let formatted = crate::hgvs::format_hgvsp(
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(
             &translation_for_hgvsp(&transcript, &translation),
             &protein,
             true,
@@ -23747,7 +24268,7 @@ mod tests {
         let formatted = class
             .protein_hgvs
             .as_ref()
-            .and_then(|data| crate::hgvs::format_hgvsp(&translation, data, false));
+            .and_then(|data| crate::hgvs::format_hgvsp_with_sequences(&translation, data, false));
         assert_eq!(formatted.as_deref(), Some("ENSPterminal.1:p.LysTer166="));
     }
 
@@ -23763,7 +24284,8 @@ mod tests {
         let protein_hgvs_data = class.protein_hgvs.as_ref().expect("protein HGVS data");
         assert_eq!(protein_hgvs_data.ref_peptide, "AAX");
         assert_eq!(protein_hgvs_data.alt_peptide, "X");
-        let formatted = crate::hgvs::format_hgvsp(&translation, protein_hgvs_data, false);
+        let formatted =
+            crate::hgvs::format_hgvsp_with_sequences(&translation, protein_hgvs_data, false);
         assert_eq!(
             formatted.as_deref(),
             Some("ENSPterminal.1:p.Ala143_Ala144del")
@@ -23773,10 +24295,9 @@ mod tests {
         // does not carry X into the peptide alleles.
         let (control, control_translation) =
             classify_incomplete_terminal_codon_variant(&cds, &protein, 1429, 1431, "GCT", "-");
-        let control_hgvsp = control
-            .protein_hgvs
-            .as_ref()
-            .and_then(|data| crate::hgvs::format_hgvsp(&control_translation, data, false));
+        let control_hgvsp = control.protein_hgvs.as_ref().and_then(|data| {
+            crate::hgvs::format_hgvsp_with_sequences(&control_translation, data, false)
+        });
         assert_eq!(control_hgvsp.as_deref(), Some("ENSPterminal.1:p.Ala144del"));
     }
 
@@ -23799,7 +24320,7 @@ mod tests {
         let formatted = class
             .protein_hgvs
             .as_ref()
-            .and_then(|data| crate::hgvs::format_hgvsp(&translation, data, false));
+            .and_then(|data| crate::hgvs::format_hgvsp_with_sequences(&translation, data, false));
         assert!(
             formatted.is_none(),
             "VEP's non-frameshift insertion path needs a right peptide flank; this synthetic insertion is past the terminal partial codon"
@@ -23890,7 +24411,7 @@ mod tests {
         assert!(protein_hgvs.ref_peptide.ends_with('X'));
         assert!(protein_hgvs.alt_peptide.ends_with('X'));
         assert!(
-            crate::hgvs::format_hgvsp(&translation, protein_hgvs, false).is_none(),
+            crate::hgvs::format_hgvsp_with_sequences(&translation, protein_hgvs, false).is_none(),
             "VEP's non-frameshift insertion path must preserve its missing-flank behavior"
         );
     }
@@ -25652,7 +26173,11 @@ mod tests {
         );
         assert_eq!(c.amino_acids.as_deref(), Some("R"));
         let protein = c.protein_hgvs.as_ref().expect("protein hgvs");
-        let formatted = crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), protein, true);
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(
+            &translation_for_hgvsp(&t, &tr),
+            protein,
+            true,
+        );
         assert_eq!(formatted.as_deref(), Some("NP_775871.2:p.Arg3="));
 
         let v116 = classify_coding_change_with_semantics(
@@ -25757,7 +26282,11 @@ mod tests {
         );
         assert_eq!(c.amino_acids.as_deref(), Some("G/E"));
         let protein = c.protein_hgvs.as_ref().expect("protein hgvs");
-        let formatted = crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), protein, true);
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(
+            &translation_for_hgvsp(&t, &tr),
+            protein,
+            true,
+        );
         assert_eq!(formatted.as_deref(), Some("NP_775871.2:p.Gly2Glu"));
     }
 
@@ -25801,7 +26330,11 @@ mod tests {
         );
         assert_eq!(c.amino_acids.as_deref(), Some("S"));
         let protein = c.protein_hgvs.as_ref().expect("protein hgvs");
-        let formatted = crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), protein, true);
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(
+            &translation_for_hgvsp(&t, &tr),
+            protein,
+            true,
+        );
         assert_eq!(formatted.as_deref(), Some("NP_775871.2:p.Ser2="));
     }
 
@@ -28675,13 +29208,14 @@ mod tests {
             false,
             Some(&tr),
             crate::vep_semantics::VepSemantics::V115,
+            None,
         )
         .expect("start_lost HGVSp payload");
 
         assert_eq!(data.ref_peptide, "ME");
         assert_eq!(data.alt_peptide, "-");
         assert_eq!(
-            crate::hgvs::format_hgvsp(&tr, &data, false).as_deref(),
+            crate::hgvs::format_hgvsp_with_sequences(&tr, &data, false).as_deref(),
             Some("ENSPSTARTDEL.1:p.MetGlu1_?2")
         );
     }
@@ -31594,7 +32128,7 @@ mod tests {
             crate::vep_semantics::VepSemantics::V115,
         )
         .expect("shifted protein hgvs");
-        let formatted = crate::hgvs::format_hgvsp(
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(
             &translation_for_hgvsp(&transcript, &translation),
             &protein,
             true,
@@ -31743,13 +32277,13 @@ mod tests {
             five_prime_context: String::new(),
             three_prime_context: String::new(),
         });
-        let fallback = crate::hgvs::ProteinHgvsData {
+        let fallback = EngineProteinHgvsData {
             start: 2,
             end: 39,
             ref_peptide: "S".to_string(),
             alt_peptide: "-".to_string(),
-            ref_translation: "MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN*".to_string(),
-            alt_translation: String::new(),
+            ref_translation: ("MSFVAGVIRRLDETVVNRIAAGEVIQRPANAIKEMIEN*".to_string()).into(),
+            alt_translation: (String::new()).into(),
             alt_translation_extension: None,
             frameshift: true,
             start_lost: true,
@@ -31774,7 +32308,7 @@ mod tests {
         .expect("VEP retains HGVSp for the coding start-lost deletion");
         assert_eq!((got.start, got.end), (1, 39));
         assert_eq!(
-            crate::hgvs::format_hgvsp(&translation, &got, true).as_deref(),
+            crate::hgvs::format_hgvsp_with_sequences(&translation, &got, true).as_deref(),
             Some("ENSP00000392649.1:p.Met1_?39")
         );
 
@@ -31795,7 +32329,7 @@ mod tests {
         .expect("VEP 115 also retains HGVSp for the coding start-lost deletion");
         assert_eq!((got_v115.start, got_v115.end), (1, 39));
         assert_eq!(
-            crate::hgvs::format_hgvsp(&translation, &got_v115, true).as_deref(),
+            crate::hgvs::format_hgvsp_with_sequences(&translation, &got_v115, true).as_deref(),
             Some("ENSP00000392649.1:p.Met1_?39")
         );
     }
@@ -31857,7 +32391,7 @@ mod tests {
         .expect("the deletion overlaps the translated start codon");
         let protein = class.protein_hgvs.as_ref().expect("HGVSp payload");
         assert_eq!(
-            crate::hgvs::format_hgvsp(&translation, protein, true).as_deref(),
+            crate::hgvs::format_hgvsp_with_sequences(&translation, protein, true).as_deref(),
             Some("ENSP00000392649.1:p.Met1_?39"),
             "classification={class:#?}"
         );
@@ -31903,13 +32437,13 @@ mod tests {
             five_prime_context: String::new(),
             three_prime_context: String::new(),
         });
-        let fallback = crate::hgvs::ProteinHgvsData {
+        let fallback = EngineProteinHgvsData {
             start: 2,
             end: 2,
             ref_peptide: "K".to_string(),
             alt_peptide: "-".to_string(),
-            ref_translation: "MK*".to_string(),
-            alt_translation: "M*".to_string(),
+            ref_translation: ("MK*".to_string()).into(),
+            alt_translation: ("M*".to_string()).into(),
             alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
@@ -32001,14 +32535,14 @@ mod tests {
         (t, exons, tr)
     }
 
-    fn star_star_fallback() -> crate::hgvs::ProteinHgvsData {
-        crate::hgvs::ProteinHgvsData {
+    fn star_star_fallback() -> EngineProteinHgvsData {
+        EngineProteinHgvsData {
             start: 20,
             end: 20,
             ref_peptide: "*".into(),
             alt_peptide: "*".into(),
-            ref_translation: format!("M{}*", "K".repeat(18)),
-            alt_translation: format!("M{}*", "K".repeat(18)),
+            ref_translation: (format!("M{}*", "K".repeat(18))).into(),
+            alt_translation: (format!("M{}*", "K".repeat(18))).into(),
             alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
@@ -32060,7 +32594,9 @@ mod tests {
             Some(&star_star_fallback()),
             true,
         )
-        .and_then(|p| crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), &p, true))
+        .and_then(|p| {
+            crate::hgvs::format_hgvsp_with_sequences(&translation_for_hgvsp(&t, &tr), &p, true)
+        })
     }
 
     /// vepyr#226 (a): `TA|G` + `A` keeps the stop (`TAAG`). VEP's guard is
@@ -32195,20 +32731,20 @@ mod tests {
             version: Some(4),
             protein_features: Vec::new(),
         };
-        let protein = crate::hgvs::ProteinHgvsData {
+        let protein = EngineProteinHgvsData {
             start: 31,
             end: 31,
             ref_peptide: "N".to_string(),
             alt_peptide: "K".to_string(),
-            ref_translation: format!("{}N{}", "A".repeat(30), "A".repeat(39)),
-            alt_translation: preferred.clone(),
+            ref_translation: (format!("{}N{}", "A".repeat(30), "A".repeat(39))).into(),
+            alt_translation: (preferred.clone()).into(),
             alt_translation_extension: chosen,
             frameshift: true,
             start_lost: false,
             stop_lost: false,
             native_refseq: false,
         };
-        let formatted = crate::hgvs::format_hgvsp(&translation, &protein, true);
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(&translation, &protein, true);
         assert_eq!(formatted.as_deref(), Some("NP_689716.4:p.Asn31LysfsTer10"));
     }
 
@@ -32263,20 +32799,20 @@ mod tests {
         .expect("alt translation");
         assert!(alt_translation.starts_with(&format!("{}KVPAAGPCL*", "A".repeat(30))));
 
-        let protein = crate::hgvs::ProteinHgvsData {
+        let protein = EngineProteinHgvsData {
             start: 31,
             end: 31,
             ref_peptide: "N".to_string(),
             alt_peptide: "K".to_string(),
-            ref_translation: ref_translation.clone(),
-            alt_translation: alt_translation.clone(),
+            ref_translation: (ref_translation.clone()).into(),
+            alt_translation: (alt_translation.clone()).into(),
             alt_translation_extension: Some(alt_translation),
             frameshift: true,
             start_lost: false,
             stop_lost: false,
             native_refseq: false,
         };
-        let formatted = crate::hgvs::format_hgvsp(&tr, &protein, true);
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(&tr, &protein, true);
         assert_eq!(formatted.as_deref(), Some("NP_689716.4:p.Asn31LysfsTer10"));
     }
 
@@ -32332,20 +32868,20 @@ mod tests {
         .expect("alt translation");
         assert_eq!(alt_translation.chars().nth(13), Some('C'));
 
-        let protein = crate::hgvs::ProteinHgvsData {
+        let protein = EngineProteinHgvsData {
             start: 14,
             end: 14,
             ref_peptide: "A".to_string(),
             alt_peptide: "C".to_string(),
-            ref_translation: ref_translation.clone(),
-            alt_translation: alt_translation.clone(),
+            ref_translation: (ref_translation.clone()).into(),
+            alt_translation: (alt_translation.clone()).into(),
             alt_translation_extension: Some(alt_translation),
             frameshift: true,
             start_lost: false,
             stop_lost: false,
             native_refseq: false,
         };
-        let formatted = crate::hgvs::format_hgvsp(&tr, &protein, true);
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(&tr, &protein, true);
         assert_eq!(
             formatted.as_deref(),
             Some("XP_005260665.1:p.Ala14CysfsTer17")
@@ -32490,7 +33026,11 @@ mod tests {
             true,
         )
         .expect("protein hgvs");
-        let formatted = crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), &protein, true);
+        let formatted = crate::hgvs::format_hgvsp_with_sequences(
+            &translation_for_hgvsp(&t, &tr),
+            &protein,
+            true,
+        );
         assert_eq!(
             formatted.as_deref(),
             Some("NP_002102.4:p.Pro39delinsGlnGlnGlnGln"),
@@ -32551,8 +33091,11 @@ mod tests {
             true,
         )
         .expect("single-CAG insertion protein HGVS");
-        let short_formatted =
-            crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), &short_protein, true);
+        let short_formatted = crate::hgvs::format_hgvsp_with_sequences(
+            &translation_for_hgvsp(&t, &tr),
+            &short_protein,
+            true,
+        );
         assert_eq!(
             short_formatted.as_deref(),
             Some("NP_002102.4:p.Pro39Gln"),
@@ -33003,13 +33546,13 @@ mod tests {
             Some("MPK*"),
             Some("ATGCCCAAATGA"),
         );
-        let fallback = crate::hgvs::ProteinHgvsData {
+        let fallback = EngineProteinHgvsData {
             start: 2,
             end: 2,
             ref_peptide: "P".to_string(),
             alt_peptide: "T".to_string(),
-            ref_translation: "MPK*".to_string(),
-            alt_translation: "MTQW*".to_string(),
+            ref_translation: ("MPK*".to_string()).into(),
+            alt_translation: ("MTQW*".to_string()).into(),
             alt_translation_extension: Some("MTQW*".to_string()),
             frameshift: true,
             start_lost: false,
@@ -33083,13 +33626,13 @@ mod tests {
             Some("MPK*"),
             Some("ATGCCCAAATGA"),
         );
-        let fallback = crate::hgvs::ProteinHgvsData {
+        let fallback = EngineProteinHgvsData {
             start: 4,
             end: 4,
             ref_peptide: "*".to_string(),
             alt_peptide: "X".to_string(),
-            ref_translation: "MPK*".to_string(),
-            alt_translation: "MPKX".to_string(),
+            ref_translation: ("MPK*".to_string()).into(),
+            alt_translation: ("MPKX".to_string()).into(),
             alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
@@ -33354,9 +33897,9 @@ mod tests {
             class.protein_hgvs.as_ref(),
             true,
         );
-        let formatted = protein
-            .as_ref()
-            .and_then(|p| crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), p, true));
+        let formatted = protein.as_ref().and_then(|p| {
+            crate::hgvs::format_hgvsp_with_sequences(&translation_for_hgvsp(&t, &tr), p, true)
+        });
         assert_eq!(formatted.as_deref(), Some("ENSP00000286063:p.Ser921dup"));
     }
 
@@ -33461,9 +34004,9 @@ mod tests {
             class.protein_hgvs.as_ref(),
             true,
         );
-        let formatted = protein
-            .as_ref()
-            .and_then(|p| crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), p, true));
+        let formatted = protein.as_ref().and_then(|p| {
+            crate::hgvs::format_hgvsp_with_sequences(&translation_for_hgvsp(&t, &tr), p, true)
+        });
         assert_eq!(
             formatted.as_deref(),
             Some("ENSP00000433814:p.Asn101LysfsTer95")
@@ -33577,9 +34120,9 @@ mod tests {
             class.protein_hgvs.as_ref(),
             true,
         );
-        let formatted = protein
-            .as_ref()
-            .and_then(|p| crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), p, true));
+        let formatted = protein.as_ref().and_then(|p| {
+            crate::hgvs::format_hgvsp_with_sequences(&translation_for_hgvsp(&t, &tr), p, true)
+        });
         assert_eq!(
             formatted.as_deref(),
             Some("ENSP00000294954:p.Leu17_Gln18dup")
@@ -38509,13 +39052,13 @@ mod tests {
             Some("MK*"),
             Some("ATGAAA"),
         );
-        let fallback = crate::hgvs::ProteinHgvsData {
+        let fallback = EngineProteinHgvsData {
             start: 1,
             end: 1,
             ref_peptide: "A".to_string(),
             alt_peptide: "T".to_string(),
-            ref_translation: "A".to_string(),
-            alt_translation: "T".to_string(),
+            ref_translation: ("A".to_string()).into(),
+            alt_translation: ("T".to_string()).into(),
             alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
@@ -40238,13 +40781,13 @@ mod tests {
 
         let ref_translation = format!("{}*", "A".repeat(44));
         let alt_translation = format!("{}M*", "A".repeat(44));
-        let protein = crate::hgvs::ProteinHgvsData {
+        let protein = EngineProteinHgvsData {
             start: 45,
             end: 45,
             ref_peptide: "*".to_string(),
             alt_peptide: "M".to_string(),
-            ref_translation,
-            alt_translation: alt_translation.clone(),
+            ref_translation: ref_translation.into(),
+            alt_translation: (alt_translation.clone()).into(),
             alt_translation_extension: Some(alt_translation),
             frameshift,
             start_lost: false,
@@ -40262,7 +40805,7 @@ mod tests {
         translation.version = Some(1);
 
         assert_eq!(
-            crate::hgvs::format_hgvsp(&translation, &protein, true).as_deref(),
+            crate::hgvs::format_hgvsp_with_sequences(&translation, &protein, true).as_deref(),
             Some("ENSP00000656242.1:p.Ter45MetfsTer2"),
             "ClinVar 5003617 golden HGVSp"
         );
@@ -40274,13 +40817,13 @@ mod tests {
         let semantics = crate::vep_semantics::VepSemantics::V116;
         let ref_translation = format!("{}*", "A".repeat(44));
         let alt_translation = format!("{}M*", "A".repeat(44));
-        let mut source_classification = crate::hgvs::ProteinHgvsData {
+        let mut source_classification = EngineProteinHgvsData {
             start: 45,
             end: 45,
             ref_peptide: "A".to_string(),
             alt_peptide: "A".to_string(),
-            ref_translation: ref_translation.clone(),
-            alt_translation: alt_translation.clone(),
+            ref_translation: (ref_translation.clone()).into(),
+            alt_translation: (alt_translation.clone()).into(),
             alt_translation_extension: Some(alt_translation),
             frameshift: false,
             start_lost: false,
@@ -40314,7 +40857,8 @@ mod tests {
         translation.version = Some(1);
 
         assert_eq!(
-            crate::hgvs::format_hgvsp(&translation, &source_classification, true).as_deref(),
+            crate::hgvs::format_hgvsp_with_sequences(&translation, &source_classification, true)
+                .as_deref(),
             Some("ENSP00000656242.1:p.Ter45MetfsTer2"),
             "ClinVar 5003617 golden HGVSp"
         );
@@ -40390,7 +40934,7 @@ mod tests {
 
         assert!(!protein.frameshift);
         assert_eq!(
-            crate::hgvs::format_hgvsp(
+            crate::hgvs::format_hgvsp_with_sequences(
                 &translation_for_hgvsp(&transcript, &translation),
                 &protein,
                 true
@@ -40916,13 +41460,13 @@ mod tests {
             );
             translation.stable_id = Some(protein_id.to_string());
             translation.version = Some(1);
-            let source_classification = crate::hgvs::ProteinHgvsData {
+            let source_classification = EngineProteinHgvsData {
                 start,
                 end: start,
                 ref_peptide: "*".to_string(),
                 alt_peptide: "L".to_string(),
-                ref_translation: ref_translation.clone(),
-                alt_translation: alt_translation.clone(),
+                ref_translation: (ref_translation.clone()).into(),
+                alt_translation: (alt_translation.clone()).into(),
                 alt_translation_extension: Some(alt_translation),
                 frameshift: true,
                 start_lost: false,
@@ -40943,7 +41487,7 @@ mod tests {
             shifted.frameshift = frameshift;
 
             assert_eq!(
-                crate::hgvs::format_hgvsp(&translation, &shifted, true).as_deref(),
+                crate::hgvs::format_hgvsp_with_sequences(&translation, &shifted, true).as_deref(),
                 Some(expected),
                 "source frameshift classification changed for {record}"
             );

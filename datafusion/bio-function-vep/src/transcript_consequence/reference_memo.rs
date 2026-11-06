@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) struct ReferenceMemo {
     entry: OnceLock<ReferenceEntry>,
+    hgvs_reference: OnceLock<Option<Arc<ChargedHgvsText>>>,
     budget: Arc<CacheBudget>,
     counters: Arc<ReferenceCounters>,
     #[cfg(test)]
@@ -28,7 +29,7 @@ struct ReferenceCounters {
 pub(super) enum ReferenceEntry {
     Missing,
     Declined,
-    Ready(CodingReference),
+    Ready(Arc<CodingReference>),
 }
 
 pub(super) struct CodingReference {
@@ -43,6 +44,7 @@ impl ReferenceMemo {
     pub(super) fn new(budget: Arc<CacheBudget>) -> Arc<Self> {
         Arc::new(Self {
             entry: OnceLock::new(),
+            hgvs_reference: OnceLock::new(),
             budget,
             counters: Arc::new(ReferenceCounters::default()),
             #[cfg(test)]
@@ -81,7 +83,7 @@ impl ReferenceMemo {
                 .and_then(|n| n.checked_add(cds.capacity()))
                 .and_then(|n| {
                     n.checked_add(
-                        std::mem::size_of::<CodingReference>() + 2 * std::mem::size_of::<usize>(),
+                        std::mem::size_of::<CodingReference>() + 4 * std::mem::size_of::<usize>(),
                     )
                 })
             else {
@@ -104,13 +106,13 @@ impl ReferenceMemo {
                 && tx.translation_seq_edits.is_empty()
                 && cds.len().is_multiple_of(3)
                 && cds.bytes().all(|b| matches!(b, b'A' | b'C' | b'G' | b'T'));
-            ReferenceEntry::Ready(CodingReference {
+            ReferenceEntry::Ready(Arc::new(CodingReference {
                 cds,
                 aas,
                 first_stop,
                 local_substitution_safe,
                 _lease: lease,
-            })
+            }))
         })
     }
 
@@ -167,6 +169,7 @@ impl SharedReferenceMemos {
     ) -> Arc<ReferenceMemo> {
         Arc::new(ReferenceMemo {
             entry: OnceLock::new(),
+            hgvs_reference: OnceLock::new(),
             budget: Arc::clone(budget),
             counters: Arc::clone(counters),
             #[cfg(test)]
@@ -240,4 +243,152 @@ pub(super) fn substitute_peptide_window(
         memo.local_codons.fetch_add(1, Ordering::Relaxed);
     }
     Some(alternate)
+}
+
+/// HGVS uses a canonical reference distinct from the consequence peptide.
+/// Retained canonical text owns its charge even after its memo is dropped.
+pub(super) struct ChargedHgvsText {
+    text: String,
+    _lease: BudgetLease,
+}
+
+pub(super) struct HgvsSubstitution {
+    reference: Arc<CodingReference>,
+    codons: std::ops::Range<usize>,
+    replacement: Vec<char>,
+    materialized: OnceLock<String>,
+}
+
+/// The common substitution formatter only needs its affected peptide window.
+/// Complex consumers can still request exactly the original full translation.
+#[derive(Clone)]
+pub(super) enum HgvsSequence {
+    Owned(String),
+    Shared(Arc<ChargedHgvsText>),
+    Substitution(Arc<HgvsSubstitution>),
+}
+
+impl std::ops::Deref for HgvsSequence {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            Self::Owned(text) => text,
+            Self::Shared(reference) => &reference.text,
+            Self::Substitution(substitution) => substitution.materialized.get_or_init(|| {
+                let reference = substitution
+                    .reference
+                    .aas
+                    .as_deref()
+                    .expect("validated peptide");
+                reference[..substitution.codons.start]
+                    .iter()
+                    .chain(substitution.replacement.iter())
+                    .chain(reference[substitution.codons.end..].iter())
+                    .collect()
+            }),
+        }
+    }
+}
+
+impl HgvsSequence {
+    pub(super) fn as_str(&self) -> &str {
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn deferred_window(&self) -> Option<(usize, bool)> {
+        match self {
+            Self::Substitution(s) => Some((s.replacement.len(), s.materialized.get().is_some())),
+            _ => None,
+        }
+    }
+}
+
+impl From<String> for HgvsSequence {
+    fn from(text: String) -> Self {
+        Self::Owned(text)
+    }
+}
+
+impl std::fmt::Debug for HgvsSequence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl PartialEq for HgvsSequence {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+impl Eq for HgvsSequence {}
+impl PartialEq<&str> for HgvsSequence {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+impl PartialEq<String> for HgvsSequence {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
+
+pub(super) struct HgvsSubstitutionSource<'a> {
+    pub(super) memo: &'a ReferenceMemo,
+    pub(super) reference: &'a Arc<CodingReference>,
+    pub(super) codons: std::ops::Range<usize>,
+}
+
+impl ReferenceMemo {
+    pub(super) fn hgvs_substitution_sequences(
+        &self,
+        translation: &TranslationFeature,
+        reference: &Arc<CodingReference>,
+        alternate: &[char],
+        codons: std::ops::Range<usize>,
+    ) -> Option<(HgvsSequence, HgvsSequence)> {
+        let aas = reference.aas.as_deref()?;
+        // On short proteins the handles can cost more than copying the text.
+        // This is a representation threshold, never an annotation predicate.
+        if aas.len() < 256 || aas.len() != alternate.len() || codons.is_empty() {
+            return None;
+        }
+        let replacement = alternate.get(codons.clone())?;
+        let canonical = self
+            .hgvs_reference
+            .get_or_init(|| {
+                let source = translation.translation_seq_canonical.as_deref();
+                let len = match source {
+                    Some(text) => text.len(),
+                    None => aas
+                        .iter()
+                        .try_fold(0usize, |len, aa| len.checked_add(aa.len_utf8()))?,
+                };
+                let bytes = len
+                    .checked_add(std::mem::size_of::<ChargedHgvsText>())?
+                    .checked_add(2 * std::mem::size_of::<usize>())?;
+                let lease = self.budget.admit(bytes)?;
+                let mut text = String::with_capacity(len);
+                match source {
+                    Some(source) => text.push_str(source),
+                    None => text.extend(aas.iter()),
+                }
+                debug_assert_eq!(text.capacity(), len);
+                Some(Arc::new(ChargedHgvsText {
+                    text,
+                    _lease: lease,
+                }))
+            })
+            .as_ref()?;
+        Some((
+            HgvsSequence::Shared(Arc::clone(canonical)),
+            HgvsSequence::Substitution(Arc::new(HgvsSubstitution {
+                reference: Arc::clone(reference),
+                codons,
+                replacement: replacement.to_vec(),
+                materialized: OnceLock::new(),
+            })),
+        ))
+    }
 }
