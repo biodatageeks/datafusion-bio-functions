@@ -16,6 +16,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use datafusion::arrow::array::{Array, RecordBatch, UInt64Array};
 use datafusion::arrow::compute::concat_batches;
@@ -63,6 +64,12 @@ pub fn write_sift_parquet(path: &Path, batches: &[RecordBatch]) -> Result<usize>
 
 /// Per-chromosome Parquet translation_sift point-lookup.
 pub struct SinglePathParquetSiftLookup {
+    profile: bool,
+    point_loads: AtomicU64,
+    requested_keys: AtomicU64,
+    decoded_key_rows: AtomicU64,
+    physical_bytes: AtomicU64,
+    read_ops: AtomicU64,
     path: PathBuf,
     meta: ArrowReaderMetadata,
     page_dir: PageDir,
@@ -96,6 +103,12 @@ impl SinglePathParquetSiftLookup {
             projection.push("key".to_string());
         }
         Ok(Self {
+            profile: std::env::var_os("VEP_ENGINE_PROFILE").is_some_and(|value| value == "1"),
+            point_loads: AtomicU64::new(0),
+            requested_keys: AtomicU64::new(0),
+            decoded_key_rows: AtomicU64::new(0),
+            physical_bytes: AtomicU64::new(0),
+            read_ops: AtomicU64::new(0),
             path: path.to_path_buf(),
             meta,
             page_dir,
@@ -118,6 +131,14 @@ impl SinglePathParquetSiftLookup {
         let offsets = self.exact_offsets(&ranges, &probe_set, &counters).await?;
         let batch = self.take_payload(&offsets, &counters).await?;
         let present = distinct_present(&batch, &probe_set)?;
+        if self.profile {
+            let (bytes, ops) = counters.snapshot();
+            self.point_loads.fetch_add(1, Ordering::Relaxed);
+            self.requested_keys
+                .fetch_add(sorted.len() as u64, Ordering::Relaxed);
+            self.physical_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.read_ops.fetch_add(ops, Ordering::Relaxed);
+        }
         Ok((batch, present))
     }
 
@@ -151,6 +172,10 @@ impl SinglePathParquetSiftLookup {
             .await
             .map_err(|e| DataFusionError::Execution(format!("read key batch: {e}")))?
         {
+            if self.profile {
+                self.decoded_key_rows
+                    .fetch_add(b.num_rows() as u64, Ordering::Relaxed);
+            }
             let ka = b
                 .column(0)
                 .as_any()
@@ -210,6 +235,21 @@ impl SinglePathParquetSiftLookup {
         tokio::fs::File::open(&self.path).await.map_err(|e| {
             DataFusionError::Execution(format!("reopen parquet '{}': {e}", self.path.display()))
         })
+    }
+}
+
+impl Drop for SinglePathParquetSiftLookup {
+    fn drop(&mut self) {
+        if self.profile {
+            eprintln!(
+                "[VEP_SIFT_LOOKUP] point_loads={} requested_keys={} decoded_key_rows={} physical_bytes={} read_ops={}",
+                self.point_loads.load(Ordering::Relaxed),
+                self.requested_keys.load(Ordering::Relaxed),
+                self.decoded_key_rows.load(Ordering::Relaxed),
+                self.physical_bytes.load(Ordering::Relaxed),
+                self.read_ops.load(Ordering::Relaxed)
+            );
+        }
     }
 }
 

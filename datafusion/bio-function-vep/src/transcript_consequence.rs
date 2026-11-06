@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use coitrees::{COITree, GenericInterval, Interval, IntervalTree};
@@ -11,7 +11,10 @@ use crate::hgvs::{HgvsGenomicShift, HgvscProfile};
 use crate::motif_matrix::{FREQUENCIES_UNIT, MotifMatrix, MotifPlacement, motif_score_delta};
 use crate::so_terms::{ALL_SO_TERMS, SoTerm};
 
+mod reference_memo;
 mod vep_coords;
+pub(crate) use reference_memo::SharedReferenceMemos;
+use reference_memo::{ReferenceEntry, ReferenceMemo, substitute_peptide_window};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VariantInput {
@@ -1138,6 +1141,7 @@ impl FeatureType {
 /// Pre-built indexes over context features, constructed once and reused
 /// across all variants in a batch.
 pub struct PreparedContext<'a> {
+    pub(crate) reference_memos: OnceLock<Vec<Arc<ReferenceMemo>>>,
     pub exons_by_tx: HashMap<&'a str, Vec<&'a ExonFeature>>,
     pub exons_by_tx_genomic: HashMap<&'a str, Vec<&'a ExonFeature>>,
     pub translation_by_tx: HashMap<&'a str, &'a TranslationFeature>,
@@ -1227,6 +1231,33 @@ impl<'a, T> PreparedFeatureIndex<'a, T> {
 }
 
 impl<'a> PreparedContext<'a> {
+    fn reference_memo(&self, index: usize) -> &ReferenceMemo {
+        &self.reference_memos.get_or_init(|| {
+            let budget = crate::cache_budget::CacheBudget::new(128 * 1024 * 1024);
+            self.transcripts
+                .iter()
+                .map(|_| ReferenceMemo::new(Arc::clone(&budget)))
+                .collect()
+        })[index]
+    }
+
+    pub(crate) fn with_shared_references(mut self, shared: &SharedReferenceMemos) -> Self {
+        self.reference_memos = OnceLock::from(
+            self.transcripts
+                .iter()
+                .map(|tx| {
+                    shared.slot(
+                        tx,
+                        self.translation_by_tx
+                            .get(tx.transcript_id.as_str())
+                            .copied(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        self
+    }
+
     pub(crate) fn overlaps_transcript(&self, chrom: &str, start: i64, end: i64) -> bool {
         let Some(tree) = self.tx_trees.get(normalize_chrom(chrom)) else {
             return false;
@@ -1335,7 +1366,9 @@ impl<'a> PreparedContext<'a> {
             |s| s.feature_id.as_str(),
         );
 
+        let reference_memos = OnceLock::new();
         Self {
+            reference_memos,
             exons_by_tx,
             exons_by_tx_genomic,
             translation_by_tx,
@@ -1587,17 +1620,14 @@ impl TranscriptConsequenceEngine {
                         profile.tx_overlap_candidates += 1;
                     }
                     let transcript_eval_started = profiling.then(Instant::now);
-                    let (mut terms, coding_class) = if let Some(profile) = profile.as_deref_mut() {
-                        self.evaluate_transcript_overlap_profiled(
-                            variant,
-                            tx,
-                            tx_exons,
-                            tx_translation,
-                            profile,
-                        )
-                    } else {
-                        self.evaluate_transcript_overlap(variant, tx, tx_exons, tx_translation)
-                    };
+                    let (mut terms, coding_class) = self.evaluate_transcript_overlap_inner(
+                        variant,
+                        tx,
+                        tx_exons,
+                        tx_translation,
+                        profile.as_deref_mut(),
+                        Some(ctx.reference_memo(tx_idx)),
+                    );
                     if let (Some(started), Some(profile)) =
                         (transcript_eval_started, profile.as_deref_mut())
                     {
@@ -2223,7 +2253,7 @@ impl TranscriptConsequenceEngine {
         tx_exons: &[&ExonFeature],
         tx_translation: Option<&TranslationFeature>,
     ) -> (Vec<SoTerm>, Option<CodingClassification>) {
-        self.evaluate_transcript_overlap_inner(variant, tx, tx_exons, tx_translation, None)
+        self.evaluate_transcript_overlap_inner(variant, tx, tx_exons, tx_translation, None, None)
     }
 
     fn evaluate_transcript_overlap_profiled(
@@ -2234,7 +2264,14 @@ impl TranscriptConsequenceEngine {
         tx_translation: Option<&TranslationFeature>,
         profile: &mut TranscriptEngineProfile,
     ) -> (Vec<SoTerm>, Option<CodingClassification>) {
-        self.evaluate_transcript_overlap_inner(variant, tx, tx_exons, tx_translation, Some(profile))
+        self.evaluate_transcript_overlap_inner(
+            variant,
+            tx,
+            tx_exons,
+            tx_translation,
+            Some(profile),
+            None,
+        )
     }
 
     fn evaluate_transcript_overlap_inner(
@@ -2244,6 +2281,7 @@ impl TranscriptConsequenceEngine {
         tx_exons: &[&ExonFeature],
         tx_translation: Option<&TranslationFeature>,
         mut profile: Option<&mut TranscriptEngineProfile>,
+        reference_memo: Option<&ReferenceMemo>,
     ) -> (Vec<SoTerm>, Option<CodingClassification>) {
         let profiling = profile.is_some();
         let mut terms = BTreeSet::new();
@@ -2448,7 +2486,14 @@ impl TranscriptConsequenceEngine {
             // - VEP VariationEffect::coding_sequence_variant uses within_cds
             //   which returns true for frameshift intron positions:
             //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
-            coding_class = self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
+            coding_class = self.add_coding_terms_cached(
+                &mut terms,
+                variant,
+                tx,
+                tx_exons,
+                tx_translation,
+                reference_memo,
+            );
 
             // VEP's frameshift/inframe predicates all have:
             //   return 0 unless defined $bvfo->cds_start && defined $bvfo->cds_end;
@@ -3353,6 +3398,18 @@ impl TranscriptConsequenceEngine {
         tx_exons: &[&ExonFeature],
         tx_translation: Option<&TranslationFeature>,
     ) -> Option<CodingClassification> {
+        self.add_coding_terms_cached(terms, variant, tx, tx_exons, tx_translation, None)
+    }
+
+    fn add_coding_terms_cached(
+        &self,
+        terms: &mut BTreeSet<SoTerm>,
+        variant: &VariantInput,
+        tx: &TranscriptFeature,
+        tx_exons: &[&ExonFeature],
+        tx_translation: Option<&TranslationFeature>,
+        reference_memo: Option<&ReferenceMemo>,
+    ) -> Option<CodingClassification> {
         let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
         let refseq_mapper_insertion_gap = (ref_len == 0)
             .then(|| refseq_mapper_insertion_cds_gap(tx, tx_exons, tx_translation, variant))
@@ -3394,12 +3451,14 @@ impl TranscriptConsequenceEngine {
             && end.checked_sub(start).and_then(|span| span.checked_add(1)) == Some(alt_len)
         {
             terms.insert(SoTerm::IntergenicVariant);
-            return classify_coding_change_with_semantics(
+            return classify_coding_change_with_spliced_span_cached(
                 tx,
                 tx_exons,
                 tx_translation,
                 variant,
                 self.semantics,
+                spliced_cds_span,
+                reference_memo,
             );
         }
 
@@ -3621,13 +3680,14 @@ impl TranscriptConsequenceEngine {
             // Keep VEP 116's ordered start_lost predicates below: its nucleotide
             // clauses run before peptide comparison (Variation
             // VariationEffect.pm:870-882).
-            let mut classification = classify_coding_change_with_spliced_span(
+            let mut classification = classify_coding_change_with_spliced_span_cached(
                 tx,
                 tx_exons,
                 tx_translation,
                 variant,
                 self.semantics,
                 spliced_cds_span,
+                reference_memo,
             );
             if self.semantics.vep116_stop_predicates() {
                 // VEP evaluates start_lost on the TranscriptVariation even
@@ -3788,12 +3848,14 @@ impl TranscriptConsequenceEngine {
             return None;
         }
 
-        if let Some(classification) = classify_coding_change_with_semantics(
+        if let Some(classification) = classify_coding_change_with_spliced_span_cached(
             tx,
             tx_exons,
             tx_translation,
             variant,
             self.semantics,
+            spliced_cds_span,
+            reference_memo,
         ) {
             let has_any = classification.has_any();
             apply_codon_classification(terms, &classification);
@@ -9538,8 +9600,36 @@ fn classify_coding_change_with_spliced_span(
     semantics: crate::vep_semantics::VepSemantics,
     spliced_cds_span: Option<(usize, usize)>,
 ) -> Option<CodingClassification> {
+    classify_coding_change_with_spliced_span_cached(
+        tx,
+        tx_exons,
+        tx_translation,
+        variant,
+        semantics,
+        spliced_cds_span,
+        None,
+    )
+}
+
+fn classify_coding_change_with_spliced_span_cached(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+    semantics: crate::vep_semantics::VepSemantics,
+    spliced_cds_span: Option<(usize, usize)>,
+    reference_memo: Option<&ReferenceMemo>,
+) -> Option<CodingClassification> {
     let translation = tx_translation?;
-    let cds_seq = reference_translateable_seq_for_vep(tx, Some(translation))?;
+    let reference = match reference_memo.map(|memo| memo.get(tx, translation)) {
+        Some(ReferenceEntry::Ready(reference)) => Some(reference),
+        Some(ReferenceEntry::Missing) => return None,
+        _ => None,
+    };
+    let cds_seq: Cow<'_, str> = match reference {
+        Some(reference) => Cow::Borrowed(&reference.cds),
+        None => Cow::Owned(reference_translateable_seq_for_vep(tx, Some(translation))?),
+    };
     let ref_genomic = normalize_allele_seq(&variant.ref_allele);
     let alt_genomic = normalize_allele_seq(&variant.alt_allele);
     let input_ref_len = ref_genomic.len();
@@ -9717,14 +9807,14 @@ fn classify_coding_change_with_spliced_span(
     // Ensembl Variation 2fb834b, TranscriptVariationAllele.pm:868-877,2393-2415:
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L868-L877
     // https://github.com/Ensembl/ensembl-variation/blob/2fb834b987ede3824e200197a838ce11e91aeb4b/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2393-L2415
-    let alternate_cds_reference = cds_seq.clone();
+    let alternate_cds_reference = cds_seq.as_ref();
     if end_idx >= alternate_cds_reference.len() {
         return None;
     }
     let ref_cds_seq = if tx.has_rna_edit && ref_seq_slice != effective_ref_tx {
-        let mut edited_cds = cds_seq.clone().into_bytes();
+        let mut edited_cds = cds_seq.as_bytes().to_vec();
         edited_cds.splice(start_idx..=end_idx, effective_ref_tx.bytes());
-        Some(String::from_utf8(edited_cds).ok()?)
+        Some(Cow::Owned(String::from_utf8(edited_cds).ok()?))
     } else {
         None
     };
@@ -9742,11 +9832,39 @@ fn classify_coding_change_with_spliced_span(
     let alt_bytes = alt_tx.as_bytes();
     mutated.extend_from_slice(alt_bytes);
     mutated.extend_from_slice(&alternate_cds_reference.as_bytes()[end_idx + 1..]);
+    let reference_patched = ref_cds_seq.is_some();
     let cds_seq = ref_cds_seq.unwrap_or(cds_seq);
-
-    let old_aas = reference_aas_for_consequence(tx, tx_translation, cds_seq.as_str())?;
-    let new_aas =
-        translate_protein_for_coding_classification(tx.codon_table, &mutated, variant, semantics)?;
+    let reusable = reference.filter(|_| !reference_patched);
+    let old_aas: Cow<'_, [char]> = match reusable {
+        Some(reference) => Cow::Borrowed(reference.aas.as_deref()?),
+        None => Cow::Owned(reference_aas_for_consequence(
+            tx,
+            tx_translation,
+            cds_seq.as_ref(),
+        )?),
+    };
+    let local_substitution = reusable.is_some_and(|r| r.local_substitution_safe)
+        && ref_len == alt_len
+        && !spans_refseq_edit_gap
+        && !spans_spliced_intron_gap
+        && alt_tx
+            .bytes()
+            .all(|b| matches!(b, b'A' | b'C' | b'G' | b'T'));
+    let new_aas = if local_substitution {
+        substitute_peptide_window(
+            tx.codon_table,
+            &old_aas,
+            &mutated,
+            start_idx,
+            end_idx,
+            reference_memo?,
+        )?
+    } else {
+        if let Some(memo) = reference_memo {
+            memo.note_fallback();
+        }
+        translate_protein_for_coding_classification(tx.codon_table, &mutated, variant, semantics)?
+    };
     let mut class = CodingClassification::default();
 
     // VEP 116's ordered start_lost predicate is applied after local codons and
@@ -9760,7 +9878,7 @@ fn classify_coding_change_with_spliced_span(
             variant,
             &mutated,
             leading_n_offset,
-            Some(cds_seq.as_str()),
+            Some(cds_seq.as_ref()),
         );
     } else if !semantics.vep116_stop_predicates() && start_idx < 3 && !tx.cds_start_nf {
         // 1. Codon level (works for SNVs and as fallback for indels). VEP
@@ -9777,7 +9895,7 @@ fn classify_coding_change_with_spliced_span(
         //    is a frameshift, VEP's peptide-level check also fires start_lost
         //    (full affected peptide range differs) alongside start_retained.
         if ref_len != alt_len {
-            match ins_del_start_altered(tx, tx_exons, variant, Some(cds_seq.as_str())) {
+            match ins_del_start_altered(tx, tx_exons, variant, Some(cds_seq.as_ref())) {
                 Some(false) => {
                     class.start_retained = true;
                     if !ref_len.abs_diff(alt_len).is_multiple_of(3) {
@@ -9818,7 +9936,10 @@ fn classify_coding_change_with_spliced_span(
         }
     }
 
-    let old_stop = old_aas.iter().position(|aa| *aa == '*');
+    let old_stop = reusable.map_or_else(
+        || old_aas.iter().position(|aa| *aa == '*'),
+        |r| r.first_stop,
+    );
     let new_stop = new_aas.iter().position(|aa| *aa == '*');
     // VEP's reference `peptide()` overlays SeqEdits over the mapped
     // translation_start/end range, whose first/last coordinates come from the
@@ -9835,7 +9956,7 @@ fn classify_coding_change_with_spliced_span(
             && failed_refseq_uses_cached_translation_for_consequence(
                 tx,
                 tx_translation,
-                cds_seq.as_str(),
+                cds_seq.as_ref(),
             ));
     if !translation_seqedit_overlap
         && let (Some(old_stop_idx), Some(new_stop_idx)) = (old_stop, new_stop)
@@ -10151,7 +10272,7 @@ fn classify_coding_change_with_spliced_span(
             let aa_changed = if use_display_peptide_window {
                 (first_codon_snv..=last_codon_snv).any(|ci| old_aas.get(ci) != new_aas.get(ci))
             } else {
-                old_aas != new_aas
+                old_aas.as_ref() != new_aas.as_slice()
             };
             // Incomplete terminal codons don't produce an amino acid in
             // translate_protein_from_cds (only complete codons are translated).
@@ -10386,7 +10507,7 @@ fn classify_coding_change_with_spliced_span(
             tx_exons,
             tx_translation,
             variant,
-            Some(cds_seq.as_str()),
+            Some(cds_seq.as_ref()),
             partial_terminal_codon,
         );
         if class.start_lost {
@@ -10441,10 +10562,10 @@ fn classify_coding_change_with_spliced_span(
     } else {
         None
     };
-    let hgvs_new_aas = preferred_hgvs_alt_translation
+    let hgvs_new_aas: Cow<'_, [char]> = preferred_hgvs_alt_translation
         .as_ref()
-        .map(|seq| seq.chars().collect::<Vec<_>>())
-        .unwrap_or_else(|| new_aas.clone());
+        .map(|seq| Cow::Owned(seq.chars().collect::<Vec<_>>()))
+        .unwrap_or_else(|| Cow::Borrowed(new_aas.as_slice()));
     let hgvs_amino_acids = vep116_ambiguous_terminal_hgvsp_alleles(&class, semantics)
         .or_else(|| {
             vep116_incomplete_terminal_hgvsp_alleles(&class, semantics, local_codon_truncated)
@@ -14792,6 +14913,227 @@ fn translate_codon(codon: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_derivation_once_and_local_substitution_work_is_window_bounded() {
+        use std::sync::atomic::Ordering;
+        let sequence = format!("ATG{}TAA", "GCT".repeat(10_000));
+        let end = 100 + sequence.len() as i64 - 1;
+        let transcript = tx(
+            "long",
+            "17",
+            100,
+            end,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(end),
+        );
+        let translation = translation("long", Some(sequence.len()), None, None, Some(&sequence));
+        let exon = exon("long", 1, 100, end);
+        let exons = [&exon];
+        let budget = crate::cache_budget::CacheBudget::new(1024 * 1024);
+        let memo = ReferenceMemo::new(Arc::clone(&budget));
+        for offset in [3, 15_003, 29_997] {
+            let variant = var("17", 100 + offset, 100 + offset, "G", "A");
+            let old = classify_coding_change_with_semantics(
+                &transcript,
+                &exons,
+                Some(&translation),
+                &variant,
+                crate::vep_semantics::VepSemantics::V116,
+            );
+            let new = classify_coding_change_with_spliced_span_cached(
+                &transcript,
+                &exons,
+                Some(&translation),
+                &variant,
+                crate::vep_semantics::VepSemantics::V116,
+                None,
+                Some(&memo),
+            );
+            assert!(old.is_some());
+            assert_eq!(format!("{old:?}"), format!("{new:?}"), "offset {offset}");
+        }
+        assert_eq!(memo.derivations.load(Ordering::Relaxed), 1);
+        assert_eq!(memo.local_codons.load(Ordering::Relaxed), 3);
+        assert!(budget.used() > 0);
+        drop(memo);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn memoized_classification_matches_uncached_for_tables_strands_and_fallbacks() {
+        use std::sync::atomic::Ordering;
+        for sequence in [
+            "ATGGCTTGATAG",
+            "NNNGCTTAATAG",
+            "ATGGCTTAATA",
+            "ATGGCTTANTAG",
+        ] {
+            for table in [CodonTable::Standard, CodonTable::VertebrateMitochondrial] {
+                for strand in [1, -1] {
+                    for edited in [false, true] {
+                        let end = 100 + sequence.len() as i64 - 1;
+                        let mut transcript = tx(
+                            "fixture",
+                            "17",
+                            100,
+                            end,
+                            strand,
+                            "protein_coding",
+                            Some(100),
+                            Some(end),
+                        );
+                        transcript.codon_table = table;
+                        transcript.has_rna_edit = edited;
+                        let translation = translation(
+                            "fixture",
+                            Some(sequence.len()),
+                            None,
+                            None,
+                            Some(sequence),
+                        );
+                        let exon = exon("fixture", 1, 100, end);
+                        let memo = ReferenceMemo::new(crate::cache_budget::CacheBudget::new(4096));
+                        for (reference, alternate) in [
+                            ("G", "A"),
+                            ("C", "T"),
+                            ("G", "N"),
+                            ("G", "-"),
+                            ("GC", "AA"),
+                            ("G", "GCTT"),
+                        ] {
+                            let start = if strand == 1 { 103 } else { end - 4 };
+                            let variant = var(
+                                "17",
+                                start,
+                                start + reference.len() as i64 - 1,
+                                reference,
+                                alternate,
+                            );
+                            let old = classify_coding_change_with_semantics(
+                                &transcript,
+                                &[&exon],
+                                Some(&translation),
+                                &variant,
+                                crate::vep_semantics::VepSemantics::V116,
+                            );
+                            let new = classify_coding_change_with_spliced_span_cached(
+                                &transcript,
+                                &[&exon],
+                                Some(&translation),
+                                &variant,
+                                crate::vep_semantics::VepSemantics::V116,
+                                None,
+                                Some(&memo),
+                            );
+                            assert_eq!(
+                                format!("{old:?}"),
+                                format!("{new:?}"),
+                                "{sequence} {table:?} strand={strand} edited={edited} {reference}>{alternate}"
+                            );
+                        }
+                        if edited || sequence.contains('N') || sequence.len() % 3 != 0 {
+                            assert_eq!(memo.local_codons.load(Ordering::Relaxed), 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reference_memo_shares_only_identical_transcript_and_translation_views() {
+        let transcripts = [tx(
+            "same",
+            "17",
+            100,
+            108,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        )];
+        let translations = [translation("same", Some(9), None, None, Some("ATGGCTTAA"))];
+        let budget = crate::cache_budget::CacheBudget::new(4096);
+        let shared = SharedReferenceMemos::new(&transcripts, &translations, budget);
+        let base = shared.slot(&transcripts[0], Some(&translations[0]));
+        assert!(Arc::ptr_eq(
+            &base,
+            &shared.slot(&transcripts[0], Some(&translations[0]))
+        ));
+        let mut hydrated = transcripts[0].clone();
+        hydrated.translateable_seq = Some("ATGTTTTAA".into());
+        let local = shared.slot(&hydrated, Some(&translations[0]));
+        assert!(!Arc::ptr_eq(&base, &local));
+        let mut overridden = translations[0].clone();
+        overridden.cds_sequence = Some("ATGAAATAA".into());
+        assert!(!Arc::ptr_eq(
+            &base,
+            &shared.slot(&transcripts[0], Some(&overridden))
+        ));
+        let ReferenceEntry::Ready(original) = base.get(&transcripts[0], &translations[0]) else {
+            panic!()
+        };
+        let ReferenceEntry::Ready(edited) = local.get(&hydrated, &translations[0]) else {
+            panic!()
+        };
+        assert_ne!(original.aas, edited.aas);
+    }
+
+    #[test]
+    fn reference_memo_concurrent_fill_and_zero_tiny_budget_fallbacks() {
+        use std::sync::atomic::Ordering;
+        let transcript = tx(
+            "same",
+            "17",
+            100,
+            108,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        );
+        let translation = translation("same", Some(9), None, None, Some("ATGGCTTAA"));
+        let memo = ReferenceMemo::new(crate::cache_budget::CacheBudget::new(4096));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    assert!(matches!(
+                        memo.get(&transcript, &translation),
+                        ReferenceEntry::Ready(_)
+                    ));
+                });
+            }
+        });
+        assert_eq!(memo.derivations.load(Ordering::Relaxed), 1);
+        let exon = exon("same", 1, 100, 108);
+        let variant = var("17", 103, 103, "G", "A");
+        let old = classify_coding_change_with_semantics(
+            &transcript,
+            &[&exon],
+            Some(&translation),
+            &variant,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+        for limit in [0, 1] {
+            let budget = crate::cache_budget::CacheBudget::new(limit);
+            let memo = ReferenceMemo::new(Arc::clone(&budget));
+            let new = classify_coding_change_with_spliced_span_cached(
+                &transcript,
+                &[&exon],
+                Some(&translation),
+                &variant,
+                crate::vep_semantics::VepSemantics::V116,
+                None,
+                Some(&memo),
+            );
+            assert_eq!(format!("{old:?}"), format!("{new:?}"));
+            assert_eq!(budget.used(), 0);
+            assert_eq!(memo.local_codons.load(Ordering::Relaxed), 0);
+        }
+    }
 
     #[test]
     fn peptide_allele_string_omits_slash_for_identical_peptides() {

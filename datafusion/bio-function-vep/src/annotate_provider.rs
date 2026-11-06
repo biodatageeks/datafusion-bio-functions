@@ -6184,6 +6184,10 @@ impl AnnotateProvider {
         let cache_root = Some(cache.base_dir().to_path_buf());
 
         let config = ContigAnnotationConfig {
+            reference_budget: crate::cache_budget::CacheBudget::from_env(
+                "VEP_REFERENCE_CACHE_MB",
+                128,
+            )?,
             vcf_table: self.vcf_table.clone(),
             options_json,
             cache_columns,
@@ -10182,6 +10186,7 @@ impl Debug for AnnotateProvider {
 /// Bundled configuration for per-contig annotation (extracted from AnnotateProvider).
 #[derive(Clone)]
 struct ContigAnnotationConfig {
+    reference_budget: Arc<crate::cache_budget::CacheBudget>,
     vcf_table: String,
     options_json: Option<String>,
     cache_columns: Vec<String>,
@@ -11039,6 +11044,7 @@ async fn scan_context_entity(
 }
 
 struct SharedContigAnnotationContext {
+    reference_memos: crate::transcript_consequence::SharedReferenceMemos,
     config: ContigAnnotationConfig,
     profile: Option<SharedContigPipelineProfile>,
     base_transcripts: Arc<Vec<TranscriptFeature>>,
@@ -13733,6 +13739,7 @@ fn prepared_context_from_buffer<'a>(
         &shared.mirnas,
         &shared.structural,
     )
+    .with_shared_references(&shared.reference_memos)
 }
 
 fn hydrate_worker_window(
@@ -16357,6 +16364,11 @@ async fn prepare_contig_data(
     };
 
     let shared_context = Arc::new(SharedContigAnnotationContext {
+        reference_memos: crate::transcript_consequence::SharedReferenceMemos::new(
+            &base_transcripts,
+            &tl,
+            Arc::clone(&config.reference_budget),
+        ),
         config: config.clone(),
         profile: pipeline_profile.clone(),
         base_transcripts,
@@ -18366,6 +18378,7 @@ mod tests {
 
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
         ContigAnnotationConfig {
+            reference_budget: crate::cache_budget::CacheBudget::new(128 * 1024 * 1024),
             vcf_table: "vcf".to_string(),
             options_json: None,
             cache_columns: Vec::new(),
@@ -18446,8 +18459,14 @@ mod tests {
             .map(|tx| (tx.transcript_id.clone(), gene_cache_regions(tx)))
             .collect();
 
+        let config = minimal_contig_annotation_config();
         Arc::new(SharedContigAnnotationContext {
-            config: minimal_contig_annotation_config(),
+            reference_memos: crate::transcript_consequence::SharedReferenceMemos::new(
+                &transcripts,
+                &translations,
+                Arc::clone(&config.reference_budget),
+            ),
+            config,
             profile: None,
             base_transcripts: Arc::new(transcripts),
             overlap_width_bp: 0,
@@ -21806,6 +21825,51 @@ mod tests {
 
         let materialized = materialize_buffer_context_translations(&shared, &buffer_context);
         let prepared = prepared_context_from_buffer(&buffer_context, &shared, &materialized);
+
+        let unmodified_buffer = BufferAnnotationContext {
+            transcripts: vec![CowTranscript::Borrowed(0), CowTranscript::Borrowed(1)],
+            exon_indices: Vec::new(),
+            translation_indices: vec![0, 1],
+            translation_overrides: HashMap::new(),
+        };
+        let original = prepared_context_from_buffer(&unmodified_buffer, &shared, &[]);
+        let repeated = prepared_context_from_buffer(&unmodified_buffer, &shared, &[]);
+        for (idx, tx) in prepared.transcripts.iter().enumerate() {
+            let base_idx = original
+                .transcripts
+                .iter()
+                .position(|base| base.transcript_id == tx.transcript_id)
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                &original.reference_memos.get().unwrap()[base_idx],
+                &repeated.reference_memos.get().unwrap()[base_idx]
+            ));
+            assert_eq!(
+                Arc::ptr_eq(
+                    &prepared.reference_memos.get().unwrap()[idx],
+                    &original.reference_memos.get().unwrap()[base_idx]
+                ),
+                tx.transcript_id == "tx2"
+            );
+        }
+        let owned_buffer = BufferAnnotationContext {
+            transcripts: vec![CowTranscript::Owned(Box::new(
+                shared.base_transcripts[0].clone(),
+            ))],
+            exon_indices: Vec::new(),
+            translation_indices: vec![0],
+            translation_overrides: HashMap::new(),
+        };
+        let owned = prepared_context_from_buffer(&owned_buffer, &shared, &[]);
+        let base_idx = original
+            .transcripts
+            .iter()
+            .position(|tx| tx.transcript_id == "tx1")
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &owned.reference_memos.get().unwrap()[0],
+            &original.reference_memos.get().unwrap()[base_idx]
+        ));
 
         assert_eq!(materialized.len(), 1);
         assert_eq!(materialized[0].transcript_id, "tx1");
