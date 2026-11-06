@@ -79,8 +79,11 @@ At one worker, output is subdivided into at most 1,024 input rows per Arrow
 batch after preparing the full VEP input-buffer context. Parallel annotation
 retains the original output batches. This does not change the 5,000-input-unit
 state transitions, transcript hydration, HGNC persistence, warm-up or partition
-seams. It limits transient CSQ/VCF copies; one very large record and the total
-output retained for a whole input buffer are still not byte-bounded.
+seams. Serial annotation sends each completed output batch through a bounded
+one-batch queue instead of retaining every output batch for the whole input
+buffer. The next buffer still waits for the current buffer's completed carry
+state. Dropping the consumer closes the queue and wakes a blocked producer.
+One very large record remains unbounded in bytes; batch count is not a byte cap.
 
 The prediction cache defaults are 128 MiB for serial work and 256 MiB shared
 across parallel workers. A 64 MiB experiment on ClinVar chr17

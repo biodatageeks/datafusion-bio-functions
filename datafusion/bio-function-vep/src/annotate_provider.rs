@@ -12119,7 +12119,7 @@ struct ContigAnnotationState {
     ordered_lookup_wait_started: Option<Instant>,
     /// In-flight fused window-annotation tasks, FIFO (= window/output order).
     /// Up to `config.annotation_workers` run concurrently on the blocking pool.
-    inflight: VecDeque<tokio::task::JoinHandle<WindowAnnotateResult>>,
+    inflight: VecDeque<PendingWindow>,
     /// Gate of the run being drained; later runs of the contig wait in
     /// `pending_runs` and are activated one after another.
     run: ActiveRunState,
@@ -12128,9 +12128,23 @@ struct ContigAnnotationState {
     pipeline_profile: Option<SharedContigPipelineProfile>,
 }
 
-/// Output of one fused window-annotation task: annotated batches plus the
-/// persisted HGNC carry state to seed the next sequential window.
-type WindowAnnotateResult = Result<(VecDeque<RecordBatch>, PersistedBufferTranscripts)>;
+/// The next window must wait for the completed HGNC carry state, even though
+/// output batches can be consumed before the current window finishes.
+type WindowAnnotateResult = Result<PersistedBufferTranscripts>;
+
+struct PendingWindow {
+    task: tokio::task::JoinHandle<WindowAnnotateResult>,
+    output: tokio::sync::mpsc::Receiver<RecordBatch>,
+}
+
+impl Drop for PendingWindow {
+    fn drop(&mut self) {
+        // A running blocking task cannot be aborted. Closing its bounded
+        // output wakes blocking_send so dropping a consumer cannot strand it.
+        self.output.close();
+        self.task.abort();
+    }
+}
 
 /// State for the threads>1 path: N independent per-partition fused pipelines,
 /// drained in partition-id order (= position order). No central poll loop /
@@ -12496,17 +12510,12 @@ enum StreamState {
     AnnotatingRunPool(RunPoolState),
     /// Await the oldest in-flight fused window task (FIFO preserves output order).
     AwaitingWindow {
-        handle: tokio::task::JoinHandle<WindowAnnotateResult>,
+        handle: PendingWindow,
         annotation_state: ContigAnnotationState,
     },
     /// A later region run of the current contig is building its filtered lookup.
     ActivatingRun {
         fut: RunActivateFuture,
-        annotation_state: ContigAnnotationState,
-    },
-    /// Yield annotated batches from the current window, then resume annotation.
-    DrainingWindow {
-        batches: VecDeque<RecordBatch>,
         annotation_state: ContigAnnotationState,
     },
     /// Deregister ephemeral tables after contig completes.
@@ -13389,11 +13398,7 @@ impl ContigAnnotationStream {
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
                 ann.ephemeral_tables.clear();
             }
-            StreamState::DrainingWindow {
-                annotation_state: ann,
-                ..
-            }
-            | StreamState::AwaitingWindow {
+            StreamState::AwaitingWindow {
                 annotation_state: ann,
                 ..
             }
@@ -14521,6 +14526,21 @@ fn annotate_worker_window(
     projection: Option<&[usize]>,
     emit_bounds: Option<&[RunBounds]>,
 ) -> Result<VecDeque<RecordBatch>> {
+    let mut out = VecDeque::with_capacity(window_batches.len());
+    annotate_worker_window_with_output(worker, window_batches, projection, emit_bounds, |batch| {
+        out.push_back(batch);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn annotate_worker_window_with_output(
+    worker: &mut AnnotationWorkerState,
+    window_batches: &[RecordBatch],
+    projection: Option<&[usize]>,
+    emit_bounds: Option<&[RunBounds]>,
+    mut emit: impl FnMut(RecordBatch) -> Result<()>,
+) -> Result<()> {
     let annotation_started = Instant::now();
     let shared = Arc::clone(&worker.shared);
     let profile = shared.profile.clone();
@@ -14543,8 +14563,6 @@ fn annotate_worker_window(
             .iter()
             .any(|&i| i >= typed_cols_start && i < typed_cols_end)
     });
-    let mut out = VecDeque::with_capacity(window_batches.len());
-
     let flush_partial = worker.lookup_done && worker.window_buffer.is_empty();
     let input_buffer_started = Instant::now();
     let ready_input_buffers = worker.input_buffer_accumulator.push_window_and_drain_ready(
@@ -14637,16 +14655,16 @@ fn annotate_worker_window(
                 record_contig_profile(&profile, |profile| {
                     profile.projection += projection_started.elapsed();
                 });
-                out.push_back(projected);
+                emit(projected)?;
             } else {
-                out.push_back(annotated);
+                emit(annotated)?;
             }
         }
     }
     record_contig_profile(&profile, |profile| {
         profile.annotation_compute += annotation_started.elapsed();
     });
-    Ok(out)
+    Ok(())
 }
 
 /// Annotate one window on a *fresh* worker, seeded with a snapshot of the
@@ -14659,6 +14677,7 @@ fn annotate_worker_window(
 /// variants is already present in `colocated_snapshot`. Hydration is rebuilt
 /// per window (a fresh worker), which only re-does work for boundary
 /// transcripts — an accepted, bounded cost.
+#[allow(clippy::too_many_arguments)]
 fn annotate_window_owned(
     shared: Arc<SharedContigAnnotationContext>,
     colocated_snapshot: Arc<HashMap<ColocatedKey, ColocatedData>>,
@@ -14667,7 +14686,8 @@ fn annotate_window_owned(
     projection: Option<Vec<usize>>,
     persisted_seed: PersistedBufferTranscripts,
     emit_bounds: Option<Vec<RunBounds>>,
-) -> Result<(VecDeque<RecordBatch>, PersistedBufferTranscripts)> {
+    output: tokio::sync::mpsc::Sender<RecordBatch>,
+) -> WindowAnnotateResult {
     let mut worker = AnnotationWorkerState::new(shared)?;
     worker.colocated_map = colocated_snapshot;
     worker.lookup_done = true;
@@ -14677,13 +14697,18 @@ fn annotate_window_owned(
     // sequentially (the stateful Merged/RefSeq path).
     worker.persisted_buffer_transcripts = persisted_seed;
     hydrate_worker_window(&mut worker, &window_batches, cache_source_type)?;
-    let out = annotate_worker_window(
+    annotate_worker_window_with_output(
         &mut worker,
         &window_batches,
         projection.as_deref(),
         emit_bounds.as_deref(),
+        |batch| {
+            output.blocking_send(batch).map_err(|_| {
+                DataFusionError::Execution("serial window output receiver was dropped".into())
+            })
+        },
     )?;
-    Ok((out, worker.persisted_buffer_transcripts))
+    Ok(worker.persisted_buffer_transcripts)
 }
 
 enum LookupPartitionPoll {
@@ -15430,7 +15455,8 @@ impl Stream for ContigAnnotationStream {
                         let cache_source_type = ann.config.cache_source_type;
                         let persisted_seed = ann.worker.persisted_buffer_transcripts.clone();
                         let emit_bounds = ann.run.trim_bounds();
-                        let handle = tokio::task::spawn_blocking(move || {
+                        let (output, receiver) = tokio::sync::mpsc::channel(1);
+                        let task = tokio::task::spawn_blocking(move || {
                             annotate_window_owned(
                                 shared,
                                 colocated,
@@ -15439,9 +15465,13 @@ impl Stream for ContigAnnotationStream {
                                 projection,
                                 persisted_seed,
                                 emit_bounds,
+                                output,
                             )
                         });
-                        ann.inflight.push_back(handle);
+                        ann.inflight.push_back(PendingWindow {
+                            task,
+                            output: receiver,
+                        });
                         self.state = StreamState::AnnotatingContig(ann);
                         continue;
                     }
@@ -15539,10 +15569,7 @@ impl Stream for ContigAnnotationStream {
                     }
                 }
 
-                StreamState::AwaitingWindow {
-                    handle,
-                    annotation_state,
-                } => {
+                StreamState::AwaitingWindow { .. } => {
                     let StreamState::AwaitingWindow {
                         mut handle,
                         annotation_state: mut ann,
@@ -15550,7 +15577,32 @@ impl Stream for ContigAnnotationStream {
                     else {
                         unreachable!()
                     };
-                    match std::pin::Pin::new(&mut handle).poll(cx) {
+                    match handle.output.poll_recv(cx) {
+                        Poll::Ready(Some(batch)) => {
+                            let profile = ann.worker.shared.profile.clone();
+                            self.state = StreamState::AwaitingWindow {
+                                handle,
+                                annotation_state: ann,
+                            };
+                            // Finish draining the current window after LIMIT,
+                            // including its errors and persisted state, exactly
+                            // as when all its batches were materialized first.
+                            let remaining =
+                                fetch_limit.map(|limit| limit.saturating_sub(rows_emitted));
+                            if remaining == Some(0) {
+                                continue;
+                            }
+                            let batch = match remaining {
+                                Some(n) if batch.num_rows() > n => batch.slice(0, n),
+                                _ => batch,
+                            };
+                            self.rows_emitted += batch.num_rows();
+                            record_contig_profile(&profile, |profile| {
+                                profile.output_batches += 1;
+                                profile.output_rows += batch.num_rows();
+                            });
+                            return Poll::Ready(Some(Ok(batch)));
+                        }
                         Poll::Pending => {
                             self.state = StreamState::AwaitingWindow {
                                 handle,
@@ -15558,12 +15610,19 @@ impl Stream for ContigAnnotationStream {
                             };
                             return Poll::Pending;
                         }
-                        Poll::Ready(Ok(Ok((batches, persisted)))) => {
-                            ann.worker.persisted_buffer_transcripts = persisted;
-                            self.state = StreamState::DrainingWindow {
-                                batches,
+                        Poll::Ready(None) => {}
+                    }
+                    match std::pin::Pin::new(&mut handle.task).poll(cx) {
+                        Poll::Pending => {
+                            self.state = StreamState::AwaitingWindow {
+                                handle,
                                 annotation_state: ann,
                             };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(Ok(persisted))) => {
+                            ann.worker.persisted_buffer_transcripts = persisted;
+                            self.state = StreamState::AnnotatingContig(ann);
                             continue;
                         }
                         Poll::Ready(Ok(Err(e))) => {
@@ -15590,50 +15649,6 @@ impl Stream for ContigAnnotationStream {
                             continue;
                         }
                     }
-                }
-
-                StreamState::DrainingWindow {
-                    batches,
-                    annotation_state,
-                } => {
-                    if let Some(batch) = batches.pop_front() {
-                        let profile = annotation_state.worker.shared.profile.clone();
-                        // LIMIT pushdown: truncate or stop if we've reached the limit.
-                        if let Some(limit) = fetch_limit {
-                            let remaining = limit.saturating_sub(rows_emitted);
-                            if remaining == 0 {
-                                // Don't emit — fall through to the window-drained
-                                // path below, which transitions to AnnotatingContig.
-                                // The limit_reached check there triggers proper
-                                // cleanup (deregister ephemeral tables).
-                                continue;
-                            }
-                            if batch.num_rows() > remaining {
-                                self.rows_emitted += remaining;
-                                record_contig_profile(&profile, |profile| {
-                                    profile.output_batches += 1;
-                                    profile.output_rows += remaining;
-                                });
-                                return Poll::Ready(Some(Ok(batch.slice(0, remaining))));
-                            }
-                        }
-                        self.rows_emitted += batch.num_rows();
-                        record_contig_profile(&profile, |profile| {
-                            profile.output_batches += 1;
-                            profile.output_rows += batch.num_rows();
-                        });
-                        return Poll::Ready(Some(Ok(batch)));
-                    }
-                    // Window drained — back to AnnotatingContig for next window
-                    // (or cleanup if window_buffer is empty).
-                    let StreamState::DrainingWindow {
-                        annotation_state: ann,
-                        ..
-                    } = std::mem::replace(&mut self.state, StreamState::Done)
-                    else {
-                        unreachable!()
-                    };
-                    self.state = StreamState::AnnotatingContig(ann);
                 }
 
                 StreamState::AnnotatingRunPool(_) => {
@@ -21228,6 +21243,71 @@ mod tests {
             ]))],
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serial_window_outputs_precede_completion_and_preserve_order() {
+        let (output, receiver) = tokio::sync::mpsc::channel(1);
+        let (finish, wait_for_finish) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            output.blocking_send(tagged_batch(1)).unwrap();
+            output.blocking_send(tagged_batch(2)).unwrap();
+            wait_for_finish.blocking_recv().unwrap();
+            Ok(PersistedBufferTranscripts::new())
+        });
+        let mut pending = PendingWindow {
+            task,
+            output: receiver,
+        };
+        assert_eq!(pending.output.recv().await.unwrap(), tagged_batch(1));
+        assert_eq!(pending.output.recv().await.unwrap(), tagged_batch(2));
+        assert!(!pending.task.is_finished());
+        finish.send(()).unwrap();
+        assert!(pending.output.recv().await.is_none());
+        assert!((&mut pending.task).await.unwrap().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_serial_window_wakes_a_blocked_producer() {
+        let (output, receiver) = tokio::sync::mpsc::channel(1);
+        let (started, wait_for_start) = tokio::sync::oneshot::channel();
+        let (finished, wait_for_finish) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            output.blocking_send(tagged_batch(1)).unwrap();
+            started.send(()).unwrap();
+            let cancelled = output.blocking_send(tagged_batch(2)).is_err();
+            let _ = finished.send(cancelled);
+            Ok(PersistedBufferTranscripts::new())
+        });
+        let pending = PendingWindow {
+            task,
+            output: receiver,
+        };
+        wait_for_start.await.unwrap();
+        drop(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_finish)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serial_window_retains_errors_after_emitting_output() {
+        let (output, receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::task::spawn_blocking(move || {
+            output.blocking_send(tagged_batch(1)).unwrap();
+            Err(DataFusionError::Execution("window failed".into()))
+        });
+        let mut pending = PendingWindow {
+            task,
+            output: receiver,
+        };
+        assert_eq!(pending.output.recv().await.unwrap(), tagged_batch(1));
+        assert!(pending.output.recv().await.is_none());
+        let error = (&mut pending.task).await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("window failed"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
