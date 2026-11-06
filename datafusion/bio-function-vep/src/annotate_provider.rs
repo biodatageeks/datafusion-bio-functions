@@ -6182,10 +6182,14 @@ impl AnnotateProvider {
         let config = ContigAnnotationConfig {
             #[cfg(feature = "parquet-cache")]
             sift_page_budget: crate::parquet_cache::sift::decoded_pages::PageCacheBudget::from_env(
+                annotation_workers,
             )?,
             reference_budget: crate::cache_budget::CacheBudget::from_env(
                 "VEP_REFERENCE_CACHE_MB",
-                128,
+                // The indexed full translator is fast enough for serial work.
+                // Retaining reference payloads there increased chr17 peak RSS;
+                // parallel workers still benefit from sharing those derivations.
+                if annotation_workers > 1 { 128 } else { 0 },
             )?,
             vcf_table: self.vcf_table.clone(),
             options_json,
@@ -14492,17 +14496,23 @@ fn warm_up_worker_state(
 
 // This limits Arrow/VCF output allocations, not VEP input-buffer state.
 // Context preparation still sees the entire original 5,000-input-unit buffer.
-const ANNOTATION_OUTPUT_CHUNK_ROWS: usize = 256;
+const ANNOTATION_OUTPUT_CHUNK_ROWS: usize = 1024;
 
-fn annotation_output_chunks(batch: &RecordBatch) -> impl Iterator<Item = RecordBatch> + '_ {
+fn annotation_output_chunks(
+    batch: &RecordBatch,
+    annotation_workers: usize,
+) -> impl Iterator<Item = RecordBatch> + '_ {
+    // Serial output benefits from smaller transient formatter allocations.
+    // Parallel shard writers already bound output independently; subdividing
+    // their batches added work without a corresponding memory requirement.
+    let chunk_rows = if annotation_workers > 1 {
+        batch.num_rows().max(1)
+    } else {
+        ANNOTATION_OUTPUT_CHUNK_ROWS
+    };
     (0..batch.num_rows())
-        .step_by(ANNOTATION_OUTPUT_CHUNK_ROWS)
-        .map(|start| {
-            batch.slice(
-                start,
-                (batch.num_rows() - start).min(ANNOTATION_OUTPUT_CHUNK_ROWS),
-            )
-        })
+        .step_by(chunk_rows)
+        .map(move |start| batch.slice(start, (batch.num_rows() - start).min(chunk_rows)))
 }
 
 fn annotate_worker_window(
@@ -14570,7 +14580,10 @@ fn annotate_worker_window(
         // Keep the whole-buffer prepared context and persisted state intact.
         // Only split its stateless annotation/output work, so dense CSQ buffers
         // cannot force multi-hundred-megabyte formatter copies in one batch.
-        for batch in buffer_batches.iter().flat_map(annotation_output_chunks) {
+        for batch in buffer_batches
+            .iter()
+            .flat_map(|batch| annotation_output_chunks(batch, config.annotation_workers))
+        {
             // SIFT/PolyPhen predictions are fetched on demand by the transcript
             // engine (`lookup_sift_polyphen`), which only queries the store for
             // single-amino-acid substitutions and memoizes per transcript. Eagerly
@@ -21727,7 +21740,7 @@ mod tests {
             .map(|i| if i % 3 == 0 { "A,C,G" } else { "T" })
             .collect();
         let input = make_buffer_batch_many_with_alts("chr1", &starts, &alts);
-        let chunks: Vec<_> = annotation_output_chunks(&input).collect();
+        let chunks: Vec<_> = annotation_output_chunks(&input, 1).collect();
         assert_eq!(
             chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
             [
@@ -21744,7 +21757,10 @@ mod tests {
         );
         let original_grid = accumulate_boundaries(std::slice::from_ref(&input), 5000).unwrap();
         assert_eq!(accumulate_boundaries(&chunks, 5000).unwrap(), original_grid);
-        assert_eq!(annotation_output_chunks(&input.slice(0, 0)).count(), 0);
+        assert_eq!(annotation_output_chunks(&input.slice(0, 0), 1).count(), 0);
+        let parallel_chunks: Vec<_> = annotation_output_chunks(&input, 8).collect();
+        assert_eq!(parallel_chunks, vec![input.clone()]);
+        assert_eq!(annotation_output_chunks(&input.slice(0, 0), 8).count(), 0);
     }
 
     #[test]

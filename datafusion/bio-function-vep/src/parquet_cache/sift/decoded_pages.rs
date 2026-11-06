@@ -21,9 +21,12 @@ pub(crate) struct PageCacheBudget {
 }
 
 impl PageCacheBudget {
-    pub(crate) fn from_env() -> Result<Arc<Self>> {
+    pub(crate) fn from_env(annotation_workers: usize) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            payload: CacheBudget::from_env("VEP_SIFT_CACHE_MB", 128)?,
+            payload: CacheBudget::from_env(
+                "VEP_SIFT_CACHE_MB",
+                if annotation_workers > 1 { 256 } else { 128 },
+            )?,
             scratch: CacheBudget::new(2 * FILL_BYTES),
         }))
     }
