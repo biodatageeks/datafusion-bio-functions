@@ -84,6 +84,7 @@ struct FormattedVcfBatch {
     lines: usize,
     bytes: Vec<u8>,
     format_duration: Duration,
+    // Keep the body payload charged until the writer drops this batch.
     _memory: Option<crate::output_memory::Hold>,
 }
 

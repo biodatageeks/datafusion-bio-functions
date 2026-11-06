@@ -14996,6 +14996,90 @@ mod tests {
     }
 
     #[test]
+    fn production_reference_defaults_reuse_long_cds_across_prepared_contexts() {
+        use crate::cache_budget::{CacheBudget, reference_cache_default_mb};
+        use std::sync::atomic::Ordering;
+
+        let sequence = format!("ATG{}TAA", "GCT".repeat(10_000));
+        let end = 100 + sequence.len() as i64 - 1;
+        let transcripts = [tx(
+            "long",
+            "17",
+            100,
+            end,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(end),
+        )];
+        let translations = [translation(
+            "long",
+            Some(sequence.len()),
+            None,
+            None,
+            Some(&sequence),
+        )];
+        let exons = [exon("long", 1, 100, end)];
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift_and_semantics(
+            5000,
+            5000,
+            true,
+            crate::vep_semantics::VepSemantics::V116,
+        );
+
+        for workers in [1, 8] {
+            let budget = CacheBudget::new(reference_cache_default_mb(workers) * 1024 * 1024);
+            let shared =
+                SharedReferenceMemos::new(&transcripts, &translations, Arc::clone(&budget));
+            let zero_budget = CacheBudget::new(0);
+            let uncached =
+                SharedReferenceMemos::new(&transcripts, &translations, Arc::clone(&zero_budget));
+            assert_eq!(budget.used(), 0, "reference retention must remain lazy");
+
+            for offset in [3, 15_003, 29_997] {
+                let variant = var("17", 100 + offset, 100 + offset, "G", "A");
+                // Recreate preparation as successive biological buffers do. A
+                // bare context has its own fallback budget and would hide the
+                // production policy bug; both paths must use shared slots.
+                let prepared =
+                    PreparedContext::new(&transcripts, &exons, &translations, &[], &[], &[], &[])
+                        .with_shared_references(&shared);
+                let control =
+                    PreparedContext::new(&transcripts, &exons, &translations, &[], &[], &[], &[])
+                        .with_shared_references(&uncached);
+                let actual = engine.evaluate_variant_prepared(&variant, &prepared);
+                let expected = engine.evaluate_variant_prepared(&variant, &control);
+                assert!(!actual.is_empty());
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+            }
+
+            let memo = shared.slot(&transcripts[0], Some(&translations[0]));
+            assert_eq!(
+                memo.derivations.load(Ordering::Relaxed),
+                1,
+                "workers={workers}"
+            );
+            assert_eq!(
+                memo.local_codons.load(Ordering::Relaxed),
+                3,
+                "workers={workers}"
+            );
+            assert!(budget.used() > 0 && budget.peak() <= budget.limit());
+            let control_memo = uncached.slot(&transcripts[0], Some(&translations[0]));
+            assert_eq!(control_memo.derivations.load(Ordering::Relaxed), 0);
+            assert_eq!(control_memo.local_codons.load(Ordering::Relaxed), 0);
+            assert_eq!(zero_budget.used(), 0);
+            drop(memo);
+            drop(shared);
+            assert_eq!(
+                budget.used(),
+                0,
+                "last owner must release the payload charge"
+            );
+        }
+    }
+
+    #[test]
     fn reference_derivation_once_and_local_substitution_work_is_window_bounded() {
         use std::sync::atomic::Ordering;
         let sequence = format!("ATG{}TAA", "GCT".repeat(10_000));

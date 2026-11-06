@@ -5,6 +5,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use datafusion::common::{DataFusionError, Result};
 
+/// Accounted reference-payload budget selected when no override is supplied.
+pub(crate) fn reference_cache_default_mb(_annotation_workers: usize) -> usize {
+    // Serial annotation also reuses long reference sequences across variants.
+    // Admission is lazy and shared; this does not allocate 128 MiB per worker.
+    128
+}
+
 #[derive(Debug)]
 pub(crate) struct CacheBudget {
     limit: usize,

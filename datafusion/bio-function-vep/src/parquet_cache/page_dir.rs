@@ -136,7 +136,7 @@ impl PageDir {
         }
     }
 
-    /// Merged candidate page row-ranges covering any of `positions`.
+    /// Candidate page indices covering any of `positions`.
     fn resolve_pages(&self, positions: &[u64]) -> Vec<usize> {
         let mut pages: Vec<usize> = Vec::new();
         for &p in positions {
@@ -191,6 +191,7 @@ impl PageDir {
             .collect()
     }
 
+    /// Merged candidate page row-ranges covering any of `positions`.
     pub fn resolve_ranges(&self, positions: &[u64]) -> Vec<(u64, u64)> {
         let pages = self.resolve_pages(positions);
         // Merge adjacent page row-ranges.

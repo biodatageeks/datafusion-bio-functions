@@ -7,13 +7,17 @@ cache format or the annotation API.
 
 | Internal diagnostic setting | Default | Meaning |
 |---|---:|---|
-| `VEP_REFERENCE_CACHE_MB` | 0 at one worker; 128 MiB otherwise | Admission limit for newly owned reference CDS and peptide payloads |
+| `VEP_REFERENCE_CACHE_MB` | 128 MiB | Admission limit for newly owned reference CDS and peptide payloads |
 | `VEP_SIFT_CACHE_MB` | 128 MiB at one worker; 256 MiB otherwise | Admission limit for decoded prediction pages, their slots, and residency tables |
 
 The limits are shared across workers and active/prefetched contigs. They are
 ceilings, not eager allocations. Zero disables the corresponding reuse. Invalid
 or overflowing values return an error. A disabled-cache run is an ablation of
 the new implementation, not a reconstruction of the old implementation.
+
+Reference reuse is enabled at every worker count. Disabling it for serial
+annotation also disables local-codon translation and repeatedly translates long
+transcripts such as TTN. Explicit zero and custom limits remain supported.
 
 Reference slots distinguish the actual transcript and translation objects.
 Hydrated transcripts and translation-only overrides receive local slots instead
@@ -92,14 +96,14 @@ caused repeated eviction and decoding (about 121 GB of decoded pages) and was
 rejected despite exact output parity. Smaller payload limits do not guarantee
 lower process RSS when repeated decoding increases allocator churn.
 
-Serial annotation uses the indexed full translator without retaining reference
-CDS/peptide payloads by default. That policy was selected using an earlier chr17
+The earlier serial default used the indexed full translator without retaining
+reference CDS/peptide payloads. That policy was selected using an earlier chr17
 configuration: disabling reuse took 166.11 seconds and 4.23 GiB peak RSS, versus
-146.92 seconds and 5.10 GiB with reuse. Subsequent measurements on the current
+146.92 seconds and 5.10 GiB with reuse. Subsequent measurements on the bounded
 buffer implementation, below, no longer support that memory rationale. The
 zero budget also disables the local-codon optimization and penalizes long
-transcripts such as TTN. This remains a documented follow-up; the diagnostic
-cache override has not been promoted to a new default in this change.
+transcripts such as TTN. The serial-reference iteration below corrects this
+policy; it preserves the output-memory changes and explicit cache overrides.
 
 ## Parallel output lifetime diagnostics
 
@@ -185,30 +189,30 @@ so it is a timing reference rather than a correctness oracle. No whole-ClinVar
 result is claimed.
 
 
-### Additional chromosome comparisons and remaining limits (2026-11-06)
+### Earlier chromosome comparison before serial reference reuse (2026-11-06)
 
-Official vep-rs v0.5.0 and the current implementation, with identical normalized
+Official vep-rs v0.5.0 and engine `8fa75a3`, with identical normalized
 chromosome inputs, reference, worker counts, full annotation flags and plain VCF
 output. Each row is a median of three fresh processes after discarded warm-ups;
 validation is outside timing. The chr17/eight-worker row reuses the preceding
 paired session. The other rows were collected subsequently on the shared host.
 
-| Chromosome | Workers | Current time | vep-rs time | Current peak RSS | vep-rs peak RSS |
+| Chromosome | Workers | Earlier vepyr time | vep-rs time | Earlier vepyr peak RSS | vep-rs peak RSS |
 |---|---:|---:|---:|---:|---:|
 | 17 | 1 | 144.69 s | 210.73 s | 3.154 GiB | 3.782 GiB |
 | 17 | 8 | 29.16 s | 33.06 s | 4.159 GiB | 4.198 GiB |
 | 2 | 1 | 383.39 s | 313.19 s | 3.448 GiB | 3.948 GiB |
 | 2 | 8 | 138.74 s | 49.84 s | 4.883 GiB | 4.072 GiB |
 
-All current outputs retain original body digests and input row identity/order.
+All outputs in this comparison retain original body digests and input row identity/order.
 Chr2 contains 401,230 records; its body MD5 is
 `4df6ae8cdc714236b95943abd465752d`. Competitor outputs reproduce their own
 body digests across repetitions and worker counts. Biological coverage differs,
 so these timings do not establish cross-engine annotation equivalence.
 
-Two limitations remain:
+This comparison identified two limitations:
 
-- The serial reference-cache default is too broad. On the same 1,000-record TTN
+- The zero serial reference-cache default disables useful work. On the same 1,000-record TTN
   block, three-run medians were 6.80 s before the output-memory change, 6.83 s
   after it, 4.93 s with the existing `VEP_REFERENCE_CACHE_MB=128` override, and
   4.56 s for vep-rs. The vepyr arms had effectively equal peak RSS and exact
@@ -227,9 +231,9 @@ Two limitations remain:
 One exploratory whole-chromosome run each with the reference-cache override
 produced 130.72 s / 3.006 GiB on chr17 and 290.10 s / 3.216 GiB on chr2, with
 exact original body and row-order matches. These are single diagnostic runs,
-not acceptance medians or a changed production default. Repeat paired controls
-before choosing the follow-up cache policy. Neither these experiments nor the
-parallel scheduling diagnosis changes the implementation in this PR.
+not acceptance medians. The subsequent serial-reference iteration uses fresh
+paired controls to validate the production default. The parallel scheduling
+diagnosis remains an unimplemented follow-up.
 
 The host was shared, including intermittent external CPU activity. All measured
 runs were retained. A requested diagnostic paused orchestration only after a
@@ -237,7 +241,60 @@ timed child exited, and a disk guard stopped the queue before chr2/eight-worker
 measurements; the pending case resumed after cache cleanup. No timed process
 was suspended and no performance or disk thresholds were relaxed.
 
-Local verification for the implementation: 1,631 Rust tests passed (3 ignored),
+Local verification for that snapshot: 1,631 Rust tests passed (3 ignored),
 2,635 Python tests passed (10 skipped, 1 expected failure), and pre-commit checks
 passed, including Clippy. Full-input validation after these changes remains
 pending; no whole-ClinVar performance or parity claim is made.
+
+## Serial reference-default correction (2026-11-06)
+
+Serial annotation now enables the existing bounded reference memo and local-codon translation. The default is a lazy 128 MiB admission budget shared across the execution, including at one worker. Explicit zero/custom overrides and biological fallbacks are unchanged. The previous serial default was zero.
+
+### Measurements
+
+Three fresh-process measurements per engine after a discarded warm-up, with rotating engine order. Same normalized input, full annotation, reference and plain VCF output on the shared macOS arm64 host. Process startup is included; digest and ordering validation is outside timing. Candidate runs leave `VEP_REFERENCE_CACHE_MB` unset. Every observation is retained.
+
+| Input | Previous vepyr | Optimized vepyr | vep-rs v0.5.0 | Previous RAM | Optimized RAM | vep-rs RAM |
+|---|---:|---:|---:|---:|---:|---:|
+| Chr2, 1 worker | 368.86 s | 279.45 s | 317.38 s | 3.469 GiB | 3.623 GiB | 3.958 GiB |
+| Chr17, 1 worker | 140.33 s | 117.61 s | 207.23 s | 3.071 GiB | 3.147 GiB | 3.791 GiB |
+
+- Chr2: 24.2% faster than the previous default and 12.0% faster than vep-rs. Peak RAM changes +4.4% (+157.9 MiB) relative to our baseline and -8.5% relative to vep-rs.
+- Chr17: 16.2% faster than the previous default and 43.2% faster than vep-rs. Peak RAM changes +2.5% (+77.1 MiB) relative to our baseline and -17.0% relative to vep-rs.
+
+### Verification
+
+- Rust: 1,632 passed, 3 ignored. Local Python 3.12.8: 2,635 passed, 10 skipped, 1 expected failure. The new long-CDS production-default regression failed before the policy correction and passed after it. Implementation formatting and Clippy checks passed.
+- Exact archived output-body digests and input record ordering passed for every run: ClinVar chr2 has 401,230 records, MD5 `4df6ae8cdc714236b95943abd465752d`; chr17 has 277,114, MD5 `d2f003d60f8c85a91dbc2247d21d855a`.
+- Dense ClinVar chr17 and sparse HG002 chr17 were also compared at one and eight workers with the unchanged phase (+5%), wall/RSS (+10%) gates. Sparse output retains 108,376 records and MD5 `927aa175d903867883ca3cf5a5a80510`.
+- Standard gate verdicts (0 means pass): `{'dense-1': 1, 'sparse-1': 0, 'dense-2': 0, 'sparse-2': 0}`. The final paired attempt was 2. Any initial failures remain in the evidence; no thresholds were changed.
+- vep-rs reproduces its own output digests. Its regulatory and edited RefSeq coverage differs, so the timing comparison is not a cross-engine parity claim.
+
+### Provenance and remaining scope
+
+A disk guard stopped orchestration between completed measurements before the last chr17 round. After inactive cache cleanup, only the three pending runs resumed in their original order. The first 21 observation files were preserved by SHA256; no timed process was interrupted or result discarded. The 32 GiB disk guard was unchanged.
+
+Native measurement build: Rust 1.91.1, `RUSTFLAGS="-C target-cpu=native" uv sync --reinstall-package vepyr`. Candidate extension SHA256: `c2ef6a305793e84228e7065a46310b027d73b78a1d84449509f6c7664ce0a6f1`. Measured source parent: `5a62b9cf30b4ab5f13a8cebd98a6fef2a50d91cf`; the exact patch and file hashes are archived. Later edits change comments and documentation only.
+
+Formats stays at `e0379fb28a0d4d74f8da4c9cbd357182361349f9`; cache revision is `ac2c8ad979ad063816368b0720e6e4501d64a3f3` (VEP 116 GRCh38 merged). Cache layout and the Python API are unchanged.
+
+This iteration changes the serial reference-cache policy. Chr2 parallel scheduling remains a separate issue: the earlier eight-worker snapshot was 138.74 s versus vep-rs 49.84 s. Whole-protein copying during HGVS preparation is another unimplemented serial opportunity; no gain is claimed for it.
+
+No whole-ClinVar validation was run. Memory admission limits cover selected payloads, not total RSS.
+
+### Standard regression controls
+
+These traced controls report annotation time, separately from the process timings and official vep-rs context above. Each arm discards an eight-worker warm-up, then measures eight and one workers. The table uses the final complete paired attempt; all earlier attempts remain in the JSON.
+
+| Input | Workers | Baseline annotation | Candidate annotation | Baseline peak RSS | Candidate peak RSS |
+|---|---:|---:|---:|---:|---:|
+| dense chr17 | 1 | 145.59 s | 124.03 s | 3.103 GiB | 3.131 GiB |
+| dense chr17 | 8 | 28.67 s | 29.64 s | 4.323 GiB | 4.295 GiB |
+| sparse chr17 | 1 | 7.80 s | 7.78 s | 2.021 GiB | 1.971 GiB |
+| sparse chr17 | 8 | 2.51 s | 2.48 s | 2.832 GiB | 2.815 GiB |
+
+Initial gate `dense-1` failed and is retained:
+
+- `8/context/done/elapsed_ms                       144.2        199.7   +38.5%  <-- REGRESSION`
+- `8/context/transcripts_done/elapsed_ms           364.2        388.5    +6.7%  <-- REGRESSION`
+- `8/prefetch/data_done/elapsed_ms                 551.2        651.0   +18.1%  <-- REGRESSION`

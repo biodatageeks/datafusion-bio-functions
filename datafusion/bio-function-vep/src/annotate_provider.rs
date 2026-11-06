@@ -6186,10 +6186,9 @@ impl AnnotateProvider {
             )?,
             reference_budget: crate::cache_budget::CacheBudget::from_env(
                 "VEP_REFERENCE_CACHE_MB",
-                // The indexed full translator is fast enough for serial work.
-                // Retaining reference payloads there increased chr17 peak RSS;
-                // parallel workers still benefit from sharing those derivations.
-                if annotation_workers > 1 { 128 } else { 0 },
+                // Reuse reference derivations and local-codon translation in
+                // serial annotation as well as across parallel workers.
+                crate::cache_budget::reference_cache_default_mb(annotation_workers),
             )?,
             vcf_table: self.vcf_table.clone(),
             options_json,
@@ -18518,12 +18517,15 @@ mod tests {
     }
 
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
+        let annotation_workers = 1;
         ContigAnnotationConfig {
             #[cfg(feature = "parquet-cache")]
             sift_page_budget: crate::parquet_cache::sift::decoded_pages::PageCacheBudget::new(
                 256 * 1024 * 1024,
             ),
-            reference_budget: crate::cache_budget::CacheBudget::new(128 * 1024 * 1024),
+            reference_budget: crate::cache_budget::CacheBudget::new(
+                crate::cache_budget::reference_cache_default_mb(annotation_workers) * 1024 * 1024,
+            ),
             vcf_table: "vcf".to_string(),
             options_json: None,
             cache_columns: Vec::new(),
@@ -18546,7 +18548,7 @@ mod tests {
             output_needs: Arc::new(OutputNeeds::all()),
             needs_transcript_context: true,
             fetch_limit: None,
-            annotation_workers: 1,
+            annotation_workers,
             pick_flags: PickFlags::default(),
             #[cfg(feature = "parquet-cache")]
             cache_root: None,
