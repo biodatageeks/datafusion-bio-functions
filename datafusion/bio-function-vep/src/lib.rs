@@ -58,6 +58,7 @@ pub mod hgvs;
 pub mod lookup_provider;
 pub mod miss_worklist;
 pub(crate) mod motif_matrix;
+pub(crate) mod output_memory;
 #[cfg(feature = "parquet-cache")]
 pub mod parquet_cache;
 pub mod partitioned_cache;

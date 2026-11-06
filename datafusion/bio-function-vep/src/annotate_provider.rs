@@ -10563,6 +10563,8 @@ struct ContigPipelineProfile {
     lookup_wait: Duration,
     hydration: Duration,
     annotation_compute: Duration,
+    /// Included in annotation_compute; shard formatting/writing or callback wait.
+    output_emission: Duration,
     input_buffer: Duration,
     variant_bounds: Duration,
     transcript_window: Duration,
@@ -10591,7 +10593,7 @@ struct ContigPipelineProfile {
 impl ContigPipelineProfile {
     fn summary_line(&self, chrom: &str) -> String {
         format!(
-            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} prepare_total={:.3}s prepare_setup={:.3}s prepare_shared_ctx={:.3}s context_load={:.3}s context_tx_scan={:.3}s context_tx={:.3}s context_exons_scan={:.3}s context_exons={:.3}s context_tl_scan={:.3}s context_tl={:.3}s context_reg_scan={:.3}s context_reg={:.3}s context_motif_scan={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s run_pool_runs={} head_wait={:.3}s",
+            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} prepare_total={:.3}s prepare_setup={:.3}s prepare_shared_ctx={:.3}s context_load={:.3}s context_tx_scan={:.3}s context_tx={:.3}s context_exons_scan={:.3}s context_exons={:.3}s context_tl_scan={:.3}s context_tl={:.3}s context_reg_scan={:.3}s context_reg={:.3}s context_motif_scan={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s run_pool_runs={} head_wait={:.3}s output_emission={:.3}s",
             self.lookup_partitions,
             self.lookup_batches,
             self.lookup_buffered_batches_max,
@@ -10630,6 +10632,7 @@ impl ContigPipelineProfile {
             self.ordered_drain_wait.as_secs_f64(),
             self.run_pool_runs,
             self.head_wait.as_secs_f64(),
+            self.output_emission.as_secs_f64(),
         )
     }
 }
@@ -12906,6 +12909,45 @@ enum RunOutput {
 }
 
 impl RunOutput {
+    /// Hydrate a biological window once, then consume shard output inline.
+    /// The generic batch stream keeps its asynchronous admission protocol.
+    async fn annotate_window(
+        &mut self,
+        worker: &mut AnnotationWorkerState,
+        window: &[RecordBatch],
+        cache_source_type: CacheSourceType,
+        projection: Option<&[usize]>,
+        emit_bounds: Option<&[RunBounds]>,
+    ) -> Result<usize> {
+        match self {
+            RunOutput::Shard { shard, .. } => run_maybe_block_in_place(|| {
+                hydrate_worker_window(worker, window, cache_source_type)?;
+                let mut rows = 0;
+                annotate_worker_window_with_policy(
+                    worker,
+                    window,
+                    projection,
+                    emit_bounds,
+                    OutputChunkPolicy::Shard,
+                    |batch| {
+                        let n = batch.num_rows();
+                        shard.write_batch(batch)?;
+                        rows += n;
+                        Ok(())
+                    },
+                )?;
+                Ok(rows)
+            }),
+            RunOutput::Batches { .. } => {
+                let out = run_maybe_block_in_place(|| {
+                    hydrate_worker_window(worker, window, cache_source_type)?;
+                    annotate_worker_window(worker, window, projection, emit_bounds)
+                })?;
+                self.write_all(out).await
+            }
+        }
+    }
+
     /// Write one window's annotated batches; returns the rows written. The
     /// shard write is blocking IO (formatting + compression) and runs under
     /// `block_in_place`; the pool write awaits the output budget first.
@@ -13048,16 +13090,15 @@ async fn annotate_lookup_run(
         while window_buffer_input_units(&worker.window_buffer) >= input_buffer_size {
             let window = drain_window_input_units(&mut worker.window_buffer, input_buffer_size);
             let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
-            let out = run_maybe_block_in_place(|| -> Result<VecDeque<RecordBatch>> {
-                hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-                annotate_worker_window(
+            stats.output_rows += output
+                .annotate_window(
                     &mut worker,
                     &window,
+                    cache_source_type,
                     projection.as_deref(),
                     emit_bounds.as_deref(),
                 )
-            })?;
-            stats.output_rows += output.write_all(out).await?;
+                .await?;
             // Report annotated input rows so the sink's progress bar advances live.
             stats.input_rows += window_input_rows;
             output.window_done(window_input_rows);
@@ -13079,18 +13120,15 @@ async fn annotate_lookup_run(
     worker.lookup_done = true;
     let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
     let window_input_rows: usize = window.iter().map(|b| b.num_rows()).sum();
-    let out = run_maybe_block_in_place(|| -> Result<VecDeque<RecordBatch>> {
-        if !window.is_empty() {
-            hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-        }
-        annotate_worker_window(
+    stats.output_rows += output
+        .annotate_window(
             &mut worker,
             &window,
+            cache_source_type,
             projection.as_deref(),
             emit_bounds.as_deref(),
         )
-    })?;
-    stats.output_rows += output.write_all(out).await?;
+        .await?;
     stats.input_rows += window_input_rows;
     output.window_done(window_input_rows);
     if profiling_enabled() {
@@ -14502,18 +14540,28 @@ fn warm_up_worker_state(
 // This limits Arrow/VCF output allocations, not VEP input-buffer state.
 // Context preparation still sees the entire original 5,000-input-unit buffer.
 const ANNOTATION_OUTPUT_CHUNK_ROWS: usize = 1024;
+// Shards consume synchronously. Tune their formatter allocation size separately
+// from the serial queue, preserving the 5,000-input-unit biological window.
+const SHARD_OUTPUT_CHUNK_ROWS: usize = 640;
+
+#[derive(Clone, Copy)]
+enum OutputChunkPolicy {
+    /// The consumer releases each output before the next annotation call.
+    Consumed,
+    /// Inline VCF formatting with an independently measured chunk size.
+    Shard,
+    /// Preserve the batch-stream path's existing async budget behavior.
+    Buffered,
+}
 
 fn annotation_output_chunks(
     batch: &RecordBatch,
-    annotation_workers: usize,
+    policy: OutputChunkPolicy,
 ) -> impl Iterator<Item = RecordBatch> + '_ {
-    // Serial output benefits from smaller transient formatter allocations.
-    // Parallel shard writers already bound output independently; subdividing
-    // their batches added work without a corresponding memory requirement.
-    let chunk_rows = if annotation_workers > 1 {
-        batch.num_rows().max(1)
-    } else {
-        ANNOTATION_OUTPUT_CHUNK_ROWS
+    let chunk_rows = match policy {
+        OutputChunkPolicy::Consumed => ANNOTATION_OUTPUT_CHUNK_ROWS,
+        OutputChunkPolicy::Shard => SHARD_OUTPUT_CHUNK_ROWS,
+        OutputChunkPolicy::Buffered => batch.num_rows().max(1),
     };
     (0..batch.num_rows())
         .step_by(chunk_rows)
@@ -14527,10 +14575,22 @@ fn annotate_worker_window(
     emit_bounds: Option<&[RunBounds]>,
 ) -> Result<VecDeque<RecordBatch>> {
     let mut out = VecDeque::with_capacity(window_batches.len());
-    annotate_worker_window_with_output(worker, window_batches, projection, emit_bounds, |batch| {
-        out.push_back(batch);
-        Ok(())
-    })?;
+    let policy = if worker.shared.config.annotation_workers > 1 {
+        OutputChunkPolicy::Buffered
+    } else {
+        OutputChunkPolicy::Consumed
+    };
+    annotate_worker_window_with_policy(
+        worker,
+        window_batches,
+        projection,
+        emit_bounds,
+        policy,
+        |batch| {
+            out.push_back(batch);
+            Ok(())
+        },
+    )?;
     Ok(out)
 }
 
@@ -14539,6 +14599,24 @@ fn annotate_worker_window_with_output(
     window_batches: &[RecordBatch],
     projection: Option<&[usize]>,
     emit_bounds: Option<&[RunBounds]>,
+    emit: impl FnMut(RecordBatch) -> Result<()>,
+) -> Result<()> {
+    annotate_worker_window_with_policy(
+        worker,
+        window_batches,
+        projection,
+        emit_bounds,
+        OutputChunkPolicy::Consumed,
+        emit,
+    )
+}
+
+fn annotate_worker_window_with_policy(
+    worker: &mut AnnotationWorkerState,
+    window_batches: &[RecordBatch],
+    projection: Option<&[usize]>,
+    emit_bounds: Option<&[RunBounds]>,
+    policy: OutputChunkPolicy,
     mut emit: impl FnMut(RecordBatch) -> Result<()>,
 ) -> Result<()> {
     let annotation_started = Instant::now();
@@ -14600,7 +14678,7 @@ fn annotate_worker_window_with_output(
         // cannot force multi-hundred-megabyte formatter copies in one batch.
         for batch in buffer_batches
             .iter()
-            .flat_map(|batch| annotation_output_chunks(batch, config.annotation_workers))
+            .flat_map(|batch| annotation_output_chunks(batch, policy))
         {
             // SIFT/PolyPhen predictions are fetched on demand by the transcript
             // engine (`lookup_sift_polyphen`), which only queries the store for
@@ -14649,16 +14727,24 @@ fn annotate_worker_window_with_output(
                 continue;
             }
 
-            if let Some(indices) = projection {
+            let annotated = if let Some(indices) = projection {
                 let projection_started = Instant::now();
                 let projected = annotated.project(indices)?;
+                // Projection shares arrays. Release the original owner before
+                // the sink drops its batch and allocates the formatted body.
+                drop(annotated);
                 record_contig_profile(&profile, |profile| {
                     profile.projection += projection_started.elapsed();
                 });
-                emit(projected)?;
+                projected
             } else {
-                emit(annotated)?;
-            }
+                annotated
+            };
+            let emission_started = Instant::now();
+            emit(annotated)?;
+            record_contig_profile(&profile, |profile| {
+                profile.output_emission += emission_started.elapsed();
+            });
         }
     }
     record_contig_profile(&profile, |profile| {
@@ -21812,6 +21898,225 @@ mod tests {
         .unwrap()
     }
 
+    fn output_lifetime_input(rows: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"; rows])),
+                Arc::new(Int64Array::from(
+                    (0..rows).map(|i| 100 + (i / 5) as i64).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    (0..rows).map(|i| 100 + (i / 5) as i64).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec!["G"; rows])),
+                Arc::new(StringArray::from(vec!["A,C,T"; rows])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn consumed_output_bounds_parallel_batches_before_annotation() {
+        let mut shared = minimal_shared_contig_annotation_context();
+        Arc::get_mut(&mut shared).unwrap().config.annotation_workers = 8;
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        worker.lookup_done = true;
+        let source = output_lifetime_input((2 * SHARD_OUTPUT_CHUNK_ROWS + 7).max(4000));
+        let mut columns = source.columns().to_vec();
+        columns[4] = Arc::new(StringArray::from(
+            (0..source.num_rows())
+                .map(|i| if i % 3 == 0 { "A,C,T" } else { "A" })
+                .collect::<Vec<_>>(),
+        ));
+        let input = RecordBatch::try_new(source.schema(), columns).unwrap();
+        assert!(batch_input_units(&input) > VEP_INPUT_BUFFER_SIZE);
+        let mut rows = 0;
+        let mut chunks = 0;
+        annotate_worker_window_with_policy(
+            &mut worker,
+            &[input.clone()],
+            Some(&[1, 5]),
+            None,
+            OutputChunkPolicy::Shard,
+            |batch| {
+                assert!(
+                    batch.num_rows() <= SHARD_OUTPUT_CHUNK_ROWS,
+                    "the consumer must receive bounded batches, not an entire parallel window"
+                );
+                rows += batch.num_rows();
+                chunks += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(rows, input.num_rows());
+        assert!(chunks > 2);
+    }
+
+    #[test]
+    fn consumed_output_projection_releases_csq_backing_allocation_inside_sink() {
+        let shared = minimal_shared_contig_annotation_context();
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        worker.lookup_done = true;
+        let mut emitted = 0;
+        annotate_worker_window_with_output(&mut worker, &[output_lifetime_input(3)], Some(&[1, 5]), None, |batch| {
+            let csq = batch.column(1).as_string::<i32>().values().clone();
+            assert!(!csq.is_empty(), "probe the newly allocated CSQ payload, not an empty buffer");
+            drop(batch);
+            assert_eq!(csq.strong_count(), 1,
+                "only the test probe may retain the backing buffer after the sink drops its batch");
+            emitted += 1;
+            Ok(())
+        }).unwrap();
+        assert_eq!(emitted, 1);
+    }
+
+    #[test]
+    fn consumed_output_sink_error_precedes_later_annotation_error() {
+        let mut shared = minimal_shared_contig_annotation_context();
+        Arc::get_mut(&mut shared).unwrap().config.annotation_workers = 8;
+        let good = output_lifetime_input(ANNOTATION_OUTPUT_CHUNK_ROWS);
+        // Bounds and ALT accounting remain valid, but annotation cannot find REF.
+        let bad = good.project(&[0, 1, 2, 4]).unwrap();
+        let windows = vec![good, bad];
+        let mut control = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+        control.lookup_done = true;
+        let later =
+            annotate_worker_window_with_output(&mut control, &windows, None, None, |_| Ok(()))
+                .expect_err("the later batch must fail annotation, making this a nonvacuous probe");
+        assert!(later.to_string().contains("ref"), "{later}");
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        worker.lookup_done = true;
+        let mut calls = 0;
+        let error = annotate_worker_window_with_output(&mut worker, &windows, None, None, |_| {
+            calls += 1;
+            Err(DataFusionError::Execution("sink-stop".into()))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("sink-stop"), "{error}");
+        assert_eq!(calls, 1);
+    }
+
+    async fn check_shard_consumes_full_partial_and_empty_windows() {
+        use datafusion_bio_format_vcf::VcfCompressionType;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for rows in [2 * ANNOTATION_OUTPUT_CHUNK_ROWS + 7, 0] {
+            let mut shared = minimal_shared_contig_annotation_context();
+            let vcf_schema = Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+                Field::new("id", DataType::Utf8, false),
+                Field::new("filter", DataType::Utf8, false),
+                Field::new("qual", DataType::Float64, true),
+            ]);
+            let source = output_lifetime_input(rows);
+            let input = RecordBatch::try_new(
+                Arc::new(vcf_schema.clone()),
+                vec![
+                    Arc::clone(source.column(0)),
+                    datafusion::arrow::compute::cast(source.column(1), &DataType::UInt32).unwrap(),
+                    datafusion::arrow::compute::cast(source.column(2), &DataType::UInt32).unwrap(),
+                    Arc::clone(source.column(3)),
+                    Arc::clone(source.column(4)),
+                    Arc::new(StringArray::from(vec!["."; rows])),
+                    Arc::new(StringArray::from(vec!["PASS"; rows])),
+                    Arc::new(Float64Array::from(vec![None; rows])),
+                ],
+            )
+            .unwrap();
+            let context = Arc::get_mut(&mut shared).unwrap();
+            context.config.annotation_workers = 8;
+            context.tmp_provider = Arc::new(
+                AnnotateProvider::new(
+                    Arc::new(SessionContext::new()),
+                    "vcf".into(),
+                    String::new(),
+                    AnnotationBackend::Parquet,
+                    CacheSourceType::Ensembl,
+                    None,
+                    vcf_schema,
+                )
+                .unwrap(),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("body.vcf");
+            let shard = crate::vcf_sink::VcfBodyShardWriter::create(
+                &path,
+                Arc::new(vec!["CSQ".into()]),
+                Arc::new(vec![]),
+                Arc::new(vec![]),
+                false,
+                Arc::from("VCFv4.2"),
+                VcfCompressionType::Plain,
+            )
+            .unwrap();
+            let progress = Arc::new(AtomicUsize::new(0));
+            let mut output = RunOutput::Shard {
+                shard: Box::new(shard),
+                rows_done: Arc::clone(&progress),
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            if rows > 0 {
+                tx.send(Ok(LookupBatchMessage {
+                    partition_id: 0,
+                    batch_id: 0,
+                    batch: input,
+                    colocated_delta: HashMap::new(),
+                }))
+                .await
+                .unwrap();
+            }
+            drop(tx);
+            let stats = annotate_lookup_run(
+                shared,
+                rx,
+                CacheSourceType::Merged,
+                Some((0..9).collect()),
+                VEP_INPUT_BUFFER_SIZE,
+                None,
+                None,
+                &mut output,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stats.input_rows, rows);
+            assert_eq!(stats.output_rows, rows);
+            assert_eq!(progress.load(Ordering::Relaxed), rows);
+            assert!(stats.lookup_closed);
+            if let RunOutput::Shard { shard, .. } = output {
+                shard.finish().unwrap();
+            }
+            let body = std::fs::read_to_string(path).unwrap();
+            assert_eq!(body.lines().count(), rows);
+            for (i, line) in body.lines().enumerate() {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                assert_eq!(fields[1].parse::<i64>().unwrap(), 100 + (i / 5) as i64);
+                assert_eq!(fields[4], "A,C,T");
+                assert!(fields[7].contains("CSQ="));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumed_shard_windows_current_thread() {
+        check_shard_consumes_full_partial_and_empty_windows().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consumed_shard_windows_multi_thread() {
+        check_shard_consumes_full_partial_and_empty_windows().await;
+    }
+
     #[test]
     fn output_chunks_preserve_multiallelic_rows_ties_and_input_buffer_grid() {
         let rows = 2 * ANNOTATION_OUTPUT_CHUNK_ROWS + 7;
@@ -21820,7 +22125,8 @@ mod tests {
             .map(|i| if i % 3 == 0 { "A,C,G" } else { "T" })
             .collect();
         let input = make_buffer_batch_many_with_alts("chr1", &starts, &alts);
-        let chunks: Vec<_> = annotation_output_chunks(&input, 1).collect();
+        let chunks: Vec<_> =
+            annotation_output_chunks(&input, OutputChunkPolicy::Consumed).collect();
         assert_eq!(
             chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
             [
@@ -21837,10 +22143,17 @@ mod tests {
         );
         let original_grid = accumulate_boundaries(std::slice::from_ref(&input), 5000).unwrap();
         assert_eq!(accumulate_boundaries(&chunks, 5000).unwrap(), original_grid);
-        assert_eq!(annotation_output_chunks(&input.slice(0, 0), 1).count(), 0);
-        let parallel_chunks: Vec<_> = annotation_output_chunks(&input, 8).collect();
+        assert_eq!(
+            annotation_output_chunks(&input.slice(0, 0), OutputChunkPolicy::Consumed).count(),
+            0
+        );
+        let parallel_chunks: Vec<_> =
+            annotation_output_chunks(&input, OutputChunkPolicy::Buffered).collect();
         assert_eq!(parallel_chunks, vec![input.clone()]);
-        assert_eq!(annotation_output_chunks(&input.slice(0, 0), 8).count(), 0);
+        assert_eq!(
+            annotation_output_chunks(&input.slice(0, 0), OutputChunkPolicy::Buffered).count(),
+            0
+        );
     }
 
     #[test]

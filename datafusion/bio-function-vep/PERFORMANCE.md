@@ -75,13 +75,14 @@ vep-rs v0.5.0 reference on the same input took 32.72 seconds; its annotation
 feature coverage differs, so it is a timing reference, not a parity oracle.
 These are one measured run after warm-up, not whole-ClinVar results.
 
-At one worker, output is subdivided into at most 1,024 input rows per Arrow
-batch after preparing the full VEP input-buffer context. Parallel annotation
-retains the original output batches. This does not change the 5,000-input-unit
-state transitions, transcript hydration, HGNC persistence, warm-up or partition
-seams. Serial annotation sends each completed output batch through a bounded
-one-batch queue instead of retaining every output batch for the whole input
-buffer. The next buffer still waits for the current buffer's completed carry
+Serial output uses at most 1,024 input rows per Arrow batch; parallel VCF shards
+use at most 640 rows. Both prepare the full VEP input-buffer context first.
+Each shard formats and writes a completed batch before annotating the next one,
+so a whole window's annotated output is no longer retained. The generic parallel
+RecordBatch stream preserves its existing batch and asynchronous budget policy.
+This does not change the 5,000-input-unit state transitions, transcript hydration,
+HGNC persistence, warm-up or partition seams. Serial annotation sends each
+completed output batch through its existing bounded one-batch queue. The next buffer still waits for the current buffer's completed carry
 state. Dropping the consumer closes the queue and wakes a blocked producer.
 One very large record remains unbounded in bytes; batch count is not a byte cap.
 
@@ -97,3 +98,86 @@ took 166.11 seconds and 4.23 GiB peak RSS, versus 146.92 seconds and 5.10 GiB wi
 reuse; both matched the original output exactly. The fresh original-binary
 serial baseline took 793.62 seconds and 4.37 GiB. These measurements motivate
 the default; they do not establish memory bounds or whole-ClinVar performance.
+
+## Parallel output lifetime diagnostics
+
+Projection shares Arrow arrays. The original batch must be dropped before its
+projected output reaches the sink; otherwise the formatter cannot release CSQ
+storage before writing owned lines or allocating a contiguous output body. Regression tests inspect
+the backing buffer's ownership after the consumer drops its projected batch,
+and exercise bounded chunks, error short-circuiting, full/partial/empty shard
+windows, multiallelic ties, progress and both Tokio runtime flavors.
+
+Set `VEP_OUTPUT_MEMORY=1` in a fresh process for formatter capacity diagnostics.
+The log reports simultaneous CSQ, line-vector and body capacity estimates across
+active workers, including a concurrent combined peak. CSQ is an upper bound if
+another caller retains an Arrow alias; line capacity is conservatively charged
+through conversion. Engine builders, context/cache metadata and allocator
+retention are outside this scope. Do not add separate worker or category peaks
+to infer a simultaneous total, or use these counters as a process RSS bound.
+Diagnostics are disabled for performance acceptance runs.
+
+The pipeline profile's `annotate` span remains inclusive of its output callback.
+`output_emission` reports the callback portion separately; inline shard writing
+therefore appears inside `annotate` as well as its existing formatter trace.
+The established VCF trace boundaries and performance gate are unchanged.
+
+The acceptance rule for this work is lower peak RSS with no repeatable slowdown
+versus the preserved native Stage G binary, with exact output bytes and order.
+The standard gate is a coarse guard; its tolerances do not authorize exchanging
+annotation speed for lower memory. Whole-ClinVar validation requires separate
+user approval after the chromosome-17 implementation loop.
+
+### Chromosome-17 memory measurements (2026-11-06)
+
+The 640-row bulk-write implementation passed the original phase/time/RSS gate
+on dense ClinVar and sparse HG002 chr17, at one and eight workers, against fresh
+Stage G controls. It also passed the no-slowdown application comparison. No
+thresholds were relaxed.
+
+| Engine | Median application time | Median peak RSS |
+|---|---:|---:|
+| Stage G baseline | 29.34 s | 6.561 GiB |
+| 640-row inline bulk writes | 29.16 s | 4.159 GiB |
+| Official vep-rs v0.5.0 | 33.06 s | 4.198 GiB |
+
+Median RSS fell 36.6%, with a 0.6% lower median runtime. All three paired
+candidate-minus-baseline time deltas were negative (-0.21, -0.26, -0.02 s).
+Candidate times ranged from 27.92 to 29.32 s; Stage G from 28.13 to 29.42 s.
+The small timing gain should be read as preserved throughput, not a claim of
+statistical significance. Relative to vep-rs, median time was 11.8% lower and
+RSS about 0.9% lower. These are local chr17 measurements, not a guarantee for
+other inputs or tail latency.
+
+The dense eight-worker control reduced annotation time by 2.2% and peak RSS by
+38.0%. Its formatting phase increased 0.9%, within the existing 5% limit.
+The one-worker control was 5.2% faster, with 4.4% higher peak RSS (within the
+10% guard); no serial memory reduction is claimed. Sparse controls were 0.4%
+and 2.1% faster at one/eight workers, with RSS 0.5% and 5.2% lower.
+
+Earlier experiments are retained as rejected or incomplete evidence. Each row
+has its own paired baseline and official vep-rs v0.5.0 reference. Times are
+application medians including startup; output validation is outside timers.
+The 2,048-row row has six measurements per arm; other rows have three.
+
+| Experiment | Stage G | Candidate | vep-rs | Candidate peak RSS | Result |
+|---|---:|---:|---:|---:|---|
+| 1,024-row bulk writes | 28.36 s | 28.47 s | 33.71 s | 4.679 GiB | Slower in every pair; rejected |
+| 2,048-row bulk writes | 28.055 s | 27.825 s | 32.815 s | 5.275 GiB | 19.1% RSS saving missed 20% target |
+| 512-row bulk writes | 28.11 s | 26.77 s | 32.51 s | 4.140 GiB | Application passed; formatting phase +5.3% failed |
+| 512-row vectored writes | 27.52 s | 28.66 s | 32.86 s | 4.143 GiB | 4.1% slower; rejected |
+| 512-row fixed write buffer | 29.76 s | 30.62 s | 33.95 s | 4.142 GiB | 2.9% slower; rejected |
+
+The writer-copy experiments are absent from the current implementation. Bulk
+writes preserve throughput while bounded synchronous emission limits live
+output allocations. Neither cache shrinking nor reduced annotation coverage
+was used. An individual very large consequence row is not bounded in bytes.
+
+Every measured ClinVar candidate retained body MD5
+`d2f003d60f8c85a91dbc2247d21d855a` and original input identity/order across
+277,114 records. The sparse control has 108,376 records and body MD5
+`927aa175d903867883ca3cf5a5a80510`. Warm-ups are excluded by a fixed protocol;
+all measured runs, including slow results and observed host contention, remain
+recorded. vep-rs coverage differs for regulatory and edited RefSeq annotations,
+so it is a timing reference rather than a correctness oracle. No whole-ClinVar
+result is claimed.
