@@ -93,11 +93,13 @@ rejected despite exact output parity. Smaller payload limits do not guarantee
 lower process RSS when repeated decoding increases allocator churn.
 
 Serial annotation uses the indexed full translator without retaining reference
-CDS/peptide payloads by default. A chr17 diagnostic with reference reuse disabled
-took 166.11 seconds and 4.23 GiB peak RSS, versus 146.92 seconds and 5.10 GiB with
-reuse; both matched the original output exactly. The fresh original-binary
-serial baseline took 793.62 seconds and 4.37 GiB. These measurements motivate
-the default; they do not establish memory bounds or whole-ClinVar performance.
+CDS/peptide payloads by default. That policy was selected using an earlier chr17
+configuration: disabling reuse took 166.11 seconds and 4.23 GiB peak RSS, versus
+146.92 seconds and 5.10 GiB with reuse. Subsequent measurements on the current
+buffer implementation, below, no longer support that memory rationale. The
+zero budget also disables the local-codon optimization and penalizes long
+transcripts such as TTN. This remains a documented follow-up; the diagnostic
+cache override has not been promoted to a new default in this change.
 
 ## Parallel output lifetime diagnostics
 
@@ -181,3 +183,61 @@ all measured runs, including slow results and observed host contention, remain
 recorded. vep-rs coverage differs for regulatory and edited RefSeq annotations,
 so it is a timing reference rather than a correctness oracle. No whole-ClinVar
 result is claimed.
+
+
+### Additional chromosome comparisons and remaining limits (2026-11-06)
+
+Official vep-rs v0.5.0 and the current implementation, with identical normalized
+chromosome inputs, reference, worker counts, full annotation flags and plain VCF
+output. Each row is a median of three fresh processes after discarded warm-ups;
+validation is outside timing. The chr17/eight-worker row reuses the preceding
+paired session. The other rows were collected subsequently on the shared host.
+
+| Chromosome | Workers | Current time | vep-rs time | Current peak RSS | vep-rs peak RSS |
+|---|---:|---:|---:|---:|---:|
+| 17 | 1 | 144.69 s | 210.73 s | 3.154 GiB | 3.782 GiB |
+| 17 | 8 | 29.16 s | 33.06 s | 4.159 GiB | 4.198 GiB |
+| 2 | 1 | 383.39 s | 313.19 s | 3.448 GiB | 3.948 GiB |
+| 2 | 8 | 138.74 s | 49.84 s | 4.883 GiB | 4.072 GiB |
+
+All current outputs retain original body digests and input row identity/order.
+Chr2 contains 401,230 records; its body MD5 is
+`4df6ae8cdc714236b95943abd465752d`. Competitor outputs reproduce their own
+body digests across repetitions and worker counts. Biological coverage differs,
+so these timings do not establish cross-engine annotation equivalence.
+
+Two limitations remain:
+
+- The serial reference-cache default is too broad. On the same 1,000-record TTN
+  block, three-run medians were 6.80 s before the output-memory change, 6.83 s
+  after it, 4.93 s with the existing `VEP_REFERENCE_CACHE_MB=128` override, and
+  4.56 s for vep-rs. The vepyr arms had effectively equal peak RSS and exact
+  output. Separate profiles reduced coding time from 4.86 to 3.00 s, restored
+  23,630 local-translation operations, and retained identical prediction-page
+  activity. The policy therefore predates the latest memory patch and disables
+  a useful optimization for TTN.
+- The parallel VCF path gives each worker a fixed whole-buffer slice. Transcript
+  count weighting omits coding length, and idle workers cannot take a peer's
+  remaining work. Chr2's eight-worker warm-up used fewer user CPU-seconds than
+  vep-rs (295.75 versus 339.14) but took much longer (133.60 versus 47.92 s),
+  with roughly one core busy through much of the tail. vep-rs divides batches
+  into smaller parallel tasks. Existing streaming-run controls do not change
+  this VCF-shard scheduling path.
+
+One exploratory whole-chromosome run each with the reference-cache override
+produced 130.72 s / 3.006 GiB on chr17 and 290.10 s / 3.216 GiB on chr2, with
+exact original body and row-order matches. These are single diagnostic runs,
+not acceptance medians or a changed production default. Repeat paired controls
+before choosing the follow-up cache policy. Neither these experiments nor the
+parallel scheduling diagnosis changes the implementation in this PR.
+
+The host was shared, including intermittent external CPU activity. All measured
+runs were retained. A requested diagnostic paused orchestration only after a
+timed child exited, and a disk guard stopped the queue before chr2/eight-worker
+measurements; the pending case resumed after cache cleanup. No timed process
+was suspended and no performance or disk thresholds were relaxed.
+
+Local verification for the implementation: 1,631 Rust tests passed (3 ignored),
+2,635 Python tests passed (10 skipped, 1 expected failure), and pre-commit checks
+passed, including Clippy. Full-input validation after these changes remains
+pending; no whole-ClinVar performance or parity claim is made.
