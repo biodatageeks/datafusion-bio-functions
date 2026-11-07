@@ -12712,10 +12712,10 @@ fn spawn_lookup_partition_worker(
 
 /// Like `spawn_lookup_partition_worker` but executes ALL partitions of `plan` in
 /// id order (= contig position order) into one ordered stream, so a grid worker
-/// reads its whole chrom-filtered contig (the VCF provider splits a contig into
-/// several byte-budget partitions even at target_partitions=1). The annotation
-/// layer then selects the worker's rank range. `partition_id` is the logical
-/// ordering / shard id.
+/// reads its whole filtered window. Grid plans request one physical VCF input
+/// partition, but consuming every partition remains necessary for providers
+/// that return more. The annotation layer selects the worker's rank range.
+/// `partition_id` is the logical ordering / shard id.
 fn spawn_lookup_full_contig_worker(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
@@ -16962,6 +16962,10 @@ async fn activate_contig_lookups(
                 filter = filter.and(col("start").lt(lit(slice.scan_hi_pos)));
             }
             wprovider.set_vcf_filter(Some(filter));
+            // This logical worker consumes its input partitions serially. One
+            // physical reader avoids reloading the tabix index for each part;
+            // the grid workers themselves provide the annotation parallelism.
+            wprovider.set_vcf_input_partitions(1);
             wprovider.set_target_partitions(config.target_partitions);
             apply_lookup_needs(&mut wprovider, &config);
             // Warm-up rows (strictly before this worker's seam) are read only to
