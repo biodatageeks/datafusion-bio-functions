@@ -11845,9 +11845,9 @@ fn admission_allows(
         && next_start < head + workers.max(1) + lookahead
 }
 
-/// A scheduling estimate from cached spliced coding length. The floor retains
-/// noncoding work; the cap keeps malformed/outlying metadata from owning a
-/// contig's entire schedule. No transcript sequence is constructed here.
+/// A scheduling estimate from cached spliced coding length. The unit floor is
+/// the transcript-overlap cost; only the remaining premium belongs to coding
+/// exons. The cap bounds outlying metadata without constructing a sequence.
 fn coding_length_cost(
     cds_len: Option<usize>,
     protein_len: Option<usize>,
@@ -11859,6 +11859,93 @@ fn coding_length_cost(
         .or_else(|| protein_len.map(|n| n.saturating_mul(3)))
         .unwrap_or(0);
     (1 + (nt / 768).min(255)) as u64
+}
+
+/// Genomic coding intervals for one transcript, using the context's inclusive
+/// coordinates. Merge overlapping/adjacent exon records before adding their
+/// premium: duplicate cache metadata must not multiply one transcript's work.
+fn coding_exon_intervals(
+    transcript: &TranscriptFeature,
+    exons: &[ExonFeature],
+    exon_indices: &[usize],
+) -> Vec<(i64, i64)> {
+    let (Some(cds_start), Some(cds_end)) = (transcript.cds_start, transcript.cds_end) else {
+        return Vec::new();
+    };
+    if cds_start <= 0 || cds_start > cds_end || transcript.start > transcript.end {
+        return Vec::new();
+    }
+    let coding_start = cds_start.max(transcript.start);
+    let coding_end = cds_end.min(transcript.end);
+    if coding_start > coding_end {
+        return Vec::new();
+    }
+    let mut intervals: Vec<_> = exon_indices
+        .iter()
+        .filter_map(|&index| {
+            let exon = exons.get(index)?;
+            let start = exon.start.max(coding_start);
+            let end = exon.end.min(coding_end);
+            (start <= end).then_some((start, end))
+        })
+        .collect();
+    intervals.sort_unstable();
+    let mut merged = 0usize;
+    for index in 0..intervals.len() {
+        let (start, end) = intervals[index];
+        if merged > 0 && start <= intervals[merged - 1].1.saturating_add(1) {
+            intervals[merged - 1].1 = intervals[merged - 1].1.max(end);
+        } else {
+            intervals[merged] = (start, end);
+            merged += 1;
+        }
+    }
+    intervals.truncate(merged);
+    intervals
+}
+
+/// Base transcript work applies throughout its span; the coding-length premium
+/// applies only to its coding exons. Geometry is temporary, one transcript at a
+/// time, and the endpoint arrays consuming this iterator die before activation.
+fn transcript_work_spans<'a>(
+    transcripts: &'a [TranscriptFeature],
+    exons: &'a [ExonFeature],
+    translations: &'a [TranslationFeature],
+    indexes: &'a SharedContextIndexes,
+) -> impl Iterator<Item = (i64, i64, u64)> + 'a {
+    transcripts.iter().flat_map(move |transcript| {
+        let premium = indexes
+            .translation_by_transcript
+            .get(&transcript.transcript_id)
+            .and_then(|&index| translations.get(index))
+            .map(|translation| {
+                coding_length_cost(
+                    translation.cds_len,
+                    translation.protein_len,
+                    translation.cds_sequence.as_ref().map(String::len),
+                )
+                .saturating_sub(1)
+            })
+            .unwrap_or(0);
+        let coding = if premium > 0 {
+            coding_exon_intervals(
+                transcript,
+                exons,
+                indexes
+                    .exons_by_transcript
+                    .get(&transcript.transcript_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )
+        } else {
+            Vec::new()
+        };
+        std::iter::once((transcript.start, transcript.end, 1)).chain(
+            coding
+                .into_iter()
+                .map(move |(start, end)| (start, end, premium)),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -11874,7 +11961,11 @@ fn buffer_transcript_weights(
     )
 }
 
-/// Sum transcript costs at each original input row, weighted by ALT units.
+/// Sum a unit of row work plus overlapping costs at each actual input start,
+/// weighted by ALT units. Starts retain ClinVar's exon-enriched distribution;
+/// no uniform density within a buffer envelope is assumed. This is a scheduling
+/// estimate using starts only: a deletion starting in an intron can cross a
+/// coding exon and be underestimated without its full REF/END geometry.
 /// Endpoint prefix sums preserve inclusive spans and overlapping transcripts;
 /// u128 accumulation prevents saturated endpoints from canceling each other.
 fn buffer_transcript_cost_weights(
@@ -11914,14 +12005,12 @@ fn buffer_transcript_cost_weights(
             let opened = prefix(&starts, starts.partition_point(|&(s, _)| s <= p));
             let closed = prefix(&ends, ends.partition_point(|&(e, _)| e < p));
             let covering = (opened - closed).min(u128::from(u64::MAX)) as u64;
-            *w = w.saturating_add(covering.saturating_mul(u64::from(row_units.max(1))));
+            let row_cost = covering.saturating_add(1);
+            *w = w.saturating_add(row_cost.saturating_mul(u64::from(row_units.max(1))));
         }
-    }
-    // Preserve the existing fixed per-buffer floor (one eighth of mean cost).
-    let total = weights.iter().fold(0u64, |sum, w| sum.saturating_add(*w));
-    let fixed = total / (b as u64).max(1) / 8;
-    for w in &mut weights {
-        *w = w.saturating_add(fixed).saturating_add(1);
+        // Keep a defensive nonzero weight even for an empty range;
+        // normal and partial buffers pay only for their actual input units.
+        *w = (*w).max(1);
     }
     weights
 }
@@ -16402,6 +16491,9 @@ async fn prepare_contig_data(
         profile.context_load += rest_elapsed;
     });
     let (ex, tl, rg, mt) = rest?;
+    // Planning and annotation share these indexes; coding-exon estimation must
+    // not build a second map or retain interval copies in every worker.
+    let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
 
     // Grid-aligned parallel lookup (stateful Merged/RefSeq, workers>1): a count
     // pass finds the global 5000-unit buffer boundaries; each worker gets a
@@ -16418,39 +16510,17 @@ async fn prepare_contig_data(
             .expect("stateful_parallel implies the count future ran")?;
         // Cost-weighted grid split (disabled with VEP_GRID_BALANCE=0). The old
         // equal-buffer-count split equalises variants per worker, not work, so
-        // gene-dense slices straggle; weighting by transcript overlap equalises
-        // the work. Coding-length costs also account for long peptide/CDS
-        // processing in sparse overlap regions. Slice boundaries do not affect output
-        // (every worker count already yields byte-identical VCFs), so this is a
-        // scheduling change only.
+        // gene-dense slices straggle. Estimate row and transcript-overlap work
+        // at actual variant starts, with a coding-length premium only inside
+        // coding exons. This changes cuts between whole logical buffers; the
+        // existing state replay and ordered output assembly remain responsible
+        // for preserving annotation across those different seams.
         let slices = if grid_balance_enabled {
             let t_w = Instant::now();
-            let coding_costs: HashMap<_, _> = tl
-                .iter()
-                .map(|translation| {
-                    (
-                        translation.transcript_id.as_str(),
-                        coding_length_cost(
-                            translation.cds_len,
-                            translation.protein_len,
-                            translation.cds_sequence.as_ref().map(String::len),
-                        ),
-                    )
-                })
-                .collect();
             let weights = buffer_transcript_cost_weights(
                 &boundaries,
                 &grid_positions,
-                base_transcripts.iter().map(|tx| {
-                    (
-                        tx.start,
-                        tx.end,
-                        coding_costs
-                            .get(tx.transcript_id.as_str())
-                            .copied()
-                            .unwrap_or(1),
-                    )
-                }),
+                transcript_work_spans(&base_transcripts, &ex, &tl, &indexes),
             );
             let planned = plan_grid_partitions_balanced(
                 &boundaries,
@@ -16463,6 +16533,7 @@ async fn prepare_contig_data(
                 "done",
                 &[
                     ("chrom", TraceValue::Str(&chrom)),
+                    ("model", TraceValue::Str("input_transcript_coding_exon")),
                     ("buffers", TraceValue::Usize(weights.len())),
                     ("slices", TraceValue::Usize(planned.len())),
                     ("elapsed", TraceValue::Duration(t_w.elapsed())),
@@ -16482,7 +16553,10 @@ async fn prepare_contig_data(
                     "grid_balance",
                     "slice",
                     &[
+                        ("chrom", TraceValue::Str(&chrom)),
                         ("worker_id", TraceValue::Usize(s.worker_id)),
+                        ("emit_start_row", TraceValue::Usize(s.emit_start_row)),
+                        ("emit_end_row", TraceValue::Usize(s.emit_end_row)),
                         (
                             "emit_rows",
                             TraceValue::Usize(s.emit_end_row - s.emit_start_row),
@@ -16587,8 +16661,6 @@ async fn prepare_contig_data(
         // the contig rather than fall back to an unrestricted pass.
         return Ok(None);
     }
-
-    let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
 
     // Open the per-contig custom-plugin registry when enabled and non-empty.
     #[cfg(feature = "parquet-cache")]
@@ -21083,6 +21155,265 @@ mod tests {
         assert_eq!(coding_length_cost(None, Some(usize::MAX), None), 256);
     }
 
+    fn grid_cost_transcript() -> TranscriptFeature {
+        let mut transcript = make_tx("coding", None, None, None, None);
+        transcript.start = 100;
+        transcript.end = 900;
+        transcript.cds_start = Some(200);
+        transcript.cds_end = Some(800);
+        transcript
+    }
+
+    fn grid_cost_exon(start: i64, end: i64) -> ExonFeature {
+        ExonFeature {
+            transcript_id: "coding".into(),
+            exon_number: 1,
+            start,
+            end,
+        }
+    }
+
+    fn grid_cost_translation() -> TranslationFeature {
+        let mut translation = make_translation("coding", Vec::new());
+        translation.cds_len = Some(7680);
+        translation
+    }
+
+    fn coding_grid_weights(
+        boundaries: &[GridBufferBoundary],
+        positions: &[(i64, u32)],
+        transcripts: &[TranscriptFeature],
+        exons: &[ExonFeature],
+        translations: &[TranslationFeature],
+    ) -> Vec<u64> {
+        let indexes = SharedContextIndexes::new(exons, translations);
+        buffer_transcript_cost_weights(
+            boundaries,
+            positions,
+            transcript_work_spans(transcripts, exons, translations, &indexes),
+        )
+    }
+
+    #[test]
+    fn coding_grid_uses_actual_starts_inside_identical_buffer_envelopes() {
+        let boundaries = [gb(0, 100), gb(4, i64::MAX)];
+        let transcripts = [grid_cost_transcript()];
+        let exons = [grid_cost_exon(200, 250), grid_cost_exon(750, 800)];
+        let translations = [grid_cost_translation()];
+        // Both inputs have the same envelope, row count and ALT-unit distribution.
+        // Only their interior starts differ: five units hit a coding exon in one.
+        let coding = [(100, 1), (220, 3), (230, 2), (900, 1)];
+        let intronic = [(100, 1), (400, 3), (500, 2), (900, 1)];
+        let weights = |positions: &[(i64, u32)]| {
+            coding_grid_weights(&boundaries, positions, &transcripts, &exons, &translations)
+        };
+        assert_eq!(weights(&coding), vec![14 + 5 * 10]);
+        assert_eq!(weights(&intronic), vec![14]);
+        // The previous full-transcript premium cannot distinguish these inputs.
+        let span_cost = [(100, 900, coding_length_cost(Some(7680), None, None))];
+        assert_eq!(
+            buffer_transcript_cost_weights(&boundaries, &coding, span_cost),
+            buffer_transcript_cost_weights(&boundaries, &intronic, span_cost)
+        );
+    }
+
+    #[test]
+    fn coding_grid_preserves_inclusive_genomic_endpoints_on_both_strands() {
+        let positions: Vec<_> = [99, 100, 199, 200, 250, 251, 749, 750, 800, 801, 900, 901]
+            .into_iter()
+            .map(|pos| (pos, 1))
+            .collect();
+        let mut boundaries: Vec<_> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, &(p, _))| gb(i, p))
+            .collect();
+        boundaries.push(gb(positions.len(), i64::MAX));
+        let exons = [grid_cost_exon(100, 250), grid_cost_exon(750, 900)];
+        for strand in [-1, 1] {
+            let mut transcript = grid_cost_transcript();
+            transcript.strand = strand;
+            assert_eq!(
+                coding_grid_weights(
+                    &boundaries,
+                    &positions,
+                    &[transcript],
+                    &exons,
+                    &[grid_cost_translation()],
+                ),
+                vec![1, 2, 2, 12, 12, 2, 2, 12, 12, 2, 2, 1],
+                "UTRs/introns keep base work; only exon/CDS intersections get a premium (strand {strand})"
+            );
+        }
+    }
+
+    #[test]
+    fn coding_grid_merges_duplicate_exons_per_transcript_only() {
+        let mut transcripts = vec![grid_cost_transcript(), grid_cost_transcript()];
+        transcripts[1].transcript_id = "other".into();
+        let mut exons = vec![
+            grid_cost_exon(700, 900),
+            grid_cost_exon(220, 250),
+            grid_cost_exon(190, 240),
+            grid_cost_exon(250, 260),
+            grid_cost_exon(261, 300),
+            grid_cost_exon(190, 240),
+            grid_cost_exon(450, 430),
+        ];
+        assert_eq!(
+            coding_exon_intervals(&transcripts[0], &exons, &[0, 1, 2, 3, 4, 5, 6, usize::MAX],),
+            vec![(200, 300), (700, 800)]
+        );
+        let mut other_exon = grid_cost_exon(200, 300);
+        other_exon.transcript_id = "other".into();
+        exons.push(other_exon);
+        let mut translations = vec![grid_cost_translation(), grid_cost_translation()];
+        translations[1].transcript_id = "other".into();
+        assert_eq!(
+            coding_grid_weights(
+                &[gb(0, 240), gb(1, 500), gb(2, i64::MAX)],
+                &[(240, 1), (500, 1)],
+                &transcripts,
+                &exons,
+                &translations,
+            ),
+            vec![23, 3],
+            "duplicate exons count once, but different overlapping transcripts both count"
+        );
+
+        let mut extreme = grid_cost_transcript();
+        extreme.end = i64::MAX;
+        extreme.cds_end = Some(i64::MAX);
+        assert_eq!(
+            coding_exon_intervals(
+                &extreme,
+                &[
+                    grid_cost_exon(i64::MAX - 2, i64::MAX),
+                    grid_cost_exon(i64::MAX, i64::MAX),
+                ],
+                &[0, 1],
+            ),
+            vec![(i64::MAX - 2, i64::MAX)],
+            "merging an inclusive final coordinate must not overflow"
+        );
+    }
+
+    #[test]
+    fn coding_grid_keeps_base_work_when_coding_metadata_is_missing_or_invalid() {
+        let boundaries = [gb(0, 400), gb(1, i64::MAX)];
+        let positions = [(400, 3)];
+        let exons = [grid_cost_exon(100, 900)];
+        let translations = [grid_cost_translation()];
+        for (cds_start, cds_end) in [
+            (None, None),
+            (None, Some(800)),
+            (Some(200), None),
+            (Some(0), Some(800)),
+            (Some(800), Some(200)),
+            (Some(901), Some(1000)),
+        ] {
+            let mut transcript = grid_cost_transcript();
+            transcript.cds_start = cds_start;
+            transcript.cds_end = cds_end;
+            assert_eq!(
+                coding_grid_weights(
+                    &boundaries,
+                    &positions,
+                    &[transcript],
+                    &exons,
+                    &translations
+                ),
+                vec![6],
+                "missing/invalid CDS must retain row and transcript bases"
+            );
+        }
+        let transcripts = [grid_cost_transcript()];
+        assert_eq!(
+            coding_grid_weights(&boundaries, &positions, &transcripts, &[], &translations),
+            vec![6]
+        );
+        assert_eq!(
+            coding_grid_weights(&boundaries, &positions, &transcripts, &exons, &[]),
+            vec![6]
+        );
+        assert_eq!(
+            coding_grid_weights(
+                &boundaries,
+                &positions,
+                &transcripts,
+                &[grid_cost_exon(500, 300)],
+                &translations,
+            ),
+            vec![6]
+        );
+        let mut reversed = grid_cost_transcript();
+        reversed.start = 900;
+        reversed.end = 100;
+        assert_eq!(
+            coding_grid_weights(&boundaries, &positions, &[reversed], &exons, &translations),
+            vec![6]
+        );
+    }
+
+    #[test]
+    fn coding_grid_base_work_tracks_alt_units_and_partial_final_buffer() {
+        let boundaries = [gb(0, 100), gb(3, 200), gb(4, i64::MAX)];
+        let positions = [(100, 1), (100, 3), (100, 0), (200, 1)];
+        assert_eq!(
+            coding_grid_weights(&boundaries, &positions, &[], &[], &[]),
+            vec![5, 1]
+        );
+        let mut translation = grid_cost_translation();
+        translation.cds_len = Some(usize::MAX);
+        assert_eq!(
+            coding_grid_weights(
+                &[gb(0, 200), gb(2, i64::MAX)],
+                &[(200, u32::MAX), (200, u32::MAX)],
+                &[grid_cost_transcript()],
+                &[grid_cost_exon(200, 800)],
+                &[translation],
+            ),
+            vec![257 * u64::from(u32::MAX) * 2],
+            "outlying coding length is capped before multiplying repeated multi-ALT input"
+        );
+    }
+
+    #[test]
+    fn coding_grid_moves_a_skewed_cut_without_changing_logical_buffer_ownership() {
+        let boundaries = [
+            gb(0, 100),
+            gb(1, 200),
+            gb(2, 300),
+            gb(3, 400),
+            gb(4, i64::MAX),
+        ];
+        let positions = [(100, 1), (200, 1), (300, 1), (400, 1)];
+        let mut transcript = grid_cost_transcript();
+        transcript.cds_start = Some(100);
+        let weights = coding_grid_weights(
+            &boundaries,
+            &positions,
+            &[transcript],
+            &[grid_cost_exon(100, 150)],
+            &[grid_cost_translation()],
+        );
+        let legacy = buffer_transcript_cost_weights(&boundaries, &positions, [(100, 900, 11)]);
+        let old_slices = plan_grid_partitions_balanced(&boundaries, 2, 0, &legacy);
+        let slices = plan_grid_partitions_balanced(&boundaries, 2, 0, &weights);
+        assert_eq!(old_slices[0].emit_end_row, 2);
+        assert_eq!(slices[0].emit_end_row, 1);
+        let owned: Vec<_> = slices
+            .iter()
+            .flat_map(|slice| slice.emit_start_row..slice.emit_end_row)
+            .collect();
+        assert_eq!(owned, (0..positions.len()).collect::<Vec<_>>());
+        assert!(
+            slices
+                .iter()
+                .all(|slice| slice.emit_start_row < slice.emit_end_row)
+        );
+    }
+
     #[test]
     fn weighted_endpoint_prefixes_preserve_coverage_when_totals_exceed_u64() {
         let bs = vec![gb(0, 0), gb(1, 100), gb(2, 200), gb(3, i64::MAX)];
@@ -21093,9 +21424,9 @@ mod tests {
         );
         assert_eq!(weights[0], u64::MAX);
         assert_eq!(weights[1], u64::MAX);
-        assert!(
-            weights[2] > 0 && weights[2] < u64::MAX,
-            "all transcripts end before 200; the desert keeps only the fixed floor"
+        assert_eq!(
+            weights[2], 1,
+            "the desert keeps only actual input-unit work"
         );
     }
 
@@ -21107,9 +21438,7 @@ mod tests {
             &[(0, 0), (100, 10), (200, 1)],
             [(0, 100, 2), (100, 0, 8)],
         );
-        assert_eq!(weights[0] - weights[2], 10);
-        assert_eq!(weights[1] - weights[2], 100);
-        assert!(weights.iter().all(|&w| w > 0));
+        assert_eq!(weights, vec![11, 110, 1]);
     }
 
     #[test]
@@ -21164,8 +21493,8 @@ mod tests {
         let spans = vec![(10, 50), (250, 350), (260, 340)];
         let w = buffer_transcript_weights(&bs, &positions, spans);
         assert_eq!(w.len(), 4);
-        // The fixed term is identical across buffers, so compare relative to a
-        // buffer whose variant is covered by nothing.
+        // Single-ALT row work is identical across buffers, so compare relative
+        // to a buffer whose variant is covered by nothing.
         let base = w[1];
         assert_eq!(w[0], base, "variant at 0 is outside the [10,50] transcript");
         assert_eq!(w[2], base, "variant at 200 is covered by nothing");
@@ -21196,8 +21525,7 @@ mod tests {
             multi[1],
             single[1]
         );
-        // depth 1 x 10 units vs depth 1 x 1 unit, before the shared fixed term
-        assert_eq!(multi[1] - single[1], 9);
+        assert_eq!(multi[1], 10 * single[1]);
     }
 
     #[test]
