@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
@@ -53,6 +52,10 @@ fn wrap_with_projection(
     }
 }
 
+#[cfg(all(test, feature = "parquet-cache"))]
+#[path = "lookup_provider_tests.rs"]
+mod tests;
+
 /// Table provider that implements variant lookup against the Parquet variation
 /// cache via `VariationLookupExec`.
 ///
@@ -87,6 +90,9 @@ pub struct LookupProvider {
     cache_root: Option<PathBuf>,
     /// Maximum number of independent cold readers used by lookup.
     target_partitions: usize,
+    /// Physical input readers for this lookup only. Stateful grid workers
+    /// consume their input serially; other callers keep the session's target.
+    vcf_input_partitions: Option<usize>,
     probe_floor_pos: Option<i64>,
     /// No output reads the lookup: pass every row through with null cache
     /// columns and never open the variation shard.
@@ -169,6 +175,7 @@ impl LookupProvider {
             #[cfg(feature = "parquet-cache")]
             cache_root: None,
             target_partitions: 1,
+            vcf_input_partitions: None,
             probe_floor_pos: None,
             skip_probing: false,
             colocated_af_groups: None,
@@ -206,6 +213,12 @@ impl LookupProvider {
         self.target_partitions = target_partitions.max(1);
     }
 
+    /// Scope VCF reader parallelism without changing the shared session or the
+    /// independent variation-cache cold-reader budget (`target_partitions`).
+    pub(crate) fn set_vcf_input_partitions(&mut self, partitions: usize) {
+        self.vcf_input_partitions = Some(partitions.max(1));
+    }
+
     /// Skip the variation probe for rows below this position (warm-up rows).
     pub fn set_probe_floor_pos(&mut self, pos: Option<i64>) {
         self.probe_floor_pos = pos;
@@ -230,25 +243,6 @@ impl LookupProvider {
     pub fn set_vcf_filter(&mut self, filter: Option<Expr>) {
         self.vcf_filter = filter;
     }
-}
-
-/// Check whether the chrom column in the given table uses "chr" prefix (e.g. "chr1").
-async fn has_chr_prefix(session: &SessionContext, table: &str) -> Result<bool> {
-    let batches = session
-        .sql(&format!("SELECT `chrom` FROM `{table}` LIMIT 1"))
-        .await?
-        .collect()
-        .await?;
-    if let Some(batch) = batches.first() {
-        if batch.num_rows() > 0 {
-            if let Some(arr) = batch.column(0).as_any().downcast_ref::<StringArray>() {
-                if !arr.is_null(0) {
-                    return Ok(arr.value(0).starts_with("chr"));
-                }
-            }
-        }
-    }
-    Ok(false)
 }
 
 impl Debug for LookupProvider {
@@ -289,14 +283,22 @@ impl TableProvider for LookupProvider {
             use crate::allele::allele_matches;
             use crate::cache::lookup_exec::VariationLookupExec;
 
-            let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
             let vcf_df = self.session.table(&self.vcf_table).await?;
             let vcf_df = if let Some(ref filter) = self.vcf_filter {
                 vcf_df.filter(filter.clone())?
             } else {
                 vcf_df
             };
-            let vcf_plan = vcf_df.create_physical_plan().await?;
+            let vcf_plan = if let Some(partitions) = self.vcf_input_partitions {
+                // DataFrame owns a session-state snapshot. Scope the target
+                // before planning so the VCF provider opens only that many
+                // readers; coalescing an already-partitioned plan is too late.
+                let (mut state, logical_plan) = vcf_df.into_parts();
+                state.config_mut().options_mut().execution.target_partitions = partitions;
+                state.create_physical_plan(&logical_plan).await?
+            } else {
+                vcf_df.create_physical_plan().await?
+            };
 
             let mut exec = VariationLookupExec::new(
                 vcf_plan,
@@ -304,7 +306,9 @@ impl TableProvider for LookupProvider {
                 self.cache_schema.clone(),
                 self.cache_columns.clone(),
                 allele_matches as fn(&str, &str, &str) -> bool,
-                vcf_has_chr,
+                // Legacy constructor argument: the stream normalizes each row's
+                // chromosome and does not use a table-wide prefix flag.
+                false,
                 self.coord_normalizer.input_zero_based,
                 self.coord_normalizer.cache_zero_based,
                 self.extended_probes,
