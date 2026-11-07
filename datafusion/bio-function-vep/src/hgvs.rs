@@ -17,14 +17,19 @@ use datafusion::common::{DataFusionError, Result};
 use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
 
+/// Owned protein context. Keep a concrete alias so existing struct literals
+/// using `"...".into()` retain their unambiguous String field types.
+pub type ProteinHgvsData = ProteinHgvsDataWithSequences<String>;
+
+/// Protein context with sequence storage selected by its caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProteinHgvsData {
+pub struct ProteinHgvsDataWithSequences<S> {
     pub start: usize,
     pub end: usize,
     pub ref_peptide: String,
     pub alt_peptide: String,
-    pub ref_translation: String,
-    pub alt_translation: String,
+    pub ref_translation: S,
+    pub alt_translation: S,
     pub alt_translation_extension: Option<String>,
     pub frameshift: bool,
     pub start_lost: bool,
@@ -2715,7 +2720,9 @@ impl ProteinHgvsNotation {
     /// Traceability:
     /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
     ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1749>
-    fn from_context(data: &ProteinHgvsData) -> Self {
+    fn from_context<S: std::ops::Deref<Target = str>>(
+        data: &ProteinHgvsDataWithSequences<S>,
+    ) -> Self {
         let ref_allele = normalize_peptide_allele(&data.ref_peptide);
         let alt_allele = normalize_peptide_allele(&data.alt_peptide);
         Self {
@@ -2744,6 +2751,14 @@ impl ProteinHgvsNotation {
 pub fn format_hgvsp(
     translation: &TranslationFeature,
     protein: &ProteinHgvsData,
+    shift_hgvs: bool,
+) -> Option<String> {
+    format_hgvsp_with_sequences(translation, protein, shift_hgvs)
+}
+
+pub(crate) fn format_hgvsp_with_sequences<S: std::ops::Deref<Target = str>>(
+    translation: &TranslationFeature,
+    protein: &ProteinHgvsDataWithSequences<S>,
     shift_hgvs: bool,
 ) -> Option<String> {
     let protein_id = versioned_id(translation.stable_id.as_deref()?, translation.version);
@@ -2869,7 +2884,7 @@ pub fn format_hgvsp(
         let alt_translation = protein
             .alt_translation_extension
             .as_deref()
-            .unwrap_or(&protein.alt_translation);
+            .unwrap_or_else(|| &protein.alt_translation);
         let past_alt_translation_deletion = protein.frameshift
             && notation.kind == "del"
             && notation.alt_allele == "del"
@@ -2981,9 +2996,9 @@ fn protein_event_type(ref_allele: &str, alt_allele: &str, frameshift: bool) -> S
 /// reference translation can omit its terminal Ter while the shifted local
 /// window contains `*` / `**`; Ensembl keeps this as a delins and truncates the
 /// alternate allele at its first Ter.
-fn preserve_terminal_stop_retaining_delins(
+fn preserve_terminal_stop_retaining_delins<S: std::ops::Deref<Target = str>>(
     notation: &mut ProteinHgvsNotation,
-    protein: &ProteinHgvsData,
+    protein: &ProteinHgvsDataWithSequences<S>,
 ) -> bool {
     if protein.frameshift || protein.stop_lost {
         return false;
@@ -3034,9 +3049,9 @@ fn preserve_terminal_stop_retaining_delins(
 
 /// Preserve stop-retaining edits as delins so the HGVSp formatter can truncate
 /// the alternate peptide at the first Ter, matching Ensembl Variation 116.
-fn preserve_stop_retaining_delins(
+fn preserve_stop_retaining_delins<S: std::ops::Deref<Target = str>>(
     notation: &mut ProteinHgvsNotation,
-    protein: &ProteinHgvsData,
+    protein: &ProteinHgvsDataWithSequences<S>,
     expected_stop_offset: Option<usize>,
 ) -> bool {
     let Some((ref_stop, alt_stop)) = protein
@@ -3069,9 +3084,9 @@ fn preserve_stop_retaining_delins(
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_fs_peptides()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2249-L2295>
-fn resolve_frameshift_hgvs(
+fn resolve_frameshift_hgvs<S: std::ops::Deref<Target = str>>(
     notation: &mut ProteinHgvsNotation,
-    protein: &ProteinHgvsData,
+    protein: &ProteinHgvsDataWithSequences<S>,
 ) -> Option<()> {
     notation.kind = "fs".to_string();
     let ref_translation = append_terminal_stop(&protein.ref_translation);
@@ -3083,7 +3098,7 @@ fn resolve_frameshift_hgvs(
     let alt_translation = protein
         .alt_translation_extension
         .as_deref()
-        .unwrap_or(&protein.alt_translation);
+        .unwrap_or_else(|| &protein.alt_translation);
     let mut start = notation.start;
 
     if start > alt_translation.len() {
@@ -3382,8 +3397,8 @@ fn surrounding_peptides(
 ///   codons (including past internal stops). `length()` is the full string
 ///   length — NOT the position of the first stop codon. This matters for
 ///   LoF transcripts with internal stop codons.
-fn stop_loss_extra_aa(
-    protein: &ProteinHgvsData,
+fn stop_loss_extra_aa<S: std::ops::Deref<Target = str>>(
+    protein: &ProteinHgvsDataWithSequences<S>,
     ref_var_pos: usize,
     frameshift: bool,
 ) -> Option<usize> {
@@ -3399,7 +3414,7 @@ fn stop_loss_extra_aa(
     let alt_translation = protein
         .alt_translation_extension
         .as_deref()
-        .unwrap_or(&protein.alt_translation);
+        .unwrap_or_else(|| &protein.alt_translation);
     let stop_idx = alt_translation.find('*')?;
     let extra = if frameshift {
         stop_idx.saturating_add(1).checked_sub(ref_var_pos)?
@@ -3448,10 +3463,10 @@ fn peptide_last_three(peptide: &str) -> Option<&'static str> {
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1833-L1974>
-fn format_hgvsp_notation(
+fn format_hgvsp_notation<S: std::ops::Deref<Target = str>>(
     protein_id: &str,
     notation: &ProteinHgvsNotation,
-    protein: &ProteinHgvsData,
+    protein: &ProteinHgvsDataWithSequences<S>,
 ) -> Option<String> {
     let mut out = format!("{protein_id}:p.");
 

@@ -97,6 +97,7 @@ struct EngineAnnotationProfile {
     hgvs_shift: Duration,
     evaluate_prepared: Duration,
     collapse_pick_sort: Duration,
+    sift_warm: Duration,
     csq_format: Duration,
     sift_polyphen: Duration,
     domains: Duration,
@@ -121,7 +122,7 @@ impl EngineAnnotationProfile {
 
     fn summary_line(&self) -> String {
         format!(
-            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} non_variant_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s plugin_take={:.6}s",
+            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} non_variant_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s plugin_take={:.6}s sift_warm={:.6}s collapse_pick_sort_excluding_sift_warm={:.6}s",
             self.rows,
             self.null_chrom_rows,
             self.null_alt_rows,
@@ -152,6 +153,10 @@ impl EngineAnnotationProfile {
             self.typed_columns.as_secs_f64(),
             self.finish_builders.as_secs_f64(),
             self.plugin_take.as_secs_f64(),
+            self.sift_warm.as_secs_f64(),
+            self.collapse_pick_sort
+                .saturating_sub(self.sift_warm)
+                .as_secs_f64(),
         )
     }
 }
@@ -3529,6 +3534,30 @@ fn lookup_sift_polyphen(
     #[cfg(feature = "parquet-cache")] sift_store: &Option<SiftPredictionStoreRef>,
     #[cfg(not(feature = "parquet-cache"))] _sift_kv: &Option<()>,
 ) -> (String, String) {
+    lookup_sift_polyphen_for_row(
+        transcript_id,
+        transcript_uid,
+        protein_position,
+        amino_acids,
+        cache,
+        #[cfg(feature = "parquet-cache")]
+        sift_store,
+        #[cfg(not(feature = "parquet-cache"))]
+        _sift_kv,
+        None,
+    )
+}
+
+fn lookup_sift_polyphen_for_row(
+    transcript_id: Option<&str>,
+    transcript_uid: Option<u32>,
+    protein_position: Option<&str>,
+    amino_acids: Option<&str>,
+    cache: &mut SiftPolyphenCache,
+    #[cfg(feature = "parquet-cache")] sift_store: &Option<SiftPredictionStoreRef>,
+    #[cfg(not(feature = "parquet-cache"))] _sift_kv: &Option<()>,
+    row_predictions: Option<&HashMap<u64, CachedPredictions>>,
+) -> (String, String) {
     let empty = || (String::new(), String::new());
 
     // VEP only produces SIFT/PolyPhen for single amino acid substitutions.
@@ -3563,8 +3592,15 @@ fn lookup_sift_polyphen(
                 return empty();
             };
             let key = ((uid as u64) << 32) | (pos as u64);
-            let Ok(found) = store.get_position_predictions(&[key]) else {
-                return empty();
+            let fetched;
+            let found = if let Some(found) = row_predictions {
+                found
+            } else {
+                fetched = match store.get_position_predictions(&[key]) {
+                    Ok(found) => found,
+                    Err(_) => return empty(),
+                };
+                &fetched
             };
             let Some(preds) = found.get(&key) else {
                 return empty();
@@ -3686,7 +3722,6 @@ fn position_predictions_from_batch(
 #[derive(Clone)]
 struct PositionSlicedParquetSiftStore {
     lookup: Arc<crate::parquet_cache::sift::SinglePathParquetSiftLookup>,
-    cache: Arc<Mutex<HashMap<u64, Option<CachedPredictions>>>>,
     blob_version: crate::cache_common::SiftBlobVersion,
 }
 
@@ -3704,47 +3739,8 @@ impl crate::cache_common::SiftPredictionStore for PositionSlicedParquetSiftStore
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
-        let mut out = HashMap::with_capacity(keys.len());
-        let mut uncached = Vec::new();
-        let mut seen_uncached = HashSet::new();
-        {
-            let cache = self.cache.lock().map_err(|error| {
-                DataFusionError::Execution(format!("Parquet SIFT position cache poisoned: {error}"))
-            })?;
-            for &key in keys {
-                if out.contains_key(&key) {
-                    continue;
-                }
-                if let Some(cached) = cache.get(&key) {
-                    if let Some(predictions) = cached {
-                        out.insert(key, predictions.clone());
-                    }
-                    continue;
-                }
-                if seen_uncached.insert(key) {
-                    uncached.push(key);
-                }
-            }
-        }
-        if uncached.is_empty() {
-            return Ok(out);
-        }
-
-        let (batch, _present) =
-            crate::cache::lookup_exec::block_on(self.lookup.take_keys(&uncached))?;
-        let fetched = position_predictions_from_batch(&batch, self.blob_version)?;
-        let mut cache = self.cache.lock().map_err(|error| {
-            DataFusionError::Execution(format!("Parquet SIFT position cache poisoned: {error}"))
-        })?;
-        for key in uncached {
-            if let Some(predictions) = fetched.get(&key) {
-                cache.insert(key, Some(predictions.clone()));
-                out.insert(key, predictions.clone());
-            } else {
-                cache.insert(key, None);
-            }
-        }
-        Ok(out)
+        let (batch, _) = crate::cache::lookup_exec::block_on(self.lookup.take_keys(keys))?;
+        position_predictions_from_batch(&batch, self.blob_version)
     }
 }
 
@@ -3755,6 +3751,7 @@ impl crate::cache_common::SiftPredictionStore for PositionSlicedParquetSiftStore
 async fn load_parquet_sift_prediction_store_for_chrom(
     cache: &crate::parquet_cache::detect::PartitionedParquetCache,
     chrom: &str,
+    budget: Arc<crate::parquet_cache::sift::decoded_pages::PageCacheBudget>,
 ) -> Result<Option<SiftPredictionStoreRef>> {
     let Some(path) = cache.context_path("translation_sift", chrom) else {
         return Ok(None);
@@ -3773,8 +3770,7 @@ async fn load_parquet_sift_prediction_store_for_chrom(
         .await?;
         let blob_version = crate::cache_common::sift_blob_version_from_metadata(schema.metadata());
         return Ok(Some(Arc::new(PositionSlicedParquetSiftStore {
-            lookup: Arc::new(lookup),
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            lookup: Arc::new(lookup.with_page_cache(budget)),
             blob_version,
         }) as SiftPredictionStoreRef));
     }
@@ -6184,6 +6180,16 @@ impl AnnotateProvider {
         let cache_root = Some(cache.base_dir().to_path_buf());
 
         let config = ContigAnnotationConfig {
+            #[cfg(feature = "parquet-cache")]
+            sift_page_budget: crate::parquet_cache::sift::decoded_pages::PageCacheBudget::from_env(
+                annotation_workers,
+            )?,
+            reference_budget: crate::cache_budget::CacheBudget::from_env(
+                "VEP_REFERENCE_CACHE_MB",
+                // Reuse reference derivations and local-codon translation in
+                // serial annotation as well as across parallel workers.
+                crate::cache_budget::reference_cache_default_mb(annotation_workers),
+            )?,
             vcf_table: self.vcf_table.clone(),
             options_json,
             cache_columns,
@@ -6822,6 +6828,9 @@ impl AnnotateProvider {
             let most_str: &str;
             // Store assignment results from cache-miss path for annotation column population.
             let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
+            // Only this row's requested keys, shared by CSQ and typed output.
+            // No unbounded execution-lifetime per-position memo is retained.
+            let mut row_predictions: Option<HashMap<u64, CachedPredictions>> = None;
             // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
             let mut row_variant: Option<VariantInput> = None;
             let mut csq_already_projected = false;
@@ -7042,14 +7051,9 @@ impl AnnotateProvider {
                 }
                 row_variant = Some(variant);
 
-                // Batch the position-sliced SIFT demand fetch: collect this
-                // row's missense `(transcript_uid, position)` keys and warm the
-                // store in a single `take_rows`, so the per-consequence
-                // `lookup_sift_polyphen` calls below (CSQ + typed columns) hit
-                // the memoized cache instead of issuing one take per
-                // consequence. Only the position-sliced store benefits; the
-                // legacy transcript-id store ignores this. SIFT is emitted only
-                // under `--everything`.
+                // Fetch and decode requested positions once for this row. The
+                // store reuses decoded Parquet pages across rows, while this map
+                // serves both CSQ and typed outputs without repeating Arrow takes.
                 #[cfg(feature = "parquet-cache")]
                 if flags.everything && needs_sift_polyphen {
                     if let Some(store) = sift_store {
@@ -7067,8 +7071,10 @@ impl AnnotateProvider {
                                     warm_keys.push(key);
                                 }
                             }
-                            if !warm_keys.is_empty() {
-                                let _ = store.get_position_predictions(&warm_keys);
+                            let started = engine_profile_enabled.then(Instant::now);
+                            row_predictions = Some(store.get_position_predictions(&warm_keys)?);
+                            if let Some(started) = started {
+                                engine_profile.sift_warm += started.elapsed();
                             }
                         }
                     }
@@ -7335,7 +7341,7 @@ impl AnnotateProvider {
                                     engine_profile,
                                     sift_polyphen,
                                     {
-                                        lookup_sift_polyphen(
+                                        lookup_sift_polyphen_for_row(
                                             tc.transcript_id.as_deref(),
                                             tx_opt.and_then(|tx| tx.transcript_uid),
                                             tc.protein_position.as_deref(),
@@ -7345,6 +7351,7 @@ impl AnnotateProvider {
                                             sift_store,
                                             #[cfg(not(feature = "parquet-cache"))]
                                             _sift_kv,
+                                            row_predictions.as_ref(),
                                         )
                                     }
                                 )
@@ -7990,7 +7997,7 @@ impl AnnotateProvider {
 
                         // SIFT, PolyPhen
                         if flags.everything {
-                            let (sift_str, polyphen_str) = lookup_sift_polyphen(
+                            let (sift_str, polyphen_str) = lookup_sift_polyphen_for_row(
                                 tc.transcript_id.as_deref(),
                                 tx_opt.and_then(|tx| tx.transcript_uid),
                                 tc.protein_position.as_deref(),
@@ -8000,6 +8007,7 @@ impl AnnotateProvider {
                                 sift_store,
                                 #[cfg(not(feature = "parquet-cache"))]
                                 _sift_kv,
+                                row_predictions.as_ref(),
                             );
                             append_opt_str(
                                 b_sift.values(),
@@ -10182,6 +10190,9 @@ impl Debug for AnnotateProvider {
 /// Bundled configuration for per-contig annotation (extracted from AnnotateProvider).
 #[derive(Clone)]
 struct ContigAnnotationConfig {
+    #[cfg(feature = "parquet-cache")]
+    sift_page_budget: Arc<crate::parquet_cache::sift::decoded_pages::PageCacheBudget>,
+    reference_budget: Arc<crate::cache_budget::CacheBudget>,
     vcf_table: String,
     options_json: Option<String>,
     cache_columns: Vec<String>,
@@ -10551,6 +10562,8 @@ struct ContigPipelineProfile {
     lookup_wait: Duration,
     hydration: Duration,
     annotation_compute: Duration,
+    /// Included in annotation_compute; shard formatting/writing or callback wait.
+    output_emission: Duration,
     input_buffer: Duration,
     variant_bounds: Duration,
     transcript_window: Duration,
@@ -10579,7 +10592,7 @@ struct ContigPipelineProfile {
 impl ContigPipelineProfile {
     fn summary_line(&self, chrom: &str) -> String {
         format!(
-            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} prepare_total={:.3}s prepare_setup={:.3}s prepare_shared_ctx={:.3}s context_load={:.3}s context_tx_scan={:.3}s context_tx={:.3}s context_exons_scan={:.3}s context_exons={:.3}s context_tl_scan={:.3}s context_tl={:.3}s context_reg_scan={:.3}s context_reg={:.3}s context_motif_scan={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s run_pool_runs={} head_wait={:.3}s",
+            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} prepare_total={:.3}s prepare_setup={:.3}s prepare_shared_ctx={:.3}s context_load={:.3}s context_tx_scan={:.3}s context_tx={:.3}s context_exons_scan={:.3}s context_exons={:.3}s context_tl_scan={:.3}s context_tl={:.3}s context_reg_scan={:.3}s context_reg={:.3}s context_motif_scan={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s run_pool_runs={} head_wait={:.3}s output_emission={:.3}s",
             self.lookup_partitions,
             self.lookup_batches,
             self.lookup_buffered_batches_max,
@@ -10618,6 +10631,7 @@ impl ContigPipelineProfile {
             self.ordered_drain_wait.as_secs_f64(),
             self.run_pool_runs,
             self.head_wait.as_secs_f64(),
+            self.output_emission.as_secs_f64(),
         )
     }
 }
@@ -11039,6 +11053,7 @@ async fn scan_context_entity(
 }
 
 struct SharedContigAnnotationContext {
+    reference_memos: crate::transcript_consequence::SharedReferenceMemos,
     config: ContigAnnotationConfig,
     profile: Option<SharedContigPipelineProfile>,
     base_transcripts: Arc<Vec<TranscriptFeature>>,
@@ -11830,57 +11845,83 @@ fn admission_allows(
         && next_start < head + workers.max(1) + lookahead
 }
 
-/// Per-buffer cost weight used by the balanced grid split: how many contig
-/// transcripts overlap the buffer's position span, plus a constant for the fixed
-/// per-buffer cost that is paid even in gene deserts.
-///
-/// Buffers already hold a fixed number of VEP input units, so *variants* per
-/// buffer are equalised by construction. What is not equalised is how many
-/// transcripts each variant is evaluated against — that is why gene-dense slices
-/// become the stragglers under the equal-buffer-count split.
+/// A scheduling estimate from cached spliced coding length. The floor retains
+/// noncoding work; the cap keeps malformed/outlying metadata from owning a
+/// contig's entire schedule. No transcript sequence is constructed here.
+fn coding_length_cost(
+    cds_len: Option<usize>,
+    protein_len: Option<usize>,
+    cds_sequence_len: Option<usize>,
+) -> u64 {
+    let nt = cds_len
+        .filter(|&n| n > 0)
+        .or_else(|| cds_sequence_len.filter(|&n| n > 0))
+        .or_else(|| protein_len.map(|n| n.saturating_mul(3)))
+        .unwrap_or(0);
+    (1 + (nt / 768).min(255)) as u64
+}
+
+#[cfg(test)]
 fn buffer_transcript_weights(
     boundaries: &[GridBufferBoundary],
     positions: &[(i64, u32)],
     spans: impl IntoIterator<Item = (i64, i64)>,
 ) -> Vec<u64> {
+    buffer_transcript_cost_weights(
+        boundaries,
+        positions,
+        spans.into_iter().map(|(s, e)| (s, e, 1)),
+    )
+}
+
+/// Sum transcript costs at each original input row, weighted by ALT units.
+/// Endpoint prefix sums preserve inclusive spans and overlapping transcripts;
+/// u128 accumulation prevents saturated endpoints from canceling each other.
+fn buffer_transcript_cost_weights(
+    boundaries: &[GridBufferBoundary],
+    positions: &[(i64, u32)],
+    spans: impl IntoIterator<Item = (i64, i64, u64)>,
+) -> Vec<u64> {
     if boundaries.len() < 2 || positions.is_empty() {
         return Vec::new();
     }
     let b = boundaries.len() - 1;
-    // Transcript coverage depth at a position = (#starts <= p) - (#ends < p),
-    // read off two sorted endpoint arrays.
-    let mut starts: Vec<i64> = Vec::new();
-    let mut ends: Vec<i64> = Vec::new();
-    for (s, e) in spans {
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    for (s, e, cost) in spans {
         let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-        starts.push(lo);
-        ends.push(hi);
+        let cost = u128::from(cost.max(1));
+        starts.push((lo, cost));
+        ends.push((hi, cost));
     }
-    starts.sort_unstable();
-    ends.sort_unstable();
-
+    starts.sort_unstable_by_key(|&(pos, _)| pos);
+    ends.sort_unstable_by_key(|&(pos, _)| pos);
+    for endpoints in [&mut starts, &mut ends] {
+        let mut sum = 0u128;
+        for (_, cost) in endpoints {
+            sum = sum.saturating_add(*cost);
+            *cost = sum;
+        }
+    }
+    let prefix = |endpoints: &[(i64, u128)], n: usize| {
+        n.checked_sub(1).map_or(0, |index| endpoints[index].1)
+    };
     let mut weights = vec![0u64; b];
     for (i, w) in weights.iter_mut().enumerate() {
         let from = boundaries[i].global_row.min(positions.len());
         let to = boundaries[i + 1].global_row.min(positions.len());
-        let mut sum = 0u64;
         for &(p, row_units) in &positions[from..to] {
-            let covering = starts.partition_point(|&s| s <= p) - ends.partition_point(|&e| e < p);
-            // Scale by input units: the buffer grid and the annotation workload
-            // both count each ALT separately, so a 10-ALT row is ~10x the work
-            // of a single-ALT row at the same transcript depth.
-            sum += covering as u64 * row_units.max(1) as u64;
+            let opened = prefix(&starts, starts.partition_point(|&(s, _)| s <= p));
+            let closed = prefix(&ends, ends.partition_point(|&(e, _)| e < p));
+            let covering = (opened - closed).min(u128::from(u64::MAX)) as u64;
+            *w = w.saturating_add(covering.saturating_mul(u64::from(row_units.max(1))));
         }
-        *w = sum;
     }
-    // Fixed per-buffer term. Measured on chr1: the buffer-invariant cost
-    // (buffer-local transcript selection scans every contig transcript) is ~12%
-    // of per-buffer CPU, so bias by an eighth of the mean. Without it a buffer
-    // in a gene desert looks free and they all pile onto one worker.
-    let total: u64 = weights.iter().sum();
-    let fixed = (total / (b as u64).max(1)) / 8;
-    for w in weights.iter_mut() {
-        *w += fixed + 1;
+    // Preserve the existing fixed per-buffer floor (one eighth of mean cost).
+    let total = weights.iter().fold(0u64, |sum, w| sum.saturating_add(*w));
+    let fixed = total / (b as u64).max(1) / 8;
+    for w in &mut weights {
+        *w = w.saturating_add(fixed).saturating_add(1);
     }
     weights
 }
@@ -11895,11 +11936,11 @@ fn plan_grid_partitions_balanced(
     overlap_width_bp: i64,
     weights: &[u64],
 ) -> Vec<WorkerGridSlice> {
-    let workers = workers.max(1);
     if boundaries.len() < 2 {
         return Vec::new();
     }
     let b = boundaries.len() - 1;
+    let workers = workers.max(1).min(b);
     if weights.len() != b {
         return plan_grid_partitions(boundaries, workers, overlap_width_bp);
     }
@@ -11935,6 +11976,63 @@ fn plan_grid_partitions_balanced(
             cuts[k] = cuts[k].max(cuts[k - 1] + 1).min(hi);
         }
     }
+    // A heavy indivisible buffer can cross several quantiles. Repairing the
+    // repeated cuts above then assigns tiny slices to later workers while an
+    // earlier slice exceeds the minimum possible maximum load. Find that
+    // minimum with greedy feasibility; u128 retains sums above u64::MAX.
+    let sum: u128 = weights.iter().map(|&w| u128::from(w)).sum();
+    let mut low = sum
+        .div_ceil(workers as u128)
+        .max(u128::from(*weights.iter().max().unwrap()));
+    let mut high = sum;
+    while low < high {
+        let limit = low + (high - low) / 2;
+        let mut parts = 1usize;
+        let mut current = 0u128;
+        for &weight in weights {
+            let weight = u128::from(weight);
+            if current + weight > limit {
+                parts += 1;
+                current = 0;
+            }
+            current += weight;
+        }
+        if parts <= workers {
+            high = limit;
+        } else {
+            low = limit + 1;
+        }
+    }
+    let current_max = cuts
+        .windows(2)
+        .map(|pair| {
+            weights[pair[0]..pair[1]]
+                .iter()
+                .map(|&w| u128::from(w))
+                .sum::<u128>()
+        })
+        .max()
+        .unwrap_or(0);
+    // Avoid changing seams when the previous policy already attains the optimum.
+    if current_max > low {
+        cuts.clear();
+        cuts.push(0);
+        let mut remaining = workers;
+        let mut current = 0u128;
+        for (i, &weight) in weights.iter().enumerate() {
+            let weight = u128::from(weight);
+            let last_cut = cuts[cuts.len() - 1];
+            if i > last_cut && (current + weight > low || b - i == remaining - 1) {
+                debug_assert!(remaining > 1);
+                cuts.push(i);
+                remaining -= 1;
+                current = 0;
+            }
+            current += weight;
+        }
+        cuts.push(b);
+        debug_assert_eq!(cuts.len(), workers + 1);
+    }
     build_grid_slices(boundaries, &cuts, overlap_width_bp)
 }
 
@@ -11958,7 +12056,8 @@ fn accumulate_boundaries(
 /// needs to know how many transcripts cover each *variant* — a buffer's span
 /// alone cannot tell it that, because buffers hold a fixed number of variants
 /// and therefore span far more base pairs in gene deserts than in dense regions.
-/// Collection is opt-in so the default path allocates nothing extra.
+/// Collection is limited to the balanced stateful parallel path; serial and
+/// streaming paths allocate no position vector.
 fn accumulate_boundaries_inner(
     batches: &[RecordBatch],
     input_buffer_size: usize,
@@ -12105,7 +12204,7 @@ struct ContigAnnotationState {
     ordered_lookup_wait_started: Option<Instant>,
     /// In-flight fused window-annotation tasks, FIFO (= window/output order).
     /// Up to `config.annotation_workers` run concurrently on the blocking pool.
-    inflight: VecDeque<tokio::task::JoinHandle<WindowAnnotateResult>>,
+    inflight: VecDeque<PendingWindow>,
     /// Gate of the run being drained; later runs of the contig wait in
     /// `pending_runs` and are activated one after another.
     run: ActiveRunState,
@@ -12114,9 +12213,23 @@ struct ContigAnnotationState {
     pipeline_profile: Option<SharedContigPipelineProfile>,
 }
 
-/// Output of one fused window-annotation task: annotated batches plus the
-/// persisted HGNC carry state to seed the next sequential window.
-type WindowAnnotateResult = Result<(VecDeque<RecordBatch>, PersistedBufferTranscripts)>;
+/// The next window must wait for the completed HGNC carry state, even though
+/// output batches can be consumed before the current window finishes.
+type WindowAnnotateResult = Result<PersistedBufferTranscripts>;
+
+struct PendingWindow {
+    task: tokio::task::JoinHandle<WindowAnnotateResult>,
+    output: tokio::sync::mpsc::Receiver<RecordBatch>,
+}
+
+impl Drop for PendingWindow {
+    fn drop(&mut self) {
+        // A running blocking task cannot be aborted. Closing its bounded
+        // output wakes blocking_send so dropping a consumer cannot strand it.
+        self.output.close();
+        self.task.abort();
+    }
+}
 
 /// State for the threads>1 path: N independent per-partition fused pipelines,
 /// drained in partition-id order (= position order). No central poll loop /
@@ -12482,17 +12595,12 @@ enum StreamState {
     AnnotatingRunPool(RunPoolState),
     /// Await the oldest in-flight fused window task (FIFO preserves output order).
     AwaitingWindow {
-        handle: tokio::task::JoinHandle<WindowAnnotateResult>,
+        handle: PendingWindow,
         annotation_state: ContigAnnotationState,
     },
     /// A later region run of the current contig is building its filtered lookup.
     ActivatingRun {
         fut: RunActivateFuture,
-        annotation_state: ContigAnnotationState,
-    },
-    /// Yield annotated batches from the current window, then resume annotation.
-    DrainingWindow {
-        batches: VecDeque<RecordBatch>,
         annotation_state: ContigAnnotationState,
     },
     /// Deregister ephemeral tables after contig completes.
@@ -12883,6 +12991,45 @@ enum RunOutput {
 }
 
 impl RunOutput {
+    /// Hydrate a biological window once, then consume shard output inline.
+    /// The generic batch stream keeps its asynchronous admission protocol.
+    async fn annotate_window(
+        &mut self,
+        worker: &mut AnnotationWorkerState,
+        window: &[RecordBatch],
+        cache_source_type: CacheSourceType,
+        projection: Option<&[usize]>,
+        emit_bounds: Option<&[RunBounds]>,
+    ) -> Result<usize> {
+        match self {
+            RunOutput::Shard { shard, .. } => run_maybe_block_in_place(|| {
+                hydrate_worker_window(worker, window, cache_source_type)?;
+                let mut rows = 0;
+                annotate_worker_window_with_policy(
+                    worker,
+                    window,
+                    projection,
+                    emit_bounds,
+                    OutputChunkPolicy::Shard,
+                    |batch| {
+                        let n = batch.num_rows();
+                        shard.write_batch(batch)?;
+                        rows += n;
+                        Ok(())
+                    },
+                )?;
+                Ok(rows)
+            }),
+            RunOutput::Batches { .. } => {
+                let out = run_maybe_block_in_place(|| {
+                    hydrate_worker_window(worker, window, cache_source_type)?;
+                    annotate_worker_window(worker, window, projection, emit_bounds)
+                })?;
+                self.write_all(out).await
+            }
+        }
+    }
+
     /// Write one window's annotated batches; returns the rows written. The
     /// shard write is blocking IO (formatting + compression) and runs under
     /// `block_in_place`; the pool write awaits the output budget first.
@@ -13025,16 +13172,15 @@ async fn annotate_lookup_run(
         while window_buffer_input_units(&worker.window_buffer) >= input_buffer_size {
             let window = drain_window_input_units(&mut worker.window_buffer, input_buffer_size);
             let window_input_rows: usize = window.iter().map(RecordBatch::num_rows).sum();
-            let out = run_maybe_block_in_place(|| -> Result<VecDeque<RecordBatch>> {
-                hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-                annotate_worker_window(
+            stats.output_rows += output
+                .annotate_window(
                     &mut worker,
                     &window,
+                    cache_source_type,
                     projection.as_deref(),
                     emit_bounds.as_deref(),
                 )
-            })?;
-            stats.output_rows += output.write_all(out).await?;
+                .await?;
             // Report annotated input rows so the sink's progress bar advances live.
             stats.input_rows += window_input_rows;
             output.window_done(window_input_rows);
@@ -13056,18 +13202,15 @@ async fn annotate_lookup_run(
     worker.lookup_done = true;
     let window: Vec<RecordBatch> = std::mem::take(&mut worker.window_buffer);
     let window_input_rows: usize = window.iter().map(|b| b.num_rows()).sum();
-    let out = run_maybe_block_in_place(|| -> Result<VecDeque<RecordBatch>> {
-        if !window.is_empty() {
-            hydrate_worker_window(&mut worker, &window, cache_source_type)?;
-        }
-        annotate_worker_window(
+    stats.output_rows += output
+        .annotate_window(
             &mut worker,
             &window,
+            cache_source_type,
             projection.as_deref(),
             emit_bounds.as_deref(),
         )
-    })?;
-    stats.output_rows += output.write_all(out).await?;
+        .await?;
     stats.input_rows += window_input_rows;
     output.window_done(window_input_rows);
     if profiling_enabled() {
@@ -13375,11 +13518,7 @@ impl ContigAnnotationStream {
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
                 ann.ephemeral_tables.clear();
             }
-            StreamState::DrainingWindow {
-                annotation_state: ann,
-                ..
-            }
-            | StreamState::AwaitingWindow {
+            StreamState::AwaitingWindow {
                 annotation_state: ann,
                 ..
             }
@@ -13733,6 +13872,7 @@ fn prepared_context_from_buffer<'a>(
         &shared.mirnas,
         &shared.structural,
     )
+    .with_shared_references(&shared.reference_memos)
 }
 
 fn hydrate_worker_window(
@@ -14479,12 +14619,88 @@ fn warm_up_worker_state(
     Ok(())
 }
 
+// This limits Arrow/VCF output allocations, not VEP input-buffer state.
+// Context preparation still sees the entire original 5,000-input-unit buffer.
+const ANNOTATION_OUTPUT_CHUNK_ROWS: usize = 1024;
+// Shards consume synchronously. Tune their formatter allocation size separately
+// from the serial queue, preserving the 5,000-input-unit biological window.
+const SHARD_OUTPUT_CHUNK_ROWS: usize = 640;
+
+#[derive(Clone, Copy)]
+enum OutputChunkPolicy {
+    /// The consumer releases each output before the next annotation call.
+    Consumed,
+    /// Inline VCF formatting with an independently measured chunk size.
+    Shard,
+    /// Preserve the batch-stream path's existing async budget behavior.
+    Buffered,
+}
+
+fn annotation_output_chunks(
+    batch: &RecordBatch,
+    policy: OutputChunkPolicy,
+) -> impl Iterator<Item = RecordBatch> + '_ {
+    let chunk_rows = match policy {
+        OutputChunkPolicy::Consumed => ANNOTATION_OUTPUT_CHUNK_ROWS,
+        OutputChunkPolicy::Shard => SHARD_OUTPUT_CHUNK_ROWS,
+        OutputChunkPolicy::Buffered => batch.num_rows().max(1),
+    };
+    (0..batch.num_rows())
+        .step_by(chunk_rows)
+        .map(move |start| batch.slice(start, (batch.num_rows() - start).min(chunk_rows)))
+}
+
 fn annotate_worker_window(
     worker: &mut AnnotationWorkerState,
     window_batches: &[RecordBatch],
     projection: Option<&[usize]>,
     emit_bounds: Option<&[RunBounds]>,
 ) -> Result<VecDeque<RecordBatch>> {
+    let mut out = VecDeque::with_capacity(window_batches.len());
+    let policy = if worker.shared.config.annotation_workers > 1 {
+        OutputChunkPolicy::Buffered
+    } else {
+        OutputChunkPolicy::Consumed
+    };
+    annotate_worker_window_with_policy(
+        worker,
+        window_batches,
+        projection,
+        emit_bounds,
+        policy,
+        |batch| {
+            out.push_back(batch);
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+fn annotate_worker_window_with_output(
+    worker: &mut AnnotationWorkerState,
+    window_batches: &[RecordBatch],
+    projection: Option<&[usize]>,
+    emit_bounds: Option<&[RunBounds]>,
+    emit: impl FnMut(RecordBatch) -> Result<()>,
+) -> Result<()> {
+    annotate_worker_window_with_policy(
+        worker,
+        window_batches,
+        projection,
+        emit_bounds,
+        OutputChunkPolicy::Consumed,
+        emit,
+    )
+}
+
+fn annotate_worker_window_with_policy(
+    worker: &mut AnnotationWorkerState,
+    window_batches: &[RecordBatch],
+    projection: Option<&[usize]>,
+    emit_bounds: Option<&[RunBounds]>,
+    policy: OutputChunkPolicy,
+    mut emit: impl FnMut(RecordBatch) -> Result<()>,
+) -> Result<()> {
     let annotation_started = Instant::now();
     let shared = Arc::clone(&worker.shared);
     let profile = shared.profile.clone();
@@ -14507,8 +14723,6 @@ fn annotate_worker_window(
             .iter()
             .any(|&i| i >= typed_cols_start && i < typed_cols_end)
     });
-    let mut out = VecDeque::with_capacity(window_batches.len());
-
     let flush_partial = worker.lookup_done && worker.window_buffer.is_empty();
     let input_buffer_started = Instant::now();
     let ready_input_buffers = worker.input_buffer_accumulator.push_window_and_drain_ready(
@@ -14541,7 +14755,13 @@ fn annotate_worker_window(
             profile.prepared_context += prepared_context_started.elapsed();
         });
 
-        for batch in &buffer_batches {
+        // Keep the whole-buffer prepared context and persisted state intact.
+        // Only split its stateless annotation/output work, so dense CSQ buffers
+        // cannot force multi-hundred-megabyte formatter copies in one batch.
+        for batch in buffer_batches
+            .iter()
+            .flat_map(|batch| annotation_output_chunks(batch, policy))
+        {
             // SIFT/PolyPhen predictions are fetched on demand by the transcript
             // engine (`lookup_sift_polyphen`), which only queries the store for
             // single-amino-acid substitutions and memoizes per transcript. Eagerly
@@ -14556,7 +14776,7 @@ fn annotate_worker_window(
 
             let engine_started = Instant::now();
             let annotated = tmp_provider.annotate_batch_with_transcript_engine(
-                batch,
+                &batch,
                 engine,
                 &ctx,
                 &worker.colocated_map,
@@ -14589,22 +14809,30 @@ fn annotate_worker_window(
                 continue;
             }
 
-            if let Some(indices) = projection {
+            let annotated = if let Some(indices) = projection {
                 let projection_started = Instant::now();
                 let projected = annotated.project(indices)?;
+                // Projection shares arrays. Release the original owner before
+                // the sink drops its batch and allocates the formatted body.
+                drop(annotated);
                 record_contig_profile(&profile, |profile| {
                     profile.projection += projection_started.elapsed();
                 });
-                out.push_back(projected);
+                projected
             } else {
-                out.push_back(annotated);
-            }
+                annotated
+            };
+            let emission_started = Instant::now();
+            emit(annotated)?;
+            record_contig_profile(&profile, |profile| {
+                profile.output_emission += emission_started.elapsed();
+            });
         }
     }
     record_contig_profile(&profile, |profile| {
         profile.annotation_compute += annotation_started.elapsed();
     });
-    Ok(out)
+    Ok(())
 }
 
 /// Annotate one window on a *fresh* worker, seeded with a snapshot of the
@@ -14617,6 +14845,7 @@ fn annotate_worker_window(
 /// variants is already present in `colocated_snapshot`. Hydration is rebuilt
 /// per window (a fresh worker), which only re-does work for boundary
 /// transcripts — an accepted, bounded cost.
+#[allow(clippy::too_many_arguments)]
 fn annotate_window_owned(
     shared: Arc<SharedContigAnnotationContext>,
     colocated_snapshot: Arc<HashMap<ColocatedKey, ColocatedData>>,
@@ -14625,7 +14854,8 @@ fn annotate_window_owned(
     projection: Option<Vec<usize>>,
     persisted_seed: PersistedBufferTranscripts,
     emit_bounds: Option<Vec<RunBounds>>,
-) -> Result<(VecDeque<RecordBatch>, PersistedBufferTranscripts)> {
+    output: tokio::sync::mpsc::Sender<RecordBatch>,
+) -> WindowAnnotateResult {
     let mut worker = AnnotationWorkerState::new(shared)?;
     worker.colocated_map = colocated_snapshot;
     worker.lookup_done = true;
@@ -14635,13 +14865,18 @@ fn annotate_window_owned(
     // sequentially (the stateful Merged/RefSeq path).
     worker.persisted_buffer_transcripts = persisted_seed;
     hydrate_worker_window(&mut worker, &window_batches, cache_source_type)?;
-    let out = annotate_worker_window(
+    annotate_worker_window_with_output(
         &mut worker,
         &window_batches,
         projection.as_deref(),
         emit_bounds.as_deref(),
+        |batch| {
+            output.blocking_send(batch).map_err(|_| {
+                DataFusionError::Execution("serial window output receiver was dropped".into())
+            })
+        },
     )?;
-    Ok((out, worker.persisted_buffer_transcripts))
+    Ok(worker.persisted_buffer_transcripts)
 }
 
 enum LookupPartitionPoll {
@@ -15388,7 +15623,8 @@ impl Stream for ContigAnnotationStream {
                         let cache_source_type = ann.config.cache_source_type;
                         let persisted_seed = ann.worker.persisted_buffer_transcripts.clone();
                         let emit_bounds = ann.run.trim_bounds();
-                        let handle = tokio::task::spawn_blocking(move || {
+                        let (output, receiver) = tokio::sync::mpsc::channel(1);
+                        let task = tokio::task::spawn_blocking(move || {
                             annotate_window_owned(
                                 shared,
                                 colocated,
@@ -15397,9 +15633,13 @@ impl Stream for ContigAnnotationStream {
                                 projection,
                                 persisted_seed,
                                 emit_bounds,
+                                output,
                             )
                         });
-                        ann.inflight.push_back(handle);
+                        ann.inflight.push_back(PendingWindow {
+                            task,
+                            output: receiver,
+                        });
                         self.state = StreamState::AnnotatingContig(ann);
                         continue;
                     }
@@ -15497,10 +15737,7 @@ impl Stream for ContigAnnotationStream {
                     }
                 }
 
-                StreamState::AwaitingWindow {
-                    handle,
-                    annotation_state,
-                } => {
+                StreamState::AwaitingWindow { .. } => {
                     let StreamState::AwaitingWindow {
                         mut handle,
                         annotation_state: mut ann,
@@ -15508,7 +15745,32 @@ impl Stream for ContigAnnotationStream {
                     else {
                         unreachable!()
                     };
-                    match std::pin::Pin::new(&mut handle).poll(cx) {
+                    match handle.output.poll_recv(cx) {
+                        Poll::Ready(Some(batch)) => {
+                            let profile = ann.worker.shared.profile.clone();
+                            self.state = StreamState::AwaitingWindow {
+                                handle,
+                                annotation_state: ann,
+                            };
+                            // Finish draining the current window after LIMIT,
+                            // including its errors and persisted state, exactly
+                            // as when all its batches were materialized first.
+                            let remaining =
+                                fetch_limit.map(|limit| limit.saturating_sub(rows_emitted));
+                            if remaining == Some(0) {
+                                continue;
+                            }
+                            let batch = match remaining {
+                                Some(n) if batch.num_rows() > n => batch.slice(0, n),
+                                _ => batch,
+                            };
+                            self.rows_emitted += batch.num_rows();
+                            record_contig_profile(&profile, |profile| {
+                                profile.output_batches += 1;
+                                profile.output_rows += batch.num_rows();
+                            });
+                            return Poll::Ready(Some(Ok(batch)));
+                        }
                         Poll::Pending => {
                             self.state = StreamState::AwaitingWindow {
                                 handle,
@@ -15516,12 +15778,19 @@ impl Stream for ContigAnnotationStream {
                             };
                             return Poll::Pending;
                         }
-                        Poll::Ready(Ok(Ok((batches, persisted)))) => {
-                            ann.worker.persisted_buffer_transcripts = persisted;
-                            self.state = StreamState::DrainingWindow {
-                                batches,
+                        Poll::Ready(None) => {}
+                    }
+                    match std::pin::Pin::new(&mut handle.task).poll(cx) {
+                        Poll::Pending => {
+                            self.state = StreamState::AwaitingWindow {
+                                handle,
                                 annotation_state: ann,
                             };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(Ok(persisted))) => {
+                            ann.worker.persisted_buffer_transcripts = persisted;
+                            self.state = StreamState::AnnotatingContig(ann);
                             continue;
                         }
                         Poll::Ready(Ok(Err(e))) => {
@@ -15548,50 +15817,6 @@ impl Stream for ContigAnnotationStream {
                             continue;
                         }
                     }
-                }
-
-                StreamState::DrainingWindow {
-                    batches,
-                    annotation_state,
-                } => {
-                    if let Some(batch) = batches.pop_front() {
-                        let profile = annotation_state.worker.shared.profile.clone();
-                        // LIMIT pushdown: truncate or stop if we've reached the limit.
-                        if let Some(limit) = fetch_limit {
-                            let remaining = limit.saturating_sub(rows_emitted);
-                            if remaining == 0 {
-                                // Don't emit — fall through to the window-drained
-                                // path below, which transitions to AnnotatingContig.
-                                // The limit_reached check there triggers proper
-                                // cleanup (deregister ephemeral tables).
-                                continue;
-                            }
-                            if batch.num_rows() > remaining {
-                                self.rows_emitted += remaining;
-                                record_contig_profile(&profile, |profile| {
-                                    profile.output_batches += 1;
-                                    profile.output_rows += remaining;
-                                });
-                                return Poll::Ready(Some(Ok(batch.slice(0, remaining))));
-                            }
-                        }
-                        self.rows_emitted += batch.num_rows();
-                        record_contig_profile(&profile, |profile| {
-                            profile.output_batches += 1;
-                            profile.output_rows += batch.num_rows();
-                        });
-                        return Poll::Ready(Some(Ok(batch)));
-                    }
-                    // Window drained — back to AnnotatingContig for next window
-                    // (or cleanup if window_buffer is empty).
-                    let StreamState::DrainingWindow {
-                        annotation_state: ann,
-                        ..
-                    } = std::mem::replace(&mut self.state, StreamState::Done)
-                    else {
-                        unreachable!()
-                    };
-                    self.state = StreamState::AnnotatingContig(ann);
                 }
 
                 StreamState::AnnotatingRunPool(_) => {
@@ -16041,12 +16266,13 @@ async fn prepare_contig_data(
             unreachable!("parquet-cache feature is required")
         }
     };
-    // Cost-weighted grid split (opt-in). Resolved before the count pass because
-    // the weights need every row's position, which only that pass sees.
+    // Balance whole buffers by transcript overlap by default. The count pass
+    // supplies their positions; VEP_GRID_BALANCE=0 retains uniform partitions
+    // for diagnostic ablation. Buffer seams and state replay stay unchanged.
     let grid_balance_enabled = stateful_parallel
-        && pipeline_trace::enabled_from_env_value(
-            std::env::var("VEP_GRID_BALANCE").ok().as_deref(),
-        );
+        && pipeline_trace::enabled_from_env_value(Some(
+            std::env::var("VEP_GRID_BALANCE").as_deref().unwrap_or("1"),
+        ));
     // Run the grid count pass (VCF positions only) CONCURRENTLY with the context
     // load (Parquet transcripts/exons) — independent IO, so the count is hidden
     // behind context load instead of running as a serial prelude before workers.
@@ -16118,8 +16344,12 @@ async fn prepare_contig_data(
     let sift_prediction_store =
         if use_lookup_sift && config.flags.everything && config.needs_sift_polyphen {
             let sift_started = Instant::now();
-            let store =
-                load_parquet_sift_prediction_store_for_chrom(cache.as_parquet(), &chrom).await?;
+            let store = load_parquet_sift_prediction_store_for_chrom(
+                cache.as_parquet(),
+                &chrom,
+                Arc::clone(&config.sift_page_budget),
+            )
+            .await?;
             record_contig_profile(&pipeline_profile, |profile| {
                 profile.sift_load += sift_started.elapsed();
             });
@@ -16186,18 +16416,41 @@ async fn prepare_contig_data(
         let (boundaries, _total_rows, grid_positions) = grid_count
             .take()
             .expect("stateful_parallel implies the count future ran")?;
-        // Cost-weighted grid split (opt-in via VEP_GRID_BALANCE). The default
+        // Cost-weighted grid split (disabled with VEP_GRID_BALANCE=0). The old
         // equal-buffer-count split equalises variants per worker, not work, so
         // gene-dense slices straggle; weighting by transcript overlap equalises
-        // the thing that actually costs. Slice boundaries do not affect output
+        // the work. Coding-length costs also account for long peptide/CDS
+        // processing in sparse overlap regions. Slice boundaries do not affect output
         // (every worker count already yields byte-identical VCFs), so this is a
         // scheduling change only.
         let slices = if grid_balance_enabled {
             let t_w = Instant::now();
-            let weights = buffer_transcript_weights(
+            let coding_costs: HashMap<_, _> = tl
+                .iter()
+                .map(|translation| {
+                    (
+                        translation.transcript_id.as_str(),
+                        coding_length_cost(
+                            translation.cds_len,
+                            translation.protein_len,
+                            translation.cds_sequence.as_ref().map(String::len),
+                        ),
+                    )
+                })
+                .collect();
+            let weights = buffer_transcript_cost_weights(
                 &boundaries,
                 &grid_positions,
-                base_transcripts.iter().map(|tx| (tx.start, tx.end)),
+                base_transcripts.iter().map(|tx| {
+                    (
+                        tx.start,
+                        tx.end,
+                        coding_costs
+                            .get(tx.transcript_id.as_str())
+                            .copied()
+                            .unwrap_or(1),
+                    )
+                }),
             );
             let planned = plan_grid_partitions_balanced(
                 &boundaries,
@@ -16224,7 +16477,7 @@ async fn prepare_contig_data(
                             && boundaries[*i].global_row < s.emit_end_row
                     })
                     .map(|(_, w)| *w)
-                    .sum();
+                    .fold(0u64, u64::saturating_add);
                 pipeline_trace::emit(
                     "grid_balance",
                     "slice",
@@ -16357,6 +16610,11 @@ async fn prepare_contig_data(
     };
 
     let shared_context = Arc::new(SharedContigAnnotationContext {
+        reference_memos: crate::transcript_consequence::SharedReferenceMemos::new(
+            &base_transcripts,
+            &tl,
+            Arc::clone(&config.reference_budget),
+        ),
         config: config.clone(),
         profile: pipeline_profile.clone(),
         base_transcripts,
@@ -18365,7 +18623,15 @@ mod tests {
     }
 
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
+        let annotation_workers = 1;
         ContigAnnotationConfig {
+            #[cfg(feature = "parquet-cache")]
+            sift_page_budget: crate::parquet_cache::sift::decoded_pages::PageCacheBudget::new(
+                256 * 1024 * 1024,
+            ),
+            reference_budget: crate::cache_budget::CacheBudget::new(
+                crate::cache_budget::reference_cache_default_mb(annotation_workers) * 1024 * 1024,
+            ),
             vcf_table: "vcf".to_string(),
             options_json: None,
             cache_columns: Vec::new(),
@@ -18388,7 +18654,7 @@ mod tests {
             output_needs: Arc::new(OutputNeeds::all()),
             needs_transcript_context: true,
             fetch_limit: None,
-            annotation_workers: 1,
+            annotation_workers,
             pick_flags: PickFlags::default(),
             #[cfg(feature = "parquet-cache")]
             cache_root: None,
@@ -18446,8 +18712,14 @@ mod tests {
             .map(|tx| (tx.transcript_id.clone(), gene_cache_regions(tx)))
             .collect();
 
+        let config = minimal_contig_annotation_config();
         Arc::new(SharedContigAnnotationContext {
-            config: minimal_contig_annotation_config(),
+            reference_memos: crate::transcript_consequence::SharedReferenceMemos::new(
+                &transcripts,
+                &translations,
+                Arc::clone(&config.reference_budget),
+            ),
+            config,
             profile: None,
             base_transcripts: Arc::new(transcripts),
             overlap_width_bp: 0,
@@ -20096,6 +20368,66 @@ mod tests {
 
     // ── lookup_sift_polyphen ───────────────────────────────────────────
 
+    #[cfg(feature = "parquet-cache")]
+    #[test]
+    fn row_prediction_reuse_formats_values_and_absences_without_reloading() {
+        struct NoReload;
+        impl crate::cache_common::SiftPredictionStore for NoReload {
+            fn get_many(&self, _: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+                panic!("position-sliced row must not request transcript predictions")
+            }
+            fn is_position_sliced(&self) -> bool {
+                true
+            }
+            fn get_position_predictions(
+                &self,
+                _: &[u64],
+            ) -> Result<HashMap<u64, CachedPredictions>> {
+                panic!("the row already fetched both positive and negative results")
+            }
+        }
+        let store: Option<SiftPredictionStoreRef> = Some(Arc::new(NoReload));
+        let predictions = HashMap::from([(
+            (7u64 << 32) | 42,
+            CachedPredictions {
+                sift: vec![CompactPrediction {
+                    position: 42,
+                    amino_acid: CompactPrediction::encode_amino_acid("I").unwrap(),
+                    prediction: CompactPrediction::encode_prediction("deleterious"),
+                    score: 0.01,
+                }],
+                ..Default::default()
+            },
+        )]);
+        let mut cache = SiftPolyphenCache::new();
+        for _output in ["CSQ", "typed"] {
+            assert_eq!(
+                lookup_sift_polyphen_for_row(
+                    None,
+                    Some(7),
+                    Some("42"),
+                    Some("V/I"),
+                    &mut cache,
+                    &store,
+                    Some(&predictions)
+                ),
+                ("deleterious(0.01)".to_owned(), String::new())
+            );
+            assert_eq!(
+                lookup_sift_polyphen_for_row(
+                    None,
+                    Some(7),
+                    Some("43"),
+                    Some("V/I"),
+                    &mut cache,
+                    &store,
+                    Some(&predictions)
+                ),
+                (String::new(), String::new())
+            );
+        }
+    }
+
     fn make_sift_cache(entries: Vec<(&str, i32, &str, &str, f32, &str, f32)>) -> SiftPolyphenCache {
         let mut cache = SiftPolyphenCache::new();
         let mut by_tx: HashMap<String, CachedPredictions> = HashMap::new();
@@ -20736,6 +21068,83 @@ mod tests {
     }
 
     #[test]
+    fn coding_length_cost_handles_missing_metadata_priority_and_outliers() {
+        assert_eq!(coding_length_cost(None, None, None), 1);
+        assert_eq!(coding_length_cost(Some(0), None, None), 1);
+        assert_eq!(coding_length_cost(Some(768), Some(99_999), Some(99_999)), 2);
+        assert_eq!(coding_length_cost(None, Some(256), None), 2);
+        assert_eq!(coding_length_cost(None, None, Some(1536)), 3);
+        assert_eq!(coding_length_cost(Some(0), Some(256), Some(1536)), 3);
+        assert_eq!(coding_length_cost(Some(usize::MAX), None, None), 256);
+        assert_eq!(coding_length_cost(None, Some(usize::MAX), None), 256);
+    }
+
+    #[test]
+    fn weighted_endpoint_prefixes_preserve_coverage_when_totals_exceed_u64() {
+        let bs = vec![gb(0, 0), gb(1, 100), gb(2, 200), gb(3, i64::MAX)];
+        let weights = buffer_transcript_cost_weights(
+            &bs,
+            &[(0, 1), (100, u32::MAX), (200, 1)],
+            [(150, -50, u64::MAX), (50, 150, u64::MAX)],
+        );
+        assert_eq!(weights[0], u64::MAX);
+        assert_eq!(weights[1], u64::MAX);
+        assert!(
+            weights[2] > 0 && weights[2] < u64::MAX,
+            "all transcripts end before 200; the desert keeps only the fixed floor"
+        );
+    }
+
+    #[test]
+    fn weighted_transcripts_keep_alt_units_inclusive_ends_and_zero_unit_floor() {
+        let bs = vec![gb(0, 0), gb(1, 100), gb(2, 200), gb(3, i64::MAX)];
+        let weights = buffer_transcript_cost_weights(
+            &bs,
+            &[(0, 0), (100, 10), (200, 1)],
+            [(0, 100, 2), (100, 0, 8)],
+        );
+        assert_eq!(weights[0] - weights[2], 10);
+        assert_eq!(weights[1] - weights[2], 100);
+        assert!(weights.iter().all(|&w| w > 0));
+    }
+
+    #[test]
+    fn weighted_grid_distinguishes_coding_length_at_equal_overlap_depth() {
+        let bs = vec![
+            gb(0, 0),
+            gb(1, 100),
+            gb(2, 200),
+            gb(3, 300),
+            gb(4, i64::MAX),
+        ];
+        let positions = vec![(0, 1), (100, 1), (200, 1), (300, 1)];
+        let spans = [
+            (0, 50, 768usize),
+            (100, 150, 768),
+            (200, 250, 768),
+            (300, 350, 76_800),
+        ];
+        let weights = buffer_transcript_cost_weights(
+            &bs,
+            &positions,
+            spans.into_iter().map(|(start, end, coding_len)| {
+                (start, end, coding_length_cost(Some(coding_len), None, None))
+            }),
+        );
+        assert!(
+            weights[3] > weights[2],
+            "equal overlap counts must not hide a transcript with 100 times more coding sequence"
+        );
+        let slices = plan_grid_partitions_balanced(&bs, 2, 0, &weights);
+        assert_eq!(
+            slices[0].emit_end_row, 3,
+            "reserve the expensive final buffer for its own worker"
+        );
+        assert_eq!(slices[1].emit_start_row, 3);
+        assert_eq!(slices[1].emit_end_row, 4);
+    }
+
+    #[test]
     fn weights_count_transcripts_overlapping_each_buffer() {
         // 4 buffers of one row each; the row's position decides its cost.
         let bs = vec![
@@ -20785,6 +21194,123 @@ mod tests {
         );
         // depth 1 x 10 units vs depth 1 x 1 unit, before the shared fixed term
         assert_eq!(multi[1] - single[1], 9);
+    }
+
+    #[test]
+    fn balanced_split_minimizes_maximum_cost_when_one_buffer_crosses_quantiles() {
+        let weights = [4u64, 4, 9, 9, 1, 1, 4, 4];
+        let boundaries: Vec<_> = (0..=weights.len()).map(|i| gb(i, i as i64 * 100)).collect();
+        let slices = plan_grid_partitions_balanced(&boundaries, 4, 0, &weights);
+        let maximum = slices
+            .iter()
+            .map(|s| {
+                weights[s.emit_start_row..s.emit_end_row]
+                    .iter()
+                    .map(|&w| u128::from(w))
+                    .sum::<u128>()
+            })
+            .max()
+            .unwrap();
+        assert_eq!(
+            maximum, 10,
+            "quantile rounding must not overload one worker while leaving another almost idle"
+        );
+    }
+
+    #[test]
+    fn balanced_split_matches_exhaustive_minimum_for_small_grids() {
+        fn optimum(weights: &[u64], parts: usize) -> u128 {
+            if parts == 1 {
+                return weights.iter().map(|&w| u128::from(w)).sum();
+            }
+            (1..=weights.len() - parts + 1)
+                .map(|cut| {
+                    let left: u128 = weights[..cut].iter().map(|&w| u128::from(w)).sum();
+                    left.max(optimum(&weights[cut..], parts - 1))
+                })
+                .min()
+                .unwrap()
+        }
+        for len in 1usize..=6 {
+            let boundaries: Vec<_> = (0..=len).map(|i| gb(i, i as i64 * 10)).collect();
+            for mut encoded in 0..3usize.pow(len as u32) {
+                let weights: Vec<_> = (0..len)
+                    .map(|_| {
+                        let value = [0u64, 1, 7][encoded % 3];
+                        encoded /= 3;
+                        value
+                    })
+                    .collect();
+                for workers in 0..=len + 2 {
+                    let slices = plan_grid_partitions_balanced(&boundaries, workers, 0, &weights);
+                    let expected_parts = workers.max(1).min(len);
+                    assert_eq!(slices.len(), expected_parts);
+                    assert_eq!(slices[0].emit_start_row, 0);
+                    assert_eq!(slices.last().unwrap().emit_end_row, len);
+                    for pair in slices.windows(2) {
+                        assert_eq!(pair[0].emit_end_row, pair[1].emit_start_row);
+                    }
+                    let maximum = slices
+                        .iter()
+                        .map(|s| {
+                            assert!(s.emit_start_row < s.emit_end_row);
+                            weights[s.emit_start_row..s.emit_end_row]
+                                .iter()
+                                .map(|&w| u128::from(w))
+                                .sum::<u128>()
+                        })
+                        .max()
+                        .unwrap();
+                    assert_eq!(
+                        maximum,
+                        optimum(&weights, expected_parts),
+                        "weights={weights:?}, workers={workers}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn balanced_split_minimax_preserves_cost_above_u64_and_caps_worker_count() {
+        let weights = [u64::MAX, 1, u64::MAX, 1];
+        let boundaries: Vec<_> = (0..=weights.len()).map(|i| gb(i, i as i64 * 100)).collect();
+        let slices = plan_grid_partitions_balanced(&boundaries, 2, 0, &weights);
+        assert_eq!(slices[0].emit_end_row, 2);
+        assert_eq!(slices[1].emit_start_row, 2);
+        let many = plan_grid_partitions_balanced(&boundaries, usize::MAX, 0, &weights);
+        assert_eq!(many.len(), weights.len());
+        assert!(many.iter().all(|s| s.emit_end_row - s.emit_start_row == 1));
+    }
+
+    #[test]
+    fn balanced_split_minimax_keeps_tie_ownership_and_warmup() {
+        let weights = [4u64, 4, 9, 9, 1, 1, 4, 4];
+        let mut boundaries: Vec<_> = (0..=weights.len())
+            .map(|i| gb(i * 5000, i as i64 * 100))
+            .collect();
+        boundaries[2].pos = boundaries[1].pos;
+        boundaries[2].rows_before_pos = 3;
+        let slices = plan_grid_partitions_balanced(&boundaries, 4, 0, &weights);
+        assert_eq!(slices[1].emit_start_row, 10000);
+        assert_eq!(slices[1].warm_up_start_row, 10000);
+        assert_eq!(slices[1].skip_leading_rows, 3);
+        let warmed = plan_grid_partitions_balanced(&boundaries, 4, 50, &weights);
+        assert_eq!(warmed[1].emit_start_row, 10000);
+        assert_eq!(warmed[1].warm_up_start_row, 0);
+        assert_eq!(warmed[1].scan_lo_pos, 0);
+        assert_eq!(warmed.last().unwrap().scan_hi_pos, i64::MAX);
+    }
+
+    #[test]
+    fn balanced_split_keeps_existing_optimal_seams() {
+        let weights = [4u64, 4, 9, 9];
+        let boundaries: Vec<_> = (0..=weights.len()).map(|i| gb(i, i as i64 * 100)).collect();
+        let slices = plan_grid_partitions_balanced(&boundaries, 3, 0, &weights);
+        assert_eq!(
+            slices.iter().map(|s| s.emit_end_row).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
     }
 
     #[test]
@@ -21105,6 +21631,71 @@ mod tests {
             ]))],
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serial_window_outputs_precede_completion_and_preserve_order() {
+        let (output, receiver) = tokio::sync::mpsc::channel(1);
+        let (finish, wait_for_finish) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            output.blocking_send(tagged_batch(1)).unwrap();
+            output.blocking_send(tagged_batch(2)).unwrap();
+            wait_for_finish.blocking_recv().unwrap();
+            Ok(PersistedBufferTranscripts::new())
+        });
+        let mut pending = PendingWindow {
+            task,
+            output: receiver,
+        };
+        assert_eq!(pending.output.recv().await.unwrap(), tagged_batch(1));
+        assert_eq!(pending.output.recv().await.unwrap(), tagged_batch(2));
+        assert!(!pending.task.is_finished());
+        finish.send(()).unwrap();
+        assert!(pending.output.recv().await.is_none());
+        assert!((&mut pending.task).await.unwrap().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_serial_window_wakes_a_blocked_producer() {
+        let (output, receiver) = tokio::sync::mpsc::channel(1);
+        let (started, wait_for_start) = tokio::sync::oneshot::channel();
+        let (finished, wait_for_finish) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            output.blocking_send(tagged_batch(1)).unwrap();
+            started.send(()).unwrap();
+            let cancelled = output.blocking_send(tagged_batch(2)).is_err();
+            let _ = finished.send(cancelled);
+            Ok(PersistedBufferTranscripts::new())
+        });
+        let pending = PendingWindow {
+            task,
+            output: receiver,
+        };
+        wait_for_start.await.unwrap();
+        drop(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_finish)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serial_window_retains_errors_after_emitting_output() {
+        let (output, receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::task::spawn_blocking(move || {
+            output.blocking_send(tagged_batch(1)).unwrap();
+            Err(DataFusionError::Execution("window failed".into()))
+        });
+        let mut pending = PendingWindow {
+            task,
+            output: receiver,
+        };
+        assert_eq!(pending.output.recv().await.unwrap(), tagged_batch(1));
+        assert!(pending.output.recv().await.is_none());
+        let error = (&mut pending.task).await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("window failed"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21609,6 +22200,264 @@ mod tests {
         .unwrap()
     }
 
+    fn output_lifetime_input(rows: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"; rows])),
+                Arc::new(Int64Array::from(
+                    (0..rows).map(|i| 100 + (i / 5) as i64).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    (0..rows).map(|i| 100 + (i / 5) as i64).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec!["G"; rows])),
+                Arc::new(StringArray::from(vec!["A,C,T"; rows])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn consumed_output_bounds_parallel_batches_before_annotation() {
+        let mut shared = minimal_shared_contig_annotation_context();
+        Arc::get_mut(&mut shared).unwrap().config.annotation_workers = 8;
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        worker.lookup_done = true;
+        let source = output_lifetime_input((2 * SHARD_OUTPUT_CHUNK_ROWS + 7).max(4000));
+        let mut columns = source.columns().to_vec();
+        columns[4] = Arc::new(StringArray::from(
+            (0..source.num_rows())
+                .map(|i| if i % 3 == 0 { "A,C,T" } else { "A" })
+                .collect::<Vec<_>>(),
+        ));
+        let input = RecordBatch::try_new(source.schema(), columns).unwrap();
+        assert!(batch_input_units(&input) > VEP_INPUT_BUFFER_SIZE);
+        let mut rows = 0;
+        let mut chunks = 0;
+        annotate_worker_window_with_policy(
+            &mut worker,
+            &[input.clone()],
+            Some(&[1, 5]),
+            None,
+            OutputChunkPolicy::Shard,
+            |batch| {
+                assert!(
+                    batch.num_rows() <= SHARD_OUTPUT_CHUNK_ROWS,
+                    "the consumer must receive bounded batches, not an entire parallel window"
+                );
+                rows += batch.num_rows();
+                chunks += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(rows, input.num_rows());
+        assert!(chunks > 2);
+    }
+
+    #[test]
+    fn consumed_output_projection_releases_csq_backing_allocation_inside_sink() {
+        let shared = minimal_shared_contig_annotation_context();
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        worker.lookup_done = true;
+        let mut emitted = 0;
+        annotate_worker_window_with_output(&mut worker, &[output_lifetime_input(3)], Some(&[1, 5]), None, |batch| {
+            let csq = batch.column(1).as_string::<i32>().values().clone();
+            assert!(!csq.is_empty(), "probe the newly allocated CSQ payload, not an empty buffer");
+            drop(batch);
+            assert_eq!(csq.strong_count(), 1,
+                "only the test probe may retain the backing buffer after the sink drops its batch");
+            emitted += 1;
+            Ok(())
+        }).unwrap();
+        assert_eq!(emitted, 1);
+    }
+
+    #[test]
+    fn consumed_output_sink_error_precedes_later_annotation_error() {
+        let mut shared = minimal_shared_contig_annotation_context();
+        Arc::get_mut(&mut shared).unwrap().config.annotation_workers = 8;
+        let good = output_lifetime_input(ANNOTATION_OUTPUT_CHUNK_ROWS);
+        // Bounds and ALT accounting remain valid, but annotation cannot find REF.
+        let bad = good.project(&[0, 1, 2, 4]).unwrap();
+        let windows = vec![good, bad];
+        let mut control = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+        control.lookup_done = true;
+        let later =
+            annotate_worker_window_with_output(&mut control, &windows, None, None, |_| Ok(()))
+                .expect_err("the later batch must fail annotation, making this a nonvacuous probe");
+        assert!(later.to_string().contains("ref"), "{later}");
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        worker.lookup_done = true;
+        let mut calls = 0;
+        let error = annotate_worker_window_with_output(&mut worker, &windows, None, None, |_| {
+            calls += 1;
+            Err(DataFusionError::Execution("sink-stop".into()))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("sink-stop"), "{error}");
+        assert_eq!(calls, 1);
+    }
+
+    async fn check_shard_consumes_full_partial_and_empty_windows() {
+        use datafusion_bio_format_vcf::VcfCompressionType;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for rows in [2 * ANNOTATION_OUTPUT_CHUNK_ROWS + 7, 0] {
+            let mut shared = minimal_shared_contig_annotation_context();
+            let vcf_schema = Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+                Field::new("id", DataType::Utf8, false),
+                Field::new("filter", DataType::Utf8, false),
+                Field::new("qual", DataType::Float64, true),
+            ]);
+            let source = output_lifetime_input(rows);
+            let input = RecordBatch::try_new(
+                Arc::new(vcf_schema.clone()),
+                vec![
+                    Arc::clone(source.column(0)),
+                    datafusion::arrow::compute::cast(source.column(1), &DataType::UInt32).unwrap(),
+                    datafusion::arrow::compute::cast(source.column(2), &DataType::UInt32).unwrap(),
+                    Arc::clone(source.column(3)),
+                    Arc::clone(source.column(4)),
+                    Arc::new(StringArray::from(vec!["."; rows])),
+                    Arc::new(StringArray::from(vec!["PASS"; rows])),
+                    Arc::new(Float64Array::from(vec![None; rows])),
+                ],
+            )
+            .unwrap();
+            let context = Arc::get_mut(&mut shared).unwrap();
+            context.config.annotation_workers = 8;
+            context.tmp_provider = Arc::new(
+                AnnotateProvider::new(
+                    Arc::new(SessionContext::new()),
+                    "vcf".into(),
+                    String::new(),
+                    AnnotationBackend::Parquet,
+                    CacheSourceType::Ensembl,
+                    None,
+                    vcf_schema,
+                )
+                .unwrap(),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("body.vcf");
+            let shard = crate::vcf_sink::VcfBodyShardWriter::create(
+                &path,
+                Arc::new(vec!["CSQ".into()]),
+                Arc::new(vec![]),
+                Arc::new(vec![]),
+                false,
+                Arc::from("VCFv4.2"),
+                VcfCompressionType::Plain,
+            )
+            .unwrap();
+            let progress = Arc::new(AtomicUsize::new(0));
+            let mut output = RunOutput::Shard {
+                shard: Box::new(shard),
+                rows_done: Arc::clone(&progress),
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            if rows > 0 {
+                tx.send(Ok(LookupBatchMessage {
+                    partition_id: 0,
+                    batch_id: 0,
+                    batch: input,
+                    colocated_delta: HashMap::new(),
+                }))
+                .await
+                .unwrap();
+            }
+            drop(tx);
+            let stats = annotate_lookup_run(
+                shared,
+                rx,
+                CacheSourceType::Merged,
+                Some((0..9).collect()),
+                VEP_INPUT_BUFFER_SIZE,
+                None,
+                None,
+                &mut output,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stats.input_rows, rows);
+            assert_eq!(stats.output_rows, rows);
+            assert_eq!(progress.load(Ordering::Relaxed), rows);
+            assert!(stats.lookup_closed);
+            if let RunOutput::Shard { shard, .. } = output {
+                shard.finish().unwrap();
+            }
+            let body = std::fs::read_to_string(path).unwrap();
+            assert_eq!(body.lines().count(), rows);
+            for (i, line) in body.lines().enumerate() {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                assert_eq!(fields[1].parse::<i64>().unwrap(), 100 + (i / 5) as i64);
+                assert_eq!(fields[4], "A,C,T");
+                assert!(fields[7].contains("CSQ="));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumed_shard_windows_current_thread() {
+        check_shard_consumes_full_partial_and_empty_windows().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consumed_shard_windows_multi_thread() {
+        check_shard_consumes_full_partial_and_empty_windows().await;
+    }
+
+    #[test]
+    fn output_chunks_preserve_multiallelic_rows_ties_and_input_buffer_grid() {
+        let rows = 2 * ANNOTATION_OUTPUT_CHUNK_ROWS + 7;
+        let starts: Vec<_> = (0..rows).map(|i| 100 + (i / 5) as i64).collect();
+        let alts: Vec<_> = (0..rows)
+            .map(|i| if i % 3 == 0 { "A,C,G" } else { "T" })
+            .collect();
+        let input = make_buffer_batch_many_with_alts("chr1", &starts, &alts);
+        let chunks: Vec<_> =
+            annotation_output_chunks(&input, OutputChunkPolicy::Consumed).collect();
+        assert_eq!(
+            chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            [
+                ANNOTATION_OUTPUT_CHUNK_ROWS,
+                ANNOTATION_OUTPUT_CHUNK_ROWS,
+                7
+            ]
+        );
+        let rebuilt = datafusion::arrow::compute::concat_batches(&input.schema(), &chunks).unwrap();
+        assert_eq!(rebuilt, input);
+        assert_eq!(
+            chunks.iter().map(batch_input_units).sum::<usize>(),
+            batch_input_units(&input)
+        );
+        let original_grid = accumulate_boundaries(std::slice::from_ref(&input), 5000).unwrap();
+        assert_eq!(accumulate_boundaries(&chunks, 5000).unwrap(), original_grid);
+        assert_eq!(
+            annotation_output_chunks(&input.slice(0, 0), OutputChunkPolicy::Consumed).count(),
+            0
+        );
+        let parallel_chunks: Vec<_> =
+            annotation_output_chunks(&input, OutputChunkPolicy::Buffered).collect();
+        assert_eq!(parallel_chunks, vec![input.clone()]);
+        assert_eq!(
+            annotation_output_chunks(&input.slice(0, 0), OutputChunkPolicy::Buffered).count(),
+            0
+        );
+    }
+
     #[test]
     fn test_input_buffer_accumulator_carries_partial_rows_across_windows() {
         let mut accumulator = InputBufferAccumulator::default();
@@ -21806,6 +22655,51 @@ mod tests {
 
         let materialized = materialize_buffer_context_translations(&shared, &buffer_context);
         let prepared = prepared_context_from_buffer(&buffer_context, &shared, &materialized);
+
+        let unmodified_buffer = BufferAnnotationContext {
+            transcripts: vec![CowTranscript::Borrowed(0), CowTranscript::Borrowed(1)],
+            exon_indices: Vec::new(),
+            translation_indices: vec![0, 1],
+            translation_overrides: HashMap::new(),
+        };
+        let original = prepared_context_from_buffer(&unmodified_buffer, &shared, &[]);
+        let repeated = prepared_context_from_buffer(&unmodified_buffer, &shared, &[]);
+        for (idx, tx) in prepared.transcripts.iter().enumerate() {
+            let base_idx = original
+                .transcripts
+                .iter()
+                .position(|base| base.transcript_id == tx.transcript_id)
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                &original.reference_memos.get().unwrap()[base_idx],
+                &repeated.reference_memos.get().unwrap()[base_idx]
+            ));
+            assert_eq!(
+                Arc::ptr_eq(
+                    &prepared.reference_memos.get().unwrap()[idx],
+                    &original.reference_memos.get().unwrap()[base_idx]
+                ),
+                tx.transcript_id == "tx2"
+            );
+        }
+        let owned_buffer = BufferAnnotationContext {
+            transcripts: vec![CowTranscript::Owned(Box::new(
+                shared.base_transcripts[0].clone(),
+            ))],
+            exon_indices: Vec::new(),
+            translation_indices: vec![0],
+            translation_overrides: HashMap::new(),
+        };
+        let owned = prepared_context_from_buffer(&owned_buffer, &shared, &[]);
+        let base_idx = original
+            .transcripts
+            .iter()
+            .position(|tx| tx.transcript_id == "tx1")
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &owned.reference_memos.get().unwrap()[0],
+            &original.reference_memos.get().unwrap()[base_idx]
+        ));
 
         assert_eq!(materialized.len(), 1);
         assert_eq!(materialized[0].transcript_id, "tx1");

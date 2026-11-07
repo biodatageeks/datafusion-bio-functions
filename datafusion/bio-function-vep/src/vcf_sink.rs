@@ -84,6 +84,8 @@ struct FormattedVcfBatch {
     lines: usize,
     bytes: Vec<u8>,
     format_duration: Duration,
+    // Keep the body payload charged until the writer drops this batch.
+    _memory: Option<crate::output_memory::Hold>,
 }
 
 struct VcfBodyTempDir {
@@ -323,6 +325,14 @@ fn format_vcf_body_chunk(
         ],
     );
     let batch = restore_input_columns(batch)?;
+    let arrow_memory = if crate::output_memory::enabled() {
+        let bytes = batch
+            .column_by_name("CSQ")
+            .map_or(0, |column| column.get_buffer_memory_size());
+        crate::output_memory::Hold::new(crate::output_memory::Kind::Csq, bytes, input_rows)
+    } else {
+        None
+    };
     let lines = batch_to_vcf_lines_for_file_format(
         &batch,
         vcf_info_fields.as_slice(),
@@ -331,7 +341,33 @@ fn format_vcf_body_chunk(
         coordinate_zero_based,
         file_format,
     )?;
+    let lines_memory = if crate::output_memory::enabled() {
+        let bytes = lines.capacity() * std::mem::size_of::<VcfRecordLine>()
+            + lines
+                .iter()
+                .map(|record| record.line.capacity())
+                .sum::<usize>();
+        crate::output_memory::Hold::new(crate::output_memory::Kind::Lines, bytes, 0)
+    } else {
+        None
+    };
+    // Lines own their strings. Release the Arrow CSQ buffers before allocating
+    // the contiguous body, rather than keeping three copies of dense output.
+    drop(batch);
+    drop(arrow_memory);
+    // The converter reserves this exact capacity while all owned lines still
+    // exist. Keep its charge with the formatted chunk until writing completes.
+    let body_memory = if crate::output_memory::enabled() {
+        crate::output_memory::Hold::new(
+            crate::output_memory::Kind::Body,
+            lines.iter().map(|record| record.line.len() + 1).sum(),
+            0,
+        )
+    } else {
+        None
+    };
     let (bytes, line_count) = vcf_lines_to_body_chunk(lines);
+    drop(lines_memory);
     pipeline_trace::emit(
         "vcf_format",
         "done",
@@ -349,6 +385,7 @@ fn format_vcf_body_chunk(
         lines: line_count,
         bytes,
         format_duration: format_started.elapsed(),
+        _memory: body_memory,
     })
 }
 
@@ -2230,6 +2267,9 @@ pub async fn annotate_to_vcf(
                 profile.rows += input_rows;
                 profile.lines += lines.len();
             }
+            // The formatter owns every output line; the Arrow batch is no
+            // longer needed while assembling/writing the contiguous body.
+            drop(batch);
             let line_count = lines.len();
             total_rows += line_count;
             let write_started = Instant::now();

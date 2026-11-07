@@ -44,6 +44,7 @@ pub mod annotate_table_function;
 pub mod annotation_store;
 #[cfg(feature = "parquet-cache")]
 pub mod cache;
+pub(crate) mod cache_budget;
 #[cfg(feature = "cache-builder")]
 pub mod cache_builder;
 pub(crate) mod cache_common;
@@ -57,6 +58,7 @@ pub mod hgvs;
 pub mod lookup_provider;
 pub mod miss_worklist;
 pub(crate) mod motif_matrix;
+pub(crate) mod output_memory;
 #[cfg(feature = "parquet-cache")]
 pub mod parquet_cache;
 pub mod partitioned_cache;

@@ -445,6 +445,9 @@ cargo run --release [--features kv-cache] --example <name> -- <args>
 |---------|---------|-------------|
 | `kv-cache` | yes | Fjall LSM-tree backend with zstd compression |
 
+See [annotation reuse and memory limits](PERFORMANCE.md) for the reference and
+prediction cache policies, diagnostic settings, and measurement requirements.
+
 ## License
 
 Apache 2.0
