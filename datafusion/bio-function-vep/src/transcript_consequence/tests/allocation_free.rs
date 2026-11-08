@@ -272,3 +272,216 @@ fn lazy_canonical_reference_skips_fallback_when_canonical_text_exists() {
         "fallback"
     );
 }
+
+fn segment(
+    genomic_start: i64,
+    genomic_end: i64,
+    cdna_start: usize,
+    ori: i8,
+) -> TranscriptCdnaMapperSegment {
+    TranscriptCdnaMapperSegment {
+        genomic_start,
+        genomic_end,
+        cdna_start,
+        cdna_end: cdna_start + usize::try_from((genomic_end - genomic_start).max(0)).unwrap(),
+        ori,
+    }
+}
+
+/// Generated segment lists of the shapes the memo and bisection must handle:
+/// disjoint and sorted (the shape of every real transcript), plus contiguous
+/// runs with cDNA gaps, overlaps, unsorted order, malformed spans and empty.
+fn generated_segments(rng: &mut Lcg, count: usize) -> Vec<TranscriptCdnaMapperSegment> {
+    let shape = rng.below(5);
+    let ori = if rng.below(2) == 0 { 1 } else { -1 };
+    let mut segments = Vec::with_capacity(count);
+    let mut next_start = 100i64;
+    let mut cdna = 1usize;
+    for _ in 0..count {
+        let len = 1 + rng.below(6) as i64;
+        let start = match shape {
+            // Overlaps the previous segment.
+            1 => next_start - rng.below(4) as i64,
+            // Contiguous with the previous segment.
+            2 => next_start,
+            _ => next_start + rng.below(5) as i64,
+        };
+        // Malformed spans (end before start) occur only in the last shape.
+        let end = if shape == 4 && rng.below(3) == 0 {
+            start - 1
+        } else {
+            start + len - 1
+        };
+        // A contiguous pair with a cDNA jump rejects the general mapper.
+        let jump = if shape == 2 && rng.below(3) == 0 {
+            2
+        } else {
+            0
+        };
+        segments.push(segment(start, end, cdna + jump, ori));
+        next_start = end + 1;
+        cdna += len as usize + jump;
+    }
+    if shape == 3 {
+        for i in (1..segments.len()).rev() {
+            segments.swap(i, rng.below(i + 1));
+        }
+    }
+    segments
+}
+
+/// The pre-change body of `sorted_mapper_segments`.
+fn sorted_segments_reference(
+    segments: &[TranscriptCdnaMapperSegment],
+) -> Vec<TranscriptCdnaMapperSegment> {
+    let mut owned = segments.to_vec();
+    owned.sort_by_key(|s| (s.genomic_start, s.genomic_end, s.cdna_start));
+    owned
+}
+
+/// The pre-change body of `use_cdna_mapper_for_general_coords`.
+fn general_coords_reference(segments: &[TranscriptCdnaMapperSegment]) -> bool {
+    if segments.is_empty() {
+        return false;
+    }
+    for window in sorted_segments_reference(segments).windows(2) {
+        let (prev, next) = (&window[0], &window[1]);
+        if next.genomic_start == prev.genomic_end.saturating_add(1)
+            && next.cdna_start != prev.cdna_end.saturating_add(1)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[test]
+fn memoized_mapper_facts_match_direct_computation() {
+    let mut rng = Lcg(4);
+    let (mut general, mut rejected, mut unsorted) = (0, 0, 0);
+    for _ in 0..30_000 {
+        let mut transcript = tx("T1", "1", 1, 1000, 1, "protein_coding", Some(1), Some(1000));
+        let count = rng.below(9);
+        transcript.cdna_mapper_segments = generated_segments(&mut rng, count);
+        let expected = general_coords_reference(&transcript.cdna_mapper_segments);
+        let sorted = sorted_segments_reference(&transcript.cdna_mapper_segments);
+        for _ in 0..2 {
+            assert_eq!(use_cdna_mapper_for_general_coords(&transcript), expected);
+            assert_eq!(sorted_mapper_segments(&transcript).as_ref(), sorted);
+        }
+        general += usize::from(expected);
+        rejected += usize::from(!expected && count > 0);
+        unsorted += usize::from(sorted != transcript.cdna_mapper_segments);
+    }
+    assert!(general > 1_000 && rejected > 1_000 && unsorted > 1_000);
+}
+
+#[test]
+fn mapper_facts_do_not_outlive_their_segments() {
+    let mut transcript = tx("T1", "1", 1, 1000, 1, "protein_coding", Some(1), Some(1000));
+    // A contiguous pair with a cDNA jump rejects the general mapper.
+    transcript.cdna_mapper_segments = vec![segment(100, 109, 1, 1), segment(110, 119, 20, 1)];
+    assert!(!use_cdna_mapper_for_general_coords(&transcript));
+
+    let mut clone = transcript.clone();
+    clone.cdna_mapper_segments = vec![segment(100, 109, 1, 1), segment(110, 119, 11, 1)];
+    assert!(use_cdna_mapper_for_general_coords(&clone));
+
+    // Replacing or clearing the segments on a transcript whose memo is filled.
+    transcript.cdna_mapper_segments = vec![segment(100, 109, 1, 1), segment(110, 119, 11, 1)];
+    assert!(use_cdna_mapper_for_general_coords(&transcript));
+    assert_eq!(
+        exact_mapper_cdna_index_for_transcript(&transcript, 115),
+        Some(16)
+    );
+    transcript.cdna_mapper_segments.clear();
+    assert!(!use_cdna_mapper_for_general_coords(&transcript));
+    assert_eq!(
+        exact_mapper_cdna_index_for_transcript(&transcript, 115),
+        None
+    );
+}
+
+#[test]
+fn bisected_mapper_lookup_matches_first_match_scan() {
+    let mut rng = Lcg(5);
+    let mut bisected = 0;
+    for _ in 0..20_000 {
+        let mut transcript = tx("T1", "1", 1, 1000, 1, "protein_coding", Some(1), Some(1000));
+        let count = rng.below(12);
+        transcript.cdna_mapper_segments = generated_segments(&mut rng, count);
+        bisected += usize::from(count > 1 && mapper_segment_facts(&transcript).disjoint);
+        for pos in 90..=220 {
+            assert_eq!(
+                exact_mapper_cdna_index_for_transcript(&transcript, pos),
+                transcript
+                    .cdna_mapper_segments
+                    .iter()
+                    .find_map(|segment| mapper_segment_cdna_index(segment, pos)),
+                "pos {pos} segments {:?}",
+                transcript.cdna_mapper_segments
+            );
+        }
+    }
+    assert!(bisected > 1_000, "too few disjoint lists: {bisected}");
+}
+
+#[test]
+fn bisected_coord_table_matches_linear_scan() {
+    let mut rng = Lcg(6);
+    let mut bisected = 0;
+    for _ in 0..20_000 {
+        let count = rng.below(12);
+        let coords: Vec<TranscriptCdnaCoord> = generated_segments(&mut rng, count)
+            .into_iter()
+            .map(|s| TranscriptCdnaCoord {
+                start: s.genomic_start,
+                end: s.genomic_end,
+                cdna_start: s.cdna_start,
+                cdna_end: s.cdna_end,
+            })
+            .collect();
+        let table = CdnaCoordTable::new(coords.clone());
+        bisected += usize::from(count > 1 && table.disjoint);
+        for strand in [1i8, -1] {
+            for pos in 90..=220 {
+                assert_eq!(
+                    table.cdna_index(strand, pos),
+                    cdna_index_from_sorted_coords(strand, pos, &coords),
+                    "strand {strand} pos {pos} coords {coords:?}"
+                );
+            }
+        }
+    }
+    assert!(bisected > 1_000, "too few disjoint tables: {bisected}");
+}
+
+#[test]
+fn alt_translation_text_matches_collected_residues() {
+    let transcript = tx("T1", "1", 1, 100, 1, "protein_coding", Some(1), Some(100));
+    let class = CodingClassification {
+        protein_position_start: Some(1),
+        protein_position_end: Some(1),
+        ..Default::default()
+    };
+    let old_aas = ['M', 'A', '*'];
+    let new_aas = ['K', 'L', 'V', '*'];
+    let text: String = new_aas.iter().collect();
+    for semantics in SEMANTICS {
+        let build = |new_aas: &[char], alt_text: Option<&str>| {
+            build_protein_hgvs_data(
+                &transcript,
+                &class,
+                Some("M/K"),
+                &old_aas,
+                new_aas,
+                alt_text,
+                true,
+                None,
+                semantics,
+                None,
+            )
+        };
+        assert_eq!(build(&new_aas, None), build(&[], Some(text.as_str())));
+    }
+}
