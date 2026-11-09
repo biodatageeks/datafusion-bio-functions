@@ -159,13 +159,86 @@ impl VariantInput {
 /// derives: clones start empty (the cache is not shared state, just a memo) and
 /// the cache never participates in equality. `OnceLock` makes it `Sync`, so the
 /// transcript can be read concurrently across partition threads.
+///
+/// It also memoizes what every coordinate lookup needs to know about
+/// `cdna_mapper_segments`, which would otherwise rescan them per lookup.
 #[derive(Debug, Default)]
-pub struct GeometryCache(std::sync::OnceLock<Option<Vec<TranscriptCdnaCoord>>>);
+pub struct GeometryCache {
+    coords: std::sync::OnceLock<Option<CdnaCoordTable>>,
+    mapper: std::sync::OnceLock<MapperSegmentFacts>,
+}
 
 impl Clone for GeometryCache {
     fn clone(&self) -> Self {
         // A clone is a fresh transcript view; don't copy the memo.
-        Self(std::sync::OnceLock::new())
+        Self::default()
+    }
+}
+
+/// A memoized coordinate table and whether a position lookup may bisect it.
+#[derive(Debug)]
+struct CdnaCoordTable {
+    coords: Vec<TranscriptCdnaCoord>,
+    /// Sorted, well-formed and non-overlapping: at most one entry can contain
+    /// a position, so bisecting finds the entry a front-to-back scan finds.
+    disjoint: bool,
+}
+
+impl CdnaCoordTable {
+    fn new(coords: Vec<TranscriptCdnaCoord>) -> Self {
+        let disjoint = coords.iter().all(|coord| coord.start <= coord.end)
+            && coords.windows(2).all(|pair| pair[0].end < pair[1].start);
+        Self { coords, disjoint }
+    }
+
+    fn cdna_index(&self, strand: i8, pos: i64) -> Option<usize> {
+        if !self.disjoint {
+            return cdna_index_from_sorted_coords(strand, pos, &self.coords);
+        }
+        let candidate = self.coords.partition_point(|coord| coord.end < pos);
+        cdna_index_from_sorted_coords(strand, pos, self.coords.get(candidate..=candidate)?)
+    }
+}
+
+/// Facts derived from one transcript's `cdna_mapper_segments`.
+#[derive(Debug, Clone, Copy)]
+struct MapperSegmentFacts {
+    // Identity of the vector described, so a transcript whose segments were
+    // replaced or cleared after the memo was filled does not reuse it.
+    segments_ptr: usize,
+    segments_len: usize,
+    sorted: bool,
+    /// Stored in genomic order, well formed and non-overlapping (see
+    /// [`CdnaCoordTable::disjoint`]).
+    disjoint: bool,
+    general_coords: bool,
+}
+
+impl MapperSegmentFacts {
+    fn of(segments: &[TranscriptCdnaMapperSegment]) -> Self {
+        let sorted = mapper_segments_sorted(segments);
+        let general_coords = if sorted {
+            mapper_segments_allow_general_coords(segments)
+        } else {
+            mapper_segments_allow_general_coords(&sorted_mapper_segments_copy(segments))
+        };
+        Self {
+            segments_ptr: segments.as_ptr() as usize,
+            segments_len: segments.len(),
+            sorted,
+            disjoint: sorted
+                && segments
+                    .iter()
+                    .all(|segment| segment.genomic_start <= segment.genomic_end)
+                && segments
+                    .windows(2)
+                    .all(|pair| pair[0].genomic_end < pair[1].genomic_start),
+            general_coords,
+        }
+    }
+
+    fn describes(&self, segments: &[TranscriptCdnaMapperSegment]) -> bool {
+        self.segments_ptr == segments.as_ptr() as usize && self.segments_len == segments.len()
     }
 }
 
@@ -6541,27 +6614,46 @@ fn vep116_ref_eq_alt_sequence_final_stop(
     let same_stop_index = ref_peptide
         .find('*')
         .is_some_and(|stop_index| alt_peptide.find('*') == Some(stop_index));
-    let mut mutated = ref_translation.to_vec();
-    let splice_start = translation_start.min(mutated.len());
+    let splice_start = translation_start.min(ref_translation.len());
     let splice_len = translation_end
         .checked_sub(translation_start)
         .and_then(|span| span.checked_add(1))
         .unwrap_or(0);
     let splice_end = translation_start
         .saturating_add(splice_len)
-        .min(mutated.len())
+        .min(ref_translation.len())
         .max(splice_start);
-    let replacement = if alt_peptide == "-" {
-        Vec::new()
-    } else {
-        alt_peptide.chars().collect()
-    };
-    mutated.splice(splice_start..splice_end, replacement);
+    let replacement = if alt_peptide == "-" { "" } else { alt_peptide };
     same_stop_index
-        || (mutated.starts_with(ref_translation)
-            && mutated
-                .get(ref_translation.len())
-                .is_some_and(|residue| *residue == '*'))
+        || ref_translation_spliced_ends_with_extra_stop(
+            ref_translation,
+            splice_start..splice_end,
+            replacement,
+        )
+}
+
+/// Whether `ref[..start] + replacement + ref[end..]` starts with all of `ref`
+/// and has `*` at index `ref.len()`, without building the spliced peptide.
+///
+/// The spliced peptide reaches index `ref.len()` only when `replacement` is
+/// longer than the replaced span; otherwise the answer is `false`. When it is
+/// longer, its prefix `ref[..start]` matches trivially, so `replacement +
+/// ref[end..]` must reproduce `ref[start..]` and continue with `*`.
+fn ref_translation_spliced_ends_with_extra_stop(
+    ref_translation: &[char],
+    span: std::ops::Range<usize>,
+    replacement: &str,
+) -> bool {
+    if replacement.chars().count() <= span.end - span.start {
+        return false;
+    }
+    let mut spliced_tail = replacement
+        .chars()
+        .chain(ref_translation[span.end..].iter().copied());
+    ref_translation[span.start..]
+        .iter()
+        .all(|&residue| spliced_tail.next() == Some(residue))
+        && spliced_tail.next() == Some('*')
 }
 
 fn vep116_ref_eq_alt_sequence_for_class(
@@ -6630,6 +6722,9 @@ fn build_protein_hgvs_data(
     peptide_alleles: Option<&str>,
     old_aas: &[char],
     new_aas: &[char],
+    // Replayed alternate translation for stop-loss and frameshift variants. It
+    // supersedes `new_aas`, and `substitution` is never set alongside it.
+    alt_translation_text: Option<&str>,
     frameshift: bool,
     translation: Option<&TranslationFeature>,
     semantics: crate::vep_semantics::VepSemantics,
@@ -6679,9 +6774,13 @@ fn build_protein_hgvs_data(
         })
         .unwrap_or_else(|| {
             (
-                canonical_ref_translation_for_hgvsp(tx, translation, old_aas.iter().collect())
+                canonical_ref_translation_for_hgvsp_with(tx, translation, || {
+                    old_aas.iter().collect()
+                })
+                .into(),
+                alt_translation_text
+                    .map_or_else(|| new_aas.iter().collect::<String>(), str::to_owned)
                     .into(),
-                new_aas.iter().collect::<String>().into(),
             )
         });
     Some(EngineProteinHgvsData {
@@ -6821,21 +6920,35 @@ fn vep_alternate_codon_window(
     window_len: usize,
     semantics: crate::vep_semantics::VepSemantics,
 ) -> Vec<u8> {
-    let mut alternate_cds = mutated.to_vec();
-    if semantics.vep116_stop_predicates() {
-        let Some(trimmed) = vep116_trim_incomplete_codon(&alternate_cds) else {
+    // Read the window from the trimmed CDS followed by the UTR without
+    // materializing their concatenation (the whole alternate CDS on long
+    // transcripts); the bytes are those of the concatenation's window.
+    let coding = if semantics.vep116_stop_predicates() {
+        let Some(keep) = vep116_trimmed_cds_len(mutated) else {
             return Vec::new();
         };
-        alternate_cds = trimmed;
+        &mutated[..keep]
+    } else {
+        mutated
+    };
+    let window_end = codon_start.saturating_add(window_len);
+    let mut window = Vec::new();
+    if codon_start < coding.len() {
+        window.extend_from_slice(&coding[codon_start..window_end.min(coding.len())]);
     }
-    let utr = three_prime_utr_seq(tx).unwrap_or_default();
-    alternate_cds.extend_from_slice(utr.as_bytes());
-    alternate_cds
-        .iter()
-        .skip(codon_start)
-        .take(window_len)
-        .copied()
-        .collect()
+    let remaining = window_len - window.len();
+    if remaining > 0
+        && let Some(utr) = three_prime_utr_seq(tx)
+    {
+        let utr = utr.as_bytes();
+        let utr_start = codon_start.saturating_sub(coding.len());
+        if utr_start < utr.len() {
+            window.extend_from_slice(
+                &utr[utr_start..utr_start.saturating_add(remaining).min(utr.len())],
+            );
+        }
+    }
+    window
 }
 
 /// Traceability:
@@ -6994,8 +7107,19 @@ fn canonical_ref_translation_for_hgvsp(
     translation: Option<&TranslationFeature>,
     fallback: String,
 ) -> String {
+    canonical_ref_translation_for_hgvsp_with(tx, translation, || fallback)
+}
+
+/// [`canonical_ref_translation_for_hgvsp`] with a lazily built `fallback`. The
+/// canonical cached translation usually wins, so callers whose fallback is a
+/// pure copy of the whole peptide pass it as a closure to skip that copy.
+fn canonical_ref_translation_for_hgvsp_with(
+    tx: &TranscriptFeature,
+    translation: Option<&TranslationFeature>,
+    fallback: impl FnOnce() -> String,
+) -> String {
     if bam_edit_succeeded(tx) {
-        return edited_ref_translation_for_hgvsp(tx, translation, fallback);
+        return edited_ref_translation_for_hgvsp(tx, translation, fallback());
     }
     if bam_edit_failed(tx) {
         // AnnotationType/Transcript.pm restores the transcript after a failed
@@ -7003,11 +7127,11 @@ fn canonical_ref_translation_for_hgvsp(
         // The retained mapper then indexes that unedited sequence.
         // <https://github.com/Ensembl/ensembl-vep/blob/57ea5c52340acc1f156267f810ad162e26597082/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L619-L627>
         // <https://github.com/Ensembl/ensembl/blob/c0cf13daa961d80584bad797b2eb0ff3a7500ef3/modules/Bio/EnsEMBL/Transcript.pm#L823-L835>
-        return fallback;
+        return fallback();
     }
     translation
         .and_then(|translation| translation.translation_seq_canonical.clone())
-        .unwrap_or(fallback)
+        .unwrap_or_else(fallback)
 }
 
 fn bam_edit_succeeded(tx: &TranscriptFeature) -> bool {
@@ -7191,17 +7315,37 @@ fn failed_bam_translateable_seq_for_vep(
     Some(cds)
 }
 
-fn reference_translateable_seq_for_hgvsp(
+/// The uppercase canonical CDS, borrowed when the cached sequence already is
+/// uppercase (`to_ascii_uppercase` would return the same text), so long
+/// transcripts are not copied once per variant.
+fn reference_translateable_seq_for_hgvsp<'a>(
     tx: &TranscriptFeature,
-    translation: Option<&TranslationFeature>,
-) -> Option<String> {
+    translation: Option<&'a TranslationFeature>,
+) -> Option<Cow<'a, str>> {
     if bam_edit_failed(tx) || bam_edit_succeeded(tx) {
-        return reference_translateable_seq_for_vep(tx, translation);
+        return reference_translateable_seq_for_vep(tx, translation).map(Cow::Owned);
     }
     translation
         .and_then(|translation| translation.cds_sequence_canonical.as_deref())
-        .map(|seq| seq.to_ascii_uppercase())
-        .or_else(|| reference_translateable_seq_for_vep(tx, translation))
+        .map(|seq| {
+            if has_ascii_lowercase(seq.as_bytes()) {
+                Cow::Owned(seq.to_ascii_uppercase())
+            } else {
+                Cow::Borrowed(seq)
+            }
+        })
+        .or_else(|| reference_translateable_seq_for_vep(tx, translation).map(Cow::Owned))
+}
+
+/// `bytes.iter().any(u8::is_ascii_lowercase)`, vectorizable: an early-exit
+/// byte loop scans a long CDS far slower than the uppercase copy it avoids, so
+/// fold each 64-byte chunk without branches and stop at the first hit.
+fn has_ascii_lowercase(bytes: &[u8]) -> bool {
+    bytes.chunks(64).any(|chunk| {
+        chunk
+            .iter()
+            .fold(false, |found, &b| found | b.is_ascii_lowercase())
+    })
 }
 
 fn uses_canonical_reference_for_hgvsp(
@@ -7222,14 +7366,14 @@ fn uses_canonical_reference_for_hgvsp(
 /// So when the VEP-style alternate translation is available, it must take
 /// precedence for HGVSp stop-distance formatting. The `direct` translation is
 /// only a fallback for local paths where the HGVS-specific replay cannot be
-/// built.
+/// built, so it is translated only when the replay is unavailable.
 fn preferred_alt_translation_extension_for_hgvsp(
     _tx: &TranscriptFeature,
     _frameshift: bool,
     preferred: Option<String>,
-    direct: Option<String>,
+    direct: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    preferred.or(direct)
+    preferred.or_else(direct)
 }
 
 /// Mirror VEP 116's `_trim_incomplete_codon()` implementation, including its
@@ -7253,6 +7397,17 @@ fn vep116_trim_incomplete_codon(seq: &[u8]) -> Option<Vec<u8>> {
     })
 }
 
+/// Length of [`vep116_trim_incomplete_codon`]'s result without copying it: the
+/// helper returns `None` for an empty sequence, the whole sequence when a
+/// complete codon remains, and an empty sequence otherwise. Callers slice
+/// `seq[..len]` to get exactly the helper's bytes.
+fn vep116_trimmed_cds_len(seq: &[u8]) -> Option<usize> {
+    if seq.is_empty() {
+        return None;
+    }
+    Some(if seq.len() >= 3 { seq.len() } else { 0 })
+}
+
 /// Build a direct alternate-CDS translation while preserving the selected
 /// VEP version's trim-before-UTR behavior. This is used for both the fallback
 /// and `alt_translation` fields so a missing extension cannot restore a
@@ -7267,15 +7422,18 @@ fn translated_alt_protein_for_hgvs(
     mutated_cds: &[u8],
     semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<String> {
-    let mut alt_cds = if semantics.vep116_stop_predicates() {
-        vep116_trim_incomplete_codon(mutated_cds)?
+    let keep = if semantics.vep116_stop_predicates() {
+        vep116_trimmed_cds_len(mutated_cds)?
     } else {
-        mutated_cds.to_vec()
+        mutated_cds.len()
     };
-    if let Some(utr) = three_prime_utr_seq(tx) {
+    let utr = three_prime_utr_seq(tx);
+    let mut alt_cds = Vec::with_capacity(keep + utr.as_ref().map_or(0, String::len));
+    alt_cds.extend_from_slice(&mutated_cds[..keep]);
+    if let Some(utr) = utr {
         alt_cds.extend_from_slice(utr.as_bytes());
     }
-    translate_protein_from_cds(&alt_cds).map(|aas| aas.into_iter().collect())
+    translate_protein_string(&alt_cds)
 }
 
 /// Traceability:
@@ -7390,13 +7548,15 @@ fn alternate_translation_for_vep_hgvs(
     alternate_seq.push_str(&alt_allele);
     alternate_seq.push_str(downstream_seq);
     if semantics.vep116_stop_predicates() {
-        alternate_seq =
-            String::from_utf8(vep116_trim_incomplete_codon(alternate_seq.as_bytes())?).ok()?;
+        // `vep116_trim_incomplete_codon` keeps all bases or none; the cut is
+        // at 0 or at the end, both character boundaries.
+        let keep = vep116_trimmed_cds_len(alternate_seq.as_bytes())?;
+        alternate_seq.truncate(keep);
     }
     if let Some(utr) = three_prime_utr_seq(tx) {
         alternate_seq.push_str(&utr);
     }
-    translate_protein_from_cds(alternate_seq.as_bytes()).map(|aas| aas.into_iter().collect())
+    translate_protein_string(alternate_seq.as_bytes())
 }
 
 /// Build the local protein HGVS peptide alleles using the same codon-window
@@ -7520,9 +7680,9 @@ fn literal_indel_protein_hgvs_data(
             {
                 return None;
             }
-            let mut edited_cds = cds_seq.into_bytes();
+            let mut edited_cds = cds_seq.into_owned().into_bytes();
             edited_cds.splice(start_idx..=end_idx, effective_ref_tx.bytes());
-            String::from_utf8(edited_cds).ok()?
+            Cow::Owned(String::from_utf8(edited_cds).ok()?)
         } else {
             cds_seq
         };
@@ -7565,7 +7725,7 @@ fn literal_indel_protein_hgvs_data(
         mutated.extend_from_slice(&cds_seq.as_bytes()[end_idx + 1..]);
     }
 
-    let old_aas = reference_aas_for_consequence(tx, Some(translation), cds_seq.as_str())?;
+    let old_aas = reference_aas_for_consequence(tx, Some(translation), cds_seq.as_ref())?;
     let new_aas = translate_protein_from_cds(&mutated)?;
 
     let raw_start = class.protein_position_start?;
@@ -7604,30 +7764,26 @@ fn literal_indel_protein_hgvs_data(
 
     let _ = (raw_start_idx, raw_end_idx); // traceability only
 
+    // Both fields fall back to the same direct translation; build it once.
+    let direct_alt_translation = translated_alt_protein_for_hgvs(tx, &mutated, semantics);
+    let alt_translation_extension =
+        alternate_translation_for_vep_hgvs(tx, tx_exons, translation, variant, semantics)
+            .or_else(|| direct_alt_translation.clone());
     Some(EngineProteinHgvsData {
         start,
         end,
         ref_peptide,
         alt_peptide,
-        ref_translation: (canonical_ref_translation_for_hgvsp(
-            tx,
-            Some(translation),
-            old_aas.iter().collect::<String>(),
-        ))
+        ref_translation: (canonical_ref_translation_for_hgvsp_with(tx, Some(translation), || {
+            old_aas.iter().collect::<String>()
+        }))
         .into(),
         // `new_aas` translates only `mutated`; it cannot restore UTR bases
         // when VEP 116's empty-CDS trim makes the source helper return None.
-        alt_translation: (translated_alt_protein_for_hgvs(tx, &mutated, semantics)
+        alt_translation: (direct_alt_translation
             .unwrap_or_else(|| new_aas.iter().collect::<String>()))
         .into(),
-        alt_translation_extension: alternate_translation_for_vep_hgvs(
-            tx,
-            tx_exons,
-            translation,
-            variant,
-            semantics,
-        )
-        .or_else(|| translated_alt_protein_for_hgvs(tx, &mutated, semantics)),
+        alt_translation_extension,
         frameshift: !ref_len.abs_diff(alt_len).is_multiple_of(3),
         start_lost: class.start_lost,
         stop_lost: class.stop_lost,
@@ -8332,7 +8488,7 @@ fn shifted_tva_peptide_window(
     semantics: crate::vep_semantics::VepSemantics,
 ) -> Option<(String, String, Option<String>)> {
     let reference_cds_seq = if coords.edited_insertion_gap {
-        reference_translateable_seq_for_vep(tx, Some(translation))?
+        Cow::Owned(reference_translateable_seq_for_vep(tx, Some(translation))?)
     } else {
         reference_translateable_seq_for_hgvsp(tx, Some(translation))?
     };
@@ -8365,7 +8521,7 @@ fn shifted_tva_peptide_window(
     };
 
     let mut cds = if is_reference {
-        reference_cds_seq.clone()
+        String::from(reference_cds_seq.as_ref())
     } else {
         let mut alternate_cds = String::with_capacity(
             reference_cds_seq
@@ -10611,15 +10767,11 @@ fn classify_coding_change_with_spliced_span_cached(
             tx,
             frameshift,
             alternate_translation_for_vep_hgvs(tx, tx_exons, translation, variant, semantics),
-            translated_alt_protein_for_hgvs(tx, &mutated, semantics),
+            || translated_alt_protein_for_hgvs(tx, &mutated, semantics),
         )
     } else {
         None
     };
-    let hgvs_new_aas: Cow<'_, [char]> = preferred_hgvs_alt_translation
-        .as_ref()
-        .map(|seq| Cow::Owned(seq.chars().collect::<Vec<_>>()))
-        .unwrap_or_else(|| Cow::Borrowed(new_aas.as_slice()));
     let hgvs_amino_acids = vep116_ambiguous_terminal_hgvsp_alleles(&class, semantics)
         .or_else(|| {
             vep116_incomplete_terminal_hgvsp_alleles(&class, semantics, local_codon_truncated)
@@ -10635,7 +10787,8 @@ fn classify_coding_change_with_spliced_span_cached(
         &class,
         hgvs_amino_acids.as_deref(),
         &old_aas,
-        &hgvs_new_aas,
+        &new_aas,
+        preferred_hgvs_alt_translation.as_deref(),
         frameshift,
         Some(translation),
         semantics,
@@ -10656,36 +10809,38 @@ fn classify_coding_change_with_spliced_span_cached(
             None
         },
     );
-    if let Some(protein_hgvs) = class.protein_hgvs.as_mut() {
-        protein_hgvs.alt_translation_extension = preferred_hgvs_alt_translation;
-    }
-    if frameshift
+    let stop_retained_frameshift = frameshift
         && class.stop_retained
         && first_codon < old_aas.len()
-        && first_codon < hgvs_new_aas.len()
         && old_aas[first_codon] == '*'
-        && hgvs_new_aas[first_codon] == '*'
-    {
+        && match preferred_hgvs_alt_translation.as_deref() {
+            Some(text) => text.chars().nth(first_codon) == Some('*'),
+            None => new_aas.get(first_codon) == Some(&'*'),
+        };
+    if !stop_retained_frameshift {
+        if let Some(protein_hgvs) = class.protein_hgvs.as_mut() {
+            protein_hgvs.alt_translation_extension = preferred_hgvs_alt_translation;
+        }
+    } else {
+        // `frameshift` holds here, so `preferred_hgvs_alt_translation` is
+        // already the replayed alternate translation with the direct
+        // translation as fallback: the extension this record needs.
         class.protein_hgvs = Some(EngineProteinHgvsData {
             start: first_codon + 1,
             end: first_codon + 1,
             ref_peptide: "*".to_string(),
             alt_peptide: "*".to_string(),
-            ref_translation: (canonical_ref_translation_for_hgvsp(
+            ref_translation: (canonical_ref_translation_for_hgvsp_with(
                 tx,
                 Some(translation),
-                old_aas.iter().collect::<String>(),
+                || old_aas.iter().collect::<String>(),
             ))
             .into(),
-            alt_translation: (hgvs_new_aas.iter().collect::<String>()).into(),
-            alt_translation_extension: alternate_translation_for_vep_hgvs(
-                tx,
-                tx_exons,
-                translation,
-                variant,
-                semantics,
-            )
-            .or_else(|| translated_alt_protein_for_hgvs(tx, &mutated, semantics)),
+            alt_translation: preferred_hgvs_alt_translation
+                .clone()
+                .unwrap_or_else(|| new_aas.iter().collect::<String>())
+                .into(),
+            alt_translation_extension: preferred_hgvs_alt_translation,
             frameshift: false,
             start_lost: class.start_lost,
             stop_lost: class.stop_lost,
@@ -11536,12 +11691,11 @@ fn classify_insertion_with_semantics_and_gap(
 
     // Extend with 3' UTR for HGVS stop-loss/frameshift extension distance.
     let preferred_hgvs_alt_translation = if class.stop_lost || frameshift {
-        let direct_alt_translation = translated_alt_protein_for_hgvs(tx, &mutated, semantics);
         if replace_refseq_mapper_gap {
             // `_get_alternate_cds()` builds from the exact mapper CDS interval.
             // The generic transcript replay only sees the genomic insertion
             // anchor and would put this allele on the wrong side of the edit.
-            direct_alt_translation
+            translated_alt_protein_for_hgvs(tx, &mutated, semantics)
         } else {
             preferred_alt_translation_extension_for_hgvsp(
                 tx,
@@ -11555,16 +11709,12 @@ fn classify_insertion_with_semantics_and_gap(
                         semantics,
                     )
                 }),
-                direct_alt_translation,
+                || translated_alt_protein_for_hgvs(tx, &mutated, semantics),
             )
         }
     } else {
         None
     };
-    let hgvs_new_aas = preferred_hgvs_alt_translation
-        .as_ref()
-        .map(|seq| seq.chars().collect::<Vec<_>>())
-        .unwrap_or_else(|| new_aas.clone());
     let hgvs_amino_acids = vep116_ambiguous_terminal_hgvsp_alleles(&class, semantics)
         .or_else(|| {
             vep116_incomplete_terminal_hgvsp_alleles(&class, semantics, partial_terminal_codon)
@@ -11580,7 +11730,8 @@ fn classify_insertion_with_semantics_and_gap(
         &class,
         hgvs_amino_acids.as_deref(),
         &old_aas,
-        &hgvs_new_aas,
+        &new_aas,
+        preferred_hgvs_alt_translation.as_deref(),
         frameshift,
         tx_translation,
         semantics,
@@ -12482,13 +12633,36 @@ fn mapper_segment_cdna_index(segment: &TranscriptCdnaMapperSegment, pos: i64) ->
 /// when adjacent segments encode a cDNA insertion gap. General consequence
 /// mapping may reject that shape and fall back to exon geometry, but VEP's
 /// `BaseTranscriptVariation::cdna_start()` still observes the mapper piece.
+///
+/// Returns the first segment's mapping in stored order. Disjoint segments have
+/// at most one match, so those are bisected; any other shape is scanned.
 pub(crate) fn exact_mapper_cdna_index_for_transcript(
     tx: &TranscriptFeature,
     pos: i64,
 ) -> Option<usize> {
-    tx.cdna_mapper_segments
-        .iter()
-        .find_map(|segment| mapper_segment_cdna_index(segment, pos))
+    let segments = tx.cdna_mapper_segments.as_slice();
+    if !mapper_segment_facts(tx).disjoint {
+        return segments
+            .iter()
+            .find_map(|segment| mapper_segment_cdna_index(segment, pos));
+    }
+    let candidate = segments.partition_point(|segment| segment.genomic_end < pos);
+    mapper_segment_cdna_index(segments.get(candidate)?, pos)
+}
+
+/// The memoized facts about `tx.cdna_mapper_segments`, recomputed if those
+/// segments are no longer the vector the memo was filled from.
+fn mapper_segment_facts(tx: &TranscriptFeature) -> MapperSegmentFacts {
+    let segments = tx.cdna_mapper_segments.as_slice();
+    let facts = *tx
+        .cdna_coords_cache
+        .mapper
+        .get_or_init(|| MapperSegmentFacts::of(segments));
+    if facts.describes(segments) {
+        facts
+    } else {
+        MapperSegmentFacts::of(segments)
+    }
 }
 
 fn exact_mapper_cdna_index_for_hgvsp(tx: &TranscriptFeature, pos: i64) -> Option<usize> {
@@ -12591,8 +12765,16 @@ fn refseq_mapped_cdna_endpoints_outside_unedited_length(
 /// [`use_cdna_mapper_for_general_coords`] and [`mapper_deleted_gap_cdna_index`]
 /// so the per-call `collect + sort` heap churn is skipped on the hot path.
 fn sorted_mapper_segments(tx: &TranscriptFeature) -> Cow<'_, [TranscriptCdnaMapperSegment]> {
-    let segments = &tx.cdna_mapper_segments;
-    let already_sorted = segments.windows(2).all(|pair| {
+    let segments = tx.cdna_mapper_segments.as_slice();
+    if mapper_segment_facts(tx).sorted {
+        Cow::Borrowed(segments)
+    } else {
+        Cow::Owned(sorted_mapper_segments_copy(segments))
+    }
+}
+
+fn mapper_segments_sorted(segments: &[TranscriptCdnaMapperSegment]) -> bool {
+    segments.windows(2).all(|pair| {
         (
             pair[0].genomic_start,
             pair[0].genomic_end,
@@ -12602,20 +12784,21 @@ fn sorted_mapper_segments(tx: &TranscriptFeature) -> Cow<'_, [TranscriptCdnaMapp
             pair[1].genomic_end,
             pair[1].cdna_start,
         )
+    })
+}
+
+fn sorted_mapper_segments_copy(
+    segments: &[TranscriptCdnaMapperSegment],
+) -> Vec<TranscriptCdnaMapperSegment> {
+    let mut owned = segments.to_vec();
+    owned.sort_by_key(|segment| {
+        (
+            segment.genomic_start,
+            segment.genomic_end,
+            segment.cdna_start,
+        )
     });
-    if already_sorted {
-        Cow::Borrowed(segments.as_slice())
-    } else {
-        let mut owned = segments.clone();
-        owned.sort_by_key(|segment| {
-            (
-                segment.genomic_start,
-                segment.genomic_end,
-                segment.cdna_start,
-            )
-        });
-        Cow::Owned(owned)
-    }
+    owned
 }
 
 pub(crate) fn mapper_deleted_gap_cdna_index(
@@ -12688,7 +12871,12 @@ pub(crate) fn refseq_deleted_edit_cdna_index(
 }
 
 fn use_cdna_mapper_for_general_coords(tx: &TranscriptFeature) -> bool {
-    if tx.cdna_mapper_segments.is_empty() {
+    mapper_segment_facts(tx).general_coords
+}
+
+/// `segments` must be in genomic order.
+fn mapper_segments_allow_general_coords(segments: &[TranscriptCdnaMapperSegment]) -> bool {
+    if segments.is_empty() {
         return false;
     }
     // Traceability:
@@ -12705,7 +12893,6 @@ fn use_cdna_mapper_for_general_coords(tx: &TranscriptFeature) -> bool {
     // geometry for positions downstream of the gap — the same workaround
     // VEP applies when its mapper produces Gap entries for edit-inserted
     // cdna bases that have no genomic mapping.
-    let segments = sorted_mapper_segments(tx);
     for window in segments.windows(2) {
         let prev = &window[0];
         let next = &window[1];
@@ -12734,15 +12921,12 @@ pub(crate) fn genomic_to_cdna_index_for_transcript(
     pos: i64,
 ) -> Option<usize> {
     if use_cdna_mapper_for_general_coords(tx) {
-        return tx
-            .cdna_mapper_segments
-            .iter()
-            .find_map(|segment| mapper_segment_cdna_index(segment, pos));
+        return exact_mapper_cdna_index_for_transcript(tx, pos);
     }
     // Use the cached coord table (built once per transcript) instead of
     // rebuilding `exon_segments` on every call.
-    match transcript_cdna_coords(tx, tx_exons) {
-        Some(coords) => cdna_index_from_sorted_coords(tx.strand, pos, coords),
+    match transcript_cdna_coord_table(tx, tx_exons) {
+        Some(table) => table.cdna_index(tx.strand, pos),
         None => genomic_to_cdna_index(tx_exons, tx.strand, pos),
     }
 }
@@ -12773,9 +12957,7 @@ pub(crate) fn mapper_cdna_start_for_insertion(
         if tx.cdna_mapper_segments.is_empty() {
             genomic_to_cdna_index_for_transcript(tx, tx_exons, position)
         } else {
-            tx.cdna_mapper_segments
-                .iter()
-                .find_map(|segment| mapper_segment_cdna_index(segment, position))
+            exact_mapper_cdna_index_for_transcript(tx, position)
         }
     };
 
@@ -12815,10 +12997,17 @@ fn transcript_cdna_coords<'a>(
     tx: &'a TranscriptFeature,
     tx_exons: &[&ExonFeature],
 ) -> Option<&'a [TranscriptCdnaCoord]> {
+    transcript_cdna_coord_table(tx, tx_exons).map(|table| table.coords.as_slice())
+}
+
+fn transcript_cdna_coord_table<'a>(
+    tx: &'a TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+) -> Option<&'a CdnaCoordTable> {
     tx.cdna_coords_cache
-        .0
-        .get_or_init(|| transcript_cdna_coords_uncached(tx, tx_exons))
-        .as_deref()
+        .coords
+        .get_or_init(|| transcript_cdna_coords_uncached(tx, tx_exons).map(CdnaCoordTable::new))
+        .as_ref()
 }
 
 /// Map a genomic position to its 1-based cDNA index using a prebuilt,
@@ -14833,8 +15022,30 @@ fn translate_protein_from_cds(cds: &[u8]) -> Option<Vec<char>> {
 }
 
 fn translate_protein_from_cds_in(table: CodonTable, cds: &[u8]) -> Option<Vec<char>> {
-    let codon_count = cds.len() / 3;
-    let mut out = Vec::with_capacity(codon_count);
+    let mut out = Vec::with_capacity(cds.len() / 3);
+    translate_codons_in(table, cds, |aa| out.push(aa))?;
+    Some(out)
+}
+
+/// [`translate_protein_from_cds`] collected into a `String`: the same residues
+/// as `translate_protein_from_cds(cds).map(|aas| aas.into_iter().collect())`,
+/// written directly instead of through a `Vec<char>` of the whole protein.
+fn translate_protein_string(cds: &[u8]) -> Option<String> {
+    translate_protein_string_in(CodonTable::Standard, cds)
+}
+
+/// [`translate_protein_from_cds_in`] collected into a `String` (see
+/// [`translate_protein_string`]).
+fn translate_protein_string_in(table: CodonTable, cds: &[u8]) -> Option<String> {
+    let mut out = String::with_capacity(cds.len() / 3);
+    translate_codons_in(table, cds, |aa| out.push(aa))?;
+    Some(out)
+}
+
+/// The codon loop shared by the `Vec<char>` and `String` translators, so both
+/// take the same fast path and fail (return `None`) on the same codons.
+#[inline]
+fn translate_codons_in(table: CodonTable, cds: &[u8], mut push: impl FnMut(char)) -> Option<()> {
     // A/C/G/T codons dominate full translations. Index their genetic code
     // directly, avoiding a UTF-8 check and string match for every triplet.
     // Keep the original path for every other byte sequence: notably N plus
@@ -14870,9 +15081,9 @@ fn translate_protein_from_cds_in(table: CodonTable, cds: &[u8]) -> Option<Vec<ch
         } else {
             translate_codon_in(table, std::str::from_utf8(codon).ok()?)?
         };
-        out.push(aa);
+        push(aa);
     }
-    Some(out)
+    Some(())
 }
 
 fn translate_protein_for_coding_classification(
@@ -15017,6 +15228,8 @@ fn translate_codon(codon: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod allocation_free;
 
     #[test]
     fn indexed_translation_matches_original_for_every_ascii_codon() {
@@ -23052,10 +23265,10 @@ mod tests {
         );
         let exons = vec![exon("tx1", 1, 100, 110), exon("tx1", 2, 200, 210)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
-        assert!(t.cdna_coords_cache.0.get().is_none());
+        assert!(t.cdna_coords_cache.coords.get().is_none());
         let _ = genomic_to_cdna_index_for_transcript(&t, &refs, 205);
         assert!(
-            t.cdna_coords_cache.0.get().is_some(),
+            t.cdna_coords_cache.coords.get().is_some(),
             "lookup should memoize the coord table on the transcript",
         );
     }
@@ -29205,6 +29418,7 @@ mod tests {
             Some("ME/E"),
             &['M', 'E', 'K'],
             &['E', 'K'],
+            None,
             false,
             Some(&tr),
             crate::vep_semantics::VepSemantics::V115,
@@ -32715,7 +32929,7 @@ mod tests {
             &transcript,
             true,
             Some(preferred.clone()),
-            Some(direct),
+            || Some(direct),
         );
         assert_eq!(chosen.as_deref(), Some(preferred.as_str()));
 
