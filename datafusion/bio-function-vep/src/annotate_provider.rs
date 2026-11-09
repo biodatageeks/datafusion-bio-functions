@@ -6054,7 +6054,7 @@ impl AnnotateProvider {
         } else {
             target_partitions
         };
-        // Stateful Merged/RefSeq now runs N grid-aligned sharded workers with
+        // Sharded VCF output runs N grid-aligned workers with
         // bounded-overlap warm-up (design 2026-06-25 §5/§7): prepare_contig_context
         // re-partitions each contig on the global 5000-unit buffer grid and each
         // worker warm-starts its carried HGNC state before its seam, so the old
@@ -12146,7 +12146,7 @@ struct ContigPreparedData {
     /// `stateful_parallel`.
     grid_slices: Vec<WorkerGridSlice>,
     /// True when activation must build grid-aligned per-worker lookups
-    /// (stateful Merged/RefSeq at workers>1) instead of the byte-budget path.
+    /// (sharded VCF output at workers>1) instead of the byte-budget path.
     stateful_parallel: bool,
     /// Placeholder variation table name; the VariationLookupExec resolves the real
     /// dataset via the cache root.
@@ -12167,7 +12167,7 @@ struct ContigReadyState {
     lookup_partitions: VecDeque<LookupPartitionHandle>,
     /// Grid-aligned per-worker slices, indexed by lookup-partition id. Empty for
     /// the byte-budget (non-grid) path — then sharded workers emit their whole
-    /// stream with no warm-up. Populated only for stateful Merged/RefSeq parallel.
+    /// stream with no warm-up. Populated only for sharded VCF output at workers>1.
     grid_slices: Vec<WorkerGridSlice>,
     shared_context: Arc<SharedContigAnnotationContext>,
     ephemeral_tables: Vec<String>,
@@ -16068,7 +16068,9 @@ async fn prepare_contig_context(
 struct ContigModes {
     /// `workers>1` without a VCF shard context: the streaming run pool.
     stream_parallel: bool,
-    /// `workers>1` with a shard context on Merged/RefSeq: grid slices for the sink.
+    /// `workers>1` with a shard context: grid slices for the sink, on every cache
+    /// type. VEP's HGNC_ID copy depends on which transcripts share a buffer, on
+    /// Ensembl caches too, where a transcript with a symbol can lack its own ID.
     stateful_parallel: bool,
     /// Serial region runs on Merged/RefSeq: grid-aligned with warm-up.
     stateful_runs: bool,
@@ -16089,7 +16091,7 @@ fn contig_modes(
     let stream_parallel = parallel && !has_shard_ctx;
     ContigModes {
         stream_parallel,
-        stateful_parallel: parallel && has_shard_ctx && stateful,
+        stateful_parallel: parallel && has_shard_ctx,
         stateful_runs: cache_enabled && has_regions && stateful && !stream_parallel,
     }
 }
@@ -16195,7 +16197,7 @@ async fn prepare_contig_data(
     };
     #[cfg(not(feature = "parquet-cache"))]
     let cache_schema: Schema = unreachable!("parquet-cache feature is required");
-    // Stateful Merged/RefSeq at workers>1 runs N grid-aligned per-worker lookup
+    // Sharded VCF output at workers>1 runs N grid-aligned per-worker lookup
     // scans (planned below, once overlap_width is known), not the byte-budget
     // partitioning.
     let contig_bounds: Option<Vec<RunBounds>> = config
@@ -21596,15 +21598,15 @@ mod tests {
             m(1, false, CacheSourceType::Merged, true),
             modes(false, false, true)
         );
-        // Sink.
-        assert_eq!(
-            m(4, true, CacheSourceType::Merged, false),
-            modes(false, true, false)
-        );
-        assert_eq!(
-            m(4, true, CacheSourceType::Ensembl, false),
-            modes(false, false, false)
-        );
+        // Sink: grid slices on every source. Which transcripts share a buffer
+        // decides VEP's HGNC_ID copy on Ensembl caches too (vepyr#282).
+        for source in [
+            CacheSourceType::Merged,
+            CacheSourceType::RefSeq,
+            CacheSourceType::Ensembl,
+        ] {
+            assert_eq!(m(4, true, source, false), modes(false, true, false));
+        }
         // Streaming pool: never stateful_parallel, never stateful_runs (the pool
         // plans regions itself), for every source.
         assert_eq!(
