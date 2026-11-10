@@ -69,6 +69,8 @@ Merged and RefSeq VCF output now balances whole input buffers by transcript
 coverage rather than assigning an equal number of buffers to each worker.
 This preserves the existing buffer boundaries, warm-up replay and output order.
 Set `VEP_GRID_BALANCE=0` to reproduce uniform scheduling for diagnostic ablation.
+Ensembl caches use the uniform split by default; set `VEP_GRID_BALANCE=1` to
+balance them as well.
 At one worker the scheduling policy is unchanged. Planning temporarily retains
 one `(position, input_units)` pair per input row on the contig.
 
@@ -78,6 +80,14 @@ same A+B native binary. Both matched the original output body exactly. The
 vep-rs v0.5.0 reference on the same input took 32.72 seconds; its annotation
 feature coverage differs, so it is a timing reference, not a parity oracle.
 These are one measured run after warm-up, not whole-ClinVar results.
+
+With an Ensembl cache the two splits are close. Summed over 22 HG002 contigs,
+uniform took 50.3, 63.8 and 98.5 seconds at eight, four and two workers, and
+weighted took 52.5, 66.2 and 99.3 seconds. Summed over 25 ClinVar contigs,
+uniform took 151.0, 206.3 and 319.7 seconds, and weighted took 148.4, 205.5 and
+323.3 seconds. Each contig ran once per build after a warm-up, and every output
+body matched its reference. Uniform partitions also need no per-row positions
+from the count pass.
 
 Serial output uses at most 1,024 input rows per Arrow batch; parallel VCF shards
 use at most 640 rows. Both prepare the full VEP input-buffer context first.

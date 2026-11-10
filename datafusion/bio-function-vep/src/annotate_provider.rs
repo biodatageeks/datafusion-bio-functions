@@ -6054,7 +6054,7 @@ impl AnnotateProvider {
         } else {
             target_partitions
         };
-        // Stateful Merged/RefSeq now runs N grid-aligned sharded workers with
+        // Sharded VCF output runs N grid-aligned workers with
         // bounded-overlap warm-up (design 2026-06-25 §5/§7): prepare_contig_context
         // re-partitions each contig on the global 5000-unit buffer grid and each
         // worker warm-starts its carried HGNC state before its seam, so the old
@@ -12146,7 +12146,7 @@ struct ContigPreparedData {
     /// `stateful_parallel`.
     grid_slices: Vec<WorkerGridSlice>,
     /// True when activation must build grid-aligned per-worker lookups
-    /// (stateful Merged/RefSeq at workers>1) instead of the byte-budget path.
+    /// (sharded VCF output at workers>1) instead of the byte-budget path.
     stateful_parallel: bool,
     /// Placeholder variation table name; the VariationLookupExec resolves the real
     /// dataset via the cache root.
@@ -12167,7 +12167,7 @@ struct ContigReadyState {
     lookup_partitions: VecDeque<LookupPartitionHandle>,
     /// Grid-aligned per-worker slices, indexed by lookup-partition id. Empty for
     /// the byte-budget (non-grid) path — then sharded workers emit their whole
-    /// stream with no warm-up. Populated only for stateful Merged/RefSeq parallel.
+    /// stream with no warm-up. Populated only for sharded VCF output at workers>1.
     grid_slices: Vec<WorkerGridSlice>,
     shared_context: Arc<SharedContigAnnotationContext>,
     ephemeral_tables: Vec<String>,
@@ -16025,15 +16025,15 @@ async fn count_contig_buffer_boundaries(
             None,
         )
         .await?;
-    let partition_count = plan.output_partitioning().partition_count().max(1);
-    let task_ctx = session.task_ctx();
-    let mut batches = Vec::new();
-    for partition_id in 0..partition_count {
-        let mut stream = plan.execute(partition_id, Arc::clone(&task_ctx))?;
-        while let Some(batch) = stream.next().await {
-            batches.push(batch?);
-        }
-    }
+    // Read the partitions concurrently: this pass runs before any worker starts,
+    // so its wall time is added to every run. They come back in partition order,
+    // which is position order for the indexed VCF scan.
+    let batches: Vec<RecordBatch> =
+        datafusion::physical_plan::collect_partitioned(plan, session.task_ctx())
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
     accumulate_boundaries_inner(&batches, input_buffer_size, collect_positions)
 }
 
@@ -16068,7 +16068,9 @@ async fn prepare_contig_context(
 struct ContigModes {
     /// `workers>1` without a VCF shard context: the streaming run pool.
     stream_parallel: bool,
-    /// `workers>1` with a shard context on Merged/RefSeq: grid slices for the sink.
+    /// `workers>1` with a shard context: grid slices for the sink, on every cache
+    /// type. VEP's HGNC_ID copy depends on which transcripts share a buffer, on
+    /// Ensembl caches too, where a transcript with a symbol can lack its own ID.
     stateful_parallel: bool,
     /// Serial region runs on Merged/RefSeq: grid-aligned with warm-up.
     stateful_runs: bool,
@@ -16089,8 +16091,22 @@ fn contig_modes(
     let stream_parallel = parallel && !has_shard_ctx;
     ContigModes {
         stream_parallel,
-        stateful_parallel: parallel && has_shard_ctx && stateful,
+        stateful_parallel: parallel && has_shard_ctx,
         stateful_runs: cache_enabled && has_regions && stateful && !stream_parallel,
+    }
+}
+
+/// Whether the grid split weights buffers by transcript cost. Merged and RefSeq
+/// caches default to weighted, because gene-dense slices otherwise straggle.
+/// Ensembl caches default to uniform; PERFORMANCE.md has the measurements.
+/// `VEP_GRID_BALANCE` overrides the default in either direction.
+fn use_weighted_grid_split(env_value: Option<&str>, cache_source_type: CacheSourceType) -> bool {
+    match env_value {
+        Some(value) => pipeline_trace::enabled_from_env_value(Some(value)),
+        None => matches!(
+            cache_source_type,
+            CacheSourceType::Merged | CacheSourceType::RefSeq
+        ),
     }
 }
 
@@ -16195,7 +16211,7 @@ async fn prepare_contig_data(
     };
     #[cfg(not(feature = "parquet-cache"))]
     let cache_schema: Schema = unreachable!("parquet-cache feature is required");
-    // Stateful Merged/RefSeq at workers>1 runs N grid-aligned per-worker lookup
+    // Sharded VCF output at workers>1 runs N grid-aligned per-worker lookup
     // scans (planned below, once overlap_width is known), not the byte-budget
     // partitioning.
     let contig_bounds: Option<Vec<RunBounds>> = config
@@ -16266,13 +16282,14 @@ async fn prepare_contig_data(
             unreachable!("parquet-cache feature is required")
         }
     };
-    // Balance whole buffers by transcript overlap by default. The count pass
-    // supplies their positions; VEP_GRID_BALANCE=0 retains uniform partitions
-    // for diagnostic ablation. Buffer seams and state replay stay unchanged.
+    // Balance whole buffers by transcript overlap where the cache type calls
+    // for it. The count pass supplies their positions. Buffer seams and state
+    // replay stay unchanged.
     let grid_balance_enabled = stateful_parallel
-        && pipeline_trace::enabled_from_env_value(Some(
-            std::env::var("VEP_GRID_BALANCE").as_deref().unwrap_or("1"),
-        ));
+        && use_weighted_grid_split(
+            std::env::var("VEP_GRID_BALANCE").ok().as_deref(),
+            config.cache_source_type,
+        );
     // Run the grid count pass (VCF positions only) CONCURRENTLY with the context
     // load (Parquet transcripts/exons) — independent IO, so the count is hidden
     // behind context load instead of running as a serial prelude before workers.
@@ -16416,7 +16433,7 @@ async fn prepare_contig_data(
         let (boundaries, _total_rows, grid_positions) = grid_count
             .take()
             .expect("stateful_parallel implies the count future ran")?;
-        // Cost-weighted grid split (disabled with VEP_GRID_BALANCE=0). The old
+        // Cost-weighted grid split, when enabled for this cache type. The old
         // equal-buffer-count split equalises variants per worker, not work, so
         // gene-dense slices straggle; weighting by transcript overlap equalises
         // the work. Coding-length costs also account for long peptide/CDS
@@ -16952,9 +16969,9 @@ async fn activate_contig_lookups(
             )?;
             // Restrict each worker to its [scan_lo_pos, scan_hi_pos) window so it
             // reads ONLY its range's lookup (warm-up + emit) — no over-read. The
-            // full-contig worker below reads ALL partitions of this filtered plan
-            // (the earlier truncation was reading only partition 0, not a broken
-            // filter). The last worker has no upper bound (reads to contig end).
+            // worker below reads its plan one partition at a time, so the window
+            // is planned as one scan. The last worker has no upper bound (reads
+            // to contig end).
             let mut filter = col("chrom")
                 .eq(lit(&*chrom))
                 .and(col("start").gt_eq(lit(slice.scan_lo_pos)));
@@ -16962,6 +16979,7 @@ async fn activate_contig_lookups(
                 filter = filter.and(col("start").lt(lit(slice.scan_hi_pos)));
             }
             wprovider.set_vcf_filter(Some(filter));
+            wprovider.set_single_vcf_scan(true);
             wprovider.set_target_partitions(config.target_partitions);
             apply_lookup_needs(&mut wprovider, &config);
             // Warm-up rows (strictly before this worker's seam) are read only to
@@ -21596,15 +21614,15 @@ mod tests {
             m(1, false, CacheSourceType::Merged, true),
             modes(false, false, true)
         );
-        // Sink.
-        assert_eq!(
-            m(4, true, CacheSourceType::Merged, false),
-            modes(false, true, false)
-        );
-        assert_eq!(
-            m(4, true, CacheSourceType::Ensembl, false),
-            modes(false, false, false)
-        );
+        // Sink: grid slices on every source. Which transcripts share a buffer
+        // decides VEP's HGNC_ID copy on Ensembl caches too (vepyr#282).
+        for source in [
+            CacheSourceType::Merged,
+            CacheSourceType::RefSeq,
+            CacheSourceType::Ensembl,
+        ] {
+            assert_eq!(m(4, true, source, false), modes(false, true, false));
+        }
         // Streaming pool: never stateful_parallel, never stateful_runs (the pool
         // plans regions itself), for every source.
         assert_eq!(
@@ -21620,6 +21638,25 @@ mod tests {
             contig_modes(false, 4, false, CacheSourceType::Merged, true),
             modes(false, false, false)
         );
+    }
+
+    #[test]
+    fn grid_split_defaults_to_uniform_only_on_ensembl() {
+        assert!(!use_weighted_grid_split(None, CacheSourceType::Ensembl));
+        assert!(use_weighted_grid_split(None, CacheSourceType::Merged));
+        assert!(use_weighted_grid_split(None, CacheSourceType::RefSeq));
+    }
+
+    #[test]
+    fn grid_split_env_overrides_the_cache_default() {
+        for source in [
+            CacheSourceType::Merged,
+            CacheSourceType::RefSeq,
+            CacheSourceType::Ensembl,
+        ] {
+            assert!(!use_weighted_grid_split(Some("0"), source));
+            assert!(use_weighted_grid_split(Some("1"), source));
+        }
     }
 
     fn tagged_batch(tag: i64) -> RecordBatch {
@@ -21870,6 +21907,95 @@ mod tests {
         assert_eq!(bs[0].pos, 10);
         assert_eq!(bs[1].pos, 30);
         assert_eq!(bs[2].pos, i64::MAX);
+    }
+
+    /// A count-pass input partition that yields `batch` once `wait_for` fires,
+    /// then fires `signal`.
+    #[derive(Debug)]
+    struct GatedPartition {
+        batch: RecordBatch,
+        wait_for: Option<Arc<tokio::sync::Notify>>,
+        signal: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl datafusion::physical_plan::streaming::PartitionStream for GatedPartition {
+        fn schema(&self) -> &SchemaRef {
+            self.batch.schema_ref()
+        }
+
+        fn execute(
+            &self,
+            _ctx: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::execution::SendableRecordBatchStream {
+            let batch = self.batch.clone();
+            let schema = batch.schema();
+            let wait_for = self.wait_for.clone();
+            let signal = self.signal.clone();
+            Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::once(async move {
+                        if let Some(gate) = wait_for {
+                            gate.notified().await;
+                        }
+                        if let Some(gate) = signal {
+                            gate.notify_one();
+                        }
+                        Ok(batch)
+                    }),
+                ),
+            )
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn count_pass_merges_concurrently_read_partitions_in_order() {
+        // Partition 0 finishes only after partition 1 has produced, so a
+        // partition-by-partition read never completes.
+        let partition_1_ready = Arc::new(tokio::sync::Notify::new());
+        let first = make_buffer_batch_many("chr2", &[10, 20]);
+        let second = make_buffer_batch_many("chr2", &[30, 40]);
+        let schema = first.schema();
+        let partitions: Vec<Arc<dyn datafusion::physical_plan::streaming::PartitionStream>> = vec![
+            Arc::new(GatedPartition {
+                batch: first,
+                wait_for: Some(Arc::clone(&partition_1_ready)),
+                signal: None,
+            }),
+            Arc::new(GatedPartition {
+                batch: second,
+                wait_for: None,
+                signal: Some(partition_1_ready),
+            }),
+        ];
+        let session = Arc::new(SessionContext::new());
+        session
+            .register_table(
+                "vcf",
+                Arc::new(
+                    datafusion::catalog::streaming::StreamingTable::try_new(schema, partitions)
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+
+        let (boundaries, rows, positions) = tokio::time::timeout(
+            Duration::from_secs(10),
+            count_contig_buffer_boundaries(&session, "vcf", "chr2", 2, true),
+        )
+        .await
+        .expect("the count pass must read its partitions concurrently")
+        .unwrap();
+
+        assert_eq!(rows, 4);
+        assert_eq!(
+            positions.iter().map(|&(pos, _)| pos).collect::<Vec<_>>(),
+            vec![10, 20, 30, 40]
+        );
+        assert_eq!(
+            boundaries.iter().map(|b| b.global_row).collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
     }
 
     #[test]

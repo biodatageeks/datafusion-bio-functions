@@ -97,6 +97,8 @@ pub struct LookupProvider {
     /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
     /// for per-contig partitioned annotation).
     vcf_filter: Option<Expr>,
+    /// Plan the VCF input as one sequential scan (see `set_single_vcf_scan`).
+    single_vcf_scan: bool,
     /// Single-flight cell for the per-contig Parquet variation lookup, supplied
     /// by the caller so that the grid workers of one contig share a single shard
     /// footer + page index. `None` means this provider owns its own cell (the
@@ -173,6 +175,7 @@ impl LookupProvider {
             skip_probing: false,
             colocated_af_groups: None,
             vcf_filter: None,
+            single_vcf_scan: false,
             #[cfg(feature = "parquet-cache")]
             parquet_lookup_cell: None,
         })
@@ -229,6 +232,15 @@ impl LookupProvider {
     /// tabix-indexed seeks in the VCF table provider.
     pub fn set_vcf_filter(&mut self, filter: Option<Expr>) {
         self.vcf_filter = filter;
+    }
+
+    /// Plan the VCF input as one sequential scan, whatever the session's target
+    /// partitions. A caller that reads the plan's partitions one after another
+    /// gains nothing from several, and they cost extra work: the VCF provider's
+    /// region split opens a reader per piece and drops the window's upper bound
+    /// on the last piece, so that piece reads on to the contig end.
+    pub fn set_single_vcf_scan(&mut self, single: bool) {
+        self.single_vcf_scan = single;
     }
 }
 
@@ -296,7 +308,13 @@ impl TableProvider for LookupProvider {
             } else {
                 vcf_df
             };
-            let vcf_plan = vcf_df.create_physical_plan().await?;
+            let vcf_plan = if self.single_vcf_scan {
+                let (mut state, plan) = vcf_df.into_parts();
+                state.config_mut().options_mut().execution.target_partitions = 1;
+                state.create_physical_plan(&plan).await?
+            } else {
+                vcf_df.create_physical_plan().await?
+            };
 
             let mut exec = VariationLookupExec::new(
                 vcf_plan,
@@ -332,5 +350,108 @@ impl TableProvider for LookupProvider {
         Err(DataFusionError::Plan(
             "LookupProvider::scan requires a Parquet variation cache root".to_string(),
         ))
+    }
+}
+
+#[cfg(all(test, feature = "parquet-cache"))]
+mod tests {
+    use super::*;
+    use crate::schema_contract::REQUIRED_VARIATION_COLUMNS;
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::prelude::{SessionConfig, col, lit};
+
+    /// Stands in for the indexed VCF provider, which plans one partition per
+    /// session target partition.
+    #[derive(Debug)]
+    struct PartitionedVcf(SchemaRef);
+
+    #[async_trait]
+    impl TableProvider for PartitionedVcf {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.0.clone()
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            let schema = match projection {
+                Some(indices) => Arc::new(self.0.project(indices)?),
+                None => self.0.clone(),
+            };
+            Ok(Arc::new(
+                EmptyExec::new(schema).with_partitions(state.config().target_partitions()),
+            ))
+        }
+    }
+
+    async fn planned_partitions(single_vcf_scan: bool) -> usize {
+        let session = Arc::new(SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(4),
+        ));
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::UInt32, false),
+            Field::new("end", DataType::UInt32, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        session
+            .register_table(
+                "vcf",
+                Arc::new(PartitionedVcf(Arc::new(vcf_schema.clone()))),
+            )
+            .unwrap();
+        let cache_schema = Schema::new(
+            REQUIRED_VARIATION_COLUMNS
+                .iter()
+                .map(|(name, data_type)| Field::new(*name, data_type.clone(), true))
+                .collect::<Vec<_>>(),
+        );
+        let mut provider = LookupProvider::new(
+            Arc::clone(&session),
+            "vcf".to_string(),
+            "variation".to_string(),
+            vcf_schema,
+            cache_schema,
+            Vec::new(),
+            false,
+            0,
+        )
+        .unwrap();
+        provider.set_vcf_filter(Some(
+            col("chrom")
+                .eq(lit("chr1"))
+                .and(col("start").gt_eq(lit(100i64))),
+        ));
+        provider.set_cache_root("/nonexistent");
+        provider.set_single_vcf_scan(single_vcf_scan);
+        let plan = provider
+            .scan(&session.state(), None, &[], None)
+            .await
+            .unwrap();
+        plan.output_partitioning().partition_count()
+    }
+
+    #[tokio::test]
+    async fn single_vcf_scan_plans_one_partition() {
+        assert_eq!(planned_partitions(true).await, 1);
+    }
+
+    #[tokio::test]
+    async fn default_vcf_scan_keeps_the_session_partitions() {
+        assert_eq!(planned_partitions(false).await, 4);
     }
 }
