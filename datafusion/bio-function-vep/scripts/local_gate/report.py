@@ -188,7 +188,8 @@ def check(baseline, candidate, parity, identity, baseline_1w, candidate_1w, targ
             results.append((f"target {dataset}", False, "dataset missing from the baseline or the candidate"))
             continue
         change = 100.0 * (1.0 - cand_total / base_total)
-        detail = f"baseline {base_total:.1f} s, candidate {cand_total:.1f} s, {change:+.1f}% faster"
+        direction = "faster" if change >= 0 else "slower"
+        detail = f"baseline {base_total:.1f} s, candidate {cand_total:.1f} s, {abs(change):.1f}% {direction}"
         if dataset in targets:
             limit = (1.0 - targets[dataset] / 100.0) * base_total
             results.append((f"target {dataset}", cand_total <= limit, f"{detail}; target {targets[dataset]:g}%"))
