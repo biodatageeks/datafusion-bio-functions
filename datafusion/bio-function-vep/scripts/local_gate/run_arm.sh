@@ -145,7 +145,14 @@ for CONTIG in ${CHROMS:-$DEFAULT_CHROMS}; do
   if awk -F'\t' -v d="$DATASET" -v c="$CONTIG" '$1 == d && $2 == c && $6 == "0" { found = 1 } END { exit !found }' "$TSV"; then
     continue
   fi
-  free=$(free_gib)
+  # The volume returns the space of files deleted a moment ago (the previous chromosome's
+  # output and shards) with a delay, so a low reading is re-checked for two minutes.
+  free=$(free_gib) n=0
+  while [ "$free" -lt "$MIN_FREE_GIB" ] && [ "$n" -lt 60 ]; do
+    sleep 2
+    n=$((n + 1))
+    free=$(free_gib)
+  done
   if [ "$free" -lt "$MIN_FREE_GIB" ]; then
     echo "STOP: $free GiB free on the volume of $ARM, need $MIN_FREE_GIB" >&2
     exit 3

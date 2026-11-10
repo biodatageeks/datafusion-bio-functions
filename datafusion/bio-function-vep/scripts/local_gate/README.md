@@ -18,7 +18,9 @@ release gate.
   goldens in `output/116/`. Docker is not needed.
 - `uv`, Rust 1.91.1, `tabix`, `bgzip`.
 - 20 GiB of free disk during every run. Plain ClinVar output is up to 7 GB per
-  chromosome, so each chromosome's VCFs are deleted before the next one starts.
+  chromosome, so each chromosome's VCFs are deleted before the next one starts. The
+  volume returns that space with a delay, so a low reading is re-checked for two minutes
+  before the run stops with exit 3.
 - An otherwise idle machine: a run waits up to three minutes for background CPU to drop
   below 200%.
 
