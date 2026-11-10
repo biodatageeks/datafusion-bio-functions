@@ -11,12 +11,15 @@ An arm directory holds `contigs.tsv`, one row per chromosome, written by `run_ar
 Exit status: 0 when every rule holds, 1 when one fails, 2 on unusable input.
 
 Rules (per dataset where a dataset is named):
-  complete              every row finished with exit 0 and a numeric time, and all arms of
-                        a dataset cover the same chromosomes
+  complete              no arm is empty, every row finished with exit 0 and a numeric
+                        time, all arms of a dataset cover the same chromosomes and every
+                        group of arms covers every dataset
+  quiet                 every timing run started with background CPU at or below 200%
   parity                every row of every --parity arm has verdict PASS
   identity              one raw body MD5 per chromosome across the candidate, parity and
                         identity arms and the first baseline arm
-  target <d>            mean candidate total <= (1 - p/100) x mean baseline total
+  target <d>            mean candidate total <= (1 - p/100) x mean baseline total; a
+                        dataset without a target fails
   no contig regression  no chromosome slower by more than 10% and by more than 0.5 s
   peak rss <d>          largest candidate RSS <= 1.10 x largest baseline RSS
   1 worker <d>          candidate total <= 1.03 x baseline total
@@ -41,7 +44,9 @@ COLUMNS = [
     "body_md5",
     "verdict",
     "env",
+    "bg_cpu",
 ]
+MAX_BG_CPU = 200.0
 CONTIG_REGRESSION_RATIO = 1.10
 CONTIG_REGRESSION_SECONDS = 0.5
 RSS_RATIO = 1.10
@@ -56,7 +61,11 @@ def load_arm(path):
         missing = [c for c in COLUMNS if c not in (reader.fieldnames or [])]
         if missing:
             raise ValueError(f"{table}: missing columns {missing}")
-        return list(reader)
+        # A chromosome that failed and was run again has two rows: the last one counts.
+        latest = {}
+        for row in reader:
+            latest[(row["dataset"], row["contig"])] = row
+        return list(latest.values())
 
 
 def _number(value):
@@ -120,20 +129,43 @@ def _peak_rss(arms, dataset):
     return max(values) if values else None
 
 
-def _complete(arms):
+def _complete(groups):
+    """Problems that make a comparison meaningless. `groups` maps a group name to its arms."""
     problems = []
+    arms = [arm for group in groups.values() for arm in group]
+    for name, group in groups.items():
+        for arm in group:
+            if not arm:
+                problems.append(f"{name}: an arm has no rows")
     for arm in arms:
         for row in arm:
             if row["exit"] != "0":
                 problems.append(f"{row['dataset']} {row['contig']}: exit {row['exit']}")
             elif _number(row["time_s"]) is None:
                 problems.append(f"{row['dataset']} {row['contig']}: no annotation time")
-    for dataset in _datasets(arms):
+    datasets = _datasets(arms)
+    for dataset in datasets:
         sets = [frozenset(row["contig"] for row in arm) for arm in _of_dataset(arms, dataset)]
         if len(set(sets)) > 1:
             union = frozenset().union(*sets)
             short = min(sets, key=len)
             problems.append(f"{dataset}: arms cover different chromosomes (e.g. missing {sorted(union - short)})")
+    for name, group in groups.items():
+        missing = [d for d in datasets if group and d not in _datasets(group)]
+        if missing:
+            problems.append(f"{name}: no arm for {', '.join(missing)}")
+    return problems
+
+
+def _busy(arms):
+    problems = []
+    for arm in arms:
+        for row in arm:
+            load = _number(row.get("bg_cpu"))
+            if load is None:
+                problems.append(f"{row['dataset']} {row['contig']}: background CPU not recorded")
+            elif load > MAX_BG_CPU:
+                problems.append(f"{row['dataset']} {row['contig']}: background CPU {load:.0f}%")
     return problems
 
 
@@ -160,10 +192,20 @@ def check(baseline, candidate, parity, identity, baseline_1w, candidate_1w, targ
     candidate_1w = candidate_1w or []
     results = []
 
-    # Arms run with the same worker count must cover the same chromosomes.
-    problems = _complete(baseline + candidate + parity + identity)
-    problems += _complete(baseline_1w + candidate_1w)
+    problems = _complete(
+        {
+            "baseline": baseline,
+            "candidate": candidate,
+            "parity": parity,
+            "identity": identity,
+            "baseline 1 worker": baseline_1w,
+            "candidate 1 worker": candidate_1w,
+        }
+    )
     results.append(("complete", not problems, "; ".join(problems[:5]) or "all rows finished"))
+
+    problems = _busy(baseline + candidate + baseline_1w + candidate_1w)
+    results.append(("quiet", not problems, "; ".join(problems[:5]) or "every timing run started on a quiet machine"))
 
     if parity:
         failed = [
@@ -193,6 +235,8 @@ def check(baseline, candidate, parity, identity, baseline_1w, candidate_1w, targ
         if dataset in targets:
             limit = (1.0 - targets[dataset] / 100.0) * base_total
             results.append((f"target {dataset}", cand_total <= limit, f"{detail}; target {targets[dataset]:g}%"))
+        else:
+            results.append((f"target {dataset}", False, f"{detail}; no target given"))
 
         base_contigs = _contig_means(baseline, dataset)
         cand_contigs = _contig_means(candidate, dataset)
@@ -234,7 +278,7 @@ def check(baseline, candidate, parity, identity, baseline_1w, candidate_1w, targ
     return results
 
 
-def _parse_targets(text):
+def parse_targets(text):
     targets = {}
     for item in filter(None, (part.strip() for part in (text or "").split(","))):
         name, sep, value = item.partition("=")
@@ -273,13 +317,17 @@ def main(argv=None):
     except SystemExit as stop:
         return 2 if stop.code else 0
     try:
-        targets = _parse_targets(args.target_pct)
+        targets = parse_targets(args.target_pct)
         groups = {
             name: [load_arm(path) for path in getattr(args, name)]
             for name in ("baseline", "candidate", "parity", "identity", "baseline_1w", "candidate_1w")
         }
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
+        return 2
+    unknown = sorted(set(targets) - set(_datasets(groups["baseline"] + groups["candidate"])))
+    if unknown:
+        print(f"error: --target-pct names no dataset of this comparison: {', '.join(unknown)}", file=sys.stderr)
         return 2
 
     _print_tables(groups["baseline"], groups["candidate"])

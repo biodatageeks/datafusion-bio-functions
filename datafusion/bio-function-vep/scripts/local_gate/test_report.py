@@ -33,6 +33,7 @@ def rows(dataset, times, **overrides):
             "body_md5": f"md5-{contig}",
             "verdict": "-",
             "env": "",
+            "bg_cpu": "50",
         }
         for column, by_contig in overrides.items():
             if contig in by_contig:
@@ -154,6 +155,47 @@ class ReportTest(unittest.TestCase):
         results = self.results(base, cand, targets={"hg002": 5.0, "clinvar": 15.0})
         self.assertTrue(results["target hg002"])
         self.assertFalse(results["target clinvar"])
+
+    def test_last_row_wins_after_a_rerun(self):
+        failed = rows("hg002", {"chr1": "NA"}, exit={"chr1": "137"}, body_md5={"chr1": "NA"})
+        loaded = self.arm(failed + rows("hg002", {"chr1": 10.0}) + rows("hg002", {"chr2": 8.0}))
+        self.assertEqual([(r["contig"], r["exit"], r["time_s"]) for r in loaded], [("chr1", "0", "10.0"), ("chr2", "0", "8.0")])
+        base = [self.arm(rows("hg002", {"chr1": 10.0, "chr2": 8.0}))]
+        self.assertTrue(self.results(base, [loaded])["complete"])
+
+    def test_missing_target_fails(self):
+        base, cand = self.pair({"chr1": 10.0}, {"chr1": 5.0})
+        self.assertFalse(self.results(base, cand, targets={})["target hg002"])
+
+    def test_empty_arm_fails_complete(self):
+        base, cand = self.pair({"chr1": 10.0}, {"chr1": 10.0})
+        self.assertFalse(self.results(base, cand, parity=[self.arm([])])["complete"])
+
+    def test_group_missing_a_dataset_fails(self):
+        base = [self.arm(rows("hg002", {"chr1": 10.0})), self.arm(rows("clinvar", {"1": 50.0}))]
+        cand = [self.arm(rows("hg002", {"chr1": 10.0})), self.arm(rows("clinvar", {"1": 50.0}))]
+        parity = [self.arm(rows("hg002", {"chr1": 10.0}, verdict={"chr1": "PASS"}))]
+        self.assertFalse(self.results(base, cand, parity=parity)["complete"])
+
+    def test_one_worker_arm_with_fewer_contigs_fails(self):
+        base, cand = self.pair({"chr1": 10.0, "chr2": 8.0}, {"chr1": 10.0, "chr2": 8.0})
+        base_1w = [self.arm(rows("hg002", {"chr1": 100.0, "chr2": 80.0}))]
+        cand_1w = [self.arm(rows("hg002", {"chr1": 100.0}))]
+        self.assertFalse(self.results(base, cand, base_1w=base_1w, cand_1w=cand_1w)["complete"])
+
+    def test_busy_machine_fails_quiet(self):
+        base, cand = self.pair({"chr1": 10.0}, {"chr1": 10.0})
+        self.assertTrue(self.results(base, cand)["quiet"])
+        base, cand = self.pair({"chr1": 10.0}, {"chr1": 10.0}, bg_cpu={"chr1": "350"})
+        self.assertFalse(self.results(base, cand)["quiet"])
+        base, cand = self.pair({"chr1": 10.0}, {"chr1": 10.0}, bg_cpu={"chr1": "NA"})
+        self.assertFalse(self.results(base, cand)["quiet"])
+
+    def test_cli_rejects_an_unknown_target_name(self):
+        base = self.arm_dir(rows("hg002", {"chr1": 10.0}))
+        cand = self.arm_dir(rows("hg002", {"chr1": 8.0}))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["--baseline", base, "--candidate", cand, "--target-pct", "HG02=10"]), 2)
 
     def test_cli_exit_codes_and_target_key_case(self):
         base = self.arm_dir(rows("hg002", {"chr1": 10.0}))

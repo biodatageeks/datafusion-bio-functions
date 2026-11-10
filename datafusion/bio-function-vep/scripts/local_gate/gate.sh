@@ -50,6 +50,22 @@ done
 [ -n "$TARGETS" ] || usage
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# A misspelt dataset name would silently drop its target rule: check before any work.
+PYTHONDONTWRITEBYTECODE=1 python3 - "$HERE" "$TARGETS" << 'EOF' || {
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import report
+
+try:
+    names = set(report.parse_targets(sys.argv[2]))
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if names == {"hg002", "clinvar"} else 1)
+EOF
+  echo "error: --target-pct must give one value each for HG002 and ClinVar, got '$TARGETS'" >&2
+  exit 2
+}
 mkdir -p "$GATE"
 GATE=$(cd "$GATE" && pwd -P)
 log() { echo "[$(date +%H:%M:%S)] $*"; }

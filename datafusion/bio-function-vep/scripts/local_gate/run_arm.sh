@@ -10,7 +10,8 @@
 #
 # Each chromosome appends one row to <arm-dir>/contigs.tsv and its VCFs are deleted before
 # the next one starts. A chromosome that already has a row with exit 0 is skipped, so an
-# interrupted arm can be resumed with the same command.
+# interrupted arm can be resumed with the same command. An arm directory belongs to one
+# build and one set of arguments: resuming it with another is refused (exit 2).
 #
 # Environment (optional): GATE_ROOT (default $HOME/research/benchmarks/local-gate),
 # DATA_VEPYR_DIR (default $HOME/workspace/data_vepyr). Every VEP_* and MIMALLOC_* variable
@@ -70,13 +71,14 @@ esac
 mkdir -p "$ARM/logs"
 ARM=$(cd "$ARM" && pwd -P)
 TSV="$ARM/contigs.tsv"
-[ -f "$TSV" ] || printf 'dataset\tcontig\tworkers\tmode\tcompression\texit\twall_s\trss_gib\ttime_s\trecords\tbody_md5\tverdict\tenv\n' > "$TSV"
+[ -f "$TSV" ] || printf 'dataset\tcontig\tworkers\tmode\tcompression\texit\twall_s\trss_gib\ttime_s\trecords\tbody_md5\tverdict\tenv\tbg_cpu\n' > "$TSV"
 COMPRESSION=plain EXT=.vcf
 if [ -n "$BGZF" ]; then COMPRESSION=bgzf EXT=.vcf.gz; fi
 ENV_TEXT=${EXTRA_ENV[*]:-}
 
-if [ ! -f "$ARM/arm.json" ]; then
-  "$VENV/bin/python" -P - "$VENV" "$ARM" "$DATASET" "$WORKERS" "$MODE" "$COMPRESSION" "$ENV_TEXT" << 'EOF'
+# An arm records the build and the arguments of its first run; a later run must match
+# them, or its old rows would be reported as results of the new build.
+"$VENV/bin/python" -P - "$VENV" "$ARM" "$DATASET" "$WORKERS" "$MODE" "$COMPRESSION" "$ENV_TEXT" << 'EOF'
 import datetime
 import json
 import os
@@ -85,22 +87,42 @@ import sys
 venv, arm, dataset, workers, mode, compression, env = sys.argv[1:]
 identity_path = os.path.join(venv, "GATE_IDENTITY.json")
 identity = json.load(open(identity_path)) if os.path.exists(identity_path) else None
-json.dump(
-    {
-        "venv": venv,
-        "identity": identity,
-        "dataset": dataset,
-        "workers": int(workers),
-        "mode": mode,
-        "compression": compression,
-        "env": env,
-        "started": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-    },
-    open(os.path.join(arm, "arm.json"), "w"),
-    indent=2,
-)
+current = {
+    "extension_sha256": (identity or {}).get("extension_sha256"),
+    "dataset": dataset,
+    "workers": int(workers),
+    "mode": mode,
+    "compression": compression,
+    "env": env,
+}
+path = os.path.join(arm, "arm.json")
+if os.path.exists(path):
+    recorded = json.load(open(path))
+    previous = dict(recorded, extension_sha256=(recorded.get("identity") or {}).get("extension_sha256"))
+    differing = [key for key, value in current.items() if previous.get(key) != value]
+    if differing:
+        print(
+            f"error: {arm} holds results of another build or other arguments "
+            f"(differs in: {', '.join(differing)}); use a new arm directory",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+else:
+    json.dump(
+        {
+            "venv": venv,
+            "identity": identity,
+            "dataset": dataset,
+            "workers": int(workers),
+            "mode": mode,
+            "compression": compression,
+            "env": env,
+            "started": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        },
+        open(path, "w"),
+        indent=2,
+    )
 EOF
-fi
 
 # Inherited switches must not leak into a measured run.
 UNSET=(-u CONDA_PREFIX -u VIRTUAL_ENV -u PYTHONPATH)
@@ -129,6 +151,9 @@ for CONTIG in ${CHROMS:-$DEFAULT_CHROMS}; do
     exit 3
   fi
   wait_quiet
+  # Recorded with the row: the wait gives up after three minutes, and report.py fails a
+  # timing run that started on a busy machine.
+  bg=$(bg_cpu)
 
   N=${CONTIG#chr}
   WORK="$ARM/results/116/fast_chr$N"
@@ -177,9 +202,9 @@ EOF
       body_md5=$({ LC_ALL=C grep -v '^#' "$OUT" || true; } | md5 -q)
     fi
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$DATASET" "$CONTIG" "$WORKERS" "$MODE" "$COMPRESSION" "$code" "$wall" "$rss" "$time_s" "$records" \
-    "$body_md5" "$verdict" "$ENV_TEXT" >> "$TSV"
+    "$body_md5" "$verdict" "$ENV_TEXT" "$bg" >> "$TSV"
   echo "$DATASET $CONTIG w$WORKERS $MODE $COMPRESSION: exit $code, annotate $time_s s, wall $wall s, rss $rss GiB, $records records, $verdict"
 
   # Whole-genome outputs do not fit on disk together: drop this chromosome's VCFs now.
