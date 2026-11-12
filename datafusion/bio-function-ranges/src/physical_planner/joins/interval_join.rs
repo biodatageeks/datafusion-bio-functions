@@ -38,7 +38,6 @@ use datafusion::physical_plan::{
     handle_state,
 };
 use futures::{Stream, StreamExt, TryStreamExt, ready};
-
 use std::fmt::{Debug, Formatter};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -132,6 +131,10 @@ impl IntervalJoinExec {
         let (join_schema, column_indices) =
             build_join_schema(&left_schema, &right_schema, join_type);
 
+        // DataFusion's `RandomState` is foldhash's `FixedState`, whose `Default` is a
+        // compile-time constant seed, so this is as deterministic as the previous
+        // `ahash::RandomState::with_seeds(0, 0, 0, 0)`. Both join sides hash through
+        // this one instance, so build and probe hashes always agree.
         let random_state = RandomState::default();
 
         let join_schema = Arc::new(join_schema);
@@ -582,8 +585,19 @@ impl ExecutionPlan for IntervalJoinExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.partition_statistics_inner(partition).map(Arc::new)
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        // A whole-join estimate for every partition, as before the DataFusion 55
+        // bump: the interval join has no per-partition statistics of its own.
+        let mut stats = estimate_join_statistics(
+            Arc::clone(&self.left),
+            Arc::clone(&self.right),
+            self.on.clone(),
+            &self.join_type,
+        )?;
+        if stats.column_statistics.len() != self.join_schema.fields().len() {
+            stats.column_statistics = Statistics::unknown_column(self.join_schema.as_ref());
+        }
+        Ok(Arc::new(stats.project(self.projection.as_ref())))
     }
 }
 
@@ -1712,21 +1726,6 @@ fn evaluate_as_i32(
         .to_owned();
 
     Ok(array)
-}
-
-impl IntervalJoinExec {
-    fn partition_statistics_inner(&self, _partition: Option<usize>) -> Result<Statistics> {
-        let mut stats = estimate_join_statistics(
-            Arc::clone(&self.left),
-            Arc::clone(&self.right),
-            self.on.clone(),
-            &self.join_type,
-        )?;
-        if stats.column_statistics.len() != self.join_schema.fields().len() {
-            stats.column_statistics = Statistics::unknown_column(self.join_schema.as_ref());
-        }
-        Ok(stats.project(self.projection.as_ref()))
-    }
 }
 
 #[cfg(test)]

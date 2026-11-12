@@ -14,6 +14,7 @@ use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::join_hash_map::{JoinHashMapU32, JoinHashMapU64};
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JoinAlgorithm {
@@ -95,10 +96,7 @@ pub(crate) fn choose_for_hash_plan(
         });
     }
 
-    let stats = datafusion::physical_plan::statistics::StatisticsContext::new().compute(
-        join.left().as_ref(),
-        &datafusion::physical_plan::statistics::StatisticsArgs::new(),
-    )?;
+    let stats = StatisticsContext::new().compute(join.left().as_ref(), &StatisticsArgs::new())?;
     let rows = stats.num_rows.get_value().copied();
     let data_bytes = stats.total_byte_size.get_value().copied();
     let (Some(rows), Some(data_bytes)) = (rows, data_bytes) else {
