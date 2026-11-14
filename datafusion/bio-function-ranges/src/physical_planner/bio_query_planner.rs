@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::execution::context::QueryPlanner;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
@@ -16,7 +17,7 @@ impl QueryPlanner for BioQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &dyn datafusion::catalog::Session,
+        session_state: &dyn Session,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let physical_planner = BioPhysicalPlanner::default();
         let display_string = logical_plan.display();

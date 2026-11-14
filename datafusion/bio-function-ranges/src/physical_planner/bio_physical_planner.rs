@@ -2,9 +2,11 @@ use crate::physical_planner::intervals::{ColIntervals, parse};
 use crate::physical_planner::joins::interval_join::IntervalJoinExec;
 use crate::session_context::{Algorithm, BioConfig};
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{DFSchema, NullEquality, Result};
 use datafusion::config::ConfigOptions;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::lit;
@@ -155,7 +157,7 @@ impl PhysicalPlanner for BioPhysicalPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &dyn datafusion::catalog::Session,
+        session_state: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let plan = self
             .planner
@@ -168,8 +170,8 @@ impl PhysicalPlanner for BioPhysicalPlanner {
         &self,
         expr: &Expr,
         input_dfschema: &DFSchema,
-        session_state: &dyn datafusion::catalog::Session,
-        planning_ctx: &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext,
+        session_state: &dyn Session,
+        planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         self.planner
             .create_physical_expr(expr, input_dfschema, session_state, planning_ctx)
