@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 
 use crate::{QcModule, TidyRow};
@@ -102,6 +101,10 @@ impl DuplicationLevels {
 }
 
 impl QcModule for DuplicationLevels {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "dup_levels"
     }
@@ -205,10 +208,6 @@ impl QcModule for DuplicationLevels {
             "PASS"
         };
         out.push(TidyRow::status(m, status));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

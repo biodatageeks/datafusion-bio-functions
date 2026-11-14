@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,9 +9,11 @@ use datafusion::arrow::array::{Int64Array, Int64Builder, RecordBatch, StringBuil
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -92,10 +93,6 @@ impl Debug for ClusterProvider {
 
 #[async_trait]
 impl TableProvider for ClusterProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -173,12 +170,15 @@ impl DisplayAs for ClusterExec {
 }
 
 impl ExecutionPlan for ClusterExec {
-    fn name(&self) -> &str {
-        "ClusterExec"
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &str {
+        "ClusterExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -186,7 +186,7 @@ impl ExecutionPlan for ClusterExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::HashPartitioned(vec![Arc::new(Column::new(
+        vec![Distribution::KeyPartitioned(vec![Arc::new(Column::new(
             self.columns.0.as_str(),
             self.contig_col_idx,
         ))])]

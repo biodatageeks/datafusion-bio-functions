@@ -44,7 +44,7 @@ fn map_column_to_source_schema(
     let message = format!("complex sub queries are not supported {expr:?}");
 
     expr.transform_up(|node| {
-        if let Some(column) = node.as_any().downcast_ref::<Column>() {
+        if let Some(column) = node.downcast_ref::<Column>() {
             let new_column = Column::new(column.name(), indices[column.index()].index);
             if side.is_some() {
                 panic!("{}", message);
@@ -192,19 +192,16 @@ fn try_parse(filter: &JoinFilter) -> Result<ColIntervals, String> {
 
     let expr = filter.expression();
     let binary = expr
-        .as_any()
         .downcast_ref::<BinaryExpr>()
         .ok_or("filter expression is not a BinaryExpr")?;
 
     if matches!(binary.op(), Operator::And) {
         let left = binary
             .left()
-            .as_any()
             .downcast_ref::<BinaryExpr>()
             .ok_or("left side of AND is not a BinaryExpr")?;
         let right = binary
             .right()
-            .as_any()
             .downcast_ref::<BinaryExpr>()
             .ok_or("right side of AND is not a BinaryExpr")?;
 
@@ -501,25 +498,23 @@ mod tests {
     fn find_join_filter(plan: &Arc<dyn ExecutionPlan>) -> Result<&JoinFilter> {
         let mut filter: Option<&JoinFilter> = None;
         plan.apply(|plan| {
-            Ok(
-                if let Some(hash) = plan.as_any().downcast_ref::<HashJoinExec>() {
-                    filter = hash.filter();
-                    TreeNodeRecursion::Stop
-                } else if let Some(nested) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
-                    filter = nested.filter();
-                    TreeNodeRecursion::Stop
-                } else {
-                    TreeNodeRecursion::Continue
-                },
-            )
+            Ok(if let Some(hash) = plan.downcast_ref::<HashJoinExec>() {
+                filter = hash.filter();
+                TreeNodeRecursion::Stop
+            } else if let Some(nested) = plan.downcast_ref::<NestedLoopJoinExec>() {
+                filter = nested.filter();
+                TreeNodeRecursion::Stop
+            } else {
+                TreeNodeRecursion::Continue
+            })
         })
         .map(|_| filter.expect("filter not found"))
     }
 
     fn to_column(expr: Arc<dyn PhysicalExpr>) -> Column {
-        expr.as_any().downcast_ref::<Column>().unwrap().clone()
+        expr.downcast_ref::<Column>().unwrap().clone()
     }
     fn to_binary(expr: Arc<dyn PhysicalExpr>) -> BinaryExpr {
-        expr.as_any().downcast_ref::<BinaryExpr>().unwrap().clone()
+        expr.downcast_ref::<BinaryExpr>().unwrap().clone()
     }
 }

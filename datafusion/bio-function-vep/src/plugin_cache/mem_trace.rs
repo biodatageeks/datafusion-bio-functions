@@ -144,7 +144,17 @@ impl TracingPool {
     }
 }
 
+impl std::fmt::Display for TracingPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TracingPool({})", self.inner)
+    }
+}
+
 impl MemoryPool for TracingPool {
+    fn name(&self) -> &str {
+        "TracingPool"
+    }
+
     fn register(&self, consumer: &MemoryConsumer) {
         self.inner.register(consumer);
     }

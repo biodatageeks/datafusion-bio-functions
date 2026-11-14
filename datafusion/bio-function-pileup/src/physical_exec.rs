@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
@@ -8,8 +7,10 @@ use std::task::{Context, Poll};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
@@ -127,12 +128,15 @@ impl DisplayAs for PileupExec {
 }
 
 impl ExecutionPlan for PileupExec {
-    fn name(&self) -> &str {
-        "PileupExec"
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &str {
+        "PileupExec"
     }
 
     fn schema(&self) -> SchemaRef {

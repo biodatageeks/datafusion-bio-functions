@@ -1,5 +1,3 @@
-use std::any::Any;
-
 use crate::{QcModule, TidyRow};
 
 /// FastQC "Basic Statistics": read count, length range, total bases, GC%.
@@ -22,6 +20,10 @@ impl BasicStats {
 }
 
 impl QcModule for BasicStats {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "basic_stats"
     }
@@ -79,10 +81,6 @@ impl QcModule for BasicStats {
         out.push(TidyRow::num(m, "gc_pct", gc_pct));
         // FastQC Basic Statistics never warns/fails.
         out.push(TidyRow::status(m, "PASS"));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

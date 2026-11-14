@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 
 use crate::{QcModule, TidyRow};
@@ -16,6 +15,10 @@ impl SeqLength {
 }
 
 impl QcModule for SeqLength {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "seq_length"
     }
@@ -58,10 +61,6 @@ impl QcModule for SeqLength {
             "PASS"
         };
         out.push(TidyRow::status(m, status));
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

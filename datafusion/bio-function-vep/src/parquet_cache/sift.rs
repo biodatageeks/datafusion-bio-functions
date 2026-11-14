@@ -349,11 +349,12 @@ impl SinglePathParquetSiftLookup {
                     let mut output =
                         MutableArrayData::new(data.iter().collect(), false, selected.len());
                     for &(page, row) in &selected {
-                        output.extend(page, row, row + 1);
+                        output.try_extend(page, row, row + 1)?;
                     }
-                    make_array(output.freeze())
+                    Ok(make_array(output.freeze()))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, datafusion::arrow::error::ArrowError>>()
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             RecordBatch::try_new(schema, columns)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
         };
