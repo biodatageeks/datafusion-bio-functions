@@ -1,6 +1,6 @@
 [package]
 name = "datafusion-bio-function-seq"
-version = "0.25.0"
+version = "0.26.0"
 description = "Sequence kernels (reverse complement, GC content, translation, read quality) and DataFusion scalar functions"
 license.workspace = true
 authors.workspace = true
