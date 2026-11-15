@@ -1,0 +1,16 @@
+[package]
+name = "datafusion-bio-function-seq"
+version = "0.25.0"
+description = "Sequence kernels (reverse complement, GC content, translation, read quality) and DataFusion scalar functions"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+
+[dev-dependencies]
+proptest = "1.6"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
