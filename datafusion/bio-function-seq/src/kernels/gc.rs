@@ -16,8 +16,8 @@ pub struct GcCounts {
 /// What GC content is divided by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum GcDenominator {
-    /// The full sequence length: seqkit `fx2tab -B GC` and `stats`, seqfu,
-    /// seqtk `comp`.
+    /// The full sequence length in bytes: seqkit `fx2tab -B GC` and `stats`,
+    /// seqfu, seqtk `comp`.
     #[default]
     Length,
     /// Only A, C, G and T: seqkit `fx2tab -g`.

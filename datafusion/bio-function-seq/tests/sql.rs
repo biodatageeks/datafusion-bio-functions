@@ -1,7 +1,10 @@
 //! SQL behaviour of the `seq_*` functions: nulls, options, errors, types.
 
-use datafusion::arrow::array::{Array, AsArray};
-use datafusion::arrow::datatypes::{DataType, Float64Type};
+use std::sync::Arc;
+
+use datafusion::arrow::array::{Array, AsArray, LargeStringArray, RecordBatch, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Float64Type, Schema};
+use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use datafusion_bio_function_seq::register_seq_functions;
 
@@ -173,4 +176,41 @@ async fn builtin_translate_is_untouched() {
             .unwrap(),
         "TCGA"
     );
+}
+
+#[tokio::test]
+async fn sliced_input_arrays() {
+    // A sliced array shares its value buffer with rows outside the slice.
+    let utf8 = StringArray::from(vec!["AAAA", "ACGT", "ATGGCC", "TTTTTTTT"]);
+    let large = LargeStringArray::from(vec!["AAAA", "ACGT", "ATGGCC", "TTTTTTTT"]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("s", DataType::Utf8, false),
+        Field::new("l", DataType::LargeUtf8, false),
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(utf8), Arc::new(large)])
+        .unwrap()
+        .slice(1, 2);
+    let ctx = ctx();
+    ctx.register_table(
+        "t",
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+    )
+    .unwrap();
+    let batches = ctx
+        .sql("SELECT seq_revcomp(s), seq_translate(l) FROM t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rc: Vec<_> = batches[0].column(0).as_string::<i32>().iter().collect();
+    let aa: Vec<_> = batches[0].column(1).as_string::<i64>().iter().collect();
+    assert_eq!(rc, vec![Some("ACGT"), Some("GGCCAT")]);
+    assert_eq!(aa, vec![Some("T"), Some("MA")]);
+}
+
+#[tokio::test]
+async fn all_q0_mean_quality_is_positive_zero() {
+    let q = one_float("SELECT seq_mean_quality('!!!!')").await.unwrap();
+    assert!(q == 0.0 && q.is_sign_positive(), "{q}");
 }

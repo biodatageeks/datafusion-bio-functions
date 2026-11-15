@@ -12,6 +12,10 @@
 //! arguments are optional, positional and must be constants. A null input
 //! gives null, and so does a ratio with a zero denominator. The names carry a
 //! `seq_` prefix because DataFusion already has a built-in `translate`.
+//!
+//! Lengths count bytes, so the `length` denominator of `seq_gc_content`
+//! counts a non-ASCII character as several bytes. Sequence data is ASCII in
+//! practice.
 
 use std::fmt;
 use std::sync::Arc;
@@ -167,14 +171,14 @@ impl ScalarUDFImpl for SeqUdf {
             Kind::Revcomp => {
                 let alphabet = Alphabet::parse(opts.text(0, "dna")?).map_err(ke)?;
                 let strict = opts.bool(1, false)?;
-                map_strings(name, &input, |s, out| {
+                map_strings(name, &input, OutputRatio::Same, |s, out| {
                     revcomp_into(s, alphabet, strict, out).map_err(ke)
                 })?
             }
             Kind::Complement => {
                 let alphabet = Alphabet::parse(opts.text(0, "dna")?).map_err(ke)?;
                 let strict = opts.bool(1, false)?;
-                map_strings(name, &input, |s, out| {
+                map_strings(name, &input, OutputRatio::Same, |s, out| {
                     complement_into(s, alphabet, strict, out).map_err(ke)
                 })?
             }
@@ -182,7 +186,7 @@ impl ScalarUDFImpl for SeqUdf {
                 let mut translator =
                     Translator::new(opts.int(0, 1)?, opts.int(1, 1)?, opts.bool(2, false)?)
                         .map_err(ke)?;
-                map_strings(name, &input, |s, out| {
+                map_strings(name, &input, OutputRatio::OneThird, |s, out| {
                     translator.translate_into(s, out);
                     Ok(())
                 })?
@@ -283,6 +287,13 @@ where
     }
 }
 
+/// Expected output size relative to the input, for pre-sizing.
+#[derive(Clone, Copy)]
+enum OutputRatio {
+    Same,
+    OneThird,
+}
+
 /// A string builder of the same type as the input.
 enum StringSink {
     Utf8(GenericStringBuilder<i32>),
@@ -291,19 +302,29 @@ enum StringSink {
 }
 
 impl StringSink {
-    fn for_input(input: &ArrayRef) -> Self {
+    /// `ratio` is the expected output bytes per input byte (1 for complement,
+    /// 3 input bytes per output byte for translation).
+    fn for_input(input: &ArrayRef, ratio: OutputRatio) -> Self {
         let rows = input.len();
+        // Size from the offsets of this array's rows, not the whole value
+        // buffer, which a sliced array shares with rows outside the slice.
+        let hint = |bytes: usize| match ratio {
+            OutputRatio::Same => bytes,
+            OutputRatio::OneThird => bytes / 3,
+        };
         match input.data_type() {
             DataType::LargeUtf8 => {
-                let bytes = input.as_string::<i64>().value_data().len();
-                StringSink::LargeUtf8(GenericStringBuilder::with_capacity(rows, bytes))
+                let o = input.as_string::<i64>().value_offsets();
+                let bytes = (o[o.len() - 1] - o[0]) as usize;
+                StringSink::LargeUtf8(GenericStringBuilder::with_capacity(rows, hint(bytes)))
             }
             DataType::Utf8View => StringSink::Utf8View(StringViewBuilder::with_capacity(rows)),
             _ => {
-                let bytes = input
-                    .as_string_opt::<i32>()
-                    .map_or(0, |a| a.value_data().len());
-                StringSink::Utf8(GenericStringBuilder::with_capacity(rows, bytes))
+                let bytes = input.as_string_opt::<i32>().map_or(0, |a| {
+                    let o = a.value_offsets();
+                    (o[o.len() - 1] - o[0]) as usize
+                });
+                StringSink::Utf8(GenericStringBuilder::with_capacity(rows, hint(bytes)))
             }
         }
     }
@@ -325,11 +346,11 @@ impl StringSink {
     }
 }
 
-fn map_strings<F>(name: &str, input: &ArrayRef, mut f: F) -> Result<ArrayRef>
+fn map_strings<F>(name: &str, input: &ArrayRef, ratio: OutputRatio, mut f: F) -> Result<ArrayRef>
 where
     F: FnMut(&[u8], &mut Vec<u8>) -> Result<()>,
 {
-    let mut sink = StringSink::for_input(input);
+    let mut sink = StringSink::for_input(input, ratio);
     let mut buf = Vec::new();
     for_each_value(name, input, |value| {
         let Some(value) = value else {

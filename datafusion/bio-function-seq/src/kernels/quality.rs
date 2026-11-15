@@ -76,7 +76,8 @@ pub fn phred_mean(
             for (i, &b) in qual.iter().enumerate() {
                 sum += table[phred(b, offset, i)? as usize];
             }
-            Ok(Some(-10.0 * (sum / n).log10()))
+            // `+ 0.0` turns the -0.0 of an all-Q0 read into 0.0.
+            Ok(Some(-10.0 * (sum / n).log10() + 0.0))
         }
     }
 }
@@ -111,6 +112,15 @@ mod tests {
             phred_mean(b"hh", 64, QualityMethod::Arithmetic).unwrap(),
             Some(40.0)
         );
+    }
+
+    #[test]
+    fn all_q0_is_positive_zero() {
+        let q = phred_mean(b"!!!!", 33, QualityMethod::ErrorProb)
+            .unwrap()
+            .unwrap();
+        assert_eq!(q, 0.0);
+        assert!(q.is_sign_positive());
     }
 
     #[test]

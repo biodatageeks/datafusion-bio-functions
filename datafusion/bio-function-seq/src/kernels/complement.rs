@@ -90,10 +90,19 @@ static DNA_COMPLEMENT: [u8; 256] = complement_table(false);
 static RNA_COMPLEMENT: [u8; 256] = complement_table(true);
 static IUPAC: [bool; 256] = iupac_table();
 
+/// The character `bytes` starts with, or U+FFFD if it is not valid UTF-8.
+fn first_char(bytes: &[u8]) -> char {
+    bytes
+        .utf8_chunks()
+        .next()
+        .and_then(|chunk| chunk.valid().chars().next())
+        .unwrap_or(char::REPLACEMENT_CHARACTER)
+}
+
 fn check_alphabet(seq: &[u8]) -> Result<(), KernelError> {
     match seq.iter().position(|&b| !IUPAC[b as usize]) {
         Some(position) => Err(KernelError::InvalidBase {
-            byte: seq[position],
+            symbol: first_char(&seq[position..]),
             position,
         }),
         None => Ok(()),
@@ -212,7 +221,7 @@ mod tests {
         assert_eq!(
             err,
             KernelError::InvalidBase {
-                byte: b'Z',
+                symbol: 'Z',
                 position: 3
             }
         );
@@ -222,11 +231,23 @@ mod tests {
         assert_eq!(
             err,
             KernelError::InvalidBase {
-                byte: b'-',
+                symbol: '-',
                 position: 2
             }
         );
         revcomp_into(b"ACGTRYSWKMBDHVNacgtu", Alphabet::Dna, true, &mut out).unwrap();
+        // A multi-byte character is reported whole, at its byte offset.
+        let err = revcomp_into("ACéT".as_bytes(), Alphabet::Dna, true, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            KernelError::InvalidBase {
+                symbol: 'é',
+                position: 2
+            }
+        );
+        assert!(err.to_string().contains("'é' at byte offset 2"), "{err}");
+        let err = revcomp_into(b"A\tC", Alphabet::Dna, true, &mut out).unwrap_err();
+        assert!(err.to_string().contains("U+0009"), "{err}");
     }
 
     #[test]

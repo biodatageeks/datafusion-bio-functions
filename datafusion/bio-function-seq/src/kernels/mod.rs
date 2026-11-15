@@ -27,8 +27,10 @@ pub use translate::{Translator, codon_table_ids};
 /// An input the kernels reject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelError {
-    /// A byte outside the IUPAC nucleotide alphabet, raised only in strict mode.
-    InvalidBase { byte: u8, position: usize },
+    /// A character outside the IUPAC nucleotide alphabet, raised only in
+    /// strict mode. `position` is a byte offset; a byte that does not start a
+    /// valid UTF-8 character is reported as U+FFFD.
+    InvalidBase { symbol: char, position: usize },
     /// A quality byte below the Phred offset.
     QualityBelowOffset {
         byte: u8,
@@ -60,13 +62,26 @@ impl fmt::Display for ShowByte {
     }
 }
 
+/// Formats a character as `'Z'` or `'é'` when printable, otherwise as `U+NNNN`.
+struct ShowChar(char);
+
+impl fmt::Display for ShowChar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_control() || self.0.is_whitespace() {
+            write!(f, "U+{:04X}", self.0 as u32)
+        } else {
+            write!(f, "'{}'", self.0)
+        }
+    }
+}
+
 impl fmt::Display for KernelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            KernelError::InvalidBase { byte, position } => write!(
+            KernelError::InvalidBase { symbol, position } => write!(
                 f,
-                "invalid nucleotide {} at position {position}; strict mode accepts only the IUPAC codes ACGTURYSWKMBDHVN",
-                ShowByte(*byte)
+                "invalid nucleotide {} at byte offset {position}; strict mode accepts only the IUPAC codes ACGTURYSWKMBDHVN",
+                ShowChar(*symbol)
             ),
             KernelError::QualityBelowOffset {
                 byte,
