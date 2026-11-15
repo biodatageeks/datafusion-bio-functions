@@ -56,6 +56,11 @@ async fn scalar_calls_and_defaults() {
         "ZCGT"
     );
     assert_eq!(
+        one_string("SELECT seq_reverse('II5#')").await.unwrap(),
+        "#5II"
+    );
+    assert_eq!(one_string("SELECT seq_reverse(NULL)").await, None);
+    assert_eq!(
         one_string("SELECT seq_translate('ATGGCCTAAGC')")
             .await
             .unwrap(),

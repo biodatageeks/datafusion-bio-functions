@@ -90,6 +90,18 @@ static DNA_COMPLEMENT: [u8; 256] = complement_table(false);
 static RNA_COMPLEMENT: [u8; 256] = complement_table(true);
 static IUPAC: [bool; 256] = iupac_table();
 
+const fn identity_table() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = i as u8;
+        i += 1;
+    }
+    table
+}
+
+static IDENTITY: [u8; 256] = identity_table();
+
 /// The character `bytes` starts with, or U+FFFD if it is not valid UTF-8.
 fn first_char(bytes: &[u8]) -> char {
     bytes
@@ -142,10 +154,26 @@ pub fn revcomp_into(
     if strict {
         check_alphabet(seq)?;
     }
-    let table = alphabet.table();
+    reverse_mapped(seq, alphabet.table(), out);
+    Ok(())
+}
+
+/// Appends `seq` reversed to `out`, for example to reverse a FASTQ quality
+/// string alongside [`revcomp_into`].
+///
+/// Like [`revcomp_into`], a multi-byte UTF-8 character is moved as a whole, so
+/// valid UTF-8 stays valid. Unlike Polars' `str.reverse()`, which reverses by
+/// Unicode grapheme cluster, ASCII input takes a plain byte-reversal path.
+pub fn reverse_into(seq: &[u8], out: &mut Vec<u8>) {
+    reverse_mapped(seq, &IDENTITY, out);
+}
+
+/// Reverses `seq` into `out`, mapping each ASCII byte through `table` and
+/// moving multi-byte UTF-8 characters unchanged.
+fn reverse_mapped(seq: &[u8], table: &[u8; 256], out: &mut Vec<u8>) {
     if seq.is_ascii() {
         out.extend(seq.iter().rev().map(|&b| table[b as usize]));
-        return Ok(());
+        return;
     }
     out.reserve(seq.len());
     let mut end = seq.len();
@@ -162,7 +190,6 @@ pub fn revcomp_into(
         }
         end = start;
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -251,6 +278,18 @@ mod tests {
     }
 
     #[test]
+    fn reverse() {
+        let r = |s: &str| {
+            let mut out = Vec::new();
+            reverse_into(s.as_bytes(), &mut out);
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(r("II5#"), "#5II");
+        assert_eq!(r(""), "");
+        assert_eq!(r("AéC€"), "€CéA");
+    }
+
+    #[test]
     fn empty_input() {
         assert_eq!(rc("", Alphabet::Dna), "");
     }
@@ -274,6 +313,14 @@ mod tests {
                 let mut twice = Vec::new();
                 revcomp_into(&once, Alphabet::Dna, false, &mut twice).unwrap();
                 prop_assert_eq!(twice, seq.as_bytes());
+            }
+
+            #[test]
+            fn reverse_matches_char_reversal(seq in "\\PC{0,100}") {
+                let mut out = Vec::new();
+                reverse_into(seq.as_bytes(), &mut out);
+                let expected: String = seq.chars().rev().collect();
+                prop_assert_eq!(String::from_utf8(out).unwrap(), expected);
             }
 
             #[test]

@@ -51,6 +51,7 @@ Scalar functions modelled on [seqkit](https://github.com/shenwei356/seqkit) and 
 | Function | Optional arguments | Matches |
 |---|---|---|
 | `seq_revcomp(seq)` / `seq_complement(seq)` | `alphabet = 'dna'` (or `'rna'`), `strict = false` | seqkit `seq -r -p`, seqfu `rc`, seqtk `seq -r`, Biopython |
+| `seq_reverse(seq)` | — | reverses a string, e.g. a FASTQ quality alongside `seq_revcomp` |
 | `seq_gc_content(seq)` | `denominator = 'length'` (or `'acgt'`) | seqkit `fx2tab -B GC` (`'acgt'`: `fx2tab -g`) |
 | `seq_translate(seq)` | `frame = 1` (±1..3), `table = 1` (NCBI id), `to_stop = false` | Biopython `Seq.translate`, seqkit `translate` |
 | `seq_mean_quality(qual)` | `offset = 33`, `method = 'error_prob'` (or `'arithmetic'`) | seqkit `fx2tab -q` |

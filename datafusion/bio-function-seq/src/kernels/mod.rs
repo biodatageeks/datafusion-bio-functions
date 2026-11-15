@@ -18,7 +18,7 @@ mod translate;
 
 use std::fmt;
 
-pub use complement::{Alphabet, complement_into, revcomp_into};
+pub use complement::{Alphabet, complement_into, revcomp_into, reverse_into};
 pub use gc::{GcCounts, GcDenominator, gc_content, gc_counts};
 pub use metrics::{ReadMetrics, read_metrics};
 pub use quality::{QualityMethod, phred_mean};

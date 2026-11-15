@@ -3,6 +3,7 @@
 //! | Function | Arguments after the sequence | Returns |
 //! |---|---|---|
 //! | `seq_revcomp` | `alphabet = 'dna'`, `strict = false` | same string type |
+//! | `seq_reverse` | — | same string type |
 //! | `seq_complement` | `alphabet = 'dna'`, `strict = false` | same string type |
 //! | `seq_gc_content` | `denominator = 'length'` | `Float64` |
 //! | `seq_translate` | `frame = 1`, `table = 1`, `to_stop = false` | same string type |
@@ -32,7 +33,7 @@ use datafusion::prelude::SessionContext;
 
 use crate::kernels::{
     Alphabet, GcDenominator, KernelError, QualityMethod, Translator, complement_into, gc_content,
-    phred_mean, revcomp_into,
+    phred_mean, revcomp_into, reverse_into,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,6 +56,7 @@ impl fmt::Display for Param {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
     Revcomp,
+    Reverse,
     Complement,
     GcContent,
     Translate,
@@ -65,6 +67,7 @@ impl Kind {
     fn name(self) -> &'static str {
         match self {
             Kind::Revcomp => "seq_revcomp",
+            Kind::Reverse => "seq_reverse",
             Kind::Complement => "seq_complement",
             Kind::GcContent => "seq_gc_content",
             Kind::Translate => "seq_translate",
@@ -78,6 +81,7 @@ impl Kind {
             Kind::Revcomp | Kind::Complement => {
                 &[("alphabet", Param::Text), ("strict", Param::Bool)]
             }
+            Kind::Reverse => &[],
             Kind::GcContent => &[("denominator", Param::Text)],
             Kind::Translate => &[
                 ("frame", Param::Int),
@@ -89,7 +93,10 @@ impl Kind {
     }
 
     fn returns_string(self) -> bool {
-        matches!(self, Kind::Revcomp | Kind::Complement | Kind::Translate)
+        matches!(
+            self,
+            Kind::Revcomp | Kind::Reverse | Kind::Complement | Kind::Translate
+        )
     }
 }
 
@@ -168,6 +175,10 @@ impl ScalarUDFImpl for SeqUdf {
         let opts = Options::new(self.kind, &args.args[1..])?;
         let ke = |e: KernelError| DataFusionError::Execution(format!("{name}: {e}"));
         let output = match self.kind {
+            Kind::Reverse => map_strings(name, &input, OutputRatio::Same, |s, out| {
+                reverse_into(s, out);
+                Ok(())
+            })?,
             Kind::Revcomp => {
                 let alphabet = Alphabet::parse(opts.text(0, "dna")?).map_err(ke)?;
                 let strict = opts.bool(1, false)?;
@@ -388,6 +399,11 @@ pub fn seq_revcomp_udf() -> ScalarUDF {
     ScalarUDF::from(SeqUdf::new(Kind::Revcomp))
 }
 
+/// `seq_reverse(seq)`, e.g. to reverse a quality string alongside `seq_revcomp`.
+pub fn seq_reverse_udf() -> ScalarUDF {
+    ScalarUDF::from(SeqUdf::new(Kind::Reverse))
+}
+
 /// `seq_complement(seq [, alphabet [, strict]])`
 pub fn seq_complement_udf() -> ScalarUDF {
     ScalarUDF::from(SeqUdf::new(Kind::Complement))
@@ -412,6 +428,7 @@ pub fn seq_mean_quality_udf() -> ScalarUDF {
 pub fn seq_udfs() -> Vec<ScalarUDF> {
     vec![
         seq_revcomp_udf(),
+        seq_reverse_udf(),
         seq_complement_udf(),
         seq_gc_content_udf(),
         seq_translate_udf(),
