@@ -16,6 +16,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
 | **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations | ✅ |
 | **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via the `annotate_vep()` table function over a Parquet cache backend | ✅ |
+| **[datafusion-bio-function-seq](datafusion/bio-function-seq)** | Sequence kernels and `seq_*` scalar functions: reverse complement, complement, GC content, translation, mean read quality | ✅ |
 
 ## Features
 
@@ -42,6 +43,23 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Subtract**: Basepair-level set difference via `SELECT * FROM subtract('left', 'right')` — fragments left intervals at right-interval overlap boundaries
 - **Multiple Algorithms**: Coitrees (default), IntervalTree, ArrayIntervalTree, Lapper, SuperIntervals — selectable via `SET bio.interval_join_algorithm`
 - **Transparent Optimization**: Hash/nested-loop joins with range conditions are automatically replaced with interval joins
+
+### Sequence operations
+
+Scalar functions modelled on [seqkit](https://github.com/shenwei356/seqkit) and [seqfu](https://github.com/telatin/seqfu2), checked against seqkit 2.14.0 and Biopython 1.88 in golden tests:
+
+| Function | Optional arguments | Matches |
+|---|---|---|
+| `seq_revcomp(seq)` / `seq_complement(seq)` | `alphabet = 'dna'` (or `'rna'`), `strict = false` | seqkit `seq -r -p`, seqfu `rc`, seqtk `seq -r`, Biopython |
+| `seq_gc_content(seq)` | `denominator = 'length'` (or `'acgt'`) | seqkit `fx2tab -B GC` (`'acgt'`: `fx2tab -g`) |
+| `seq_translate(seq)` | `frame = 1` (±1..3), `table = 1` (NCBI id), `to_stop = false` | Biopython `Seq.translate`, seqkit `translate` |
+| `seq_mean_quality(qual)` | `offset = 33`, `method = 'error_prob'` (or `'arithmetic'`) | seqkit `fx2tab -q` |
+
+```sql
+SELECT name, seq_revcomp(sequence) AS rc, seq_gc_content(sequence) AS gc FROM reads;
+```
+
+The byte-level kernels live in `datafusion_bio_function_seq::kernels` with no Arrow types, so non-DataFusion engines (polars-bio's Polars expression plugin) share the same code. Register the functions with `datafusion_bio_function_seq::register_seq_functions(&ctx)`.
 
 ### VEP Annotation
 
