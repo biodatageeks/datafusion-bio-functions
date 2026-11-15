@@ -161,9 +161,12 @@ pub fn revcomp_into(
 /// Appends `seq` reversed to `out`, for example to reverse a FASTQ quality
 /// string alongside [`revcomp_into`].
 ///
-/// Like [`revcomp_into`], a multi-byte UTF-8 character is moved as a whole, so
-/// valid UTF-8 stays valid. Unlike Polars' `str.reverse()`, which reverses by
-/// Unicode grapheme cluster, ASCII input takes a plain byte-reversal path.
+/// Reverses by Unicode code point: a multi-byte UTF-8 character is moved as a
+/// whole, so valid UTF-8 stays valid, and ASCII input takes a plain
+/// byte-reversal path. Combining marks and multi-code-point emoji are
+/// therefore reordered, unlike Polars' `str.reverse()`, which reverses by
+/// grapheme cluster. Sequence and quality strings are ASCII, so the two agree
+/// there.
 pub fn reverse_into(seq: &[u8], out: &mut Vec<u8>) {
     reverse_mapped(seq, &IDENTITY, out);
 }
