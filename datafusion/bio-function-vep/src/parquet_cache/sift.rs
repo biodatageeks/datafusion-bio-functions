@@ -34,6 +34,9 @@ use crate::parquet_cache::write::point_lookup_writer_properties;
 
 /// Coalescing-reader window (bytes) — matches the variation lookup.
 const COALESCE_GAP_BYTES: u64 = 64 * 1024;
+/// Largest batch a bulk SIFT page read asks for. parquet >= 59 reserves this
+/// many values per column up front, so shorter page ranges ask for fewer.
+const MAX_PAGE_BATCH_ROWS: usize = 8192;
 pub(crate) mod decoded_pages;
 
 /// Write already-sorted (`key` ascending) translation_sift batches to a single
@@ -464,8 +467,8 @@ impl SinglePathParquetSiftLookup {
         // `decoded_page_bound` assumes; a fixed 8192 padded every column of a
         // short page to 8192 rows.
         let batch_rows = usize::try_from(range.1.saturating_sub(range.0))
-            .unwrap_or(8192)
-            .clamp(1, 8192);
+            .unwrap_or(usize::MAX)
+            .clamp(1, MAX_PAGE_BATCH_ROWS);
         let reader = CoalescingAsyncReader::new(
             self.open_async().await?,
             counters.clone(),

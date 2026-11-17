@@ -547,30 +547,39 @@ mod tests {
         // parquet >= 59 reserves `batch_size` values per column before
         // decoding, so with a fixed 8192-row batch every column of a decoded
         // page held capacity for 8192 rows. The short tail page of a shard
-        // then failed its metadata bound (147682 > 119572 on 114 rows).
+        // then failed its metadata bound (147682 > 119572 on 114 rows). The
+        // first, full page is checked too, as the common case.
         let keys: Vec<u64> = (0..10_290).collect();
         let file = fixture(&keys, &[0x5a; 56]);
-        let lookup = lookup(&file, PageCacheBudget::new(64 * 1024 * 1024)).await;
-        let probe = *keys.last().unwrap();
-        let range = lookup.page_dir.resolve_page_ranges(&[probe])[0];
-        let page_rows = usize::try_from(range.1 - range.0).unwrap();
-        assert!(page_rows < 8192, "fixture needs pages shorter than a batch");
-        let (resident_bound, _) = lookup.decoded_page_bound(range).unwrap();
+        let (first, tail) = (keys[0], *keys.last().unwrap());
+        let mut rows_by_probe = Vec::new();
+        for probe in [first, tail] {
+            let lookup = lookup(&file, PageCacheBudget::new(64 * 1024 * 1024)).await;
+            let range = lookup.page_dir.resolve_page_ranges(&[probe])[0];
+            let page_rows = usize::try_from(range.1 - range.0).unwrap();
+            assert!(page_rows < 8192, "fixture needs pages shorter than a batch");
+            let (resident_bound, _) = lookup.decoded_page_bound(range).unwrap();
 
-        let (actual, present) = lookup.take_keys(&[probe]).await.unwrap();
-        let (expected, _) = lookup.take_keys_uncached(&[probe]).await.unwrap();
-        assert_same(&actual, &expected);
-        assert_eq!(present, vec![probe]);
-        let cache = lookup.decoded_cache.as_ref().unwrap();
-        assert_eq!(cache.counters.loads.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            cache.counters.rows.load(Ordering::Relaxed),
-            page_rows as u64
-        );
-        let decoded = cache.counters.decoded_bytes.load(Ordering::Relaxed);
+            let (actual, present) = lookup.take_keys(&[probe]).await.unwrap();
+            let (expected, _) = lookup.take_keys_uncached(&[probe]).await.unwrap();
+            assert_same(&actual, &expected);
+            assert_eq!(present, vec![probe]);
+            let cache = lookup.decoded_cache.as_ref().unwrap();
+            assert_eq!(cache.counters.loads.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                cache.counters.rows.load(Ordering::Relaxed),
+                page_rows as u64
+            );
+            let decoded = cache.counters.decoded_bytes.load(Ordering::Relaxed);
+            assert!(
+                decoded <= resident_bound as u64,
+                "probe {probe}: {decoded} > {resident_bound}"
+            );
+            rows_by_probe.push(page_rows);
+        }
         assert!(
-            decoded <= resident_bound as u64,
-            "{decoded} > {resident_bound}"
+            rows_by_probe[1] < rows_by_probe[0],
+            "the tail page must be shorter than a full page: {rows_by_probe:?}"
         );
     }
 
