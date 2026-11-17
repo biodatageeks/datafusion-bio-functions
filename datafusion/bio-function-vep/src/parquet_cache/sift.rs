@@ -28,15 +28,13 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 
 use crate::parquet_cache::page_dir::{
-    CoalescingAsyncReader, IoCounters, PageDir, selection_from_offsets, selection_from_ranges,
+    CoalescingAsyncReader, IoCounters, PageDir, ranges_row_count, selection_from_offsets,
+    selection_from_ranges, selective_batch_rows,
 };
 use crate::parquet_cache::write::point_lookup_writer_properties;
 
 /// Coalescing-reader window (bytes) — matches the variation lookup.
 const COALESCE_GAP_BYTES: u64 = 64 * 1024;
-/// Largest batch a bulk SIFT page read asks for. parquet >= 59 reserves this
-/// many values per column up front, so shorter page ranges ask for fewer.
-const MAX_PAGE_BATCH_ROWS: usize = 8192;
 pub(crate) mod decoded_pages;
 
 /// Write already-sorted (`key` ascending) translation_sift batches to a single
@@ -175,7 +173,7 @@ impl SinglePathParquetSiftLookup {
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.meta.clone())
                 .with_projection(key_mask)
                 .with_row_selection(selection_from_ranges(ranges))
-                .with_batch_size(8192)
+                .with_batch_size(selective_batch_rows(ranges_row_count(ranges)))
                 .build()
                 .map_err(|e| DataFusionError::Execution(format!("build key stream: {e}")))?;
         let mut offsets = Vec::new();
@@ -223,7 +221,7 @@ impl SinglePathParquetSiftLookup {
         let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.meta.clone())
             .with_projection(mask)
             .with_row_selection(selection_from_offsets(offsets))
-            .with_batch_size(8192);
+            .with_batch_size(selective_batch_rows(offsets.len()));
         let proj_schema = builder.schema().clone();
         let mut stream = builder
             .build()
@@ -462,13 +460,9 @@ impl SinglePathParquetSiftLookup {
             .iter()
             .filter_map(|n| self.meta.schema().index_of(n).ok())
             .collect();
-        // parquet >= 59 reserves `batch_size` values per column before decoding,
-        // so a batch sized to the page range keeps the cached page as small as
-        // `decoded_page_bound` assumes; a fixed 8192 padded every column of a
-        // short page to 8192 rows.
-        let batch_rows = usize::try_from(range.1.saturating_sub(range.0))
-            .unwrap_or(usize::MAX)
-            .clamp(1, MAX_PAGE_BATCH_ROWS);
+        // Sized to the page range so the cached page holds what
+        // `decoded_page_bound` assumes (see `selective_batch_rows`).
+        let batch_rows = selective_batch_rows(ranges_row_count(&[range]));
         let reader = CoalescingAsyncReader::new(
             self.open_async().await?,
             counters.clone(),
@@ -525,6 +519,30 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn short_point_read_keeps_no_full_batch_capacity() {
+        // parquet >= 59 reserves `batch_size` values per column up front and a
+        // one-batch read hands that capacity to the caller, so a fixed 8192
+        // kept this 4-row point read at 48,368 bytes.
+        let keys: Vec<u64> = (0..3000u64).map(|i| (i << 32) | (i * 3 + 7)).collect();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_sift_parquet(tmp.path(), &[sift_batch(&keys)]).unwrap();
+        let lookup = SinglePathParquetSiftLookup::open(
+            tmp.path(),
+            vec!["key".to_string(), "sift".to_string(), "poly".to_string()],
+        )
+        .await
+        .unwrap();
+        let probes = [keys[0], keys[1], keys[1500], keys[2999]];
+        let (batch, _) = lookup.take_keys_uncached(&probes).await.unwrap();
+        assert_eq!(batch.num_rows(), 4);
+        let bytes = batch.get_array_memory_size();
+        assert!(
+            bytes < crate::parquet_cache::page_dir::MAX_SELECTIVE_BATCH_ROWS * 4,
+            "4-row point read holds {bytes} bytes"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

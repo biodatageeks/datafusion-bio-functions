@@ -33,7 +33,8 @@ use crate::cache::variation_runtime::{
 };
 use crate::parquet_cache::encode::reconstruct_af_members;
 use crate::parquet_cache::page_dir::{
-    CoalescingAsyncReader, IoCounters, PageDir, selection_from_offsets, selection_from_ranges,
+    CoalescingAsyncReader, IoCounters, PageDir, ranges_row_count, selection_from_offsets,
+    selection_from_ranges, selective_batch_rows,
 };
 
 /// Coalescing-reader window (bytes). 64 KiB is the measured sweet spot.
@@ -177,7 +178,7 @@ impl SinglePathParquetVariationLookup {
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.meta.clone())
                 .with_projection(start_mask)
                 .with_row_selection(selection_from_ranges(ranges))
-                .with_batch_size(8192)
+                .with_batch_size(selective_batch_rows(ranges_row_count(ranges)))
                 .build()
                 .map_err(|e| DataFusionError::Execution(format!("build start stream: {e}")))?;
         let mut offsets = Vec::new();
@@ -221,7 +222,7 @@ impl SinglePathParquetVariationLookup {
         let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.meta.clone())
             .with_projection(mask)
             .with_row_selection(selection_from_offsets(offsets))
-            .with_batch_size(8192);
+            .with_batch_size(selective_batch_rows(offsets.len()));
         let proj_schema = builder.schema().clone();
         let mut stream = builder
             .build()
@@ -466,6 +467,18 @@ mod tests {
                 .unwrap();
             assert_eq!(out_vn.value(r), format!("rs{orig}"));
         }
+
+        // parquet >= 59 reserves `batch_size` values per column up front and a
+        // one-batch read hands that capacity to the caller: with a fixed 8192
+        // this 3-row payload kept a page's worth of rows per column (9,528
+        // bytes against 1,576 sized to the selection).
+        let payload = lookup
+            .take_payload(&[4, 101, 400], &IoCounters::new())
+            .await
+            .unwrap();
+        assert_eq!(payload.num_rows(), 3);
+        let bytes = payload.get_array_memory_size();
+        assert!(bytes < 4 * 1024, "3-row payload holds {bytes} bytes");
     }
 
     /// Build a small shard whose three AF groups cover the shapes the read path

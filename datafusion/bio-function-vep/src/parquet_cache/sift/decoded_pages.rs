@@ -557,7 +557,10 @@ mod tests {
             let lookup = lookup(&file, PageCacheBudget::new(64 * 1024 * 1024)).await;
             let range = lookup.page_dir.resolve_page_ranges(&[probe])[0];
             let page_rows = usize::try_from(range.1 - range.0).unwrap();
-            assert!(page_rows < 8192, "fixture needs pages shorter than a batch");
+            assert!(
+                page_rows < crate::parquet_cache::page_dir::MAX_SELECTIVE_BATCH_ROWS,
+                "fixture needs pages shorter than a batch"
+            );
             let (resident_bound, _) = lookup.decoded_page_bound(range).unwrap();
 
             let (actual, present) = lookup.take_keys(&[probe]).await.unwrap();

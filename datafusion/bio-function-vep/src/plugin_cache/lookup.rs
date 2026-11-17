@@ -28,7 +28,8 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use coitrees::{COITree, GenericInterval, Interval, IntervalTree};
 
 use crate::parquet_cache::page_dir::{
-    CoalescingAsyncReader, IoCounters, PageDir, selection_from_offsets, selection_from_ranges,
+    CoalescingAsyncReader, IoCounters, PageDir, ranges_row_count, selection_from_offsets,
+    selection_from_ranges, selective_batch_rows,
 };
 
 /// Byte gap under which nearby page ranges coalesce into one read.
@@ -207,7 +208,7 @@ impl PluginLookup {
         )
         .with_projection(start_mask)
         .with_row_selection(selection_from_ranges(&ranges))
-        .with_batch_size(8192)
+        .with_batch_size(selective_batch_rows(ranges_row_count(&ranges)))
         .build()
         .map_err(|e| DataFusionError::Execution(format!("build start stream: {e}")))?;
         let mut offsets = Vec::new();
@@ -245,7 +246,7 @@ impl PluginLookup {
         )
         .with_projection(self.payload_mask())
         .with_row_selection(selection_from_offsets(&offsets))
-        .with_batch_size(8192);
+        .with_batch_size(selective_batch_rows(offsets.len()));
         let proj_schema = self.projected_schema();
         let mut payload_stream = builder
             .build()
