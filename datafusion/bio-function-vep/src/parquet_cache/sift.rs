@@ -459,6 +459,13 @@ impl SinglePathParquetSiftLookup {
             .iter()
             .filter_map(|n| self.meta.schema().index_of(n).ok())
             .collect();
+        // parquet >= 59 reserves `batch_size` values per column before decoding,
+        // so a batch sized to the page range keeps the cached page as small as
+        // `decoded_page_bound` assumes; a fixed 8192 padded every column of a
+        // short page to 8192 rows.
+        let batch_rows = usize::try_from(range.1.saturating_sub(range.0))
+            .unwrap_or(8192)
+            .clamp(1, 8192);
         let reader = CoalescingAsyncReader::new(
             self.open_async().await?,
             counters.clone(),
@@ -468,7 +475,7 @@ impl SinglePathParquetSiftLookup {
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, self.meta.clone())
                 .with_projection(ProjectionMask::roots(self.meta.parquet_schema(), roots))
                 .with_row_selection(selection_from_ranges(&[range]))
-                .with_batch_size(8192)
+                .with_batch_size(batch_rows)
                 .build()
                 .map_err(|e| DataFusionError::Execution(format!("build SIFT page stream: {e}")))?;
         let mut batches = Vec::new();
