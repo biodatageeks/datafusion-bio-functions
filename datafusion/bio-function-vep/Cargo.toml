@@ -29,7 +29,7 @@ toml = "0.8"
 md-5 = "0.10"
 tempfile = "3"
 noodles-core = "0.16"
-noodles-fasta = "0.49"
+noodles-fasta = "0.68"
 # Keep these on the same noodles revision already used by datafusion-bio-formats.
 # `noodles-core` is aliased because the FASTA path above still uses 0.16.
 noodles-core-tabix = { package = "noodles-core", git = "https://github.com/biodatageeks/noodles.git", rev = "42a3c0165617b7b8f9f5c5905287968eef92e31e" }
