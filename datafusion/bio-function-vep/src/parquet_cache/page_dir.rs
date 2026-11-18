@@ -220,6 +220,26 @@ impl PageDir {
     }
 }
 
+/// Largest batch a selective read asks for.
+pub const MAX_SELECTIVE_BATCH_ROWS: usize = 8192;
+
+/// Batch size for a read that selects `selected_rows` rows.
+///
+/// parquet >= 59 reserves `batch_size` values per column before decoding, and
+/// a read that yields one batch hands that capacity on: arrow's `concat` passes
+/// a single array through as a slice. A fixed 8192 therefore padded every
+/// column of a short read to 8192 rows, in memory the caller then kept.
+pub fn selective_batch_rows(selected_rows: usize) -> usize {
+    selected_rows.clamp(1, MAX_SELECTIVE_BATCH_ROWS)
+}
+
+/// Rows selected by [`selection_from_ranges`] over `ranges`.
+pub fn ranges_row_count(ranges: &[(u64, u64)]) -> usize {
+    ranges.iter().fold(0usize, |rows, &(a, b)| {
+        rows.saturating_add(usize::try_from(b.saturating_sub(a)).unwrap_or(usize::MAX))
+    })
+}
+
 /// A `RowSelection` that selects whole page row-ranges (skips the gaps between).
 pub fn selection_from_ranges(ranges: &[(u64, u64)]) -> RowSelection {
     let mut sel = Vec::with_capacity(ranges.len() * 2);
@@ -446,6 +466,22 @@ mod tests {
         assert_eq!(pd.num_runs(), 1);
         let r = pd.resolve_ranges(&[50, 150]);
         assert_eq!(r, vec![(0, 200)]); // merged into one contiguous range
+    }
+
+    #[test]
+    fn selective_batch_rows_follow_the_selection_within_the_cap() {
+        assert_eq!(selective_batch_rows(0), 1);
+        assert_eq!(selective_batch_rows(3), 3);
+        assert_eq!(
+            selective_batch_rows(MAX_SELECTIVE_BATCH_ROWS + 1),
+            MAX_SELECTIVE_BATCH_ROWS
+        );
+        assert_eq!(ranges_row_count(&[(0, 512), (1024, 1050)]), 538);
+        assert_eq!(ranges_row_count(&[(10, 5)]), 0);
+        assert_eq!(
+            ranges_row_count(&[(0, u64::MAX), (0, u64::MAX)]),
+            usize::MAX
+        );
     }
 
     #[test]
