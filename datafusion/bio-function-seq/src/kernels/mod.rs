@@ -12,23 +12,32 @@
 mod codon_tables;
 mod complement;
 mod gc;
+mod hash;
 mod metrics;
 mod motif;
 mod orf;
 mod quality;
 mod transcribe;
 mod translate;
+mod trim;
+mod weight;
+mod weights_data;
 
 use std::fmt;
 
 pub use complement::{Alphabet, complement_into, revcomp_into, reverse_into};
-pub use gc::{GcCounts, GcDenominator, gc_content, gc_counts};
+pub use gc::{
+    GcCounts, GcDenominator, Windows, gc_content, gc_content_windows_into, gc_counts, gc_skew_into,
+};
+pub use hash::seq_hash;
 pub use metrics::{ReadMetrics, read_metrics};
 pub use motif::Motif;
 pub use orf::{Orf, OrfFinder, StartCodons, Strands};
 pub use quality::{QualityMethod, expected_errors, phred_mean, phred_min_max};
 pub use transcribe::{back_transcribe_into, transcribe_into};
 pub use translate::{Ambiguity, CdsError, Translator, codon_table_ids};
+pub use trim::QualityTrimmer;
+pub use weight::MolecularWeight;
 
 /// An input the kernels reject.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +59,8 @@ pub enum KernelError {
     /// A sequence that is not a complete coding sequence, raised only when
     /// translating with `cds`. `detail` names the failed check and the codon.
     InvalidCds { error: CdsError, detail: String },
+    /// A sequence and its quality string of different lengths.
+    LengthMismatch { sequence: usize, quality: usize },
     /// An option string the kernel does not recognise.
     InvalidOption {
         name: &'static str,
@@ -112,6 +123,10 @@ impl fmt::Display for KernelError {
             KernelError::InvalidCds { detail, .. } => write!(
                 f,
                 "invalid CDS: {detail}; cds_status reports the failing check of each row"
+            ),
+            KernelError::LengthMismatch { sequence, quality } => write!(
+                f,
+                "sequence length {sequence} differs from quality length {quality}"
             ),
             KernelError::InvalidOption {
                 name,
