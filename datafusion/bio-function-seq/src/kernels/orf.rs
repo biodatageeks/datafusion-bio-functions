@@ -169,6 +169,11 @@ impl OrfFinder {
         &self.orfs
     }
 
+    /// The ORFs of the last [`OrfFinder::find`].
+    pub fn orfs(&self) -> &[Orf] {
+        &self.orfs
+    }
+
     /// The translation of an ORF returned by the last [`OrfFinder::find`]:
     /// its first codon as `M` when the ORF has a start codon, an ambiguous
     /// codon as `X` unless every expansion agrees, and no stop. Empty unless
@@ -478,7 +483,9 @@ mod tests {
     fn finder_is_reusable() {
         let mut f = finder(1, 1, StartCodons::Atg, false);
         assert_eq!(rows(&mut f, "ATGGCCTAA").len(), 1);
+        assert_eq!(f.orfs().len(), 1);
         assert!(rows(&mut f, "GGGGGG").is_empty());
+        assert!(f.orfs().is_empty());
         assert_eq!(rows(&mut f, "TTAGGCCAT")[0].2, '-');
     }
 
