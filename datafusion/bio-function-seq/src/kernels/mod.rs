@@ -22,7 +22,7 @@ pub use complement::{Alphabet, complement_into, revcomp_into, reverse_into};
 pub use gc::{GcCounts, GcDenominator, gc_content, gc_counts};
 pub use metrics::{ReadMetrics, read_metrics};
 pub use quality::{QualityMethod, phred_mean};
-pub use translate::{Translator, codon_table_ids};
+pub use translate::{Ambiguity, CdsError, Translator, codon_table_ids};
 
 /// An input the kernels reject.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,9 @@ pub enum KernelError {
     InvalidFrame(i64),
     /// An id that is not an NCBI translation table.
     UnknownCodonTable(i64),
+    /// A sequence that is not a complete coding sequence, raised only when
+    /// translating with `cds`. `detail` names the failed check and the codon.
+    InvalidCds { error: CdsError, detail: String },
     /// An option string the kernel does not recognise.
     InvalidOption {
         name: &'static str,
@@ -99,6 +102,10 @@ impl fmt::Display for KernelError {
                 f,
                 "unknown NCBI translation table {id}; expected one of {:?}",
                 codon_table_ids().collect::<Vec<_>>()
+            ),
+            KernelError::InvalidCds { detail, .. } => write!(
+                f,
+                "invalid CDS: {detail}; cds_status reports the failing check of each row"
             ),
             KernelError::InvalidOption {
                 name,

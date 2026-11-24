@@ -198,8 +198,7 @@ impl ScalarUDFImpl for SeqUdf {
                     Translator::new(opts.int(0, 1)?, opts.int(1, 1)?, opts.bool(2, false)?)
                         .map_err(ke)?;
                 map_strings(name, &input, OutputRatio::OneThird, |s, out| {
-                    translator.translate_into(s, out);
-                    Ok(())
+                    translator.translate_into(s, out).map_err(ke)
                 })?
             }
             Kind::GcContent => {
