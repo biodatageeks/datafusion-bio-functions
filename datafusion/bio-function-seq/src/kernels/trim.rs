@@ -226,7 +226,6 @@ mod tests {
         check(None, None, Some((4, 15.0)), expected);
 
         // SLIDINGWINDOW:4:10: a window equal to the threshold passes.
-        let mut expected = expected;
         expected[0] = Some(("A", "I"));
         expected[4] = ALL[4];
         expected[6] = ALL[6];

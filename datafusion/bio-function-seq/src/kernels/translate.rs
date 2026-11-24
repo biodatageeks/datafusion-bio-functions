@@ -270,7 +270,7 @@ fn cds_ends_error(table: &CodonTable, coding: &[u8]) -> Option<CdsError> {
         Some(c) if every_expansion_in(table.starts, c[0], c[1], c[2]) => {}
         _ => return Some(CdsError::NoStartCodon),
     }
-    if coding.len() % 3 != 0 {
+    if !coding.len().is_multiple_of(3) {
         return Some(CdsError::LengthNotMultipleOf3);
     }
     let last = &coding[coding.len() - 3..];
