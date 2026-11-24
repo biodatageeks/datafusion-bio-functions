@@ -13,7 +13,10 @@ mod codon_tables;
 mod complement;
 mod gc;
 mod metrics;
+mod motif;
+mod orf;
 mod quality;
+mod transcribe;
 mod translate;
 
 use std::fmt;
@@ -21,7 +24,10 @@ use std::fmt;
 pub use complement::{Alphabet, complement_into, revcomp_into, reverse_into};
 pub use gc::{GcCounts, GcDenominator, gc_content, gc_counts};
 pub use metrics::{ReadMetrics, read_metrics};
-pub use quality::{QualityMethod, phred_mean};
+pub use motif::Motif;
+pub use orf::{Orf, OrfFinder, StartCodons, Strands};
+pub use quality::{QualityMethod, expected_errors, phred_mean, phred_min_max};
+pub use transcribe::{back_transcribe_into, transcribe_into};
 pub use translate::{Ambiguity, CdsError, Translator, codon_table_ids};
 
 /// An input the kernels reject.

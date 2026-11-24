@@ -82,6 +82,40 @@ pub fn phred_mean(
     }
 }
 
+/// Expected number of errors in a read: the sum of the per-base error
+/// probabilities `10^(-Q/10)`, as used by vsearch and USEARCH
+/// (`--fastq_maxee`). An empty quality string gives 0.
+pub fn expected_errors(qual: &[u8], offset: u8) -> Result<f64, KernelError> {
+    let table = &*ERROR_PROB;
+    let mut sum = 0.0;
+    for (i, &b) in qual.iter().enumerate() {
+        sum += table[phred(b, offset, i)? as usize];
+    }
+    Ok(sum)
+}
+
+/// The lowest and highest Phred score of a read, or `None` for an empty
+/// quality string.
+pub fn phred_min_max(qual: &[u8], offset: u8) -> Result<Option<(u8, u8)>, KernelError> {
+    let Some(&first) = qual.first() else {
+        return Ok(None);
+    };
+    let (mut min, mut max) = (first, first);
+    for &b in &qual[1..] {
+        min = min.min(b);
+        max = max.max(b);
+    }
+    if min < offset {
+        let position = qual.iter().position(|&b| b < offset).unwrap_or(0);
+        return Err(KernelError::QualityBelowOffset {
+            byte: qual[position],
+            offset,
+            position,
+        });
+    }
+    Ok(Some((min - offset, max - offset)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +174,34 @@ mod tests {
             }
         );
         assert!(phred_mean(b"5", 64, QualityMethod::Arithmetic).is_err());
+    }
+
+    #[test]
+    fn expected_errors_is_the_sum_of_error_probabilities() {
+        // I is Q40 and # is Q2.
+        let ee = expected_errors(b"I#", 33).unwrap();
+        assert!((ee - (1e-4 + 10f64.powf(-0.2))).abs() < 1e-15, "{ee}");
+        assert_eq!(expected_errors(b"!", 33).unwrap(), 1.0);
+        // A sum over no bases is zero, not null.
+        assert_eq!(expected_errors(b"", 33).unwrap(), 0.0);
+        assert_eq!(expected_errors(b"hh", 64).unwrap(), 2e-4);
+        assert!(expected_errors(b"I ", 33).is_err());
+    }
+
+    #[test]
+    fn min_and_max() {
+        assert_eq!(phred_min_max(b"I5#", 33).unwrap(), Some((2, 40)));
+        assert_eq!(phred_min_max(b"5", 33).unwrap(), Some((20, 20)));
+        assert_eq!(phred_min_max(b"hh", 64).unwrap(), Some((40, 40)));
+        assert_eq!(phred_min_max(b"", 33).unwrap(), None);
+        assert_eq!(
+            phred_min_max(b"I I ", 33).unwrap_err(),
+            KernelError::QualityBelowOffset {
+                byte: b' ',
+                offset: 33,
+                position: 1
+            }
+        );
     }
 
     #[test]
